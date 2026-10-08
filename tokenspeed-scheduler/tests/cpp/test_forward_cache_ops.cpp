@@ -199,7 +199,8 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
                                      CompletedPages{
                                          .prefix_hashes = hashes,
                                          .first_new_prefix_page = 0,
-                                         .boundary_kind = CacheBoundaryKind::kChunk,
+                                         .boundary_kind = CacheBoundaryKind::kEndpoint,
+                                         .retained_prefix_pages = static_cast<std::int32_t>(hashes.size()),
                                      },
                                  .num_computed_tokens = 8,
                              }));
@@ -215,7 +216,7 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
         EXPECT_TRUE(tables[1].Blocks()[i]) << "slot " << i;
     }
 
-    // Only the two-page resume tail is cached. The older two SWA pages become
+    // The Endpoint caches only the two-page resume tail. The older two SWA pages become
     // free before four fresh pages are acquired, for a net cost of two.
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 2);
 

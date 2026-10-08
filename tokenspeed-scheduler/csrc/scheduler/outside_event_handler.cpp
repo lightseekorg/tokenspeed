@@ -109,6 +109,9 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                                       std::make_move_iterator(new_hashes.end()));
 
         registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
+        const std::int32_t num_computed_tokens = request.TokenSize() - 1;
+        const fsm::CompletedBoundary boundary = progress.ConsumeCompletedBoundary(
+            first_new_prefix_page, num_computed_tokens, request.PrefillSize(), coordinator_.PrefixGranularity());
         coordinator_.CacheCompletedBlocks(
             request.BlockTablesRef(),
             RequestProgress{
@@ -116,11 +119,12 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                     CompletedPages{
                         .prefix_hashes = progress.prefix_hashes,
                         .first_new_prefix_page = first_new_prefix_page,
-                        .boundary_kind = CacheBoundaryKind::kEndpoint,
+                        .boundary_kind = boundary.kind,
+                        .retained_prefix_pages = boundary.retained_prefix_pages,
                         .stream_completed_to_host = false,
                         .materialized_state_boundaries = progress.materialized_state_boundaries,
                     },
-                .num_computed_tokens = request.TokenSize() - 1,
+                .num_computed_tokens = num_computed_tokens,
             },
             progress.access_epoch);
     }

@@ -89,19 +89,6 @@ void fillBlockTables(Operation& operation, Request& request, const CacheCoordina
     operation.block_tables = BuildBlockTables(coordinator, request.BlockTablesRef(), group_ids);
 }
 
-void classifyCompletedStateBoundaries(CompletedPages& completed, std::int32_t endpoint_tokens,
-                                      std::int32_t prefix_granularity) {
-    if (completed.boundary_kind != CacheBoundaryKind::kChunk) {
-        return;
-    }
-    const std::int32_t endpoint_boundary = endpoint_tokens / prefix_granularity * prefix_granularity;
-    if (endpoint_boundary > 0 && std::ranges::find(completed.materialized_state_boundaries, endpoint_boundary) !=
-                                     completed.materialized_state_boundaries.end()) {
-        // Classify the last aligned prompt or recovery checkpoint without upgrading history.
-        completed.state_boundary_kind = CacheBoundaryKind::kEndpoint;
-    }
-}
-
 void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
                                  const std::vector<std::span<const std::int32_t>>& prefix_pages,
                                  std::int32_t filled_prefix_pages) {
@@ -126,19 +113,6 @@ bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::s
     return true;
 }
 
-CacheBoundaryKind consumeCompletedBoundaryKind(fsm::CacheProgress& cache_progress, std::int32_t num_computed_tokens,
-                                               std::int32_t prefill_size) {
-    if (cache_progress.promotion_boundary_tokens > 0 &&
-        num_computed_tokens >= cache_progress.promotion_boundary_tokens) {
-        const bool reached_exactly = num_computed_tokens == cache_progress.promotion_boundary_tokens;
-        cache_progress.promotion_boundary_tokens = 0;
-        if (reached_exactly) {
-            return CacheBoundaryKind::kPromoted;
-        }
-    }
-    return num_computed_tokens == prefill_size ? CacheBoundaryKind::kEndpoint : CacheBoundaryKind::kChunk;
-}
-
 // What a scheduled prefill window proves about state: local prefill
 // materializes its latest internal aligned checkpoint; a remote landing
 // brings only the endpoint state, a checkpoint when the window ends aligned.
@@ -152,10 +126,12 @@ void recordPrefillStateCheckpoint(fsm::CacheProgress& cache_progress, fsm::Prefi
 
 // Hashes the prefix pages that num_computed_tokens has filled since the
 // previous admission and states the request's progress for the coordinator.
-// The returned spans view cache_progress, which must outlive their use.
+// resume_tokens is where a later request resumes: the prompt end, or the
+// computed frontier of a retraction. The returned spans view cache_progress,
+// which must outlive their use.
 RequestProgress advanceRequestProgress(Request& request, fsm::CacheProgress& cache_progress,
-                                       std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
-                                       bool stream_completed_to_host) {
+                                       std::int32_t num_computed_tokens, std::int32_t resume_tokens,
+                                       std::int32_t prefix_granularity, bool stream_completed_to_host) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
@@ -163,14 +139,16 @@ RequestProgress advanceRequestProgress(Request& request, fsm::CacheProgress& cac
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
     if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
+        const fsm::CompletedBoundary boundary = cache_progress.ConsumeCompletedBoundary(
+            first_new_prefix_page, num_computed_tokens, resume_tokens, prefix_granularity);
         progress.completed_pages = CompletedPages{
             .prefix_hashes = cache_progress.prefix_hashes,
             .first_new_prefix_page = first_new_prefix_page,
-            .boundary_kind = consumeCompletedBoundaryKind(cache_progress, num_computed_tokens, request.PrefillSize()),
+            .boundary_kind = boundary.kind,
+            .retained_prefix_pages = boundary.retained_prefix_pages,
             .stream_completed_to_host = stream_completed_to_host,
             .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
         };
-        classifyCompletedStateBoundaries(*progress.completed_pages, request.PrefillSize(), prefix_granularity);
     }
     return progress;
 }
@@ -511,8 +489,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         .reserve_snapshot_state_growth = config_.role != Role::kP && completes_prefill,
     };
     const RequestProgress progress =
-        advanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost());
+        advanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), request->PrefillSize(),
+                               coordinator_.PrefixGranularity(), config_.StreamsDeviceCacheToHost());
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{prefill_tokens}});
@@ -535,9 +513,9 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     fsm::CacheProgress cache_progress = request->CacheProgress();
     const std::int32_t num_computed_tokens = request->NumComputedTokens();
-    const RequestProgress progress =
-        advanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>());
+    const RequestProgress progress = advanceRequestProgress(
+        *request, cache_progress, num_computed_tokens, request->PrefillSize(), coordinator_.PrefixGranularity(),
+        config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>());
 
     if (!progress.completed_pages &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
@@ -665,12 +643,12 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
         // taking TokenSize() there would publish pages that were never
         // computed.
         const std::int32_t num_computed_tokens = victim.NumComputedTokens();
+        // The computed frontier is the readmission's recovery point.
         RequestProgress progress =
-            advanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+            advanceRequestProgress(victim, cache_progress, num_computed_tokens,
+                                   /*resume_tokens=*/num_computed_tokens, coordinator_.PrefixGranularity(),
                                    /*stream_completed_to_host=*/false);
         if (progress.completed_pages) {
-            classifyCompletedStateBoundaries(*progress.completed_pages, num_computed_tokens,
-                                             coordinator_.PrefixGranularity());
             coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
         }
         coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
