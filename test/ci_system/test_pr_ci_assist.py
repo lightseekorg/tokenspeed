@@ -1496,6 +1496,19 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "promoted"
+    # Recover a controller failure using the same checked candidate and hour.
+    live[0]["phase"] = "manual"
+    assist.control(state["pr"])
+    assert len(promoted) == 1 and live[0]["phase"] == "manual"
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setattr(assist.time, "time", lambda: 1893459600)
+    assist.control(state["pr"])
+    assert len(promoted) == 1 and live[0]["phase"] == "manual"
+    monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
+    assist.control(state["pr"])
+    assert len(promoted) == 2 and live[0]["phase"] == "promoted"
+    assert promoted[-1]["candidate"] == promoted[0]["candidate"]
+    assert promoted[-1]["repair_run"] == promoted[0]["repair_run"]
     # Explicitly continue a failed candidate from its owning repair artifact.
     # Old candidate diagnostics survive, but none of its passes authorize the
     # fresh candidate or skip the model turn.
@@ -1781,3 +1794,42 @@ def test_dispatch_event_uses_tested_source_not_main_controller(
     assert not emitted
     with pytest.raises(ValueError, match="open same-repository"):
         assist.pull(123)
+
+
+def test_promotion_accepts_only_owned_validation_branch(
+    monkeypatch, tmp_path, selected
+):
+    _, state = selected
+    state.update(action="fix", phase="validating", repair_run=200)
+    state["candidate"] = dict(
+        patch="c" * 40,
+        validation="d" * 40,
+        tree="e" * 40,
+        branch="bot/pr-ci-assist-123-42-200",
+    )
+    monkeypatch.setattr(repair, "WORK", tmp_path)
+    monkeypatch.setattr(repair, "public_gate", lambda: None)
+    monkeypatch.setattr(repair, "repair_deadline", lambda s: 1893459600)
+    monkeypatch.setattr(repair.time, "time", lambda: 1893459599)
+    monkeypatch.setattr(
+        repair,
+        "pull",
+        lambda n: dict(head={"sha": state["head"]}, base={"sha": state["base"]}),
+    )
+    monkeypatch.setattr(repair, "pages", lambda *a: [])
+    monkeypatch.setattr(repair, "latest_command", lambda c: {"id": state["command"]})
+    monkeypatch.setattr(repair, "api", lambda p: {"object": {"sha": "d" * 40}})
+
+    class FetchReached(Exception):
+        pass
+
+    def command(*args, **kwargs):
+        assert args == ("git", "fetch", "origin", "d" * 40)
+        raise FetchReached
+
+    monkeypatch.setattr(repair, "command", command)
+    with pytest.raises(FetchReached):
+        repair.promote(state)
+    state["candidate"]["branch"] = "bot/pr-ci-assist-123-42-199"
+    with pytest.raises(ValueError, match="Invalid candidate record"):
+        repair.promote(state)

@@ -1506,11 +1506,10 @@ def promote(state: dict):
     if not latest or latest["id"] != state["command"]:
         raise ValueError("Repair was superseded before promotion.")
     candidate = state["candidate"]
-    if candidate[
-        "branch"
-    ] != f"bot/pr-ci-assist-{state['pr']}-{state['command']}" or not all(
-        SHA.fullmatch(candidate[k]) for k in ("patch", "validation", "tree")
-    ):
+    if candidate["branch"] not in {
+        f"bot/pr-ci-assist-{state['pr']}-{state['command']}",
+        f"bot/pr-ci-assist-{state['pr']}-{state['command']}-{state['repair_run']}",
+    } or not all(SHA.fullmatch(candidate[k]) for k in ("patch", "validation", "tree")):
         raise ValueError("Invalid candidate record.")
     if (
         api(f"git/ref/heads/{candidate['branch']}")["object"]["sha"]

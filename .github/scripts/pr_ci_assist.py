@@ -969,6 +969,22 @@ def control(number: int, *, expected_command: int | None = None):
                 if t.startswith((f"Slurm {state['head']} |", f"K8s {state['head']} |"))
             ]
             state["since"] = prior["since"]
+    # Explicit reconciliation can recover a controller failure without
+    # replacing the checked candidate or extending its original deadline.
+    if (
+        not resume_run
+        and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and state
+        and comment
+        and state["phase"] == "manual"
+        and "candidate" in state
+        and state["command"] == comment["id"]
+        and state["action"] == "fix"
+        and permitted(comment) == "fix"
+        and api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
+    ):
+        state["phase"] = "validating"
+        initial = True
     if not state or state["phase"] in FINISHED_PHASES:
         return
     if (
