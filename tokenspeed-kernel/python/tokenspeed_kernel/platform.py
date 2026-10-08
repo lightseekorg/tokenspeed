@@ -423,6 +423,23 @@ def _detect_npu_platform() -> PlatformInfo:
     )
 
 
+def _cuda_shared_memory_budget(props) -> int:
+    """Return the per-block shared-memory limit used by Triton tile selection."""
+    optin = getattr(props, "shared_memory_per_block_optin", None)
+    if optin is not None:
+        return int(optin)
+
+    default = getattr(props, "shared_memory_per_block", None)
+    if default is not None:
+        return int(default)
+
+    logger.warning(
+        "CUDA shared-memory limit is unavailable; using 0 and retaining the "
+        "large-memory tile fallback"
+    )
+    return 0
+
+
 def _detect_cuda_platform() -> PlatformInfo:
     """Detect NVIDIA CUDA platform."""
     import torch
@@ -443,7 +460,7 @@ def _detect_cuda_platform() -> PlatformInfo:
         memory_bandwidth=_estimate_bandwidth(props),
         sm_count=props.multi_processor_count,
         max_threads_per_sm=getattr(props, "max_threads_per_multi_processor", 0),
-        max_shared_memory_per_sm=getattr(props, "max_shared_memory_per_block", 0),
+        max_shared_memory_per_sm=_cuda_shared_memory_budget(props),
         sm_features=sm_features,
         runtime_features=runtime_features,
         interconnect=interconnect,

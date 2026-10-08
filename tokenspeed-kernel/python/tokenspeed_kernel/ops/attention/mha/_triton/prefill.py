@@ -311,6 +311,17 @@ def _fwd_kernel(
         tl.store(LSE_Extend + offs_lse, lse, mask=mask_m)
 
 
+# Use the device budget instead of architecture version: SM120 has a smaller
+# shared-memory limit than datacenter Blackwell.
+_LARGE_SHARED_MEMORY_BYTES = 128 * 1024
+
+
+def _has_large_shared_memory(platform) -> bool:
+    """Return whether the device can use the large-memory tile."""
+    budget = platform.max_shared_memory_per_sm
+    return budget == 0 or budget >= _LARGE_SHARED_MEMORY_BYTES
+
+
 def prefill_attention_fwd(
     q_extend,
     k_extend,
@@ -366,14 +377,15 @@ def prefill_attention_fwd(
         num_warps = 4
 
     else:
-        if platform.is_hopper_plus:
+        small_smem = not _has_large_shared_memory(platform)
+        if platform.is_hopper_plus and not small_smem:
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
         elif platform.is_ampere_plus:
             # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-            if platform.arch_version.minor == 9 or platform.arch_version.minor == 6:
+            if small_smem:
                 if Lq <= 128:
                     BLOCK_M, BLOCK_N = (64, 128)
                 elif Lq <= 256:
