@@ -528,7 +528,17 @@ def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
     repair.identity(tmp_path)
     task = tmp_path / repair.NATIVE_CONFIG
     task.parent.mkdir(parents=True)
-    original = assist.ROOT.joinpath(repair.NATIVE_CONFIG).read_text()
+    prefix = 'PYTHONPATH="python:tokenspeed-kernel/python"'
+    suffix = "$" + "{PYTHONPATH:+:$PYTHONPATH}"
+    original = (
+        assist.ROOT.joinpath(repair.NATIVE_CONFIG)
+        .read_text()
+        .replace(prefix[:-1] + suffix + '"', prefix)
+        .replace(
+            'PYTHONPATH="tokenspeed-mla/python' + suffix + '" ',
+            "PYTHONPATH=tokenspeed-mla/python ",
+        )
+    )
     task.write_text(original)
     git("add", ".")
     git("commit", "-s", "-m", "initial")
@@ -547,8 +557,6 @@ def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
     )
     allowed = repair.allowed_paths(request)
     assert allowed == {"model.py", repair.NATIVE_CONFIG}
-    prefix = 'PYTHONPATH="python:tokenspeed-kernel/python"'
-    suffix = "$" + "{PYTHONPATH:+:$PYTHONPATH}"
     candidate = original.replace(prefix, prefix[:-1] + suffix + '"')
     task.write_text(candidate)
     assert repair.guard(tmp_path, head, allowed)
