@@ -505,14 +505,30 @@ class ModelRunner:
         load. The reported count comes from the tensors the loader actually
         yielded, not from the request: a checkpoint that yields nothing is a
         failure, not a success that updated nothing.
+
+        A model whose weights the startup loader transformed after loading
+        (``post_load_transformed_modules``) is refused before anything is
+        written: a checkpoint holds those weights untransformed.
         """
         from tokenspeed.runtime.configs.load_config import LoadConfig
         from tokenspeed.runtime.model_loader.loader import (
             DefaultModelLoader,
             get_model_loader,
+            post_load_transformed_modules,
         )
 
         model_path = str(obj.model_path)
+        transformed = post_load_transformed_modules(self.model)
+        if transformed:
+            more = len(transformed) - 3
+            return False, (
+                "update_weights_from_disk cannot reload this model in place: the "
+                "startup loader transformed its weights after loading ("
+                + ", ".join(transformed[:3])
+                + (f", and {more} more" if more > 0 else "")
+                + "), and a checkpoint holds them untransformed. Nothing was "
+                f"written; restart the engine with {model_path!r} instead"
+            )
         load_format = obj.load_format or self.server_args.load_format
         consumed = 0
         try:

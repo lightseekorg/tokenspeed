@@ -25,6 +25,9 @@ below it was exercised. These tests drive the real
 ``RequestHandler.process_requests`` and assert on parameter values loaded from
 a real safetensors checkpoint, including a round trip (load B, then A again),
 because a load that writes the wrong data also changes the model.
+
+A refused reload must leave every parameter as it was, so those tests assert
+that ``load_weights`` saw nothing, not only that the request failed.
 """
 
 from __future__ import annotations
@@ -55,6 +58,16 @@ from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
 from tokenspeed.runtime.engine.request_handler import RequestHandler  # noqa: E402
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.model_runner import ModelRunner  # noqa: E402
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod  # noqa: E402
+from tokenspeed.runtime.layers.dense.unquant import (  # noqa: E402
+    UnquantizedLinearMethod,
+)
+from tokenspeed.runtime.layers.linear import (  # noqa: E402
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from tokenspeed.runtime.layers.moe.expert import MoELayer  # noqa: E402
 from tokenspeed.runtime.model_loader import loader as loader_module  # noqa: E402
 
 
@@ -384,6 +397,138 @@ class TestRealCheckpoint(unittest.TestCase):
             self.assertTrue(output.success, output.message)
             torch.testing.assert_close(model.w.data, expected["w"])
         self.assertEqual(handler.clear_cache_fn.call_count, 2)
+
+
+def _bare(cls: type[torch.nn.Module]) -> torch.nn.Module:
+    """An instance of ``cls`` built without its constructor.
+
+    The post-load check reads only a module's class, its ``quant_method`` and
+    an MoE layer's ``plan``, so no layer needs real weights or a mapping.
+    """
+    module = cls.__new__(cls)
+    torch.nn.Module.__init__(module)
+    return module
+
+
+def _moe(preprocessor=None) -> MoELayer:
+    experts = _bare(MoELayer)
+    experts.plan = {"weight_preprocessor": preprocessor}
+    return experts
+
+
+def _quantized(model: torch.nn.Module) -> torch.nn.Module:
+    """Add a block-FP8 projection, which the startup loader post-processes."""
+    model.proj = torch.nn.Module()
+    model.proj.quant_method = Fp8LinearMethod.__new__(Fp8LinearMethod)
+    return model
+
+
+class TestPostLoadTransforms(unittest.TestCase):
+    def _transformed(self, **modules) -> list[str]:
+        model = torch.nn.Module()
+        for name, module in modules.items():
+            setattr(model, name, module)
+        return loader_module.post_load_transformed_modules(model)
+
+    def test_quantized_projection_is_a_transform(self):
+        self.assertEqual(
+            loader_module.post_load_transformed_modules(_quantized(torch.nn.Module())),
+            ["proj (Fp8LinearMethod)"],
+        )
+
+    def test_moe_layer_whose_kernel_repacks_its_experts_is_a_transform(self):
+        def shuffle_experts(plan, w):
+            del plan, w
+
+        self.assertEqual(
+            self._transformed(experts=_moe(shuffle_experts)),
+            ["experts (shuffle_experts)"],
+        )
+
+    def test_moe_layer_whose_kernel_has_no_preprocessor_is_not(self):
+        # The unquantized gfx950 MoE kernels plan no weight preprocessor, so
+        # their experts keep the checkpoint layout.
+        self.assertEqual(self._transformed(experts=_moe(None)), [])
+
+    def test_unknown_hook_is_a_transform(self):
+        # A hook nobody has shown to be a no-op is treated as one that is not.
+        class Repacked(torch.nn.Module):
+            def process_weights_after_loading(self, module) -> None:
+                del module
+
+        self.assertEqual(self._transformed(layer=Repacked()), ["layer (Repacked)"])
+
+    def test_unquantized_dense_layers_are_not(self):
+        layers = {}
+        for name, cls in (
+            ("qkv_proj", QKVParallelLinear),
+            ("gate_up_proj", MergedColumnParallelLinear),
+            ("o_proj", RowParallelLinear),
+        ):
+            layers[name] = _bare(cls)
+            layers[name].quant_method = UnquantizedLinearMethod()
+        self.assertEqual(self._transformed(**layers), [])
+
+    def test_no_op_hooks_leave_the_layer_untouched(self):
+        # The allow list is what keeps unquantized models reloadable, so each
+        # member must really leave the loaded weights alone.
+        for hook in loader_module.no_op_post_load_hooks():
+            with self.subTest(hook=hook.__qualname__):
+                layer = torch.nn.Module()
+                layer.weight = torch.nn.Parameter(
+                    torch.arange(6.0).reshape(2, 3), requires_grad=False
+                )
+                weight, values = layer.weight, layer.weight.detach().clone()
+                attributes = set(vars(layer)), set(layer._parameters)
+
+                hook(layer, layer)
+
+                self.assertIs(layer.weight, weight)
+                self.assertTrue(torch.equal(layer.weight.detach(), values))
+                self.assertEqual((set(vars(layer)), set(layer._parameters)), attributes)
+
+
+class TestReloadRefusals(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _load(self, runner, path, **kwargs):
+        return runner.update_weights_from_disk(
+            UpdateWeightFromDiskReqInput(model_path=str(path), **kwargs)
+        )
+
+    def test_post_processed_model_is_refused_before_anything_is_written(self):
+        _write_checkpoint(self.root / "step-1", scale=7.0)
+        model = _quantized(_TinyModel())
+        bound: list[str] = []
+        model.bind_checkpoint_dir = bound.append
+        runner = _runner(model, self.root / "step-0")
+
+        ok, message = self._load(runner, self.root / "step-1")
+
+        self.assertFalse(ok)
+        self.assertIn("proj (Fp8LinearMethod)", message)
+        self.assertIn("Nothing was written", message)
+        self.assertIn("restart the engine", message)
+        self.assertEqual(model.seen, [])
+        self.assertEqual(bound, [])
+        self.assertTrue(torch.equal(model.w.data, torch.zeros(4, 3)))
+        self.assertEqual(runner.model_config.model_path, str(self.root / "step-0"))
+
+    def test_model_with_only_no_op_hooks_still_reloads(self):
+        updated = _write_checkpoint(self.root / "step-1", scale=7.0)
+        model = _TinyModel()
+        model.o_proj = _bare(RowParallelLinear)
+        model.o_proj.quant_method = UnquantizedLinearMethod()
+        model.experts = _moe(None)
+        runner = _runner(model, self.root / "step-1")
+
+        ok, message = self._load(runner, self.root / "step-1")
+
+        self.assertTrue(ok, message)
+        torch.testing.assert_close(model.w.data, updated["w"])
 
 
 class TestReloadMatchesStartupLoad(unittest.TestCase):
