@@ -212,7 +212,28 @@ Mooncake updates: the `weight_version` checks, the attention-DP same-round gate,
 a cache flush before the load, and the replica-wide result. The reply counts
 the checkpoint tensors actually read, and a checkpoint that yields none is a
 failure. Load formats that do not read checkpoint files (for example `dummy`)
-are refused.
+are refused. The checkpoint is streamed the way the startup load streams it,
+so a model that reads tables from its checkpoint directory (DeepSeek-V4.1's
+Engram tables) reads them from the new one.
+
+The request is refused, with nothing written, when the startup loader
+transformed the model's weights after loading them, because a checkpoint holds
+those weights untransformed: quantized checkpoints (FP8, MXFP4, NVFP4,
+compressed-tensors), and MoE layers whose kernel repacks the experts, which
+includes the FlashInfer TRT-LLM and CUTLASS kernels for unquantized experts.
+Restart the engine with the new checkpoint instead. (`rl.update_from` still
+lists `disk` for such a model: it describes the engine, not the loaded model.)
+Unquantized dense models,
+and unquantized MoE on a kernel that keeps the checkpoint layout (the Triton
+kernel, or the Gluon kernel on gfx950), reload in place.
+
+For a safetensors checkpoint the shard headers are read before the first
+write. A shard shorter than its header declares (for example, one still being
+written) or a tensor whose shape differs from the same name in the checkpoint
+the model holds fails the request with the weights unchanged. A failure after
+the load has started says that the worker's weights may now mix the two
+checkpoints: reload a complete checkpoint or restart the engine before relying
+on its output. The weight version does not advance on any failure.
 
 `POST /update_weights_from_tensor` stays on the router for slime-compatible
 clients, but answers `501 Not Implemented` with
