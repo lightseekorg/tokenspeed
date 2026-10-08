@@ -244,6 +244,8 @@ def _matmul_decode(
         # Rows left in this expert fit i32 even when the weight slab needs the
         # wide index type.
         descriptor_m = (eM - off_m).to(gl.int32)
+    # The weight descriptors start at this N tile, so their bounds must too.
+    descriptor_n = (N - pid_n * BLOCK_N).to(gl.int32)
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,
@@ -255,7 +257,7 @@ def _matmul_decode(
         w_offs,
         w_scale_offs,
         descriptor_m,
-        N,
+        descriptor_n,
         K,
         stride_x_m,
         stride_x_k,

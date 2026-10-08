@@ -40,6 +40,9 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.fused import (  # noqa: E402
     gluon_mxfp_precomputed_mxfp4_fused_moe as _gfx1250_static_moe,
 )
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (  # noqa: E402
+    launch_triton_quantize_mxfp4_activation_gfx1250,
+)
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx1250_moe_weights,
 )
@@ -84,9 +87,8 @@ def _fp8_mxfp4_swiglu_moe_reference(
     return expected.to(torch.bfloat16)
 
 
-def _make_static_fp8_moe_module(
+def _make_mxfp4_moe_module(
     raw: dict[str, torch.Tensor],
-    preprocess: Callable[[dict, torch.nn.Module], None],
     *,
     w13_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
@@ -115,6 +117,17 @@ def _make_static_fp8_moe_module(
         )
     if w2_bias is not None:
         module.w2_weight_bias = torch.nn.Parameter(w2_bias.clone(), requires_grad=False)
+    return module
+
+
+def _make_static_fp8_moe_module(
+    raw: dict[str, torch.Tensor],
+    preprocess: Callable[[dict, torch.nn.Module], None],
+    *,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
+) -> torch.nn.Module:
+    module = _make_mxfp4_moe_module(raw, w13_bias=w13_bias, w2_bias=w2_bias)
     module.w13_input_scale = torch.nn.Parameter(
         torch.ones(1, dtype=torch.float32, device="cuda"), requires_grad=False
     )
@@ -841,6 +854,7 @@ def test_static_fp8_activation_moe_gfx1250(
         w2_bias=module.w2_weight_bias,
         w13_mx_scale=module.w13_precision_config.b_mx_scale,
         w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        activation_dtype="fp8",
         decode=decode,
         block_m=block_m,
     )
@@ -854,6 +868,216 @@ def test_static_fp8_activation_moe_gfx1250(
         w2_bias,
         topk_ids,
         topk_weights,
+    )
+
+    torch.cuda.synchronize()
+    assert actual.shape == hidden_states.shape
+    assert torch.count_nonzero(expected).item() > 0
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("rows", [6, 300])
+@pytest.mark.parametrize("width", [576, 5120])
+def test_gfx1250_mxfp4_activation_quantize_matches_reference(
+    rows: int, width: int
+) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 quantizer")
+
+    generator = torch.Generator(device="cuda").manual_seed(rows * width)
+    x = torch.randn(rows, width, device="cuda", generator=generator) * 4
+    x[0, :32] = 0
+    x = x.to(torch.bfloat16)
+
+    packed, scale = launch_triton_quantize_mxfp4_activation_gfx1250(x)
+    expected_packed, expected_scale = kernel_quantize_mxfp4(
+        x, scale_layout="linear", solution="triton"
+    )
+
+    assert scale.shape == (rows, width // 32)
+    assert scale.stride(0) % 16 == 0
+    assert torch.equal(packed, expected_packed)
+    assert torch.equal(scale, expected_scale)
+
+
+def _dynamic_mxfp4_swiglu_moe_reference(
+    hidden_states: torch.Tensor,
+    raw: dict[str, torch.Tensor],
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    w13_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    alpha: float,
+    limit: float,
+    beta: float,
+) -> torch.Tensor:
+    hidden = _dequantize_dynamic_mxfp4(hidden_states).float()
+    expected = torch.zeros_like(hidden_states, dtype=torch.float32)
+    for expert in topk_ids.unique().tolist():
+        token, slot = (topk_ids == expert).nonzero(as_tuple=True)
+        w13 = dequantize_mxfp4(raw["w13_weight"][expert], raw["w13_scale"][expert])
+        w2 = dequantize_mxfp4(raw["w2_weight"][expert], raw["w2_scale"][expert])
+        gate_up = F.linear(
+            hidden[token], w13, None if w13_bias is None else w13_bias[expert]
+        )
+        gate, linear = gate_up[:, 0::2], gate_up[:, 1::2]
+        if limit > 0:
+            gate = gate.clamp(max=limit)
+            linear = linear.clamp(-limit, limit)
+        intermediate = gate * torch.sigmoid(alpha * gate) * (linear + beta)
+        intermediate = _dequantize_dynamic_mxfp4(intermediate.to(torch.bfloat16))
+        partial = F.linear(
+            intermediate.float(), w2, None if w2_bias is None else w2_bias[expert]
+        )
+        expected.index_add_(
+            0,
+            token,
+            partial.to(torch.bfloat16).float() * topk_weights[token, slot, None],
+        )
+    return expected.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("decode,num_tokens", [(False, 4), (True, 1)])
+def test_dynamic_mxfp4_activation_moe_gfx1250(decode: bool, num_tokens: int) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE kernel")
+
+    generator = torch.Generator(device="cuda").manual_seed(20261008)
+    hidden_size = 256
+    intermediate_size = 256
+    num_experts = 4
+    top_k = 2
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    w13_bias = (
+        torch.randn(
+            (num_experts, 2 * intermediate_size),
+            device="cuda",
+            generator=generator,
+        )
+        * 0.05
+    )
+    w2_bias = (
+        torch.randn((num_experts, hidden_size), device="cuda", generator=generator)
+        * 0.05
+    )
+    module = _make_mxfp4_moe_module(raw, w13_bias=w13_bias, w2_bias=w2_bias)
+    preprocess_gluon_mxfp4_gfx1250_moe_weights({}, module)
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+
+    actual = _gfx1250_static_moe(
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        module.w13_weight_triton_tensor,
+        module.w2_weight_triton_tensor,
+        w13_bias=module.w13_weight_bias,
+        w2_bias=module.w2_weight_bias,
+        w13_mx_scale=module.w13_precision_config.b_mx_scale,
+        w2_mx_scale=module.w2_precision_config.b_mx_scale,
+        decode=decode,
+        activation_dtype="mxfp4",
+    )
+    expected = _dynamic_mxfp4_swiglu_moe_reference(
+        hidden_states,
+        raw,
+        topk_ids,
+        topk_weights,
+        w13_bias=w13_bias,
+        w2_bias=w2_bias,
+        alpha=1.702,
+        limit=7.0,
+        beta=1.0,
+    )
+
+    torch.cuda.synchronize()
+    assert actual.shape == hidden_states.shape
+    assert torch.count_nonzero(expected).item() > 0
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "num_experts,top_k,num_tokens,decode",
+    [
+        # DeepSeek-V4.1-Flash TP4 routed experts, then its DSPARK draft layer.
+        pytest.param(384, 6, 1, True, id="e384-decode-m1"),
+        pytest.param(384, 6, 96, True, id="e384-decode-m96"),
+        pytest.param(384, 6, 2048, False, id="e384-prefill-m2048"),
+        pytest.param(128, 3, 4, True, id="e128-decode-m4"),
+    ],
+)
+def test_dynamic_mxfp4_activation_moe_gfx1250_dsv41_shapes(
+    num_experts: int,
+    top_k: int,
+    num_tokens: int,
+    decode: bool,
+) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE kernel")
+
+    hidden_size, intermediate_size = 5120, 576
+    swiglu_limit = 10.0
+    generator = torch.Generator(device="cuda").manual_seed(num_experts + num_tokens)
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    module = _make_mxfp4_moe_module(raw)
+    preprocess_gluon_mxfp4_gfx1250_moe_weights({}, module)
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    scores = torch.rand(num_tokens, num_experts, device="cuda", generator=generator)
+    # The last expert's partial stage-1 N tile ends at the weight allocation.
+    scores[0, -1] = 2.0
+    topk_weights, topk_ids = scores.topk(top_k, dim=-1)
+    topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    topk_ids = topk_ids.to(torch.int32)
+
+    def apply() -> torch.Tensor:
+        return _gfx1250_static_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            swiglu_alpha=1.0,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=0.0,
+            decode=decode,
+            activation_dtype="mxfp4",
+        )
+
+    actual = apply()
+    if decode:
+        # Serving replays decode from CUDA graphs.
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = apply()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, actual, atol=0, rtol=0)
+    expected = _dynamic_mxfp4_swiglu_moe_reference(
+        hidden_states,
+        raw,
+        topk_ids,
+        topk_weights,
+        w13_bias=None,
+        w2_bias=None,
+        alpha=1.0,
+        limit=swiglu_limit,
+        beta=0.0,
     )
 
     torch.cuda.synchronize()

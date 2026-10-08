@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.residual.triton import (
+    _mhc_mixes_impl,
     _mhc_pre_impl,
     _mhc_prenorm_gemm_triton,
 )
@@ -242,4 +243,57 @@ if current_platform().is_amd:
             pre_reduce_apply_impl=_mhc_pre_reduce_apply_impl,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+        )
+
+    from tokenspeed_kernel_amd.ops.gfx1250.mhc import (
+        launch_gluon_mhc_mixes_project_gfx1250,
+        use_gluon_mhc_mixes_project_gfx1250,
+    )
+
+    def _mhc_prenorm_gemm_gfx1250(
+        x: torch.Tensor,
+        fn: torch.Tensor,
+        out_mul: torch.Tensor,
+        out_sqrsum: torch.Tensor,
+        n_splits: int,
+    ) -> None:
+        if use_gluon_mhc_mixes_project_gfx1250(x.shape[1], n_splits):
+            launch_gluon_mhc_mixes_project_gfx1250(x, fn, out_mul, out_sqrsum, n_splits)
+        else:
+            _mhc_prenorm_gemm_triton(x, fn, out_mul, out_sqrsum, n_splits)
+
+    @register_kernel(
+        "residual",
+        "mhc_mixes",
+        name="gluon_mhc_mixes_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+        ),
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mhc_mixes_gfx1250(
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        rms_eps: float,
+        hc_eps: float,
+        sinkhorn_iters: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the hc=4 prenorm projection on GFX1250 WMMA for prefill batches."""
+        return _mhc_mixes_impl(
+            residual,
+            weight,
+            scale,
+            base,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+            _mhc_prenorm_gemm_gfx1250,
         )

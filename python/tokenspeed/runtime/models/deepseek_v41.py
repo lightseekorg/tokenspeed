@@ -161,8 +161,8 @@ def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Return FP8 codes and uint8 E8M0 scales using reference 1x32 quantization.
 
     The reference rounds the FP32 product ``max(amax, 1e-4) * (1/448)`` by
-    inspecting its exponent/mantissa. Generic MXFP8 quantizers differ at zero,
-    tiny activations, and power-of-two boundaries, so do not substitute one.
+    inspecting its exponent/mantissa; kernels registered for the
+    ``token_group_32``/``ue8m0`` traits reproduce it bit for bit.
     """
     if x.shape[-1] % 32:
         raise ValueError(
@@ -175,7 +175,7 @@ def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             group_size=32,
             scale_encoding="ue8m0",
             enable_pdl=False,
-            override="triton_quantize_fp8_group32_ue8m0",
+            override=None,
             solution=None,
         )
     grouped = x.float().unflatten(-1, (-1, 32))

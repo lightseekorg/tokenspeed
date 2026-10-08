@@ -231,6 +231,58 @@ prefill and decode warmups compile both before serving. Direct kernel callers
 must warm both token ranges; disabling startup warmups can defer compilation
 until the first call in an unwarmed range.
 
+### gfx1250 BF16 GEMM
+
+`gluon_mm_a16w16_gfx1250` is a general BF16 GEMM with FP32 or BF16 output. It
+backs the DeepSeek V4.1 FP32 projection (`gluon_dsv4_linear_fp32_gfx1250`) and
+single-group BF16 projections up to 2048 rows
+(`gluon_grouped_bf16_projection_gfx1250`).
+
+#### Contract
+
+- The operation computes `A @ B.T` from BF16 `A` `[M, K]` with a unit column
+  stride and contiguous BF16 `B` `[N, K]`, with `M >= 1`, `N` divisible by 16,
+  and `K` divisible by 128.
+- Output is FP32 or BF16, chosen explicitly. A caller-owned output needs a unit
+  column stride.
+
+#### Algorithm
+
+Batches that the dense WMMA kernel can tile within one wave of the 256 CUs run
+there. Up to 32 rows use one 16- or 32-row tile without split-K. From 33 to 128
+rows, a 64- or 128-row tile splits K by the first of 5, 4, or 2 that divides the
+K tiles, leaves at least two per split, and keeps the grid within the CUs; a
+split of 5 keeps 16-column tiles, and other splits use 32-column tiles. Larger
+batches use `128 x 64` tiles, split K in two when the grid still fits, and move
+to the large-M kernel once those tiles alone exceed the CUs. Split partials are
+FP32 and the shared reduction sums them in split order, so results are
+deterministic.
+
+### gfx1250 MXFP8 large-M projection
+
+`gluon_mm_mxfp8_ue8m0_largem_gfx1250` covers DeepSeek V4.1 MXFP8 projections
+from 17 rows, above the decode projection's range.
+
+#### Contract
+
+- The operation computes `A @ B.T` from row-major E4M3 matrices shaped `[M, K]`
+  and `[N, K]` with raw UE8M0 scales shaped `[M, ceil(K/32)]` and
+  `[N, ceil(K/32)]` and an explicit `[1, 32]` scale block. All inner strides
+  must be one.
+- Output is BF16; `alpha` is not supported. Automatic selection requires
+  `M >= 17`, `N` divisible by 16, and `K` divisible by 32.
+
+#### Algorithm
+
+TDM stages A, B, and both scale planes into padded LDS slots that feed
+`16 x 16 x 128` scaled WMMA directly. Up to 128 rows, a 32-, 64-, or 128-row
+tile keeps 32 columns and three buffers below 16 K tiles; otherwise it uses 64
+columns and splits K by the first of 10, 8, 5, 4, or 2 that divides the K tiles
+and fits the CUs. Larger batches use `128 x 128` tiles, `128 x 256` tiles when
+those alone give at least 384 tiles, or `128 x 64` tiles split in two when
+there are fewer than 64 `128 x 128` tiles and at least 16 K tiles. Split
+partials are FP32 and use the dense BF16 GEMM's reduction.
+
 ## Attention
 
 ### DeepSeek V4 attention
@@ -312,10 +364,12 @@ two raw FP8 buffers. Lifetime reuse keeps the physical LDS allocation unchanged.
 
 ### DeepSeek V4.1 CSA2 index selection
 
-The gfx950 scorer uses scaled MXFP4 MFMA; gfx1250 dequantizes keys to BF16
-and uses wave32 WMMA. Both accept 32 padded index heads of dimension 128 and
-64-row, page-planar MXFP4 caches. Launch metadata reports score-capacity FLOPs
-and estimated tensor traffic without reading device-resident sequence lengths.
+The adapter packs queries as MXFP4 values with one E8M0 scale per 32 values.
+The gfx950 scorer multiplies them with the MXFP4 keys using scaled MXFP4 MFMA,
+and the gfx1250 scorer uses scaled E2M1 wave32 WMMA. Both accept 32 padded
+index heads of dimension 128 and 64-row, page-planar MXFP4 caches. Launch
+metadata reports score-capacity FLOPs and estimated tensor traffic without
+reading device-resident sequence lengths.
 
 The `tokenspeed-kernel` adapter owns query preparation, validation, and sorted
 row/block selection. Gluon accepts one local or replicated shard with 1..32
@@ -331,6 +385,12 @@ cache; a non-unit stride between page bytes is normalized to contiguous
 storage before scoring. Missing or out-of-range cache pages never contribute
 rows or blocks, including the newest visible block. A valid newest block
 remains eligible regardless of its score.
+
+On gfx1250, FP32 score tiles with at least 128 query rows select with a
+row-wise radix top-k: one program per row finds the k-th largest value with
+four 8-bit histogram passes, then writes the selected values and columns in
+ascending column order, taking ties at the threshold in column order. Smaller
+tiles, including decode, use `torch.topk`.
 
 ### gfx1250 MLA decode
 
@@ -718,16 +778,21 @@ compiler-inserted shared-memory barriers provide inter-wave synchronization.
 
 ### gfx1250 MXFP4 Experts
 
-On gfx1250, the MoE API selects Gluon kernels with FP8 activations and MXFP4
-weights for precomputed top-k routing. Two expert GEMMs run per layer: a
+On gfx1250, the MoE API selects Gluon kernels with FP8 or MXFP4 activations
+and MXFP4 weights for precomputed top-k routing. The `fp8` activation policy
+selects FP8; `input` and `mxfp4` select MXFP4, the A4W4 numerics gfx950 runs
+for DeepSeek V4.1. Two expert GEMMs run per layer: a
 gate/up GEMM with a fused SwiGLU or SiTU activation, then a down GEMM that
 combines into each token's output row.
 
 #### Contract
 
-- Activations enter both GEMMs as E4M3 divided by a per-tensor FP32 scale,
-  which the GEMM multiplies back into its FP32 accumulator. Weights are packed
-  MXFP4 with one UE8M0 scale per 32 values.
+- FP8 activations enter both GEMMs as E4M3 divided by a per-tensor FP32
+  scale, which the GEMM multiplies back into its FP32 accumulator. MXFP4
+  activations are quantized per row with one dynamic UE8M0 scale per 32
+  values, bit-identical to the portable `quantize_mxfp4`; scale rows are
+  padded to 16 bytes for TDM. Weights are packed MXFP4 with one UE8M0 scale
+  per 32 values.
 - `y_global_scale` divides the result by a scalar before the epilogue casts it
   to the output dtype. It applies after bias and after the fused activation,
   so combining it with an FP8 `out_dtype` produces an activation the next GEMM
@@ -754,6 +819,10 @@ weights:
 4. **Down GEMM + weighted combine** consumes that E4M3 intermediate,
    accumulates in FP32, and scatters into each token's output row, followed by
    the weighted top-k reduction.
+
+With MXFP4 activations, step 2 quantizes the input to MXFP4 instead, the
+gate/up GEMM stores a BF16 intermediate, and a second quantizer pass converts
+it to MXFP4 before the down GEMM.
 
 The row tile is resolved from the gathered row count and expert count unless
 the caller pins it. Ragged M and N edges are masked rather than peeled, so a
@@ -811,3 +880,52 @@ probabilities by 256 before the E4M3 cast to preserve small weights, and
 divide out that factor at normalization. The projected-value API applies
 the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
+
+## Quantization
+
+### gfx1250 group-32 FP8 activation quantization
+
+`gluon_quantize_fp8_group32_ue8m0_gfx1250` quantizes activations for DeepSeek
+V4.1 FP8 and MXFP8 projections.
+
+#### Contract
+
+- Input is BF16 or FP16 `[M, K]` with a unit column stride and `K` divisible by
+  32; padded row strides are accepted.
+- Output is contiguous E4M3 codes `[M, K]` and row-major uint8 UE8M0 biased
+  exponents `[M, K/32]`, bit-identical to `triton_quantize_fp8_group32_ue8m0`.
+
+#### Algorithm
+
+A group's scale is `2 ** ceil(log2(max(amax, 1e-4) / 448))`, taken from the
+FP32 bits of the quotient, and its codes are the correctly rounded
+`x / scale` cast to E4M3. Each program covers consecutive groups, with four
+threads per group and eight elements per thread: 32 groups and four warps
+below 49,152 groups, and 256 groups and eight warps from there.
+
+## Hyper-connections
+
+### gfx1250 mHC mixes projection
+
+`gluon_mhc_mixes_gfx1250` computes the hc=4 prenorm mixing coefficients for
+BF16 residual streams. It shares split selection, normalization, and the
+Sinkhorn iterations with `triton_mhc_mixes`, and replaces only the projection
+`x @ fn.T` with its row sums of squares.
+
+#### Contract
+
+- `x` is contiguous BF16 `[T, K]` (the four flattened streams) and `fn` is
+  contiguous FP32 `[24, K]`. The projection writes FP32 partials
+  `[splits, T, 24]` and `[splits, T]`.
+- The WMMA projection runs when `K` splits into whole 128- or 64-wide K tiles
+  that fill the TDM pipeline in every partition; other `K` uses the portable
+  Triton projection.
+
+#### Algorithm
+
+The FP32 weight tile splits into a BF16 rounding and two BF16 remainders that
+sum back to it exactly. BF16 products are exact in FP32, so three BF16 WMMAs
+give the FP32 projection up to accumulation order. Each program covers 64 rows
+and one K partition, pipelines K tiles through three or four TDM buffers, and
+pads the 24 mixes to two 16-wide WMMA tiles. The token count and tiles per
+partition are runtime arguments.

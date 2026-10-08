@@ -107,7 +107,9 @@ def test_canonical_and_prepacked_gemm_match(device: str, m: int) -> None:
     # Triton one when M % 4 != 0; they can round an FP8 value differently, which
     # shifts a whole output row. Check canonical against its own quantized
     # operands instead: only the bf16 output rounding remains (|out| ~ 5e-3).
-    q_x, x_scales = _online_quantize_mxfp8(x, [128, 128], "float32", enable_pdl=False)
+    q_x, x_scales = _online_quantize_mxfp8(
+        x, [128, 128], "float32", enable_pdl=False, kernel_name=None
+    )
     # TRT-LLM pads the scale rows to a multiple of four.
     activation = q_x[:m].float() * x_scales[:m].repeat_interleave(128, dim=1)
     reference = activation @ _dequantize_weight(weight, weight_scales).t()

@@ -26,8 +26,12 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
 from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.selected import (
     launch_gluon_dsv41_selected_attention_gfx1250,
 )
+from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.topk import (
+    launch_triton_dsv41_index_topk_select_gfx1250,
+)
 
 __all__ = [
     "dsv41_index_logits_gfx1250",
     "launch_gluon_dsv41_selected_attention_gfx1250",
+    "launch_triton_dsv41_index_topk_select_gfx1250",
 ]

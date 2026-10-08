@@ -664,6 +664,7 @@ if platform.is_amd:
             ),
             w13_mx_scale=w13_pc.b_mx_scale,
             w2_mx_scale=w2_pc.b_mx_scale,
+            activation_dtype="fp8",
             out_dtype=w2_pc.out_dtype or torch.bfloat16,
             activation="situ",
             situ_beta=situ_beta,
@@ -696,7 +697,8 @@ if platform.is_amd:
             "supports_ep": frozenset({False}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({1}),
-            "internal_activation_dtype": frozenset({"fp8"}),
+            # "input" and "mxfp4" both run dynamic MXFP4 activations.
+            "internal_activation_dtype": frozenset({"fp8", "input", "mxfp4"}),
             "supports_bias": frozenset({True}),
         },
         priority=Priority.SPECIALIZED,
@@ -713,13 +715,16 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
     ):
-        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del router_logits, num_tokens_global, max_num_tokens_per_gpu
         del do_finalize, enable_pdl
         if topk_weights is None or topk_ids is None:
             raise ValueError(
                 "gluon_mxfp4_gfx1250_precomputed_moe_apply requires "
                 "topk_weights and topk_ids"
             )
+        activation_dtype = (
+            "fp8" if plan.get("internal_activation_dtype") == "fp8" else "mxfp4"
+        )
 
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
         w13_pc = w.w13_precision_config
@@ -751,6 +756,7 @@ if platform.is_amd:
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
             decode=decode,
+            activation_dtype=activation_dtype,
         )
 
     @register_kernel(

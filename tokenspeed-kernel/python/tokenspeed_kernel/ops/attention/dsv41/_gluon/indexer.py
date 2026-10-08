@@ -27,7 +27,6 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _index_gather_heads,
     _index_topk_outputs,
     cache_pack,
-    index_q_quantize,
 )
 
 _MFMA_HEADS = 32
@@ -53,9 +52,7 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
     scales = packed[:, 64:68].contiguous().view(torch.int32).reshape(tokens, heads)
     pad = _MFMA_HEADS - heads
     if pad < 0:
-        raise ValueError(
-            f"GFX950 CSA2 MFMA indexer supports at most {_MFMA_HEADS} heads"
-        )
+        raise ValueError(f"AMD CSA2 MXFP4 indexer supports at most {_MFMA_HEADS} heads")
     if pad:
         values = torch.nn.functional.pad(values, (0, 0, 0, pad))
         scales = torch.nn.functional.pad(scales, (0, pad))
@@ -65,28 +62,24 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
     return values.contiguous(), scales.contiguous(), weights.contiguous()
 
 
-def _pad_query(q: torch.Tensor, weights: torch.Tensor):
-    q = index_q_quantize(q.contiguous(), "index", None)
-    tokens, heads, _ = q.shape
-    pad = _MFMA_HEADS - heads
-    if pad < 0:
-        raise ValueError(f"GFX1250 CSA2 indexer supports at most {_MFMA_HEADS} heads")
-    if pad:
-        q = torch.nn.functional.pad(q, (0, 0, 0, pad))
-        weights = torch.nn.functional.pad(weights.float(), (0, pad))
-    else:
-        weights = weights.float()
-    return q.contiguous(), weights.contiguous()
+def _torch_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return scores.topk(k, dim=1, sorted=False)
 
 
-def _select_sorted(scores: torch.Tensor, k: int, out: torch.Tensor, lens: torch.Tensor):
+def _select_sorted(
+    scores: torch.Tensor,
+    k: int,
+    out: torch.Tensor,
+    lens: torch.Tensor,
+    select_topk=_torch_topk,
+):
     out.fill_(-1)
     lens.zero_()
     width = scores.shape[1]
     take = min(int(k), width)
     if not scores.shape[0] or take < 1:
         return
-    values, indices = scores.topk(take, dim=1, sorted=False)
+    values, indices = select_topk(scores, take)
     valid = values > -torch.inf
     ordered = (
         indices.masked_fill(~valid, torch.iinfo(torch.int64).max).sort(dim=1).values
@@ -121,8 +114,13 @@ def run_dsv41_csa2_index_topk(
     process_group,
     out,
     launch_logits,
+    select_topk=_torch_topk,
 ):
-    """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch."""
+    """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch.
+
+    ``select_topk(scores, k)`` returns ``(values, columns)`` like ``torch.topk(...,
+    sorted=False)``.
+    """
     out = _index_topk_outputs(
         index_q,
         weights,
@@ -208,9 +206,7 @@ def run_dsv41_csa2_index_topk(
                 logits,
                 score_chunk_size,
             )
-            values_topk, columns = logits.topk(
-                min(int(topk), width), dim=1, sorted=False
-            )
+            values_topk, columns = select_topk(logits, min(int(topk), width))
             logical = _logical_from_scan(columns, tile_candidates)
             packed = torch.where(
                 values_topk > -torch.inf,
@@ -246,6 +242,7 @@ def run_dsv41_csa2_index_topk(
                     int(candidate_topk),
                     block_out[output_begin:output_end],
                     block_lens[output_begin:output_end],
+                    select_topk,
                 )
     return out
 
@@ -271,6 +268,18 @@ def launch_gfx950_logits(
     )
 
 
+def launch_gfx1250_topk(scores: torch.Tensor, k: int):
+    # The radix select runs one program per row, so it only beats torch.topk
+    # once a score tile has enough rows to occupy most of the GPU.
+    if scores.shape[0] < 128 or scores.dtype != torch.float32 or scores.stride(1) != 1:
+        return _torch_topk(scores, k)
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
+        launch_triton_dsv41_index_topk_select_gfx1250,
+    )
+
+    return launch_triton_dsv41_index_topk_select_gfx1250(scores, k)
+
+
 def launch_gfx1250_logits(
     q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
 ):
@@ -278,9 +287,10 @@ def launch_gfx1250_logits(
         dsv41_index_logits_gfx1250,
     )
 
-    q, w = _pad_query(q, w)
+    values, scales, w = _pack_index_q(q, w)
     dsv41_index_logits_gfx1250(
-        q,
+        values,
+        scales,
         w,
         cache_2d,
         table,

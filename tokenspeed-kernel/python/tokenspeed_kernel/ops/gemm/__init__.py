@@ -464,6 +464,7 @@ def grouped_bf16_projection(
             "n": weight.shape[1],
             "k": weight.shape[2],
             "a_inner_stride_one": x.stride(-1) == 1,
+            "b_contiguous": weight.is_contiguous(),
             "b_inner_stride_one": weight.stride(-1) == 1,
             "is_cuda": x.is_cuda,
         },
@@ -502,15 +503,19 @@ def dsv4_linear_fp32(
         raise ValueError("hidden_states and weight must be floating-point tensors")
 
     enable_pdl = pdl_enabled()
+    k = int(weight.shape[1])
     traits = {
+        "n": int(weight.shape[0]),
+        "k": k,
         "has_tokens": hidden_states.numel() > 0,
+        "hidden_inner_stride_one": hidden_states.stride(-1) == 1,
         "hidden_rank": hidden_states.ndim,
+        "weight_contiguous": weight.is_contiguous(),
     }
     signature = format_signature(
         hidden_states=dense_tensor_format(hidden_states.dtype),
         weight=dense_tensor_format(weight.dtype),
     )
-    k = int(weight.shape[1])
     try:
         kernel = select_kernel(
             "gemm",
@@ -699,14 +704,19 @@ def _online_quantize_mxfp8(
     scale_encoding: str,
     *,
     enable_pdl: bool,
+    kernel_name: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    gfx1250_gluon = kernel_name in {
+        "gluon_mm_mxfp8_ue8m0_gfx1250",
+        "gluon_mm_mxfp8_ue8m0_largem_gfx1250",
+    }
     return quantize_fp8(
         A,
         granularity="token_group",
         group_size=block_size[1],
         scale_encoding=scale_encoding,
-        enable_pdl=enable_pdl,
-        solution="triton",
+        enable_pdl=False if gfx1250_gluon else enable_pdl,
+        solution=None if gfx1250_gluon else "triton",
     )
 
 
@@ -924,6 +934,7 @@ def mm(
             block_size,
             "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
             enable_pdl=enable_pdl,
+            kernel_name=kernel.name,
         )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
@@ -1074,6 +1085,7 @@ def bmm(
             block_size,
             "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
             enable_pdl=enable_pdl,
+            kernel_name=kernel.name,
         )
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
