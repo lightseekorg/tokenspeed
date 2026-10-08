@@ -75,12 +75,15 @@ CONFIG_NAMES = {
 }
 NATIVE_CONFIG = NATIVE_CHECKS["nvidia-kernel-library-tests.yml"]["config"]
 ROOT_API = "tokenspeed-kernel/python/tokenspeed_kernel/__init__.py"
+FP8_API = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/flashinfer.py"
+FP8_REFERENCE = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/fp8_utils.py"
 REPAIR_FEEDBACK = {
     "native-task": "Native repair must retain the original tests and every original byte except appending ${PYTHONPATH:+:$PYTHONPATH} inside an existing quoted PYTHONPATH prefix.",
     "test-syntax": "Test conflict resolution is not valid Python.",
     "source-syntax": "Source conflict resolution is not valid Python. Correct the supplied syntax error before validation.",
     "test-assertions": "Conflict resolution removed or changed test assertions. Preserve current main and PR-added assertions with their original behavior and thresholds.",
     "retired-api": "Main deliberately removed root operator exports. Preserve that removal and migrate callers to operator modules instead of restoring the exports.",
+    "quantization-reference": "Reuse main's prepacked quantizer from ops/gemm/fp8_utils.py instead of reconstructing it in ops/gemm/flashinfer.py. Its native/Triton rounding, zero-group scales and padding are part of the supported contract; migrate callers to the existing implementation.",
     "scope": "Repair changes files outside its scope.",
     "file-size": "Repair deletes a file or exceeds the size limit.",
     "file-mode": "Repair changes file type or mode.",
@@ -351,6 +354,34 @@ def guard_retired_exports(source: Path, head: str, base: str):
         raise RepairRejected("retired-api", path=ROOT_API, details=sorted(restored))
 
 
+def guard_prepacked_reference(source: Path, head: str, base: str):
+    symbol = "flashinfer_fp8_blockscale_quantize_prepacked"
+
+    def defines(content):
+        return any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == symbol
+            for node in ast.parse(content).body
+        )
+
+    if not defines(source.joinpath(FP8_API).read_text()):
+        return
+    if defines(command("git", "show", f"{head}:{FP8_API}", cwd=source)):
+        return
+    if not command(
+        "git", "ls-tree", "--name-only", base, "--", FP8_REFERENCE, cwd=source
+    ):
+        return
+    if defines(
+        command("git", "show", f"{base}:{FP8_REFERENCE}", cwd=source)
+    ) and not defines(command("git", "show", f"{base}:{FP8_API}", cwd=source)):
+        raise RepairRejected(
+            "quantization-reference",
+            path=FP8_API,
+            details=dict(symbol=symbol, reference=FP8_REFERENCE),
+        )
+
+
 def guard_file(source: Path, head: str, p: str, validation_base: str | None):
     file = source / p
     if not file.is_file():
@@ -401,7 +432,7 @@ def guard(
     allowed: set[str],
     *,
     validation_base: str | None = None,
-    check_retired_exports: bool = True,
+    check_main_contracts: bool = True,
 ):
     no_symlinks(source)
     names = command(
@@ -421,12 +452,16 @@ def guard(
     }
     if ROOT_API in allowed:
         checked.add(ROOT_API)
+    if FP8_API in allowed:
+        checked.add(FP8_API)
     issues = []
     for p in sorted(checked):
         try:
             guard_file(source, head, p, validation_base)
-            if p == ROOT_API and validation_base and check_retired_exports:
+            if p == ROOT_API and validation_base and check_main_contracts:
                 guard_retired_exports(source, head, validation_base)
+            if p == FP8_API and validation_base and check_main_contracts:
+                guard_prepacked_reference(source, head, validation_base)
         except RepairRejected as error:
             issues.append(error)
     if issues:
@@ -531,7 +566,14 @@ def configure():
     WORK.joinpath("model").mkdir(parents=True, exist_ok=True)
     request = json.loads(WORK.joinpath("request.json").read_text())
     diagnostics = []
-    evidence = request.get("diagnostics", request["state"])
+    evidence = request.get("diagnostics")
+    if evidence is None and request.get("resume_run"):
+        evidence = previous_repair(request).get("diagnostics")
+        if evidence is not None:
+            request["diagnostics"] = evidence
+            WORK.joinpath("request.json").write_text(json.dumps(request))
+    if evidence is None:
+        evidence = request["state"]
     native = {
         c["run"]: NATIVE_CHECKS[c["workflow"]]
         for c in evidence.get("native_checks", [])
@@ -804,7 +846,7 @@ def seed_repair(source: Path, request: dict, allowed: set[str], conflicts: set[s
                 state["head"],
                 names,
                 validation_base=base,
-                check_retired_exports=False,
+                check_main_contracts=False,
             )
             for path in names | conflicts:
                 parent = review / path
@@ -887,11 +929,19 @@ def model():
                 )
     feedback = plan_root / "feedback.json"
     feedback.write_text("{}")
-    if resumed and ROOT_API in allowed:
-        try:
-            guard_retired_exports(source, state["head"], base)
-        except RepairRejected as error:
-            feedback.write_text(json.dumps(error.feedback))
+    if resumed:
+        issues = []
+        for path, check in (
+            (ROOT_API, guard_retired_exports),
+            (FP8_API, guard_prepacked_reference),
+        ):
+            if path in allowed:
+                try:
+                    check(source, state["head"], base)
+                except RepairRejected as error:
+                    issues.append(error.feedback)
+        if issues:
+            feedback.write_text(json.dumps({**issues[0], "issues": issues}))
     # Corrective turns must reuse a trusted tool definition. The model can read
     # this runner-owned file, but cannot replace it through its writable inputs.
     agent = sandbox_root / "repair.md"

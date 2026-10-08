@@ -934,7 +934,13 @@ def control(number: int, *, expected_command: int | None = None):
         initial = True
     diagnostics = (
         {k: state[k] for k in ("native_checks", "run_ids") if k in state}
-        if resume_run and state and "candidate" in state
+        if resume_run
+        and state
+        and "candidate" in state
+        and (
+            "failed" in state["statuses"]
+            or any(c["status"] == "failed" for c in state.get("native_checks", []))
+        )
         else None
     )
     if initial:

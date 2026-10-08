@@ -679,6 +679,13 @@ def test_source_screen_retains_public_parents_and_rejects_new_private_text(tmp_p
     old_exports = 'from package.ops import mm\n__all__ = ["mm"]\n'
     bootstrap = "from package import bootstrap as _bootstrap\n_bootstrap()\n"
     root_api.write_text(old_exports)
+    fp8_api = tmp_path / repair.FP8_API
+    fp8_api.parent.mkdir(parents=True)
+    fp8_api.write_text("value = 1\n")
+    fp8_reference = tmp_path / repair.FP8_REFERENCE
+    fp8_reference.write_text(
+        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return native_quantizer(x)\n"
+    )
     git("add", ".")
     git("commit", "-s", "-m", "initial")
     head = git("rev-parse", "HEAD")
@@ -698,6 +705,26 @@ def test_source_screen_retains_public_parents_and_rejects_new_private_text(tmp_p
         )
     root_api.write_text(bootstrap)
     assert repair.new_source_text(tmp_path, head, base, {"model.py"}) == "value = 3"
+    fp8_api.write_text(
+        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return x / x.abs().amax()\n"
+    )
+    with pytest.raises(repair.RepairRejected, match="Reuse main's prepacked quantizer"):
+        repair.guard(
+            tmp_path,
+            head,
+            {"model.py", repair.ROOT_API, repair.FP8_API},
+            validation_base=base,
+        )
+    fp8_api.write_text(
+        "from tokenspeed_kernel.ops.gemm.fp8_utils import flashinfer_fp8_blockscale_quantize_prepacked\n"
+    )
+    assert repair.guard(
+        tmp_path,
+        head,
+        {"model.py", repair.ROOT_API, repair.FP8_API},
+        validation_base=base,
+    )
+    fp8_api.write_text("value = 1\n")
     file.write_text("# new https://example.com/v1\nvalue = 3\n")
     with pytest.raises(repair.RepairRejected, match="public-output"):
         repair.guard(
@@ -812,6 +839,32 @@ def test_native_failure_diagnostics_include_slurm_artifact(monkeypatch, tmp_path
     )
     repair.configure()
     assert requested == ["actions/runs/102"]
+    prior = {
+        **request,
+        "state": {
+            "repair_run": 201,
+            "repository": REPO,
+            "pr": 123,
+            "head": "a" * 40,
+            "base": "b" * 40,
+            "command": 43,
+        },
+    }
+    prior["state"]["validation_base"] = "b" * 40
+    previous = tmp_path / "previous-repair"
+    previous.mkdir()
+    previous.joinpath("request.json").write_text(json.dumps(prior))
+    previous.joinpath("patch.diff").write_text("accepted source edits")
+    request.update(resume_run=201, state={**prior["state"], "repair_run": 202})
+    request.pop("diagnostics")
+    tmp_path.joinpath("request.json").write_text(json.dumps(request))
+    requested.clear()
+    repair.configure()
+    assert requested == ["actions/runs/102"]
+    assert (
+        json.loads(tmp_path.joinpath("request.json").read_text())["diagnostics"]
+        == prior["diagnostics"]
+    )
 
 
 def test_failed_task_retries_once_and_falls_back_only_before_submission(
@@ -1454,6 +1507,22 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assert retry["resume_run"] == 201 and retry["state"]["repair_run"] == 202
     assert retry["diagnostics"]["native_checks"] == [failed]
     assert "candidate" not in retry["state"] and not retry["check_only"]
+    live[0].update(
+        phase="manual",
+        statuses=["waiting"],
+        native_checks=[dict(workflow=workflow, status="waiting", run=104)],
+        candidate=dict(
+            patch="c" * 40,
+            validation="d" * 40,
+            tree="e" * 40,
+            branch="bot/pr-ci-assist-123-43-202",
+        ),
+    )
+    monkeypatch.setenv("GITHUB_RUN_ID", "203")
+    monkeypatch.setenv("REPAIR_RUN", "202")
+    assist.control(state["pr"])
+    retry = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert "diagnostics" not in retry
 
 
 def test_cancelled_repair_is_recovered_on_next_reconciliation(
