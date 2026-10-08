@@ -2233,6 +2233,7 @@ def _attention_kpool_prefill_topk(prefill_plan: bool) -> object:
         kv_page_size=64,
         topk_pools=512,
         softmax_scale=128**-0.5,
+        prepared_query=None,
         apply_relu=True,
         append_tail=True,
         chunk_pools=8192,

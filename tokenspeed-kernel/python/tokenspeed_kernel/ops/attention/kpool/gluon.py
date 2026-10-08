@@ -626,6 +626,7 @@ def _kpool_prefill_topk_impl(
     kv_page_size: int,
     topk_pools: int,
     softmax_scale: float,
+    prepared_query: tuple[torch.Tensor, torch.Tensor] | None,
     apply_relu: bool = True,
     append_tail: bool = True,
     chunk_pools: int = _DEFAULT_CHUNK_POOLS,
@@ -646,8 +647,11 @@ def _kpool_prefill_topk_impl(
 
     Short selections of at most 2048 pools use ordered head accumulation when
     they fit in one normalized scoring window. Longer or split selections keep
-    the balanced reduction.
+    the balanced reduction. The MFMA/WMMA scorers read BF16 queries directly
+    and require ``prepared_query=None``.
     """
+    if prepared_query is not None:
+        raise ValueError("Gluon KPool scoring requires prepared_query=None")
     return _kpool_prefill_topk_fp8(
         q,
         pooled_k_cache,
@@ -699,56 +703,68 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(*args, **kwargs):
     )
 
 
+def gluon_kpool_prefill_prepare_query_fp8_gfx950(
+    q: torch.Tensor, weights: torch.Tensor, *, softmax_scale: float
+) -> None:
+    """Gluon scores BF16 queries directly, so no preparation is needed."""
+    del q, weights, softmax_scale
+    return None
+
+
+def gluon_kpool_prefill_prepare_query_fp8_gfx1250(
+    q: torch.Tensor, weights: torch.Tensor, *, softmax_scale: float
+) -> None:
+    """Gluon scores BF16 queries directly, so no preparation is needed."""
+    del q, weights, softmax_scale
+    return None
+
+
 if _IS_AMD:
-    register_kernel(
-        "attention",
-        "kpool_prefill_topk",
-        name="gluon_kpool_prefill_topk_fp8_gfx950",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 5),
-            max_arch_version=ArchVersion(9, 5),
-            vendors=frozenset({"amd"}),
+    for arch, prepare, topk in (
+        (
+            ArchVersion(9, 5),
+            gluon_kpool_prefill_prepare_query_fp8_gfx950,
+            gluon_kpool_prefill_topk_fp8_gfx950,
         ),
-        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
-        priority=Priority.SPECIALIZED,
-        traits={
-            "index_heads": frozenset({32}),
-            "head_dim": frozenset({128}),
-            "page_size": frozenset({16}),
-            "pool_size": frozenset({4}),
-            "topk_pools": frozenset({512}),
-            "has_prefill_plan": frozenset({False, True}),
-            "index_k_format": frozenset({"fp8_scaled"}),
-            "score_activation": frozenset({"relu"}),
-            "topk_layout": frozenset({"global_slots"}),
-        },
-    )(gluon_kpool_prefill_topk_fp8_gfx950)
-    register_kernel(
-        "attention",
-        "kpool_prefill_topk",
-        name="gluon_kpool_prefill_topk_fp8_gfx1250",
-        solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(12, 5),
-            max_arch_version=ArchVersion(12, 5),
-            vendors=frozenset({"amd"}),
+        (
+            ArchVersion(12, 5),
+            gluon_kpool_prefill_prepare_query_fp8_gfx1250,
+            gluon_kpool_prefill_topk_fp8_gfx1250,
         ),
-        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
-        priority=Priority.SPECIALIZED,
-        traits={
-            "index_heads": frozenset({32}),
-            "head_dim": frozenset({128}),
-            "page_size": frozenset({16}),
-            "pool_size": frozenset({4}),
-            "topk_pools": frozenset({512}),
-            "has_prefill_plan": frozenset({False, True}),
-            "index_k_format": frozenset({"fp8_scaled"}),
-            "score_activation": frozenset({"relu"}),
-            "topk_layout": frozenset({"global_slots"}),
-        },
-    )(gluon_kpool_prefill_topk_fp8_gfx1250)
+    ):
+        for mode, kernel in (
+            ("kpool_prefill_prepare_query", prepare),
+            ("kpool_prefill_topk", topk),
+        ):
+            register_kernel(
+                "attention",
+                mode,
+                name=kernel.__name__,
+                solution="gluon",
+                capability=CapabilityRequirement(
+                    min_arch_version=arch,
+                    max_arch_version=arch,
+                    vendors=frozenset({"amd"}),
+                ),
+                signatures=frozenset(
+                    {format_signature(q=dense_tensor_format(torch.bfloat16))}
+                ),
+                priority=Priority.SPECIALIZED,
+                traits={
+                    "index_heads": frozenset({32}),
+                    "head_dim": frozenset({128}),
+                    "page_size": frozenset({16}),
+                    "pool_size": frozenset({4}),
+                    "topk_pools": frozenset({512}),
+                    "has_prefill_plan": frozenset({False, True}),
+                    "index_k_format": frozenset({"fp8_scaled"}),
+                    "score_activation": frozenset({"relu"}),
+                    "topk_layout": frozenset({"global_slots"}),
+                },
+            )(kernel)
     __all__ = [
+        "gluon_kpool_prefill_prepare_query_fp8_gfx950",
+        "gluon_kpool_prefill_prepare_query_fp8_gfx1250",
         "gluon_kpool_prefill_topk_fp8_gfx950",
         "gluon_kpool_prefill_topk_fp8_gfx1250",
     ]
