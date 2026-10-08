@@ -1079,6 +1079,9 @@ class OutputProcesser:
         It is appended to output_ids so the decode side starts generation from the
         correct position.
 
+        ``cached_tokens`` reports prefill cache reuse and determines uncached prompt
+        work. Decode-local cache hits only reduce KV transfer.
+
         A constrained request also advances its matcher here. Prefill and decode
         each compiled their own matcher for the request, and this token is the
         only one the decode node never samples itself: without accepting it here
@@ -1096,8 +1099,7 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return
         state = self.rid_to_state[req_id]
-        # P and D reuse overlapping leading prefixes; never sum their hits.
-        state.cached_tokens = max(state.cached_tokens, cached_tokens)
+        state.cached_tokens = cached_tokens
         if bootstrap_token == -1:
             logger.warning(
                 f"[on_remote_prefill_done] rid={req_id!s} received bootstrap_token=-1, "
