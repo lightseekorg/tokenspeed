@@ -261,12 +261,20 @@ class QwenGDNRecipe(CacheRecipe):
     def _tree_state_bytes(self) -> int:
         """A ReplaySSM tree verify's node states: one layer's worth per draft
         position, shared by every layer (``MambaAttnBackend._tree_node_states``)."""
-        if not self.draft_tree:
+        linear_attn = self.attn_config.component(LinearAttnConfig)
+        from tokenspeed_kernel.ops.attention.gdn import (
+            gdn_tree_verify_needs_node_states,
+        )
+
+        nodes = int(self.server_args.speculative_num_draft_tokens)
+        if (
+            not self.draft_tree
+            or not linear_attn.tree_node_state_workspace
+            or not gdn_tree_verify_needs_node_states(nodes)
+        ):
             return 0
         _, _, ssm_shape, ssm_dtype = self._state_shapes
-        rows = self.attn_config.max_bs * int(
-            self.server_args.speculative_num_draft_tokens
-        )
+        rows = self.attn_config.max_bs * nodes
         return rows * math.prod(ssm_shape) * cache_dtype_bytes(ssm_dtype)
 
     def _replay_payload_bytes(self) -> int:

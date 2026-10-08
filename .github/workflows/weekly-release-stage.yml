@@ -1,0 +1,107 @@
+name: Weekly release stage
+
+on:
+  workflow_call:
+    inputs:
+      stage:
+        required: true
+        type: string
+      previous:
+        required: true
+        type: string
+      version:
+        type: string
+        default: ''
+      resume_run_id:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  stage:
+    if: github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: weekly-release-${{ inputs.stage }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install controller dependencies
+        run: python -m pip install packaging cryptography pre-commit PyYAML
+
+      - name: Preserve the controller from the triggering commit
+        run: cp .github/scripts/weekly-release.py "$RUNNER_TEMP/weekly-release.py"
+
+      - name: Download previous stage state
+        if: inputs.previous != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: weekly-state-${{ inputs.previous }}
+          path: ${{ runner.temp }}/weekly-state
+
+      - name: Download completed publication state for release-only recovery
+        if: inputs.resume_run_id != ''
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+        run: |
+          if [[ ! "$RESUME_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'Invalid recovery run ID.' >&2
+            exit 1
+          fi
+          names=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$RESUME_RUN_ID/artifacts" --jq '.artifacts[] | select(.expired == false) | .name')
+          artifact=weekly-state-docker
+          if grep -Fxq 'weekly-state-release' <<< "$names"; then
+            artifact=weekly-state-release
+          fi
+          gh run download "$RESUME_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$artifact" --dir "$RUNNER_TEMP/weekly-state"
+
+      - name: Restore this stage on rerun
+        if: inputs.resume_run_id == ''
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          STAGE: ${{ inputs.stage }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/weekly-state"
+          names=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '.artifacts[] | select(.expired == false) | .name')
+          if grep -Fxq "weekly-state-$STAGE" <<< "$names"; then
+            gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --name "weekly-state-$STAGE" --dir "$RUNNER_TEMP/weekly-resume"
+            cp "$RUNNER_TEMP/weekly-resume/state.json" "$RUNNER_TEMP/weekly-state/state.json"
+          fi
+
+      - name: Run stage and wait for publication
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          DOCKER_READY: ${{ vars.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
+          STAGE: ${{ inputs.stage }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+        run: |
+          python "$RUNNER_TEMP/weekly-release.py" --stage "$STAGE" \
+            --state "$RUNNER_TEMP/weekly-state/state.json" --version "$REQUESTED_VERSION" \
+            --resume-run-id "$RESUME_RUN_ID"
+
+      - name: Preserve recovery state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-state-${{ inputs.stage }}
+          path: ${{ runner.temp }}/weekly-state/state.json
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 90

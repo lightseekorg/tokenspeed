@@ -36,7 +36,7 @@ from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flas
 
 from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
 from tokenspeed.runtime.moe.expert_load_rows import LayerExpertLoad
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 
 class TopKOutputFormat(Enum):
@@ -455,6 +455,38 @@ class TopKOutput(Protocol):
         ...
 
 
+_SIMULATED_ROUTING_MIN_ROWS = 16384
+_simulated_logits: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+
+
+def simulated_router_logits(router_logits: torch.Tensor) -> torch.Tensor:
+    """Return logits that send each token to a fixed random set of experts.
+
+    Row ``i`` of a seeded uniform table stands in for token ``i``, so every
+    layer and step routes batch slot ``i`` the same way while a batch spreads
+    over experts. The rows are a view, adding no launches to captured graphs;
+    the table grows only outside capture, and the first forward is eager.
+    """
+    tokens, experts = router_logits.shape
+    key = (router_logits.device, router_logits.dtype, experts)
+    table = _simulated_logits.get(key)
+    if table is None or table.shape[0] < tokens:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"simulated routing table has no rows for {tokens} tokens "
+                "during graph capture"
+            )
+        generator = torch.Generator(device=router_logits.device).manual_seed(0)
+        table = torch.rand(
+            max(tokens, _SIMULATED_ROUTING_MIN_ROWS),
+            experts,
+            generator=generator,
+            device=router_logits.device,
+        ).to(router_logits.dtype)
+        _simulated_logits[key] = table
+    return table[:tokens]
+
+
 class TopK(torch.nn.Module):
 
     def __init__(
@@ -520,6 +552,13 @@ class TopK(torch.nn.Module):
             num_sink_experts=num_sink_experts,
             sink_global_scale=sink_global_scale,
         )
+        routing_simulation = envs.TOKENSPEED_MOE_ROUTING_SIMULATION.get()
+        if routing_simulation not in ("", "uniform"):
+            raise ValueError(
+                "TOKENSPEED_MOE_ROUTING_SIMULATION must be unset or 'uniform', "
+                f"got {routing_simulation!r}"
+            )
+        self.simulate_routing = routing_simulation == "uniform"
 
     def forward(
         self,
@@ -533,6 +572,8 @@ class TopK(torch.nn.Module):
         output_format = (
             output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
         )
+        if self.simulate_routing:
+            router_logits = simulated_router_logits(router_logits)
 
         if output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(

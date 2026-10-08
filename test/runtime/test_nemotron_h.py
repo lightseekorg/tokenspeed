@@ -238,6 +238,7 @@ def _backend(
     *,
     verify_width: int = 1,
     replay_ssm: bool = False,
+    draft_tree: bool = False,
 ):
     from tokenspeed.runtime.layers.attention.backends.state.mamba2 import (
         Mamba2AttnBackend,
@@ -259,6 +260,7 @@ def _backend(
         chunk_size=128,
         dt_limit=(0.0, float("inf")),
         replay_ssm=replay_ssm,
+        draft_tree=draft_tree,
     )
     config = AttnConfig(
         device="cuda",
@@ -458,7 +460,9 @@ def _super_attn_config(tp: int, kv_dtype: torch.dtype, *, is_draft: bool, device
     )
 
 
-def _super_cache_recipe(tp: int, kv_dtype: torch.dtype, *, draft_tokens: int):
+def _super_cache_recipe(
+    tp: int, kv_dtype: torch.dtype, *, draft_tokens: int, topk: int = 1
+):
     """The Mamba2 recipe, with one MTP draft layer when ``draft_tokens`` is set."""
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         cache_recipe,
@@ -473,7 +477,7 @@ def _super_cache_recipe(tp: int, kv_dtype: torch.dtype, *, draft_tokens: int):
             prefix_granularity=128,
             max_total_tokens=None,
             speculative_num_draft_tokens=draft_tokens,
-            speculative_eagle_topk=1,
+            speculative_eagle_topk=topk,
             enable_replay_ssm=with_draft,
         ),
         model_config=SimpleNamespace(
@@ -533,6 +537,15 @@ def test_mamba2_cache_plan_packs_state_and_kv_without_state_padding(tp, kv_dtype
     # A KV page pads only by its share of the conv segments.
     kv_padding = (plan.lcm_block_bytes / kv_packing - 8 * k_bytes) / (8 * k_bytes)
     assert kv_padding < 0.02
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mamba2_tree_plans_no_node_state_workspace():
+    """A Mamba2 tree verify replays a branch's ancestors, so no node states are planned."""
+    chain = _super_cache_recipe(1, torch.float8_e4m3fn, draft_tokens=8)
+    tree = _super_cache_recipe(1, torch.float8_e4m3fn, draft_tokens=8, topk=2)
+    assert tree.draft_tree and tree.replay_ssm
+    assert tree.setup().fixed_workspace_bytes == chain.setup().fixed_workspace_bytes
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -959,11 +972,15 @@ def test_mamba2_verify_scan_continues_each_request_from_its_committed_state(repl
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype):
+@pytest.mark.parametrize("tree", [False, True])
+def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype, tree):
     """Verify then commit through the backend: replayed pages equal the staged ones."""
     from test.runtime.test_gdn_state_paging import _ContractPool
 
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeVerifyInputs,
+    )
 
     heads, head_dim, groups, d_state, steps, batch = 8, 64, 2, 128, 3, 2
     key_dim, value_dim = groups * d_state, heads * head_dim
@@ -982,11 +999,29 @@ def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype):
     for name in ("mixed_qkv", "conv_weights", "a"):
         inputs[name] = inputs[name].bfloat16()
     tables = torch.tensor([[1, 5], [2, 6]], dtype=torch.int32, device="cuda")
+    parents = torch.tensor([[-1, 0, 0], [-1, 0, 1]], dtype=torch.int32, device="cuda")
+    # Request 0 accepts the branch 0 -> 2; request 1 the whole chain 0 -> 1 -> 2.
+    path = torch.tensor([[0, 2, -1], [0, 1, 2]], dtype=torch.int32, device="cuda")
+    accepted = torch.tensor([2, 3] if tree else [1, 3], dtype=torch.int32)
     outputs, pools = [], []
     for replay in (True, False):
         backend = _backend(
-            heads, head_dim, groups, d_state, verify_width=steps, replay_ssm=replay
+            heads,
+            head_dim,
+            groups,
+            d_state,
+            verify_width=steps,
+            replay_ssm=replay,
+            draft_tree=tree,
         )
+        if tree:
+            backend.bind_tree_verify(
+                TreeVerifyInputs(
+                    torch.zeros(batch * steps, dtype=torch.int64, device="cuda"),
+                    steps,
+                    parent=parents,
+                )
+            )
         pool = _ContractPool(
             4,
             {0: ("linear_attention", conv.bfloat16(), ssm.to(state_dtype))},
@@ -1029,8 +1064,11 @@ def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype):
             )
         )
         backend.commit_verified_state(
-            torch.tensor([1, 3], dtype=torch.int32, device="cuda"), accepted_path=None
+            accepted.cuda(), accepted_path=path if tree else None
         )
+        if tree:
+            # Branches replay their ancestors; no node-state workspace exists.
+            assert backend._tree_node_states is None
         pools.append(pool)
     torch.cuda.synchronize()
 

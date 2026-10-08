@@ -440,6 +440,10 @@ class RequestHandler:
                     )
                 else:
                     self._pending_weight_ops.append(recv_req)
+            # The in-engine RL control app refuses these two sources up front
+            # (SUPPORTED_WEIGHT_UPDATE_SOURCES in io_struct, also advertised to
+            # gateways as rl.update_from); keep that set in step with the load
+            # branches above.
             elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
                 self.send_func.send_pyobj(
                     UpdateWeightsFromTensorReqOutput(

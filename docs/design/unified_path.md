@@ -161,16 +161,32 @@ from one first bound to that pool:
   a reserve takes it -- minus the projection. The reserve covers the bytes
   inside the capture windows as projected -- what a boot without a probe
   captures there, one-time bytes the first captures take included; the
-  probe releases them and the serving capture pays them again. The
+  probe releases them and the serving capture pays them again. On CUDA, what
+  executor init and kernel tuning keep resident between the probe build and
+  the probe -- buffers, and on a cold tuning cache the kernels of every tactic
+  tried, though not the stack limit they raised, which is restored after
+  tuning -- is measured the same way, including the free space a kept block
+  pins in an allocator segment, and this startup residue joins each rank's
+  projection before the MAX; its net is floored at zero. Off CUDA it stays on
+  the headroom, as on a boot without a reserve; on ROCm, ROCr keeps the
+  scratch memory tuning grows assigned to its queues, and reclaims it when a
+  device allocation fails. The
   utilization headroom covers everything else: activations, fragmentation,
-  the warmups and workspaces a capture allocates around its windows, and any
-  shortfall of the projection, as it covers every graph on a boot without a
+  the warmups and workspaces a capture allocates around its windows, the
+  local memory a kept kernel reserves when it raises the stack limit again
+  after tuning (a driver allocation that first drains the device, and the
+  launch fails if it does not fit), and any shortfall of the projection, as
+  it covers every graph and all of startup on a boot without a
   reserve. Profiling again after the probe would charge the cache a second
-  time for what tuning and the probe left allocated. The deltas read the
+  time for what startup and the probe left allocated. The deltas read the
   whole device, so the probe assumes no other process allocates on it during
   startup. Not covered: a ladder every one of whose sampled marginals was
   served from slack, which is priced at nothing and says so in the
-  log.
+  log; and what the probe build allocates after its profile, such as
+  attention backend workspaces, which the headroom funds.
+  The EPD receive pool, which a multimodal prefill node allocates after
+  its cache is sized, is left out of the profile instead, by each rank before
+  the cross-rank minimum.
 
 ### Padding contract
 
@@ -1196,13 +1212,16 @@ extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
 
-## Experimental KDA prefill subgraphs
+## Recurrent prefill subgraphs (KDA, Mamba2)
 
-### Capturing KDA in the outer graph
+### Capturing recurrent layers in the outer graph
 
+`CapacityPrefillBackend` (`state/prefill_capacity.py`) owns this contract for
+KDA and Mamba2; each subclass only states which forwards it admits and whether
+uncaptured shapes also run the capacity layout. GDN does not capture its layers.
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture and replay. This consumer-stream seam builds or
-refreshes `KdaPrefillMetadata` with the selected token and request capacities.
+refreshes `CapacityPrefillMetadata` with the selected token and request capacities.
 Eager execution uses the live count; replay may round up to a captured count.
 The same metadata contract controls scan capacity, checkpoint packing and
 output restoration in every case; there is no temporary metadata binding or
@@ -1212,6 +1231,15 @@ Whether a shape can be captured is also asked on its own, through
 `admits_prefill_graph`, which reads no forward context and writes nothing; the
 seam must return the same answer, and startup capture raises when a backend
 admits a shape and then refuses to prepare it.
+
+Mamba2 keeps the scheduler metadata for uncaptured shapes: its chunk plans
+need only live bounds, so the capacity layout would only add packing to eager
+forwards. A retained shape owns one persistent chunk plan per scan (body and
+tail), sized `extent // chunk_size + sequences` and padded with empty chunks;
+the preparation seam rewrites both in place, in one pinned upload, before each
+use. Mamba2 chunks align to the packed token axis, so when one-token dummy tails
+shift a later request's tail, a multi-request capture matches eager within
+rounding rather than bit for bit; a one-request capture matches exactly.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels and post-attention compute together.
@@ -1311,8 +1339,9 @@ orchestrator.
 
 ### Fixed-capacity execution metadata
 
-The private KDA metadata overrides only the packed execution extent; real
-host lengths and GPU boundaries still agree. An explicit
+The capacity metadata overrides only the packed execution extent; real
+host lengths and GPU boundaries still agree. Its `PrefillCapacity` validates
+the packed bounds it builds. For KDA, an explicit
 `KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths:
 each sequence may fill the bucket, but their combined tokens must also fit it.
 The CuTeDSL adapter alone converts this descriptor to native planning bounds.

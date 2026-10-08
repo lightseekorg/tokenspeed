@@ -356,6 +356,56 @@ class GroupTableStacksTest(unittest.TestCase):
             stacks.decode_locations(FULL, 1, 3)
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_fill_and_extend_compile_once_across_batches(self):
+        """Raw tables arrive as row slices at any offset and long extends size a
+        fresh span per batch; neither may key a new binary."""
+        from unittest.mock import patch
+
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+            _unpack_group_kernel,
+        )
+        from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
+            _extend_locs_kernel,
+        )
+
+        base = torch.tensor(
+            [[5, 6, 1], [9, 0, 2], [3, 4, 1], [7, 8, 9], [1, 2, 3]], dtype=torch.int32
+        )
+        cpu, gpu = self._stacks(), self._stacks(device="cuda")
+
+        def run(rows, offset, extend):
+            results = []
+            for stacks, table in ((cpu, base), (gpu, base.cuda())):
+                raw = table[offset : offset + rows]
+                stacks.fill(rows, rows, {FULL: raw, SWA: raw})
+                lens = torch.full((rows,), extend, dtype=torch.int32)
+                locs = stacks.extend_locations(
+                    torch.zeros_like(lens).to(table.device),
+                    lens.to(table.device),
+                    rows * extend,
+                )
+                results.append(
+                    [
+                        stacks.tables[:, :rows].cpu(),
+                        *(locs[g].cpu() for g in (FULL, SWA)),
+                    ]
+                )
+            for want, got in zip(*results):
+                self.assertTrue(torch.equal(want, got))
+
+        # Spans past max_extend_tokens (16) take a fresh tensor strided by the total.
+        run(2, 0, 9)
+        kernels = (_unpack_group_kernel, _extend_locs_kernel)
+        with patch.object(
+            kernels[0], "_do_compile", wraps=kernels[0]._do_compile
+        ) as unpack, patch.object(
+            kernels[1], "_do_compile", wraps=kernels[1]._do_compile
+        ) as extend:
+            for rows, offset, length in ((1, 1, 1), (2, 1, 9), (4, 0, 8), (3, 1, 11)):
+                run(rows, offset, length)
+        self.assertEqual((unpack.call_count, extend.call_count), (0, 0))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_cuda_fill_matches_torch_reference(self):
         torch.manual_seed(1)
         stacks_cuda = self._stacks("cuda", max_bs=8)

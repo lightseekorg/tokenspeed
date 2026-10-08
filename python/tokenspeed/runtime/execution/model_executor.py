@@ -45,6 +45,12 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.scheduler_utils import engram_context_len
+from tokenspeed.runtime.execution.accept_simulation import (
+    ACCEPT_LENGTH_SCALE,
+    parse_simulated_accept_length,
+    simulated_accept_lengths,
+    simulated_output_tokens,
+)
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
@@ -585,6 +591,18 @@ class ModelExecutor:
             )
         else:
             self.drafter = None
+        self._simulated_accept_length = parse_simulated_accept_length(
+            envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
+            spec_algorithm=config.spec_algo,
+            verify_width=config.output_length,
+            draft_tree=config.spec_topk > 1,
+        )
+        if self._simulated_accept_length is not None:
+            logger.info(
+                "Simulating speculative acceptance: every verify step keeps "
+                f"{self._simulated_accept_length / ACCEPT_LENGTH_SCALE:g} tokens "
+                f"per request on average, of up to {config.output_length:d}"
+            )
 
         self.tree_spec: TreeSpec | None = None
         if config.spec_topk > 1:
@@ -1278,6 +1296,44 @@ class ModelExecutor:
             )
         return kwargs
 
+    def _finish_decode_verify(
+        self,
+        output_tokens: torch.Tensor,
+        accept_lengths: torch.Tensor,
+        candidates: torch.Tensor,
+        row_offset: int,
+        decode_input_ids: list[int] | None,
+    ) -> torch.Tensor:
+        """Settle the widths decode rows keep, and under simulated acceptance
+        the tokens that match them.
+
+        Simulated widths and tokens are written in place, which keeps the
+        packed output D2H path. Rows forced to a single-token verify keep
+        one token either way.
+        """
+        rows = accept_lengths.shape[0]
+        scaled_length = self._simulated_accept_length
+        if scaled_length is None or rows == 0:
+            return self._apply_force_single_token_verify(
+                accept_lengths, row_offset, rows, decode_input_ids
+            )
+        pool_indices = self.input_buffers.req_pool_indices_buf[
+            row_offset : row_offset + rows
+        ]
+        cache_lengths = self.runtime_states.valid_cache_lengths.index_select(
+            0, pool_indices
+        )
+        kept = self._apply_force_single_token_verify(
+            simulated_accept_lengths(cache_lengths, scaled_length),
+            row_offset,
+            rows,
+            decode_input_ids,
+        )
+        tokens = output_tokens.view(rows, -1)
+        tokens.copy_(simulated_output_tokens(tokens, candidates, accept_lengths, kept))
+        accept_lengths.copy_(kept)
+        return accept_lengths
+
     def _apply_force_single_token_verify(
         self,
         accept_lengths: torch.Tensor,
@@ -1348,8 +1404,8 @@ class ModelExecutor:
                     )
                 ),
             )
-            accept_lengths = self._apply_force_single_token_verify(
-                accept_lengths, 0, num_decodes, ctx.decode_input_ids
+            accept_lengths = self._finish_decode_verify(
+                output_tokens, accept_lengths, candidates, 0, ctx.decode_input_ids
             )
             return output_tokens, accept_lengths
 
@@ -1401,8 +1457,8 @@ class ModelExecutor:
                 candidates,
                 tree=None,
             )
-            lengths = self._apply_force_single_token_verify(
-                lengths, num_extends, num_decodes, ctx.decode_input_ids
+            lengths = self._finish_decode_verify(
+                tokens, lengths, candidates, num_extends, ctx.decode_input_ids
             )
             token_parts.append(tokens)
             length_parts.append(lengths)

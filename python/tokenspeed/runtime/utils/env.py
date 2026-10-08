@@ -343,6 +343,13 @@ class Envs:
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
+    # "uniform" routes each token to a fixed random set of experts, so dummy
+    # weights spread MoE traffic like a trained router does.
+    TOKENSPEED_MOE_ROUTING_SIMULATION = EnvStr("")
+    # Tokens per request each speculative verify step keeps, on average, in
+    # place of what verification accepted. A raw string so malformed input
+    # fails at startup instead of silently turning the simulation off.
+    TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN = EnvStr("")
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)

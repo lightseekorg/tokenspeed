@@ -34,6 +34,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (  # noqa: E402
     HybridLinearAttnBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (  # noqa: E402
+    CacheGroupGeometry,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.mha import (  # noqa: E402
     MHAAttnBackend,
 )
@@ -66,9 +69,13 @@ def _trtllm(kv_cache_dtype=torch.bfloat16):
     return leaf
 
 
-def _router(*leaves):
+def _router(*leaves, retention="full_history", entry_stride=1):
     router = object.__new__(CacheGroupRouter)
-    router.leaves = {gid: leaf for gid, leaf in enumerate(leaves)}
+    router.leaves = {str(gid): leaf for gid, leaf in enumerate(leaves)}
+    router._geometry = CacheGroupGeometry(
+        row_geometry={gid: (64, entry_stride) for gid in router.leaves},
+        retentions={gid: (retention, None) for gid in router.leaves},
+    )
     return router
 
 
@@ -85,8 +92,15 @@ def _hybrid(full, linear):
     return hybrid
 
 
-def test_trtllm_router_supports_verify_and_lanes():
-    resolve_tree_support(_router(_trtllm()), _router(_trtllm()))
+@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_trtllm_router_supports_verify_and_lanes(kv_cache_dtype):
+    resolve_tree_support(
+        _router(_trtllm(kv_cache_dtype)), _router(_trtllm(kv_cache_dtype))
+    )
+
+
+def test_full_history_cache_groups_verify_and_draft_trees():
+    resolve_tree_support(_router(_trtllm(), _trtllm()), _router(_trtllm(), _trtllm()))
 
 
 def test_gdn_target_verifies_trees():
@@ -99,6 +113,14 @@ def test_replay_ssm_target_verifies_trees():
     )
 
 
+@pytest.mark.parametrize("replay_ssm", [False, True])
+def test_mamba2_target_verifies_trees(replay_ssm):
+    resolve_tree_support(
+        _hybrid(_router(_trtllm()), _mamba(Mamba2AttnBackend, replay_ssm)),
+        _router(_trtllm()),
+    )
+
+
 def test_draft_with_linear_layers_is_refused():
     with pytest.raises(NotImplementedError, match="draft: .*linear-attention"):
         resolve_tree_support(_router(_trtllm()), _hybrid(_router(_trtllm()), _mamba()))
@@ -108,10 +130,16 @@ def test_draft_with_linear_layers_is_refused():
     "target, blocker",
     [
         (lambda: _router(MHAAttnBackend.__new__(MHAAttnBackend)), "MHAAttnBackend"),
-        (lambda: _router(_trtllm(torch.float8_e4m3fn)), "kv_cache_dtype"),
-        (lambda: _router(_trtllm(), _trtllm()), "one cache group"),
+        (lambda: _router(_trtllm(torch.float8_e5m2)), "kv_cache_dtype"),
+        (
+            lambda: _router(_trtllm(), _trtllm(), retention="sliding_window"),
+            "one row per token; 0, 1 slide",
+        ),
+        (
+            lambda: _router(_trtllm(), entry_stride=4),
+            "one row per token; 0 slide or pack",
+        ),
         (lambda: _hybrid(_router(_trtllm()), _mamba(KdaAttnBackend)), "KDA"),
-        (lambda: _hybrid(_router(_trtllm()), _mamba(Mamba2AttnBackend)), "Mamba2"),
     ],
 )
 def test_unsupported_target_nodes_are_named(target, blocker):
@@ -122,7 +150,7 @@ def test_unsupported_target_nodes_are_named(target, blocker):
 def test_every_blocker_is_reported_at_once():
     with pytest.raises(NotImplementedError) as err:
         resolve_tree_support(
-            _router(_trtllm(torch.float8_e4m3fn)),
+            _router(_trtllm(torch.float8_e5m2)),
             _hybrid(_router(_trtllm()), _mamba()),
         )
     assert "verify: " in str(err.value) and "draft: " in str(err.value)

@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_mtp,
     gdn_decode_step,
     gdn_replay_commit,
+    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CAUSAL_CONV1D_BLOCK_M,
@@ -462,6 +463,9 @@ class MambaAttnBackend(AttentionBackend):
         self._gdn_replay: _GDNReplayWorkspace | None = None
         # ReplaySSM tree verify: node states shared by all layers; payload addresses for the commit.
         self.draft_tree = linear_attn is not None and bool(linear_attn.draft_tree)
+        self._tree_node_state_workspace = (
+            linear_attn is not None and linear_attn.tree_node_state_workspace
+        )
         self._tree_node_states: torch.Tensor | None = None
         self._replay_payload_addresses: torch.Tensor | None = None
         self._replay_payload_rows: torch.Tensor | None = None
@@ -762,12 +766,17 @@ class MambaAttnBackend(AttentionBackend):
                     ),
                     state_dtype=ssm.dtype,
                 )
-            if self.draft_tree:
+            if (
+                self.draft_tree
+                and self._tree_node_state_workspace
+                and gdn_tree_verify_needs_node_states(draft_token_num)
+            ):
                 self._tree_node_states = torch.zeros(
                     (max_bs, draft_token_num, *ssm.shape[1:]),
                     dtype=ssm.dtype,
                     device=ssm.device,
                 )
+            if self.draft_tree:
                 payload = self._gdn_replay.payload
                 self._replay_payload_addresses = torch.tensor(
                     [payload[i].data_ptr() for i in range(payload.shape[0])],
@@ -908,13 +917,18 @@ class MambaAttnBackend(AttentionBackend):
         continue from its parent's scratch row; commit reads the accepted path."""
         if self.replay_ssm and not self.draft_tree:
             raise RuntimeError(
-                "ReplaySSM draft-tree verify needs the node-state workspace the GDN "
-                "recipe plans for draft trees (LinearAttnConfig.draft_tree)"
+                "ReplaySSM draft-tree verify needs the draft-tree workspaces the "
+                "cache recipe plans (LinearAttnConfig.draft_tree)"
             )
         self.tree_verify = inputs
 
     def _tree_parents(self, bs: int) -> torch.Tensor | None:
         return None if self.tree_verify is None else self.tree_verify.parent[:bs]
+
+    def _tree_ancestors(self, bs: int) -> torch.Tensor | None:
+        if self.tree_verify is None:
+            return None
+        return self.tree_verify.mask.view(-1, self.tree_verify.num_nodes)[:bs]
 
     def _verify_scratch_grid(self, bs: int, draft_token_num: int) -> torch.Tensor:
         """Scratch row grid ``[bs, draft_token_num]``: row ``req*(T+1)`` is
@@ -2537,7 +2551,7 @@ class MambaAttnBackend(AttentionBackend):
             initial_state = ssm_comp
             initial_indices = state_in_blocks[:batch_size]
             output_state_indices = None
-            if self.tree_verify is not None:
+            if self._tree_node_states is not None:
                 intermediate_states = self._tree_node_states[:batch_size]
         else:
             initial_state = ssm_scratch
@@ -2567,7 +2581,7 @@ class MambaAttnBackend(AttentionBackend):
             use_qk_l2norm=True,
             output_state_indices=mtp_output_indices,
             intermediate_states_buffer=intermediate_states,
-            parent_indices=self._tree_parents(batch_size),
+            tree_ancestors=self._tree_ancestors(batch_size),
             disable_state_update=self.replay_ssm,
             solution=mtp_solution,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)

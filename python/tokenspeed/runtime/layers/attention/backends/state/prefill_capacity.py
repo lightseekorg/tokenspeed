@@ -18,9 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Capacity-shaped KDA execution metadata shared by eager and CUDA graphs."""
+"""Capacity-shaped recurrent prefill metadata shared by eager and CUDA graphs."""
 
+from __future__ import annotations
+
+from abc import abstractmethod
 from dataclasses import dataclass, fields, is_dataclass, replace
+from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.gdn.triton import (
@@ -28,18 +32,54 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     build_causal_conv1d_capacity_metadata,
     refresh_causal_conv1d_capacity_metadata,
 )
-from tokenspeed_kernel.ops.attention.kda import KdaPrefillCapacity
 
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+    MambaAttnBackend,
     MambaForwardMetadata,
     _PrefillCheckpointBatch,
 )
 from tokenspeed.runtime.utils.tensor import upload_packed
 
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        AttnConfig,
+        SoftmaxAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+
+
+@dataclass(frozen=True)
+class PrefillCapacity:
+    """Token rows and request slots one prefill shape reserves.
+
+    Each request may use up to ``token_capacity`` rows, but their combined
+    live lengths must fit it too.
+    """
+
+    token_capacity: int
+    num_sequences: int
+
+    def __post_init__(self):
+        if self.token_capacity <= 0 or self.num_sequences <= 0:
+            raise ValueError("prefill capacities must be positive")
+
+    def validate(self, live_boundaries: torch.Tensor, tokens: int) -> None:
+        """Admit host boundaries of positive packed sequences that fit, without a D2H."""
+        if tokens != self.token_capacity:
+            raise ValueError("input extent differs from the token capacity")
+        if live_boundaries.numel() != self.num_sequences + 1:
+            raise ValueError("sequence count differs from the live boundaries")
+        lengths = live_boundaries[1:] - live_boundaries[:-1]
+        if live_boundaries[0].item() != 0 or (lengths <= 0).any().item():
+            raise ValueError("capacity prefill requires positive packed sequences")
+        if live_boundaries[-1].item() > self.token_capacity:
+            raise ValueError("live tokens exceed the token capacity")
+
 
 @dataclass(kw_only=True)
-class KdaPrefillMetadata(MambaForwardMetadata):
-    capacity: KdaPrefillCapacity
+class CapacityPrefillMetadata(MambaForwardMetadata):
+    capacity: PrefillCapacity
 
     @property
     def prefill_token_extent(self) -> int:
@@ -92,7 +132,7 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity, num_sequences):
     lengths = source.extend_seq_lens_cpu
     padding = num_sequences - lengths.numel()
     if padding < 0:
-        raise ValueError("KDA live request count exceeds capture capacity")
+        raise ValueError("live request count exceeds the captured capacity")
     live = source.prefill_checkpoint_batch
     body_lengths = lengths if live is None else live.body_seq_lens_cpu
     tail_lengths = lengths - body_lengths
@@ -109,8 +149,8 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity, num_sequences):
     body_slots = torch.cat((body_lengths, body_lengths.new_ones(padding)))
     tail_slots = torch.cat((slot_lengths, slot_lengths.new_ones(padding)))
     body_bounds, tail_bounds = bounds(body_slots), bounds(tail_slots)
-    KdaPrefillCapacity(bucket, rows.numel()).validate(body_bounds, bucket)
-    KdaPrefillCapacity(tail_capacity, rows.numel()).validate(tail_bounds, tail_capacity)
+    PrefillCapacity(bucket, rows.numel()).validate(body_bounds, bucket)
+    PrefillCapacity(tail_capacity, rows.numel()).validate(tail_bounds, tail_capacity)
 
     def indices(sequence_starts, sequence_lengths, capacity):
         offsets = torch.arange(int(sequence_lengths.sum()), dtype=torch.int64)
@@ -193,7 +233,7 @@ def _refresh_checkpoint_destinations(target, source):
     old = target.state_checkpoint_blocks_by_group
     new = source.state_checkpoint_blocks_by_group
     if new is not None and old.keys() != new.keys():
-        raise RuntimeError("KDA graph state groups changed without pool rebind")
+        raise RuntimeError("graph state groups changed without pool rebind")
     inactive = target.prefill_checkpoint_batch.state_update_rows < 0
     for group, indices in old.items():
         if new is None:
@@ -203,7 +243,7 @@ def _refresh_checkpoint_destinations(target, source):
                 indices.numel() < new[group].numel()
                 or indices.dtype != new[group].dtype
             ):
-                raise RuntimeError("KDA graph state index geometry changed")
+                raise RuntimeError("graph state index geometry changed")
             indices[: new[group].numel()].copy_(new[group])
             indices[new[group].numel() :].fill_(-1)
             indices.masked_fill_(inactive, -1)
@@ -215,10 +255,10 @@ def _capacity_metadata(source, bucket, tail_capacity):
     Eager and captured forwards reserve the same checkpoint/tail slots.
     Startup capture retains the snapshot; uncaptured shapes do not retain it.
     """
-    capacity = KdaPrefillCapacity(bucket, source.extend_seq_lens_cpu.numel())
+    capacity = PrefillCapacity(bucket, source.extend_seq_lens_cpu.numel())
     capacity.validate(source.cu_extend_seq_lens_cpu, bucket)
     cloned = _clone_metadata(source)
-    result = KdaPrefillMetadata(
+    result = CapacityPrefillMetadata(
         **{
             field.name: getattr(cloned, field.name)
             for field in fields(MambaForwardMetadata)
@@ -264,7 +304,9 @@ def _clone_metadata(value):
     return value
 
 
-def prepare_kda_prefill_metadata(source, token_capacity, prefix_granularity, target):
+def prepare_capacity_prefill_metadata(
+    source, token_capacity, prefix_granularity, target
+):
     """Prepare one execution shape, optionally refreshing retained storage.
 
     ``source`` is the scheduler-derived metadata for this forward. Fresh
@@ -273,7 +315,7 @@ def prepare_kda_prefill_metadata(source, token_capacity, prefix_granularity, tar
     while each native scan packs one masked dummy token per slot. ``target`` is
     either a startup-retained view for that shape or None for fresh per-forward storage.
     No request state is allocated here. Returns the metadata consumed by every
-    KDA layer, without a temporary backend binding or an execution-mode flag.
+    recurrent layer, without a temporary backend binding or an execution-mode flag.
     """
     if target is None:
         tail_capacity = min(
@@ -282,7 +324,7 @@ def prepare_kda_prefill_metadata(source, token_capacity, prefix_granularity, tar
         )
         return _capacity_metadata(source, token_capacity, tail_capacity)
     if target.capacity.token_capacity != token_capacity:
-        raise ValueError("KDA metadata token capacity changed")
+        raise ValueError("prefill metadata token capacity changed")
     _refresh_capacity_metadata(target, source)
     return target
 
@@ -298,7 +340,7 @@ def _refresh_capacity_metadata(target, source):
     """
     actual_bs = source.extend_seq_lens_cpu.numel()
     capacity = target.capacity
-    KdaPrefillCapacity(capacity.token_capacity, actual_bs).validate(
+    PrefillCapacity(capacity.token_capacity, actual_bs).validate(
         source.cu_extend_seq_lens_cpu, capacity.token_capacity
     )
     padding = capacity.num_sequences - actual_bs
@@ -306,7 +348,7 @@ def _refresh_capacity_metadata(target, source):
         padding < 0
         or int(source.cu_extend_seq_lens_cpu[-1]) + padding > capacity.token_capacity
     ):
-        raise ValueError("KDA padded requests exceed capture capacity")
+        raise ValueError("padded requests exceed the captured capacity")
     for name in (
         "query_start_loc",
         "scan_query_start_loc",
@@ -350,12 +392,103 @@ def _refresh_capacity_metadata(target, source):
         if old is None and new is None:
             continue
         if old.keys() != new.keys():
-            raise RuntimeError("KDA graph state groups changed without pool rebind")
+            raise RuntimeError("graph state groups changed without pool rebind")
         for group, indices in old.items():
             if (
                 indices.numel() < new[group].numel()
                 or indices.dtype != new[group].dtype
             ):
-                raise RuntimeError("KDA graph state index geometry changed")
+                raise RuntimeError("graph state index geometry changed")
             indices[: new[group].numel()].copy_(new[group])
             indices[new[group].numel() :].fill_(-1)
+
+
+class CapacityPrefillBackend(MambaAttnBackend):
+    """A recurrent backend whose layers a prefill graph can capture inline.
+
+    Startup capture retains one capacity metadata per (tokens, requests) shape;
+    each later forward of that shape refreshes it in place before replay. A
+    subclass decides which forwards it admits and whether uncaptured shapes
+    also run on the capacity layout.
+    """
+
+    # Whether eager forwards of uncaptured shapes also run the capacity layout.
+    _capacity_layout_when_uncaptured: bool
+
+    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
+        super().__init__(config, spec)
+        self._prefill_metadata: dict[tuple[int, int], CapacityPrefillMetadata] = {}
+        self._prefill_metadata_pool: CachePool | None = None
+
+    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
+        # The orchestrator releases old graphs first; these are execution buffers, not state pages.
+        self._reset_prefill_metadata()
+
+    def _reset_prefill_metadata(self) -> None:
+        self._prefill_metadata.clear()
+        self._prefill_metadata_pool = None
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self._reset_prefill_metadata()
+
+    @property
+    def prefill_metadata_is_capture_ready(self) -> bool:
+        metadata = self.forward_metadata
+        return (
+            isinstance(metadata, CapacityPrefillMetadata)
+            and self._prefill_metadata.get(
+                (metadata.capacity.token_capacity, metadata.capacity.num_sequences)
+            )
+            is metadata
+        )
+
+    @abstractmethod
+    def _admits_capacity_prefill(self) -> bool:
+        """Whether this backend's configuration can run capacity prefills."""
+
+    def admits_prefill_graph(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode
+    ) -> bool:
+        return (
+            self._admits_capacity_prefill()
+            and self.step_counter is None
+            and forward_mode.is_extend()
+        )
+
+    def prepare_prefill_metadata(
+        self, token_capacity: int, bs: int, forward_mode: ForwardMode, *, capture: bool
+    ) -> bool:
+        if not self.admits_prefill_graph(token_capacity, bs, forward_mode):
+            return False
+        if (
+            self._prefill_metadata_pool is not None
+            and self._prefill_metadata_pool is not self.cache_pool
+        ):
+            raise RuntimeError("cache pool changed without graph release/recapture")
+        source = self.forward_metadata
+        key = (token_capacity, bs)
+        retained = self._prefill_metadata.get(key)
+        if (
+            retained is None
+            and not capture
+            and not self._capacity_layout_when_uncaptured
+        ):
+            return True
+        actual_bs = source.extend_seq_lens_cpu.numel()
+        if actual_bs > bs or (actual_bs != bs and (capture or retained is None)):
+            raise ValueError("request padding requires an existing captured capacity")
+        target = prepare_capacity_prefill_metadata(
+            source, token_capacity, self._prefix_granularity, retained
+        )
+        if capture:
+            # Only startup grows retained storage; serving never captures.
+            self._prefill_metadata[key] = target
+            self._prefill_metadata_pool = self.cache_pool
+        if self._prefill_metadata.get(key) is target:
+            self._refresh_captured_prefill(target)
+        self.forward_metadata = target
+        return True
+
+    def _refresh_captured_prefill(self, metadata: CapacityPrefillMetadata) -> None:
+        """Refresh backend-owned buffers a retained shape's graphs read, before each use."""

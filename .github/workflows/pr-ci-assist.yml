@@ -1,0 +1,191 @@
+name: PR CI Assist
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_run:
+    workflows: [PR CI Plan, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
+    types: [completed]
+    branches-ignore: [main]
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR whose existing authorized watch/fix should be reconciled"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    if: >-
+      github.repository == 'lightseekorg/tokenspeed' &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.pull_request &&
+        contains(github.event.comment.body, '@lightseek-bot') &&
+        (contains(github.event.comment.body, 'watch') ||
+         contains(github.event.comment.body, 'fix')))) &&
+      (github.event_name != 'workflow_run' ||
+       github.event.workflow_run.event == 'pull_request' ||
+       github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      pr: ${{ steps.resolve.outputs.pr }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+        run: python3 .github/scripts/pr_ci_assist.py resolve
+
+  control:
+    needs: resolve
+    if: needs.resolve.outputs.pr != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: pr-ci-assist-${{ needs.resolve.outputs.pr }}
+      cancel-in-progress: false
+    outputs:
+      repair: ${{ steps.control.outputs.repair }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - run: python3 -m pip install pyyaml
+      - id: control
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          PR_NUMBER: ${{ needs.resolve.outputs.pr }}
+          TOKENSPEED_B200_RUNNER_LABEL: b200v2
+        run: python3 .github/scripts/pr_ci_assist.py control --pr "$PR_NUMBER"
+      - if: steps.control.outputs.repair == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-request
+          path: ${{ runner.temp }}/pr-ci-assist/request.json
+          retention-days: 1
+
+  repair:
+    needs: control
+    if: needs.control.outputs.repair == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: repair-request
+          path: ${{ runner.temp }}/pr-ci-assist
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: npm install --global @moonshot-ai/kimi-code@2.1.1
+      - run: python3 -m pip install pyyaml
+      - name: Prepare provider configuration
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          KIMI_CODE_HOME: ${{ runner.temp }}/ci-assist-home
+        run: python3 .github/scripts/pr_ci_repair.py configure
+      - name: Prepare source repair
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          KIMI_CODE_HOME: ${{ runner.temp }}/ci-assist-home
+        run: python3 .github/scripts/pr_ci_repair.py model
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repair-patch
+          path: |
+            ${{ runner.temp }}/pr-ci-assist/request.json
+            ${{ runner.temp }}/pr-ci-assist/patch.diff
+          retention-days: 1
+
+  check:
+    needs: repair
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: repair-patch
+          path: ${{ runner.temp }}/pr-ci-assist
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install pre-commit pyyaml
+      - name: Check repair without publishing credentials
+        run: python3 .github/scripts/pr_ci_repair.py check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checked-repair
+          path: |
+            ${{ runner.temp }}/pr-ci-assist/request.json
+            ${{ runner.temp }}/pr-ci-assist/patch.diff
+            ${{ runner.temp }}/pr-ci-assist/checked.json
+          retention-days: 1
+
+  stage:
+    needs: [resolve, control, check]
+    if: needs.check.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: pr-ci-assist-${{ needs.resolve.outputs.pr }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: checked-repair
+          path: ${{ runner.temp }}/pr-ci-assist
+      - run: python3 -m pip install pyyaml
+      - env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          TOKENSPEED_B200_RUNNER_LABEL: b200v2
+        run: python3 .github/scripts/pr_ci_repair.py stage
+
+  failed:
+    needs: [resolve, control, repair, check, stage]
+    if: >-
+      always() && needs.control.outputs.repair == 'true'
+      && (needs.repair.result == 'failure' || needs.repair.result == 'cancelled'
+          || needs.check.result == 'failure' || needs.check.result == 'cancelled'
+          || needs.stage.result == 'failure' || needs.stage.result == 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: pr-ci-assist-${{ needs.resolve.outputs.pr }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: repair-request
+          path: ${{ runner.temp }}/pr-ci-assist
+      - env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+        run: python3 .github/scripts/pr_ci_repair.py failed

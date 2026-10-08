@@ -2793,6 +2793,10 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
     def get_hot_token_id(self):
         return self.hot_token_id
 
+    def mark_embedding_initialized(self) -> None:
+        """Count the embedding as loaded, as when dummy weights fill it."""
+        self._embed_loaded_from_checkpoint = True
+
     def set_embed_and_head(self, embed, head):
         if (
             hasattr(self.config, "target_hidden_size")

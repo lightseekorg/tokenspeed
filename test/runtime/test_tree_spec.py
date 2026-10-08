@@ -26,7 +26,10 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
-from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
+from tokenspeed.runtime.layers.attention.backends.paged.router import (
+    CacheGroupRouter,
+    RouterDecodeWriteLocations,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeVerifyInputs,
 )
@@ -86,8 +89,10 @@ def test_fresh_spec_is_the_chain(nodes):
     assert torch.equal(spec.mask_buf, fresh[1])
 
 
-def test_router_compacts_aliased_layer_buffers_once_and_follows_the_pool():
-    """Layers aliasing one K region move it once; a new pool gets its own table."""
+def test_router_compacts_each_group_at_its_window_and_follows_the_pool():
+    """Each cache group moves rows at its own window, also in a region another
+    group shares (disjoint pages); layers aliasing one K region within a group
+    move it once; a new pool gets its own tables."""
     nodes, bs, slots = 4, 2, 32
     router = CacheGroupRouter(
         None,
@@ -103,32 +108,51 @@ def test_router_compacts_aliased_layer_buffers_once_and_follows_the_pool():
             torch.zeros(bs, nodes, dtype=torch.int32, device="cuda"),
         )
     )
-    locations = torch.tensor([3, 4, 5, 6, 20, 21, 22, 23], dtype=torch.int32).cuda()
-    router.decode_window_locations = lambda: locations
+    locations = {
+        "a": torch.tensor([3, 4, 5, 6, 20, 21, 22, 23], dtype=torch.int32).cuda(),
+        "b": torch.tensor([8, 9, 10, 11, 12, 13, 14, 15], dtype=torch.int32).cuda(),
+    }
+    # The groups this router serves; compaction reads only their names.
+    router.leaves = dict.fromkeys(locations)
+    router.decode_write_locations = RouterDecodeWriteLocations(
+        tokens_per_req=nodes, by_group=locations
+    )
     path = torch.tensor([[0, 2, 3, -1], [0, 1, 3, -1]], dtype=torch.int32).cuda()
 
     def pool():
         k0, v0, v1 = (torch.randn(slots, 2, 8, device="cuda") for _ in range(3))
-        buffers = {0: (k0, v0), 1: (k0, v1)}  # layer 1's K aliases layer 0's
+        buffers = {
+            0: (k0, v0),
+            1: (k0, v1),  # layer 1's K aliases layer 0's
+            2: (k0, v1),  # group b shares group a's regions
+        }
         return buffers, SimpleNamespace(
-            history_group_by_layer=lambda: {0: "full", 1: "full"},
+            history_group_by_layer=lambda: {0: "a", 1: "a", 2: "b"},
             get_kv_buffer=buffers.__getitem__,
         )
 
-    def compacted(buf):
+    def compacted(buf, windows):
         want = buf.clone()
-        for b in range(bs):
-            for depth, row in enumerate(path[b].tolist()):
-                if row >= 0:
-                    want[locations[b * nodes + depth]] = buf[locations[b * nodes + row]]
+        for window in windows:
+            for b in range(bs):
+                for depth, row in enumerate(path[b].tolist()):
+                    if row >= 0:
+                        want[window[b * nodes + depth]] = buf[window[b * nodes + row]]
         return want
 
     for _ in range(2):
         buffers, cache_pool = pool()
         router.cache_pool = cache_pool
         router._bind_tree_window_rows()
-        regions = [buffers[0][0], buffers[0][1], buffers[1][1]]
-        want = [compacted(buf) for buf in regions]
+        regions = [
+            (buffers[0][0], ("a", "b")),
+            (buffers[0][1], ("a",)),
+            (buffers[1][1], ("a", "b")),
+        ]
+        want = [
+            compacted(buf, [locations[gid] for gid in groups])
+            for buf, groups in regions
+        ]
         router.compact_verify_window(path)
-        for got, expected in zip(regions, want):
+        for (got, _), expected in zip(regions, want):
             assert torch.equal(got, expected)

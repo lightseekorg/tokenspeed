@@ -41,6 +41,7 @@ BatchMLAPagedAttentionWrapper = ErrorClass
 BatchPrefillWithPagedKVCacheWrapper = ErrorClass
 BatchPrefillWithRaggedKVCacheWrapper = ErrorClass
 cudnn_batch_prefill_with_kv_cache = error_fn
+get_trtllm_gen_multi_ctas_kv_counter_bytes = error_fn
 trtllm_batch_context_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache_mla = error_fn
@@ -90,6 +91,7 @@ if platform.is_nvidia:
     from flashinfer.prefill import (
         trtllm_ragged_attention_deepseek as _trtllm_ragged_attention_deepseek,
     )
+    from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
     trtllm_batch_context_with_kv_cache = _with_pdl_default(
         _trtllm_batch_context_with_kv_cache
@@ -282,6 +284,7 @@ __all__ = [
     "BatchPrefillWithPagedKVCacheWrapper",
     "BatchPrefillWithRaggedKVCacheWrapper",
     "cudnn_batch_prefill_with_kv_cache",
+    "get_trtllm_gen_multi_ctas_kv_counter_bytes",
     "trtllm_batch_context_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache_mla",

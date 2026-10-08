@@ -60,7 +60,8 @@ def tree_window_attention(
 
     Args:
         q: ``[bs * rows_per_req, num_q_heads, head_dim]`` queries.
-        k_cache: ``[slots, num_kv_heads, head_dim]`` token rows of the cache.
+        k_cache: ``[slots, num_kv_heads, head_dim]`` token rows of the cache, in
+            ``q.dtype`` or unscaled FP8 E4M3.
         v_cache: laid out like ``k_cache``.
         page_table: ``[bs, max_pages]`` int32 page ids; slot = page * page_size + offset.
         seq_lens: ``[bs]`` int32 keys per request, the window included (>= window).

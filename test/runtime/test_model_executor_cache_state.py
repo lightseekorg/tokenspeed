@@ -230,6 +230,7 @@ def test_non_spec_decode_routes_through_verify():
     executor.drafter = None
     executor.tree_spec = None
     executor.config = SimpleNamespace(output_length=1)
+    executor._simulated_accept_length = None
     executor.input_buffers = SimpleNamespace(
         input_ids_buf=torch.arange(8, dtype=torch.int32),
         force_single_token_verify_buf=torch.zeros(8, dtype=torch.bool),

@@ -666,19 +666,6 @@ class ModelConfig:
                 "Running in encoder-only mode: the language model will not "
                 "be constructed or loaded (encode role)."
             )
-        # Cap gpu_memory_utilization for VLMs in mm mode — the vision encoder
-        # needs headroom that the global default doesn't account for.
-        if (
-            self.is_multimodal_active
-            and getattr(server_args, "_gpu_memory_utilization_defaulted", False)
-            and server_args.gpu_memory_utilization > 0.9
-        ):
-            logger.info(
-                "Clamping gpu_memory_utilization "
-                f"{server_args.gpu_memory_utilization:.2f} -> 0.9 to leave headroom "
-                "for the vision encoder.",
-            )
-            server_args.gpu_memory_utilization = 0.9
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 

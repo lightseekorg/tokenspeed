@@ -80,6 +80,7 @@ from tokenspeed.runtime.engine.protocol import EngineClient
 from tokenspeed.runtime.engine.scheduler_control_client import (
     SchedulerControlClient,
 )
+from tokenspeed.runtime.entrypoints import rl_control
 from tokenspeed.runtime.metrics.collector import RequestMetrics
 from tokenspeed.runtime.pd.utils import (
     DisaggregationMode,
@@ -472,10 +473,10 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for replica_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     replica_obj = prepare_parallel_sampling_replica(
-                        tmp_obj, tokenized_objs[i]
+                        tmp_obj, tokenized_objs[i], replica_index
                     )
                     self._send_one_request(tmp_obj, replica_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj))
@@ -704,12 +705,23 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
             server = uvicorn.Server(
                 uvicorn.Config(
-                    app, host=self.server_args.host, port=port, log_level="warning"
+                    app,
+                    host=rl_control.control_bind_host(self.server_args),
+                    port=port,
+                    log_level="warning",
                 )
             )
             await server.serve()
         except Exception as e:  # noqa: BLE001
             logger.error(f"RL control plane stopped: {e!s}")
+
+    def rl_control_url(self) -> str | None:
+        """Base URL of the in-engine RL control app, for gateway discovery."""
+        return rl_control.control_url(self.server_args)
+
+    def rl_advertisement(self) -> dict[str, str]:
+        """Control URL plus capability labels, for ``GetServerInfo.server_args``."""
+        return rl_control.advertisement(self.server_args)
 
     async def sigterm_watchdog(self):
         while not self.gracefully_exit:

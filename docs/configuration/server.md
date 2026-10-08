@@ -64,6 +64,8 @@ switch an envelope folds is also available individually under `auto`.
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
 | `--stream-output` | Return generated text as disjoint streaming segments. |
 | `--weight-version` | Initial model-weight version stamped into generation metadata. Defaults to `default`. |
+| `--rl-control-host` | Bind host for the in-engine RL control app. Defaults to `--host`. |
+| `--rl-control-api-key` | Bearer token required on every RL control route. Unset leaves the app open, which is what slime expects by default. |
 | `--model-update-config` | JSON object handed to the Model Updater SDK for `POST /update_weights_from_mooncake`. Requires the three flags below; see [Mooncake Weight Updates](#mooncake-weight-updates). |
 | `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
 | `--model-update-engine-type` | SDK `EngineType` member name for this engine, resolved as `EngineType[value.upper()]`. Required with `--model-update-config`. |
@@ -203,10 +205,15 @@ The following slime paths are not yet supported end to end:
   `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
 - rollout routing replay (`--use-rollout-routing-replay`).
 
-The HTTP routes for `update_weights_from_tensor` and `update_weights_from_disk`
-remain for SGLang clients, but TokenSpeed's scheduler does not implement their
-receive paths: the scheduler replies `success=false` with
-"not supported on this engine". Use the distributed or Mooncake update mode.
+`POST /update_weights_from_disk` and `POST /update_weights_from_tensor` stay on
+the router for slime-compatible clients, but answer `501 Not Implemented` with
+`{"success": false, "message": "..."}` before anything reaches the scheduler:
+TokenSpeed's scheduler implements neither the disk load path nor the CUDA-IPC
+receive path and would answer such a request with `success=false` ("not
+supported on this engine"). Use `POST /update_weights_from_distributed` or the
+Mooncake update described below. For the same reason the engine advertises
+`rl.update_from = "distributed,mooncake"`, so a gateway never routes a disk
+or tensor update here.
 
 ### Weight Updates Under Attention DP
 
@@ -293,6 +300,24 @@ Trainer-side contract:
   the whole checkpoint and restores consistency) or restart the engine before
   resuming dispatch; the same holds for the distributed update.
 
+### Driving TokenSpeed from an external gateway
+
+A gateway that fronts several engines (for example SMG with `--enable-rl`)
+talks to this control app directly; the `ts serve` sidecar is not involved.
+Launch the engine with `--rl-control-port <port>` and
+`--rl-control-host <address the gateway can reach>` (the default binds
+localhost only), and set `--rl-control-api-key` unless the network is trusted:
+an open control app on a routable host accepts weight updates from anyone who
+can connect. The engine puts the resulting control URL and its capabilities
+(`rl.control_url`, `rl.pause_modes`, `rl.update_from`, ...) into its server
+info, and SMG reads them when it registers the gRPC worker, so nothing has to
+be configured on the gateway side. The routes keep slime's expectations:
+`POST /pause_generation` accepts `{"mode": "wait"|"abort"|"keep"}` (default
+`wait`), and `/flush_cache` answers on both GET and POST. Routes with optional
+bodies accept an omitted body, but malformed or non-object JSON answers `400`
+before any control operation runs. Wildcard bind addresses (`0.0.0.0` or `::`)
+are not advertised as control URLs; use a concrete address for gateway discovery.
+
 ## Scheduler And Memory
 
 | Parameter | Purpose |
@@ -300,7 +325,7 @@ Trainer-side contract:
 | `--max-model-len` | Maximum sequence length. If omitted, TokenSpeed uses the model config. |
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
-| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration. Defaults to `8192`. Set `-1` to disable chunked prefill. |
+| `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--block-size` | KV cache block size. |
@@ -308,7 +333,7 @@ Trainer-side contract:
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
-| `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost. |
+| `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
@@ -355,6 +380,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
+| `--emulate-rank-zero` | Run only global rank 0 of the configured layout on one GPU, with local stand-ins for its collectives. For single-GPU performance work; outputs are not meaningful. See [Emulating Rank 0 on One GPU](../serving/parallelism.md#emulating-rank-0-on-one-gpu). |
 
 Use `--tensor-parallel-size` for simple launches. Use the
 TokenSpeed-specific split knobs when attention, dense, and MoE layers need
@@ -522,8 +548,9 @@ Memory: the recorded distributions take
 (`--speculative-num-draft-tokens` fp32 rows per request-pool slot), plus a
 batch-ordered gather buffer of `max_num_seqs x num_draft_tokens x vocab_size x
 4` bytes on the verifier; 80 requests at 4 draft tokens over a 129K vocabulary
-cost about 330 MB in total. Both come out of the `--gpu-memory-utilization`
-headroom, not the KV-cache budget.
+cost about 330 MB in total. On CUDA, when the CUDA-graph memory reserve is on,
+both are charged to it as startup residue, out of the KV-cache budget;
+otherwise they come out of the `--gpu-memory-utilization` headroom.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.
