@@ -162,6 +162,9 @@ from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize
 from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
 from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
+from tokenspeed_kernel.ops.transform import (
+    hadamard_transform as kernel_hadamard_transform,
+)
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
@@ -559,7 +562,7 @@ def _hadamard_transform(
         x = torch.empty((8_192, 32, 128), dtype=dtype, device="meta")
     else:
         x = torch.empty((8_192, 32, 256), dtype=dtype, device="meta")[..., ::2]
-    return tokenspeed_kernel.hadamard_transform(x, scale=128**-0.5)
+    return kernel_hadamard_transform(x, scale=128**-0.5)
 
 
 def _mm_dense_cdna4_aligned() -> torch.Tensor:
