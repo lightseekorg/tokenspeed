@@ -317,14 +317,21 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     AdmissionMatch match = matchPrefixAtAdmission(request);
     if (config_.enable_cache_trace) {
-        recordCacheTrace({.kind = "probe",
-                          .request_id = request->Id(),
-                          .prompt_tokens = request->PrefillSize(),
-                          .cacheable_tokens = match.cacheable_tokens,
-                          .device_match_tokens = match.probe.device.num_common_tokens,
-                          .host_match_tokens = match.probe.host.num_common_tokens,
-                          .readmission = request->Is<fsm::Retracted>()},
-                         match.candidate_prefix_hashes);
+        const std::array<std::int32_t, 4> observation{match.cacheable_tokens, match.probe.device.num_common_tokens,
+                                                      match.probe.host.num_common_tokens,
+                                                      request->Is<fsm::Retracted>()};
+        const auto previous = cache_trace_probes_.find(request->Id());
+        if (previous == cache_trace_probes_.end() || previous->second != observation) {
+            cache_trace_probes_[request->Id()] = observation;
+            recordCacheTrace({.kind = "probe",
+                              .request_id = request->Id(),
+                              .prompt_tokens = request->PrefillSize(),
+                              .cacheable_tokens = match.cacheable_tokens,
+                              .device_match_tokens = match.probe.device.num_common_tokens,
+                              .host_match_tokens = match.probe.host.num_common_tokens,
+                              .readmission = request->Is<fsm::Retracted>()},
+                             match.candidate_prefix_hashes);
+        }
     }
     const fsm::PrefillSource source = config_.role == Role::kD && request->Is<fsm::Submitted>()
                                           ? fsm::PrefillSource::kRemote
@@ -459,6 +466,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
 
     _assert(admission.has_value(), "first-chunk admission must produce a result");
     if (config_.enable_cache_trace) {
+        cache_trace_probes_.erase(request->Id());
         recordCacheTrace({.kind = "admitted",
                           .request_id = request->Id(),
                           .reason = source == fsm::PrefillSource::kRemote ? "remote" : "local",
@@ -594,6 +602,9 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
     }
 
     load_back_operations.push_back(tier_transfers_.StartPrefixLoad(std::move(load_pairs)));
+    if (config_.enable_cache_trace) {
+        cache_trace_load_requests_.emplace(load_back_operations.back().op_id, request->Id());
+    }
     return operation;
 }
 

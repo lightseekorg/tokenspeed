@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -351,8 +352,10 @@ private:
     std::uint64_t cache_trace_dropped_{0};
     std::size_t cache_trace_bytes_{0};
     std::unordered_map<std::string, std::uint64_t> cache_trace_prefixes_;
-    bool cache_trace_dictionary_exhausted_{false};
+    std::uint64_t cache_trace_next_prefix_ref_{0};
     std::unordered_map<std::string, std::vector<std::string>> cache_trace_computed_prefixes_;
+    std::unordered_map<std::string, std::array<std::int32_t, 4>> cache_trace_probes_;
+    std::unordered_map<std::uint32_t, std::string> cache_trace_load_requests_;
     std::string cache_trace_producer_id_;
     std::int32_t cache_trace_computed_tokens_{-1};
     std::string cache_trace_boundary_kind_;

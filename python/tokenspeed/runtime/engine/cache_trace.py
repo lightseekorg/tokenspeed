@@ -110,7 +110,12 @@ class CacheTraceWriter:
         if event.get("kind") == "start":
             self._history_complete = event.get("reason") == "empty" and sequence == 1
         self._history_complete = self._history_complete and not self._history_lost
-        record = {**self.metadata, "history_complete": self._history_complete, **event}
+        metadata = (
+            self.metadata
+            if event.get("kind") == "capture_start"
+            else {"schema": self.metadata["schema"], "epoch": self.epoch}
+        )
+        record = {**metadata, "history_complete": self._history_complete, **event}
         record.setdefault("timestamp_ns", time.time_ns())
         line = json.dumps(record, separators=(",", ":")) + "\n"
         self._file.write(line)

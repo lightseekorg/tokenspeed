@@ -105,13 +105,14 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.enable_cache_trace) {
         coordinator_.SetCacheTraceSink(
             [this](const CacheKey& key, CacheTier tier, CacheCoordinator::CacheMutation mutation, const char* reason) {
+                const bool stored = mutation == CacheCoordinator::CacheMutation::kStored;
                 recordCacheTrace({.kind = mutation == CacheCoordinator::CacheMutation::kStored ? "stored" : "removed",
-                                  .request_id = cache_trace_producer_id_,
+                                  .request_id = stored ? cache_trace_producer_id_ : "",
                                   .tier = tier == CacheTier::kDevice ? "L1" : "L2",
                                   .reason = reason,
                                   .namespace_id = key.namespace_id,
-                                  .boundary_kind = cache_trace_boundary_kind_,
-                                  .computed_tokens = cache_trace_computed_tokens_,
+                                  .boundary_kind = stored ? cache_trace_boundary_kind_ : "",
+                                  .computed_tokens = stored ? cache_trace_computed_tokens_ : -1,
                                   .group_id = static_cast<std::int32_t>(key.group_id),
                                   .page_offset = key.page_offset},
                                  {&key.content_hash, 1});
@@ -141,40 +142,35 @@ void Scheduler::recordCacheTrace(CacheTraceEvent event, std::span<const std::str
     if (!config_.enable_cache_trace) {
         return;
     }
-    // Prefix identity is emitted once per scheduler lifetime. References are
-    // invalid after any gap, including a dropped dictionary entry.
+    // This map only memoizes emitted identities. Reclaiming it does not erase
+    // earlier file records: references remain unique for the entire capture.
     if (event.kind != "stored" && event.kind != "removed" && event.kind != "prefix") {
         std::uint64_t parent = 0;
         std::size_t first_new = prefix_hashes.size();
         // A cumulative hash identifies its entire parent chain. Most decode
         // steps only look up the known tip; walk and emit newly added pages.
-        if (!cache_trace_dictionary_exhausted_) {
-            while (first_new > 0) {
-                const auto key = std::to_string(event.namespace_id) + ":" + prefix_hashes[first_new - 1];
-                const auto found = cache_trace_prefixes_.find(key);
-                if (found != cache_trace_prefixes_.end()) {
-                    parent = found->second;
-                    break;
-                }
-                --first_new;
+        while (first_new > 0) {
+            const auto key = std::to_string(event.namespace_id) + ":" + prefix_hashes[first_new - 1];
+            const auto found = cache_trace_prefixes_.find(key);
+            if (found != cache_trace_prefixes_.end()) {
+                parent = found->second;
+                break;
             }
-            for (const auto& hash : prefix_hashes.subspan(first_new)) {
-                if (cache_trace_prefixes_.size() >= 131072) {
-                    cache_trace_dictionary_exhausted_ = true;
-                    recordCacheTrace({.kind = "gap", .reason = "prefix_dictionary_full"});
-                    parent = 0;
-                    break;
-                }
-                const auto reference = cache_trace_prefixes_.size() + 1;
-                cache_trace_prefixes_.emplace(std::to_string(event.namespace_id) + ":" + hash, reference);
-                recordCacheTrace({.kind = "prefix",
-                                  .prefix_hashes = {hash},
-                                  .hash_count = 1,
-                                  .prefix_ref = reference,
-                                  .parent_ref = parent,
-                                  .namespace_id = event.namespace_id});
-                parent = reference;
+            --first_new;
+        }
+        for (const auto& hash : prefix_hashes.subspan(first_new)) {
+            if (cache_trace_prefixes_.size() >= 131072) {
+                cache_trace_prefixes_.clear();
             }
+            const auto reference = ++cache_trace_next_prefix_ref_;
+            cache_trace_prefixes_.emplace(std::to_string(event.namespace_id) + ":" + hash, reference);
+            recordCacheTrace({.kind = "prefix",
+                              .prefix_hashes = {hash},
+                              .hash_count = 1,
+                              .prefix_ref = reference,
+                              .parent_ref = parent,
+                              .namespace_id = event.namespace_id});
+            parent = reference;
         }
         event.prefix_ref = parent;
     } else if (event.kind == "stored" || event.kind == "removed") {
@@ -617,6 +613,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         if (config_.enable_cache_trace) {
             recordCacheTrace({.kind = "finished", .request_id = request->Id()});
             cache_trace_computed_prefixes_.erase(request->Id());
+            cache_trace_probes_.erase(request->Id());
         }
         requests_by_id_.erase(request->Id());
         return true;

@@ -55,7 +55,9 @@ def test_cache_trace_close_finishes_when_sentinel_enqueue_times_out(
 
 
 def test_cache_trace_history_requires_native_empty_start_and_no_gap(tmp_path):
-    writer = CacheTraceWriter(str(tmp_path / "capture"), {"global_rank": 0})
+    writer = CacheTraceWriter(
+        str(tmp_path / "capture"), {"global_rank": 0, "groups": [{"group_id": "full"}]}
+    )
     writer.publish(
         [
             {"kind": "start", "reason": "empty", "sequence": 1},
@@ -75,3 +77,8 @@ def test_cache_trace_history_requires_native_empty_start_and_no_gap(tmp_path):
         False,
         False,
     ]
+    assert records[0]["groups"] == [{"group_id": "full"}]
+    assert all("groups" not in record for record in records[1:])
+    assert all(
+        record["epoch"] == writer.epoch and record["schema"] == 2 for record in records
+    )

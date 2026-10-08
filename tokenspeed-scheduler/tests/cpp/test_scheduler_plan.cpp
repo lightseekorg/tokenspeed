@@ -94,6 +94,13 @@ TEST_F(CacheTraceTestSuite, L1RemovalDoesNotHideHostReuse) {
         std::ranges::any_of(history, [](const auto& event) { return event.kind == "stored" && event.tier == "L2"; }));
     EXPECT_TRUE(
         std::ranges::any_of(history, [](const auto& event) { return event.kind == "removed" && event.tier == "L1"; }));
+    for (const auto& event : history) {
+        if (event.kind == "removed") {
+            EXPECT_TRUE(event.request_id.empty());
+            EXPECT_TRUE(event.boundary_kind.empty());
+            EXPECT_EQ(event.computed_tokens, -1);
+        }
+    }
     Submit(MakeRequestSpec("reuse", 2, 1));
     PlanOnce();
     const auto events = scheduler_->DrainCacheTrace();
@@ -117,6 +124,21 @@ TEST_F(CacheTraceTestSuite, OverflowIsExplicitAndDrainRecovers) {
     EXPECT_GT(events.back().dropped_events, 0);
     EXPECT_GT(events.back().sequence, events[events.size() - 2].sequence + 1);
     EXPECT_TRUE(scheduler_->DrainCacheTrace().empty());
+}
+
+TEST_F(CacheTraceTestSuite, UnchangedWaitingProbeIsNotRepeated) {
+    Submit(MakeRequestSpec("occupying", 4));
+    PlanOnce();
+    scheduler_->DrainCacheTrace();
+    Submit(MakeRequestSpec("waiting", 2, 100));
+    PlanOnce();
+    const auto first = scheduler_->DrainCacheTrace();
+    EXPECT_TRUE(std::ranges::any_of(
+        first, [](const auto& event) { return event.kind == "probe" && event.request_id == "waiting"; }));
+    PlanOnce();
+    const auto second = scheduler_->DrainCacheTrace();
+    EXPECT_FALSE(std::ranges::any_of(
+        second, [](const auto& event) { return event.kind == "probe" && event.request_id == "waiting"; }));
 }
 
 TEST_F(CacheTraceTestSuite, ComputedAndFinalFrontiersCarryProducerEvidence) {
@@ -171,6 +193,37 @@ TEST_F(CacheTraceTestSuite, LongPrefixDictionaryIsCompleteAndReused) {
     const auto reused = scheduler.DrainCacheTrace();
     ASSERT_EQ(reused.size(), 1);
     EXPECT_EQ(reused.front().prefix_ref, submitted->prefix_ref);
+}
+
+TEST_F(CacheTraceTestSuite, PrefixDictionaryReclaimsWithoutLosingIdentity) {
+    auto config = MakeConfig();
+    config.device_allocator.total_pages = 1024;
+    config.cache_groups[0].total_pages = 1024;
+    Scheduler scheduler{config};
+    std::unordered_map<std::uint64_t, std::uint64_t> parents;
+    std::uint64_t last_reference = 0;
+    for (int i = 0; i < 440; ++i) {
+        scheduler.SubmitRequests({MakeRequestSpec("distinct_" + std::to_string(i), 300, i * 1000 + 1)});
+        const auto events = scheduler.DrainCacheTrace();
+        for (const auto& event : events) {
+            EXPECT_NE(event.kind, "gap");
+            if (event.kind == "prefix") {
+                EXPECT_EQ(event.prefix_ref, ++last_reference);
+                EXPECT_TRUE(event.parent_ref == 0 || parents.contains(event.parent_ref));
+                parents.emplace(event.prefix_ref, event.parent_ref);
+            } else if (event.kind == "submitted") {
+                auto reference = event.prefix_ref;
+                int pages = 0;
+                while (reference != 0) {
+                    ASSERT_TRUE(parents.contains(reference));
+                    reference = parents.at(reference);
+                    ++pages;
+                }
+                EXPECT_EQ(pages, event.hash_count);
+            }
+        }
+    }
+    EXPECT_GT(last_reference, 131072);
 }
 
 TEST_F(SchedulerTestSuite, LoadBack_NotTriggeredWithoutHostCacheHit) {

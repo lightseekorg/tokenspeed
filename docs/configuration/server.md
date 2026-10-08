@@ -618,6 +618,8 @@ widening the draft's attention to the full history.
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+| `--cache-trace-path` | Private, bounded JSONL diagnostics, one file per attention-TP group and process. See [diagnostic capture](../design/cache-concepts.md#diagnostic-capture). |
+| `--cache-trace-frontiers` / `--no-cache-trace-frontiers` | Include computed-prefix, final-readability and capacity records in cache capture. Enabled by default; disabling reduces overhead and the available attribution evidence. |
 
 Every `--decode-log-interval` decode rounds the scheduler's representative rank
 prints one `Decode batch.` line: `#running-req`, `avg_seq_len` (the mean of

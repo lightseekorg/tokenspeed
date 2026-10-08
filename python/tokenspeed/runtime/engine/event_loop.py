@@ -311,6 +311,7 @@ class EventLoop:
                     "global_rank": global_rank,
                     "attn_tp_rank": attn_tp_rank,
                     "attn_tp_size": cache_replica_tp_size,
+                    "capture_scope": "attention_tp_leader",
                     "pp_rank": mapping.pp_rank,
                     "pp_size": self.pp_size,
                     "num_device_pages": geometry.num_device_pages,
@@ -340,7 +341,7 @@ class EventLoop:
                     ],
                 },
             )
-            if server_args.cache_trace_path is not None
+            if server_args.cache_trace_path is not None and attn_tp_rank == 0
             else None
         )
 
@@ -404,7 +405,9 @@ class EventLoop:
         )
         if self._cache_trace is not None:
             scheduler_cfg.enable_cache_trace = True
-            scheduler_cfg.enable_cache_trace_frontiers = True
+            scheduler_cfg.enable_cache_trace_frontiers = (
+                server_args.cache_trace_frontiers
+            )
         logger.info(
             f"Scheduler config: prefix_granularity={scheduler_cfg.prefix_granularity!s}"
             f" num_device_pages={scheduler_cfg.num_device_pages!s} "

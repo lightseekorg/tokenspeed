@@ -202,6 +202,14 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
+    if (config_.enable_cache_trace) {
+        const auto producer = cache_trace_load_requests_.find(event.op_id);
+        if (producer != cache_trace_load_requests_.end()) {
+            recordCacheTrace(
+                {.kind = "load_back", .request_id = producer->second, .reason = event.success ? "success" : "failed"});
+            cache_trace_load_requests_.erase(producer);
+        }
+    }
     tier_transfers_.CompleteLoadBack(event.op_id, event.success);
 }
 

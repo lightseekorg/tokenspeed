@@ -345,6 +345,7 @@ class ServerArgs:
     # Cache events
     kv_events_config: str | None = None
     cache_trace_path: str | None = None
+    cache_trace_frontiers: bool = True
 
     # Port for the in-engine SGLang-compatible RL control app (weight sync,
     # pause/resume, and memory occupation). Set by the ``ts serve`` orchestrator;
@@ -2323,13 +2324,20 @@ class ServerArgs:
             ),
         )
 
-        # Data parallelism
         parser.add_argument(
             "--cache-trace-path",
             type=str,
             default=ServerArgs.cache_trace_path,
-            help="Opt-in private cache diagnostic JSONL capture; one bounded file per rank and process.",
+            help="Opt-in private cache diagnostic JSONL capture; one bounded file per attention-TP group and process.",
         )
+        parser.add_argument(
+            "--cache-trace-frontiers",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.cache_trace_frontiers,
+            help="Include computed-prefix and final-readability diagnostics when cache tracing is enabled.",
+        )
+
+        # Data parallelism
         parser.add_argument(
             "--data-parallel-size",
             metavar="DATA_PARALLEL_SIZE",
