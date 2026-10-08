@@ -2,6 +2,7 @@ import os
 import sys
 from dataclasses import fields, replace
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -72,6 +73,91 @@ def _pool_over_new_arena(spec, config, *, num_layers: int, rank: int = 0):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [1, 3])
+def test_glm_workspace_budget_includes_kda_and_shared_kpool_tails(width):
+    from test.runtime.test_glm53_flash_cache_spec import _recipe
+
+    from tokenspeed.runtime.layers.attention import registry
+
+    recipe = _recipe(
+        tp_size=8,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        draft_layers=int(width > 1),
+    )
+    config = replace(recipe.attn_config, device="cuda", max_bs=2)
+    recipe.attn_config = config
+    if recipe.draft_attn_config is not None:
+        recipe.draft_attn_config = replace(
+            recipe.draft_attn_config, device="cuda", max_bs=2
+        )
+    recipe.probe_batch_rows = 4
+    recipe.server_args.disable_kda_prefill_graph = True
+    recipe.server_args.kda_backend = "auto"
+    linear = config.component(LinearAttnConfig)
+    num_layers = recipe.model_config.num_attention_layers
+    model = SimpleNamespace(
+        num_attention_layers=num_layers,
+        attention_arch=registry.AttentionArch.DSA,
+        hf_config=SimpleNamespace(
+            architectures=["Glm53FlashForConditionalGeneration"],
+            full_attention_layer_ids=[
+                layer for layer in range(num_layers) if layer not in linear.layer_ids
+            ],
+        ),
+    )
+    setup = recipe.setup()
+    arena = create_cache_arena(
+        setup.spec, device=config.device, enable_memory_saver=False
+    )
+    backend, pool = registry._create_target_components(
+        server_args=recipe.server_args,
+        model_config=model,
+        config=config,
+        cache_spec=setup.spec.layer_view(first_layer=0, num_layers=num_layers),
+        arena=arena,
+        rank=0,
+        full_attn_backend_name="dsa",
+        linear_attention="kda",
+        is_inkling=False,
+        backend=None,
+    )
+    backend.set_cache_pool(pool)
+    # The tail allocation is shared by target/draft views; count its storage
+    # once, together with the verify buffers owned by the target backend.
+    tail_bytes = pool._kpool_tail_workspace.storage.nbytes
+    verify_bytes = (
+        backend.preallocate_verify_workspace(config.max_bs, width) if width > 1 else 0
+    )
+    assert setup.fixed_workspace_bytes == tail_bytes + verify_bytes
+
+
+@pytest.mark.parametrize(
+    "uses_paged_state_verify,expected_bytes",
+    [(True, 128), (True, 0), (False, 128)],
+)
+def test_verify_preparation_calls_root_with_existing_budget_gate(
+    uses_paged_state_verify, expected_bytes
+):
+    backend = Mock(spec=AttentionBackend)
+    backend.preallocate_verify_workspace.return_value = 128
+    draft_backend = Mock(spec=AttentionBackend)
+    kwargs = dict(
+        server_args=SimpleNamespace(speculative_num_draft_tokens=3),
+        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        backend=backend,
+        draft_backend=draft_backend,
+        uses_paged_state_verify=uses_paged_state_verify,
+        is_inkling=False,
+    )
+    _prepare_fixed_workspaces(**kwargs, expected_bytes=expected_bytes)
+    if uses_paged_state_verify and expected_bytes:
+        backend.preallocate_verify_workspace.assert_called_once_with(4, 3)
+    else:
+        backend.preallocate_verify_workspace.assert_not_called()
+    draft_backend.preallocate_verify_workspace.assert_not_called()
+
+
 def _model_wide_kwargs(**overrides) -> dict:
     """The AttnConfig (model-wide) tier the test configs share."""
     kwargs = dict(
@@ -99,6 +185,126 @@ def _mha_config() -> AttnConfig:
         cache_layer_types=(),
     )
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
+
+
+def test_deepseek_v4_mtp_reads_window_from_cache_group():
+    from tokenspeed.runtime.layers.attention import registry
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    args = ServerArgs(
+        model="x",
+        device="cpu",
+        prefix_granularity=256,
+        max_num_seqs=2,
+        chunked_prefill_size=256,
+        speculative_algorithm="EAGLE",
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        attention_use_fp4_indexer_cache=False,
+    )
+    args.mapping.rank = 0
+    model_fields = dict(
+        model_profile=None,
+        attention_arch=registry.AttentionArch.MLA,
+        dtype=torch.bfloat16,
+        context_len=512,
+        num_attention_heads=64,
+        num_key_value_heads=1,
+        head_dim=512,
+        kv_lora_rank=512,
+        qk_nope_head_dim=448,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+        scaling=512**-0.5,
+    )
+    hf_fields = dict(
+        compress_ratios=(1, 4, 1),
+        head_dim=512,
+        qk_rope_head_dim=64,
+        index_head_dim=128,
+        sliding_window=256,
+    )
+    target = SimpleNamespace(
+        **model_fields,
+        num_attention_layers=2,
+        hf_config=SimpleNamespace(**hf_fields, architectures=["DeepseekV4ForCausalLM"]),
+    )
+    draft = SimpleNamespace(
+        **model_fields,
+        num_attention_layers=1,
+        hf_config=SimpleNamespace(
+            **hf_fields, architectures=["DeepseekV4ForCausalLMNextN"]
+        ),
+    )
+    build = registry.create_attn_components(
+        args,
+        target,
+        gpu_id=0,
+        rank=0,
+        gpu_memory=0,
+        draft_model_config=draft,
+        graph_reserve_bytes=0,
+        post_profile_bytes=0,
+        probe_batch_rows=1,
+        profiled_cache_bytes=32 << 20,
+        reuse_target_backend=None,
+        reuse_draft_backend=None,
+    )
+    assert build.attn_backend._swa_window_tokens() == 256
+    assert build.draft_attn_backend._swa_window_tokens() == 256
+
+
+@pytest.mark.parametrize(
+    "is_draft,width,num_layers,layerwise,ring_rows",
+    [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
+)
+def test_inkling_construction_matches_ring_reservation(
+    is_draft, width, num_layers, layerwise, ring_rows
+):
+    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+        InklingAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
+        _conv_ring_bytes,
+    )
+
+    config = _mha_config()
+    spec = replace(
+        config.component(MHAConfig),
+        num_attention_heads=4,
+        num_kv_heads=4,
+        attn_tp_size=2,
+    )
+    config = replace(
+        config,
+        components=(spec,),
+        is_draft=is_draft,
+        speculative_num_draft_tokens=width,
+    )
+    text = SimpleNamespace(
+        sconv_kernel_size=4,
+        num_key_value_heads=4,
+        head_dim=2,
+        hidden_size=8,
+    )
+    inner = AttentionBackend(config, spec)
+    backend = InklingAttnBackend.from_config(
+        inner,
+        text,
+        config,
+        num_layers=num_layers,
+        is_draft=is_draft,
+        enable_layerwise_cache_ready=layerwise,
+    )
+    assert backend.conv_pool.conv_state.shape == (num_layers, 4, ring_rows, 24)
+    assert backend.conv_spec_num_tokens == width
+    assert backend.enable_layerwise_cache_ready is layerwise
+    assert backend.fixed_workspace_bytes() == _conv_ring_bytes(
+        text_config=text,
+        attn_config=config,
+        num_layers=num_layers,
+        spec_tokens=width,
+    )
 
 
 def _mla_config() -> AttnConfig:
@@ -340,17 +546,27 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
 
 @pytest.mark.parametrize(
-    ("replay_enabled", "replay_supported", "topk", "expected_workspace_bytes"),
+    (
+        "replay_enabled",
+        "replay_supported",
+        "topk",
+        "draft_tokens",
+        "expected_workspace_bytes",
+    ),
     # Non-replay stages conv+ssm for 8 verify rows: 8 * (8 + 8). Replay: 64
     # conv staging bytes plus the captured payload (6 rows of 7 bf16
     # channels) and the fp32 A_log/dt_bias pairs -- 64 + 84 + 16.
     # A replayed draft tree (topk 2) adds one 8-byte ssm state per draft position: 2 * 3 * 8.
     (
-        (False, True, 1, 128),
-        (True, False, 1, 128),
-        (True, True, 1, 164),
-        (False, True, 2, 128),
-        (True, True, 2, 212),
+        (False, True, 1, 3, 128),
+        (True, False, 1, 3, 128),
+        (True, True, 1, 3, 164),
+        (False, True, 2, 3, 128),
+        (True, True, 2, 3, 212),
+        (True, True, 2, 7, 452),
+        (True, True, 2, 8, 384),
+        (True, True, 2, 16, 736),
+        (True, True, 2, 17, 1052),
     ),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
@@ -358,6 +574,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     replay_enabled: bool,
     replay_supported: bool,
     topk: int,
+    draft_tokens: int,
     expected_workspace_bytes: int,
 ) -> None:
     monkeypatch.setattr(
@@ -386,7 +603,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     server_args = SimpleNamespace(
         block_size=64,
         max_total_tokens=None,
-        speculative_num_draft_tokens=3,
+        speculative_num_draft_tokens=draft_tokens,
         speculative_eagle_topk=topk,
         enable_replay_ssm=replay_enabled,
     )
@@ -1223,7 +1440,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         prepare_communication_runtime=lambda tokens: None,
     )
     monkeypatch.setattr(factory, "create_model_runner", lambda *a: (target, None))
-    monkeypatch.setattr(device, "probe_arena_floor", lambda *a: 8)
+    monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
         chunked_prefill_size=8192,

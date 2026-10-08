@@ -34,6 +34,7 @@ from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.utils.tensor import prepare_padded_rows
 
 
 def shared_expert_mapping(mapping, value):
@@ -148,13 +149,7 @@ class SharedExpertCommunication:
             raise ValueError("Shared-expert TP exceeds prepared capacity")
         if rows == 0:
             return inputs.new_empty((0, self.hidden))
-        local_rows = inputs.shape[0]
-        if local_rows == rows and inputs.is_contiguous():
-            send = inputs
-        else:
-            send = self.send[:rows]
-            send.zero_()
-            send[:local_rows].copy_(inputs)
+        send = prepare_padded_rows(inputs, rows, self.send, alignment_bytes=1)
         if self.gather is not None and rows <= 128:
             gathered = trtllm_allgather(self.gather, send)
         else:

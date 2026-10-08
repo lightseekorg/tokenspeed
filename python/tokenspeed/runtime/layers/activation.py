@@ -27,7 +27,7 @@
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel import prepare_fp8_linear_activation, silu_and_mul
+from tokenspeed_kernel.ops.activation import prepare_fp8_linear_activation, silu_and_mul
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import (
@@ -158,7 +158,7 @@ class SituAndMul(torch.nn.Module):
                 f"SiTU expects an even [gate, up] width, got {x.shape[-1]}"
             )
         if x.is_cuda:
-            from tokenspeed_kernel import situ_and_mul
+            from tokenspeed_kernel.ops.activation import situ_and_mul
 
             return situ_and_mul(
                 x,

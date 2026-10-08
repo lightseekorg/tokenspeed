@@ -561,7 +561,7 @@ def v41_hc_post(
     if not x.is_cuda:
         mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
         return (post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed).to(x.dtype)
-    from tokenspeed_kernel import mhc_post
+    from tokenspeed_kernel.ops.residual import mhc_post
 
     return mhc_post(x, residual, post.unsqueeze(-1), comb, override=None, solution=None)
 

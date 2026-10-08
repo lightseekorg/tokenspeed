@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import mm
-from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8
+from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8, mm
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(

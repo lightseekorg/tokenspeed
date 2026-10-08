@@ -26,9 +26,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     autotune_cache_path,
@@ -1080,7 +1080,7 @@ class ModelExecutor:
             topk_weights, topk_ids = torch.topk(scores, layer.top_k, dim=-1)
             topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
             if layer.supports_precomputed_topk:
-                tokenspeed_kernel.moe_apply(
+                kernel_moe_apply(
                     layer.plan,
                     hidden_states,
                     layer,
@@ -1090,7 +1090,7 @@ class ModelExecutor:
                     num_tokens_global=num_tokens,
                 )
             else:
-                tokenspeed_kernel.moe_apply(
+                kernel_moe_apply(
                     layer.plan,
                     hidden_states,
                     layer,

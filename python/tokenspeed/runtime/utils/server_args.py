@@ -760,10 +760,8 @@ class ServerArgs:
             gpu_mem = None
 
         # Set GPU memory utilization.
-        self._gpu_memory_utilization_defaulted = False
         if self.gpu_memory_utilization is None:
             self.gpu_memory_utilization = 0.95
-            self._gpu_memory_utilization_defaulted = True
 
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
@@ -3067,7 +3065,8 @@ class ServerArgs:
         parser.add_argument(
             "--disable-cudagraph-memory-reserve",
             action="store_true",
-            help="Do not reserve the projected CUDA-graph pool memory in the KV cache budget.",
+            help="Do not reserve the projected CUDA-graph pool memory, nor what startup "
+            "keeps resident on CUDA, in the KV cache budget.",
         )
         parser.add_argument(
             "--tensor-parallel-size",

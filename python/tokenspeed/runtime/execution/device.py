@@ -81,6 +81,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
@@ -1025,23 +1026,15 @@ def arm_data_plane_sync_debug(device: str) -> None:
     )
 
 
-def _cudagraph_probe_refusal(
-    server_args: ServerArgs, model: torch.nn.Module
-) -> str | None:
+def _cudagraph_probe_refusal(server_args: ServerArgs) -> str | None:
     """Why this boot cannot use a probe, or None when it can.
 
-    ``enforce_eager`` captures nothing to measure. A narrowing model's decoder
-    ladder fabricates a request per ``max_decoder_rows_per_request`` rows,
-    which the floor cannot bound before the model is built.
+    ``enforce_eager`` captures nothing to measure.
     """
-    from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
-
     if server_args.disable_cudagraph_memory_reserve:
         return "--disable-cudagraph-memory-reserve is set"
     if server_args.enforce_eager:
         return "--enforce-eager captures no graphs"
-    if narrowing_prefill_model(model) is not None:
-        return "a narrowing prefill model's decoder ladder is unbounded before build"
     return None
 
 
@@ -1085,6 +1078,8 @@ def _rebind_under_reserve(
     gpu_id: int,
     probe: AttentionBuild,
     requested_backends: tuple[str | None, str | None],
+    *,
+    startup_resident_bytes: int,
 ) -> tuple[AttentionBuild, PoolViews]:
     """Rebuild the real pool under the probe's reserve, and its views with it.
 
@@ -1104,12 +1099,17 @@ def _rebind_under_reserve(
         server_args,
         gpu_id,
         profiled_cache_bytes=probe.profiled_cache_bytes,
+        startup_resident_bytes=startup_resident_bytes,
     )
     return attention, pool_views(attention)
 
 
 def probe_arena_floor(
-    server_args: ServerArgs, model_config: ModelConfig, max_forward_tokens: int
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    max_forward_tokens: int,
+    *,
+    decoder_rows_per_request: int | None,
 ) -> int:
     """Parent blocks a probe arena needs for the widest row the boot fabricates.
 
@@ -1117,18 +1117,26 @@ def probe_arena_floor(
     ceiling, which is a default rather than zero when unset, and a configured
     capture batch size fabricates that many rows whatever the bucket. Returned
     rather than inlined so a test can assert the number instead of the source.
+    A narrowing model's decoder ladder (``decoder_rows_per_request`` is its
+    ``max_decoder_rows_per_request``, None for other models) fabricates one
+    request per that many rows of a bucket no wider than the token ladder's,
+    and never more than ``max_num_seqs``.
     """
     from tokenspeed.runtime.execution.cudagraph_memory import probe_arena_parent_blocks
     from tokenspeed.runtime.execution.model_executor import (
         _resolve_prefill_graph_max_tokens,
     )
 
+    tokens = max(max_forward_tokens, _resolve_prefill_graph_max_tokens(server_args))
     return probe_arena_parent_blocks(
-        max_forward_tokens=max(
-            max_forward_tokens, _resolve_prefill_graph_max_tokens(server_args)
-        ),
+        max_forward_tokens=tokens,
         context_len=model_config.context_len,
         capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+        decoder_requests=(
+            0
+            if decoder_rows_per_request is None
+            else min(-(-tokens // decoder_rows_per_request), server_args.max_num_seqs)
+        ),
     )
 
 
@@ -1194,7 +1202,11 @@ def build_device_side(
         create_model_executor,
         create_model_runner,
     )
-    from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+    from tokenspeed.runtime.execution.memory_delta import (
+        NULL_MEMORY_DELTA_OBSERVER,
+        DriverMemoryDeltaObserver,
+    )
+    from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1259,14 +1271,26 @@ def build_device_side(
         server_args.attention_backend,
         server_args.drafter_attention_backend,
     )
-    refusal = _cudagraph_probe_refusal(server_args, target.model)
+    refusal = _cudagraph_probe_refusal(server_args)
     if refusal is not None:
-        logger.info(f"CUDA-graph memory reserve off: {refusal}")
+        logger.info(
+            f"CUDA-graph memory reserve off, startup residue unreserved: {refusal}"
+        )
     probing = refusal is None
+    narrowing = narrowing_prefill_model(target.model)
     attention = build_components(
         graph_reserve_bytes=0,
         probe_batch_rows=(
-            probe_arena_floor(server_args, model_config, max_forward_tokens)
+            probe_arena_floor(
+                server_args,
+                model_config,
+                max_forward_tokens,
+                decoder_rows_per_request=(
+                    None
+                    if narrowing is None
+                    else narrowing.max_decoder_rows_per_request
+                ),
+            )
             if probing
             else None
         ),
@@ -1292,7 +1316,13 @@ def build_device_side(
             )
             server_args.chunked_prefill_size = aligned
 
-    with startup_phase("executor.init"):
+    # On CUDA, what startup keeps resident after the probe build joins the reserve.
+    startup_memory = (
+        DriverMemoryDeltaObserver(torch.get_device_module(server_args.device), gpu_id)
+        if probing and current_platform().is_nvidia
+        else NULL_MEMORY_DELTA_OBSERVER
+    )
+    with startup_memory.measure("startup"), startup_phase("executor.init"):
         executor = create_model_executor(
             server_args=server_args,
             config=ModelExecutorConfig.from_server_args(
@@ -1312,7 +1342,11 @@ def build_device_side(
             draft_token_to_kv_pool=views.draft_token_to_kv_pool,
         )
     # Once per process, before the probe: a graph keeps its capture-time tactic.
-    with startup_phase("kernels.autotune"):
+    with (
+        startup_memory.measure("startup"),
+        startup_phase("kernels.autotune"),
+        current_platform().restore_stack_limit(),
+    ):
         executor.autotune()
     if probing:
         # Consumers above keep the probe's: they read only block-count-invariant fields.
@@ -1324,6 +1358,7 @@ def build_device_side(
                 gpu_id,
                 attention,
                 requested_backends,
+                startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
 
     with startup_phase("graph.capture"):

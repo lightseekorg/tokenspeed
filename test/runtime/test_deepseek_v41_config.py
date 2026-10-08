@@ -26,6 +26,7 @@ fixture checks against its actual config.json. No snapshot path is assumed.
 
 import json
 import os
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -67,6 +68,16 @@ from tokenspeed.runtime.layers.attention.registry import (
 )
 from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY, get_config
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(
+    est_time=30,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*", "h100-*"],
+    disabled_on_runners_reason="verified on Blackwell runners only",
+)
 
 
 @pytest.fixture
@@ -339,6 +350,12 @@ def test_text_only_roundtrip_and_engram_alias(
     assert restored.num_hidden_layers == 40
 
 
+def test_multimodal_checkpoint_keeps_the_default_utilization(runtime_config):
+    args, model = runtime_config
+    assert model.is_multimodal_active
+    assert args.gpu_memory_utilization == 0.95
+
+
 def test_model_config_uses_nested_mla_dims_without_yarn_scale(runtime_config):
     args, model = runtime_config
     assert isinstance(model.hf_config, DeepseekV41Config)
@@ -499,3 +516,7 @@ def test_real_server_args_prepare_cache_pool_and_backend(runtime_config, overlap
     # The prefill graph captures the encoder and decoder stages around the
     # eager narrowing (NarrowingPrefillModel), so the backend allows it.
     assert backend.cuda_graph_support.prefill_graph
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

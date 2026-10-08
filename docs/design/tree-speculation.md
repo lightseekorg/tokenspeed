@@ -82,9 +82,10 @@ widened back to the model dtype, which is exact.
 
 Linear-attention (GDN and Mamba2) layers keep one conv window and one recurrent
 state per verify node in the backend's verify scratch. Node `t` starts from the
-state after its parent, not after node `t - 1`: `gdn_decode_mtp` and
-`mamba2_verify_scan` take `parent_indices` and reload the parent's state at
-branch points (a chain never reloads); `causal_conv1d_update` with `parent_indices` rebuilds each node's
+state after its parent, not after node `t - 1`: `mamba2_verify_scan` takes
+`parent_indices` and `gdn_decode_mtp` the tree's ancestor mask (the one tree
+attention reads), and both reload the parent's state at branch points (a chain
+never reloads); `causal_conv1d_update` with `parent_indices` rebuilds each node's
 window from its ancestors' inputs and the initial window. The commit copies the scratch row of the
 last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
 familiar `accept_len`. The fused KDA verify kernel follows a chain and refuses
@@ -93,8 +94,12 @@ trees.
 Draft trees use ReplaySSM like chains (on by default; staging a recurrent
 state per node and per layer grows with the tree, Qwen3.8: 3 MiB x 48 layers
 per node). Under ReplaySSM the verify
-never writes the state pool. The state of every branch point (a node with a
-child other than the next node) goes to one workspace shared by all layers
+never writes the state pool. A GDN tree of 8 to 16 nodes
+(`GDN_TREE_VERIFY_CHUNKED_MIN_NODES`, `GDN_TREE_VERIFY_CHUNKED_MAX_NODES`) is
+verified in the chunked form of the delta rule, every node at once with the
+ancestor mask in place of the causal one, and keeps no node states. In other
+trees the state of every branch point (a node with a child other than the next
+node) goes to one workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),
 and a branch reloads its parent from there. Mamba2 has no such workspace: its
 elementwise update lets a branch replay the parent's ancestors over the read
