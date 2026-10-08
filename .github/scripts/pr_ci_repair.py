@@ -84,6 +84,7 @@ REPAIR_FEEDBACK = {
     "test-assertions": "Conflict resolution removed or changed test assertions. Preserve current main and PR-added assertions with their original behavior and thresholds.",
     "retired-api": "Main deliberately removed root operator exports. Preserve that removal and migrate callers to operator modules instead of restoring the exports.",
     "quantization-reference": "Reuse main's prepacked quantizer from ops/gemm/fp8_utils.py instead of reconstructing it in ops/gemm/flashinfer.py. Its native/Triton rounding, zero-group scales and padding are part of the supported contract; migrate callers to the existing implementation.",
+    "missing-reference": "The merged source has no ops/gemm/fp8_utils.py module. Preserve the PR's refactor and adapt consumers through available registered backends. Read the main-side reference snapshot for native/Triton rounding, zero-group scales and padding; do not import a deleted module or reconstruct quantization with plain division.",
     "scope": "Repair changes files outside its scope.",
     "file-size": "Repair deletes a file or exceeds the size limit.",
     "file-mode": "Repair changes file type or mode.",
@@ -354,8 +355,20 @@ def guard_retired_exports(source: Path, head: str, base: str):
         raise RepairRejected("retired-api", path=ROOT_API, details=sorted(restored))
 
 
-def guard_prepacked_reference(source: Path, head: str, base: str):
+def guard_prepacked_reference(source: Path, head: str, base: str, path: str = FP8_API):
     symbol = "flashinfer_fp8_blockscale_quantize_prepacked"
+    if not source.joinpath(FP8_REFERENCE).is_file():
+        if any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "tokenspeed_kernel.ops.gemm.fp8_utils"
+            for node in ast.walk(ast.parse(source.joinpath(path).read_text()))
+        ):
+            raise RepairRejected(
+                "missing-reference", path=path, details=dict(reference=FP8_REFERENCE)
+            )
+        return
+    if path != FP8_API:
+        return
 
     def defines(content):
         return any(
@@ -460,8 +473,8 @@ def guard(
             guard_file(source, head, p, validation_base)
             if p == ROOT_API and validation_base and check_main_contracts:
                 guard_retired_exports(source, head, validation_base)
-            if p == FP8_API and validation_base and check_main_contracts:
-                guard_prepacked_reference(source, head, validation_base)
+            if Path(p).suffix == ".py" and validation_base and check_main_contracts:
+                guard_prepacked_reference(source, head, validation_base, p)
         except RepairRejected as error:
             issues.append(error)
     if issues:
@@ -915,7 +928,9 @@ def model():
     parents = sandbox_root / "parents"
     parents.mkdir()
     for name, ref in (("head", state["head"]), ("main", base)):
-        for path in sorted(conflicts):
+        for path in sorted(
+            conflicts | ({FP8_REFERENCE} if FP8_API in allowed else set())
+        ):
             if command("git", "ls-tree", "--name-only", ref, "--", path, cwd=source):
                 target = parents / name / path
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -931,13 +946,15 @@ def model():
     feedback.write_text("{}")
     if resumed:
         issues = []
-        for path, check in (
-            (ROOT_API, guard_retired_exports),
-            (FP8_API, guard_prepacked_reference),
-        ):
-            if path in allowed:
+        if ROOT_API in allowed:
+            try:
+                guard_retired_exports(source, state["head"], base)
+            except RepairRejected as error:
+                issues.append(error.feedback)
+        for path in sorted(allowed):
+            if Path(path).suffix == ".py" and source.joinpath(path).is_file():
                 try:
-                    check(source, state["head"], base)
+                    guard_prepacked_reference(source, state["head"], base, path)
                 except RepairRejected as error:
                     issues.append(error.feedback)
         if issues:
@@ -973,6 +990,8 @@ the allowed source does not complete this task.
         prompt += " The existing source contains the previous accepted edits. Read feedback.json first for known material issues in those edits, and correct them before proposing a patch. Complete their verification against current main and correct the remaining conflict resolutions. A retained test missing from the prior patch still has its main-side contents; migrate its imports or calls only if required by the PR's supported API. Preserve already completed edits and avoid restarting the broad investigation."
     if "diagnostics" in request:
         prompt += " The diagnostics now describe validation of the previous accepted candidate. Repair that observed failure while preserving the accepted edits; passing original-head checks do not resolve this candidate failure."
+    if FP8_API in allowed and parents.joinpath("main", FP8_REFERENCE).is_file():
+        prompt += f" The PR may remove a module that exists on main. Read {parents}/main/{FP8_REFERENCE} for authoritative prepacked FP8 behavior, but check actual merged-source module availability before importing it. Preserve the PR's refactor and adapt callers to available registered/native/Triton backends. Zero-group scales, padding and backend rounding must match that reference; ad hoc tensor arithmetic is not an equivalent implementation."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()

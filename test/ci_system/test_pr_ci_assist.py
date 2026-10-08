@@ -724,6 +724,14 @@ def test_source_screen_retains_public_parents_and_rejects_new_private_text(tmp_p
         {"model.py", repair.ROOT_API, repair.FP8_API},
         validation_base=base,
     )
+    fp8_reference.unlink()
+    with pytest.raises(repair.RepairRejected, match="merged source has no"):
+        repair.guard_prepacked_reference(tmp_path, head, base)
+    fp8_api.write_text(
+        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return registered_quantizer(x)\n"
+    )
+    repair.guard_prepacked_reference(tmp_path, head, base)
+    fp8_reference.write_text(git("show", f"{base}:{repair.FP8_REFERENCE}") + "\n")
     fp8_api.write_text("value = 1\n")
     file.write_text("# new https://example.com/v1\nvalue = 3\n")
     with pytest.raises(repair.RepairRejected, match="public-output"):
