@@ -734,7 +734,7 @@ the allowed source does not complete this task.
                 ):
                     identifier = event.get("session_id", "")
                     if isinstance(identifier, str) and re.fullmatch(
-                        r"[a-f0-9-]{36}", identifier
+                        r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", identifier
                     ):
                         session[:] = [identifier]
             result.wait()
