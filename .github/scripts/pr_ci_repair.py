@@ -771,6 +771,47 @@ the allowed source does not complete this task.
     WORK.joinpath("patch.diff").write_text(diff + "\n")
 
 
+def refresh_validation_base(source: Path, request: dict, base: str):
+    state = request["state"]
+    prior = state.get("validation_base", state["base"])
+    if base == prior:
+        return
+    if not SHA.fullmatch(base):
+        raise ValueError("Invalid validation base.")
+    command("git", "fetch", "origin", base, cwd=source)
+    selected = set(
+        command("git", "diff", "--name-only", state["head"], cwd=source).splitlines()
+    )
+    changed = set(
+        command(
+            "git", "diff", "--name-only", "--no-renames", prior, base, cwd=source
+        ).splitlines()
+    )
+    if selected & changed:
+        raise ValueError(
+            "Main changed repaired files; a fresh source repair is required."
+        )
+    contents = {p: source.joinpath(p).read_bytes() for p in selected}
+    command("git", "reset", "--hard", state["head"], cwd=source)
+    conflicts = merge(source, base, commit=False)
+    if not set(conflicts).issubset(selected):
+        raise ValueError(
+            "Main introduced new conflicts; a fresh source repair is required."
+        )
+    for path, content in contents.items():
+        source.joinpath(path).write_bytes(content)
+    restore_patch(source, state["head"], selected)
+    request["conflicted_tests"] = sorted(
+        p for p in conflicts if {"test", "tests"}.intersection(Path(p).parts[:-1])
+    )
+    request["repair_base"] = prior
+    state["validation_base"] = base
+    print(
+        "Repair: refreshing checks on an updated main with unchanged repaired files.",
+        flush=True,
+    )
+
+
 def check():
     request = json.loads(WORK.joinpath("request.json").read_text())
     remaining_time(request)
@@ -781,6 +822,14 @@ def check():
     command("git", "apply", str(WORK / "patch.diff"), cwd=source)
     allowed = allowed_paths(request)
     guard(source, state["head"], allowed, validation_base=base)
+    latest_base = command(
+        "git", "ls-remote", "origin", "refs/heads/main", cwd=source
+    ).partition("\t")[0]
+    refresh_validation_base(source, request, latest_base)
+    base = state.get("validation_base", state["base"])
+    allowed = allowed_paths(request)
+    guard(source, state["head"], allowed, validation_base=base)
+    WORK.joinpath("request.json").write_text(json.dumps(request))
     command("git", "add", "--all", cwd=source)
     env = dict(os.environ)
     names = command("git", "diff", "--name-only", "--cached", cwd=source).splitlines()
@@ -853,13 +902,14 @@ def check():
     )
 
 
-def current_request(request: dict) -> dict:
+def current_request(request: dict, *, check_base: bool = True) -> dict:
     state = request["state"]
     remaining_time(request)
     if request["deadline"] != repair_deadline(state):
         raise ValueError("Repair deadline changed.")
     if (
-        "validation_base" in state
+        check_base
+        and "validation_base" in state
         and state["validation_base"] != api("git/ref/heads/main")["object"]["sha"]
     ):
         raise ValueError("Main changed before validation.")
@@ -936,6 +986,21 @@ def guard_native_dispatch(state: dict):
 def stage():
     public_gate()
     request = json.loads(WORK.joinpath("request.json").read_text())
+    if "repair_base" in request:
+        original = {
+            **request,
+            "state": {**request["state"], "validation_base": request["repair_base"]},
+        }
+        current_request(original, check_base=False)
+        if (
+            request["state"]["validation_base"]
+            != api("git/ref/heads/main")["object"]["sha"]
+        ):
+            raise ValueError("Main changed after the refreshed checks.")
+        publish(
+            request["state"],
+            "Repair checks refreshed on current main; validation remains required.",
+        )
     current_request(request)
     state = request["state"]
     base = state.get("validation_base", state["base"])

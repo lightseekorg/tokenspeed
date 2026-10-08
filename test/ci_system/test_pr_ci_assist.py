@@ -1022,6 +1022,35 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     with pytest.raises(ValueError, match="selected commit"):
         write_source(tmp_path, "f" * 40, "test/ci/example.yaml", "amd-1gpu")
 
+    # A main update outside the model's patch can refresh checks while keeping
+    # the resolved source; an overlapping change needs a fresh model repair.
+    git("remote", "add", "origin", str(tmp_path))
+    git("checkout", "--detach", base)
+    other.write_text("base_only = False\n")
+    git("add", "--", "base.py")
+    git("commit", "-s", "-m", "updated base")
+    updated = git("rev-parse", "HEAD")
+    git("checkout", "--detach", head)
+    file.write_text("value = 4\n")
+    request = {"state": {"head": head, "base": common, "validation_base": base}}
+    repair.refresh_validation_base(tmp_path, request, updated)
+    assert file.read_text() == "value = 4\n" and not other.exists()
+    assert request["state"]["validation_base"] == updated
+    assert request["repair_base"] == base
+    assert repair.guard(tmp_path, head, {"model.py"}, validation_base=updated)
+    git("reset", "--hard", head)
+    git("checkout", "--detach", updated)
+    file.write_text("value = 5\n")
+    git("add", "--", "model.py")
+    git("commit", "-s", "-m", "overlapping base")
+    overlapping = git("rev-parse", "HEAD")
+    git("checkout", "--detach", head)
+    file.write_text("value = 4\n")
+    request["state"]["validation_base"] = base
+    with pytest.raises(ValueError, match="Main changed repaired files"):
+        repair.refresh_validation_base(tmp_path, request, overlapping)
+    assert file.read_text() == "value = 4\n"
+
 
 def test_source_change_stops_before_dispatch(monkeypatch, tmp_path, selected):
     _, state = selected
