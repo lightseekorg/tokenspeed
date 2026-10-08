@@ -113,6 +113,9 @@ jobs:
           node-version: '24'
       - if: '!inputs.check_only'
         run: npm install --global @moonshot-ai/kimi-code@2.1.1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - run: python3 -m pip install pyyaml ruff
       - name: Prepare provider configuration
         if: '!inputs.check_only'
