@@ -126,6 +126,7 @@ def test_triton_fp8_moe_matches_torch(
     )
     topk_ids = _topk_ids(num_tokens, num_experts, top_k, generator)
     topk_ids[0, 1] = -1
+    topk_ids[1, 0] = num_experts
     topk_weights = torch.rand(
         num_tokens, top_k, device="cuda", dtype=torch.float32, generator=generator
     )

@@ -137,10 +137,17 @@ def _validate(
 
 
 if platform.is_amd:
+    from tokenspeed_kernel.ops.moe.triton._common import (
+        _combine,
+        _routing,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
         gluon_fp8_block_dequantize,
         gluon_fp8_block_exact_mfma_moe,
         gluon_fp8_block_warp_decode_moe,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.fp8 import (
+        launch_gluon_fp8_block_experts_gfx1250,
     )
 
     def gluon_fp8_moe_weights(plan: dict, w: torch.nn.Module) -> None:
@@ -281,3 +288,105 @@ if platform.is_amd:
             do_finalize=do_finalize,
             enable_pdl=enable_pdl,
         )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_fp8_block_precomputed_moe_apply_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"fp8"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False, True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ep_size": frozenset({1, 4}),
+            "ispp_alignment": frozenset({512}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "fp8_scale_block_shape": frozenset({(_FP8_BLOCK, _FP8_BLOCK)}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_fp8_block_precomputed_moe_apply_gfx1250(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Apply block-E4M3 experts to BF16 activations with gfx1250 WMMA.
+
+        Weight tiles are upcast to BF16 in registers and each 128x128 block's
+        FP32 inverse scale multiplies its FP32 partial product, so neither the
+        weights nor the activations are requantized.
+
+        Args:
+            plan: MoE execution plan selecting SiLU/SwiGLU activation.
+            x: Contiguous BF16 hidden states ``[tokens, hidden]``.
+            w: Module containing block-E4M3 experts and their inverse scales.
+            router_logits: Unused for precomputed routing.
+            topk_weights: Route weights ``[tokens, top_k]``.
+            topk_ids: Global expert ids ``[tokens, top_k]``; ids outside this
+                rank's experts contribute zero.
+            num_tokens_global: Unused EP token count.
+            max_num_tokens_per_gpu: Unused token-capacity hint.
+            do_finalize: Must be true.
+            enable_pdl: Unused launch hint.
+
+        Returns:
+            Finalized BF16 states ``[tokens, hidden]``.
+        """
+        validated_weights, validated_ids, swiglu_limit = _validate(
+            plan, x, w, topk_weights, topk_ids, do_finalize
+        )
+        if x.shape[0] == 0:
+            return torch.empty_like(x)
+        num_experts = w.w13_weight.shape[0]
+        if int(getattr(w, "ep_size", 1)) > 1:
+            num_local_experts = int(getattr(w, "num_local_experts", num_experts))
+            validated_ids = (
+                validated_ids - int(getattr(w, "ep_rank", 0)) * num_local_experts
+            )
+        expert_route_ids, expert_counts = _routing(validated_ids, num_experts)
+        route_output = torch.empty(
+            (validated_ids.numel(), x.shape[1]), device=x.device, dtype=x.dtype
+        )
+        output = torch.empty_like(x)
+        intermediate = torch.empty(
+            (validated_ids.numel(), w.w13_weight.shape[1] // 2),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        launch_gluon_fp8_block_experts_gfx1250(
+            x,
+            w.w13_weight,
+            w.w2_weight,
+            w.w13_weight_scale_inv,
+            w.w2_weight_scale_inv,
+            expert_route_ids,
+            expert_counts,
+            validated_ids.shape[1],
+            swiglu_limit,
+            intermediate,
+            route_output,
+        )
+        # Expert programs skip ids outside this rank; those rows stay uninitialized.
+        invalid = (validated_ids < 0) | (validated_ids >= num_experts)
+        route_output.view(invalid.shape[0], invalid.shape[1], -1).masked_fill_(
+            invalid.unsqueeze(-1), 0
+        )
+        _combine(route_output, validated_weights, output)
+        return output

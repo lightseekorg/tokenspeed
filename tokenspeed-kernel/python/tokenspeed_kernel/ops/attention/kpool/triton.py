@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -257,30 +258,38 @@ def _select_pools_dense(
     apply_relu: bool,
     max_num_pools: int,
     use_cute_dsl_topk: bool,
+    logical_topk: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> torch.Tensor:
     num_tokens = q.shape[0]
     if max_num_pools <= topk_pools:
         return torch.empty((num_tokens, topk_pools), dtype=torch.int32, device=q.device)
 
+    # Bounded selectors read only each row's valid pools, so the scorer can
+    # leave the padded columns uninitialized.
+    bounded_topk = use_cute_dsl_topk or logical_topk is not None
     row_bytes = max_num_pools * torch.float32.itemsize
     rows_per_tile = min(num_tokens, max(1, _MAX_DENSE_LOGITS_BYTES // row_bytes))
     pool_indices = (
         torch.empty(
             (num_tokens, topk_pools),
-            dtype=torch.int32 if use_cute_dsl_topk else torch.int64,
+            dtype=torch.int32 if bounded_topk else torch.int64,
             device=q.device,
         )
-        if use_cute_dsl_topk or rows_per_tile < num_tokens
+        if bounded_topk or rows_per_tile < num_tokens
         else None
     )
     logits_workspace = torch.empty(
         (rows_per_tile, max_num_pools), dtype=torch.float32, device=q.device
     )
     pool_lens = None
-    if use_cute_dsl_topk:
+    if bounded_topk:
         pool_lens = torch.div(causal_lens, pool_size, rounding_mode="floor").to(
             torch.int32
         )
+    if logical_topk is not None:
+        pool_lens = pool_lens.clamp_(0, max_num_pools)
+        pool_starts = torch.zeros_like(pool_lens)
+        selected_lens = torch.empty_like(pool_lens)
 
     for start in range(0, num_tokens, rows_per_tile):
         end = min(start + rows_per_tile, num_tokens)
@@ -297,9 +306,18 @@ def _select_pools_dense(
             apply_relu=apply_relu,
             max_num_pools=max_num_pools,
             out=logits_workspace[: end - start],
-            length_masked_consumer=use_cute_dsl_topk,
+            length_masked_consumer=bounded_topk,
         )
-        if use_cute_dsl_topk:
+        if logical_topk is not None:
+            logical_topk(
+                logits,
+                pool_starts[start:end],
+                pool_lens[start:end],
+                topk=topk_pools,
+                out=pool_indices[start:end],
+                lens_out=selected_lens[start:end],
+            )
+        elif use_cute_dsl_topk:
             assert pool_indices is not None
             cute_dsl_decode_topk, _ = _load_cute_dsl_topk()
             cute_dsl_decode_topk(
@@ -375,6 +393,55 @@ def triton_dense_kpool_decode_topk(
         Global FlatKV slots and valid counts.
     """
     del chunk_pools
+    return dense_kpool_decode_topk(
+        q,
+        pooled_k_cache,
+        weights,
+        seq_lens,
+        index_block_table,
+        kv_block_table,
+        pool_size=pool_size,
+        page_size=page_size,
+        kv_page_size=kv_page_size,
+        topk_pools=topk_pools,
+        softmax_scale=softmax_scale,
+        q_len_per_req=q_len_per_req,
+        apply_relu=apply_relu,
+        append_tail=append_tail,
+        max_seq_len=max_seq_len,
+        out=out,
+        lens_out=lens_out,
+        logical_topk=None,
+    )
+
+
+def dense_kpool_decode_topk(
+    q: torch.Tensor,
+    pooled_k_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    index_block_table: torch.Tensor,
+    kv_block_table: torch.Tensor,
+    *,
+    pool_size: int,
+    page_size: int,
+    kv_page_size: int,
+    topk_pools: int,
+    softmax_scale: float,
+    q_len_per_req: int,
+    apply_relu: bool,
+    append_tail: bool,
+    max_seq_len: int | None,
+    out: torch.Tensor | None,
+    lens_out: torch.Tensor | None,
+    logical_topk: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score every visible pool densely, select, and expand to FlatKV slots.
+
+    ``logical_topk`` is a bounded ``(logits, row_starts, row_ends, *, topk,
+    out, lens_out)`` selector reading only each row's valid pools; ``None``
+    keeps the CuTe DSL or ``torch.topk`` selection.
+    """
     pool_size, topk_pools = int(pool_size), int(topk_pools)
     q_len_per_req = int(q_len_per_req)
     num_tokens = q.shape[0]
@@ -401,11 +468,12 @@ def triton_dense_kpool_decode_topk(
     )
     _, has_cute_dsl_decode_topk = _load_cute_dsl_topk()
     use_cute = (
-        has_cute_dsl_decode_topk()
+        logical_topk is None
+        and has_cute_dsl_decode_topk()
         and topk_pools == _CUTE_DSL_TOPK_POOLS
         and q_len_per_req in _CUTE_DSL_Q_LENS
     )
-    if use_cute or torch.cuda.is_current_stream_capturing():
+    if use_cute or logical_topk is not None or torch.cuda.is_current_stream_capturing():
         max_num_pools = max(index_block_table.shape[1] * int(page_size), 1)
         if max_seq_len is not None:
             if int(max_seq_len) < 0:
@@ -431,6 +499,7 @@ def triton_dense_kpool_decode_topk(
         apply_relu=apply_relu,
         max_num_pools=max_num_pools,
         use_cute_dsl_topk=use_cute,
+        logical_topk=logical_topk,
     )
     return expand_kpool_to_flat_kv(
         pool_indices,

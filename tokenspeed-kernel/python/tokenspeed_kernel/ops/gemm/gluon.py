@@ -430,7 +430,7 @@ if current_platform().is_amd:
             ),
             priority=Priority.SPECIALIZED,
             traits={
-                "m": frozenset(range(1, 17)),
+                "m": frozenset(range(1, 65)),
                 "n_align": frozenset({128}),
                 "k_align": frozenset({128}),
                 "k_min": frozenset({128}),

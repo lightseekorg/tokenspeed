@@ -1174,7 +1174,7 @@ def test_mhc_pre_split_count():
     base = torch.randn(24, device=DEVICE, generator=generator)
 
     def run(tokens):
-        # Up to 256 tokens take the split-K GEMM and the generic mix kernel.
+        # Up to 256 tokens take the split-K GEMM and the four-stream mix kernel.
         args = (x[:tokens], fn, scale, base, 1e-6, 1e-5, 3)
         actual = residual.triton_mhc_pre(*args, norm_weight=None, norm_eps=None)
         for got, want in zip(actual, _reference(*args), strict=True):
@@ -1197,7 +1197,7 @@ def test_mhc_pre_split_count():
     sweep = (65, 130, 200, 256)
     warm_specialization_classes(run, key, sweep, range(1, 257))
     with assert_no_triton_compile(
-        residual._mhc_prenorm_gemm_triton_kernel, residual._mhc_pre_mix_triton_kernel
+        residual._mhc_prenorm_gemm_triton_kernel, residual._mhc_pre_mix_hc4_kernel
     ):
         for tokens in sweep:
             run(tokens)

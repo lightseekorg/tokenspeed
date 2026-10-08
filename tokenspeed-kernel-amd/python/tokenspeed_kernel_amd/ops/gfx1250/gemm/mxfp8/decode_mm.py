@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 
 _BLOCK_M = 16
+_FP32_WIDE_BLOCK_M = 64
 _BLOCK_N = 16
 _UE8M0_MIN_K = 256
 _UE8M0_BLOCK_K = 512
@@ -157,6 +158,21 @@ def _select_split_k(contract: str, m: int, n: int, k: int) -> int:
             return 5
         return 1
     raise ValueError(f"unknown MXFP8 scale contract: {contract}")
+
+
+def _select_fp32_wide_tile(n: int, k: int) -> tuple[int, int, int]:
+    """Return ``(BLOCK_N, SPLIT_K, BLOCK_K)`` for one 17-to-64-row tile.
+
+    Outputs up to 512 columns leave too few N tiles to fill the CUs, so K
+    splits four ways into 512-wide tiles. Wider outputs stay direct with the
+    widest K tile up to 1024 that divides K, and from 4096 columns a 32-column
+    tile halves the workgroup count. Across the GLM-5.3 and V4 projections at
+    64 rows this lands within 5% of the best swept configuration.
+    """
+    if n <= 512 and k % (4 * 512) == 0:
+        return _BLOCK_N, 4, 512
+    block_k = next(size for size in (1024, 512, 256, 128) if k % size == 0)
+    return (2 * _BLOCK_N if n >= 4096 else _BLOCK_N), 1, block_k
 
 
 def _select_fp32_block_k(k: int, *, allow_long: bool) -> int:
@@ -576,18 +592,22 @@ def gluon_mm_fp8_blockscale_gfx1250(
     M: gl.constexpr,
     N: gl.constexpr,
     K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     SPLIT_K: gl.constexpr,
     TDM_FUSION: gl.constexpr,
+    WARP_BASES: gl.constexpr,
 ):
     """Compute a canonical FP32 ``[128,128]`` block-scaled projection.
 
-    The normal producer assigns one wave to a ``16 x 16`` output tile. The
-    measured fused-TDM specialization assigns two waves to ``16 x 32`` and
-    combines the A and B tensor loads with disjoint wave hints. Both variants
-    stage variable-width K tiles in padded, triple-buffered LDS.
+    The normal producer covers one ``BLOCK_M x BLOCK_N`` output tile with the
+    16x16 WMMA tiles that WARP_BASES assigns to its waves; tiles the waves
+    leave repeat in registers. A 64-row tile streams each weight tile once for
+    the whole batch. The measured fused-TDM specialization assigns two waves to
+    ``16 x 32`` and combines the A and B tensor loads with disjoint wave hints.
+    All variants stage variable-width K tiles in padded, triple-buffered LDS.
 
     Compute slices every staged tile into 128-wide raw E4M3 WMMA operations.
     Each FP32 partial is multiplied by its per-row activation scale and its
@@ -596,21 +616,20 @@ def gluon_mm_fp8_blockscale_gfx1250(
     Direct execution writes BF16; split execution writes FP32 partials for the
     reduction kernel.
     """
-    BLOCK_M: gl.constexpr = 16
     WMMA_BLOCK_K: gl.constexpr = 128
     NUM_K_SUBTILES: gl.constexpr = BLOCK_K // WMMA_BLOCK_K
     gl.static_assert(BLOCK_K >= WMMA_BLOCK_K and BLOCK_K % WMMA_BLOCK_K == 0)
     gl.static_assert(NUM_BUFFERS == 3)
     gl.static_assert(TDM_FUSION >= 0)
     gl.static_assert(TDM_FUSION <= 1)
+    gl.static_assert(BLOCK_M == 16 or BLOCK_M == 64)
+    gl.static_assert(BLOCK_N == 16 or BLOCK_N == 32)
     num_warps: gl.constexpr = gl.num_warps()
     if TDM_FUSION == 0:
-        gl.static_assert(num_warps == 1)
-        gl.static_assert(BLOCK_N == 16)
         TDM_OPS_PER_TILE: gl.constexpr = 2
     else:
         gl.static_assert(num_warps == 2)
-        gl.static_assert(BLOCK_N == 32)
+        gl.static_assert(BLOCK_M == 16 and BLOCK_N == 32)
         TDM_OPS_PER_TILE: gl.constexpr = 1
     gl.static_assert(SPLIT_K >= 1 and K % SPLIT_K == 0)
     gl.static_assert(0 < M and M <= BLOCK_M)
@@ -628,14 +647,10 @@ def gluon_mm_fp8_blockscale_gfx1250(
         split_id = pid // NUM_N_TILES
     k_start = split_id * K_PER_SPLIT
     scale_start = split_id * (K_PER_SPLIT // WMMA_BLOCK_K)
-    if BLOCK_N == 16:
-        warp_bases: gl.constexpr = []
-    else:
-        warp_bases: gl.constexpr = [[0, 1]]
     wmma_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=warp_bases,
+        warp_bases=WARP_BASES,
         reg_bases=[],
         instr_shape=[16, 16, 128],
     )
@@ -893,6 +908,7 @@ def _validate_common(
     B_scales: torch.Tensor | None,
     out_dtype: torch.dtype,
     out: torch.Tensor | None,
+    max_m: int = _BLOCK_M,
 ) -> tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError("A and B must be 2D")
@@ -912,8 +928,8 @@ def _validate_common(
         raise ValueError("A_scales and B_scales are required")
     if out_dtype != torch.bfloat16:
         raise ValueError(f"gfx1250 MXFP8 GEMV requires BF16 output, got {out_dtype}")
-    if not 1 <= m <= _BLOCK_M:
-        raise ValueError(f"gfx1250 MXFP8 GEMV requires 1 <= M <= 16, got {m}")
+    if not 1 <= m <= max_m:
+        raise ValueError(f"gfx1250 MXFP8 GEMV requires 1 <= M <= {max_m}, got {m}")
     if n % _BLOCK_N != 0:
         raise ValueError(f"gfx1250 MXFP8 GEMV requires N % 16 == 0, got N={n}")
     if out is None:
@@ -1074,10 +1090,11 @@ def launch_gluon_mm_fp8_blockscale_gfx1250(
     projections ``1536 x 4096`` and ``2048 x 7168`` use four and seven K
     partitions, respectively, for ``M < 16``. The latter also selects the
     two-wave fused-TDM producer; the full 16-row batch and other shapes stay on
-    the one-wave direct path.
+    the one-wave direct path. Batches of 17 to 64 rows run as one 64-row tile
+    of four waves, so each weight tile streams once for the whole batch.
 
     Args:
-        A: Row-major E4M3 activation matrix `[M,K]`, with `1 <= M <= 16`.
+        A: Row-major E4M3 activation matrix `[M,K]`, with `1 <= M <= 64`.
         B: Row-major E4M3 weight matrix `[N,K]`.
         A_scales: Per-row FP32 scales `[M,K/128]`.
         B_scales: FP32 scales `[N/128,K/128]`.
@@ -1100,6 +1117,7 @@ def launch_gluon_mm_fp8_blockscale_gfx1250(
         B_scales,
         out_dtype,
         out,
+        max_m=_FP32_WIDE_BLOCK_M,
     )
     if n % 128 != 0 or k < _FP32_SCALE_MIN_K or k % 128 != 0:
         raise ValueError(
@@ -1119,25 +1137,79 @@ def launch_gluon_mm_fp8_blockscale_gfx1250(
                 f"{name} must be row-major GPU FP32 {shape} colocated with A"
             )
 
+    if m > _BLOCK_M:
+        block_n, split_k, block_k = _select_fp32_wide_tile(n, k)
+        _launch_fp32_blockscale(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out,
+            block_m=_FP32_WIDE_BLOCK_M,
+            block_n=block_n,
+            block_k=block_k,
+            split_k=split_k,
+        )
+        return out
+
     split_k = _select_split_k("fp32", m, n, k)
     if split_k < 1 or k % split_k != 0 or (k // split_k) % 128 != 0:
         raise RuntimeError(f"invalid FP32-scale split-K factor {split_k} for K={k}")
-    split_size = k // split_k
-    kernel_block_k = _select_fp32_block_k(
-        split_size,
-        allow_long=k >= 4096,
+    tdm_fusion = _select_tdm_fusion("fp32", m, n, k, split_k)
+    _launch_fp32_blockscale(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        out,
+        block_m=_BLOCK_M,
+        block_n=_tdm_block_n(tdm_fusion),
+        block_k=_select_fp32_block_k(k // split_k, allow_long=k >= 4096),
+        split_k=split_k,
+        tdm_fusion=tdm_fusion,
     )
+    return out
+
+
+def _launch_fp32_blockscale(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor,
+    B_scales: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    split_k: int,
+    tdm_fusion: int = _TDM_FUSION_NONE,
+) -> None:
+    """Launch the FP32-scale producer, plus the reduction when K is split.
+
+    A 16-row tile runs one wave per 16-column WMMA tile. A 64-row tile stacks
+    four waves along M, and each wave repeats its tile along a 32-column N
+    block in registers.
+    """
+    m, k = A.shape
+    n = B.shape[0]
+    if split_k < 1 or k % split_k != 0 or (k // split_k) % block_k != 0:
+        raise RuntimeError(
+            f"invalid FP32-scale split-K {split_k} / BLOCK_K {block_k} for K={k}"
+        )
+    if n % block_n != 0:
+        raise RuntimeError(f"FP32-scale BLOCK_N {block_n} must divide N={n}")
+    if tdm_fusion != _TDM_FUSION_NONE:
+        warp_bases = ((0, 1),)
+    elif block_m == _BLOCK_M:
+        warp_bases = () if block_n == _BLOCK_N else ((0, 1),)
+    else:
+        warp_bases = ((1, 0), (2, 0))
     if split_k == 1:
         kernel_out = out
         stride_ok = 0
     else:
         kernel_out = torch.empty((split_k, m, n), dtype=torch.float32, device=A.device)
         stride_ok = kernel_out.stride(0)
-
-    tdm_fusion = _select_tdm_fusion("fp32", m, n, k, split_k)
-    block_n = _tdm_block_n(tdm_fusion)
-    if n % block_n != 0:
-        raise RuntimeError(f"TDM fusion mode {tdm_fusion} requires N % {block_n} == 0")
     gluon_mm_fp8_blockscale_gfx1250[(n // block_n * split_k,)](
         A,
         B,
@@ -1158,12 +1230,14 @@ def launch_gluon_mm_fp8_blockscale_gfx1250(
         M=m,
         N=n,
         K=k,
+        BLOCK_M=block_m,
         BLOCK_N=block_n,
-        BLOCK_K=kernel_block_k,
+        BLOCK_K=block_k,
         NUM_BUFFERS=_NUM_BUFFERS,
         SPLIT_K=split_k,
         TDM_FUSION=tdm_fusion,
-        num_warps=block_n // _BLOCK_N,
+        WARP_BASES=warp_bases,
+        num_warps=1 << len(warp_bases),
         waves_per_eu=_WAVES_PER_EU,
     )
     if split_k > 1:
@@ -1184,7 +1258,6 @@ def launch_gluon_mm_fp8_blockscale_gfx1250(
             num_warps=1,
             waves_per_eu=_WAVES_PER_EU,
         )
-    return out
 
 
 __all__ = [

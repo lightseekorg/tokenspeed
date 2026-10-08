@@ -21,6 +21,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.routing import (
         invoke_sigmoid_bias_topk_route_prefill_gluon as invoke_sigmoid_bias_topk_route_prefill_gfx1250,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.moe.sigmoid_bias_topk import (
+        launch_gluon_sigmoid_bias_topk_route_gfx1250,
+    )
 
     @register_kernel(
         "moe",
@@ -104,9 +107,48 @@ if current_platform().is_amd:
         )
         return topk_weights.to(weights_dtype), topk_ids
 
+    @register_kernel(
+        "moe",
+        "sigmoid_bias_topk",
+        name="gluon_sigmoid_bias_topk_route_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            "router_logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+        ),
+        priority=Priority.PERFORMANT,
+        traits={
+            "experts": frozenset(range(1, 1025)),
+            "topk": frozenset(range(1, 17)),
+        },
+    )
+    def gluon_sigmoid_bias_topk_route_gfx1250(
+        *,
+        router_logits: torch.Tensor,
+        correction_bias: torch.Tensor,
+        topk: int,
+        routed_scaling_factor: float,
+        normalize_topk_weights: bool,
+        weights_dtype: torch.dtype = torch.float32,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_weights, topk_ids = launch_gluon_sigmoid_bias_topk_route_gfx1250(
+            router_logits=router_logits,
+            correction_bias=correction_bias,
+            topk=topk,
+            routed_scaling_factor=routed_scaling_factor,
+            normalize_topk_weights=normalize_topk_weights,
+            weights_dtype=weights_dtype,
+        )
+        return topk_weights, topk_ids
+
     __all__ = [
         "gluon_sigmoid_bias_topk_gfx1250",
         "gluon_sigmoid_bias_topk_gfx950",
+        "gluon_sigmoid_bias_topk_route_gfx1250",
     ]
 else:
     __all__ = []

@@ -884,7 +884,23 @@ def _mhc_pre_impl(
             **fused_norm_kwargs,
         )
     else:
-        if pre_mix_impl is None:
+        if pre_mix_impl is None and hc_mult == 4:
+            mhc_pre_mix_hc4(
+                gemm_out_mul,
+                gemm_out_sqrsum,
+                hc_scale,
+                hc_base,
+                pre_mix,
+                post_mix,
+                comb_mix,
+                hidden_size=hidden_size,
+                rms_eps=rms_eps,
+                hc_eps=hc_eps,
+                sinkhorn_iters=sinkhorn_iters,
+                n_splits=n_splits,
+                num_tokens=num_tokens,
+            )
+        elif pre_mix_impl is None:
             _mhc_pre_mix_triton_kernel[(num_tokens,)](
                 gemm_out_mul,
                 gemm_out_sqrsum,
