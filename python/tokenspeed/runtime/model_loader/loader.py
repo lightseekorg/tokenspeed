@@ -407,6 +407,22 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        yield from self.get_checkpoint_weights(
+            model_config.model_path, model_config.revision, model
+        )
+
+    def get_checkpoint_weights(
+        self,
+        model_path: str,
+        revision: str | None,
+        model: nn.Module,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Stream the checkpoint at ``model_path`` the way ``load_model`` does.
+
+        The in-place reload (``ModelRunner.update_weights_from_disk``) reads
+        through here too, so a reloaded model binds the new checkpoint
+        directory and picks its load group exactly as at startup.
+        """
         # Draft (NextN/MTP) models embedded in the target checkpoint expose
         # ``checkpoint_weight_name_filter`` so only the shards holding their
         # weights are read instead of the whole checkpoint.
@@ -414,8 +430,8 @@ class DefaultModelLoader(BaseModelLoader):
         bind_checkpoint_dir = getattr(model, "bind_checkpoint_dir", None)
         if callable(bind_checkpoint_dir):
             hf_folder, _, _ = self._prepare_weights(
-                model_config.model_path,
-                model_config.revision,
+                model_path,
+                revision,
                 getattr(model, "fall_back_to_pt_during_load", False),
             )
             bind_checkpoint_dir(hf_folder)
@@ -426,8 +442,8 @@ class DefaultModelLoader(BaseModelLoader):
             checkpoint_load_group = self.load_config.checkpoint_load_group
 
         primary_weights = DefaultModelLoader.Source(
-            model_config.model_path,
-            model_config.revision,
+            model_path,
+            revision,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )

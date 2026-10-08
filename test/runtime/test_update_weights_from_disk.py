@@ -55,6 +55,7 @@ from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
 from tokenspeed.runtime.engine.request_handler import RequestHandler  # noqa: E402
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.model_runner import ModelRunner  # noqa: E402
+from tokenspeed.runtime.model_loader import loader as loader_module  # noqa: E402
 
 
 class _TinyModel(torch.nn.Module):
@@ -90,6 +91,7 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     runner.model = model
     runner.device = "cpu"
     runner.gpu_id = 0
+    runner.checkpoint_load_group = None
     runner.model_config = SimpleNamespace(model_path=str(booted_from))
     runner.server_args = SimpleNamespace(
         load_format="auto",
@@ -382,6 +384,74 @@ class TestRealCheckpoint(unittest.TestCase):
             self.assertTrue(output.success, output.message)
             torch.testing.assert_close(model.w.data, expected["w"])
         self.assertEqual(handler.clear_cache_fn.call_count, 2)
+
+
+class TestReloadMatchesStartupLoad(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _load(self, runner, path):
+        return runner.update_weights_from_disk(
+            UpdateWeightFromDiskReqInput(model_path=str(path))
+        )
+
+    def test_checkpoint_dir_is_bound_to_the_new_checkpoint_before_loading(self):
+        # DeepSeek-V4.1 reads its Engram tables from the bound directory, so a
+        # reload that keeps the old binding loads them from the old checkpoint.
+        _write_checkpoint(self.root / "step-0", scale=1.0)
+        _write_checkpoint(self.root / "step-1", scale=7.0)
+        model = _TinyModel()
+        events: list[tuple[str, str]] = []
+        model.bind_checkpoint_dir = lambda path: events.append(("bind", path))
+
+        def load(weights):
+            for name, tensor in weights:
+                events.append(("load", name))
+                dict(model.named_parameters())[name].data.copy_(tensor)
+
+        model.load_weights = load
+        runner = _runner(model, self.root / "step-0")
+
+        ok, message = self._load(runner, self.root / "step-1")
+
+        self.assertTrue(ok, message)
+        self.assertEqual(events[0], ("bind", str(self.root / "step-1")))
+        self.assertEqual(sorted(name for _, name in events[1:]), ["b", "w"])
+
+    def _groups_read(self, runner, path) -> list:
+        real = loader_module.DefaultModelLoader._get_weights_iterator
+        groups = []
+
+        def spy(loader, source, weight_name_filter, checkpoint_load_group):
+            groups.append(checkpoint_load_group)
+            return real(loader, source, weight_name_filter, checkpoint_load_group)
+
+        with mock.patch.object(
+            loader_module.DefaultModelLoader, "_get_weights_iterator", spy
+        ):
+            ok, message = self._load(runner, path)
+        self.assertTrue(ok, message)
+        return groups
+
+    def test_reload_falls_back_to_the_runners_checkpoint_load_group(self):
+        # The startup LoadConfig carries the runner's group; a pipeline stage's
+        # draft must not join collectives with ranks that never built it.
+        _write_checkpoint(self.root / "step-1", scale=7.0)
+        runner = _runner(_TinyModel(), self.root / "step-1")
+        runner.checkpoint_load_group = (0, 1)
+
+        self.assertEqual(self._groups_read(runner, self.root / "step-1"), [(0, 1)])
+
+    def test_models_own_checkpoint_load_group_wins(self):
+        _write_checkpoint(self.root / "step-1", scale=7.0)
+        model = _TinyModel()
+        model.checkpoint_load_group = (2, 3)
+        runner = _runner(model, self.root / "step-1")
+        runner.checkpoint_load_group = (0, 1)
+
+        self.assertEqual(self._groups_read(runner, self.root / "step-1"), [(2, 3)])
 
 
 if __name__ == "__main__":

@@ -498,12 +498,13 @@ class ModelRunner:
     def update_weights_from_disk(self, obj) -> tuple[bool, str]:
         """Reload this worker's parameters in place from a checkpoint directory.
 
-        The checkpoint is read with the startup loader and handed to the
-        model's own ``load_weights``, so fused and stacked parameters map
-        exactly as on the initial load. The reported count comes from the
-        tensors the loader actually yielded, not from the request: a
-        checkpoint that yields nothing is a failure, not a success that
-        updated nothing.
+        The checkpoint is streamed the way the startup loader streams it
+        (``DefaultModelLoader.get_checkpoint_weights``) into the model's own
+        ``load_weights``, so fused and stacked parameters map, the checkpoint
+        directory is bound and the load group is chosen as on the initial
+        load. The reported count comes from the tensors the loader actually
+        yielded, not from the request: a checkpoint that yields nothing is a
+        failure, not a success that updated nothing.
         """
         from tokenspeed.runtime.configs.load_config import LoadConfig
         from tokenspeed.runtime.model_loader.loader import (
@@ -526,6 +527,7 @@ class ModelRunner:
                     weight_loader_prefetch_num_threads=(
                         self.server_args.weight_loader_prefetch_num_threads
                     ),
+                    checkpoint_load_group=self.checkpoint_load_group,
                 )
             )
             if not isinstance(loader, DefaultModelLoader):
@@ -535,21 +537,7 @@ class ModelRunner:
                     "files; an in-place reload needs a file-backed format"
                 )
 
-            # Same primary source ``DefaultModelLoader._get_all_weights``
-            # builds at startup, pointed at the new checkpoint.
-            source = DefaultModelLoader.Source(
-                model_path,
-                revision=None,
-                prefix="",
-                fall_back_to_pt=getattr(
-                    self.model, "fall_back_to_pt_during_load", False
-                ),
-            )
-            weights = loader._get_weights_iterator(
-                source,
-                getattr(self.model, "checkpoint_weight_name_filter", None),
-                getattr(self.model, "checkpoint_load_group", None),
-            )
+            weights = loader.get_checkpoint_weights(model_path, None, self.model)
 
             def _counted():
                 nonlocal consumed
