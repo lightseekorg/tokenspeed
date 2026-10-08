@@ -33,6 +33,7 @@ import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: F401
 import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
+import tokenspeed_kernel.ops.gemm.torch  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm_cutedsl  # noqa: F401
