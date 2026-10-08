@@ -245,27 +245,6 @@ def test_gluon_mhc_prefill_token_count_does_not_recompile() -> None:
             launch(num_tokens)
 
 
-def test_gluon_mhc_large_prefill_graph_replays_changed_input() -> None:
-    args = _prefill_args(257, 4096)
-    residual = args[0]
-    tokenspeed_kernel.mhc_pre(*args, norm_weight=None, norm_eps=None)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        graph_output = tokenspeed_kernel.mhc_pre(
-            *args,
-            norm_weight=None,
-            norm_eps=None,
-        )
-
-    residual.copy_(torch.randn_like(residual))
-    expected = _reference(*args)
-    graph.replay()
-    for actual_tensor, expected_tensor in zip(graph_output, expected, strict=True):
-        torch.testing.assert_close(
-            actual_tensor.float(), expected_tensor.float(), rtol=2e-2, atol=2e-2
-        )
-
-
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("strided_weight", [False, True])

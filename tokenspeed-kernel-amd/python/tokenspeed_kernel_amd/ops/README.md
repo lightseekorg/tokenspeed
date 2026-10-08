@@ -756,21 +756,19 @@ updated page tables and lengths in place.
 
 ### gfx950 mHC pre-mapping
 
-For four BF16 residual streams, FP32 projection weights, hidden width 4096 or
-7168, and 20 Sinkhorn iterations on gfx950, calls with 1–64 token rows use the
-existing reduction kernel, 65–256 rows use the portable Triton path, and
-eligible calls above 256 rows use the complete Gluon prefill operation. Other
-configurations retain their existing registered backend.
-Inputs whose buffer offsets exceed signed 32-bit range retain the portable
-projection.
+The operation accepts BF16 residual streams shaped `[..., 4, hidden_size]`,
+FP32 projection weights shaped `[24, 4 * hidden_size]`, three FP32 scales,
+24 FP32 biases, normalization epsilons, and a Sinkhorn iteration count. It returns
+a BF16 layer input
+`[..., hidden_size]`, FP32 post coefficients `[..., 4, 1]`, and an FP32
+combination matrix `[..., 4, 4]`. Optional output RMS normalization takes a
+weight vector and its epsilon together.
 
-The projection computes 64 token rows and 24 outputs per workgroup. Four waves
-reuse each asynchronously staged FP32 weight tile while accumulating their own
-rows with FP32 matrix instructions. A Gluon reduction kernel accumulates the
-projection partials in order, computes the pre/post sigmoid coefficients, and
-normalizes the four-by-four combination matrix with 20 Sinkhorn rounds. A
-separate Gluon kernel applies the pre coefficients to the four streams and
-optionally performs output RMS normalization, preserving the intermediate
-BF16 rounding. Token and reduction-split counts are runtime arguments in the
-mixing stage; hidden width and normalization mode are fixed model geometry.
-The final projection tile is masked for arbitrary token counts.
+The four streams are flattened and projected with FP32 accumulation, while
+their squared values provide the residual RMS normalization factor. Projection
+partials are summed. Sigmoid transforms produce the pre/post
+coefficients; a stable softmax followed by alternating Sinkhorn row and column
+normalization produces the combination matrix. The pre coefficients mix the
+four residual streams into the layer input, rounded to BF16 before optional
+output RMS normalization. Staged projection weights are reused across token
+rows, and the final projection tile is masked for arbitrary token counts.

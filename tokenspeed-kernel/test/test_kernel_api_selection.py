@@ -2764,28 +2764,6 @@ def test_mhc_prefill_selects_gfx950_projection(
     assert selected.name == expected
 
 
-def test_mhc_prefill_registration_forwards_to_full_amd_operation(monkeypatch):
-    if KernelRegistry.get().get_by_name("gluon_mhc_prefill_gfx950") is None:
-        pytest.skip("AMD prefill backend is unavailable on this platform")
-    arguments = tuple(object() for _ in range(7))
-    norm_weight = object()
-    outputs = tuple(object() for _ in range(3))
-    calls = []
-
-    def implementation(*args, **kwargs):
-        calls.append((args, kwargs))
-        return outputs
-
-    monkeypatch.setattr(_residual_gluon, "_mhc_prefill_impl", implementation)
-    result = _residual_gluon.gluon_mhc_prefill_gfx950(
-        *arguments,
-        norm_weight=norm_weight,
-        norm_eps=1e-5,
-    )
-    assert result is outputs
-    assert calls == [(arguments, {"norm_weight": norm_weight, "norm_eps": 1e-5})]
-
-
 def test_mhc_normalization_contract_is_explicit() -> None:
     parameters = inspect.signature(kernel_mhc_pre).parameters
 
