@@ -275,7 +275,8 @@ def guard(
         raise RepairRejected("scope")
     for p in names:
         if p == NATIVE_CONFIG:
-            guard_native_task(source, head)
+            # Keep current main's trusted test commands when the PR is older.
+            guard_native_task(source, validation_base or head)
         elif {"test", "tests"}.intersection(Path(p).parts[:-1]):
             if validation_base is None:
                 raise ValueError("Test resolution requires a pinned main commit.")
@@ -651,7 +652,7 @@ assertions, thresholds and coverage; do not weaken or skip tests.
 Apply the repair with Edit or Write. Describing a proposed change without editing
 the allowed source does not complete this task.
 """)
-    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Finish the smallest substantiated repair promptly to leave time for dispatch and validation. Start with the actual failed step in diagnostics.txt and its CI specification. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
+    prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Finish the smallest substantiated repair promptly to leave time for dispatch and validation. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()

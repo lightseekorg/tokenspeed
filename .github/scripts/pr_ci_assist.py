@@ -907,14 +907,10 @@ def control(number: int, *, expected_command: int | None = None):
         and comment
         and comment["id"] == state["command"]
         and state["action"] == "fix"
-        and state["phase"] == "manual"
+        and state["phase"] in {"manual", "stale", "repairing"}
         and "candidate" not in state
         and "repair_run" in state
         and (state["head"], state["base"]) == (pr["head"]["sha"], pr["base"]["sha"])
-        and (
-            "validation_base" not in state
-            or state["validation_base"] == api("git/ref/heads/main")["object"]["sha"]
-        )
         and api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
     ):
         initial = True

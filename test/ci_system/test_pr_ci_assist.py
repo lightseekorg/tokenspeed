@@ -558,6 +558,29 @@ def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
     )
     with pytest.raises(ValueError, match="retain the original tests"):
         repair.guard(tmp_path, head, allowed)
+    # Main may update another command while this older PR needs its import fix.
+    main_task = original.replace(
+        "PYTHONPATH=tokenspeed-mla/python ",
+        'PYTHONPATH="tokenspeed-mla/python${PYTHONPATH:+:$PYTHONPATH}" ',
+    )
+    task.write_text(main_task)
+    assist.command("git", "add", ".", cwd=tmp_path)
+    assist.command(
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-s",
+        "-m",
+        "base",
+        cwd=tmp_path,
+    )
+    base = assist.command("git", "rev-parse", "HEAD", cwd=tmp_path)
+    task.write_text(main_task.replace(prefix, prefix[:-1] + suffix + '"'))
+    assert repair.guard(tmp_path, head, allowed, validation_base=base)
+    task.write_text(candidate)
+    with pytest.raises(ValueError, match="retain the original tests"):
+        repair.guard(tmp_path, head, allowed, validation_base=base)
     task.write_text(candidate.replace(suffix, ":$PYTHONPATH"))
     with pytest.raises(ValueError, match="retain the original tests"):
         repair.guard(tmp_path, head, allowed)
@@ -1141,6 +1164,8 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assist.control(state["pr"])
     assert not emitted and live[0]["phase"] == "manual"
     pr["head"]["sha"] = state["head"]
+    # An explicit retry may refresh main while retaining the authorized PR head.
+    live[0].update(phase="stale", validation_base="f" * 40)
     assist.control(state["pr"])
     assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
     assert live[0]["command"] == 43 and live[0]["repair_run"] == 201
