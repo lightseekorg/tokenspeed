@@ -27,6 +27,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -759,7 +760,14 @@ def runtime_lint(source: Path, request: dict):
         if s.get("name") == "Lint runtime Python with ruff"
     )
     result = subprocess.run(
-        ["bash", "-c", step["run"].strip() + " --output-format=json"],
+        [
+            "bash",
+            "-c",
+            step["run"]
+            .strip()
+            .replace("python -m ruff", f"{shlex.quote(sys.executable)} -I -m ruff", 1)
+            + " --output-format=json",
+        ],
         cwd=source,
         capture_output=True,
         text=True,
@@ -1315,6 +1323,24 @@ def current_request(request: dict, *, check_base: bool = True) -> dict:
     latest = latest_command(comments)
     if not latest or latest["id"] != state["command"]:
         raise ValueError("A newer command superseded this repair.")
+    if (
+        live
+        and live["phase"] == "manual"
+        and "repair_run" not in live
+        and "candidate" not in live
+        and state["repair_run"] == int(os.environ["GITHUB_RUN_ID"])
+        and all(
+            live[k] == state[k] for k in ("pr", "command", "head", "base", "action")
+        )
+        and state["phase"] == "repairing"
+        and state["action"] == "fix"
+        and state["head"] == pr["head"]["sha"]
+        and state["base"] == pr["base"]["sha"]
+    ):
+        publish(
+            state, "Continuing the authorized repair after an unowned monitor update."
+        )
+        live = state
     if (
         not live
         or live != state

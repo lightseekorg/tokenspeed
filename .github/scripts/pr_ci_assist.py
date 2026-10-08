@@ -943,9 +943,11 @@ def control(number: int, *, expected_command: int | None = None):
         and state["action"] == "fix"
         and state["phase"] in {"manual", "stale", "repairing"}
         and ("candidate" not in state or resume_run)
-        and "repair_run" in state
         and (state["head"], state["base"]) == (pr["head"]["sha"], pr["base"]["sha"])
-        and api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
+        and (
+            "repair_run" not in state
+            or api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
+        )
     ):
         initial = True
     diagnostics = (
@@ -1135,16 +1137,6 @@ def control(number: int, *, expected_command: int | None = None):
     native_statuses = [c["status"] for c in state["native_checks"]]
     if "candidate" in state:
         dispatch_native_checks(state)
-    if any(s in {"missing", "blocked"} for s in native_statuses) or (
-        "failed" in native_statuses
-        and (state["action"] != "fix" or "candidate" in state)
-    ):
-        state["phase"] = "manual"
-        publish(
-            state,
-            "Native checks need human intervention; no dispatch retry or PR update.",
-        )
-        return
     requested_fix = state["action"] == "fix" and "candidate" not in state
     lint = next(
         (
@@ -1165,6 +1157,17 @@ def control(number: int, *, expected_command: int | None = None):
         if lint and lint["status"] == "completed" and lint["conclusion"] == "failure"
         else None
     )
+    if (
+        "blocked" in native_statuses
+        or ("missing" in native_statuses and not (requested_fix and lint_run))
+        or ("failed" in native_statuses and not requested_fix)
+    ):
+        state["phase"] = "manual"
+        publish(
+            state,
+            "Native checks need human intervention; no dispatch retry or PR update.",
+        )
+        return
     if requested_fix and pr["mergeable"] is False:
         state["conflicts"] = True
         statuses = ["waiting"] * len(tasks)

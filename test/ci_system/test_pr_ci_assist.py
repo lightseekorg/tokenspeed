@@ -610,6 +610,8 @@ def test_runtime_lint_returns_unused_import_to_corrective_turn(monkeypatch, tmp_
     source = tmp_path / path
     source.parent.mkdir(parents=True)
     source.write_text("import math\n")
+    # Repository files must not replace the installed checker in the model runner.
+    tmp_path.joinpath("ruff.py").write_text('raise RuntimeError("untrusted checker")\n')
     request = dict(deadline=int(time.time()) + 60, data=dict(paths=[path]))
     feedback = tmp_path / "feedback.json"
     turns = []
@@ -1454,6 +1456,23 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assert tmp_path.joinpath("request.json").is_file()
     assert live[0]["repair_run"] == 200
     assert json.loads(tmp_path.joinpath("request.json").read_text())["lint_run"] == 102
+    # A legacy monitor can leave an unowned manual state after cancellation of
+    # the redundant original-head native run. Explicit dispatch still repairs
+    # the current lint failure; the fresh candidate must run its native checks.
+    workflow = "nvidia-kernel-library-tests.yml"
+    data["native_checks"] = [{"workflow": workflow, **NATIVE_CHECKS[workflow]}]
+    monkeypatch.setattr(
+        assist, "native_check", lambda *args: dict(workflow=workflow, status="missing")
+    )
+    live[0]["phase"] = "manual"
+    del live[0]["repair_run"]
+    emitted.clear()
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
+    assert live[0]["repair_run"] == 200
+    assert json.loads(tmp_path.joinpath("request.json").read_text())["lint_run"] == 102
+    del data["native_checks"]
     runs.pop()
     monkeypatch.setattr(assist, "report", lambda *args: "failed")
     assert (
@@ -1609,6 +1628,34 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     retry = json.loads(tmp_path.joinpath("request.json").read_text())
     assert retry["diagnostics"]["native_checks"] == [late]
     assert retry["resume_run"] == 203 and not retry["check_only"]
+
+
+def test_owned_request_recovers_only_an_unowned_monitor_update(monkeypatch, selected):
+    _, state = selected
+    state.update(action="fix", phase="repairing", repair_run=201)
+    request = dict(state=state, deadline=100)
+    pr = dict(head=dict(sha=state["head"]), base=dict(sha=state["base"]))
+    live = copy.deepcopy(state)
+    live["phase"] = "manual"
+    del live["repair_run"]
+    monkeypatch.setenv("GITHUB_RUN_ID", "201")
+    monkeypatch.setattr(repair.time, "time", lambda: 50)
+    monkeypatch.setattr(repair, "repair_deadline", lambda _: 100)
+    monkeypatch.setattr(repair, "pull", lambda _: pr)
+    monkeypatch.setattr(repair, "pages", lambda *args: [])
+    monkeypatch.setattr(repair, "load_state", lambda *args: live)
+    monkeypatch.setattr(repair, "latest_command", lambda _: dict(id=state["command"]))
+    published = []
+    monkeypatch.setattr(
+        repair, "publish", lambda s, _: published.append(copy.deepcopy(s))
+    )
+    assert repair.current_request(request) == pr
+    assert published == [state] and request["deadline"] == 100
+    # A different owner must never be overwritten by the previous repair.
+    live["repair_run"] = 202
+    with pytest.raises(ValueError, match="authorization or source changed"):
+        repair.current_request(request)
+    assert published == [state]
 
 
 def test_cancelled_repair_is_recovered_on_next_reconciliation(
