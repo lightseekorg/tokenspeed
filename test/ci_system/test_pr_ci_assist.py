@@ -1000,6 +1000,10 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     file.write_text("value = 4\n")
     repair.restore_patch(tmp_path, head, {"model.py"})
     assert not other.exists()  # no wholesale main changes in the PR patch
+    file.write_text("value =\n")
+    with pytest.raises(repair.RepairRejected, match="not valid Python"):
+        repair.guard(tmp_path, head, {"model.py"})
+    file.write_text("value = 4\n")
     repair.guard(tmp_path, head, {"model.py"})
     git("add", ".")
     git("commit", "-s", "-m", "repair")

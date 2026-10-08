@@ -77,6 +77,7 @@ NATIVE_CONFIG = NATIVE_CHECKS["nvidia-kernel-library-tests.yml"]["config"]
 REPAIR_FEEDBACK = {
     "native-task": "Native repair must retain the original tests and every original byte except appending ${PYTHONPATH:+:$PYTHONPATH} inside an existing quoted PYTHONPATH prefix.",
     "test-syntax": "Test conflict resolution is not valid Python.",
+    "source-syntax": "Source conflict resolution is not valid Python. Correct the supplied syntax error before validation.",
     "test-assertions": "Conflict resolution removed or changed test assertions. Preserve the supplied assertions from both parents.",
     "scope": "Repair changes files outside its scope.",
     "file-size": "Repair deletes a file or exceeds the size limit.",
@@ -284,6 +285,15 @@ def guard(
         file = source / p
         if not file.is_file() or file.stat().st_size > 1000000:
             raise RepairRejected("file-size", path=p)
+        if file.suffix == ".py" and not {"test", "tests"}.intersection(file.parts[:-1]):
+            try:
+                ast.parse(file.read_text())
+            except SyntaxError as error:
+                raise RepairRejected(
+                    "source-syntax",
+                    path=p,
+                    details={"line": error.lineno, "reason": error.msg},
+                ) from None
         # Reject executable/type changes; regular source edits only.
         status = command(
             "git", "diff", "--raw", "--no-renames", head, "--", p, cwd=source
