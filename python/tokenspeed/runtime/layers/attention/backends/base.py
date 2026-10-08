@@ -196,6 +196,15 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
 
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        """Allocate graph-stable target verify buffers and return their bytes.
+
+        ``max_bs`` is the serving batch capacity; ``draft_token_num`` is the
+        verify width. Composites delegate to their verify consumers. Backends
+        without verify buffers return zero.
+        """
+        return 0
+
     def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
         """Allocate the query-context-parallel history gather workspace and
         return its bytes (the recipe reserved them from the cache budget;

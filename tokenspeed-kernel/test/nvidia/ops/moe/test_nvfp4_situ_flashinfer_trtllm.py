@@ -38,6 +38,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
 NUM_EXPERTS = 16
 TOP_K = 10  # scaled-down test shape (real Kimi-K3 num_experts_per_token=16)
@@ -295,7 +297,6 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
     expected = _reference_moe(hidden_states, raw, topk_ids, topk_weights, situ=True)
     situ_err = _rel_l2(actual, expected)
 
-    import tokenspeed_kernel
     from flashinfer import fp4_quantize
 
     prequantized = fp4_quantize(
@@ -304,7 +305,7 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
         is_sf_swizzled_layout=False,
         enable_pdl=False,
     )
-    quantized_result = tokenspeed_kernel.moe_apply(
+    quantized_result = kernel_moe_apply(
         {
             "apply_kernel_name": "flashinfer_trtllm_nvfp4_situ_routed_moe_apply",
             "a2a_backend": "none",
@@ -373,9 +374,8 @@ def test_flashinfer_nvfp4_situ_routed_moe_matches_dequant_reference(
 def test_moe_plan_selects_nvfp4_situ_routed_kernel(
     routing_mode: str | None,
 ) -> None:
-    import tokenspeed_kernel
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -585,8 +585,8 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
     """Poison native map padding, change routing, and replay without Python.
 
     The allocation observer is test-only: it retains the guarded int32 routing
-    map so the test can inspect padding and corrupt it between replays. Product
-    initialization occurs in the native launcher, without allocation interception.
+    map and its preceding padded-count allocation. Upstream routing initializes
+    unused rows inside active expert tiles, not allocation slack or the guard.
     """
     from flashinfer.fused_moe import core
     from flashinfer.tllm_enums import ActivationType
@@ -630,9 +630,11 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
         )
 
     class ObserveMap(TorchDispatchMode):
-        def __init__(self):
+        def __init__(self, initialize):
             super().__init__()
+            self.initialize = initialize
             self.maps = []
+            self.counts = []
 
         def __torch_dispatch__(self, func, types, args, kwargs):
             result = func(*args, **kwargs)
@@ -642,23 +644,33 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
                 and result.is_cuda
                 and result.dtype == torch.int32
                 and result.ndim == 1
+            ):
+                # The native launcher allocates total_num_padded_tokens before
+                # the map; its other scalar, num_non_exiting_ctas, follows it.
+                if result.numel() == 1 and not self.maps:
+                    self.counts.append(result)
                 # Native expert tiles are multiples of eight, plus one guard.
                 # All other workspace sizes for these geometries are even or
                 # smaller than the expanded assignment count.
-                and result.numel() > num_tokens * top_k
-                and result.numel() % 8 == 1
-            ):
-                result.zero_()
-                self.maps.append(result)
+                if result.numel() > num_tokens * top_k and result.numel() % 8 == 1:
+                    if self.initialize:
+                        result.zero_()
+                    self.maps.append(result)
             return result
 
-    def check_map(route_map, expanded):
+    def check_map(observer, expanded, poison):
+        assert len(observer.maps) == len(observer.counts) == 1
+        route_map = observer.maps[0]
+        padded_count = observer.counts[0].item()
+        assert 0 <= padded_count < route_map.numel()
         inverse = expanded.long().flatten()
         live = inverse >= 0
-        expected = torch.full_like(route_map, -1)
+        assert (inverse[live] < padded_count).all()
+        expected = torch.full_like(route_map[:padded_count], -1)
         tokens = torch.arange(num_tokens, device="cuda").repeat_interleave(top_k)
         expected[inverse[live]] = tokens[live].int()
-        torch.testing.assert_close(route_map, expected, rtol=0, atol=0)
+        torch.testing.assert_close(route_map[:padded_count], expected, rtol=0, atol=0)
+        assert (route_map[padded_count:] == poison).all()
         if routed:
             local = (ids >= local_offset) & (ids < local_offset + local_count)
             torch.testing.assert_close(live.view_as(ids), local, rtol=0, atol=0)
@@ -667,32 +679,34 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
     # allowed to rely on capture-time Python during the replay checks below.
     apply(False)
     apply(True)
-    observer = ObserveMap()
+    observer = ObserveMap(initialize=True)
     with observer:
         _, _, expanded = apply(False)
-    assert len(observer.maps) == 1
-    check_map(observer.maps[0], expanded)
+    check_map(observer, expanded, poison=0)
 
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
-    observer = ObserveMap()
+    observer = ObserveMap(initialize=False)
     with torch.cuda.graph(graph), observer:
         _, _, graph_expanded = apply(False)
     assert len(observer.maps) == 1
     route_map = observer.maps[0]
     output_graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(output_graph):
+    output_observer = ObserveMap(initialize=False)
+    with torch.cuda.graph(output_graph), output_observer:
         graph_output = apply(True)
-    for shift in (0, 3, 7, 0):
+    assert len(output_observer.maps) == 1
+    for shift, poison in ((0, 0), (3, num_tokens - 1), (7, -1), (0, 0)):
         # Move between expert distributions, including empty local experts.
         logits.copy_(logits.roll(shift, dims=-1))
         next_weights, next_ids = logits.float().softmax(-1).topk(top_k, dim=-1)
         ids.copy_(next_ids)
         weights.copy_(next_weights)
-        route_map.zero_()
+        route_map.fill_(poison)
         graph.replay()
-        check_map(route_map, graph_expanded)
+        check_map(observer, graph_expanded, poison=poison)
         actual = apply(True)
+        output_observer.maps[0].fill_(poison)
         output_graph.replay()
         torch.testing.assert_close(graph_output, actual, rtol=0, atol=0)
         with monkeypatch.context() as context:

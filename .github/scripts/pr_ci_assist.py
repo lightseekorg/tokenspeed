@@ -237,7 +237,8 @@ def publish(state: dict, message: str):
                 result = (
                     f"[{result}](https://github.com/{REPO}/actions/runs/{check['run']})"
                 )
-            body += f"| {label} | PR `{state['head'][:8]}` | {result} |\n"
+            sha = state.get("candidate", {}).get("validation", state["head"])
+            body += f"| {label} | `{sha[:8]}` | {result} |\n"
         sha = state.get("candidate", {}).get("validation", state["head"])
         for task, status in zip(state["tasks"], state["statuses"]):
             link = f"https://github.com/{REPO}/blob/{sha}/{quote(task['config'], safe='/')}"
@@ -384,7 +385,7 @@ def dispatch(task: dict, sha: str, cluster: str):
 def runs_for(state: dict) -> list[dict]:
     since = api(f"issues/comments/{state['since']}")["created_at"]
     runs = pages(f"actions/runs?head_sha={state['head']}", "workflow_runs")
-    for workflow in ("slurm-dispatch.yml", "k8s-dispatch.yml"):
+    for workflow in ("slurm-dispatch.yml", "k8s-dispatch.yml", *NATIVE_CHECKS):
         runs += pages(
             f"actions/workflows/{workflow}/runs?event=workflow_dispatch&created=>={since}",
             "workflow_runs",
@@ -396,19 +397,34 @@ def runs_for(state: dict) -> list[dict]:
 
 def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
     result = dict(workflow=check["workflow"], status="waiting", run=0)
+    candidate = state.get("candidate")
     for run in runs:
-        if (
-            run["event"] != "pull_request"
-            or run["head_sha"] != state["head"]
-            or run["path"] != f".github/workflows/{check['workflow']}"
-            or not any(
-                p["number"] == state["pr"]
-                and p["head"]["sha"] == state["head"]
-                and p["base"]["sha"] == state["base"]
-                and p["base"]["ref"] == "main"
-                for p in run["pull_requests"]
+        if run["path"] != f".github/workflows/{check['workflow']}":
+            continue
+        if candidate:
+            matches = (
+                run["event"] == "workflow_dispatch"
+                and run["head_sha"] == candidate["validation"]
+                and run["head_branch"] == candidate["branch"]
+                and run["actor"]["login"] == BOT
             )
-        ):
+        else:
+            matches = (
+                run["event"] == "pull_request"
+                and run["head_sha"] == state["head"]
+                and any(
+                    p["number"] == state["pr"] and p["head"]["sha"] == state["head"]
+                    # An older base failure can diagnose this unchanged head;
+                    # only the candidate's own run can validate its repair.
+                    and (
+                        p["base"]["sha"] == state["base"]
+                        or (state["action"] == "fix" and run["conclusion"] == "failure")
+                    )
+                    and p["base"]["ref"] == "main"
+                    for p in run["pull_requests"]
+                )
+            )
+        if not matches:
             continue
         result["run"] = run["id"]
         if run["status"] != "completed":
@@ -435,9 +451,85 @@ def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
                 for step in jobs[0]["steps"]
             )
         ):
+            if candidate and "artifact" in check:
+                return {
+                    **result,
+                    "status": native_artifact(run, check, candidate["validation"]),
+                }
             return {**result, "status": "passed"}
         return {**result, "status": "missing"}
     return result
+
+
+def native_artifact(run: dict, check: dict, sha: str) -> str:
+    with tempfile.TemporaryDirectory(dir=WORK) as directory:
+        target = Path(directory)
+        artifacts = pages(f"actions/runs/{run['id']}/artifacts", "artifacts")
+        if not any(
+            a["name"] == check["artifact"] and not a["expired"] for a in artifacts
+        ):
+            return "missing"
+        download(run, check["artifact"], target)
+        if json.loads((target / "source.json").read_text()).get("source_sha") != sha:
+            return "missing"
+        rows = json.loads((target / "manifest.json").read_text())
+        if len(rows) != 1:
+            return "missing"
+        row = rows[0]
+        if (
+            row["task"]["config"] != check["config"]
+            or row["task"]["runner"] != check["runner"]
+            or not re.fullmatch(r"[0-9]+", row["job_id"])
+        ):
+            return "missing"
+        proof = json.loads(target.joinpath(f"{row['job_id']}-result.json").read_text())
+        if (
+            proof.get("source_sha") == sha
+            and proof.get("config") == check["config"]
+            and proof.get("runner") == check["runner"]
+            and proof.get("ok") is True
+            and "ut" in proof.get("executed_stages", [])
+            and row["state"] == "COMPLETED"
+            and row["exit_code"] == "0:0"
+        ):
+            return "passed"
+        return "missing"
+
+
+def dispatch_native_checks(state: dict):
+    """Reserve each candidate workflow before requesting its existing native run."""
+    candidate = state["candidate"]
+    pending = [
+        c
+        for c in state["native_checks"]
+        if not c["run"] and c["workflow"] not in state.get("native_submitted", [])
+    ]
+    if not pending:
+        return
+    from pr_ci_repair import guard_native_dispatch
+
+    guard_native_dispatch(state)
+    for check in pending:
+        state.setdefault("native_submitted", []).append(check["workflow"])
+        publish(
+            state, "Candidate native validation requested; existing runs are reused."
+        )
+        public_gate()
+        if (
+            api(f"git/ref/heads/{candidate['branch']}")["object"]["sha"]
+            != candidate["validation"]
+        ):
+            raise ValueError("Validation branch moved before native dispatch.")
+        command(
+            "gh",
+            "workflow",
+            "run",
+            check["workflow"],
+            "--repo",
+            REPO,
+            "--ref",
+            candidate["branch"],
+        )
 
 
 def download(run: dict, name: str, target: Path):
@@ -896,7 +988,7 @@ def control(number: int):
         )
         return
     replanned = state.pop("plan_refresh", None) is not None
-    if not tasks and (state["action"] != "watch" or not data.get("native_checks")):
+    if not tasks and not data.get("native_checks"):
         state["phase"] = "manual"
         publish(
             state,
@@ -927,13 +1019,24 @@ def control(number: int):
         return
     runs = runs_for(state)
     previous_checks = state.get("native_checks", [])
+    # Conflicts are repaired first; candidates need their own native results.
+    track_native = (
+        "candidate" in state
+        or state["action"] == "watch"
+        or pr["mergeable"] is not False
+    )
     state["native_checks"] = [
         native_check(check, state, runs)
         for check in data.get("native_checks", [])
-        if state["action"] == "watch"
+        if track_native
     ]
     native_statuses = [c["status"] for c in state["native_checks"]]
-    if any(s in {"failed", "missing", "blocked"} for s in native_statuses):
+    if "candidate" in state:
+        dispatch_native_checks(state)
+    if any(s in {"missing", "blocked"} for s in native_statuses) or (
+        "failed" in native_statuses
+        and (state["action"] != "fix" or "candidate" in state)
+    ):
         state["phase"] = "manual"
         publish(
             state,
@@ -948,7 +1051,9 @@ def control(number: int):
         statuses = [task_status(t, state, runs, submit=True) for t in tasks]
     previous = state["statuses"]
     state["statuses"] = statuses
-    if requested_fix and (pr["mergeable"] is False or "failed" in statuses):
+    if requested_fix and (
+        pr["mergeable"] is False or "failed" in statuses or "failed" in native_statuses
+    ):
         state["phase"] = "repairing"
         state["repair_run"] = int(os.environ["GITHUB_RUN_ID"])
         publish(

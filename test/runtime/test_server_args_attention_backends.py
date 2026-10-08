@@ -23,6 +23,7 @@ from unittest import mock
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention import registry
+from tokenspeed.runtime.layers.attention.backends.state import kda
 from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -160,7 +161,7 @@ class TestAttentionBackendChoices(unittest.TestCase):
                         return_value=SimpleNamespace(device="cpu"),
                     ),
                     mock.patch.object(
-                        registry, "_resolve_kda_backend", return_value="cutedsl_kda"
+                        kda, "resolve_kda_backend", return_value="cutedsl_kda"
                     ),
                     mock.patch.object(registry, "is_qwen4_exp", return_value=False),
                 ):
@@ -174,6 +175,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
                     )
                     self.assertIs(
                         backend.linear_attn_backend._prefill_graph_enabled, not disabled
+                    )
+                    self.assertEqual(
+                        backend.linear_attn_backend.kda_backend, "cutedsl_kda"
                     )
 
     def test_model_path_alias_sets_model(self):
@@ -387,6 +391,56 @@ class TestAttentionBackendChoices(unittest.TestCase):
         self.assertEqual(config.speculative_num_steps, 3)
         self.assertEqual(config.speculative_num_draft_tokens, 4)
         self.assertEqual(config.context_len, 4108)
+
+
+class TestKdaBackendPolicy(unittest.TestCase):
+    def test_prefill_backend_selection(self):
+        cases = (
+            # AMD keeps kernel-registry selection, including explicit NVIDIA policies.
+            (True, False, False, "auto", "auto"),
+            (True, False, False, "cutedsl_kda", "auto"),
+            # NVIDIA auto prefers CuteDSL, then FlashKDA, then FLA.
+            (False, True, True, "auto", "cutedsl_kda"),
+            (False, True, False, "auto", "flashkda"),
+            (False, False, False, "auto", "fla"),
+            # Explicit NVIDIA choices remain authoritative.
+            (False, True, True, "fla", "fla"),
+            (False, True, True, "flashkda", "flashkda"),
+            (False, True, True, "cutedsl_kda", "cutedsl_kda"),
+        )
+        for is_amd, is_hopper_plus, cute_supported, requested, expected in cases:
+            with (
+                self.subTest(is_amd=is_amd, requested=requested, expected=expected),
+                mock.patch.object(
+                    kda,
+                    "current_platform",
+                    return_value=SimpleNamespace(
+                        is_amd=is_amd, is_hopper_plus=is_hopper_plus
+                    ),
+                ),
+                mock.patch(
+                    "tokenspeed_kernel.ops.attention.kda.cute_dsl.cutedsl_kda_supported",
+                    return_value=cute_supported,
+                ) as supports_cute,
+            ):
+                self.assertEqual(kda.resolve_kda_backend(requested), expected)
+                if is_amd:
+                    supports_cute.assert_not_called()
+
+    def test_unsupported_explicit_cutedsl_is_rejected(self):
+        with (
+            mock.patch.object(
+                kda,
+                "current_platform",
+                return_value=SimpleNamespace(is_amd=False, is_hopper_plus=True),
+            ),
+            mock.patch(
+                "tokenspeed_kernel.ops.attention.kda.cute_dsl.cutedsl_kda_supported",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(ValueError, "requires an NVIDIA sm_100 or sm_103"),
+        ):
+            kda.resolve_kda_backend("cutedsl_kda")
 
 
 class TestPagedRouterNameResolution(unittest.TestCase):

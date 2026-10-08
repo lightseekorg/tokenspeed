@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.gemm import (
+    _online_quantize_mxfp8,
     fp8_linear,
     fp8_linear_into,
     fp8_linear_prepacked,
     mm,
     prepare_fp8_linear,
 )
-from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8
 from tokenspeed_kernel.ops.gemm.flashinfer import (
     gemm_fp8_nt_groupwise,
     has_flashinfer_fp8_blockscale,

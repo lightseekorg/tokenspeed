@@ -393,6 +393,8 @@ NVIDIA release image
 different build. The container needs Python and pip. If PyYAML is absent, the
 job installs `PyYAML>=6,<7` into its job-local `/tmp` before starting the
 pipeline; images that already provide PyYAML do not perform this bootstrap.
+Task commands that prepend source directories to `PYTHONPATH` must preserve its
+inherited value so these bootstrapped dependencies remain importable.
 
 The generated `sbatch` command uses `/tmp` as its working directory because the
 login-node checkout may not be mounted on compute nodes. Override it with

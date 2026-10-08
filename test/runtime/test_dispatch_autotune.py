@@ -1331,7 +1331,7 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
         "UnquantizedLinearMethod",
         ("apply",),
         dict(
-            tokenspeed_kernel=SimpleNamespace(mm=mm),
+            kernel_mm=mm,
             resolve_kernel_override=resolve_kernel_override,
             use_decode_gemv=shortcut,
         ),

@@ -25,9 +25,21 @@
 
 import logging
 
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel import fp8_linear, prepare_fp8_linear
+from tokenspeed_kernel.ops.gemm import (
+    dsv4_grouped_output_projection_process_weights as kernel_dsv4_grouped_output_projection_process_weights,
+)
+from tokenspeed_kernel.ops.gemm import (
+    fp8_linear,
+    fp8_linear_into,
+)
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import (
+    prepare_fp8_linear,
+)
+from tokenspeed_kernel.ops.gemm import (
+    prepare_trtllm_cutedsl_fp8_linear as kernel_prepare_trtllm_cutedsl_fp8_linear,
+)
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
     per_block_quant_fp8,
     per_token_group_quant_fp8,
@@ -205,7 +217,7 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             if grouped_output_projection_plan is not None:
                 layer.weight_scale_inv.data = (
-                    tokenspeed_kernel.dsv4_grouped_output_projection_process_weights(
+                    kernel_dsv4_grouped_output_projection_process_weights(
                         grouped_output_projection_plan,
                         layer.weight.data,
                         layer.weight_scale_inv.data,
@@ -219,12 +231,10 @@ class Fp8LinearMethod(LinearMethodBase):
             if backend == "trtllm_cutedsl" and tuple(
                 self.quant_config.weight_block_size
             ) == (128, 128):
-                layer._prepared_fp8_linear = (
-                    tokenspeed_kernel.prepare_trtllm_cutedsl_fp8_linear(
-                        layer.weight.data,
-                        layer.weight_scale_inv.data,
-                        self.quant_config.weight_block_size,
-                    )
+                layer._prepared_fp8_linear = kernel_prepare_trtllm_cutedsl_fp8_linear(
+                    layer.weight.data,
+                    layer.weight_scale_inv.data,
+                    self.quant_config.weight_block_size,
                 )
                 return
             layer._prepared_fp8_linear = prepare_fp8_linear(
@@ -290,6 +300,65 @@ class Fp8LinearMethod(LinearMethodBase):
                             weight_scale[0].clone(), requires_grad=False
                         )
 
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
+        """Let a prepared block-FP8 GEMM write directly into communication scratch."""
+        if self.block_quant:
+            if (
+                out.shape != (*x.shape[:-1], layer.weight.shape[0])
+                or out.dtype != output_dtype
+                or out.device != x.device
+                or not out.is_contiguous()
+            ):
+                raise ValueError("Incompatible block-FP8 output destination")
+            return self._apply_block(layer, x, bias, block_scale, output_dtype, out)
+        return super().apply_into(layer, x, bias, block_scale, output_dtype, out)
+
+    def _apply_block(self, layer, x, bias, block_scale, output_dtype, out):
+        input_2d = x.view(-1, x.shape[-1])
+        output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+        output_dtype = output_dtype or x.dtype
+        destination = out.view(-1, layer.weight.shape[0]) if out is not None else None
+        plan = self.prepared_linear_plan(layer)
+        if plan is None:
+            output = kernel_mm(
+                input_2d,
+                layer.weight,
+                A_scales=block_scale,
+                B_scales=layer.weight_scale_inv,
+                bias=bias,
+                out_dtype=output_dtype,
+                quant="mxfp8",
+                block_size=self.quant_config.weight_block_size,
+                out=destination,
+            )
+        elif destination is None:
+            output = fp8_linear(
+                plan,
+                input_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                input_scales=block_scale,
+                bias=bias,
+                out_dtype=output_dtype,
+            )
+        else:
+            output = fp8_linear_into(
+                plan,
+                input_2d,
+                layer.weight,
+                layer.weight_scale_inv,
+                input_scales=block_scale,
+                bias=bias,
+                out_dtype=output_dtype,
+                out=destination,
+            )
+        # Preserve caller identity: destination is a view, not a second output.
+        return (
+            out
+            if out is not None
+            else output.to(dtype=output_dtype).view(*output_shape)
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -300,32 +369,7 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if self.block_quant:
-            input_2d = x.view(-1, x.shape[-1])
-            output_shape = [*x.shape[:-1], layer.weight.shape[0]]
-            output_dtype = output_dtype or x.dtype
-            plan = getattr(layer, "_prepared_fp8_linear", None)
-            if plan is None:
-                output = tokenspeed_kernel.mm(
-                    input_2d,
-                    layer.weight,
-                    A_scales=block_scale,
-                    B_scales=layer.weight_scale_inv,
-                    bias=bias,
-                    out_dtype=output_dtype,
-                    quant="mxfp8",
-                    block_size=self.quant_config.weight_block_size,
-                )
-            else:
-                output = fp8_linear(
-                    plan,
-                    input_2d,
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    input_scales=block_scale,
-                    bias=bias,
-                    out_dtype=output_dtype,
-                )
-            return output.to(dtype=output_dtype).view(*output_shape)
+            return self._apply_block(layer, x, bias, block_scale, output_dtype, None)
         else:
             input = x
             weight = layer.weight
@@ -351,7 +395,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
             qinput = qinput.view(-1, qinput.shape[-1])
 
-            output = tokenspeed_kernel.mm(
+            output = kernel_mm(
                 qinput,
                 weight,
                 A_scales=x_scale,

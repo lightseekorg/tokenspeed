@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import (
+from tokenspeed_kernel.ops.quantization import (
     fp8_quantize_dequantize,
     quantize_fp8,
     quantize_fp8_with_scale,

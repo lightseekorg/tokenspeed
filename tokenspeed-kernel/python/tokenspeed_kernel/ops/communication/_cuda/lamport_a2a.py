@@ -23,9 +23,8 @@
 CUDA C++ expresses the system-scoped 64-bit packet transactions explicitly.
 Projection callers own topology admission, padding and NCCL fallback.
 
-Both packet and chunk exchange currently require exactly four GPUs per
-process group on one host. Peer indexing and scratch layouts specialize for
-four peers; other group sizes are rejected, with no implicit NCCL fallback.
+Packet and chunk exchange support 2, 4 or 8 GPUs per process group on one
+host. Peer indexing specializes for the group size, with no implicit fallback.
 """
 
 import socket
@@ -39,9 +38,9 @@ from tokenspeed_kernel.signature import format_signatures
 
 
 class TokenSpeedA2ALamportState:
-    """Persistent TP4 scratch, initialized collectively before graph capture.
+    """Persistent TP2/4/8 scratch, initialized collectively before graph capture.
 
-    The supplied process group must contain exactly four GPUs, irrespective
+    The supplied process group must contain 2, 4 or 8 GPUs, irrespective
     of the total number of GPUs in the job.
 
     All ranks must call in the same order, with equal physical shapes, on one
@@ -63,8 +62,16 @@ class TokenSpeedA2ALamportState:
             raise ValueError(
                 "A2A requires one host and identical capacity, channels, and grid on all ranks"
             )
-        if group.size() != 4 or max_rows < 1 or channels < 8 or channels % 8:
-            raise ValueError("Requires TP4, positive capacity, channels divisible by 8")
+        self.tp_size = group.size()
+        if (
+            self.tp_size not in (2, 4, 8)
+            or max_rows < 1
+            or channels < 2 * self.tp_size
+            or channels % (2 * self.tp_size)
+        ):
+            raise ValueError(
+                "Requires TP2/4/8, positive capacity, and two-BF16-aligned shards"
+            )
         if 3 * max_rows * channels // 2 > 2**31 - 1:
             raise ValueError("A2A workspace exceeds 32-bit indexing")
         if (
@@ -96,7 +103,7 @@ class TokenSpeedA2ALamportState:
                 self.handle.get_buffer(
                     r, self.scratch.shape, self.scratch.dtype
                 ).data_ptr()
-                for r in range(4)
+                for r in range(self.tp_size)
             ],
             dtype=torch.int64,
             device=device,
@@ -106,7 +113,7 @@ class TokenSpeedA2ALamportState:
             max_rows * channels, dtype=torch.bfloat16, device=device
         )
         self.module = build_cuda_module(
-            "tokenspeed_lamport_a2a_v1",
+            "tokenspeed_lamport_a2a_v2",
             [Path(__file__).with_name("lamport_a2a.cu")],
         )
         torch.cuda.synchronize(device)
@@ -115,21 +122,22 @@ class TokenSpeedA2ALamportState:
     def prepare_fp8_quantization(self):
         """Allocate borrowed FP8 values and MN-major FP32 scales before capture.
 
-        Only the forward [M,K] -> [4*M,K/4] exchange is quantized. Every
+        Only the forward [M,K] -> [TP*M,K/TP] exchange is quantized. Every
         channel shard must contain complete 128-element quantization groups.
         Packet/chunk storage and generations remain shared with BF16 calls.
         """
-        if self.channels % 512:
-            raise ValueError("Fused A2A quantization requires K divisible by 512")
+        if self.channels % (128 * self.tp_size):
+            raise ValueError("Fused A2A quantization requires 128-aligned shards")
         if self.fp8_output is not None:
             return
+        padded_rows = (self.tp_size * self.max_rows + 3) // 4 * 4
         self.fp8_output = torch.empty(
-            (4 * self.max_rows, self.channels // 4),
+            (padded_rows, self.channels // self.tp_size),
             dtype=torch.float8_e4m3fn,
             device=self.output.device,
         )
         self.fp8_scales = torch.empty(
-            self.max_rows * self.channels // 128,
+            padded_rows * (self.channels // self.tp_size // 128),
             dtype=torch.float32,
             device=self.output.device,
         )
@@ -138,9 +146,9 @@ class TokenSpeedA2ALamportState:
         """Collectively enable vectorized chunk publication before capture.
 
         Inputs at least threshold_bytes use chunk flags; smaller inputs retain
-        the packet kernel. All peers must agree. Channels must be divisible by
-        32. Separate scratch/generations are essential: raw chunk payload must
-        never be interpreted as packet readiness tags after a size transition.
+        the packet kernel. All peers must agree. Channel shards must be aligned
+        to eight BF16 values. Separate scratch/generations ensure chunk payloads
+        are never interpreted as packet readiness tags after a size transition.
         Extra scratch is three payload buffers plus per-CTA flags.
         """
         from tokenspeed_kernel.thirdparty.flashinfer.jit import build_cuda_module
@@ -149,9 +157,9 @@ class TokenSpeedA2ALamportState:
         dist.all_gather_object(thresholds, threshold_bytes, group=self.group)
         if any(value != threshold_bytes for value in thresholds):
             raise ValueError("All A2A peers must agree on the chunk threshold")
-        if threshold_bytes <= 0 or self.channels % 32:
+        if threshold_bytes <= 0 or self.channels % (8 * self.tp_size):
             raise ValueError(
-                "Chunk exchange requires a positive threshold and K divisible by 32"
+                "Chunk exchange requires a positive threshold and eight-BF16-aligned shards"
             )
         if self.chunk_threshold_bytes is not None:
             if self.chunk_threshold_bytes != threshold_bytes:
@@ -163,7 +171,7 @@ class TokenSpeedA2ALamportState:
                 (3 * self.chunk_capacity,), dtype=torch.int64, device=device
             )
             self.chunk_flags = symm.empty(
-                (3 * 4 * self.blocks,), dtype=torch.int64, device=device
+                (3 * self.tp_size * self.blocks,), dtype=torch.int64, device=device
             )
         self.chunk_flags.zero_()
         self.chunk_handle = symm.rendezvous(self.chunk_scratch, group=self.group)
@@ -173,7 +181,7 @@ class TokenSpeedA2ALamportState:
                 self.chunk_handle.get_buffer(
                     r, self.chunk_scratch.shape, torch.int64
                 ).data_ptr()
-                for r in range(4)
+                for r in range(self.tp_size)
             ],
             dtype=torch.int64,
             device=device,
@@ -183,14 +191,14 @@ class TokenSpeedA2ALamportState:
                 self.chunk_flag_handle.get_buffer(
                     r, self.chunk_flags.shape, torch.int64
                 ).data_ptr()
-                for r in range(4)
+                for r in range(self.tp_size)
             ],
             dtype=torch.int64,
             device=device,
         )
         self.chunk_control = torch.tensor([1, 0], dtype=torch.int32, device=device)
         self.chunk_module = build_cuda_module(
-            "tokenspeed_chunk_a2a_v1",
+            "tokenspeed_chunk_a2a_v2",
             [Path(__file__).with_name("chunk_a2a.cu")],
         )
         torch.cuda.synchronize(device)
@@ -208,7 +216,7 @@ class TokenSpeedA2ALamportState:
 def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
     """Exchange BF16 channel shards while preserving every input bit.
 
-    Forward: [M,K] -> [4*M,K/4]. Inverse: [4*M,K/4] -> [M,K].
+    Forward: [M,K] -> [TP*M,K/TP]. Inverse: [TP*M,K/TP] -> [M,K].
     inputs must be contiguous BF16 with a 16-byte-aligned address.
     state owns persistent scratch; inverse explicitly chooses layout.
     out=None returns borrowed state.output, valid until the next call. A supplied
@@ -231,8 +239,9 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
         == state.chunk_scratch.untyped_storage().data_ptr()
     ):
         raise ValueError("Input must not alias chunk communication scratch")
-    rows = inputs.shape[0] // 4 if inverse else inputs.shape[0]
-    shape = (4 * rows, state.channels // 4) if inverse else (rows, state.channels)
+    size = state.tp_size
+    rows = inputs.shape[0] // size if inverse else inputs.shape[0]
+    shape = (size * rows, state.channels // size) if inverse else (rows, state.channels)
     if (
         tuple(inputs.shape) != shape
         or not 1 <= rows <= state.max_rows
@@ -246,7 +255,7 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
             "violates the A2A contract"
         )
     result_shape = (
-        (rows, state.channels) if inverse else (4 * rows, state.channels // 4)
+        (rows, state.channels) if inverse else (size * rows, state.channels // size)
     )
     if out is None:
         output = state.output[: inputs.numel()].view(result_shape)
@@ -330,9 +339,10 @@ def tokenspeed_a2a_lamport_fp8_quantize(state, inputs):
         inputs: Contiguous BF16 [M,K], with equal positive physical M on all peers.
 
     Returns:
-        Borrowed FP8 [4*M,K/4] and MN-major FP32 scales [K/512,4*M], valid until
-        the next quantized call. Consumers use ordinary stream ordering; no
-        external tile-readiness protocol or additional quantization is needed.
+        Borrowed FP8 [P,K/TP] and MN-major FP32 scales [K/(128*TP),P], where
+        P=round_up(TP*M,4). Padding is zero/one, matching the prepared quantizer.
+        Buffers last until the next quantized call. Ordinary stream ordering
+        suffices; no external tile-readiness protocol or quantization is needed.
     """
     if (
         state.fp8_output is None
@@ -364,8 +374,10 @@ def tokenspeed_a2a_lamport_fp8_quantize(state, inputs):
     ):
         raise ValueError("Fused A2A input must not alias state storage")
     rows = inputs.shape[0]
-    values = state.fp8_output[: 4 * rows]
-    scales = state.fp8_scales[: rows * state.channels // 128].view(-1, 4 * rows)
+    padded_rows = (state.tp_size * rows + 3) // 4 * 4
+    values = state.fp8_output[:padded_rows]
+    scale_count = padded_rows * (state.channels // state.tp_size // 128)
+    scales = state.fp8_scales[:scale_count].view(-1, padded_rows)
     if (
         state.chunk_threshold_bytes is not None
         and inputs.numel() * inputs.element_size() >= state.chunk_threshold_bytes

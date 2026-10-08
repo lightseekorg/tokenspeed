@@ -41,6 +41,51 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 DEVICE = "cuda"
 
 
+def test_projection_a2a_pack_batch_shape():
+    from tokenspeed_kernel.ops.communication import triton as communication
+
+    peers, channels = 4, 16384
+    shard = channels // peers
+
+    def run(local_rows, physical_rows, row_padding, column_stride):
+        inputs = torch.empty_strided(
+            (local_rows, channels),
+            (channels * column_stride + row_padding, column_stride),
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        inputs.copy_(torch.randn_like(inputs))
+        # Poison reused scratch so unwritten owner padding also fails numerics.
+        workspace = torch.full(
+            (peers, physical_rows, shard),
+            float("nan"),
+            dtype=inputs.dtype,
+            device=DEVICE,
+        )
+        packed = communication.triton_pack_channel_shards_for_a2a(inputs, workspace)
+        expected = torch.zeros_like(workspace)
+        expected[:, :local_rows].copy_(
+            inputs.reshape(local_rows, peers, shard).transpose(0, 1)
+        )
+        torch.testing.assert_close(packed.view_as(expected), expected, rtol=0, atol=0)
+
+    # Warm the scalar alignment classes, not every token count or stride.
+    run(16, 16, 0, 1)
+    run(17, 32, 1, 2)
+    run(17, 33, 3, 3)
+    with assert_no_triton_compile(communication._pack_channel_shards_for_a2a_kernel):
+        for case in (
+            (32, 32, 0, 1),
+            (64, 64, 0, 1),
+            (128, 128, 0, 1),
+            (97, 128, 3, 2),
+            (129, 257, 5, 3),
+            (513, 529, 7, 5),
+            (0, 64, 0, 1),
+        ):
+            run(*case)
+
+
 def test_packed_qkv_complex_rotary_token_count():
     from tokenspeed_kernel.ops.attention.mha._triton import qkv_rotary
 

@@ -48,6 +48,9 @@ NATIVE_CHECKS = {
         "step": "Run native library unit tests",
         "job": "native-libraries",
         "target": "Native GPU CI",
+        "config": "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml",
+        "runner": "slurm-nvidia-arm-4gpu",
+        "artifact": "nvidia-kernel-library-tests",
     },
 }
 STATUSES = {"passed", "waiting", "failed", "missing", "blocked"}
@@ -111,7 +114,13 @@ def record(comment: dict, kind: str) -> dict | None:
             not required.issubset(data)
             or set(data)
             - required
-            - {"candidate", "repair_run", "plan_refresh", "native_checks"}
+            - {
+                "candidate",
+                "repair_run",
+                "plan_refresh",
+                "native_checks",
+                "native_submitted",
+            }
             or type(data.get("command")) is not int
             or data.get("action") not in {"watch", "fix"}
             or data.get("phase")
@@ -153,6 +162,17 @@ def record(comment: dict, kind: str) -> dict | None:
             ):
                 return None
         if len({c["workflow"] for c in checks}) != len(checks):
+            return None
+        submitted_native = data.get("native_submitted", [])
+        if (
+            not isinstance(submitted_native, list)
+            or any(
+                not isinstance(w, str) or w not in NATIVE_CHECKS
+                for w in submitted_native
+            )
+            or len(set(submitted_native)) != len(submitted_native)
+            or (submitted_native and "candidate" not in data)
+        ):
             return None
         if (
             type(data["since"]) is not int

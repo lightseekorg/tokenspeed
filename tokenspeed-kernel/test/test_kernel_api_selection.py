@@ -18,9 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Golden selection tests for top-level tokenspeed-kernel public APIs.
+"""Golden selection tests for tokenspeed-kernel operator APIs.
 
-Each case invokes a real API or an internal registry facade used by a public
+Each case invokes a real API or an internal registry facade used by an operator
 API with :class:`SelectedKernel` calls intercepted by a spy,
 and asserts the auto-selected kernel name.  Cases run on every host: the
 platform each case targets is injected via ``Platform.override`` with the
@@ -40,7 +40,6 @@ from functools import partial
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel
 import tokenspeed_kernel.numerics.reference.gemm as _gemm_reference
 import tokenspeed_kernel.ops.attention as _attention_pkg
 import tokenspeed_kernel.ops.attention.cuda as _attention_cuda
@@ -120,6 +119,13 @@ from tokenspeed_kernel.ops.attention.gdn import GdnChunkPrefillResult
 from tokenspeed_kernel.ops.attention.gdn import triton as _attention_triton_gdn
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
 from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel_mha
+from tokenspeed_kernel.ops.gemm import bmm as kernel_bmm
+from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32 as kernel_dsv4_linear_fp32
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
+from tokenspeed_kernel.ops.moe import moe_topk as kernel_moe_topk
 from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8 as _moe_deep_gemm_deepep_fp8
 from tokenspeed_kernel.ops.moe.flashinfer import (
     cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
@@ -145,8 +151,16 @@ from tokenspeed_kernel.ops.moe.triton import (
     kimi3_sigmoid_topk as _moe_triton_kimi3_sigmoid_topk,
 )
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
+from tokenspeed_kernel.ops.quantization import (
+    fp8_quantize_dequantize as kernel_fp8_quantize_dequantize,
+)
+from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
+from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
+from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
+from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
 from tokenspeed_kernel.selection import (
     SelectedKernel,
     select_kernel,
@@ -255,8 +269,6 @@ _RELOAD_MODULES = [
     _sampling_cute_dsl,
     _sampling_gluon,
     _sampling_pkg,
-    # Top-level public API re-exports.
-    tokenspeed_kernel,
 ]
 
 
@@ -269,7 +281,6 @@ def _kernel_registry(fresh_registry):
 
 def test_attention_api_ownership_and_result_type_identity_are_stable():
     assert _attention_pkg.__all__ == ["attn_merge_state"]
-    assert tokenspeed_kernel.attn_merge_state is _attention_pkg.attn_merge_state
     assert _attention_gdn_pkg.GdnChunkPrefillResult is GdnChunkPrefillResult
     assert _attention_kda_pkg.KdaPrefillResult is KdaPrefillResult
 
@@ -286,11 +297,6 @@ def test_residual_family_exports_and_modes():
         "mhc_pre",
     }
     assert set(_residual_pkg.__all__) == expected_exports
-    assert all(
-        getattr(tokenspeed_kernel, name) is getattr(_residual_pkg, name)
-        for name in expected_exports
-    )
-
     residual_modes = {
         mode
         for family, mode in KernelRegistry.get().list_operators()
@@ -366,7 +372,7 @@ def test_dsv4_padded_heads_platform_policy(
 def test_moe_process_weights_returns_for_no_preprocessing_plan():
     module = torch.nn.Module()
 
-    result = tokenspeed_kernel.moe_process_weights(
+    result = kernel_moe_process_weights(
         {"weight_preprocessor": None},
         module,
     )
@@ -383,7 +389,7 @@ def test_moe_process_weights_dispatches_plan_preprocessor_callable():
     module = torch.nn.Module()
     plan = {"weight_preprocessor": preprocess}
 
-    result = tokenspeed_kernel.moe_process_weights(plan, module)
+    result = kernel_moe_process_weights(plan, module)
 
     assert result is None
     assert calls == [(plan, module)]
@@ -465,12 +471,12 @@ def _fp8_dtype() -> torch.dtype:
 
 def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
     x = torch.empty((4, 128), dtype=torch.bfloat16)
-    return tokenspeed_kernel.quantize_mxfp8(x)
+    return kernel_quantize_mxfp8(x)
 
 
 def _fp8_quantize_dequantize() -> torch.Tensor:
     x = torch.empty((4, 128), dtype=torch.bfloat16)
-    return tokenspeed_kernel.fp8_quantize_dequantize(
+    return kernel_fp8_quantize_dequantize(
         x,
         group_size=128,
         scale_encoding="ue8m0",
@@ -482,25 +488,25 @@ def _fp8_quantize_dequantize() -> torch.Tensor:
 def _mm_dense() -> torch.Tensor:
     a = torch.empty((4, 16), dtype=torch.bfloat16)
     b = torch.empty((32, 16), dtype=torch.bfloat16)
-    return tokenspeed_kernel.mm(a, b)
+    return kernel_mm(a, b)
 
 
 def _mm_dense_cdna4_aligned() -> torch.Tensor:
     a = torch.empty((16, 64), dtype=torch.bfloat16)
     b = torch.empty((128, 64), dtype=torch.bfloat16)
-    return tokenspeed_kernel.mm(a, b)
+    return kernel_mm(a, b)
 
 
 def _bmm_dense() -> torch.Tensor:
     a = torch.empty((4, 2, 16), dtype=torch.bfloat16)
     b = torch.empty((4, 32, 16), dtype=torch.bfloat16)
-    return tokenspeed_kernel.bmm(a, b)
+    return kernel_bmm(a, b)
 
 
 def _dsv4_linear_fp32() -> torch.Tensor:
     hidden_states = torch.empty((2, 4096), dtype=torch.bfloat16)
     weight = torch.empty((256, 4096), dtype=torch.bfloat16)
-    return tokenspeed_kernel.dsv4_linear_fp32(hidden_states, weight)
+    return kernel_dsv4_linear_fp32(hidden_states, weight)
 
 
 def _mm_mxfp8() -> torch.Tensor:
@@ -508,7 +514,7 @@ def _mm_mxfp8() -> torch.Tensor:
     b = torch.empty((128, 128), dtype=_fp8_dtype())
     a_scales = torch.empty((4, 1), dtype=torch.float32)
     b_scales = torch.empty((1, 1), dtype=torch.float32)
-    return tokenspeed_kernel.mm(
+    return kernel_mm(
         a,
         b,
         A_scales=a_scales,
@@ -627,7 +633,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         Platform.override(mi450_platform)
         monkeypatch.setattr(_gemm_pkg, "_platform", mi450_platform)
         registry.clear_cache()
-        actual = tokenspeed_kernel.mm(
+        actual = kernel_mm(
             a,
             b,
             A_scales=a_scales,
@@ -701,7 +707,7 @@ def test_gemm_mxfp8_online_activation_preserves_repeated_rows() -> None:
         + 0.01
     )
 
-    out = tokenspeed_kernel.mm(
+    out = kernel_mm(
         a,
         b,
         B_scales=b_scales,
@@ -821,7 +827,7 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     block_a_scales = torch.ones((4, 1), dtype=torch.float32)
     block_b_scales = torch.ones((1, 1), dtype=torch.float32)
 
-    blockscale = tokenspeed_kernel.mm(
+    blockscale = kernel_mm(
         a,
         b,
         A_scales=block_a_scales,
@@ -834,7 +840,7 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert blockscale.shape == (4, 128)
     assert blockscale.dtype == torch.bfloat16
 
-    online_blockscale = tokenspeed_kernel.mm(
+    online_blockscale = kernel_mm(
         a_bf16,
         b,
         B_scales=block_b_scales,
@@ -846,7 +852,7 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert online_blockscale.shape == (4, 128)
     assert online_blockscale.dtype == torch.bfloat16
 
-    tensor_scaled = tokenspeed_kernel.mm(
+    tensor_scaled = kernel_mm(
         a,
         b,
         A_scales=tensor_scales,
@@ -872,7 +878,7 @@ def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> N
     b = b_kn if b_layout == "KN" else b_kn.t().contiguous()
     scale = torch.ones((1,), dtype=torch.float32)
 
-    out = tokenspeed_kernel.mm(
+    out = kernel_mm(
         a, b, A_scales=scale, B_scales=scale, out_dtype=torch.float32, quant="fp8"
     )
 
@@ -890,7 +896,7 @@ def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
     block_a_scales = torch.ones((2, 4, 1), dtype=torch.float32)
     block_b_scales = torch.ones((2, 1, 1), dtype=torch.float32)
 
-    blockscale = tokenspeed_kernel.bmm(
+    blockscale = kernel_bmm(
         a,
         b,
         A_scales=block_a_scales,
@@ -903,7 +909,7 @@ def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert blockscale.shape == (2, 4, 128)
     assert blockscale.dtype == torch.bfloat16
 
-    online_blockscale = tokenspeed_kernel.bmm(
+    online_blockscale = kernel_bmm(
         a_bf16,
         b,
         B_scales=block_b_scales,
@@ -915,7 +921,7 @@ def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert online_blockscale.shape == (2, 4, 128)
     assert online_blockscale.dtype == torch.bfloat16
 
-    tensor_scaled = tokenspeed_kernel.bmm(
+    tensor_scaled = kernel_bmm(
         a,
         b,
         A_scales=tensor_scales,
@@ -927,7 +933,7 @@ def test_bmm_quantized_reference_dispatches_fp8_inputs() -> None:
     assert tensor_scaled.shape == (2, 4, 128)
     assert tensor_scaled.dtype == torch.bfloat16
 
-    channel_scaled = tokenspeed_kernel.bmm(
+    channel_scaled = kernel_bmm(
         a,
         b,
         A_scales=channel_a_scales,
@@ -975,7 +981,7 @@ def test_mm_non_native_out_kernel_copies_to_out(monkeypatch) -> None:
 
     monkeypatch.setattr(_gemm_pkg, "select_kernel", select_copy_out_kernel)
 
-    actual = tokenspeed_kernel.mm(a, b, out=out, override="test_mm_copy_out_kernel")
+    actual = kernel_mm(a, b, out=out, override="test_mm_copy_out_kernel")
     expected = a @ b.T
 
     assert actual is out
@@ -988,7 +994,7 @@ def _mm_nvfp4(m: int, n: int, k_packed: int) -> torch.Tensor:
     a_scales = torch.empty((m, 1), dtype=torch.float32)
     b_scales = torch.empty((n, 1), dtype=torch.float32)
     alpha = torch.empty((), dtype=torch.float32)
-    return tokenspeed_kernel.mm(
+    return kernel_mm(
         a,
         b,
         A_scales=a_scales,
@@ -1059,7 +1065,7 @@ def _mm_nvfp4_a16() -> torch.Tensor:
     a = torch.empty((4, 128), dtype=torch.bfloat16)
     b = torch.empty((128, 64), dtype=torch.uint8)
     b_scales = _nvfp4_a16_prepared_scales(128, 128)
-    return tokenspeed_kernel.mm(
+    return kernel_mm(
         a,
         b,
         B_scales=b_scales,
@@ -1119,7 +1125,7 @@ def test_gemm_nvfp4_a16_square_weight_uses_weight_rows_for_n(monkeypatch) -> Non
         return SelectedKernel("test_nvfp4_a16_shape", kernel)
 
     monkeypatch.setattr(_gemm_pkg, "select_kernel", select_nvfp4_a16)
-    actual = tokenspeed_kernel.mm(
+    actual = kernel_mm(
         a,
         b,
         B_scales=b_scales,
@@ -1134,7 +1140,7 @@ def _mm_mxfp4() -> torch.Tensor:
     b = torch.empty((128, 32), dtype=torch.uint8)
     a_scales = torch.empty((4, 2), dtype=torch.uint8)
     b_scales = torch.empty((128, 2), dtype=torch.uint8)
-    return tokenspeed_kernel.mm(
+    return kernel_mm(
         a,
         b,
         A_scales=a_scales,
@@ -2493,7 +2499,7 @@ def test_workspace_rows_fail_at_selection_without_a_declaring_leaf(
     real_platform = Platform.get()
     Platform.override(h100_platform)
     try:
-        with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+        with pytest.raises(kernel_NoKernelFoundError):
             _attention_dsa_pkg.dsa_prefill_topk(
                 torch.empty((1, 32, 128), dtype=torch.bfloat16),
                 torch.empty((1, 32), dtype=torch.float32),
@@ -2660,7 +2666,7 @@ def _mhc_pre() -> object:
     fn = torch.empty((24, 64), dtype=torch.float32)
     hc_scale = torch.empty((3,), dtype=torch.float32)
     hc_base = torch.empty((24,), dtype=torch.float32)
-    return tokenspeed_kernel.mhc_pre(
+    return kernel_mhc_pre(
         residual,
         fn,
         hc_scale,
@@ -2694,7 +2700,7 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
     fn = torch.empty((24, 32), dtype=torch.float32)
     hc_scale = torch.empty(3, dtype=torch.float32)
     hc_base = torch.empty(24, dtype=torch.float32)
-    tokenspeed_kernel.mhc_pre(
+    kernel_mhc_pre(
         residual,
         fn,
         hc_scale,
@@ -2712,7 +2718,7 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
 
 
 def test_mhc_normalization_contract_is_explicit() -> None:
-    parameters = inspect.signature(tokenspeed_kernel.mhc_pre).parameters
+    parameters = inspect.signature(kernel_mhc_pre).parameters
 
     for name in ("norm_weight", "norm_eps"):
         assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
@@ -2745,7 +2751,7 @@ def test_mhc_normalization_arguments_must_be_paired(
     with pytest.raises(
         ValueError, match="norm_weight and norm_eps must be provided together"
     ):
-        tokenspeed_kernel.mhc_pre(
+        kernel_mhc_pre(
             residual,
             fn,
             hc_scale,
@@ -2763,7 +2769,7 @@ def _mhc_post() -> object:
     residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
     post = torch.empty((1, 4, 1), dtype=torch.float32)
     comb = torch.empty((1, 4, 4), dtype=torch.float32)
-    return tokenspeed_kernel.mhc_post(hidden_states, residual, post, comb)
+    return kernel_mhc_post(hidden_states, residual, post, comb)
 
 
 def _attention_gdn_chunk_prefill() -> object:
@@ -2792,7 +2798,7 @@ def _sampling_argmax() -> object:
     if not torch.cuda.is_available():
         pytest.skip("argmax dispatches through kernel selection only for CUDA tensors")
     logits = torch.empty((4, 4096), dtype=torch.float32, device="cuda")
-    return tokenspeed_kernel.argmax(logits)
+    return kernel_argmax(logits)
 
 
 def _assert_moe_plan(plan: dict, *, apply: str, preprocessor: str | None) -> None:
@@ -2841,7 +2847,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
     try:
         Platform.override(platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             weight_dtype,
             input_dtype=torch.bfloat16,
             activation="silu",
@@ -2883,7 +2889,7 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
         Platform.override(b200_platform)
         registry.clear_cache()
         with pytest.raises(ValueError, match="does not support deepep_mode"):
-            tokenspeed_kernel.moe_plan(
+            kernel_moe_plan(
                 "nvfp4",
                 input_dtype=torch.bfloat16,
                 activation="silu",
@@ -2914,7 +2920,7 @@ def test_moe_plan_rejects_persistent_workspace_for_ordinary_kernel(
         Platform.override(h100_platform)
         KernelRegistry.get().clear_cache()
         with pytest.raises(ValueError, match="does not support persistent workspace"):
-            tokenspeed_kernel.moe_plan(
+            kernel_moe_plan(
                 "unquant",
                 input_dtype=torch.bfloat16,
                 activation="silu",
@@ -2969,7 +2975,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
     try:
         Platform.override(b200_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "fp8",
             input_dtype=torch.bfloat16,
             activation="silu",
@@ -2997,7 +3003,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
 
 
 def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -3027,7 +3033,7 @@ def test_moe_plan_rejects_invalid_deepep_mode(
     deepep_mode: str, a2a_backend: str, match: str
 ) -> None:
     with pytest.raises(ValueError, match=match):
-        tokenspeed_kernel.moe_plan(
+        kernel_moe_plan(
             "fp8",
             input_dtype=torch.bfloat16,
             activation="silu",
@@ -3065,7 +3071,7 @@ def test_gluon_dsa_prefill_topk_rejects_unsupported_page_size() -> None:
     if registry.get_by_name("gluon_dsa_prefill_topk_fp8_gfx950") is None:
         pytest.skip("Gluon DSA top-k is AMD-only")
 
-    with pytest.raises(tokenspeed_kernel.NoKernelFoundError, match="traits"):
+    with pytest.raises(kernel_NoKernelFoundError, match="traits"):
         _attention_dsa_prefill_topk(page_size=32, solution="gluon")
 
 
@@ -3306,7 +3312,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="swiglu",
@@ -3344,7 +3350,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="swiglu",
@@ -3406,7 +3412,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="situ",
@@ -3452,7 +3458,7 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="swiglu",
@@ -3486,7 +3492,7 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
     try:
         Platform.override(mi350_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="situ",
@@ -3579,7 +3585,7 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
     try:
         Platform.override(mi450_platform)
         registry.clear_cache()
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation="situ",
@@ -3798,7 +3804,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
 
 
 def _moe_apply_unquant_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -3820,7 +3826,7 @@ def _moe_apply_unquant_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -3833,7 +3839,7 @@ def _moe_topk_bias(tokens: int) -> object:
     """Exercise bias-router selection across specialized and portable batches."""
     router_logits = torch.empty((tokens, 256), dtype=torch.float32)
     correction_bias = torch.empty((256,), dtype=torch.float32)
-    return tokenspeed_kernel.moe_topk(
+    return kernel_moe_topk(
         router_logits,
         top_k=6,
         score_function="sqrt_softplus",
@@ -3848,7 +3854,7 @@ def _moe_topk_hash() -> object:
     router_logits = torch.empty((2, 384), dtype=torch.bfloat16)
     hash_indices_table = torch.zeros((8, 6), dtype=torch.int32)
     input_ids = torch.zeros((2,), dtype=torch.int64)
-    return tokenspeed_kernel.moe_topk(
+    return kernel_moe_topk(
         router_logits,
         top_k=6,
         score_function="sqrt_softplus",
@@ -3861,7 +3867,7 @@ def _moe_topk_hash() -> object:
 
 
 def _moe_apply_unquant_cutlass() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -3882,11 +3888,11 @@ def _moe_apply_unquant_cutlass() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_fp8_cutlass() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "fp8",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -3908,7 +3914,7 @@ def _moe_apply_fp8_cutlass() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_mxfp4_plan(
@@ -3926,7 +3932,7 @@ def _moe_apply_mxfp4_plan(
     # DeepSeek-V4.1-Flash on one EP8 rank: SwiGLU experts, 5120-wide hidden,
     # 2304-wide FFN, dense EP (no all-to-all). Kimi-K3 differs by SiTU and a
     # 3072-wide FFN.
-    return tokenspeed_kernel.moe_plan(
+    return kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation=activation,
@@ -3948,7 +3954,7 @@ def _moe_apply_mxfp4_plan(
 def _moe_apply_mxfp4_invoke(plan: dict) -> object:
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_mxfp4_cutlass_w4a16() -> object:
@@ -4060,7 +4066,7 @@ def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
     # rather than saturate FP8 at runtime.
     if not _is_hopper(Platform.get()):
         pytest.skip("Hopper registrations only")
-    with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+    with pytest.raises(kernel_NoKernelFoundError):
         _moe_apply_mxfp4_plan(
             activation="swiglu",
             ispp=2304,
@@ -4084,7 +4090,7 @@ def test_mxfp4_fp8_activation_fails_closed_on_backends_without_a_w4a8_kernel() -
     if not _is_hopper(Platform.get()):
         pytest.skip("Hopper registrations only")
     for solution in ("marlin", "triton"):
-        with pytest.raises(tokenspeed_kernel.NoKernelFoundError):
+        with pytest.raises(kernel_NoKernelFoundError):
             _moe_apply_mxfp4_plan(
                 activation="swiglu",
                 ispp=2304,
@@ -4110,7 +4116,7 @@ def _moe_apply_mxfp4_situ_auto() -> object:
 
 
 def _moe_apply_fp8_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "fp8",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -4132,11 +4138,11 @@ def _moe_apply_fp8_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_nvfp4_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4158,7 +4164,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -4168,7 +4174,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
 
 
 def _moe_apply_nvfp4_cutlass() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4190,11 +4196,11 @@ def _moe_apply_nvfp4_cutlass() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_nvfp4_trtllm_routed() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4220,7 +4226,7 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -4234,7 +4240,7 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
     # No routing_mode requested: the kernel-routing registration must keep
     # winning under solution "flashinfer_trtllm" (its callers pass only
     # router_logits), so the routed variant sits at a lower priority.
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4257,11 +4263,11 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
     assert plan["support_routing"] is True
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_unquant_trtllm_routed() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4287,7 +4293,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -4298,7 +4304,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
 
 
 def _moe_apply_nvfp4_deepep_cutedsl() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -4323,11 +4329,11 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_fp8_deepep_deep_gemm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "fp8",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -4356,7 +4362,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -4367,7 +4373,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
 
 
 def _moe_apply_mxfp4_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4389,11 +4395,11 @@ def _moe_apply_mxfp4_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_mxfp4_triton() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4418,7 +4424,7 @@ def _moe_apply_mxfp4_triton() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int64)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -4429,7 +4435,7 @@ def _moe_apply_mxfp4_triton() -> object:
 
 
 def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "fp8",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -4449,7 +4455,7 @@ def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> obj
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int64)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -4460,7 +4466,7 @@ def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> obj
 
 
 def _moe_apply_unquant_triton() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4485,7 +4491,7 @@ def _moe_apply_unquant_triton() -> object:
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     topk_weights = torch.empty((4, 2), dtype=torch.float32)
     topk_ids = torch.empty((4, 2), dtype=torch.int64)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -4496,7 +4502,7 @@ def _moe_apply_unquant_triton() -> object:
 
 
 def _moe_apply_mxfp4_gluon() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4517,11 +4523,11 @@ def _moe_apply_mxfp4_gluon() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_mxint4_trtllm() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxint4",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -4542,11 +4548,11 @@ def _moe_apply_mxint4_trtllm() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
 def _moe_apply_mxfp4_dynamic_tp() -> object:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="silu",
@@ -4567,7 +4573,7 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
     )
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
-    return tokenspeed_kernel.moe_apply(
+    return kernel_moe_apply(
         plan,
         x,
         torch.nn.Module(),
@@ -6234,7 +6240,7 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
         KernelRegistry.reset()
         importlib.reload(_moe_trtllm_fp8)
 
-        plan = tokenspeed_kernel.moe_plan(
+        plan = kernel_moe_plan(
             "fp8",
             input_dtype=torch.bfloat16,
             activation="swiglu",
