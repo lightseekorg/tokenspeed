@@ -886,12 +886,19 @@ def repair_deadline(state: dict) -> int:
     )
 
 
-def control(number: int):
+def control(number: int, *, expected_command: int | None = None):
     public_gate()
     pr = pull(number)
     comments = pages(f"issues/{number}/comments", None)
     state = load_state(comments, pr)
     comment = latest_command(comments)
+    if expected_command is not None and (
+        not state
+        or not comment
+        or state["command"] != expected_command
+        or comment["id"] != expected_command
+    ):
+        return
     initial = bool(comment and (not state or comment["id"] > state["command"]))
     if (
         not initial
@@ -1154,11 +1161,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("resolve", "control", "plan-source"))
     parser.add_argument("--pr", type=int)
+    parser.add_argument("--command", type=int)
     args = parser.parse_args()
     try:
         {
             "resolve": resolve,
-            "control": lambda: control(args.pr),
+            "control": lambda: control(args.pr, expected_command=args.command),
             "plan-source": plan_source,
         }[args.stage]()
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):

@@ -1269,7 +1269,71 @@ def test_queued_validation_expires_without_a_completion_event(monkeypatch, selec
     repair.wait_for_validation(request)
     assert len(reconciled) == 1 and reconciled[0][1]["timeout"] == 60
     assert reconciled[0][0][1] == str(repair.ROOT / ".github/scripts/pr_ci_assist.py")
+    assert reconciled[0][0][-2:] == ["--command", str(state["command"])]
     assert state["phase"] == "manual" and "one-hour" in messages[0]
+
+
+def test_validation_poll_does_not_consume_a_new_repair_command(monkeypatch, selected):
+    _, state = selected
+    state.update(action="fix", phase="validating")
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pull", lambda number: {})
+    monkeypatch.setattr(assist, "pages", lambda *args: [])
+    monkeypatch.setattr(assist, "load_state", lambda *args: state)
+    monkeypatch.setattr(
+        assist, "latest_command", lambda *args: {"id": state["command"] + 1}
+    )
+    monkeypatch.setattr(
+        assist, "permitted", lambda *args: pytest.fail("Poll consumed a new command")
+    )
+    assist.control(state["pr"], expected_command=state["command"])
+    assert state["phase"] == "validating"
+
+
+def test_rejected_patch_receives_feedback_within_the_original_budget(
+    monkeypatch, tmp_path, capsys
+):
+    request = {"deadline": 100}
+    now = [40]
+    monkeypatch.setattr(repair.time, "time", lambda: now[0])
+    feedback = tmp_path / "feedback.json"
+    turns = []
+
+    def run_model(attempt):
+        turns.append(repair.remaining_time(request))
+        if attempt:
+            assert (
+                json.loads(feedback.read_text())["reason"]
+                == repair.REPAIR_FEEDBACK["test-assertions"]
+            )
+        now[0] += 10
+
+    def proposal():
+        if len(turns) == 1:
+            raise repair.RepairRejected(
+                "test-assertions",
+                path="test/example.py",
+                details=["private diagnostic"],
+            )
+        return "accepted patch"
+
+    assert (
+        repair.repair_with_feedback(request, run_model, proposal, feedback)
+        == "accepted patch"
+    )
+    assert turns == [60, 50] and request["deadline"] == 100
+    output = capsys.readouterr().out
+    assert "test-assertions" in output and "private diagnostic" not in output
+    turns.clear()
+
+    def rejected():
+        raise repair.RepairRejected("test-syntax")
+
+    with pytest.raises(repair.RepairRejected):
+        repair.repair_with_feedback(
+            request, lambda attempt: turns.append(attempt), rejected, feedback
+        )
+    assert turns == [0, 1, 2]
 
 
 def test_dispatch_event_uses_tested_source_not_main_controller(

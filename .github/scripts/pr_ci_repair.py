@@ -74,6 +74,41 @@ CONFIG_NAMES = {
     ".clang-tidy",
 }
 NATIVE_CONFIG = NATIVE_CHECKS["nvidia-kernel-library-tests.yml"]["config"]
+REPAIR_FEEDBACK = {
+    "native-task": "Native repair must retain the original tests and every original byte except appending ${PYTHONPATH:+:$PYTHONPATH} inside an existing quoted PYTHONPATH prefix.",
+    "test-syntax": "Test conflict resolution is not valid Python.",
+    "test-assertions": "Conflict resolution removed or changed test assertions. Preserve the supplied assertions from both parents.",
+    "scope": "Repair changes files outside its scope.",
+    "file-size": "Repair deletes a file or exceeds the size limit.",
+    "file-mode": "Repair changes file type or mode.",
+    "missing-file": "An allowed resolution file is missing. Restore its supported contents without weakening tests.",
+    "untracked": "Repair introduced untracked files.",
+    "no-edits": "Repair returned without an editable patch. Apply the substantiated fix using Edit or Write.",
+    "public-output": "Repair needs manual public-output review.",
+    "patch-size": "Repair exceeds the patch limit.",
+}
+
+
+class RepairRejected(ValueError):
+    def __init__(self, category: str, *, path: str = "", details=None):
+        super().__init__(REPAIR_FEEDBACK[category])
+        self.category = category
+        self.feedback = dict(reason=str(self), path=path, details=details)
+
+
+def repair_with_feedback(request: dict, run_model, proposal, feedback: Path):
+    """Give rejected patches bounded corrective turns within the original hour."""
+    for attempt in range(3):
+        remaining_time(request)
+        run_model(attempt)
+        try:
+            return proposal()
+        except RepairRejected as error:
+            print(f"Repair patch rejected: {error.category}.", flush=True)
+            if error.category == "public-output" or attempt == 2:
+                raise
+            feedback.write_text(json.dumps(error.feedback))
+            print("Repair: returning patch feedback to the model.", flush=True)
 
 
 def safe_path(path: str) -> bool:
@@ -137,7 +172,7 @@ def guard_native_task(source: Path, head: str):
         keepends=True
     )
     if len(old_lines) != len(new_lines):
-        raise ValueError("Native repair changes test configuration.")
+        raise RepairRejected("native-task", path=NATIVE_CONFIG)
     for old, new in zip(old_lines, new_lines):
         if old == new:
             continue
@@ -146,9 +181,7 @@ def guard_native_task(source: Path, head: str):
             not match
             or new != f"{match[1]}{match[2]}${{PYTHONPATH:+:$PYTHONPATH}}{match[3]}"
         ):
-            raise ValueError(
-                "Native repair must retain the original tests and only preserve PYTHONPATH."
-            )
+            raise RepairRejected("native-task", path=NATIVE_CONFIG)
 
 
 def public_source_diff(source: Path, head: str, names: set[str]) -> str:
@@ -187,9 +220,9 @@ def scan(diff: str):
         r"https?://|\bwww\.|\b(?:sk-|ghp_|gho_|github_pat_)|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|/(?:home|tmp|root|proc)/",
         added,
     ):
-        raise ValueError("Repair needs manual public-output review.")
+        raise RepairRejected("public-output")
     if len(diff.encode()) > 200000:
-        raise ValueError("Repair exceeds the patch limit.")
+        raise RepairRejected("patch-size")
 
 
 def guard_test_assertions(source: Path, head: str, base: str, path: str):
@@ -197,7 +230,7 @@ def guard_test_assertions(source: Path, head: str, base: str, path: str):
         try:
             nodes = ast.walk(ast.parse(content))
         except SyntaxError:
-            raise ValueError("Test conflict resolution is not valid Python.") from None
+            raise RepairRejected("test-syntax", path=path) from None
         return Counter(
             ast.dump(node, include_attributes=False)
             for node in nodes
@@ -222,8 +255,11 @@ def guard_test_assertions(source: Path, head: str, base: str, path: str):
             # A renamed test may exist only on one side of the merge.
             continue
         required |= assertions(command("git", "show", f"{ref}:{path}", cwd=source))
-    if required - assertions(source.joinpath(path).read_text()):
-        raise ValueError("Conflict resolution removed or changed test assertions.")
+    missing = required - assertions(source.joinpath(path).read_text())
+    if missing:
+        raise RepairRejected(
+            "test-assertions", path=path, details=list(missing.elements())
+        )
 
 
 def guard(
@@ -236,7 +272,7 @@ def guard(
     if not names or any(
         p not in allowed or (p != NATIVE_CONFIG and not safe_path(p)) for p in names
     ):
-        raise ValueError("Repair changes files outside its scope.")
+        raise RepairRejected("scope")
     for p in names:
         if p == NATIVE_CONFIG:
             guard_native_task(source, head)
@@ -246,13 +282,13 @@ def guard(
             guard_test_assertions(source, head, validation_base, p)
         file = source / p
         if not file.is_file() or file.stat().st_size > 1000000:
-            raise ValueError("Repair deletes a file or exceeds the size limit.")
+            raise RepairRejected("file-size", path=p)
         # Reject executable/type changes; regular source edits only.
         status = command(
             "git", "diff", "--raw", "--no-renames", head, "--", p, cwd=source
         )
         if any(row.split()[0][1:] != row.split()[1] for row in status.splitlines()):
-            raise ValueError("Repair changes file type or mode.")
+            raise RepairRejected("file-mode", path=p)
     diff = command("git", "diff", "--binary", "--no-ext-diff", head, cwd=source)
     scan(public_source_diff(source, head, set(names)))
     return diff
@@ -498,6 +534,50 @@ def remaining_time(request: dict) -> int:
     return remaining
 
 
+def proposed_patch(source, request, allowed, conflicts, before, planner, guard_root):
+    state = request["state"]
+    base = state.get("validation_base", state["base"])
+    print("Repair: checking proposed patch.", flush=True)
+    no_symlinks(source)
+    for path in conflicts | before.keys():
+        if not source.joinpath(path).is_file():
+            raise RepairRejected("missing-file", path=path)
+    selected = conflicts | {
+        p for p, content in before.items() if source.joinpath(p).read_bytes() != content
+    }
+    if not selected:
+        raise RepairRejected("no-edits")
+    if command("git", "ls-files", "--others", "--exclude-standard", cwd=source):
+        raise RepairRejected("untracked")
+    unstaged = set(command("git", "diff", "--name-only", cwd=source).splitlines())
+    if not unstaged.issubset(allowed):
+        raise RepairRejected("scope")
+    # Inspect a private copy at the original head. Leave the model's merged
+    # working tree intact so a corrective turn can continue its actual edits.
+    with tempfile.TemporaryDirectory(prefix="patch-review-", dir=WORK) as work:
+        review = Path(work) / "source"
+        command(
+            "git", "worktree", "add", "--detach", str(review), state["head"], cwd=ROOT
+        )
+        try:
+            for path in selected:
+                target = review / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.joinpath(path).read_bytes())
+                shutil.copymode(source / path, target)
+            diff = guard(review, state["head"], allowed, validation_base=base)
+            os.environ["KIMI_CODE_HOME"] = str(guard_root)
+            try:
+                planner._check_public_output(
+                    public_source_diff(review, state["head"], selected), guard_root
+                )
+            except SystemExit:
+                raise RepairRejected("public-output") from None
+            return diff
+        finally:
+            command("git", "worktree", "remove", "--force", str(review), cwd=ROOT)
+
+
 def model():
     request = json.loads(WORK.joinpath("request.json").read_text())
     state = request["state"]
@@ -545,7 +625,9 @@ def model():
         Path(os.environ["KIMI_CODE_HOME"]) / "config.toml", home / "config.toml"
     )
     plan_root.joinpath("context.json").write_text(json.dumps(request["data"]))
-    agent = plan_root / "repair.md"
+    # Corrective turns must reuse a trusted tool definition. The model can read
+    # this runner-owned file, but cannot replace it through its writable inputs.
+    agent = sandbox_root / "repair.md"
     agent.write_text("""---
 name: ci-repair
 description: Focused source repair
@@ -575,54 +657,77 @@ the allowed source does not complete this task.
     guard_root.joinpath("config.toml").write_bytes(
         Path(os.environ["KIMI_CODE_HOME"], "config.toml").read_bytes()
     )
-    with (plan_root / "events.jsonl").open("w") as events, (
-        plan_root / "cli.stderr"
-    ).open("w") as errors:
-        print("Repair: preparing edit sandbox.", flush=True)
-        sandbox = edit_sandbox(source, allowed, [plan_root, home], home=home)
-        for path, label in (
-            (agent, "agent definition"),
-            (plan_root / "diagnostics.txt", "failure evidence"),
-            (
-                home / "config.toml",
-                "provider configuration",
-            ),
-        ):
-            if subprocess.run([*sandbox, "test", "-r", str(path)]).returncode:
-                print(f"Repair input access denied: {label}.", flush=True)
-                raise ValueError("Repair inputs are inaccessible.")
-        print("Repair: starting repair process.", flush=True)
-        result = subprocess.Popen(
-            [
-                *sandbox,
-                "timeout",
-                "--kill-after=10s",
-                str(remaining_time(request)),
-                "kimi",
-                "--agent-file",
-                str(agent),
-                "--add-dir",
-                str(source),
-                "--skills-dir",
-                str(plan_root),
-                "--output-format",
-                "stream-json",
-                "-p",
-                prompt,
-            ],
-            cwd=plan_root,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=errors,
-            text=True,
-            errors="replace",
+    print("Repair: preparing edit sandbox.", flush=True)
+    sandbox = edit_sandbox(source, allowed, [plan_root, home], home=home)
+    for path, label in (
+        (agent, "agent definition"),
+        (plan_root / "diagnostics.txt", "failure evidence"),
+        (home / "config.toml", "provider configuration"),
+    ):
+        if subprocess.run([*sandbox, "test", "-r", str(path)]).returncode:
+            print(f"Repair input access denied: {label}.", flush=True)
+            raise ValueError("Repair inputs are inaccessible.")
+    session = []
+
+    def run_model(attempt):
+        turn_prompt = prompt
+        if attempt:
+            turn_prompt = (
+                ("" if session else prompt + "\n")
+                + f"The proposed patch was rejected. Read feedback.json and correct only the identified issue in the existing source edits. Preserve both merge parents' supported behavior. {remaining_time(request)} seconds remain in the original one-hour repair and validation budget. Apply the correction promptly to leave time for required checks and GPU dispatch."
+            )
+        # Restore trusted provider settings before each process starts.
+        (home / "config.toml").write_bytes(
+            guard_root.joinpath("config.toml").read_bytes()
         )
-        seen = set()
-        for line in result.stdout:
-            events.write(line)
-            repair_progress(line, seen)
-        result.wait()
-    if result.returncode:
+        print(f"Repair: starting model turn {attempt + 1}.", flush=True)
+        with (plan_root / f"events-{attempt}.jsonl").open("w") as events, (
+            plan_root / "cli.stderr"
+        ).open("w") as errors:
+            result = subprocess.Popen(
+                [
+                    *sandbox,
+                    "timeout",
+                    "--kill-after=10s",
+                    str(remaining_time(request)),
+                    "kimi",
+                    *(["-r", session[0]] if session else ["--agent-file", str(agent)]),
+                    "--add-dir",
+                    str(source),
+                    "--skills-dir",
+                    str(plan_root),
+                    "--output-format",
+                    "stream-json",
+                    "-p",
+                    turn_prompt,
+                ],
+                cwd=plan_root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=errors,
+                text=True,
+                errors="replace",
+            )
+            seen = set()
+            for line in result.stdout:
+                events.write(line)
+                repair_progress(line, seen)
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if (
+                    isinstance(event, dict)
+                    and event.get("type") == "session.resume_hint"
+                ):
+                    identifier = event.get("session_id", "")
+                    if isinstance(identifier, str) and re.fullmatch(
+                        r"[a-f0-9-]{36}", identifier
+                    ):
+                        session[:] = [identifier]
+            result.wait()
+        if not result.returncode:
+            return
         print(f"Repair process exited with status {result.returncode}.", flush=True)
         stderr = (plan_root / "cli.stderr").read_text(errors="replace")
         signatures = {
@@ -641,29 +746,14 @@ the allowed source does not complete this task.
             if signature in stderr:
                 print(f"Repair failure category: {message}", flush=True)
         raise ValueError("Repair failed or timed out.")
-    print("Repair: checking proposed patch.", flush=True)
-    no_symlinks(source)
-    # Compare against the pre-model merge, then keep only the edited/conflicted
-    # files when returning to the original head (never copy all of main).
-    selected = conflicts | {
-        p for p, content in before.items() if source.joinpath(p).read_bytes() != content
-    }
-    if not selected:
-        print("Repair: no source edits proposed.", flush=True)
-        raise ValueError("Repair returned without an editable patch.")
-    dirty = command("git", "status", "--porcelain", cwd=source)
-    if command("git", "ls-files", "--others", "--exclude-standard", cwd=source):
-        raise ValueError("Repair introduced untracked files.")
-    # Check every allowed file, and ensure other merged files retain their
-    # staged version. Unmerged entries must all be selected resolution files.
-    unstaged = set(command("git", "diff", "--name-only", cwd=source).splitlines())
-    if not unstaged.issubset(allowed) or not dirty:
-        raise ValueError("Repair edits escaped the allowlist.")
-    restore_patch(source, state["head"], selected)
-    diff = guard(source, state["head"], allowed, validation_base=base)
-    os.environ["KIMI_CODE_HOME"] = str(guard_root)
-    planner._check_public_output(
-        public_source_diff(source, state["head"], selected), guard_root
+
+    diff = repair_with_feedback(
+        request,
+        run_model,
+        lambda: proposed_patch(
+            source, request, allowed, conflicts, before, planner, guard_root
+        ),
+        plan_root / "feedback.json",
     )
     WORK.joinpath("patch.diff").write_text(diff + "\n")
 
@@ -920,6 +1010,8 @@ def wait_for_validation(request: dict):
                         "control",
                         "--pr",
                         str(state["pr"]),
+                        "--command",
+                        str(state["command"]),
                     ],
                     env=env,
                     check=True,
@@ -928,9 +1020,13 @@ def wait_for_validation(request: dict):
             except subprocess.TimeoutExpired:
                 break
         pr = pull(state["pr"])
-        live = load_state(pages(f"issues/{state['pr']}/comments", None), pr)
+        comments = pages(f"issues/{state['pr']}/comments", None)
+        live = load_state(comments, pr)
+        latest = latest_command(comments)
         if (
             not live
+            or not latest
+            or latest["id"] != state["command"]
             or live["command"] != state["command"]
             or live["phase"] != "validating"
         ):
