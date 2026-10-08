@@ -625,6 +625,8 @@ def model():
         Path(os.environ["KIMI_CODE_HOME"]) / "config.toml", home / "config.toml"
     )
     plan_root.joinpath("context.json").write_text(json.dumps(request["data"]))
+    feedback = plan_root / "feedback.json"
+    feedback.write_text("{}")
     # Corrective turns must reuse a trusted tool definition. The model can read
     # this runner-owned file, but cannot replace it through its writable inputs.
     agent = sandbox_root / "repair.md"
@@ -662,7 +664,12 @@ the allowed source does not complete this task.
     # The controller refreshes this file between turns; the restricted CLI only
     # reads it. Retain its controller ownership after preparing writable state.
     command(
-        "sudo", "-n", "chown", f"{os.getuid()}:{os.getgid()}", str(home / "config.toml")
+        "sudo",
+        "-n",
+        "chown",
+        f"{os.getuid()}:{os.getgid()}",
+        str(home / "config.toml"),
+        str(feedback),
     )
     for path, label in (
         (agent, "agent definition"),
@@ -686,8 +693,8 @@ the allowed source does not complete this task.
             guard_root.joinpath("config.toml").read_bytes()
         )
         print(f"Repair: starting model turn {attempt + 1}.", flush=True)
-        with (plan_root / f"events-{attempt}.jsonl").open("w") as events, (
-            plan_root / "cli.stderr"
+        with (guard_root / f"events-{attempt}.jsonl").open("w") as events, (
+            guard_root / "cli.stderr"
         ).open("w") as errors:
             result = subprocess.Popen(
                 [
@@ -734,7 +741,7 @@ the allowed source does not complete this task.
         if not result.returncode:
             return
         print(f"Repair process exited with status {result.returncode}.", flush=True)
-        stderr = (plan_root / "cli.stderr").read_text(errors="replace")
+        stderr = (guard_root / "cli.stderr").read_text(errors="replace")
         signatures = {
             "EACCES": "File access denied.",
             "ENOENT": "A required file or executable is missing.",
@@ -758,7 +765,7 @@ the allowed source does not complete this task.
         lambda: proposed_patch(
             source, request, allowed, conflicts, before, planner, guard_root
         ),
-        plan_root / "feedback.json",
+        feedback,
     )
     WORK.joinpath("patch.diff").write_text(diff + "\n")
 
