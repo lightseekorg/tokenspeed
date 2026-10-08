@@ -603,6 +603,36 @@ def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
     assert repair.NATIVE_CONFIG not in repair.allowed_paths(request)
 
 
+def test_runtime_lint_returns_unused_import_to_corrective_turn(monkeypatch, tmp_path):
+    import time
+
+    path = "python/tokenspeed/runtime/model.py"
+    source = tmp_path / path
+    source.parent.mkdir(parents=True)
+    source.write_text("import math\n")
+    request = dict(deadline=int(time.time()) + 60, data=dict(paths=[path]))
+    feedback = tmp_path / "feedback.json"
+    turns = []
+
+    def edit(attempt):
+        turns.append(attempt)
+        if attempt:
+            issue = json.loads(feedback.read_text())
+            assert issue["category"] == "runtime-lint"
+            assert issue["path"] == path
+            assert issue["details"][0]["code"] == "F401"
+            source.write_text("VALUE = 1\n")
+
+    def proposal():
+        repair.runtime_lint(tmp_path, request)
+        return source.read_text()
+
+    assert (
+        repair.repair_with_feedback(request, edit, proposal, feedback) == "VALUE = 1\n"
+    )
+    assert turns == [0, 1]
+
+
 def test_conflicted_test_resolution_preserves_both_sides_assertions(tmp_path, selected):
     def git(*args):
         return assist.command(
@@ -1402,6 +1432,19 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assist.control(state["pr"])
     assert live[0]["phase"] == "manual" and len(dispatched) == 1
     author.update(id=43, body="fix")
+    # Lint alone must enter repair even when the selected GPU task passed.
+    runs.append(
+        dict(
+            id=102,
+            path=".github/workflows/lint.yml",
+            event="pull_request",
+            head_sha=state["head"],
+            status="completed",
+            conclusion="failure",
+            pull_requests=[dict(number=state["pr"], head=dict(sha=state["head"]))],
+        )
+    )
+    monkeypatch.setattr(assist, "report", lambda *args: "passed")
     event.write_text(json.dumps({"comment": {"id": 43}}))
     monkeypatch.setenv("GITHUB_EVENT_NAME", "issue_comment")
     emitted = []
@@ -1410,6 +1453,9 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
     assert tmp_path.joinpath("request.json").is_file()
     assert live[0]["repair_run"] == 200
+    assert json.loads(tmp_path.joinpath("request.json").read_text())["lint_run"] == 102
+    runs.pop()
+    monkeypatch.setattr(assist, "report", lambda *args: "failed")
     assert (
         json.loads(tmp_path.joinpath("request.json").read_text())["deadline"]
         == 1893459600

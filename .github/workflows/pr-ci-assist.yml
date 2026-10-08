@@ -4,7 +4,7 @@ on:
   issue_comment:
     types: [created]
   workflow_run:
-    workflows: [PR CI Plan, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
+    workflows: [PR CI Plan, Lint, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
     types: [completed]
     branches-ignore: [main]
   workflow_call:
@@ -113,7 +113,7 @@ jobs:
           node-version: '24'
       - if: '!inputs.check_only'
         run: npm install --global @moonshot-ai/kimi-code@2.1.1
-      - run: python3 -m pip install pyyaml
+      - run: python3 -m pip install pyyaml ruff
       - name: Prepare provider configuration
         if: '!inputs.check_only'
         env:
@@ -154,7 +154,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: python3 -m pip install pre-commit pyyaml
+      - run: python3 -m pip install pre-commit pyyaml ruff
       - name: Check repair without publishing credentials
         run: python3 .github/scripts/pr_ci_repair.py check
       - uses: actions/upload-artifact@v4

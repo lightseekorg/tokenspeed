@@ -35,6 +35,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
+import yaml
 from pr_ci_assist import (
     REPO,
     ROOT,
@@ -78,6 +79,7 @@ ROOT_API = "tokenspeed-kernel/python/tokenspeed_kernel/__init__.py"
 FP8_API = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/flashinfer.py"
 FP8_REFERENCE = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/fp8_utils.py"
 REPAIR_FEEDBACK = {
+    "runtime-lint": "Required runtime Ruff checks failed. Correct the supplied source diagnostics without changing the lint policy.",
     "native-task": "Native repair must retain the original tests and every original byte except appending ${PYTHONPATH:+:$PYTHONPATH} inside an existing quoted PYTHONPATH prefix.",
     "test-syntax": "Test conflict resolution is not valid Python.",
     "source-syntax": "Source conflict resolution is not valid Python. Correct the supplied syntax error before validation.",
@@ -593,11 +595,15 @@ def configure():
         if c["status"] == "failed" and c["run"]
     }
     run_ids = set(evidence["run_ids"].values()) | set(native)
+    if request.get("lint_run"):
+        run_ids.add(request["lint_run"])
     for run_id in run_ids:
         jobs = pages(f"actions/runs/{run_id}/jobs?filter=latest", "jobs")
         names = {t["name"] for t in validate_plan(request["plan"], request["data"])}
         if run_id in native:
             names.add(native[run_id]["job"])
+        if run_id == request.get("lint_run"):
+            names.add("lint")
         for job in jobs:
             if job["conclusion"] == "failure" and any(
                 job["name"] == n or f"{n} (" in job["name"] for n in names
@@ -745,6 +751,36 @@ def remaining_time(request: dict) -> int:
     return remaining
 
 
+def runtime_lint(source: Path, request: dict):
+    workflow = yaml.safe_load(ROOT.joinpath(".github/workflows/lint.yml").read_text())
+    step = next(
+        s
+        for s in workflow["jobs"]["lint"]["steps"]
+        if s.get("name") == "Lint runtime Python with ruff"
+    )
+    result = subprocess.run(
+        ["bash", "-c", step["run"].strip() + " --output-format=json"],
+        cwd=source,
+        capture_output=True,
+        text=True,
+        timeout=remaining_time(request),
+    )
+    if result.returncode == 0:
+        return
+    if result.returncode != 1:
+        raise ValueError("Required runtime lint could not run.")
+    issues = [
+        dict(
+            code=i["code"],
+            message=i["message"],
+            path=str(Path(i["filename"]).relative_to(source)),
+            line=i["location"]["row"],
+        )
+        for i in json.loads(result.stdout)
+    ]
+    raise RepairRejected("runtime-lint", path=issues[0]["path"], details=issues)
+
+
 def proposed_patch(source, request, allowed, conflicts, before, planner, guard_root):
     state = request["state"]
     base = state.get("validation_base", state["base"])
@@ -778,6 +814,7 @@ def proposed_patch(source, request, allowed, conflicts, before, planner, guard_r
                 shutil.copymode(source / path, target)
             command("git", "add", "--", *sorted(selected), cwd=review)
             diff = guard(review, state["head"], allowed, validation_base=base)
+            runtime_lint(source, request)
             os.environ["KIMI_CODE_HOME"] = str(guard_root)
             try:
                 planner._check_public_output(
@@ -891,7 +928,12 @@ def model():
     changed = command(
         "git", "diff", "--name-only", f"{state['base']}...{state['head']}", cwd=source
     ).splitlines()
-    if any(p.startswith(PROTECTED) or Path(p).name in CONFIG_NAMES for p in changed):
+    if NATIVE_CONFIG in changed:
+        guard_native_task(source, base)
+    if any(
+        (p.startswith(PROTECTED) and p != NATIVE_CONFIG) or Path(p).name in CONFIG_NAMES
+        for p in changed
+    ):
         raise ValueError("Control/config changes require manual repair.")
     conflicts = set(merge(source, base, commit=False))
     request["conflicted_paths"] = sorted(conflicts)
@@ -1213,6 +1255,7 @@ def check():
         cwd=source,
     )
     diff = guard(source, state["head"], allowed, validation_base=base)
+    runtime_lint(source, request)
     WORK.joinpath("patch.diff").write_text(diff + "\n")
     command("git", "add", "--all", cwd=source)
     command(
@@ -1241,6 +1284,7 @@ def check():
     )
     if result.returncode or command("git", "diff", "--name-only", cwd=source):
         raise ValueError("Merged repair failed required pre-commit checks.")
+    runtime_lint(source, request)
     WORK.joinpath("checked.json").write_text(
         json.dumps(
             {

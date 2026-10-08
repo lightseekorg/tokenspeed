@@ -1146,6 +1146,25 @@ def control(number: int, *, expected_command: int | None = None):
         )
         return
     requested_fix = state["action"] == "fix" and "candidate" not in state
+    lint = next(
+        (
+            r
+            for r in runs
+            if r.get("path") == ".github/workflows/lint.yml"
+            and r.get("event") == "pull_request"
+            and r.get("head_sha") == state["head"]
+            and any(
+                p["number"] == number and p["head"]["sha"] == state["head"]
+                for p in r.get("pull_requests", [])
+            )
+        ),
+        None,
+    )
+    lint_run = (
+        lint["id"]
+        if lint and lint["status"] == "completed" and lint["conclusion"] == "failure"
+        else None
+    )
     if requested_fix and pr["mergeable"] is False:
         state["conflicts"] = True
         statuses = ["waiting"] * len(tasks)
@@ -1155,6 +1174,7 @@ def control(number: int, *, expected_command: int | None = None):
     state["statuses"] = statuses
     if requested_fix and (
         resume_run
+        or lint_run
         or pr["mergeable"] is False
         or "failed" in statuses
         or "failed" in native_statuses
@@ -1180,6 +1200,7 @@ def control(number: int, *, expected_command: int | None = None):
                     "deadline": repair_deadline(state),
                     "resume_run": int(resume_run) if resume_run else None,
                     "check_only": check_only,
+                    "lint_run": lint_run,
                     **({"diagnostics": diagnostics} if diagnostics is not None else {}),
                 }
             )
