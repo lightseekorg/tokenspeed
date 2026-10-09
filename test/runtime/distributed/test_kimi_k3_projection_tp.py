@@ -39,6 +39,41 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=120, suite="runtime-2gpu")
 
 
+@pytest.mark.parametrize(
+    ("sizes", "mapping_overrides", "message"),
+    [
+        (("abc", "1"), {}, "positive integers"),
+        (("1", "3"), {}, "positive divisors"),
+        (("0", "1"), {}, "positive divisors"),
+        (("2", "1"), {"attn_tp_size": 2}, "attention TP1/DPworld"),
+        (("1", "2"), {"moe_ep_size": 2}, "MoE TP1/EPworld"),
+        (("2", "2"), {"pp_size": 2, "moe_ep_size": 2}, "PP1"),
+    ],
+)
+def test_projection_settings_reject_invalid_configuration(
+    sizes, mapping_overrides, message
+):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.kimi_k3_projection import (
+        validate_projection_settings,
+    )
+
+    mapping_args = dict(
+        rank=0,
+        world_size=4,
+        attn_tp_size=1,
+        linear_attn_tp_size=1,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=4,
+        pp_size=1,
+    )
+    mapping_args.update(mapping_overrides)
+    mapping = Mapping(**mapping_args)
+    with pytest.raises(ValueError, match=message):
+        validate_projection_settings(mapping, *sizes)
+
+
 @torch.no_grad()
 def test_checkpoint_shards():
     from tokenspeed.runtime.distributed.mapping import DenseLayerMapping

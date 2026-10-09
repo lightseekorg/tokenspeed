@@ -24,8 +24,10 @@ and pipeline parallelism must be disabled.
 
 Projection sharding supports BF16 and the 128×128 block-FP8 attention weights
 in the NVFP4 checkpoint, with BF16 activations. It retains the checkpoint's
-FP8 codes and scales. QKV TP requires gated MLA with Q-LoRA. MLA Q-B, KV-B,
-KDA convolution, norms and recurrent-state caches retain their existing mapping.
+FP8 codes and scales. QKV TP requires gated MLA. Gated MLA requires Q-LoRA,
+including when projections remain replicated; configurations without Q-LoRA
+are rejected during model construction. MLA Q-B, KV-B, KDA convolution, norms
+and recurrent-state caches retain their existing mapping.
 Target-model projection settings do not change the draft model.
 
 ## DEP16 example

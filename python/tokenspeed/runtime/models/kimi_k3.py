@@ -394,9 +394,10 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         self.qkv_parallel = qkv_parallel
         self.output_parallel = output_parallel
         self.use_output_gate = config.mla_use_output_gate
-        if qkv_parallel is not None and (
-            not self.use_output_gate or q_lora_rank is None
-        ):
+        # Without Q-LoRA the parent skips the factory that builds the gate.
+        if self.use_output_gate and q_lora_rank is None:
+            raise ValueError("Gated MLA requires Q-LoRA (q_lora_rank must not be None)")
+        if qkv_parallel is not None and not self.use_output_gate:
             raise ValueError("MLA QKV TP requires the gated q-lora projection")
         super().__init__(
             config=config,
@@ -424,7 +425,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
     ) -> nn.Module:
         """Build the gated QKV-A layout directly, replicated or column-sharded."""
         if self.use_output_gate:
-            assert self.q_lora_rank is not None, "gated MLA assumes the q-lora path"
             # The gate projection shares its input with the a-projections, so
             # its per-rank shard rides the same GEMV: one weight laid out as
             # [q_a | kv_a+rope | g_shard] x hidden. (The dsv3 min-latency
