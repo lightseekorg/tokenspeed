@@ -30,9 +30,14 @@ and packed into the ``output_score_vals`` column of ``BatchTokenIDOut``.
 from __future__ import annotations
 
 import math
+import os
+import sys
 
 import pytest
 import torch
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")

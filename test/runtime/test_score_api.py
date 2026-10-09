@@ -33,10 +33,15 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
+import sys
 
 import msgspec
 import pytest
 import torch
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
@@ -92,10 +97,65 @@ def test_score_apply_softmax_requires_labels():
         _verify(SamplingParams(score_apply_softmax=True))
 
 
+@pytest.mark.parametrize("token_id", (True, 1.5, "1"))
+def test_score_params_reject_non_integer_labels(token_id):
+    with pytest.raises(ValueError, match="integer token IDs"):
+        _verify(
+            SamplingParams(
+                max_new_tokens=0,
+                score_label_token_ids=[token_id],
+                score_apply_softmax=False,
+            )
+        )
+
+
+def test_score_params_reject_duplicate_labels():
+    with pytest.raises(ValueError, match="unique token IDs"):
+        _verify(
+            SamplingParams(
+                max_new_tokens=0,
+                score_label_token_ids=[1, 1],
+                score_apply_softmax=False,
+            )
+        )
+
+
+def test_score_params_require_explicit_normalization():
+    with pytest.raises(ValueError, match="explicitly True or False"):
+        _verify(SamplingParams(max_new_tokens=0, score_label_token_ids=[1]))
+
+
+def test_score_gather_uses_emitted_prefill_prefix():
+    # One completed prefill, one skipped incomplete prefill, then decode logits.
+    logits = torch.tensor([[1.0, 2.0, 3.0], [7.0, 8.0, 9.0]])
+    labels = torch.tensor([[0, 2], [1, 2]])
+    out = gather_score_logprobs(logits, labels, 1)
+    assert out.shape == (1, 2)
+    assert torch.allclose(
+        out, torch.log_softmax(logits[:1], dim=-1).gather(-1, labels[:1])
+    )
+
+
+def test_score_gather_skips_all_incomplete_prefills():
+    # The only logits belong to decode; no prefill row was emitted.
+    assert (
+        gather_score_logprobs(torch.ones(1, 3), torch.tensor([[0, 2], [1, 2]]), 0)
+        is None
+    )
+
+
+def test_registry_direct_family_registration_wins(monkeypatch):
+    from tokenspeed.runtime.decision import registry
+
+    factory = lambda family: ("custom", family)
+    monkeypatch.setitem(registry._ADAPTERS, "qwen3", factory)
+    assert get_decision_adapter("qwen3") == ("custom", "qwen3")
+
+
 def test_score_params_default_to_no_scoring():
     params = SamplingParams()
     assert params.score_label_token_ids is None
-    assert params.score_apply_softmax is False
+    assert params.score_apply_softmax is None
     _verify(params)
 
 
@@ -118,7 +178,7 @@ def test_score_params_decode_older_payload_defaults():
         msgspec.msgpack.encode(legacy), type=SamplingParams
     )
     assert decoded.score_label_token_ids is None
-    assert decoded.score_apply_softmax is False
+    assert decoded.score_apply_softmax is None
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +216,7 @@ def test_gather_score_logprobs_matches_manual():
     torch.manual_seed(0)
     logits = torch.randn(3, 50)
     label_ids = torch.tensor([[0, 1], [2, 3], [4, 5]])
-    gathered = gather_score_logprobs(logits, label_ids)
+    gathered = gather_score_logprobs(logits, label_ids, 3)
     expected = torch.log_softmax(logits.float(), dim=-1).gather(-1, label_ids)
     assert torch.equal(gathered, expected)
 

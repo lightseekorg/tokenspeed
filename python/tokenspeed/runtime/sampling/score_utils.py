@@ -60,18 +60,26 @@ def build_score_label_ids(
 
 
 def gather_score_logprobs(
-    next_token_logits: torch.Tensor, score_label_ids: torch.Tensor
-) -> torch.Tensor:
+    next_token_logits: torch.Tensor,
+    score_label_ids: torch.Tensor,
+    num_prefill_outputs: int,
+) -> torch.Tensor | None:
     """Gather full-vocab logprobs at the label positions.
 
     ``next_token_logits`` is ``[rows, vocab]`` with one row per scored
     sequence at its answer boundary; ``score_label_ids`` is the padded
     ``[rows, max_labels]`` index from :func:`build_score_label_ids`.
-    Returns raw logprobs ``[rows, max_labels]`` — padded columns and rows
+    ``num_prefill_outputs`` selects the emitted request prefix; incomplete
+    chunks and decode rows have no score readout. Zero returns ``None``.
+    Returns raw logprobs ``[num_prefill_outputs, max_labels]`` — padded columns and rows
     without score labels hold values the consumer must ignore.
     """
-    logprobs = torch.log_softmax(next_token_logits.float(), dim=-1)
-    return logprobs.gather(-1, score_label_ids)
+    if num_prefill_outputs == 0:
+        return None
+    logprobs = torch.log_softmax(
+        next_token_logits[:num_prefill_outputs].float(), dim=-1
+    )
+    return logprobs.gather(-1, score_label_ids[:num_prefill_outputs])
 
 
 def finalize_score_row(row_logprobs: list[float], apply_softmax: bool) -> list[float]:

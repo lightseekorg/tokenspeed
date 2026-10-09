@@ -1570,8 +1570,9 @@ class ModelExecutor:
         score_logprobs = None
         if sampling_info.score_label_ids is not None:
             score_logprobs = gather_score_logprobs(
-                logits_output.next_token_logits[: ctx.num_extends],
+                logits_output.next_token_logits,
                 sampling_info.score_label_ids,
+                ctx.output_layout.num_prefill_outputs,
             )
 
         candidates = self._decode_candidates(ctx)

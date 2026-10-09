@@ -28,7 +28,8 @@ belongs where, and why.
 
 Semantics that must not drift:
 
-- **Every declared label is scored.** The readout gathers the declared
+- **Every declared label is scored.** Label IDs must be unique integers
+  (booleans are rejected), bounding the label set by the model vocabulary. The readout gathers the declared
   `label_token_ids` from the full-vocab log_softmax at the answer
   boundary. It never relies on top-k generation logprobs, which may omit
   a label the application needs. Label-selective extraction does *not*
@@ -38,7 +39,9 @@ Semantics that must not drift:
   final prefill chunk; mid-chunk positions are not answer boundaries.
 - **`apply_softmax` normalizes across the label set of one row** (a
   label-restricted softmax), never across rows, and is an explicit
-  required choice. `false` returns raw logprobs.
+  required choice, including raw `/generate` and msgpack callers. Missing
+  choice is rejected when labels are present; older generation payloads
+  default to no scoring. `false` returns raw logprobs.
 - **Score requests are score-only.** `score_label_token_ids` requires
   `max_new_tokens=0` (`SamplingParams.verify`). Decoding past the
   boundary would leave the contract undefined.
@@ -72,8 +75,10 @@ A score request is an ordinary generation request with
   computed before the abort. Numerical-abort outputs suppress that row.
 - SIS execution: each `query + item` is an independent logical sequence.
   The shared query is reused through the ordinary radix cache — item 1
-  computes it, items 2..N prefix-match it. No new cache-group or
-  attention-mask machinery.
+  can be reused by later requests once its cache pages are committed.
+  Siblings admitted together on a cold cache may each compute that prefix;
+  v1 does not add a separate warmup request or promise within-batch reuse.
+  No new cache-group or attention-mask machinery.
 
 ## Ownership split
 

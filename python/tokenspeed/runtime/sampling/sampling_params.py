@@ -109,7 +109,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     # (label-restricted softmax); when False they are raw logprobs gathered
     # from the full-vocab log_softmax. Normalized scores are NOT calibrated
     # correctness probabilities — see docs/design/scoring.md.
-    score_apply_softmax: bool = False
+    score_apply_softmax: bool | None = None
 
     def __post_init__(self) -> None:
         # Runs after msgpack decode too; once normalize() resolved the
@@ -214,17 +214,27 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             if len(self.score_label_token_ids) == 0:
                 raise ValueError("score_label_token_ids must be a non-empty list.")
             for token_id in self.score_label_token_ids:
+                if not isinstance(token_id, int) or isinstance(token_id, bool):
+                    raise ValueError(
+                        "score_label_token_ids must contain integer token IDs, excluding booleans."
+                    )
                 if not 0 <= token_id < vocab_size:
                     raise ValueError(
                         f"score_label_token_ids must be in [0, {vocab_size - 1}], "
                         f"got {token_id}."
                     )
+            if len(set(self.score_label_token_ids)) != len(self.score_label_token_ids):
+                raise ValueError("score_label_token_ids must contain unique token IDs.")
             # Scores are read at the answer boundary, i.e. the last prefill
             # position; decoding past it would leave the contract undefined.
             if self.max_new_tokens != 0:
                 raise ValueError(
                     "score_label_token_ids requires max_new_tokens=0 (score-only "
                     f"request), got max_new_tokens={self.max_new_tokens}."
+                )
+            if not isinstance(self.score_apply_softmax, bool):
+                raise ValueError(
+                    "score_apply_softmax must be explicitly True or False when score labels are supplied."
                 )
         elif self.score_apply_softmax:
             raise ValueError(

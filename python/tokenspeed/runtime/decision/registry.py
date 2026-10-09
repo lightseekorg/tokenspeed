@@ -69,7 +69,7 @@ def get_decision_adapter(name: str) -> DecisionAdapter:
     Raises ``ValueError`` for unknown names — a misspelled family must fail
     at request time, not silently pick up a mismatched scaffold.
     """
-    adapter_name = _FAMILY_TO_ADAPTER.get(name, name)
+    adapter_name = name if name in _ADAPTERS else _FAMILY_TO_ADAPTER.get(name, name)
     factory = _ADAPTERS.get(adapter_name)
     if factory is None:
         available = sorted(set(_ADAPTERS) | set(_FAMILY_TO_ADAPTER))
