@@ -433,7 +433,10 @@ def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
         event_name="workflow_run",
         event=SimpleNamespace(
             workflow_run=SimpleNamespace(
-                event="push", name="AMD Tests", conclusion="skipped"
+                event="push",
+                name="AMD Tests",
+                path=".github/workflows/amd-tests.yml",
+                conclusion="skipped",
             ),
             issue=SimpleNamespace(pull_request=True),
             comment=SimpleNamespace(body="Ordinary PR comment"),
@@ -446,7 +449,8 @@ def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
     assert not eval(condition, {"__builtins__": {}}, context)
     github.event.workflow_run.event = "pull_request"
     assert eval(condition, {"__builtins__": {}}, context)
-    github.event.workflow_run.name = "PR CI Plan"
+    github.event.workflow_run.name = "CI plan #123 | head | base"
+    github.event.workflow_run.path = ".github/workflows/pr-ci-plan.yml"
     assert not eval(condition, {"__builtins__": {}}, context)
     github.event.workflow_run.conclusion = "success"
     assert eval(condition, {"__builtins__": {}}, context)
