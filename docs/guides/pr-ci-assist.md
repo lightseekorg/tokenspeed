@@ -31,3 +31,9 @@ Repairs are checked and tested on a candidate commit before updating the PR.
 Passing another backend does not satisfy the requested task. Required PR CI
 still applies after the update. Status comments are created at the start and
 at completion or a blocker; intermediate progress updates the same comment.
+
+If queueing exhausts the one-hour repair budget, let the candidate checks finish.
+Then run **PR CI Assist** manually with the PR number and `repair_run` left empty.
+This gives reconciliation a 15-minute window to verify the existing results and
+publish the same candidate. It starts no new repair or GPU validation, and still
+requires the original command, PR source, main, and validation branch to match.

@@ -1624,9 +1624,8 @@ def wait_for_validation(request: dict):
         )
 
 
-def promote(state: dict):
+def promote(state: dict, *, deadline: int):
     public_gate()
-    deadline = repair_deadline(state)
     base = state.get("validation_base", state["base"])
     if (
         "validation_base" in state
@@ -1634,7 +1633,7 @@ def promote(state: dict):
     ):
         raise ValueError("Main changed before promotion.")
     if time.time() >= deadline:
-        raise ValueError("The one-hour repair and validation budget expired.")
+        raise ValueError("The authorized publication budget expired.")
     pr = pull(state["pr"])
     if (pr["head"]["sha"], pr["base"]["sha"]) != (state["head"], state["base"]):
         raise ValueError("PR or main moved before promotion.")

@@ -1107,9 +1107,9 @@ def control(number: int, *, expected_command: int | None = None):
                 if t.startswith((f"Slurm {state['head']} |", f"K8s {state['head']} |"))
             ]
             state["since"] = prior["since"]
-    # Explicit reconciliation can recover a controller failure without
-    # replacing the checked candidate or extending its original deadline.
-    if (
+    # Explicit reconciliation can publish an already checked candidate after
+    # queueing consumed its repair budget; it never submits more validation.
+    reconcile = bool(
         not resume_run
         and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
         and state
@@ -1120,7 +1120,18 @@ def control(number: int, *, expected_command: int | None = None):
         and state["action"] == "fix"
         and permitted(comment) == "fix"
         and api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
-    ):
+    )
+    deadline = 0
+    if reconcile:
+        started = api(f"actions/runs/{os.environ['GITHUB_RUN_ID']}")["run_started_at"]
+        deadline = (
+            int(
+                datetime.datetime.fromisoformat(
+                    started.replace("Z", "+00:00")
+                ).timestamp()
+            )
+            + 15 * 60
+        )
         state["phase"] = "validating"
         initial = True
     if not state or state["phase"] in FINISHED_PHASES:
@@ -1136,14 +1147,21 @@ def control(number: int, *, expected_command: int | None = None):
         state["phase"] = "stale"
         publish(state, "PR or main changed. Request a new plan and command.")
         return
+    if not reconcile and "repair_run" in state:
+        deadline = repair_deadline(state)
     if (
         state["phase"] in {"repairing", "validating"}
         and "repair_run" in state
-        and time.time() >= repair_deadline(state)
+        and time.time() >= deadline
     ):
         state["phase"] = "manual"
         publish(
-            state, "The one-hour repair and validation budget expired; PR unchanged."
+            state,
+            (
+                "The reconciliation budget expired; PR unchanged."
+                if reconcile
+                else "The one-hour repair and validation budget expired; PR unchanged."
+            ),
         )
         return
     if "plan_refresh" in state and os.environ["GITHUB_EVENT_NAME"] == "workflow_run":
@@ -1256,7 +1274,7 @@ def control(number: int, *, expected_command: int | None = None):
         native_check(check, state, runs) for check in data.get("native_checks", [])
     ]
     native_statuses = [c["status"] for c in state["native_checks"]]
-    if "candidate" in state:
+    if "candidate" in state and not reconcile:
         dispatch_native_checks(state)
     requested_fix = state["action"] == "fix" and "candidate" not in state
     lint = next(
@@ -1296,7 +1314,7 @@ def control(number: int, *, expected_command: int | None = None):
         state["conflicts"] = pr["mergeable"] is False
         statuses = ["waiting"] * len(tasks)
     else:
-        statuses = [task_status(t, state, runs, submit=True) for t in tasks]
+        statuses = [task_status(t, state, runs, submit=not reconcile) for t in tasks]
     previous = state["statuses"]
     state["statuses"] = statuses
     if requested_fix and (
@@ -1336,10 +1354,14 @@ def control(number: int, *, expected_command: int | None = None):
         output("repair", "true")
         return
     combined = native_statuses + statuses
+    if reconcile and not all(s == "passed" for s in combined):
+        state["phase"] = "manual"
+        publish(state, "Validation has not fully passed; PR unchanged.")
+        return
     if "candidate" in state and all(s == "passed" for s in combined):
         from pr_ci_repair import promote
 
-        promote(state)
+        promote(state, deadline=deadline)
         state["phase"] = "promoted"
         publish(
             state,

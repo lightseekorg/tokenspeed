@@ -257,7 +257,7 @@ def test_targeted_fix_enters_repair_and_waits_for_target_validation(
         lambda t, *args, **kw: "waiting" if t["runner"] == b200["runner"] else "passed",
     )
     promoted = []
-    monkeypatch.setattr(repair, "promote", lambda s: promoted.append(s))
+    monkeypatch.setattr(repair, "promote", lambda s, *, deadline: promoted.append(s))
     assist.control(state["pr"])
     assert live[0]["phase"] == "validating" and not promoted
     monkeypatch.setattr(assist, "task_status", lambda *args, **kw: "passed")
@@ -1858,7 +1858,13 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     )
     monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
     promoted = []
-    monkeypatch.setattr(repair, "promote", lambda s: promoted.append(copy.deepcopy(s)))
+    promotion_deadlines = []
+
+    def promote(s, *, deadline):
+        promoted.append(copy.deepcopy(s))
+        promotion_deadlines.append(deadline)
+
+    monkeypatch.setattr(repair, "promote", promote)
     monkeypatch.setattr(assist, "report", lambda *args: "passed")
     assist.control(state["pr"])
     assert not promoted and len(dispatched) == 2
@@ -1894,19 +1900,53 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "promoted"
-    # Recover a controller failure using the same checked candidate and hour.
+    # Explicit reconciliation can publish the same candidate after the original
+    # hour, but only from completed checks and without dispatching any new work.
     live[0]["phase"] = "manual"
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "manual"
     monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+    original_api = assist.api
+    monkeypatch.setattr(
+        assist,
+        "api",
+        lambda path: (
+            {**original_api(path), "run_started_at": "2030-01-01T01:00:00Z"}
+            if path == "actions/runs/999"
+            else original_api(path)
+        ),
+    )
     monkeypatch.setattr(assist.time, "time", lambda: 1893459600)
+    native_status = ["waiting"]
+    monkeypatch.setattr(
+        assist,
+        "native_check",
+        lambda *args: dict(workflow=workflow, status=native_status[0], run=103),
+    )
+    monkeypatch.setattr(
+        assist,
+        "dispatch_native_checks",
+        lambda *args: pytest.fail("Reconciliation submitted native validation"),
+    )
+    original_task_status = assist.task_status
+
+    def existing_task_status(*args, submit):
+        assert not submit
+        return original_task_status(*args, submit=submit)
+
+    monkeypatch.setattr(assist, "task_status", existing_task_status)
+    emitted.clear()
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "manual"
-    monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
+    native_status[0] = "passed"
     assist.control(state["pr"])
     assert len(promoted) == 2 and live[0]["phase"] == "promoted"
+    assert promotion_deadlines[-1] == 1893460500
     assert promoted[-1]["candidate"] == promoted[0]["candidate"]
     assert promoted[-1]["repair_run"] == promoted[0]["repair_run"]
+    assert len(dispatched) == 2 and not emitted
+    monkeypatch.setattr(assist, "task_status", original_task_status)
     # Explicitly continue a failed candidate from its owning repair artifact.
     # Old candidate diagnostics survive, but none of its passes authorize the
     # fresh candidate or skip the model turn.
@@ -2254,7 +2294,6 @@ def test_promotion_accepts_only_owned_validation_branch(
     )
     monkeypatch.setattr(repair, "WORK", tmp_path)
     monkeypatch.setattr(repair, "public_gate", lambda: None)
-    monkeypatch.setattr(repair, "repair_deadline", lambda s: 1893459600)
     monkeypatch.setattr(repair.time, "time", lambda: 1893459599)
     monkeypatch.setattr(
         repair,
@@ -2274,7 +2313,7 @@ def test_promotion_accepts_only_owned_validation_branch(
 
     monkeypatch.setattr(repair, "command", command)
     with pytest.raises(FetchReached):
-        repair.promote(state)
+        repair.promote(state, deadline=1893459600)
     state["candidate"]["branch"] = "bot/pr-ci-assist-123-42-199"
     with pytest.raises(ValueError, match="Invalid candidate record"):
-        repair.promote(state)
+        repair.promote(state, deadline=1893459600)
