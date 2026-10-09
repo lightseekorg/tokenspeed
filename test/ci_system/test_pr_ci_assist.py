@@ -286,11 +286,14 @@ def test_targeted_diagnostics_use_completed_job_log_endpoint(
 
     def command(*args):
         calls.append(args)
-        return "target job failure evidence"
+        assert "--allow-escape-sequences" in args
+        return "\x1b[31mtarget job failure evidence\x1b[0m"
 
     monkeypatch.setattr(repair, "command", command)
     repair.configure()
-    assert calls == [("gh", "api", f"repos/{REPO}/actions/jobs/201/logs")]
+    assert calls == [
+        ("gh", "api", "--allow-escape-sequences", f"repos/{REPO}/actions/jobs/201/logs")
+    ]
     text = (tmp_path / "model/diagnostics.txt").read_text()
     assert job["name"] in text and "target job failure evidence" in text
 

@@ -643,9 +643,13 @@ def configure():
             "Requested failed job (untrusted diagnostic data):\n"
             + json.dumps({k: job[k] for k in ("id", "run_id", "name", "head_sha")})
             + "\n"
-            + command("gh", "api", f"repos/{REPO}/actions/jobs/{target['job']}/logs")[
-                -200000:
-            ]
+            # Capture colored logs as data; never print them to the terminal.
+            + command(
+                "gh",
+                "api",
+                "--allow-escape-sequences",
+                f"repos/{REPO}/actions/jobs/{target['job']}/logs",
+            )[-200000:]
         )
     for run_id in run_ids:
         # The completed job log is available before the whole workflow ends.
