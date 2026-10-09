@@ -149,19 +149,11 @@ def _nonempty_str(value: str) -> str:
 def validate_dcp_disaggregation_role(
     *, has_dcp: bool, disaggregation_mode: str
 ) -> None:
-    """Reject DCP on PD roles whose transfer path cannot shard pages yet.
-
-    An aggregated engine and the prefill role may shard: the prefill sender
-    copies only the pages each rank owns and every rank of the DCP subgroup
-    serves every decode rank. The decode role receives into an unsharded
-    cache only -- no receive path lands a block on its owner alone -- and the
-    encode role has no KV cache to shard.
-    """
-    if has_dcp and disaggregation_mode not in ("null", "prefill"):
+    """Allow cache-page sharding on roles that own a KV cache."""
+    if has_dcp and disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(
             "--decode-context-parallel-size > 1 requires --disaggregation-mode "
-            f"null or prefill (got {disaggregation_mode!r}): only the prefill "
-            "side of a PD transfer can be DCP-sharded"
+            f"null, prefill or decode (got {disaggregation_mode!r})"
         )
 
 

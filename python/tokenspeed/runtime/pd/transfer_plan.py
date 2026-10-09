@@ -24,7 +24,12 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+import numpy as np
+
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
+    owned_local_pages,
+)
 from tokenspeed.runtime.pd.cache_protocol import (
     CacheTransferContract,
     validate_cache_peer_layout,
@@ -54,6 +59,60 @@ class CacheTransferFragment:
     dst_row_stride_bytes: int
     bytes_per_row: int
     rows_per_page: int
+
+
+def local_transfer_pages(
+    source_blocks: tuple[int, ...],
+    destination_blocks: tuple[int, ...],
+    *,
+    group_id: str,
+    source_layout: CacheTransferContract,
+    destination_layout: CacheTransferContract,
+    source_tp_rank: int,
+    destination_tp_rank: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve paired logical positions to pages owned by this transfer edge.
+
+    Block IDs are independently allocated by P and D, not comparable between
+    peers. The input order pairs the same logical positions. Rank coordinates
+    are attention TP ranks, containing consecutive DCP replica subgroups.
+    Returns equally sized source/destination physical-page int64 arrays; an edge
+    with no owned pairs returns empty arrays and still participates in ACKs.
+    """
+    if len(source_blocks) != len(destination_blocks):
+        raise ValueError("Cache transfer source and destination pages differ in count")
+    source = np.asarray(source_blocks, dtype=np.int64)
+    destination = np.asarray(destination_blocks, dtype=np.int64)
+    # Placement permits null pages, but a PD manifest must contain real pages.
+    if source.size and (source.min() <= 0 or destination.min() <= 0):
+        raise UnsupportedPDLayoutError(
+            "Cache transfer block is outside the virtual address space"
+        )
+    source_degree = source_layout.shard_count(group_id)
+    destination_degree = destination_layout.shard_count(group_id)
+    try:
+        source_owned, source_pages = owned_local_pages(
+            source,
+            shard_count=source_degree,
+            rank=source_tp_rank % source_degree,
+            virtual_block_count=source_layout.virtual_block_count(group_id),
+        )
+        destination_owned, destination_pages = owned_local_pages(
+            destination,
+            shard_count=destination_degree,
+            rank=destination_tp_rank % destination_degree,
+            virtual_block_count=destination_layout.virtual_block_count(group_id),
+        )
+    except IndexError as exc:
+        raise UnsupportedPDLayoutError(
+            "Cache transfer block is outside the virtual address space"
+        ) from exc
+    # Each helper already compacts its own pages. Select the other owner's
+    # mask at those original positions to preserve source/destination pairing.
+    return (
+        source_pages[destination_owned[source_owned]],
+        destination_pages[source_owned[destination_owned]],
+    )
 
 
 MAX_CACHE_TP_SIZE = 1024
@@ -180,8 +239,8 @@ class CacheTransferPlanner:
 
     Two source geometries compose here: head partitions split a page's rows
     over TP ranks, and DCP page sharding (``CacheGroupSpec.shard_count``)
-    deals whole pages over a consecutive TP subgroup. The destination is
-    always unsharded.
+    deals whole pages over a consecutive TP subgroup. Source and destination
+    cache groups shard independently.
     """
 
     def __init__(
@@ -205,6 +264,32 @@ class CacheTransferPlanner:
             raise UnsupportedPDLayoutError(
                 f"Cache TP sizes cannot exceed {MAX_CACHE_TP_SIZE}"
             )
+        self._prefill_shards = {
+            spec.group_id: spec.shard_count for spec in prefill_layout.group_specs
+        }
+        self._decode_shards = {
+            spec.group_id: spec.shard_count for spec in decode_layout.group_specs
+        }
+        for layout, tp_size in (
+            (prefill_layout, prefill_tp_size),
+            (decode_layout, decode_tp_size),
+        ):
+            for spec in layout.group_specs:
+                if tp_size % spec.shard_count:
+                    raise UnsupportedPDLayoutError(
+                        "Cache shard count must divide attention TP size"
+                    )
+                if spec.shard_count > 1 and any(
+                    layout.transfer_schema.partition_for(field.field_id) is not None
+                    for field in layout.fields_for_group(spec.group_id)
+                ):
+                    raise UnsupportedPDLayoutError(
+                        "DCP transfer cannot use head-partitioned fields within page-sharded cache groups"
+                    )
+        self._has_sharded_cache = any(
+            count > 1
+            for count in (*self._prefill_shards.values(), *self._decode_shards.values())
+        )
         self.prefill_tp_size = prefill_tp_size
         self.decode_tp_size = decode_tp_size
         all_fields = frozenset(field.field_id for field in prefill_layout.plan.fields)
@@ -219,29 +304,11 @@ class CacheTransferPlanner:
             field.field_id: prefill_layout.transfer_schema.partition_for(field.field_id)
             for field in prefill_layout.plan.fields
         }
-        # DCP page sharding on the source: a sharded group's virtual blocks are
-        # dealt cyclically over a consecutive subgroup of shard_count Prefill
-        # TP ranks, so every rank of the chosen subgroup is a source and sends
-        # only the blocks it owns. The destination must hold every block
-        # whole; landing a block on its Decode owner only has no receive path.
-        self._shard_counts: dict[str, int] = {}
-        for prefill_spec, decode_spec in zip(
-            prefill_layout.group_specs, decode_layout.group_specs, strict=True
-        ):
-            if decode_spec.shard_count != 1:
-                raise UnsupportedPDLayoutError(
-                    f"cache group {decode_spec.group_id!r} is sharded on Decode; "
-                    "PD transfer into a DCP-sharded destination is not supported"
-                )
-            if prefill_spec.shard_count == 1:
-                continue
-            if prefill_tp_size % prefill_spec.shard_count:
-                raise UnsupportedPDLayoutError(
-                    f"cache group {prefill_spec.group_id!r} shard count "
-                    f"{prefill_spec.shard_count} does not divide Prefill "
-                    f"TP={prefill_tp_size}"
-                )
-            self._shard_counts[prefill_spec.group_id] = prefill_spec.shard_count
+        self._shard_counts = {
+            group_id: count
+            for group_id, count in self._prefill_shards.items()
+            if count > 1
+        }
         self._segment_pairs = tuple(
             (prefill_spec.group_id, prefill_segment, decode_segment)
             for prefill_spec, decode_spec in zip(
@@ -297,7 +364,7 @@ class CacheTransferPlanner:
         return (
             self.prefill_tp_size == self.decode_tp_size
             and self._field_ids is None
-            and not self.has_sharded_groups
+            and not self._has_sharded_cache
         )
 
     def plan_for_decode_rank(self, decode_tp_rank: int) -> RankTransferPlan:
