@@ -143,3 +143,15 @@ def test_logprobs_refuse_misshaped_inputs():
         vocab_parallel_logprobs(logits, targets.float(), vocab_block=BLOCK)
     with pytest.raises(ValueError, match=r"logits must be \[rows, vocab\]"):
         vocab_parallel_logprobs(logits[0], targets[:1], vocab_block=BLOCK)
+
+
+def test_multiple_targets_preserve_scalar_reduction_bits():
+    logits = _logits(3, 19).to(torch.bfloat16)
+    targets = torch.tensor([[0, BLOCK, VOCAB - 1], [BLOCK + 7, 1, 40], [8, 9, 10]])
+    result = vocab_parallel_logprobs(logits, targets, vocab_block=BLOCK)
+    assert result.shape == targets.shape
+    for column in range(targets.shape[1]):
+        scalar = vocab_parallel_logprobs(logits, targets[:, column], vocab_block=BLOCK)
+        assert torch.equal(result[:, column], scalar)
+    solo = vocab_parallel_logprobs(logits[1:2], targets[1:2], vocab_block=BLOCK)
+    assert torch.equal(result[1:2], solo)

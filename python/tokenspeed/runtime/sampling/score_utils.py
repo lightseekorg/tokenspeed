@@ -33,6 +33,7 @@ import math
 
 import torch
 
+from tokenspeed.runtime.sampling.logprobs import gather_token_logprobs
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
@@ -63,6 +64,8 @@ def gather_score_logprobs(
     next_token_logits: torch.Tensor,
     score_label_ids: torch.Tensor,
     num_prefill_outputs: int,
+    *,
+    logprob_order: str,
 ) -> torch.Tensor | None:
     """Gather full-vocab logprobs at the label positions.
 
@@ -71,15 +74,18 @@ def gather_score_logprobs(
     ``[rows, max_labels]`` index from :func:`build_score_label_ids`.
     ``num_prefill_outputs`` selects the emitted request prefix; incomplete
     chunks and decode rows have no score readout. Zero returns ``None``.
+    ``logprob_order`` uses the same resolved reduction as sampled and prompt
+    logprobs, including the trainer's fixed vocab-block order.
     Returns raw logprobs ``[num_prefill_outputs, max_labels]`` — padded columns and rows
     without score labels hold values the consumer must ignore.
     """
     if num_prefill_outputs == 0:
         return None
-    logprobs = torch.log_softmax(
-        next_token_logits[:num_prefill_outputs].float(), dim=-1
+    return gather_token_logprobs(
+        next_token_logits[:num_prefill_outputs],
+        score_label_ids[:num_prefill_outputs],
+        logprob_order=logprob_order,
     )
-    return logprobs.gather(-1, score_label_ids[:num_prefill_outputs])
 
 
 def finalize_score_row(row_logprobs: list[float], apply_softmax: bool) -> list[float]:

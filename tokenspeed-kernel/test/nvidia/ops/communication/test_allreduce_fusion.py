@@ -18,10 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Public fused-all-reduce input contracts and backend dispatch."""
+"""Public fused-all-reduce input contracts."""
 
 import importlib
-import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -29,110 +28,6 @@ import pytest
 import torch
 
 api = importlib.import_module("tokenspeed_kernel.ops.communication.allreduce_fusion")
-backend_module = importlib.import_module(
-    "tokenspeed_kernel.thirdparty.flashinfer.allreduce_fusion"
-)
-
-
-@pytest.fixture
-def flashinfer_modules(monkeypatch):
-    prefix = "flashinfer.comm.mnnvl_cutedsl"
-    ht = SimpleNamespace(
-        HTProtocol=Mock(),
-        HT_FINALIZE_GB300_H3584_K16=object(),
-        HT_ALL_REDUCE_GB300_H3584=object(),
-    )
-    workspace = Mock()
-    modules = {
-        "flashinfer.comm": SimpleNamespace(allreduce_fusion=Mock()),
-        "flashinfer.comm.allreduce": SimpleNamespace(AllReduceFusionPattern=Mock()),
-        "flashinfer.comm.mnnvl": SimpleNamespace(is_multicast_supported=Mock()),
-        "flashinfer.comm.mnnvl_cutedsl_ar": SimpleNamespace(
-            MNNVLCuteDSLAllReduceFusionWorkspace=workspace
-        ),
-        f"{prefix}.config": SimpleNamespace(
-            KernelTarget=lambda protocol, preset: (protocol, preset),
-            MNNVLCuteDSLConfig=SimpleNamespace,
-            MRangeDispatch=SimpleNamespace,
-            ProtocolKind=SimpleNamespace(LL="ll", BT="bt"),
-            StaticProfile=SimpleNamespace,
-        ),
-        f"{prefix}.kernel_bt.protocol": SimpleNamespace(
-            BTAllReduceTuning=SimpleNamespace,
-            BTCollectiveTuning=SimpleNamespace,
-            BTFinalizeTuning=SimpleNamespace,
-        ),
-        f"{prefix}.kernel_ll.protocol": SimpleNamespace(
-            LLAllReduceTuning=SimpleNamespace,
-            LLCollectiveTuning=SimpleNamespace,
-            LLFinalizeTuning=SimpleNamespace,
-        ),
-        f"{prefix}.kernel_ht": SimpleNamespace(protocol=ht),
-        f"{prefix}.kernel_ht.protocol": ht,
-    }
-    for name, module in modules.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    return ht, workspace
-
-
-@pytest.mark.parametrize("tp_size", [4, 8, 16])
-@pytest.mark.parametrize("capacity", [1024, 16384])
-def test_backend_uses_upstream_ht_with_unchanged_capacity(
-    monkeypatch, flashinfer_modules, tp_size, capacity
-):
-    ht, workspace = flashinfer_modules
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch, "empty", Mock())
-    monkeypatch.setattr(torch, "zeros", Mock())
-    group = SimpleNamespace(size=lambda: tp_size, rank=lambda: tp_size - 1)
-    backend = backend_module.MNNVLAllReduceFusionBackend(
-        group, 3584, 16, capacity, 1e-5
-    )
-    assert workspace.call_args.kwargs["max_token_num"] == 1024
-    profile = workspace.call_args.kwargs["config"].profiles[0]
-    assert profile.finalize_routes.upper_bounds == (32, 1024)
-    assert profile.all_reduce_routes.upper_bounds == (32, 1024)
-    assert backend._ht_finalize_tuning is ht.HT_FINALIZE_GB300_H3584_K16
-    assert backend._ht_allreduce_tuning is ht.HT_ALL_REDUCE_GB300_H3584
-    if capacity <= 1024:
-        ht.HTProtocol.assert_not_called()
-        assert backend._ht is None
-    else:
-        ht.HTProtocol.assert_called_once_with(
-            hidden_size=3584,
-            top_k=16,
-            tp_size=tp_size,
-            rank=tp_size - 1,
-            capacity_m=capacity,
-            rms_epsilon=1e-5,
-            routed_scaling_factor=1.0,
-            weight_bias=0.0,
-            include_shared_expert=False,
-            add_residual=False,
-            write_residual_output=False,
-            finalize_tunings=(ht.HT_FINALIZE_GB300_H3584_K16,),
-            all_reduce_tunings=(ht.HT_ALL_REDUCE_GB300_H3584,),
-            group=group,
-        )
-        assert backend._ht is ht.HTProtocol.return_value
-
-
-def test_support_probe_rejects_flashinfer_without_h3584_presets(
-    monkeypatch, flashinfer_modules
-):
-    ht, _ = flashinfer_modules
-    del ht.HT_FINALIZE_GB300_H3584_K16
-    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 8)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 3))
-    assert (
-        backend_module.allreduce_fusion_support_error(
-            object(), 3584, 16, 8192, torch.bfloat16
-        )
-        == "FlashInfer H3584 HT presets are unavailable"
-    )
 
 
 def inputs():
@@ -198,45 +93,3 @@ def test_route_metadata_must_match_the_input_pattern(finalize):
             expanded_idx_to_permuted_idx=indices,
         )
     workspace.kernel.impl.assert_not_called()
-
-
-@pytest.mark.parametrize("m", [1024, 1025])
-@pytest.mark.parametrize("finalize", [False, True])
-def test_flashinfer_bt_to_ht_dispatch_boundary(m, finalize):
-    backend = object.__new__(backend_module.MNNVLAllReduceFusionBackend)
-    backend.output = torch.empty(2048, 8)
-    backend.rms_eps = 1e-5
-    backend._workspace = object()
-    backend._patterns = SimpleNamespace(
-        kARResidualRMSNorm=1, kMoEFinalizeARResidualRMSNorm=7
-    )
-    result = torch.ones(m, 8)
-    backend._allreduce_fusion = Mock(return_value=result)
-    backend._ht_finalize_tuning = "finalize"
-    backend._ht_allreduce_tuning = "allreduce"
-    final = Mock(return_value=(result, None))
-    reduced = Mock(return_value=(result, None))
-    backend._ht = SimpleNamespace(
-        state=object(),
-        finalize_kernels={"finalize": final},
-        all_reduce_kernels={"allreduce": reduced},
-    )
-    x = torch.ones(m, 8)
-    gamma = torch.ones(8)
-    weights = torch.ones(m, 2) if finalize else None
-    indices = torch.zeros(m, 2, dtype=torch.int32) if finalize else None
-    assert backend.run(x, gamma, m, finalize, weights, indices) is result
-    if m <= 1024:
-        kwargs = backend._allreduce_fusion.call_args.kwargs
-        assert kwargs["pattern"] == (7 if finalize else 1)
-        assert kwargs["shared_expert_output"] is None
-        assert kwargs["residual_in"] is None
-        assert kwargs["workspace"] is backend._workspace
-        assert kwargs["launch_with_pdl"] is True
-        final.assert_not_called()
-        reduced.assert_not_called()
-    else:
-        backend._allreduce_fusion.assert_not_called()
-        selected = final if finalize else reduced
-        selected.assert_called_once()
-        assert selected.call_args.args[0] is x

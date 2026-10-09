@@ -1573,6 +1573,7 @@ class ModelExecutor:
                 logits_output.next_token_logits,
                 sampling_info.score_label_ids,
                 ctx.output_layout.num_prefill_outputs,
+                logprob_order=self.sampling_backend.config.logprob_order,
             )
 
         candidates = self._decode_candidates(ctx)

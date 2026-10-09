@@ -73,6 +73,9 @@ def engine_and_tokenizer():
     engine = Engine(
         model=_MODEL,
         gpu_memory_utilization=0.4,
+        # This regression needs device prefix caching, not an L2 host tier.
+        disable_kvstore=True,
+        max_total_tokens=8192,
         max_model_len=2048,
         max_num_seqs=8,
         max_cudagraph_capture_size=8,
@@ -213,6 +216,24 @@ def test_ordinary_decode_graph_after_scoring(engine_and_tokenizer):
     )
     assert out["meta_info"]["completion_tokens"] == 8
     assert "scores" not in out
+
+
+def test_score_megatron_reduction_matches_sampled_logprobs():
+    from tokenspeed.runtime.configs.numerics import MEGATRON_VOCAB_BLOCK
+    from tokenspeed.runtime.sampling.score_utils import gather_score_logprobs
+    from tokenspeed.runtime.sampling.utils import gather_token_logprobs
+
+    torch.manual_seed(19)
+    logits = torch.randn(
+        2, 2 * MEGATRON_VOCAB_BLOCK, device="cuda", dtype=torch.bfloat16
+    )
+    labels = torch.tensor([[0, MEGATRON_VOCAB_BLOCK + 1], [7, 100]], device="cuda")
+    scores = gather_score_logprobs(logits, labels, 2, logprob_order="megatron")
+    for column in range(labels.shape[1]):
+        sampled = gather_token_logprobs(
+            logits, labels[:, column], logprob_order="megatron"
+        )
+        assert torch.equal(scores[:, column], sampled)
 
 
 if __name__ == "__main__":

@@ -47,26 +47,37 @@ YES_NO_LABELS = ("Yes", "No")
 LETTER_LABELS = tuple(string.ascii_uppercase)
 
 
-def _label_token_ids(labels: Sequence[str], tokenizer, family: str) -> list[int]:
-    """Resolve label strings to single token ids, failing loudly otherwise.
+def _label_token_ids(
+    labels: Sequence[str], tokenizer, family: str, answer_prefixes: Sequence[str]
+) -> list[int]:
+    """Resolve single-token label continuations at every answer boundary.
 
     A label that tokenizes to more than one token would silently break the
     readout (scores would gather only its first token's probability), so
     this is a hard error, not a clamp.
     """
-    token_ids = []
-    for label in labels:
-        ids = tokenizer.encode(label, add_special_tokens=False)
-        if len(ids) != 1:
+    shared_ids: list[int] | None = None
+    for prefix in answer_prefixes:
+        prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+        token_ids = []
+        for label in labels:
+            ids = tokenizer.encode(prefix + label, add_special_tokens=False)
+            if ids[: len(prefix_ids)] != prefix_ids or len(ids) != len(prefix_ids) + 1:
+                raise ValueError(
+                    f"Decision adapter {family!r}: label {label!r} must add "
+                    "exactly one token at the answer boundary without changing "
+                    "the prompt tokens. Pick a different label or call the "
+                    "score API with explicit label_token_ids."
+                )
+            token_ids.append(ids[-1])
+        if shared_ids is not None and token_ids != shared_ids:
             raise ValueError(
-                f"Decision adapter {family!r}: label {label!r} encodes to "
-                f"{len(ids)} tokens ({ids}) with the served tokenizer; every "
-                "scoring label must be exactly one token. Pick a different "
-                "label or tokenize client-side and call the score API with "
-                "explicit label_token_ids."
+                f"Decision adapter {family!r}: label token IDs differ between "
+                "candidate answer boundaries; use explicit per-request scoring."
             )
-        token_ids.append(ids[0])
-    return token_ids
+        shared_ids = token_ids
+    assert shared_ids is not None
+    return shared_ids
 
 
 @runtime_checkable
@@ -103,8 +114,8 @@ class GenericDecisionAdapter:
     def compile(self, req: DecisionRequest, tokenizer) -> ScoreCall:
         if req.style == STYLE_POINTWISE_YESNO:
             items = [
-                f"Proposed answer: {candidate}\n"
-                "Is this proposed answer correct? Answer Yes or No."
+                f"\n\nProposed answer: {candidate}\n"
+                "Is this proposed answer correct? Answer Yes or No.\n"
                 for candidate in req.candidates
             ]
             labels = list(YES_NO_LABELS)
@@ -120,11 +131,11 @@ class GenericDecisionAdapter:
             )
             letters = LETTER_LABELS[: len(req.candidates)]
             items = [
-                f"{options}\n"
+                f"\n\n{options}\n"
                 "Choose the single correct option above. Your entire response "
                 "must be exactly one letter from: "
                 f"{', '.join(letters)}. Do not include any other words, "
-                "punctuation, or explanation."
+                "punctuation, or explanation.\n"
             ]
             labels = list(letters)
         else:
@@ -134,7 +145,9 @@ class GenericDecisionAdapter:
         return ScoreCall(
             query=req.query,
             items=items,
-            label_token_ids=_label_token_ids(labels, tokenizer, self.family),
+            label_token_ids=_label_token_ids(
+                labels, tokenizer, self.family, [req.query + item for item in items]
+            ),
             apply_softmax=req.apply_softmax,
         )
 

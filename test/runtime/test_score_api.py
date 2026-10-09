@@ -129,7 +129,7 @@ def test_score_gather_uses_emitted_prefill_prefix():
     # One completed prefill, one skipped incomplete prefill, then decode logits.
     logits = torch.tensor([[1.0, 2.0, 3.0], [7.0, 8.0, 9.0]])
     labels = torch.tensor([[0, 2], [1, 2]])
-    out = gather_score_logprobs(logits, labels, 1)
+    out = gather_score_logprobs(logits, labels, 1, logprob_order="torch")
     assert out.shape == (1, 2)
     assert torch.allclose(
         out, torch.log_softmax(logits[:1], dim=-1).gather(-1, labels[:1])
@@ -139,9 +139,31 @@ def test_score_gather_uses_emitted_prefill_prefix():
 def test_score_gather_skips_all_incomplete_prefills():
     # The only logits belong to decode; no prefill row was emitted.
     assert (
-        gather_score_logprobs(torch.ones(1, 3), torch.tensor([[0, 2], [1, 2]]), 0)
+        gather_score_logprobs(
+            torch.ones(1, 3), torch.tensor([[0, 2], [1, 2]]), 0, logprob_order="torch"
+        )
         is None
     )
+
+
+def test_score_gather_forwards_resolved_logprob_order(monkeypatch):
+    from tokenspeed.runtime.sampling import score_utils
+
+    logits = torch.ones(3, 4)
+    labels = torch.tensor([[0, 2], [1, 3]])
+    calls = []
+
+    def gather(rows, targets, *, logprob_order):
+        calls.append((rows, targets, logprob_order))
+        return torch.full_like(targets, -0.5, dtype=torch.float32)
+
+    monkeypatch.setattr(score_utils, "gather_token_logprobs", gather)
+    result = gather_score_logprobs(logits, labels, 1, logprob_order="megatron")
+    assert result.tolist() == [[-0.5, -0.5]]
+    rows, targets, order = calls[0]
+    assert torch.equal(rows, logits[:1])
+    assert torch.equal(targets, labels[:1])
+    assert order == "megatron"
 
 
 def test_registry_direct_family_registration_wins(monkeypatch):
@@ -216,7 +238,7 @@ def test_gather_score_logprobs_matches_manual():
     torch.manual_seed(0)
     logits = torch.randn(3, 50)
     label_ids = torch.tensor([[0, 1], [2, 3], [4, 5]])
-    gathered = gather_score_logprobs(logits, label_ids, 3)
+    gathered = gather_score_logprobs(logits, label_ids, 3, logprob_order="torch")
     expected = torch.log_softmax(logits.float(), dim=-1).gather(-1, label_ids)
     assert torch.equal(gathered, expected)
 
@@ -265,6 +287,11 @@ class _StubTokenizer:
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
         assert add_special_tokens is False
+        if text.endswith("\n"):
+            return [17]
+        for label, token_id in self.VOCAB.items():
+            if text.endswith(f"\n{label}"):
+                return [17, token_id]
         if text == "Multi Token":
             return [41, 42]
         if text not in self.VOCAB:
@@ -300,6 +327,9 @@ def test_generic_adapter_pointwise_compile():
     assert "billing" in call.items[0] and "tech" not in call.items[0]
     assert call.label_token_ids == [100, 200]
     assert call.apply_softmax is True
+    assert (call.query + call.items[0]).startswith(
+        "Which team owns this ticket?\n\nProposed answer:"
+    )
 
 
 def test_generic_adapter_fused_compile():
@@ -309,6 +339,9 @@ def test_generic_adapter_fused_compile():
     assert len(call.items) == 1
     assert "A) billing" in call.items[0] and "C) sales" in call.items[0]
     assert call.label_token_ids == [301, 302, 303]
+    assert (call.query + call.items[0]).startswith(
+        "Which team owns this ticket?\n\nA) billing"
+    )
 
 
 def test_generic_adapter_rejects_multi_token_label():
@@ -319,9 +352,41 @@ def test_generic_adapter_rejects_multi_token_label():
 
 class _MultiTokenTokenizer(_StubTokenizer):
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        if text == "Yes":
-            return [100, 101]
+        if text.endswith("\nYes"):
+            return [17, 100, 101]
         return super().encode(text, add_special_tokens)
+
+
+def test_generic_adapter_uses_contextual_label_ids():
+    class ContextTokenizer(_StubTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            ids = super().encode(text, add_special_tokens)
+            return [ids[0], ids[1] + 1000] if len(ids) == 2 else ids
+
+    call = GenericDecisionAdapter().compile(_request(), ContextTokenizer())
+    assert call.label_token_ids == [1100, 1200]
+
+
+def test_generic_adapter_rejects_boundary_token_merge():
+    class MergeTokenizer(_StubTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            if text.endswith("\nYes"):
+                return [99]
+            return super().encode(text, add_special_tokens)
+
+    with pytest.raises(ValueError, match="without changing the prompt"):
+        GenericDecisionAdapter().compile(_request(), MergeTokenizer())
+
+
+def test_generic_adapter_rejects_context_dependent_candidate_label_ids():
+    class CandidateTokenizer(_StubTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            if "tech" in text and text.endswith("\nYes"):
+                return [17, 101]
+            return super().encode(text, add_special_tokens)
+
+    with pytest.raises(ValueError, match="differ between candidate"):
+        GenericDecisionAdapter().compile(_request(), CandidateTokenizer())
 
 
 def test_generic_adapter_extract_pointwise():

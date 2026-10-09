@@ -34,6 +34,10 @@ Semantics that must not drift:
   boundary. It never relies on top-k generation logprobs, which may omit
   a label the application needs. Label-selective extraction does *not*
   remove the vocabulary projection or full-distribution normalization.
+- **Score readout obeys the resolved `logprob_order`.** It uses the same
+  selected-token reduction as output and prompt logprobs, including
+  Megatron's fixed vocab-block fold. Multiple labels share one vocab
+  reduction per row.
 - **The answer boundary is the last prefill position** of each
   `query + item` sequence. Scores are read there exactly once, on the
   final prefill chunk; mid-chunk positions are not answer boundaries.
@@ -90,9 +94,12 @@ A score request is an ordinary generation request with
   task and the model's training.
 - **The adapter layer (`runtime/decision/`) owns everything
   model-specific**: the prompt scaffold, the label vocabulary (with a
-  hard single-token check against the served tokenizer), and the
+  hard single-token continuation check at every complete answer boundary), and the
   translation of raw score rows into a decision. The engine below it
-  only knows `label_token_ids`. Family adapters are registered
+  only knows `label_token_ids`. The generic adapter separates query and
+  scaffold explicitly and terminates the prompt with a newline. It refuses
+  labels that change prompt tokenization or have different IDs across
+  candidates. Family adapters are registered
   explicitly by name; an unknown name is an error, not a silent fallback
   to generic behavior.
 - **Execution mode belongs to the runtime.** SIS is the only mode today.
