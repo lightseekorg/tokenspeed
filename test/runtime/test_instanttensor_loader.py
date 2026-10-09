@@ -84,7 +84,11 @@ class TestInstantTensorWeights(unittest.TestCase):
                 # Copy immediately in case InstantTensor exposes internal buffers.
                 instanttensor_tensors[name] = tensor.to("cpu")
 
-            reference_tensors = dict(safetensors_weights_iterator(safetensors_files))
+            reference_tensors = dict(
+                safetensors_weights_iterator(
+                    safetensors_files, local_rank=0, local_world_size=1
+                )
+            )
 
             self.assertEqual(len(instanttensor_tensors), len(reference_tensors))
             for name, got in instanttensor_tensors.items():

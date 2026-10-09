@@ -16,11 +16,33 @@ For a compact compatibility table, see
 | `--tokenizer` | Tokenizer path when it differs from the model path. |
 | `--tokenizer-mode` | Select tokenizer behavior. `auto` uses fast tokenizers and model-specific hooks when available. |
 | `--skip-tokenizer-init` | Skip tokenizer initialization for input-ID-only serving paths. |
-| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
+| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, `sharded_state`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
+
+### Checkpoint Prefetch And TP Shards
+
+Safetensors loading prefetches checkpoints into the OS page cache. Ranks on
+the same node divide background reads in sorted shard order; every node
+prefetches its own copy. Each reader keeps the full consumption order within
+the existing window of min(40 GiB, 25% of available host memory), including
+shards assigned to peers. Reads remain asynchronous: a consumer does not
+wait for another rank and can demand-page an unfinished peer shard. Models
+with rank-dependent weight-name filters prefetch independently. Use
+`--disable-weight-loader-prefetch-checkpoints` to disable prefetch or
+`--weight-loader-prefetch-num-threads` to set reader concurrency per rank.
+
+`--load-format sharded_state` reads only the current global rank's files,
+named `model-rank-{rank}-part-{part}.safetensors` by default. These are
+post-processed runtime state dictionaries, not ordinary Hugging Face shards.
+Reload with the same model configuration, parallel mapping, quantization,
+and runtime weight layout. The loader constructs and post-processes the
+model before copying the saved state into it; compatibility must be checked
+for the model and quantization in use. Keep model configuration/tokenizer
+files with the checkpoint. A custom filename pattern can be supplied with
+`--model-loader-extra-config '{"pattern":"model-rank-{rank}-part-{part}.safetensors"}'`.
 
 ## Precision And Quantization
 

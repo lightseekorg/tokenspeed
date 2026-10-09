@@ -43,6 +43,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
@@ -329,6 +330,7 @@ class DefaultModelLoader(BaseModelLoader):
         source: "Source",
         weight_name_filter: Callable[[str], bool] | None,
         checkpoint_load_group: tuple[int, ...] | None,
+        mapping: Mapping,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format.
 
@@ -342,6 +344,19 @@ class DefaultModelLoader(BaseModelLoader):
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
+        hf_weights_files.sort()
+        # Filtered models can consume different shard lists on different ranks.
+        # Keep their independent prefetch rather than assign reads to absent peers.
+        local_rank, local_world_size = 0, 1
+        if use_safetensors and weight_name_filter is None:
+            node_start = mapping.node_rank * mapping.nprocs_per_node
+            local_ranks = tuple(
+                rank
+                for rank in range(node_start, node_start + mapping.nprocs_per_node)
+                if checkpoint_load_group is None or rank in checkpoint_load_group
+            )
+            local_rank = local_ranks.index(mapping.rank)
+            local_world_size = len(local_ranks)
         if use_safetensors and weight_name_filter is not None:
             index_file = (
                 "consolidated.safetensors.index.json"
@@ -388,12 +403,16 @@ class DefaultModelLoader(BaseModelLoader):
                 lambda name: weight_name_filter(source.prefix + name),
                 prefetch=self.load_config.weight_loader_prefetch_checkpoints,
                 prefetch_num_threads=self.load_config.weight_loader_prefetch_num_threads,
+                local_rank=local_rank,
+                local_world_size=local_world_size,
             )
         elif use_safetensors:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
                 prefetch=self.load_config.weight_loader_prefetch_checkpoints,
                 prefetch_num_threads=self.load_config.weight_loader_prefetch_num_threads,
+                local_rank=local_rank,
+                local_world_size=local_world_size,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
@@ -432,7 +451,10 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
         yield from self._get_weights_iterator(
-            primary_weights, weight_name_filter, checkpoint_load_group
+            primary_weights,
+            weight_name_filter,
+            checkpoint_load_group,
+            model_config.mapping,
         )
 
         secondary_weights = cast(
@@ -440,7 +462,7 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._get_weights_iterator(
-                source, weight_name_filter, checkpoint_load_group
+                source, weight_name_filter, checkpoint_load_group, model_config.mapping
             )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -572,8 +594,9 @@ class ShardedStateLoader(BaseModelLoader):
     """
     Model loader that directly loads each worker's model state dict, which
     enables a fast load path for large tensor-parallel models where each worker
-    only needs to read its own shard rather than the entire checkpoint. See
-    `examples/save_sharded_state.py` for creating a sharded checkpoint.
+    only needs to read its own shard rather than the entire checkpoint.
+    Checkpoints contain post-processed state and require the same model,
+    parallel mapping, quantization and runtime weight layout when reloaded.
     """
 
     DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
