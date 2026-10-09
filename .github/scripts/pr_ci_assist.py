@@ -26,13 +26,20 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-from pr_ci_plan import CoverageError, context, task_key, validate_test_coverage
+from pr_ci_plan import (
+    CoverageError,
+    context,
+    native_checks,
+    task_key,
+    validate_test_coverage,
+)
 from pr_ci_state import BOT, BOT_ID, COMMAND, NATIVE_CHECKS, REPO, SHA, marker, record
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -338,6 +345,154 @@ def checkout(head: str, base: str, *, work: Path | None = None) -> Path:
         command("git", "fetch", "origin", sha)
     command("git", "worktree", "add", "--detach", str(target), head)
     return target
+
+
+def fetch_commits(source: Path, *refs: str):
+    for ref in refs:
+        if not SHA.fullmatch(ref):
+            raise ValueError("Invalid source SHA.")
+        present = subprocess.run(
+            ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+            cwd=source,
+            capture_output=True,
+        )
+        if present.returncode:
+            command("git", "fetch", "origin", ref, cwd=source)
+
+
+def ancestor(source: Path, before: str, after: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", before, after],
+            cwd=source,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def pr_source_matches(state: dict, pr: dict, *, source: Path) -> bool:
+    if state["head"] != pr["head"]["sha"]:
+        return False
+    base = pr["base"]["sha"]
+    if state["base"] == base:
+        return True
+    if "validation_base" not in state:
+        return False
+    main = api("git/ref/heads/main")["object"]["sha"]
+    fetch_commits(source, state["base"], base, main)
+    return ancestor(source, state["base"], base) and ancestor(source, base, main)
+
+
+def main_advance_compatible(state: dict, main: str, *, source: Path) -> bool:
+    """Reuse the original candidate only when its validation inputs are unchanged."""
+    base = state["validation_base"]
+    if main == base:
+        return True
+    fetch_commits(source, base, main, state["base"], state["head"])
+    if not ancestor(source, base, main):
+        return False
+
+    def changed(before, after):
+        return set(
+            command(
+                "git",
+                "diff",
+                "--name-only",
+                "--no-renames",
+                before,
+                after,
+                cwd=source,
+            ).splitlines()
+        )
+
+    paths = changed(base, main)
+    merge_base = command("git", "merge-base", state["base"], state["head"], cwd=source)
+    repaired = changed(merge_base, state["head"])
+    candidate = state.get("candidate")
+    if candidate:
+        fetch_commits(source, candidate["patch"], candidate["validation"])
+        repaired.update(changed(state["head"], candidate["patch"]))
+    if paths & repaired:
+        return False
+
+    sys.path.insert(0, str(ROOT / "test/ci_system"))
+    from ci_path_filter import path_requires_group, runner_label_in_group
+
+    groups = set()
+    for task in state["tasks"]:
+        if task["cluster"]:
+            groups.add(f"nvidia-{task['cluster']}-slurm")
+        else:
+            groups.update(
+                group
+                for group in ("amd", "nvidia-arm", "nvidia-x86")
+                if runner_label_in_group(task["runner"], group)
+            )
+    workflows = {check["workflow"] for check in state.get("native_checks", [])}
+    runtime_paths = set()
+    for path in paths:
+        parts = Path(path).parts
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
+            or path.startswith((".github/", "test/ci/", "test/ci_system/"))
+            or "requirements" in parts
+            or Path(path).name.startswith("requirements")
+            or Path(path).name
+            in {"pyproject.toml", "setup.py", "setup.cfg", "CMakeLists.txt"}
+            or Path(path).suffix in {".cmake", ".lock"}
+        ):
+            return False
+        if path.endswith(".md") or path.startswith("docs/"):
+            continue
+        # Unknown inputs are not evidence of independence. The existing CI
+        # filters define the dependency boundaries for these components.
+        if parts[0] not in {
+            "python",
+            "test",
+            "tokenspeed-kernel",
+            "tokenspeed-kernel-amd",
+            "tokenspeed-mla",
+            "tokenspeed-scheduler",
+        } or not (groups or workflows):
+            return False
+        runtime_paths.add(path)
+    if workflows.intersection(
+        check["workflow"] for check in native_checks(list(runtime_paths))
+    ):
+        return False
+    # Inspect both versions: removing a cross-vendor reference must not make
+    # a formerly shared file appear independent of an already tested backend.
+    if groups and runtime_paths:
+        with tempfile.TemporaryDirectory() as directory:
+            for revision in (base, main):
+                snapshot = Path(directory) / revision
+                snapshot.mkdir()
+                for path in runtime_paths:
+                    contents = subprocess.run(
+                        ["git", "show", f"{revision}:{path}"],
+                        cwd=source,
+                        capture_output=True,
+                    )
+                    if contents.returncode == 0:
+                        target = snapshot / path
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(contents.stdout)
+                if any(
+                    path_requires_group(path, group, snapshot)
+                    for path in runtime_paths
+                    for group in groups
+                ):
+                    return False
+    if candidate:
+        merge = subprocess.run(
+            ["git", "merge-tree", "--write-tree", candidate["validation"], main],
+            cwd=source,
+            capture_output=True,
+        )
+        if merge.returncode:
+            return False
+    return True
 
 
 def validate_plan(plan: dict, data: dict) -> list[dict]:
@@ -1114,7 +1269,7 @@ def control(number: int, *, expected_command: int | None = None):
         and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
         and state
         and comment
-        and state["phase"] == "manual"
+        and state["phase"] in {"manual", "stale"}
         and "candidate" in state
         and state["command"] == comment["id"]
         and state["action"] == "fix"
@@ -1136,16 +1291,17 @@ def control(number: int, *, expected_command: int | None = None):
         initial = True
     if not state or state["phase"] in FINISHED_PHASES:
         return
-    if (
-        state["head"] != pr["head"]["sha"]
-        or state["base"] != pr["base"]["sha"]
-        or (
-            "validation_base" in state
-            and state["validation_base"] != api("git/ref/heads/main")["object"]["sha"]
+    if not pr_source_matches(state, pr, source=ROOT) or (
+        "validation_base" in state
+        and not main_advance_compatible(
+            state, api("git/ref/heads/main")["object"]["sha"], source=ROOT
         )
     ):
         state["phase"] = "stale"
-        publish(state, "PR or main changed. Request a new plan and command.")
+        publish(
+            state,
+            "PR source or relevant main inputs changed. Refresh the repair and validation.",
+        )
         return
     if not reconcile and "repair_run" in state:
         deadline = repair_deadline(state)

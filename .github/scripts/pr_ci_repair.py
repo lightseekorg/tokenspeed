@@ -48,8 +48,10 @@ from pr_ci_assist import (
     dispatch_native_checks,
     latest_command,
     load_state,
+    main_advance_compatible,
     native_check,
     pages,
+    pr_source_matches,
     public_gate,
     publish,
     pull,
@@ -1378,7 +1380,9 @@ def current_request(request: dict, *, check_base: bool = True) -> dict:
     if (
         check_base
         and "validation_base" in state
-        and state["validation_base"] != api("git/ref/heads/main")["object"]["sha"]
+        and not main_advance_compatible(
+            state, api("git/ref/heads/main")["object"]["sha"], source=ROOT
+        )
     ):
         raise ValueError("Main changed before validation.")
     pr = pull(state["pr"])
@@ -1410,8 +1414,7 @@ def current_request(request: dict, *, check_base: bool = True) -> dict:
         or live != state
         or state["phase"] != "repairing"
         or state["action"] != "fix"
-        or state["head"] != pr["head"]["sha"]
-        or state["base"] != pr["base"]["sha"]
+        or not pr_source_matches(state, pr, source=ROOT)
     ):
         raise ValueError("Repair authorization or source changed.")
     return pr
@@ -1478,9 +1481,8 @@ def stage():
             "state": {**request["state"], "validation_base": request["repair_base"]},
         }
         current_request(original, check_base=False)
-        if (
-            request["state"]["validation_base"]
-            != api("git/ref/heads/main")["object"]["sha"]
+        if not main_advance_compatible(
+            request["state"], api("git/ref/heads/main")["object"]["sha"], source=ROOT
         ):
             raise ValueError("Main changed after the refreshed checks.")
         publish(
@@ -1627,15 +1629,14 @@ def wait_for_validation(request: dict):
 def promote(state: dict, *, deadline: int):
     public_gate()
     base = state.get("validation_base", state["base"])
-    if (
-        "validation_base" in state
-        and base != api("git/ref/heads/main")["object"]["sha"]
+    if "validation_base" in state and not main_advance_compatible(
+        state, api("git/ref/heads/main")["object"]["sha"], source=ROOT
     ):
         raise ValueError("Main changed before promotion.")
     if time.time() >= deadline:
         raise ValueError("The authorized publication budget expired.")
     pr = pull(state["pr"])
-    if (pr["head"]["sha"], pr["base"]["sha"]) != (state["head"], state["base"]):
+    if not pr_source_matches(state, pr, source=ROOT):
         raise ValueError("PR or main moved before promotion.")
     latest = latest_command(pages(f"issues/{state['pr']}/comments", None))
     if not latest or latest["id"] != state["command"]:
@@ -1691,16 +1692,20 @@ def promote(state: dict, *, deadline: int):
         subprocess.run(["git", "merge", "--abort"], cwd=source, capture_output=True)
         command("git", "reset", "--hard", promoted, cwd=source)
     current = pull(state["pr"])
-    if (current["head"]["sha"], current["base"]["sha"]) != (
-        state["head"],
-        state["base"],
-    ):
+    if not pr_source_matches(state, current, source=source):
         raise ValueError("PR or main moved during promotion.")
-    if (
-        "validation_base" in state
-        and base != api("git/ref/heads/main")["object"]["sha"]
-    ):
-        raise ValueError("Main changed during promotion.")
+    if "validation_base" in state:
+        main = api("git/ref/heads/main")["object"]["sha"]
+        if not main_advance_compatible(state, main, source=source):
+            raise ValueError("Relevant main inputs changed during promotion.")
+        if main != base:
+            result = subprocess.run(
+                ["git", "merge-tree", "--write-tree", "HEAD", main],
+                cwd=source,
+                capture_output=True,
+            )
+            if result.returncode:
+                raise ValueError("Promoted repair conflicts with current main.")
     push(source, pr["head"]["ref"], deadline=deadline)
 
 

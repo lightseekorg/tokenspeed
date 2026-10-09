@@ -1675,6 +1675,139 @@ def test_source_change_stops_before_dispatch(monkeypatch, tmp_path, selected):
     assert state["phase"] == "stale" and len(published) == 1
 
 
+@pytest.fixture
+def main_advance_repo(tmp_path, selected):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(*args):
+        return assist.command(
+            "git", "-c", "core.hooksPath=/dev/null", *args, cwd=source
+        )
+
+    def commit(path, text):
+        target = source / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        git("add", "--all")
+        git("commit", "-s", "-m", "test input")
+        return git("rev-parse", "HEAD")
+
+    git("init", "-b", "main")
+    repair.identity(source)
+    path = "tokenspeed-kernel-amd/python/transform.py"
+    commit(path, "value = 1\n")
+    shared = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/cuda.py"
+    base = commit(shared, "is_amd = True\n")
+    git("checkout", "-b", "pr")
+    head = commit(path, "value = 2\n")
+    patch = commit(path, "value = 3\n")
+    _, state = selected
+    state.update(
+        head=head,
+        base=base,
+        validation_base=base,
+        repair_run=200,
+        action="fix",
+        phase="validating",
+        native_checks=[],
+        candidate=dict(
+            patch=patch,
+            validation=patch,
+            tree=git("rev-parse", "HEAD^{tree}"),
+            branch="bot/pr-ci-assist-123-42-200",
+        ),
+    )
+    state["tasks"][0].update(runner="amd-mi35x-1gpu-test", cluster="")
+    git("checkout", "main")
+    return source, git, commit, state, path, shared
+
+
+def test_main_advance_preserves_source_and_validation_boundaries(
+    main_advance_repo, monkeypatch
+):
+    source, git, commit, state, path, shared = main_advance_repo
+    original = copy.deepcopy(state)
+    docs = commit("docs/guide.md", "Documentation\n")
+    other_vendor = commit("tokenspeed-mla/python/kernel.py", "value = 1\n")
+    assert assist.main_advance_compatible(state, other_vendor, source=source)
+    assert state == original
+    pr = dict(head=dict(sha=state["head"]), base=dict(sha=docs))
+    monkeypatch.setattr(assist, "api", lambda _: {"object": {"sha": other_vendor}})
+    assert assist.pr_source_matches(state, pr, source=source)
+    pr["head"]["sha"] = docs
+    assert not assist.pr_source_matches(state, pr, source=source)
+    # An independent backend stops being independent when its own native check
+    # is also part of the retained validation.
+    state["native_checks"] = [
+        dict(workflow="nvidia-kernel-library-tests.yml", status="passed", run=1)
+    ]
+    assert not assist.main_advance_compatible(state, other_vendor, source=source)
+    state["native_checks"] = []
+    # Both sides of a vendor classification matter, including a removed marker.
+    changed = commit(shared, "is_nvidia = True\n")
+    assert not assist.main_advance_compatible(state, changed, source=source)
+    git("checkout", "--detach", docs)
+    overlap = commit(path, "value = 4\n")
+    assert not assist.main_advance_compatible(state, overlap, source=source)
+    git("checkout", "--detach", docs)
+    controls = commit("test/ci/ut/task.yaml", "changed: true\n")
+    assert not assist.main_advance_compatible(state, controls, source=source)
+    git("checkout", "--detach", docs)
+    dependency = commit("python/pyproject.toml", "[project]\n")
+    assert not assist.main_advance_compatible(state, dependency, source=source)
+    state["validation_base"] = other_vendor
+    assert not assist.main_advance_compatible(state, docs, source=source)
+
+
+def test_promotion_reuses_original_tree_but_rechecks_latest_main(
+    main_advance_repo, monkeypatch, tmp_path
+):
+    source, git, commit, state, path, _ = main_advance_repo
+    main = commit("docs/guide.md", "Documentation\n")
+    changed = commit(path, "value = 4\n")
+    git("remote", "add", "origin", str(source))
+    git("checkout", "--detach", state["head"])
+    pr = dict(head=dict(sha=state["head"], ref="pr"), base=dict(sha=state["base"]))
+    monkeypatch.setattr(repair, "ROOT", source)
+    monkeypatch.setattr(repair, "WORK", tmp_path)
+    monkeypatch.setattr(repair, "public_gate", lambda: None)
+    monkeypatch.setattr(repair, "pull", lambda _: pr)
+    monkeypatch.setattr(repair, "pages", lambda *args: [])
+    monkeypatch.setattr(repair, "latest_command", lambda _: {"id": state["command"]})
+    monkeypatch.setattr(repair.time, "time", lambda: 50)
+    mains = [main, main]
+
+    def api(endpoint):
+        return {
+            "object": {
+                "sha": (
+                    mains.pop(0)
+                    if endpoint == "git/ref/heads/main"
+                    else state["candidate"]["validation"]
+                )
+            }
+        }
+
+    monkeypatch.setattr(repair, "api", api)
+    pushed = []
+    monkeypatch.setattr(
+        repair, "push", lambda *args, **kwargs: pushed.append(git("rev-parse", "HEAD"))
+    )
+    repair.promote(state, deadline=100)
+    assert len(pushed) == 1
+    assert git("rev-parse", "HEAD^") == state["head"]
+    assert git("rev-parse", "HEAD^{tree}") == state["candidate"]["tree"]
+    assert not source.joinpath("docs/guide.md").exists()
+    # A relevant change arriving during promotion must stop the push, even if
+    # the initial compatibility check accepted the earlier documentation edit.
+    git("checkout", "--detach", state["head"])
+    mains[:] = [main, changed]
+    with pytest.raises(ValueError, match="Relevant main inputs changed"):
+        repair.promote(state, deadline=100)
+    assert len(pushed) == 1
+
+
 def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     monkeypatch, tmp_path, selected
 ):
@@ -1940,11 +2073,33 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "manual"
     native_status[0] = "passed"
-    assist.control(state["pr"])
+    # An unrelated main advance also permits reconciliation of a candidate
+    # retained as stale, without replacing its original validation source.
+    live[0]["phase"] = "stale"
+    validation_base = live[0]["validation_base"]
+
+    def compatible(s, main, *, source):
+        assert main == "f" * 40 and s["validation_base"] == validation_base
+        return True
+
+    reconcile_api = assist.api
+    with monkeypatch.context() as unrelated:
+        unrelated.setattr(assist, "main_advance_compatible", compatible)
+        unrelated.setattr(
+            assist,
+            "api",
+            lambda path: (
+                {"object": {"sha": "f" * 40}}
+                if path == "git/ref/heads/main"
+                else reconcile_api(path)
+            ),
+        )
+        assist.control(state["pr"])
     assert len(promoted) == 2 and live[0]["phase"] == "promoted"
     assert promotion_deadlines[-1] == 1893460500
     assert promoted[-1]["candidate"] == promoted[0]["candidate"]
     assert promoted[-1]["repair_run"] == promoted[0]["repair_run"]
+    assert promoted[-1]["validation_base"] == validation_base
     assert len(dispatched) == 2 and not emitted
     monkeypatch.setattr(assist, "task_status", original_task_status)
     # Explicitly continue a failed candidate from its owning repair artifact.
