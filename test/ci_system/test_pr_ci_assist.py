@@ -278,11 +278,8 @@ def test_targeted_diagnostics_use_completed_job_log_endpoint(
     monkeypatch.setattr(repair, "api", lambda path: job)
     monkeypatch.setattr(
         repair,
-        "pages",
-        lambda *args: [
-            dict(name="KIMI_API_URL", value="provider"),
-            dict(name="KIMI_MODEL", value="planner"),
-        ],
+        "org_variables",
+        lambda *args: {"KIMI_API_URL": "provider", "KIMI_MODEL": "planner"},
     )
     calls = []
 
@@ -1142,11 +1139,6 @@ def test_native_failure_diagnostics_include_slurm_artifact(monkeypatch, tmp_path
     monkeypatch.setattr(repair, "api", lambda path: dict(run_attempt=1))
 
     def pages(path, field):
-        if "organization-variables" in path:
-            return [
-                dict(name="KIMI_API_URL", value="provider"),
-                dict(name="KIMI_MODEL", value="planner"),
-            ]
         if "/jobs" in path:
             return [dict(name=check["job"], conclusion="failure", id=201)]
         return [dict(name=check["artifact"], expired=False)]
@@ -1167,6 +1159,11 @@ def test_native_failure_diagnostics_include_slurm_artifact(monkeypatch, tmp_path
 
     monkeypatch.setattr(repair, "pages", pages)
     monkeypatch.setattr(repair, "command", command)
+    monkeypatch.setattr(
+        repair,
+        "org_variables",
+        lambda *args: {"KIMI_API_URL": "provider", "KIMI_MODEL": "planner"},
+    )
     repair.configure()
     diagnostics = tmp_path.joinpath("model/diagnostics.txt").read_text()
     assert "native job failure evidence" in diagnostics

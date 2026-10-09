@@ -63,6 +63,7 @@ from pr_ci_assist import (
 from pr_ci_common import (
     check_model_output,
     mask_secret,
+    org_variables,
     planner_config,
     screen_public_output,
 )
@@ -529,10 +530,7 @@ def restore_patch(source: Path, head: str, selected: set[str]):
 
 
 def configure():
-    variables = {
-        v["name"]: v["value"]
-        for v in pages("actions/organization-variables", "variables")
-    }
+    variables = org_variables(command, REPO)
     for name in ("KIMI_API_URL", "KIMI_MODEL"):
         mask_secret(variables[name])
     WORK.joinpath("model").mkdir(parents=True, exist_ok=True)

@@ -30,6 +30,7 @@ from pathlib import Path
 from pr_ci_common import check_model_output as _check_public_output
 from pr_ci_common import (
     mask_secret,
+    org_variables,
     planner_config,
     published_matches,
     require_bot,
@@ -63,18 +64,7 @@ def prepare(root: Path) -> None:
     if _command("git", "rev-parse", "HEAD").strip() != os.environ["PR_HEAD_SHA"]:
         raise SystemExit("Checkout differs from the reviewed commit.")
     _check_bot()
-    rows = _command(
-        "gh",
-        "api",
-        "--paginate",
-        f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/organization-variables?per_page=30",
-        "--jq",
-        ".variables[] | @json",
-    )
-    variables = {
-        row["name"]: row["value"]
-        for row in (json.loads(line) for line in rows.splitlines() if line.strip())
-    }
+    variables = org_variables(_command, os.environ["GITHUB_REPOSITORY"])
     url = variables.get("KIMI_API_URL", "")
     model = variables.get("KIMI_MODEL", "")
     if not url or not model:

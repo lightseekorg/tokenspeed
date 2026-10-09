@@ -82,6 +82,20 @@ def require_public_repo(
         raise error(message)
 
 
+def org_variables(command: Callable[..., str], repo: str) -> dict[str, str]:
+    """Fetch the repository's Actions organization variables by name."""
+    rows = json.loads(
+        command(
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{repo}/actions/organization-variables?per_page=100",
+        )
+    )
+    return {v["name"]: v["value"] for page in rows for v in page["variables"]}
+
+
 def mask_secret(value: str) -> None:
     """Mask a secret in GitHub Actions log output."""
     escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
