@@ -334,6 +334,66 @@ def test_fused_topk_topp_unaligned_rows(
 
 
 @requires_nvidia
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("V", [1, 127, 128, 129])
+def test_fused_topk_topp_small_vocab(device: str, V: int, enable_pdl: bool) -> None:
+    """Vocabularies no larger than the 128-entry top-K window must keep their
+    probability mass.
+
+    The fixed-K radix top-K producer cannot fill its window when V < 128 and
+    writes nothing at V == 128, so the apply kernel used to renormalize stale
+    scratch. Such rows now sort the whole row directly; V = 129 is the first
+    vocabulary on the unchanged radix path. Checked eagerly and on CUDA graph
+    replay with new probabilities.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU is required for fused_topk_topp_renorm test")
+    torch.manual_seed(V)
+    bs = 4
+    # Greedy, top-K + top-P, top-K at the window size, and top-P only.
+    top_ks = torch.tensor(
+        [1, 8, 128, _TOP_K_DISABLED], dtype=torch.int32, device=device
+    )
+    top_ps = torch.tensor([1.0, 0.9, 0.8, 0.7], dtype=torch.float32, device=device)
+    probs = torch.softmax(torch.randn(bs, V, device=device) * 3.0, dim=-1)
+    workspace = torch.empty(
+        fused_topk_topp_workspace_size(bs, V), dtype=torch.uint8, device=device
+    )
+    out = torch.empty_like(probs)
+
+    def run() -> None:
+        # Zeroed scratch makes an unwritten top-K intermediate fail
+        # deterministically; NaN output checks that dropped entries are zeroed.
+        workspace.zero_()
+        out.fill_(float("nan"))
+        fused_topk_topp_renorm(
+            probs, top_ks, top_ps, workspace=workspace, out=out, enable_pdl=enable_pdl
+        )
+
+    def check() -> None:
+        torch.cuda.synchronize()
+        ref = _ref_topk_topp(probs, top_ks, top_ps)
+        torch.testing.assert_close(out != 0, ref != 0, atol=0, rtol=0)
+        torch.testing.assert_close(out, ref, atol=1e-6, rtol=1e-5)
+
+    run()
+    check()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    # New inputs on replay. Uniform rows keep every token tied at the top-P
+    # cutoff when no top-K cut applies: the top-P-only row, and K = 128 >= V
+    # (at V = 129, K = 128 is a real top-K cut).
+    probs.copy_(torch.softmax(torch.randn(bs, V, device=device) * 3.0, dim=-1))
+    probs[-1] = 1.0 / V
+    if V <= 128:
+        probs[2] = 1.0 / V
+    graph.replay()
+    check()
+
+
+@requires_nvidia
 def test_fused_topk_topp_workspace_size_grows_with_batch(device: str) -> None:
     """Workspace size must grow monotonically with batch and vocab so callers
     can pre-allocate a buffer sized for ``max_bs × vocab``."""
