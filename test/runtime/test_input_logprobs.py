@@ -369,6 +369,7 @@ class _Result:
         )
         self.grammar_completion = None
         self.next_input_ids = None
+        self.score_logprobs = None
         self.input_logprob_plan = plan
         self.input_token_logprobs = (
             torch.tensor(input_token_logprobs, dtype=torch.float32)
@@ -556,7 +557,7 @@ def test_decode_node_prepends_the_bootstrap_logprob_to_output_logprobs(
     state.computed_length = 3
     processor.rid_to_state["d"] = state
     with caplog.at_level("WARNING"):
-        processor.on_remote_prefill_done("d", 101, 2, -0.25)
+        processor.on_remote_prefill_done("d", 101, 2, -0.25, None)
     assert state.output_ids == [101]
     assert state.output_token_logprobs_val == [-0.25]
     assert state.output_token_logprobs_idx == [101]
@@ -568,7 +569,7 @@ def test_decode_node_prepends_the_bootstrap_logprob_to_output_logprobs(
     other = _state([1, 2, 3], start=0, computes_prompt_logprobs=False)
     processor.rid_to_state["e"] = other
     with caplog.at_level("WARNING"):
-        processor.on_remote_prefill_done("e", 102, 2, None)
+        processor.on_remote_prefill_done("e", 102, 2, None, None)
     assert other.output_ids == [102]
     assert other.output_token_logprobs_val == []
     assert (

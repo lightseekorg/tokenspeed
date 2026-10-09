@@ -545,6 +545,8 @@ def test_terminal_events_clear_transport_room_state(
         prefill_response_tracker={9: {0}},
         expected_prefill_ranks_table={9: frozenset({0})},
         bootstrap_token_table={9: 42},
+        score_vals_table={},
+        _pending_score_vals_table={},
         spec_candidate_ids_table={9: [1]},
         cached_tokens_table={9: remote_hits},
         bootstrap_logprob_table={9: -0.25},
@@ -559,6 +561,12 @@ def test_terminal_events_clear_transport_room_state(
     decode_manager.pop_prefill_metadata = lambda room: (
         MooncakeKVManagerDecode.pop_prefill_metadata(decode_manager, room)
     )
+    decode_manager.pop_prefill_score_vals = (
+        lambda room: MooncakeKVManagerDecode.pop_prefill_score_vals(
+            decode_manager, room
+        )
+    )
+    decode_manager.score_vals_table[9] = [0.8, 0.2]
     receiver = object.__new__(MooncakeKVReceiver)
     receiver.prefill = lambda *, block_manifest: None
     receiver.kv_mgr = decode_manager
@@ -573,6 +581,7 @@ def test_terminal_events_clear_transport_room_state(
     decode._remote_cache_slots = {}
     decode._remote_cached_tokens = {}
     decode._remote_bootstrap_logprobs = {}
+    decode._remote_score_vals = {}
     decode._remote_spec_candidate_ids = {}
     decode.cache_layout = _layout()
     admission = _op()
@@ -583,6 +592,9 @@ def test_terminal_events_clear_transport_room_state(
     assert decode.pop_remote_cache_slot("request") == 7
     assert decode.pop_remote_cached_tokens("request") == max(2, remote_hits)
     assert decode.pop_remote_bootstrap_logprob("request") == -0.25
+    assert decode.pop_remote_score_vals("request") == [0.8, 0.2]
+    assert decode_manager.score_vals_table == {}
+    assert decode._remote_score_vals == {}
     assert decode.pop_remote_spec_candidate_ids("request") == (7, [1])
     assert decode._admissions == {}
     assert decode._remote_cache_slots == {}
@@ -608,6 +620,7 @@ def test_terminal_cleanup_wakes_prefill_metadata_waiter() -> None:
     manager.prefill_metadata = {}
     manager.cached_tokens = {}
     manager.bootstrap_logprobs = {}
+    manager.score_vals = {}
     manager.transfer_infos = {9: {}}
     manager.request_status = {9: TransferPoll.WaitingForInput}
     result = []
@@ -1438,6 +1451,8 @@ def test_decode_accepts_only_the_planned_prefill_rank_completion_set() -> None:
         value.expected_prefill_ranks_table = {9: frozenset((0, 2))}
         value.prefill_response_tracker = defaultdict(set)
         value.bootstrap_token_table = {}
+        value.score_vals_table = {}
+        value._pending_score_vals_table = {}
         value.spec_candidate_ids_table = {}
         value.cached_tokens_table = {}
         value.bootstrap_logprob_table = {}
@@ -1451,22 +1466,35 @@ def test_decode_accepts_only_the_planned_prefill_rank_completion_set() -> None:
         return value
 
     complete = manager()
-    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280, -0.5)
+    complete._handle_prefill_status(
+        9, TransferPoll.Success, 0, 42, None, 1280, -0.5, [0.8, 0.2]
+    )
     assert complete.request_status[9] == TransferPoll.WaitingForInput
-    complete._handle_prefill_status(9, TransferPoll.Success, 0, 42, None, 1280, -0.5)
+    assert complete.score_vals_table == {}
+    complete._handle_prefill_status(
+        9, TransferPoll.Success, 0, 42, None, 1280, -0.5, [0.8, 0.2]
+    )
     assert complete.cached_tokens_table[9] == 1280
     # The rank completing last carries no bootstrap metadata; the first valid
     # token and logprob seen are kept.
-    complete._handle_prefill_status(9, TransferPoll.Success, 2, -1, None, 1280, None)
+    complete._handle_prefill_status(
+        9, TransferPoll.Success, 2, -1, None, 1280, None, None
+    )
     assert complete.request_status[9] == TransferPoll.Success
     assert complete.bootstrap_token_table[9] == 42
+    assert complete.pop_prefill_score_vals(9) == [0.8, 0.2]
+    assert complete._pending_score_vals_table == {}
     assert complete.pop_prefill_metadata(9) == (42, None, 1280, -0.5)
     assert complete.cached_tokens_table == {}
     assert complete.bootstrap_logprob_table == {}
 
     wrong_rank = manager()
-    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 0, -1, None, 1280, None)
-    wrong_rank._handle_prefill_status(9, TransferPoll.Success, 1, -1, None, 1280, None)
+    wrong_rank._handle_prefill_status(
+        9, TransferPoll.Success, 0, -1, None, 1280, None, None
+    )
+    wrong_rank._handle_prefill_status(
+        9, TransferPoll.Success, 1, -1, None, 1280, None, None
+    )
     assert wrong_rank.request_status[9] == TransferPoll.Failed
     assert wrong_rank.prefill_response_tracker[9] == {0}
     assert "unexpected Prefill TP rank" in wrong_rank.failure_records[9]
@@ -1543,6 +1571,7 @@ def test_prefill_usage_status_wire_roundtrip():
     manager.prefill_metadata = {}
     manager.cached_tokens = {}
     manager.bootstrap_logprobs = {}
+    manager.score_vals = {}
     messages = []
     manager._connect = lambda endpoint: (
         SimpleNamespace(send_multipart=messages.append),
@@ -1550,6 +1579,9 @@ def test_prefill_usage_status_wire_roundtrip():
     )
     manager.record_cached_tokens(9, 1280)
     manager.record_bootstrap_logprob(9, -0.123456789012345678)
+    row = [0.8, 0.2]
+    manager.record_score_vals(9, row)
+    row[0] = 0.0
     manager.sync_status_to_decode_endpoint(
         "127.0.0.1",
         1234,
@@ -1569,10 +1601,12 @@ def test_prefill_usage_status_wire_roundtrip():
         [5, 6],
         1280,
         -0.123456789012345678,
+        [0.8, 0.2],
     )
     # Older senders lack the optional trailing frames: no logprob, then no usage.
-    assert parse_prefill_status_message(messages[0][:-1])[-2:] == (1280, None)
-    assert parse_prefill_status_message(messages[0][:-2])[-2:] == (0, None)
+    assert parse_prefill_status_message(messages[0][:7])[-1] is None
+    assert parse_prefill_status_message(messages[0][:6])[-3:] == (1280, None, None)
+    assert parse_prefill_status_message(messages[0][:5])[-3:] == (0, None, None)
     manager.begin_room(9)
     assert manager.prefill_metadata == {}
     assert manager.cached_tokens == {}
@@ -1599,6 +1633,7 @@ def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
     manager.prefill_metadata = {}
     manager.cached_tokens = {}
     manager.bootstrap_logprobs = {}
+    manager.score_vals = {}
     manager.record_cached_tokens(9, 1280)
     manager.record_bootstrap_logprob(9, -1.5)
     done = threading.Event()

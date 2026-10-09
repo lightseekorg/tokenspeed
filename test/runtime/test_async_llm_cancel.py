@@ -25,9 +25,11 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 import asyncio  # noqa: E402
 import types  # noqa: E402
 from typing import Any, Dict  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM  # noqa: E402
 from tokenspeed.runtime.engine.collector import RequestOutputCollector  # noqa: E402
+from tokenspeed.runtime.engine.io_struct import AbortReq, GenerateReqInput  # noqa: E402
 from tokenspeed.runtime.engine.output_processor import ReqState  # noqa: E402
 
 
@@ -170,6 +172,62 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
             0,
             "normal finish should not schedule an AbortReq",
         )
+
+
+class TestBatchSetupCleanup(unittest.IsolatedAsyncioTestCase):
+    def _batch(self):
+        obj = GenerateReqInput(
+            text=["valid", "too long"],
+            sampling_params={
+                "max_new_tokens": 0,
+                "score_label_token_ids": [1],
+                "score_apply_softmax": False,
+            },
+        )
+        obj.normalize_batch_and_arguments()
+        obj.rid = ["first", "second"]
+        return obj
+
+    async def _assert_tokenization_failure_cleanup(self, error):
+        mgr = _StubAsyncLLM()
+        first = types.SimpleNamespace(rid="first", created_time=0.0)
+        mgr._tokenize_one_request = AsyncMock(side_effect=[first, error])
+        generator = mgr._handle_batch_request(self._batch(), created_time=0.0)
+        with self.assertRaises(type(error)):
+            await generator.__anext__()
+        self.assertEqual(mgr.rid_to_state, {})
+        sent = mgr.engine_core_client.send_to_scheduler.aborts
+        self.assertIs(sent[0], first)
+        aborts = [message for message in sent if isinstance(message, AbortReq)]
+        self.assertEqual([message.rid for message in aborts], ["first"])
+
+    async def test_late_tokenization_error_retires_earlier_child(self):
+        await self._assert_tokenization_failure_cleanup(ValueError("context exceeded"))
+
+    async def test_cancellation_during_batch_setup_retires_earlier_child(self):
+        await self._assert_tokenization_failure_cleanup(asyncio.CancelledError())
+
+    async def test_partial_send_failure_retires_registered_child(self):
+        mgr = _StubAsyncLLM()
+        first = types.SimpleNamespace(rid="first", created_time=0.0)
+        mgr._tokenize_one_request = AsyncMock(return_value=first)
+        send = mgr._send_one_request
+
+        def failed_send(*args):
+            send(*args)
+            raise OSError("send failed")
+
+        mgr._send_one_request = failed_send
+        generator = mgr._handle_batch_request(self._batch(), created_time=0.0)
+        with self.assertRaisesRegex(OSError, "send failed"):
+            await generator.__anext__()
+        self.assertEqual(mgr.rid_to_state, {})
+        aborts = [
+            message
+            for message in mgr.engine_core_client.send_to_scheduler.aborts
+            if isinstance(message, AbortReq)
+        ]
+        self.assertEqual([message.rid for message in aborts], ["first"])
 
 
 if __name__ == "__main__":

@@ -62,6 +62,8 @@ class PdTransferHooks:
             if state is None:
                 continue
             loop.kv_transfer.record_cached_tokens(request_id, state.cached_tokens)
+            if state.score_vals is not None and not state.to_abort:
+                loop.kv_transfer.record_score_vals(request_id, state.score_vals)
             if state.output_token_logprobs_val:
                 loop.kv_transfer.record_bootstrap_logprob(
                     request_id, state.output_token_logprobs_val[0]
@@ -91,10 +93,15 @@ class PdTransferHooks:
                 bootstrap_logprob = loop.kv_transfer.pop_remote_bootstrap_logprob(
                     req_id
                 )
+                score_vals = loop.kv_transfer.pop_remote_score_vals(req_id)
                 state = loop.output_processor.rid_to_state.get(req_id)
                 if state is None or not state.to_abort:
                     loop.output_processor.on_remote_prefill_done(
-                        req_id, bootstrap_token, cached_tokens, bootstrap_logprob
+                        req_id,
+                        bootstrap_token,
+                        cached_tokens,
+                        bootstrap_logprob,
+                        score_vals,
                     )
                 processed.extend(
                     loop.output_processor.finish_remote_prefill_only_request(req_id)

@@ -159,6 +159,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         # final chunk's commit (like cached_tokens) and shipped in the status
         # message so the decode node's output logprobs start with it.
         self.bootstrap_logprobs: dict[int, float] = {}
+        self.score_vals: dict[int, list[float]] = {}
         self.bootstrap_token_cond = threading.Condition()
         # Determine the number of threads to use for kv sender
         cpu_count = os.cpu_count()
@@ -230,12 +231,19 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             if self.request_status.get(room) not in (None, TransferPoll.Failed):
                 self.bootstrap_logprobs[room] = logprob
 
+    def record_score_vals(self, room: int, score_vals: list[float]) -> None:
+        """Snapshot the committed score row for the final status message."""
+        with self.bootstrap_token_cond:
+            if self.request_status.get(room) not in (None, TransferPoll.Failed):
+                self.score_vals[room] = list(score_vals)
+
     def begin_room(self, room: int) -> None:
         """Reset request metadata before publishing a room."""
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
             self.cached_tokens.pop(room, None)
             self.bootstrap_logprobs.pop(room, None)
+            self.score_vals.pop(room, None)
         self.update_status(room, TransferPoll.Bootstrapping)
 
     def discard_room(self, room: int) -> None:
@@ -246,6 +254,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
             self.prefill_metadata.pop(room, None)
             self.cached_tokens.pop(room, None)
             self.bootstrap_logprobs.pop(room, None)
+            self.score_vals.pop(room, None)
             self.bootstrap_token_cond.notify_all()
 
     def _wait_prefill_metadata(
@@ -845,11 +854,19 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         with self.bootstrap_token_cond:
             cached_tokens = self.cached_tokens.get(room, 0)
             bootstrap_logprob = self.bootstrap_logprobs.get(room)
+            score_vals = (
+                self.score_vals.get(room) if status == TransferPoll.Success else None
+            )
         # Optional trailing frame: the bootstrap logprob as an IEEE double
         # (exact), empty when the prefill node has none for this request.
         bootstrap_logprob_payload = (
             struct.pack("<d", bootstrap_logprob)
             if bootstrap_logprob is not None
+            else b""
+        )
+        score_payload = (
+            np.asarray(score_vals, dtype="<f8").tobytes()
+            if score_vals is not None
             else b""
         )
         socket, lock = self._connect("tcp://" + remote + ":" + str(dst_port))
@@ -863,6 +880,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     spec_candidate_payload,
                     str(cached_tokens).encode("ascii"),
                     bootstrap_logprob_payload,
+                    score_payload,
                 ]
             )
 

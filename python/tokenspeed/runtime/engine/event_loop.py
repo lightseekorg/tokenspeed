@@ -834,7 +834,7 @@ class EventLoop:
         request state the logprobs land in and takes the abort-or-finish
         branch the NaN guard decides, so the last stage broadcasts
         (output_tokens, output_lengths, next_input_ids, output_logprobs,
-        input_token_logprobs, output_nan_flags) over the PP gloo group and
+        input_token_logprobs, output_nan_flags, score_logprobs) over the PP gloo group and
         the others adopt them. The flags travel with the values they audit:
         only the last stage holds logits and prompt logprobs to flag, and a
         stage recording the adopted (sanitized) logprobs as healthy while
@@ -860,6 +860,7 @@ class EventLoop:
                     results.output_logprobs,
                     results.input_token_logprobs,
                     results.output_nan_flags,
+                    results.score_logprobs,
                 )
             ]
         dist.broadcast_object_list(payload, src=src_global_rank, group=group)
@@ -871,6 +872,7 @@ class EventLoop:
                 results.output_logprobs,
                 results.input_token_logprobs,
                 results.output_nan_flags,
+                results.score_logprobs,
             ) = payload[0]
 
     def _commit_forward_results(

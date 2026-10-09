@@ -127,6 +127,9 @@ class _DecodeExecutor(DisaggDecodeExecutor):
     def pop_remote_bootstrap_logprob(self, request_id):
         return None
 
+    def pop_remote_score_vals(self, request_id):
+        return None
+
     def pop_remote_cache_slot(self, req_id):
         return self._slot
 
@@ -183,7 +186,7 @@ def _planned(*, num_extends, label=None):
 def _loop(trace, kv_transfer, state):
     output_processor = SimpleNamespace(
         rid_to_state={"r0": state} if state is not None else {},
-        on_remote_prefill_done=lambda rid, tok, cached_tokens, logprob: trace.append(
+        on_remote_prefill_done=lambda rid, tok, cached_tokens, logprob, scores: trace.append(
             ("bootstrap", tok)
         ),
         finish_remote_prefill_only_request=lambda rid: [],
@@ -896,7 +899,12 @@ def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests(
         record_cached_tokens=lambda room, count: recorded.append((room, count)),
         record_bootstrap_logprob=lambda room, lp: logprobs.append((room, lp)),
     )
-    state = SimpleNamespace(cached_tokens=1280, output_token_logprobs_val=[])
+    state = SimpleNamespace(
+        cached_tokens=1280,
+        output_token_logprobs_val=[],
+        score_vals=None,
+        to_abort=False,
+    )
     loop = SimpleNamespace(
         kv_transfer=transfer,
         output_processor=SimpleNamespace(rid_to_state={"hit": state}),
