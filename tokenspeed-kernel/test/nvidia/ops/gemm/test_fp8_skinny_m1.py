@@ -21,11 +21,11 @@
 """The M == 1 per-tensor FP8 skinny GEMV: selection, results and capture."""
 
 import pytest
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.gemm import _gemm_format_signature
 from tokenspeed_kernel.ops.gemm import cute_dsl as cute_dsl_ops
 from tokenspeed_kernel.ops.gemm import flashinfer as flashinfer_ops
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.selection import select_kernel
 
 pytestmark = pytest.mark.skipif(
@@ -79,7 +79,7 @@ def test_matches_the_cublaslt_fp8_gemm(n, k):
     expected = flashinfer_ops.flashinfer_mm_fp8_tensor_scaled(
         a, b, a_scale, b_scale, torch.bfloat16
     )
-    out = tokenspeed_kernel.mm(
+    out = kernel_mm(
         a, b, A_scales=a_scale, B_scales=b_scale, out_dtype=torch.bfloat16, quant="fp8"
     )
     torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)

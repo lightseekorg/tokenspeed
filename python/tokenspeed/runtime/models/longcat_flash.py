@@ -22,10 +22,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable as _Iterable
 
-import tokenspeed_kernel
 import torch
 import torch.nn as nn
 import torch.nn.functional as _F
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.platform import current_platform as _current_platform
 from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as _dsv3_router_gemm
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -235,7 +235,7 @@ class _RuntimeLongcatRouter(nn.Module):
             # The classifier's logits feed expert selection, so they must be
             # batch-invariant or top-k flips at near-ties. cuBLAS and the
             # dsv3 router kernel tile by shape; the aok leaf does not.
-            return tokenspeed_kernel.mm(
+            return kernel_mm(
                 hidden_states.float(),
                 self.classifier.weight.float(),
                 override="aok",

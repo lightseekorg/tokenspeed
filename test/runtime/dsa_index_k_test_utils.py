@@ -34,7 +34,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     index_k_plane_dtype,
@@ -109,7 +109,7 @@ def expected_index_k_rows(
     keys = keys.to(torch.bfloat16)
     if index_k_format == "bf16":
         return keys, None
-    fp8, scale = quantize_fp8_with_scale(
+    fp8, scale = quantize_fp8(
         keys.to(_write_device(index_k_format)),
         granularity="token_group",
         group_size=FP8_GROUP_SIZE,

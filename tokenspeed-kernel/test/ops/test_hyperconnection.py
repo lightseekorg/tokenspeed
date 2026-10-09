@@ -26,13 +26,12 @@ from collections.abc import Sequence
 
 import pytest
 import torch
-from tokenspeed_kernel import (
-    gated_residual_combine,
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
-    gated_residual_mix,
     grouped_gemma_rmsnorm,
 )
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.residual import gated_residual_combine, gated_residual_mix
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.registry import KernelRegistry

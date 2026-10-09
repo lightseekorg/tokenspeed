@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.thirdparty.cuda import moe_finalize_fuse_shared
 
@@ -119,7 +122,6 @@ def test_routed_deferred_finalize_matches_finalized(
     """trtllm routed unquant MoE: do_finalize=False + our fused finalize must
     reproduce do_finalize=True. Also proves the deferred gemm2 rows are
     un-weighted (the finalize applies the only weighting)."""
-    import tokenspeed_kernel
     from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant
 
     monkeypatch.setattr("tokenspeed_kernel.ops.moe.pdl_enabled", lambda: enable_pdl)
@@ -128,7 +130,7 @@ def test_routed_deferred_finalize_matches_finalized(
     num_experts, top_k, hidden, inter = 16, 6, 256, 256
     num_shared = 2
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -163,7 +165,7 @@ def test_routed_deferred_finalize_matches_finalized(
     w.tp_size = 1
     w.ep_rank = 0
     w.num_local_experts = num_experts
-    tokenspeed_kernel.moe_process_weights(plan, w)
+    kernel_moe_process_weights(plan, w)
 
     x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
     router_logits = torch.randn(num_tokens, num_experts, device="cuda")
@@ -175,7 +177,7 @@ def test_routed_deferred_finalize_matches_finalized(
     ).to(torch.int32)
 
     def apply(do_finalize):
-        return tokenspeed_kernel.moe_apply(
+        return kernel_moe_apply(
             plan,
             x,
             w,

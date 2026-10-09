@@ -27,7 +27,12 @@ import re
 BOT = "lightseek-bot"
 BOT_ID = 243258330
 REPO = "lightseekorg/tokenspeed"
-COMMAND = re.compile(r"\s*@lightseek-bot[ \t]+(watch|fix)\s*", re.IGNORECASE)
+COMMAND = re.compile(
+    rf"\s*@lightseek-bot[ \t]+(watch|fix)"
+    rf"(?:[ \t]+https://github\.com/{re.escape(REPO)}/actions/runs/"
+    r"(?P<run>[1-9][0-9]*)/job/(?P<job>[1-9][0-9]*)(?:\?pr=(?P<pr>[1-9][0-9]*))?)?\s*",
+    re.IGNORECASE,
+)
 SHA = re.compile(r"[0-9a-f]{40}")
 NATIVE_CHECKS = {
     "scheduler-cpp-test.yml": {
@@ -48,6 +53,9 @@ NATIVE_CHECKS = {
         "step": "Run native library unit tests",
         "job": "native-libraries",
         "target": "Native GPU CI",
+        "config": "test/ci/ut/ut-tokenspeed-kernel-nvidia-arm.yaml",
+        "runner": "slurm-nvidia-arm-4gpu",
+        "artifact": "nvidia-kernel-library-tests",
     },
 }
 STATUSES = {"passed", "waiting", "failed", "missing", "blocked"}
@@ -111,7 +119,15 @@ def record(comment: dict, kind: str) -> dict | None:
             not required.issubset(data)
             or set(data)
             - required
-            - {"candidate", "repair_run", "plan_refresh", "native_checks"}
+            - {
+                "candidate",
+                "repair_run",
+                "validation_base",
+                "plan_refresh",
+                "native_checks",
+                "native_submitted",
+                "target",
+            }
             or type(data.get("command")) is not int
             or data.get("action") not in {"watch", "fix"}
             or data.get("phase")
@@ -127,8 +143,22 @@ def record(comment: dict, kind: str) -> dict | None:
             }
         ):
             return None
+        if "target" in data and (
+            data["action"] != "fix"
+            or not isinstance(data["target"], dict)
+            or set(data["target"]) != {"run", "job"}
+            or any(type(v) is not int or v < 1 for v in data["target"].values())
+        ):
+            return None
         if "plan_refresh" in data and (
             type(data["plan_refresh"]) is not int or data["plan_refresh"] < 1
+        ):
+            return None
+        if "validation_base" in data and (
+            not isinstance(data["validation_base"], str)
+            or not SHA.fullmatch(data["validation_base"])
+            or "repair_run" not in data
+            or data["action"] != "fix"
         ):
             return None
         if (
@@ -154,6 +184,17 @@ def record(comment: dict, kind: str) -> dict | None:
                 return None
         if len({c["workflow"] for c in checks}) != len(checks):
             return None
+        submitted_native = data.get("native_submitted", [])
+        if (
+            not isinstance(submitted_native, list)
+            or any(
+                not isinstance(w, str) or w not in NATIVE_CHECKS
+                for w in submitted_native
+            )
+            or len(set(submitted_native)) != len(submitted_native)
+            or (submitted_native and "candidate" not in data)
+        ):
+            return None
         if (
             type(data["since"]) is not int
             or not isinstance(data["submitted"], list)
@@ -174,7 +215,11 @@ def record(comment: dict, kind: str) -> dict | None:
                     isinstance(c[k], str) and SHA.fullmatch(c[k])
                     for k in ("patch", "validation", "tree")
                 )
-                or c["branch"] != f"bot/pr-ci-assist-{data['pr']}-{data['command']}"
+                or c["branch"]
+                not in {
+                    f"bot/pr-ci-assist-{data['pr']}-{data['command']}",
+                    f"bot/pr-ci-assist-{data['pr']}-{data['command']}-{data.get('repair_run')}",
+                }
             ):
                 return None
     else:
