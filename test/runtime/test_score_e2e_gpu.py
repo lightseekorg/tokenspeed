@@ -236,6 +236,24 @@ def test_score_megatron_reduction_matches_sampled_logprobs():
         assert torch.equal(scores[:, column], sampled)
 
 
+def test_score_label_upload_does_not_synchronize_serving_stream():
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.sampling.score_utils import build_score_label_ids
+
+    params = [
+        SamplingParams(score_label_token_ids=[5, 9]),
+        SamplingParams(),
+        SamplingParams(score_label_token_ids=[1, 2, 3]),
+    ]
+    previous = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        labels = build_score_label_ids(params, 3, "cuda")
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    assert labels.cpu().tolist() == [[5, 9, 0], [0, 0, 0], [1, 2, 3]]
+
+
 if __name__ == "__main__":
     raise SystemExit(
         pytest.main([__file__, "-v", "-s", "-o", "faulthandler_timeout=90"])

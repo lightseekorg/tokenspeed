@@ -236,7 +236,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                 raise ValueError(
                     "score_apply_softmax must be explicitly True or False when score labels are supplied."
                 )
-        elif self.score_apply_softmax:
+        elif self.score_apply_softmax is not None:
             raise ValueError(
                 "score_apply_softmax is only meaningful together with "
                 "score_label_token_ids."

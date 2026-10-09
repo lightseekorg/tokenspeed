@@ -61,9 +61,11 @@ A score request is an ordinary generation request with
   response contract.
 - The readout lives in the eager forward step
   (`ModelExecutor._forward_step`), gathering from the sanitized logits
-  before sampling. Extend batches never replay a captured CUDA graph
-  (`ForwardStepRunner` requires decode mode), but the shared forward return contract still carries both prompt
-  logprobs and scores. Capture, replay, eager, idle and pipeline-parallel
+  before sampling. The model stack may replay a prefill graph for eligible
+  extend or mixed batches; the score gather remains in the eager tail after
+  that model forward. `ForwardStepRunner` owns decode graphs. The shared
+  forward return contract carries both prompt logprobs and scores.
+  Capture, replay, eager, idle and pipeline-parallel
   placeholders return the same five fields. Pipeline stages receive score
   rows with the existing commit-time result broadcast; decode graphs return `None`
   for both prefill-only readouts.

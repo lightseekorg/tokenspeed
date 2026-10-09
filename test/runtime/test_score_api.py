@@ -92,9 +92,10 @@ def test_score_params_reject_out_of_vocab_label():
         _verify(SamplingParams(max_new_tokens=0, score_label_token_ids=[100]))
 
 
-def test_score_apply_softmax_requires_labels():
+@pytest.mark.parametrize("apply_softmax", (True, False))
+def test_score_apply_softmax_requires_labels(apply_softmax):
     with pytest.raises(ValueError, match="score_apply_softmax"):
-        _verify(SamplingParams(score_apply_softmax=True))
+        _verify(SamplingParams(score_apply_softmax=apply_softmax))
 
 
 @pytest.mark.parametrize("token_id", (True, 1.5, "1"))

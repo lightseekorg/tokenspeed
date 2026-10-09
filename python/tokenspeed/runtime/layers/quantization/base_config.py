@@ -45,6 +45,14 @@ class QuantizeMethodBase(ABC):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
+    def static_fp8_input_scale(self, layer: nn.Module) -> torch.Tensor | None:
+        """The per-tensor FP8 scale ``apply`` quantizes its input with, which a producer may apply instead."""
+        return None
+
+    def nvfp4_global_scale(self, layer: nn.Module) -> torch.Tensor | None:
+        """The global scale ``apply`` hands ``fp4_quantize`` for its input, which a producer may apply instead."""
+        return None
+
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Process the weight after loading.
 

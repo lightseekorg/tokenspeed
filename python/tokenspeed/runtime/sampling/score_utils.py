@@ -53,11 +53,20 @@ def build_score_label_ids(
     if not any(label_lists):
         return None
     max_labels = max(len(ids) for ids in label_lists if ids is not None)
-    label_ids = torch.zeros(num_rows, max_labels, dtype=torch.int64)
+    target_device = torch.device(device)
+    label_ids = torch.zeros(
+        num_rows,
+        max_labels,
+        dtype=torch.int64,
+        device="cpu",
+        pin_memory=target_device.type == "cuda",
+    )
     for row, ids in enumerate(label_lists):
         if ids is not None:
-            label_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.int64)
-    return label_ids.to(device)
+            label_ids[row, : len(ids)] = torch.tensor(
+                ids, dtype=torch.int64, device="cpu"
+            )
+    return label_ids.to(target_device, non_blocking=True)
 
 
 def gather_score_logprobs(
