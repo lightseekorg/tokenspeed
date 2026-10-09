@@ -235,7 +235,7 @@ def _attend_kv_tile(
     return M, L, acc
 
 
-@gluon.jit(repr=_mla_decode_fwd_kernel_repr)
+@gluon.jit(repr=_mla_decode_fwd_kernel_repr, do_not_specialize=["block_tables_stride"])
 def _mla_decode_fwd_kernel(
     split_output_ptr,  # [total_num_tokens, num_query_heads, KV_LORA_RANK + qk_rope_head_dim]
     split_max_ptr,  # [total_num_tokens, num_query_heads, num_kv_splits]
@@ -309,7 +309,11 @@ def _mla_decode_fwd_kernel(
         q_start_idx = seq_idx
     else:
         seq_idx = q_block_global_idx // num_q_blocks_per_seq
-        q_start_idx = gl.load(query_start_len_ptr + seq_idx)
+        if query_start_len_ptr is None:
+            # Every sequence carries num_tokens_per_seq consecutive queries.
+            q_start_idx = seq_idx * num_tokens_per_seq
+        else:
+            q_start_idx = gl.load(query_start_len_ptr + seq_idx)
 
     q_block_local_idx = q_block_global_idx - seq_idx * num_q_blocks_per_seq
 
@@ -619,6 +623,9 @@ def _mla_decode_fwd_kernel(
         + query_offset_1_qk * NUM_KV_SPLITS
         + split_kv_id
     )
+    # A query that sees no key of this split leaves M at the 0 that the
+    # all-masked tile substitutes; -inf keeps it out of the split maximum.
+    M = gl.where(L > 0.0, M, float("-inf"))
     gl.store(split_max_ptr + split_offset, M, mask=query_mask_0_qk & query_mask_1_qk)
     gl.store(split_expsum_ptr + split_offset, L, mask=query_mask_0_qk & query_mask_1_qk)
 
@@ -637,7 +644,10 @@ _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_mla_decode_fwd_reduce_kernel_repr)
+@gluon.jit(
+    repr=_mla_decode_fwd_reduce_kernel_repr,
+    do_not_specialize=["num_seqs", "block_tables_stride", "total_num_tokens"],
+)
 def _mla_decode_fwd_reduce_kernel(
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     lse_ptr,  # [num_tokens, num_query_heads] or None
@@ -759,6 +769,8 @@ def _mla_decode_fwd_reduce_kernel(
         split_max_ptr + split_offset, mask=split_mask, other=float("-inf")
     )
     overall_max = gl.max(split_max)
+    # A causal query with no visible key has no finite split maximum.
+    overall_max = gl.where(overall_max > float("-inf"), overall_max, 0.0)
 
     # Load and rescale per-split exponent sums.
     split_expsum = gl.load(split_expsum_ptr + split_offset, mask=split_mask, other=0.0)
@@ -1061,6 +1073,295 @@ def launch_gluon_mla_decode_gfx1250(
     return (out, lse) if return_lse else out
 
 
+def _select_query_block_num_kv_splits(
+    *,
+    num_sms: int,
+    num_q_programs: int,
+    max_seqlen_k: int,
+    tile_size: int,
+) -> int:
+    """Split the KV until the query-block programs cover each CU once.
+
+    A query-block program holds up to 64 rows of FP32 accumulators, so it
+    occupies a CU by itself; more splits than CUs only add partials to reduce.
+    """
+    max_kv_splits = min(64, max(1, math.ceil(max_seqlen_k / tile_size)))
+    splits = min(max_kv_splits, max(1, num_sms // max(1, num_q_programs)))
+    return 1 << (splits.bit_length() - 1)
+
+
+def _query_block_shape(num_query_heads: int, queries: int) -> tuple[int, int, int]:
+    """Return BLOCK_M, BLOCK_Q and head blocks for one request's query block.
+
+    A program holds BLOCK_Q whole queries of every head, so each KV tile it
+    loads serves all of them. Past 64 rows the block splits by query, and a
+    query with more than 64 heads splits by head.
+    """
+    rows = queries * num_query_heads
+    block_m = 16 if rows <= 16 else 32 if rows <= 32 else 64
+    if num_query_heads <= block_m:
+        return block_m, block_m // num_query_heads, 1
+    return block_m, 1, math.ceil(num_query_heads / block_m)
+
+
+def _launch_query_block_decode(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    softmax_scale: float,
+    out: torch.Tensor,
+    lse: torch.Tensor | None,
+    *,
+    num_kv_splits: int,
+    num_warps: int,
+    num_buffers: int,
+    waves_per_eu: int,
+) -> None:
+    batch_size, queries, num_query_heads, _ = q.shape
+    kv_lora_rank = out.shape[-1]
+    qk_rope_head_dim = q.shape[-1] - kv_lora_rank
+    page_size = kv_cache.shape[1]
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    block_m, block_q, num_head_blocks = _query_block_shape(num_query_heads, queries)
+    total_num_q_blocks = batch_size * triton.cdiv(queries, block_q) * num_head_blocks
+    num_tokens = batch_size * queries
+    q_flat = q.reshape(num_tokens, num_query_heads, q.shape[-1])
+    out_flat = out.view(num_tokens, num_query_heads, kv_lora_rank)
+    lse_flat = lse.view(num_tokens, num_query_heads) if lse is not None else None
+
+    split_output = torch.empty(
+        (num_tokens, num_query_heads, num_kv_splits, kv_lora_rank),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    split_max = torch.empty(
+        (num_tokens, num_query_heads, num_kv_splits),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    split_expsum = torch.empty_like(split_max)
+    _mla_decode_fwd_kernel[(total_num_q_blocks, 1, num_kv_splits)](
+        split_output_ptr=split_output,
+        split_max_ptr=split_max,
+        split_expsum_ptr=split_expsum,
+        query_ptr=q_flat,
+        query_scales_ptr=None,
+        kv_buffer_ptr=kv_cache,
+        block_tables_ptr=page_table,
+        seq_lens_ptr=cache_seqlens,
+        SCALE=softmax_scale,
+        q_scale_ptr=None,
+        kv_scale_ptr=None,
+        out_scale_ptr=None,
+        num_query_heads=num_query_heads,
+        num_kv_heads=1,
+        block_tables_stride=page_table.stride(0),
+        query_stride_0=q_flat.stride(0),
+        query_stride_1=q_flat.stride(1),
+        query_scales_stride_0=0,
+        query_scales_stride_1=0,
+        KV_LORA_RANK=kv_lora_rank,
+        QK_ROPE_HEAD_DIM=qk_rope_head_dim,
+        stride_kv_buffer_0=kv_cache.stride(0),
+        stride_kv_buffer_1=kv_cache.stride(1),
+        stride_kv_buffer_2=kv_cache.stride(2),
+        stride_kv_buffer_3=kv_cache.stride(3),
+        query_start_len_ptr=None,
+        num_tokens_per_seq=queries,
+        num_blocks=kv_cache.shape[0],
+        TILE_SIZE=page_size,
+        BLOCK_Q=block_q,
+        BLOCK_M=block_m,
+        NUM_KV_SPLITS=num_kv_splits,
+        WARP_SIZE=32,
+        NUM_HEAD_BLOCKS=num_head_blocks,
+        SHUFFLED_KV_CACHE=False,
+        ALL_DECODE=False,
+        K_WIDTH=16 if is_fp8 else 8,
+        SCALE_K_WIDTH_LORA=0,
+        SCALE_K_WIDTH_ROPE=0,
+        IS_FP8=is_fp8,
+        BLOCK_SCALES_SIZE=16,
+        NUM_BUFFERS=num_buffers,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+        num_stages=2,
+    )
+    _mla_decode_fwd_reduce_kernel[(num_tokens, num_query_heads)](
+        output_ptr=out_flat,
+        lse_ptr=lse_flat,
+        split_output_ptr=split_output,
+        split_max_ptr=split_max,
+        split_expsum_ptr=split_expsum,
+        seq_lens_ptr=cache_seqlens,
+        out_scale_ptr=None,
+        num_seqs=batch_size,
+        num_query_heads=num_query_heads,
+        output_stride_0=out_flat.stride(0),
+        output_stride_1=out_flat.stride(1),
+        lse_stride_0=lse_flat.stride(0) if lse_flat is not None else 0,
+        lse_stride_1=lse_flat.stride(1) if lse_flat is not None else 0,
+        block_tables_stride=page_table.stride(0),
+        num_tokens_per_seq=queries,
+        total_num_tokens=num_tokens,
+        TILE_SIZE=page_size,
+        KV_LORA_RANK=kv_lora_rank,
+        query_start_len_ptr=None,
+        BLOCK_Q=block_q,
+        NUM_KV_SPLITS=num_kv_splits,
+        ALL_DECODE=False,
+        HAS_LSE=lse is not None,
+        num_warps=4,
+        waves_per_eu=1,
+        num_stages=1,
+    )
+
+
+def launch_gluon_mla_decode_query_blocks_gfx1250(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    logit_cap: float = 0.0,
+    return_lse: bool = False,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Decode causal query blocks with one page-table row per request.
+
+    Each KV tile is read once for all of a request's queries rather than once
+    per query, which is what a speculative verify step needs.
+
+    Args:
+        q: Queries shaped ``[requests, queries, heads, 576]`` with 2 to 16
+            queries per request, in FP16, BF16 or FP8 matching ``kv_cache``.
+        kv_cache: Contiguous paged cache shaped ``[pages, 64, 1, 576]``.
+        page_table: Int32 physical page indices shaped ``[requests, pages]``.
+        cache_seqlens: Int32 final KV lengths shaped ``[requests]``, at least
+            ``queries`` each. Query ``j`` sees ``cache_seqlens[i] - queries +
+            j + 1`` tokens.
+        max_seqlen_k: KV-length upper bound used to choose the split count.
+        qk_nope_head_dim: Original non-RoPE query width; unused because ``q``
+            is already in the latent space.
+        kv_lora_rank: Latent width; must be 512.
+        qk_rope_head_dim: Positional width; must be 64.
+        softmax_scale: Scale applied to QK logits before softmax.
+        logit_cap: Soft cap on attention logits; only ``0.0`` is supported.
+        return_lse: Whether to also return natural-log log-sum-exp values.
+        out: Optional contiguous BF16 destination shaped
+            ``[requests, queries, heads, 512]``.
+
+    Returns:
+        BF16 latent output shaped ``[requests, queries, heads, 512]``, or
+        ``(output, lse)`` with FP32 LSE shaped ``[requests, queries, heads]``.
+    """
+    if logit_cap != 0.0:
+        raise NotImplementedError("gluon MLA decode gfx1250 does not support logit_cap")
+    if q.ndim != 4 or not 2 <= q.shape[1] <= 16 or q.shape[2] < 1:
+        raise ValueError(
+            "query-block MLA requires q [requests, 2..16 queries, heads, "
+            f"kv_lora_rank + qk_rope_head_dim], got {tuple(q.shape)}"
+        )
+    supported_dtypes = (
+        torch.float16,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    )
+    if q.dtype not in supported_dtypes or kv_cache.dtype != q.dtype:
+        raise TypeError(
+            "query-block MLA requires matching FP16, BF16 or FP8 q and KV, "
+            f"got {q.dtype} and {kv_cache.dtype}"
+        )
+    if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
+        raise NotImplementedError(
+            "query-block MLA requires kv_lora_rank=512 and qk_rope_head_dim=64, "
+            f"got {kv_lora_rank} and {qk_rope_head_dim}"
+        )
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    if q.shape[-1] != qk_head_dim or q.stride(-1) != 1:
+        raise ValueError(
+            f"q must have a contiguous {qk_head_dim}-wide head dimension, "
+            f"got shape {tuple(q.shape)} and strides {q.stride()}"
+        )
+    if kv_cache.ndim != 4 or kv_cache.shape[1:] != (64, 1, qk_head_dim):
+        raise ValueError(
+            f"kv_cache must be [num_pages, 64, 1, {qk_head_dim}], "
+            f"got {tuple(kv_cache.shape)}"
+        )
+    if not kv_cache.is_contiguous():
+        raise ValueError("kv_cache must be contiguous")
+    batch_size, queries, num_query_heads, _ = q.shape
+    if (
+        page_table.ndim != 2
+        or page_table.dtype != torch.int32
+        or page_table.shape[0] != batch_size
+        or page_table.stride(1) != 1
+    ):
+        raise ValueError(
+            "page_table must be an int32 [requests, pages] tensor with unit "
+            f"inner stride, got {page_table.dtype} {tuple(page_table.shape)}"
+        )
+    if (
+        cache_seqlens.dtype != torch.int32
+        or cache_seqlens.shape != (batch_size,)
+        or not cache_seqlens.is_contiguous()
+    ):
+        raise ValueError(
+            "cache_seqlens must be a contiguous int32 [requests] tensor, "
+            f"got {cache_seqlens.dtype} {tuple(cache_seqlens.shape)}"
+        )
+
+    shape = (batch_size, queries, num_query_heads, kv_lora_rank)
+    if out is None:
+        out = torch.empty(shape, dtype=torch.bfloat16, device=q.device)
+    elif (
+        out.shape != shape
+        or out.dtype != torch.bfloat16
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"out must be contiguous BF16 {shape} on {q.device}, got "
+            f"{out.dtype} {tuple(out.shape)}"
+        )
+    lse = (
+        torch.empty(shape[:-1], dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    block_m, block_q, num_head_blocks = _query_block_shape(num_query_heads, queries)
+    num_q_programs = batch_size * triton.cdiv(queries, block_q) * num_head_blocks
+    num_kv_splits = _select_query_block_num_kv_splits(
+        num_sms=torch.cuda.get_device_properties(q.device).multi_processor_count,
+        num_q_programs=num_q_programs,
+        max_seqlen_k=max_seqlen_k,
+        tile_size=kv_cache.shape[1],
+    )
+    _launch_query_block_decode(
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        softmax_scale,
+        out,
+        lse,
+        num_kv_splits=num_kv_splits,
+        num_warps=2 if block_m == 16 else 4,
+        num_buffers=2 if is_fp8 else 1,
+        waves_per_eu=1,
+    )
+    return (out, lse) if return_lse else out
+
+
 def launch_gluon_mla_decode_projected_value_gfx1250(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1146,5 +1447,6 @@ def launch_gluon_mla_decode_projected_value_gfx1250(
 
 __all__ = [
     "launch_gluon_mla_decode_gfx1250",
+    "launch_gluon_mla_decode_query_blocks_gfx1250",
     "launch_gluon_mla_decode_projected_value_gfx1250",
 ]
