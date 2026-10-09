@@ -340,6 +340,33 @@ def test_plan_source_only_activates_for_current_open_pr(monkeypatch, tmp_path):
     )
     triggers = workflow.get("on", workflow.get(True))
     assert set(triggers) == {"pull_request", "workflow_dispatch"}
+    assert triggers["pull_request"]["branches"] == ["main"]
+    assert "concurrency" not in workflow
+    assert workflow["jobs"]["plan"]["concurrency"]["cancel-in-progress"] is True
+    condition = (
+        workflow["jobs"]["plan"]["if"]
+        .replace("\n", " ")
+        .replace("&&", "and")
+        .replace("||", "or")
+    )
+    github = SimpleNamespace(
+        repository=REPO,
+        event_name="pull_request",
+        actor="author",
+        event=SimpleNamespace(
+            action="edited",
+            changes=SimpleNamespace(base=None),
+            pull_request=SimpleNamespace(
+                head=SimpleNamespace(repo=SimpleNamespace(full_name=REPO))
+            ),
+        ),
+    )
+    assert not eval(condition, {"__builtins__": {}}, {"github": github})
+    github.event.changes.base = {"ref": {"from": "feature"}}
+    assert eval(condition, {"__builtins__": {}}, {"github": github})
+    github.event.action = "synchronize"
+    github.event.changes.base = None
+    assert eval(condition, {"__builtins__": {}}, {"github": github})
     steps = workflow["jobs"]["plan"]["steps"]
     source = next(i for i, step in enumerate(steps) if step.get("id") == "source")
     assert all(
@@ -405,7 +432,9 @@ def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
         repository=REPO,
         event_name="workflow_run",
         event=SimpleNamespace(
-            workflow_run=SimpleNamespace(event="push"),
+            workflow_run=SimpleNamespace(
+                event="push", name="AMD Tests", conclusion="skipped"
+            ),
             issue=SimpleNamespace(pull_request=True),
             comment=SimpleNamespace(body="Ordinary PR comment"),
         ),
@@ -416,6 +445,10 @@ def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
     }
     assert not eval(condition, {"__builtins__": {}}, context)
     github.event.workflow_run.event = "pull_request"
+    assert eval(condition, {"__builtins__": {}}, context)
+    github.event.workflow_run.name = "PR CI Plan"
+    assert not eval(condition, {"__builtins__": {}}, context)
+    github.event.workflow_run.conclusion = "success"
     assert eval(condition, {"__builtins__": {}}, context)
     github.event.workflow_run.event = "workflow_dispatch"
     assert eval(condition, {"__builtins__": {}}, context)
