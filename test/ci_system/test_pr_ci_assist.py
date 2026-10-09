@@ -2194,7 +2194,7 @@ def test_rejected_patch_receives_feedback_within_the_original_budget(
         now[0] += 10
 
     def proposal():
-        if len(turns) < 4:
+        if len(turns) < 3:
             raise repair.RepairRejected(
                 "test-assertions",
                 path="test/example.py",
@@ -2206,7 +2206,7 @@ def test_rejected_patch_receives_feedback_within_the_original_budget(
         repair.repair_with_feedback(request, run_model, proposal, feedback)
         == "accepted patch"
     )
-    assert turns == [60, 50, 40, 30] and request["deadline"] == 100
+    assert turns == [60, 50, 40] and request["deadline"] == 100
     output = capsys.readouterr().out
     assert "test/example.py" in output and "private diagnostic" not in output
     turns.clear()
@@ -2218,7 +2218,7 @@ def test_rejected_patch_receives_feedback_within_the_original_budget(
         repair.repair_with_feedback(
             request, lambda attempt: turns.append(attempt), rejected, feedback
         )
-    assert turns == list(range(8))
+    assert turns == list(range(3))
     now[0] = request["deadline"]
     with pytest.raises(ValueError, match="budget expired"):
         repair.repair_with_feedback(

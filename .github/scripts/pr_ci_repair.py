@@ -115,7 +115,7 @@ class RepairRejected(ValueError):
 
 def repair_with_feedback(request: dict, run_model, proposal, feedback: Path):
     """Give rejected patches bounded corrective turns within the original hour."""
-    for attempt in range(8):
+    for attempt in range(3):
         remaining_time(request)
         run_model(attempt)
         try:
@@ -128,7 +128,7 @@ def repair_with_feedback(request: dict, run_model, proposal, feedback: Path):
                         f"Repair issue: {issue['category']} in {issue['path']}.",
                         flush=True,
                     )
-            if error.category == "public-output" or attempt == 7:
+            if error.category == "public-output" or attempt == 2:
                 raise
             feedback.write_text(json.dumps(error.feedback))
             print("Repair: returning patch feedback to the model.", flush=True)
@@ -923,13 +923,13 @@ the allowed source does not complete this task.
         if subprocess.run([*sandbox, "test", "-r", str(path)], check=False).returncode:
             print(f"Repair input access denied: {label}.", flush=True)
             raise ValueError("Repair inputs are inaccessible.")
-    session = []
 
     def run_model(attempt):
         turn_prompt = prompt
         if attempt:
             turn_prompt = (
-                ("" if session else prompt + "\n")
+                prompt
+                + "\n"
                 + f"The proposed patch was rejected. Read feedback.json and correct all listed issues together in the existing source edits. The supplied assertion snippets must all remain with their original behavior and thresholds. Preserve both merge parents' supported behavior. {remaining_time(request)} seconds remain in the original one-hour repair and validation budget. Apply the correction promptly to leave time for required checks and GPU dispatch."
             )
         # Restore trusted provider settings before each process starts.
@@ -947,7 +947,8 @@ the allowed source does not complete this task.
                     "--kill-after=10s",
                     str(remaining_time(request)),
                     "kimi",
-                    *(["-r", session[0]] if session else ["--agent-file", str(agent)]),
+                    "--agent-file",
+                    str(agent),
                     "--add-dir",
                     str(source),
                     "--add-dir",
@@ -970,19 +971,6 @@ the allowed source does not complete this task.
             for line in result.stdout:
                 events.write(line)
                 repair_progress(line, seen)
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if (
-                    isinstance(event, dict)
-                    and event.get("type") == "session.resume_hint"
-                ):
-                    identifier = event.get("session_id", "")
-                    if isinstance(identifier, str) and re.fullmatch(
-                        r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", identifier
-                    ):
-                        session[:] = [identifier]
             result.wait()
         if not result.returncode:
             return
