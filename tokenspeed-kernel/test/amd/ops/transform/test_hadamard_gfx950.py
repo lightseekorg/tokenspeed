@@ -23,9 +23,6 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.transform import hadamard_transform
-from tokenspeed_kernel_amd.ops.gfx950.transform.hadamard import (
-    gluon_hadamard_transform_128_gfx950,
-)
 from utils import assert_no_triton_compile
 
 
@@ -63,6 +60,11 @@ def test_gfx950_hadamard_empty_input(device: str, require) -> None:
 
 def test_gfx950_hadamard_row_count_reuses_binary(device: str, require) -> None:
     require("transform", "hadamard_transform", "gluon", torch.bfloat16, "x")
+    # Deferred past the platform check: the AMD kernel package is optional and
+    # is absent on non-AMD runners, where the check above skips first.
+    from tokenspeed_kernel_amd.ops.gfx950.transform.hadamard import (
+        gluon_hadamard_transform_128_gfx950,
+    )
 
     def run(tokens: int) -> None:
         x = torch.empty((tokens, 32, 128), dtype=torch.bfloat16, device=device)
