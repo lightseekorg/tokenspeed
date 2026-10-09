@@ -229,6 +229,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
             shutdown_event,
         ) -> None:
             trace.append("construct")
+            self._cache_trace = None
             self.shutdown_event = shutdown_event
             self.max_total_num_tokens = 1024
             self.max_single_request_tokens = 768
