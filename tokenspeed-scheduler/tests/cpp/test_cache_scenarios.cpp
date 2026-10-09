@@ -3206,6 +3206,90 @@ TEST_F(PromotionBoundaryHeadOfLineSuite, DoesNotStartSecondIncompletePrefill) {
         << "the full-history hit promotes token 6 before the remaining prompt";
 }
 
+// A sliding-window group beside a full-history one, prefix pages four cache
+// pages wide (P = 8, page 2) and a chunk budget below one prefix page. The
+// pool is small enough that the seed's decode growth evicts its cached,
+// slid-out sliding-window pages while it still holds its full-history pages,
+// so a later prompt sharing the seed's first two prefix pages hits only the
+// full-history group: the probe reports a promotion boundary at token 16 and
+// no common hit.
+class ChunkBudgetBelowPrefixPageSuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kPromptTokens = 20;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 8;
+        cfg.device_allocator.total_pages = 19;  // null page + 18 usable
+        cfg.host_allocator.total_pages = 0;
+        cfg.max_scheduled_tokens = 6;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full", /*block_granularity=*/2, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("swa", /*block_granularity=*/2, cfg.device_allocator.total_pages,
+                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+                      /*sliding_window_tokens=*/4),
+        };
+        return cfg;
+    }
+
+    // 16 shared tokens (two prefix pages) and a 4-token tail.
+    static std::vector<std::int32_t> Prompt(std::int32_t tail_start) {
+        std::vector<std::int32_t> tokens = MakeTokens(16, /*start=*/1);
+        const std::vector<std::int32_t> tail = MakeTokens(kPromptTokens - 16, tail_start);
+        tokens.insert(tokens.end(), tail.begin(), tail.end());
+        return tokens;
+    }
+};
+
+TEST_F(ChunkBudgetBelowPrefixPageSuite, PromotedPromptStillPrefills) {
+    // The seed runs alone: four chunks, then decodes until it has 8 tokens.
+    Submit(RequestSpec{.request_id = "seed", .tokens = Prompt(/*tail_start=*/1001)});
+    std::int32_t generated = 0;
+    for (int round = 0; round < 32 && generated < 8; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        ASSERT_EQ(batch->request_ids, std::vector<std::string>{"seed"});
+        if (batch->NumExtends() == 1 && batch->extend_prefix_lens[0] + batch->input_lengths[0] < kPromptTokens) {
+            SendForwardDone("seed");
+            continue;
+        }
+        SendForwardDone("seed", {9000 + generated});
+        ++generated;
+    }
+    ASSERT_EQ(generated, 8);
+    SendFinish("seed");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->ActiveLcmBlocks(), 0u) << "only cached prefix pages remain";
+
+    // The sliding-window group misses, so the prompt prefills from token 0.
+    Submit(RequestSpec{.request_id = "second", .tokens = Prompt(/*tail_start=*/2001)});
+    std::int32_t computed = 0;
+    for (int round = 0; round < 8 && computed < kPromptTokens; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr || batch->request_ids.empty()) {
+            continue;
+        }
+        ASSERT_EQ(batch->request_ids, std::vector<std::string>{"second"});
+        ASSERT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{computed});
+        computed += batch->input_lengths[0];
+        if (computed < kPromptTokens) {
+            SendForwardDone("second");
+        } else {
+            SendForwardDone("second", {42});
+        }
+    }
+    EXPECT_EQ(computed, kPromptTokens)
+        << "the promoted prompt stopped prefilling: with a budget below one prefix page every "
+           "promotion-aligned chunk is 0 tokens, which is not a capacity failure";
+}
+
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
