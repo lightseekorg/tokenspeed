@@ -31,12 +31,83 @@ from tokenspeed_kernel.platform import current_platform
 
 logger = logging.getLogger(__file__)
 
+
+@triton.jit
+def _pack_channel_shards_for_a2a_kernel(
+    source,
+    destination,
+    N,
+    M,
+    D: tl.constexpr,
+    P: tl.constexpr,
+    S0,
+    S1,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    peer = offsets // (M * D)
+    row = offsets // D % M
+    column = peer * D + offsets % D
+    values = tl.load(
+        source + row * S0 + column * S1, (offsets < P * M * D) & (row < N), other=0
+    )
+    tl.store(destination + offsets, values, offsets < P * M * D)
+
+
+def triton_pack_channel_shards_for_a2a(
+    inputs: torch.Tensor, workspace: torch.Tensor
+) -> torch.Tensor:
+    """Split channels across peers and zero-pad destination-rank-major A2A messages.
+
+    Args:
+        inputs: Local ``[N, P*D]`` rows; arbitrary positive strides are allowed.
+        workspace: Contiguous ``[P, M, D]`` persistent scratch, with ``M >= N``.
+            When used, every element is overwritten, including zero padding.
+
+    Returns:
+        Contiguous ``[P*M, D]`` send rows. For one contiguous input row and
+        ``M == 1``, this aliases inputs without launching a kernel. Otherwise
+        it aliases workspace. Neither case changes dtype or quantization.
+    """
+    if inputs.ndim != 2 or workspace.ndim != 3:
+        raise ValueError("Channel-shard A2A packing expects [N,K] and [P,M,D]")
+    peers, rows, shard = workspace.shape
+    if (
+        peers < 1
+        or rows < 1
+        or shard < 1
+        or inputs.shape[0] > rows
+        or inputs.shape[1] != peers * shard
+        or not workspace.is_contiguous()
+        or inputs.dtype != workspace.dtype
+        or inputs.device != workspace.device
+    ):
+        raise ValueError("Incompatible channel-shard A2A packing workspace")
+    if rows == 1 and inputs.shape[0] == 1 and inputs.is_contiguous():
+        return inputs.view(peers, shard)
+    _pack_channel_shards_for_a2a_kernel[(triton.cdiv(workspace.numel(), 1024),)](
+        inputs,
+        workspace,
+        inputs.shape[0],
+        rows,
+        shard,
+        peers,
+        inputs.stride(0),
+        inputs.stride(1),
+        1024,
+    )
+    return workspace.view(peers * rows, shard)
+
+
 __all__ = [
+    "triton_pack_channel_shards_for_a2a",
     "create_state",
     "get_token_dist",
     "reduce_scatter",
     "all_gather",
     "all_gather_inner",
+    "rsag_all_reduce",
+    "multimem_probe_payload",
     "all_reduce_can_run",
     "all_reduce",
     "initialize_all_reduce_state",
@@ -66,6 +137,7 @@ class TritonCommState:
     device: torch.device
     attnres_max_numel: int
     enable_lamport: bool
+    moe_tail_max_rows: int
     max_numel: int
     max_bytes: int
     max_token_num: int
@@ -1047,6 +1119,7 @@ def nvidia_create_rsag_state(
     symm_mem.rendezvous(comm_buff, group=group)
     return TritonCommState(
         enable_lamport=False,
+        moe_tail_max_rows=0,
         group=group,
         rank_in_group=rank_in_group,
         world_size=group.size(),
@@ -1175,6 +1248,115 @@ def nvidia_rsag_all_gather(
         return output.clone() if safe else output
     finally:
         rsag_restore_hidden(state, hidden_size_bak, comm_buff_bak)
+
+
+def nvidia_rsag_all_reduce(
+    state: TritonCommState,
+    hidden_states: torch.Tensor,
+    *,
+    issuer: int,
+    safe: bool = True,
+) -> torch.Tensor:
+    """All-reduce ``hidden_states`` through one rank's in-switch reduction.
+
+    The ``issuer`` rank loads every row through ``multimem.ld_reduce`` (the
+    switch sums the group's copies in fp32 and rounds to bf16 once) and
+    multicasts the result to the group; the other ranks only take part in the
+    kernels' barriers. Measured on 8xH20 (``test_communcation.py``): the
+    in-switch result is bitwise stable across repetitions and independent of
+    how many rows ride along, but its association order depends on WHICH rank
+    issues the load -- two issuers disagree on a few elements per 10^7 where
+    the fp32 sum is ill-conditioned -- and on which GPUs make up the group
+    (two groups of four reduce an ill-conditioned payload to different bits on
+    half of it). A reduce-scatter that lets each rank reduce its own slice
+    therefore moves a row's bits with the slicing (the batch, or the request's
+    placement); pinning the issuer is what makes the sum one function of its
+    inputs for one group over the deployment's lifetime, which is the property
+    ``--batch-invariant-collectives`` asks of every reduction, and the
+    runtime's startup self-check is what establishes it across groups. The
+    price is the issuer's port carrying the whole payload twice; that is still
+    well under the ordered fold's world_size x all-gather traffic.
+
+    Args:
+        state: An RS/AG state whose ``hidden_dim`` equals the row width and
+            whose ``max_token_num`` covers ``rows``.
+        hidden_states: ``[rows, hidden]`` bf16, this rank's partial.
+        issuer: Rank in the group that issues the in-switch loads; the same
+            value on every rank, fixed for the deployment.
+        safe: Return a copy; ``False`` returns a view into the communication
+            buffer that the next collective on ``state`` overwrites.
+
+    Returns:
+        ``[rows, hidden]`` bf16, the sum over the group, identical on every rank.
+    """
+    assert hidden_states.dtype == torch.bfloat16, "Only bfloat16 is supported for now"
+    assert (
+        hidden_states.dim() == 2 and hidden_states.shape[-1] == state.hidden_dim
+    ), f"Mismatched shape, {hidden_states.shape=} vs {state.hidden_dim=}"
+    assert 0 <= issuer < state.world_size, f"{issuer=} outside {state.world_size=}"
+    rows = hidden_states.shape[0]
+    assert (
+        rows <= state.max_token_num
+    ), f"The inner comm buffer is too small: {rows=} is not <= {state.max_token_num=}"
+    state.comm_buff[:rows, :].copy_(hidden_states)
+    local_num_tokens = rows if state.rank_in_group == issuer else 0
+    token_list_in_group = [0] * state.world_size
+    token_list_in_group[issuer] = rows
+    num_blocks = nvidia_rsag_reduce_scatter_num_blocks(
+        token_list_in_group, state.hidden_dim
+    )
+    nvidia_rsag_multimem_reduce_scatter(
+        state, local_num_tokens, 0, num_blocks=num_blocks
+    )
+    nvidia_rsag_multimem_all_gather(state, local_num_tokens, 0)
+    output = state.comm_buff[:rows, :]
+    return output.clone() if safe else output
+
+
+def multimem_probe_payload(
+    rank_in_group: int,
+    world_size: int,
+    rows: int,
+    hidden_size: int,
+    device: torch.device,
+    seed: int,
+) -> torch.Tensor:
+    """This rank's slice of a payload whose group sum exposes its association order.
+
+    Per element, one rank holds ``+B`` and another ``-B`` (``B = 2^k``) and the
+    rest hold values around ``B * 2^-18`` whose low mantissa bits fall below
+    fp32's resolution at ``B``: a partial sum that has absorbed ``+B`` but not
+    yet ``-B`` rounds those bits away, so the fp32 running sum -- and the bf16
+    result -- differ between almost any two association orders. Every rank
+    derives the same assignment from ``seed`` and takes its own slice, so a
+    group reducing it tests the order its reduction uses, and two groups
+    reducing it must agree bitwise if they reduce in the same order.
+
+    Args:
+        rank_in_group: This rank's index in the group.
+        world_size: Ranks in the group (at least 2).
+        rows: Rows of the payload.
+        hidden_size: Columns of the payload.
+        device: Device the slice lives on.
+        seed: Shared seed; the same value on every rank of the group.
+
+    Returns:
+        ``[rows, hidden_size]`` bf16, this rank's slice.
+    """
+    assert world_size >= 2, "a reduction order needs at least two ranks"
+    gen = torch.Generator(device=device).manual_seed(seed)
+    # A random permutation of the ranks per element: the first holds +B, the
+    # second -B. Drawn in full on every rank so the slices agree.
+    holder = torch.rand(
+        world_size, rows, hidden_size, generator=gen, device=device
+    ).argsort(dim=0)
+    exponent = torch.randint(4, 12, (rows, hidden_size), generator=gen, device=device)
+    big = 2.0**exponent
+    small = torch.randn(world_size, rows, hidden_size, generator=gen, device=device)
+    mine = (small[rank_in_group] * big * 2.0**-18).to(torch.bfloat16)
+    mine = torch.where(holder[0] == rank_in_group, big.to(torch.bfloat16), mine)
+    mine = torch.where(holder[1] == rank_in_group, (-big).to(torch.bfloat16), mine)
+    return mine.contiguous()
 
 
 # ------------------------------------------------------------------------------
@@ -1516,6 +1698,7 @@ def amd_create_rsag_state(
     assert rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
     return TritonCommState(
         enable_lamport=False,
+        moe_tail_max_rows=0,
         group=group,
         rank_in_group=rank_in_group,
         world_size=world_size,
@@ -1729,6 +1912,7 @@ def create_allreduce_residual_rmsnorm_state(
 
     return TritonCommState(
         enable_lamport=False,
+        moe_tail_max_rows=0,
         group=group,
         rank_in_group=rank_in_group,
         world_size=world_size,
@@ -1908,6 +2092,7 @@ def create_state(
     attnres_max_numel: int,
     attnres_max_rows: int,
     enable_lamport: bool,
+    moe_tail_max_rows: int,
 ) -> TritonCommState:
     """Create an all-reduce or reduce-scatter/all-gather communication state.
 
@@ -1925,6 +2110,8 @@ def create_state(
             zero when the state does not use AttnRes.
         enable_lamport: Allow Lamport for eligible producer-direct payloads;
             pass false for RS/AG states.
+        moe_tail_max_rows: Maximum rows in the reusable symmetric result buffer;
+            zero skips its allocation.
 
     Returns:
         The initialized communication state.
@@ -1936,6 +2123,8 @@ def create_state(
         raise ValueError(
             "AttnRes element and row capacities must both be zero or non-zero"
         )
+    if moe_tail_max_rows < 0 or (moe_tail_max_rows and not max_bytes):
+        raise ValueError("MoE result capacity requires producer-direct storage")
     if max_numel or max_bytes or attnres_max_numel:
         device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
         world_size = group.size()
@@ -1957,6 +2146,7 @@ def create_state(
             max_bytes=max_bytes,
             attnres_max_numel=attnres_max_numel,
             enable_lamport=enable_lamport,
+            moe_tail_max_rows=moe_tail_max_rows,
             max_token_num=attnres_max_rows,
             hidden_dim=0,
             comm_buff=comm_buff,
@@ -2009,6 +2199,7 @@ def _iris_state_key(state: TritonCommState, dtype: torch.dtype) -> tuple:
         state.attnres_max_numel,
         state.max_token_num,
         state.enable_lamport,
+        state.moe_tail_max_rows,
         dtype,
     )
 
@@ -2023,6 +2214,7 @@ def _iris_state_is_compatible(iris_state, state, dtype: torch.dtype) -> bool:
         and iris_state.producer_direct_max_numel >= state.max_bytes // dtype.itemsize
         and iris_state.attnres_max_numel >= state.attnres_max_numel
         and iris_state.attnres_max_rows >= state.max_token_num
+        and iris_state.moe_tail_max_rows >= state.moe_tail_max_rows
         # AttnRes-only views can share a prepared state regardless of its
         # producer-direct policy; they never dispatch a Lamport reduction.
         and (state.max_bytes == 0 or iris_state.enable_lamport == state.enable_lamport)
@@ -2053,6 +2245,7 @@ def _get_or_create_iris_state(state: TritonCommState, dtype: torch.dtype):
             attnres_max_numel=state.attnres_max_numel,
             attnres_max_rows=state.max_token_num,
             enable_lamport=state.enable_lamport,
+            moe_tail_max_rows=state.moe_tail_max_rows,
             dtype=dtype,
             heap_size=None,
             device=state.device,
@@ -2165,7 +2358,7 @@ def all_reduce_symmetric(
     state: TritonCommState,
     tensors: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, ...]:
-    """Reduce consecutive Iris producer outputs in one launch."""
+    """Return caller-owned reductions of consecutive Iris producer outputs."""
     import tokenspeed_kernel.ops.communication.iris as _iris_mod
 
     key = _iris_state_key(state, tensors[0].dtype)
@@ -2310,6 +2503,7 @@ def _attnres_comm_state(
 ) -> TritonCommState:
     return TritonCommState(
         enable_lamport=False,
+        moe_tail_max_rows=0,
         group=group,
         rank_in_group=rank,
         world_size=group.size(),
@@ -2662,3 +2856,22 @@ def all_gather_inner(
         skip_entry_sync=skip_entry_sync,
         safe=safe,
     )
+
+
+def rsag_all_reduce(
+    state: TritonCommState,
+    hidden_states: torch.Tensor,
+    *,
+    issuer: int,
+    safe: bool = True,
+) -> torch.Tensor:
+    """All-reduce on an RS/AG state -- NVIDIA-only, see ``nvidia_rsag_all_reduce``.
+
+    The in-switch (NVLS multimem) reduction is the one verified bitwise
+    run-stable and batch-invariant for a fixed issuer (``test_communcation.py``);
+    the AMD RS/AG kernels fold rank by rank on the GPUs and have not been put
+    through that verification, so they do not serve this entry.
+    """
+    platform = current_platform()
+    assert platform.is_nvidia, f"rsag_all_reduce only supports NVIDIA, got {platform}"
+    return nvidia_rsag_all_reduce(state, hidden_states, issuer=issuer, safe=safe)

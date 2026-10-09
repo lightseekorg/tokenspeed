@@ -61,7 +61,6 @@ from tokenspeed.runtime.layers.qwen4_exp_ple import (
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
-    kv_cache_scales_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.qwen3_5 import (
@@ -77,9 +76,6 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeSparseMoeBlock,
 )
 from tokenspeed.runtime.models.utils import validate_attention_partition
-from tokenspeed.runtime.moe.distribution_recorder import (
-    get_global_expert_distribution_recorder,
-)
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
 
@@ -312,6 +308,8 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
             layer_id=layer_id,
             is_moe=self.is_moe,
             prev_is_moe=self.is_moe,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         if _qwen4_exp_uses_sigmoid_output_gate(config):
             self.linear_attn.norm = _Qwen4ExpRMSNormGated(
@@ -419,12 +417,16 @@ class Qwen4ExpAttentionDecoderLayer(
             tp_group=self.attn_tp_group,
             prefix=add_prefix("o_proj", prefix),
         )
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
         )
         self.mlp, self.is_moe = _build_qwen4_exp_mlp(
             config,
@@ -436,13 +438,13 @@ class Qwen4ExpAttentionDecoderLayer(
         )
         self.input_layernorm = None
         self.post_attention_layernorm = None
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_id,
             is_moe=self.is_moe,
             prev_is_moe=self.is_moe,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.indexer = None
         if getattr(config, "indexer_n_heads", None) is not None:
@@ -463,13 +465,15 @@ class Qwen4ExpAttentionDecoderLayer(
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        q, k, v, gate = self._project_qkv_rope(positions, hidden_states)
+        q, k, v, gate = self._project_qkv(hidden_states)
         selected_slots = (
             self.indexer(hidden_states, positions, ctx)
             if self.indexer is not None
             else None
         )
-        attention_output = self._attn(q, k, v, gate, ctx, topk_indices=selected_slots)
+        attention_output = self._attn(
+            positions, q, k, v, gate, ctx, topk_indices=selected_slots
+        )
         output, _ = self.o_proj(attention_output)
         return output
 
@@ -525,25 +529,6 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             if getattr(layer, "indexer", None) is not None
         )
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        """Load per-tensor FP8 KV scales for full-attention layers."""
-
-        for layer_idx, scaling_factor in kv_cache_scales_loader(
-            quantization_param_path,
-            self.mapping.attn.tp_rank,
-            self.mapping.attn.tp_size,
-            self.config.num_hidden_layers,
-            self.config.model_type,
-        ):
-            paged_attention = getattr(self.layers[layer_idx], "attn", None)
-            if paged_attention is None:
-                continue
-            scale = float(scaling_factor)
-            paged_attention.k_scale = scale
-            paged_attention.v_scale = scale
-            paged_attention.k_scale_float = scale
-            paged_attention.v_scale_float = scale
-
     def _start_ple_prefetch(
         self, ple: Qwen4ExpPLELayer, input_ids: torch.Tensor, ctx: ForwardContext
     ) -> None:
@@ -575,14 +560,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 next_ple = self.layers[layer_id + 1].ple
                 if next_ple is not None:
                     self._start_ple_prefetch(next_ple, input_ids, ctx)
-            with get_global_expert_distribution_recorder().with_current_layer(layer_id):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    ctx=ctx,
-                    input_ids=input_ids,
-                )
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                ctx=ctx,
+                input_ids=input_ids,
+            )
             if (
                 input_deepstack_embeds is not None
                 and input_deepstack_embeds.numel()
@@ -817,9 +801,6 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
             self, self.config, self.mapping, weights, include_visual=False
         )
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        self.model.load_kv_cache_scales(quantization_param_path)
-
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         config = getattr(config, "text_config", config)
@@ -863,10 +844,6 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             weights,
             include_visual=self.is_multimodal_active,
         )
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        if self.model is not None:
-            self.model.load_kv_cache_scales(quantization_param_path)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

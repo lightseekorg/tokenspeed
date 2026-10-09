@@ -27,20 +27,8 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.testing as testing
+import cutlass.memory
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
-
-# Compat shim: setmaxregister_{decrease,increase} added in cutlass-dsl 4.4;
-# older versions only have the deprecated warpgroup_reg_{dealloc,alloc}.
-_setmaxregister_decrease = getattr(
-    cute.arch,
-    "setmaxregister_decrease",
-    getattr(cute.arch, "warpgroup_reg_dealloc", None),
-)
-_setmaxregister_increase = getattr(
-    cute.arch,
-    "setmaxregister_increase",
-    getattr(cute.arch, "warpgroup_reg_alloc", None),
-)
 
 # Compat shim: get_max_tmem_alloc_cols added in cutlass-dsl 4.4;
 # older versions don't have it, so we provide a fallback implementation.
@@ -478,6 +466,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         output_scale: cutlass.Float32,
         stream: cuda.CUstream,
         use_pdl: cutlass.Constexpr = True,
+        local_visible_lens: Optional[cute.Tensor] = None,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
 
@@ -499,6 +488,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type c_rope: cute.Tensor
         :param page_table: The page table tensor with shape [batch_size, page_count] (contiguous)
         :type page_table: cute.Tensor
+        :param local_visible_lens: Optional [batch_size, seq_len_q] exclusive
+            prefix bounds into the compact local page table.
         :param o: The output tensor with shape [batch_size, seq_len_q, num_head, latent_dim] (contiguous)
         :type o: cute.Tensor
         :param lse: The LSE tensor with shape [batch_size, seq_len_q, num_head] (contiguous)
@@ -705,6 +696,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
+            self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.acc_dtype,
@@ -713,6 +705,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.v_dtype,
+            self.v_dtype,
             p_major_mode,
             self.v_major_mode,
             self.acc_dtype,
@@ -720,6 +713,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             self.mma_pv_tiler[:2],
         )
         ws_tiled_mma_epi = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -732,6 +726,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             ),
         )
         ws_tiled_mma_splitn_epi = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             OperandMajorMode.K,
             OperandMajorMode.K,
@@ -1061,6 +1056,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             split_kv,
             cache_seqs,
             causal_seqs,
+            local_visible_lens,
             block_split_kvs,
             softmax_scale_log2,
             output_scale,
@@ -1094,6 +1090,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 split_kv,
                 cache_seqs,
                 block_split_kvs,
+                local_visible_lens is not None,
                 output_scale,
             ).launch(
                 grid=(
@@ -1177,6 +1174,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         causal_seqs: cute.Tensor,  # per-request global causal bound (DCP)
+        local_visible_lens: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
@@ -1288,16 +1286,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = cutlass.memory.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
             arch=self.arch,
         )
 
@@ -1398,10 +1396,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         #  Load warps, including page table and data tensors
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.empty_warp_ids[0] and warp_idx <= self.empty_warp_ids[-1]:
-            _setmaxregister_decrease(self.other_reg_num)
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
 
         if warp_idx == self.load_tma_k_warp_id:
-            _setmaxregister_decrease(self.other_reg_num)
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
             cute.arch.griddepcontrol_wait()
             load_k_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_k_pipeline_stage
@@ -1462,7 +1460,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 load_k_rope_pipeline.producer_tail(load_k_rope_producer_state)
 
         if warp_idx == self.load_tma_v_warp_id:
-            _setmaxregister_decrease(self.other_reg_num)
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
             cute.arch.griddepcontrol_wait()
             load_q_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.load_q_stage
@@ -1531,7 +1529,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         #  MMA warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            _setmaxregister_decrease(self.other_reg_num)
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
             # Fire off async TMEM allocation request early, then overlap
             # the allocation latency with pipeline state creation and
             # tile scheduler setup.
@@ -1645,7 +1643,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             warp_idx >= self.compute_warp_ids[0]
             and warp_idx <= self.compute_warp_ids[-1]
         ):
-            _setmaxregister_increase(self.softmax_reg_num)
+            cute.arch.setmaxregister_increase(self.softmax_reg_num)
             mma_s_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.mma_s_stage
             )
@@ -1680,6 +1678,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
                         K_causal=causal_seqs[blk_coord[2]],
+                        local_visible_lens=local_visible_lens,
                         L=mCL.shape[1],
                         tmem_ptr=tmem_ptr,
                         tidx=tidx,
@@ -1718,7 +1717,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             warp_idx >= self.correction_warp_ids[0]
             and warp_idx <= self.correction_warp_ids[-1]
         ):
-            _setmaxregister_increase(self.correction_reg_num)
+            cute.arch.setmaxregister_increase(self.correction_reg_num)
             p_cor_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.p_cor_stage
             )
@@ -1749,6 +1748,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
                         K_causal=causal_seqs[blk_coord[2]],
+                        local_visible_lens=local_visible_lens,
                         L=mCL.shape[1],
                         H=(
                             cutlass.min(
@@ -1779,10 +1779,37 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         p_cor_consumer_state=p_cor_consumer_state,
                         mma_o_consumer_state=mma_o_consumer_state,
                     )
+                elif cutlass.const_expr(
+                    mAccO is None and local_visible_lens is not None
+                ):
+                    # No producer ran for this zero-K tile.
+                    self.write_empty_output(mO, mLSE, blk_coord, tidx)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
         return
+
+    @cute.jit
+    def write_empty_output(self, mO, mLSE, blk_coord, tidx):
+        """Write a zero-K tile without touching TMEM or pipeline states."""
+        thread = tidx % (self.num_compute_warps * self.threads_per_warp)
+        threads = self.num_compute_warps * self.threads_per_warp
+        rows = self.mma_pv_tiler[0] // self.cluster_shape_mnk[0]
+        for index in cutlass.range(thread, rows * self.latent_dim, threads):
+            row = blk_coord[0] * rows + index // self.latent_dim
+            valid = row < mO.shape[0]
+            if cutlass.const_expr(self.pack_q):
+                valid = (
+                    valid
+                    and blk_coord[1] * self.mma_qk_tiler[0] + row < self.total_q_rows
+                )
+            if valid:
+                mO[row, index % self.latent_dim, blk_coord[1], blk_coord[2]] = (
+                    self.o_dtype(0)
+                )
+                if cutlass.const_expr(mLSE is not None):
+                    if index % self.latent_dim == 0:
+                        mLSE[row, blk_coord[1], blk_coord[2]] = -self.lse_dtype.inf
 
     @cute.kernel
     def reduction_kernel(
@@ -1794,6 +1821,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
+        has_local_visible_lens: cutlass.Constexpr,
         output_scale: cutlass.Float32,
     ):
         """The reduction kernel for Multi-Head Latent Attention (MLA) that combines intermediate results
@@ -1845,10 +1873,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         else:
             k_tile_lo = 0
         k_tile_per_cta = cute.ceil_div(k_tile_total - k_tile_lo, local_split_kv)
-        local_split_kv = cute.ceil_div(k_tile_total - k_tile_lo, k_tile_per_cta)
+        local_split_kv = cute.ceil_div(k_tile_total - k_tile_lo, max(1, k_tile_per_cta))
 
         # Alloc shared memory
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         # LSE phase: one weight per lane of warp 0
         reducer_scale_count = (
             ceil_div(self.reducer_max_splits, self.threads_per_warp)
@@ -1891,6 +1919,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             copy_atom=partial_copy_atom,
             thr_copy=partial_thr_copy,
             local_split_kv=local_split_kv,
+            has_local_visible_lens=has_local_visible_lens,
             smem_lse_scale=smem_lse_scale,
             vec=vec,
         )
@@ -1936,7 +1965,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 lse_max + cute.math.log2(sum_lse, fastmath=True)
                 if not sum_lse == self.lse_dtype(0.0)
                 or sum_lse != sum_lse  # noqa: SIM201
-                else self.lse_dtype.inf
+                else -self.lse_dtype.inf
             )
             if tidx == 0 and d_tile_idx == 0:
                 if cutlass.const_expr(not self.skip_lse):
@@ -1947,6 +1976,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 smem_lse_scale[split_kv_idx] = (
                     cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
                     * output_scale
+                    if not has_local_visible_lens or sum_lse != 0.0
+                    else 0.0
                 )
 
         pipeline.sync(barrier_id=4)
@@ -1986,7 +2017,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tPgP = params.thr_copy.partition_S(gSet)
         tPrP = cute.make_fragment_like(tPgP)
         tPpP = cute.make_rmem_tensor(cute.make_layout((1, batch, 1)), cutlass.Boolean)
-        for k in cutlass.range_constexpr(batch):
+        for k in cutlass.range(batch, unroll_full=True):
             tPpP[0, k, 0] = cute.elem_less(first + k, params.local_split_kv)
         tPrP.fill(0.0)
         cute.copy(params.copy_atom, tPgP, tPrP, pred=tPpP)
@@ -2008,8 +2039,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 for k in cutlass.range_constexpr(group):
                     split = g * group + k
                     lse_scale = params.smem_lse_scale[first + split]
-                    for v in cutlass.range_constexpr(params.vec):
-                        rAccO[v] += tPrP[v, split, 0].to(self.acc_dtype) * lse_scale
+                    # Empty DCP partials must not propagate NaNs through 0 * NaN.
+                    if not params.has_local_visible_lens or lse_scale != 0.0:
+                        for v in cutlass.range_constexpr(params.vec):
+                            rAccO[v] += tPrP[v, split, 0].to(self.acc_dtype) * lse_scale
         return
 
     @staticmethod
@@ -3073,6 +3106,18 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # need masking. Runtime because it depends on K (per-batch in
         # var-seq / split-KV).
         first_mask_tile_idx = k_tile_total - mask_tile_count
+        if cutlass.const_expr(common_params.local_visible_lens is not None):
+            # Every query can see tiles wholly before the minimum local bound.
+            # Do this once per work tile, outside the KV loop.
+            min_visible = common_params.K
+            for query_index in cutlass.range_constexpr(self.seq_len_q):
+                min_visible = min(
+                    min_visible,
+                    common_params.local_visible_lens[
+                        common_params.blk_coord[2], query_index
+                    ],
+                )
+            first_mask_tile_idx = min_visible // tile_n
 
         # Phase 0: tiles straddling a sliding window's low edge. The edge moves
         # by one key per query row, so it spans the same tile count the causal
@@ -3462,10 +3507,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         #                      where F=fold_sq_factor and M is laid out as [F, H].
         #   fold_sq_factor=1 : q_tok(r) = blk_coord[1] (single q token per work tile)
         # r_global = row_in_cta + cluster_idx * (M_tile / cluster_m)
-        # Masked positions are filled with a large negative sentinel (not -inf).
-        # With -inf, rows that become entirely masked in a tile produce NaN in
-        # the final output via the FMA/exp2 path on sm_100; -1e6 underflows
-        # exp2(x * scale) to 0 in fp32 while avoiding -inf propagation.
+        # Keep the legacy finite sentinel. Local prefixes need exact zero
+        # probability for empty rows; the softmax below handles their -inf max.
+        masked_score = self.acc_dtype(-1.0e6)
+        if cutlass.const_expr(common_params.local_visible_lens is not None):
+            masked_score = -self.acc_dtype.inf
         cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
         if cutlass.const_expr(self.arch == "sm_100"):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
@@ -3475,10 +3521,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cute.arch.fence_view_async_tmem_load()
             softmax_params.mma_s_pipeline.consumer_release(mma_s_consumer_state)
             mma_s_consumer_state.advance()
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+            for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                 if apply_mask:
                     qk_col = tTR_tS[i][1]
-                    if cutlass.const_expr(self.is_causal):
+                    if cutlass.const_expr(
+                        self.is_causal or common_params.local_visible_lens is not None
+                    ):
                         if cutlass.const_expr(self.pack_q):
                             q_tok = (
                                 common_params.blk_coord[1] * self.mma_qk_tiler[0]
@@ -3494,7 +3542,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             )
                         else:
                             q_tok = common_params.blk_coord[1]
-                        if cutlass.const_expr(self.cp_world == 1):
+                        if cutlass.const_expr(
+                            common_params.local_visible_lens is not None
+                        ):
+                            # Padded query rows must not read beyond metadata.
+                            k_bound = common_params.local_visible_lens[
+                                common_params.blk_coord[2],
+                                min(q_tok, self.seq_len_q - 1),
+                            ]
+                        elif cutlass.const_expr(self.cp_world == 1):
                             # Non-DCP: causal bound is the full local context length
                             # (identical to the pre-DCP behavior; folded at compile time).
                             k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
@@ -3511,7 +3567,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             qk_col + self.mma_qk_tiler[1] * k_index,
                             k_bound,
                         )
-                        else self.acc_dtype(-1.0e6)
+                        else masked_score
                     )
                     if cutlass.const_expr(self.window_left >= 0):
                         # Row q_tok's window opens at
@@ -3545,7 +3601,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 - 1,
                                 qk_col + self.mma_qk_tiler[1] * k_index,
                             )
-                            else self.acc_dtype(-1.0e6)
+                            else masked_score
                         )
             # reduction for row_max
             row_max_new = tTR_rAcc.load().reduce(cute.ReductionOp.MAX, row_max_new, 0)
@@ -3576,8 +3632,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             mma_s_consumer_state.advance()
             tTR_rAcc = cute.make_tensor(tTR_rAcc_red.iterator, tTR_rAcc.layout)
             if apply_mask:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
-                    if cutlass.const_expr(self.is_causal):
+                for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
+                    if cutlass.const_expr(
+                        self.is_causal or common_params.local_visible_lens is not None
+                    ):
                         if cutlass.const_expr(self.pack_q):
                             q_tok = (
                                 common_params.blk_coord[1] * self.mma_qk_tiler[0]
@@ -3598,7 +3656,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         # effective K(row) = K - (S_q - 1) + q_tok; equivalent to
                         # K - (S_q - 1 - q_tok), written to avoid Python int/CuTe
                         # Int32 __rsub__ quirks when self.seq_len_q==1.
-                        if cutlass.const_expr(self.cp_world == 1):
+                        if cutlass.const_expr(
+                            common_params.local_visible_lens is not None
+                        ):
+                            # Padded query rows must not read beyond metadata.
+                            k_bound = common_params.local_visible_lens[
+                                common_params.blk_coord[2],
+                                min(q_tok, self.seq_len_q - 1),
+                            ]
+                        elif cutlass.const_expr(self.cp_world == 1):
                             # Non-DCP: causal bound is the full local context length
                             # (identical to the pre-DCP behavior; folded at compile time).
                             k_bound = common_params.K - (self.seq_len_q - 1) + q_tok
@@ -3615,7 +3681,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                             k_bound,
                         )
-                        else self.acc_dtype(-1.0e6)
+                        else masked_score
                     )
                     if cutlass.const_expr(self.window_left >= 0):
                         # Row q_tok's window opens at
@@ -3649,7 +3715,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                                 - 1,
                                 tTR_tS[i][1] + self.mma_qk_tiler[1] * k_index,
                             )
-                            else self.acc_dtype(-1.0e6)
+                            else masked_score
                         )
                 # reduction for row_max after manual masking
                 row_max_new = tTR_rAcc.load().reduce(
@@ -3667,9 +3733,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             common_params.smem_exchange[tidx] = row_max_new
             warp_in_group = tidx // self.threads_per_warp
             if warp_in_group % 2 == 0:
-                self.softmax_exchange_sync_bar_pair02.wait()
+                self.softmax_exchange_sync_bar_pair02.arrive_and_wait()
             else:
-                self.softmax_exchange_sync_bar_pair13.wait()
+                self.softmax_exchange_sync_bar_pair13.arrive_and_wait()
             row_max_new = cute.arch.fmax(
                 row_max_new,
                 common_params.smem_exchange[
@@ -3677,8 +3743,12 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 ],
             )
         # find correction factor
+        max_delta = row_max - row_max_new
+        if cutlass.const_expr(common_params.local_visible_lens is not None):
+            # Both maxima are -inf until this row sees a local key.
+            max_delta = max_delta if row_max_new != -self.acc_dtype.inf else 0.0
         correction_factor = cute.math.exp2(
-            (row_max - row_max_new) * softmax_params.softmax_scale_log2, fastmath=True
+            max_delta * softmax_params.softmax_scale_log2, fastmath=True
         )
         # skip the rescale if the row max barely grew; the first tile never skips
         skip = (
@@ -3703,7 +3773,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # softmax
         fma_b = softmax_params.softmax_scale_log2
-        fma_c = (0.0 - row_max_new) * softmax_params.softmax_scale_log2
+        safe_row_max = row_max_new
+        if cutlass.const_expr(common_params.local_visible_lens is not None):
+            safe_row_max = row_max_new if row_max_new != -self.acc_dtype.inf else 0.0
+        fma_c = (0.0 - safe_row_max) * softmax_params.softmax_scale_log2
 
         for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
             tTR_rAcc[i] = tTR_rAcc[i] * fma_b + fma_c
@@ -4162,9 +4235,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             common_params.smem_exchange[tidx] = row_sum
             warp_in_group = tidx // self.threads_per_warp
             if warp_in_group % 2 == 0:
-                self.epilogue_exchange_sync_bar_pair02.wait()
+                self.epilogue_exchange_sync_bar_pair02.arrive_and_wait()
             else:
-                self.epilogue_exchange_sync_bar_pair13.wait()
+                self.epilogue_exchange_sync_bar_pair13.arrive_and_wait()
             # (64, 2)
             row_sum = (
                 row_sum
@@ -4175,12 +4248,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Pre-compute the output scale factor once to avoid redundant MUFU.RCP
         # instructions inside the per-element loop (rcp_approx generates MUFU.RCP
         # which has 8-cycle throughput; hoisting it saves up to ~500 cycles).
+        safe_row_sum = row_sum
+        if cutlass.const_expr(common_params.local_visible_lens is not None):
+            safe_row_sum = row_sum if row_sum != 0.0 else 1.0
         # partials skip output_scale; the reduction kernel applies it
         if cutlass.const_expr(common_params.mAccO is None):
-            epi_scale = epilogue_params.output_scale * cute.arch.rcp_approx(row_sum)
+            epi_scale = epilogue_params.output_scale * cute.arch.rcp_approx(
+                safe_row_sum
+            )
             store_dtype = self.o_dtype
         else:
-            epi_scale = cute.arch.rcp_approx(row_sum)
+            epi_scale = cute.arch.rcp_approx(safe_row_sum)
             store_dtype = self.partial_dtype
 
         # mma_o pipeline consumer wait
@@ -4195,6 +4273,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
             # Full TMEM load to registers
             cute.copy(tmem_load_tiled_copy, tTR_tAcc, tTR_rAcc)
+            if cutlass.const_expr(common_params.local_visible_lens is not None):
+                if row_sum == 0.0:
+                    tTR_rAcc.fill(0.0)
 
             if cutlass.const_expr(self.use_m64_ws):
                 num_epi_subtiles = cute.size(tTR_rAcc, mode=[2])

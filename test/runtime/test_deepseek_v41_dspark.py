@@ -52,6 +52,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention import registry as attention_registry
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
@@ -383,7 +384,9 @@ def test_window_attention_kernel_matches_reference():
     )
     q[:, :real_heads] = torch.randn(batch * block, real_heads, dim, device=device)
     swa = torch.randn(batch * block, dim, dtype=torch.bfloat16, device=device)
-    sink = torch.full((padded_heads,), -float("inf"), device=device)
+    sink = torch.full(
+        (padded_heads,), -float("inf"), dtype=torch.float32, device=device
+    )
     sink[:real_heads] = torch.tensor([0.1, -0.3], device=device)
     backend = _window_backend(positions, field, history, block, rows)
     kwargs = dict(
@@ -524,6 +527,7 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch):
     history.copy_(_history_slots(starts, 128, 64))
     ctx = _ctx(None, 10, ForwardMode.DECODE)
     ctx.bs, ctx.num_extends = 2, 0
+    ctx.output_layout = ForwardOutputLayout(0, 0, 2, 5)
 
     def forward():
         return model.forward_backbone(bonus, starts, history, pool, ctx)
@@ -615,6 +619,7 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
         )
         ctx = _ctx(None, n * width, ForwardMode.DECODE)
         ctx.bs, ctx.num_extends = n, 0
+        ctx.output_layout = ForwardOutputLayout(0, 0, n, width)
         ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
         windows.zero_()
         return drafter.run(
@@ -712,6 +717,7 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
     ib.extend_seq_lens_cpu[:1] = 5
     ctx = _ctx(None, 3 + width, ForwardMode.MIXED)
     ctx.bs, ctx.num_extends = 2, 1
+    ctx.output_layout = ForwardOutputLayout(1, 1, 1, width)
     ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
     hidden = torch.randn(
         3 + width, drafter.hidden_width, dtype=torch.bfloat16, device="cuda:0"
@@ -829,7 +835,9 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
     assert side.is_dspark and not side.is_deepseek_v4
 
     # Stop at the allocation boundary, after the real registry chooses both sides.
-    config_builder = Mock(return_value=SimpleNamespace(component=lambda cls: None))
+    config_builder = Mock(
+        return_value=SimpleNamespace(component=lambda cls: None, dcp_size=1)
+    )
     monkeypatch.setattr(attention_registry, "_create_attn_config", config_builder)
     monkeypatch.setattr(
         attention_registry, "_resolve_cache_family", Mock(return_value="deepseek_v41")
@@ -855,6 +863,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
             decode_input_tokens=6,
             overlap_schedule_depth=0,
             graph_reserve_bytes=0,
+            post_profile_bytes=0,
             probe_batch_rows=None,
             profiled_cache_bytes=None,
             reuse_target_backend=None,

@@ -116,7 +116,17 @@ async def wait_grpc_serving(
 
     deadline = time.monotonic() + timeout
     last_err: Exception | None = None
-    async with grpc.aio.insecure_channel(target) as channel:
+    # This channel starts before the engine binds. Keep reconnects near the
+    # polling cadence rather than inheriting serving-channel backoff, which
+    # can delay noticing an already-ready engine by over a minute.
+    async with grpc.aio.insecure_channel(
+        target,
+        options=[
+            ("grpc.initial_reconnect_backoff_ms", 1000),
+            ("grpc.min_reconnect_backoff_ms", 1000),
+            ("grpc.max_reconnect_backoff_ms", 1000),
+        ],
+    ) as channel:
         stub = health_pb2_grpc.HealthStub(channel)
         while time.monotonic() < deadline:
             try:

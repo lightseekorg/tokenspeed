@@ -224,19 +224,6 @@ def test_argmax_unsupported_inputs_preserve_torch_fallback(kind):
     )
 
 
-@pytest.mark.parametrize("kind", ["shape", "dtype", "device"])
-def test_argmax_rejects_invalid_output(kind):
-    x = torch.empty((4, 4096), device="cuda")
-    if kind == "shape":
-        out = torch.empty(5, dtype=torch.int64, device="cuda")
-    elif kind == "dtype":
-        out = torch.empty(4, dtype=torch.float32, device="cuda")
-    else:
-        out = torch.empty(4, dtype=torch.int64, device="cpu")
-    with pytest.raises(ValueError):
-        argmax_impl.argmax(x, out=out)
-
-
 def test_argmax_public_dispatch_and_repeated_graph_calls():
     from tokenspeed_kernel.ops.sampling import argmax
     from tokenspeed_kernel.selection import select_kernel

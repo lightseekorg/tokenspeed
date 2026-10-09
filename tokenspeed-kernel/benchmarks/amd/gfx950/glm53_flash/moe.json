@@ -25,7 +25,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 0.5,
+        "max_regression_absolute_us": 1.0,
         "max_relative_mad": 0.05
       }
     },

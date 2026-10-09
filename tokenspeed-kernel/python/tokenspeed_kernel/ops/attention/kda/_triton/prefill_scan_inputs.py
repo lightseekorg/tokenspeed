@@ -39,17 +39,20 @@ def _prepare_capacity_scan_kernel(
     CU,
     CHUNKS,
     CHUNK_ROWS,
-    T: tl.constexpr,
+    # Token, sequence and chunk counts follow the batch; runtime so every batch
+    # shape shares one binary. N_BLOCK buckets N for the per-sequence tile.
+    T,
     H: tl.constexpr,
     D: tl.constexpr,
-    N: tl.constexpr,
+    N,
     QS: tl.constexpr,
     KS: tl.constexpr,
     VS: tl.constexpr,
     GS: tl.constexpr,
     BS: tl.constexpr,
     PACKED: tl.constexpr,
-    MAX_CHUNKS: tl.constexpr,
+    MAX_CHUNKS,
+    N_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -72,7 +75,7 @@ def _prepare_capacity_scan_kernel(
             beta_row < T,
         )
     if tl.program_id(0) == 0:
-        slot = tl.arange(0, triton.next_power_of_2(N))
+        slot = tl.arange(0, N_BLOCK)
         begin = tl.load(CU + slot, slot < N, 0)
         end = tl.load(CU + slot + 1, slot < N, 0)
         counts = tl.where(slot < N, tl.cdiv(end - begin, 16), 0)
@@ -150,6 +153,7 @@ def prepare_capacity_scan(q, k, v, gate, beta, boundaries, inputs_packed: bool):
         BS=beta.stride(1),
         PACKED=inputs_packed,
         MAX_CHUNKS=count,
+        N_BLOCK=triton.next_power_of_2(sequences),
         BLOCK=1024,
     )
     return oq, ok, ov, og, ob, chunks, chunk_rows

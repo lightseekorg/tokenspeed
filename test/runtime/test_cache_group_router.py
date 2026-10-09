@@ -96,7 +96,9 @@ class WriteLocationMathTest(unittest.TestCase):
         tables, page_sizes = self._tables()
         prefix = torch.tensor([4, 0], dtype=torch.int32)
         new = torch.tensor([5, 2], dtype=torch.int32)
-        locs = extend_write_locations(tables, page_sizes, prefix, new, total_tokens=7)
+        locs = extend_write_locations(
+            tables, page_sizes, prefix, new, 7, torch.empty((2, 7), dtype=torch.int32)
+        )
         self.assertEqual(tuple(locs.shape), (2, 7))
         # request 0, group 0: positions 4..8 -> page 8 slots 0..3, page 9 slot 0.
         self.assertEqual(locs[0, :5].tolist(), [32, 33, 34, 35, 36])
@@ -132,11 +134,150 @@ class WriteLocationMathTest(unittest.TestCase):
         prefix = torch.randint(0, 30, (bs,), dtype=torch.int32)
         new = torch.randint(1, 200, (bs,), dtype=torch.int32)
         total = int(new.sum())
-        ref = extend_write_locations(tables, page_sizes, prefix, new, total)
+        groups = tables.shape[0]
+        ref = extend_write_locations(
+            tables,
+            page_sizes,
+            prefix,
+            new,
+            total,
+            torch.empty((groups, total), dtype=torch.int32),
+        )
         out = extend_write_locations(
-            tables.cuda(), page_sizes.cuda(), prefix.cuda(), new.cuda(), total
+            tables.cuda(),
+            page_sizes.cuda(),
+            prefix.cuda(),
+            new.cuda(),
+            total,
+            torch.empty((groups, total), dtype=torch.int32, device="cuda"),
         )
         torch.testing.assert_close(out.cpu(), ref)
+
+
+class PersistentExtendSpanTest(unittest.TestCase):
+    """The extend span lives in the stack's buffer so a captured prologue can pad
+    over it; a span past the buffer is a fresh tensor."""
+
+    def _stacks(self, capacity):
+        specs = [
+            GroupTableSpec(
+                FULL, block_granularity=4, kernel_page_size=4, max_num_pages=3
+            )
+        ]
+        stacks = GroupTableStacks(
+            specs,
+            max_bs=2,
+            max_tokens_per_req=1,
+            max_extend_tokens=capacity,
+            device="cpu",
+        )
+        stacks.tables[0, :2] = torch.tensor([[8, 9, 0], [3, 0, 0]], dtype=torch.int32)
+        return stacks
+
+    def test_a_fitting_span_is_a_view_with_a_zero_tail(self):
+        stacks = self._stacks(capacity=8)
+        prefix = torch.tensor([4, 0], dtype=torch.int32)
+        new = torch.tensor([3, 2], dtype=torch.int32)
+        span = stacks.extend_locations(prefix, new, 5)[FULL]
+        self.assertEqual(span.data_ptr(), stacks.extend_locs[0].data_ptr())
+        self.assertEqual(span.tolist(), [36, 37, 38, 12, 13])
+        self.assertEqual(stacks.extend_locs[0, 5:].tolist(), [0, 0, 0])
+        stacks.extend_locations(prefix, torch.tensor([1, 1], dtype=torch.int32), 2)
+        self.assertEqual(stacks.extend_locs[0].tolist(), [36, 12, 0, 0, 0, 0, 0, 0])
+
+    def test_a_span_past_the_buffer_is_fresh(self):
+        stacks = self._stacks(capacity=3)
+        prefix = torch.tensor([4, 0], dtype=torch.int32)
+        new = torch.tensor([3, 2], dtype=torch.int32)
+        span = stacks.extend_locations(prefix, new, 5)[FULL]
+        self.assertNotEqual(span.data_ptr(), stacks.extend_locs[0].data_ptr())
+        self.assertEqual(span.tolist(), [36, 37, 38, 12, 13])
+
+    def test_the_padded_span_widens_over_the_zero_tail(self):
+        stacks = self._stacks(capacity=8)
+        span = stacks.extend_locations(
+            torch.tensor([4, 0], dtype=torch.int32),
+            torch.tensor([3, 2], dtype=torch.int32),
+            5,
+        )[FULL]
+        padded = stacks.padded_extend_span(FULL, 8)
+        self.assertEqual(padded.tolist(), [36, 37, 38, 12, 13, 0, 0, 0])
+        self.assertEqual(padded.data_ptr(), span.data_ptr())
+        self.assertEqual(stacks.padded_extend_span(FULL, 5).tolist(), span.tolist())
+        with self.assertRaisesRegex(ValueError, "cannot pad to 4 rows"):
+            stacks.padded_extend_span(FULL, 4)
+        # Past the buffer the forward runs eager: a fresh tensor, zero tail.
+        wide = stacks.padded_extend_span(FULL, 9)
+        self.assertNotEqual(wide.data_ptr(), span.data_ptr())
+        self.assertEqual(wide.tolist(), [36, 37, 38, 12, 13, 0, 0, 0, 0])
+
+    def test_a_span_past_the_buffer_pads_onto_a_fresh_tail(self):
+        stacks = self._stacks(capacity=3)
+        stacks.extend_locations(
+            torch.tensor([4, 0], dtype=torch.int32),
+            torch.tensor([3, 2], dtype=torch.int32),
+            5,
+        )
+        self.assertEqual(
+            stacks.padded_extend_span(FULL, 8).tolist(), [36, 37, 38, 12, 13, 0, 0, 0]
+        )
+        with self.assertRaisesRegex(ValueError, "cannot pad to 4 rows"):
+            stacks.padded_extend_span(FULL, 4)
+
+    def test_a_mixed_round_places_its_decode_rows_after_the_span(self):
+        """Request 0 extends three tokens; request 1 decodes one at slot 14."""
+        stacks = self._stacks(capacity=8)
+        span = stacks.extend_locations(
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            3,
+        )[FULL]
+        stacks.decode_locs[0, :2] = torch.tensor([39, 14], dtype=torch.int32)
+        stacks.append_decode_rows(1, 1)
+        padded = stacks.padded_extend_span(FULL, 8)
+        self.assertEqual(padded.data_ptr(), span.data_ptr())
+        self.assertEqual(padded.tolist(), [36, 37, 38, 14, 0, 0, 0, 0])
+        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 14])
+        with self.assertRaisesRegex(ValueError, "cannot pad to 3 rows"):
+            stacks.padded_extend_span(FULL, 3)
+        # Widening past capacity preserves the decode row as well.
+        self.assertEqual(
+            stacks.padded_extend_span(FULL, 9).tolist(),
+            [36, 37, 38, 14, 0, 0, 0, 0, 0],
+        )
+        # A new pure extend drops the decode rows again.
+        stacks.extend_locations(
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            3,
+        )
+        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 0])
+
+    def test_mixed_decode_rows_past_the_buffer_pad_onto_a_fresh_tail(self):
+        stacks = self._stacks(capacity=3)
+        stacks.extend_locations(
+            torch.tensor([4], dtype=torch.int32),
+            torch.tensor([3], dtype=torch.int32),
+            3,
+        )
+        stacks.decode_locs[0, :2] = torch.tensor([39, 14], dtype=torch.int32)
+        stacks.append_decode_rows(1, 1)
+        self.assertEqual(stacks.padded_extend_span(FULL, 4).tolist(), [36, 37, 38, 14])
+        self.assertEqual(
+            stacks.padded_extend_span(FULL, 6).tolist(), [36, 37, 38, 14, 0, 0]
+        )
+
+    def test_a_backend_without_a_padded_span_serves_exact_counts_only(self):
+        from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+
+        backend = object.__new__(AttentionBackend)
+        span = torch.tensor([7, 8, 9], dtype=torch.int32)
+        backend.forward_write_locations = lambda layer, mode: span
+        self.assertIs(
+            AttentionBackend.padded_write_locations(backend, None, None, 3), span
+        )
+        with self.assertRaisesRegex(ValueError, "3 write slots for 4 rows"):
+            AttentionBackend.padded_write_locations(backend, None, None, 4)
 
 
 class GroupTableStacksTest(unittest.TestCase):
@@ -150,7 +291,11 @@ class GroupTableStacksTest(unittest.TestCase):
             ),
         ]
         return GroupTableStacks(
-            specs, max_bs=max_bs, max_tokens_per_req=2, device=device
+            specs,
+            max_bs=max_bs,
+            max_tokens_per_req=2,
+            max_extend_tokens=16,
+            device=device,
         )
 
     def test_fill_expands_pads_and_nulls_holes(self):
@@ -209,6 +354,56 @@ class GroupTableStacksTest(unittest.TestCase):
         self.assertEqual(a.data_ptr(), b.data_ptr())
         with self.assertRaisesRegex(RuntimeError, "sized for 2 tokens"):
             stacks.decode_locations(FULL, 1, 3)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
+    def test_cuda_fill_and_extend_compile_once_across_batches(self):
+        """Raw tables arrive as row slices at any offset and long extends size a
+        fresh span per batch; neither may key a new binary."""
+        from unittest.mock import patch
+
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+            _unpack_group_kernel,
+        )
+        from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
+            _extend_locs_kernel,
+        )
+
+        base = torch.tensor(
+            [[5, 6, 1], [9, 0, 2], [3, 4, 1], [7, 8, 9], [1, 2, 3]], dtype=torch.int32
+        )
+        cpu, gpu = self._stacks(), self._stacks(device="cuda")
+
+        def run(rows, offset, extend):
+            results = []
+            for stacks, table in ((cpu, base), (gpu, base.cuda())):
+                raw = table[offset : offset + rows]
+                stacks.fill(rows, rows, {FULL: raw, SWA: raw})
+                lens = torch.full((rows,), extend, dtype=torch.int32)
+                locs = stacks.extend_locations(
+                    torch.zeros_like(lens).to(table.device),
+                    lens.to(table.device),
+                    rows * extend,
+                )
+                results.append(
+                    [
+                        stacks.tables[:, :rows].cpu(),
+                        *(locs[g].cpu() for g in (FULL, SWA)),
+                    ]
+                )
+            for want, got in zip(*results):
+                self.assertTrue(torch.equal(want, got))
+
+        # Spans past max_extend_tokens (16) take a fresh tensor strided by the total.
+        run(2, 0, 9)
+        kernels = (_unpack_group_kernel, _extend_locs_kernel)
+        with patch.object(
+            kernels[0], "_do_compile", wraps=kernels[0]._do_compile
+        ) as unpack, patch.object(
+            kernels[1], "_do_compile", wraps=kernels[1]._do_compile
+        ) as extend:
+            for rows, offset, length in ((1, 1, 1), (2, 1, 9), (4, 0, 8), (3, 1, 11)):
+                run(rows, offset, length)
+        self.assertEqual((unpack.call_count, extend.call_count), (0, 0))
 
     @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
     def test_cuda_fill_matches_torch_reference(self):
@@ -291,15 +486,11 @@ class _StubLeaf(PagedAttentionBackend):
         )
         self.calls.append(("refresh", bs, actual_bs, num_extends, for_graph_replay))
 
-    def forward_decode(
-        self, q, k, v, layer, out_cache_loc, pool, bs, save_kv_cache=True, **kw
-    ):
+    def forward_decode(self, q, k, v, layer, out_cache_loc, pool, bs, **kw):
         self.calls.append(("decode", layer.group_id, out_cache_loc))
         return q
 
-    def forward_extend(
-        self, q, k, v, layer, out_cache_loc, pool, bs, save_kv_cache=True, **kw
-    ):
+    def forward_extend(self, q, k, v, layer, out_cache_loc, pool, bs, **kw):
         self.calls.append(("extend", layer.group_id, out_cache_loc))
         return q
 
@@ -460,7 +651,9 @@ class CacheGroupRouterTest(unittest.TestCase):
             block_tables=tables,
         )
         q = torch.zeros(2)
-        router.forward(q, None, None, _layer(SWA), None, ForwardMode.DECODE, 2)
+        router.forward(
+            q, None, None, _layer(SWA), None, ForwardMode.DECODE, 2, save_kv_cache=False
+        )
         kind, gid, loc = leaves[SWA].calls[-1]
         self.assertEqual((kind, gid), ("decode", SWA))
         # Slot math is page-size invariant: pos 8 of request 0 is raw page 7
@@ -473,7 +666,16 @@ class CacheGroupRouterTest(unittest.TestCase):
         )
         self.assertFalse(any(c[0] == "decode" for c in leaves[FULL].calls))
         with self.assertRaisesRegex(KeyError, "names cache group 'nope'"):
-            router.forward(q, None, None, _layer("nope"), None, ForwardMode.DECODE, 2)
+            router.forward(
+                q,
+                None,
+                None,
+                _layer("nope"),
+                None,
+                ForwardMode.DECODE,
+                2,
+                save_kv_cache=False,
+            )
 
     def test_decode_write_location_views_are_pointer_stable_per_bs(self):
         router, _ = self._router(spec=2)
@@ -525,6 +727,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             2,
+            save_kv_cache=False,
         )
         self.assertIs(
             leaves[FULL].calls[-1][2],
@@ -578,6 +781,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(prefix),
             extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         kind, bs, num_extends, page_table, mode = leaves[FULL].calls[-2]
         self.assertEqual(
@@ -602,6 +807,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.EXTEND,
             2,
+            save_kv_cache=False,
         )
         self.assertIs(leaves[FULL].calls[-1][2], locs)
         no_extends = torch.zeros(0, dtype=torch.int32)
@@ -620,6 +826,8 @@ class CacheGroupRouterTest(unittest.TestCase):
                 extend_replay_lens_cpu=torch.zeros_like(no_extends),
                 extend_prompt_lens_cpu=no_extends + no_extends,
                 extend_with_prefix=False,
+                query_shard=None,
+                block_tables_cpu={},
             )
 
     def test_extend_init_rejects_bounded_replay_rows(self):
@@ -645,6 +853,8 @@ class CacheGroupRouterTest(unittest.TestCase):
                 extend_replay_lens_cpu=torch.tensor([2, 0], dtype=torch.int32),
                 extend_prompt_lens_cpu=prefix + new,
                 extend_with_prefix=True,
+                query_shard=None,
+                block_tables_cpu={},
             )
 
     def test_mixed_round_slices_decode_requests_after_the_extend_requests(self):
@@ -669,6 +879,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_prompt_lens_cpu=torch.tensor([4], dtype=torch.int32)
             + torch.tensor([5], dtype=torch.int32),
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.EXTEND).tolist(),
@@ -678,6 +890,16 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertEqual(
             router.write_locations(_layer(FULL), ForwardMode.DECODE).tolist(), [39]
         )
+        # The prologue's slots for the whole forward: extend rows, decode rows,
+        # then padding; wider than the (here empty) buffer, so a fresh tensor.
+        self.assertEqual(
+            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 6).tolist(),
+            [24, 25, 26, 27, 0, 39],
+        )
+        self.assertEqual(
+            router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8).tolist(),
+            [24, 25, 26, 27, 0, 39, 0, 0],
+        )
         router.forward(
             torch.zeros(1),
             torch.zeros(1),
@@ -686,8 +908,34 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             1,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [39])
+
+    def test_a_graph_padded_mixed_round_records_the_persistent_buffer(self):
+        router, _ = self._router(spec=1)
+        router.init_cuda_graph_state(4, max_extend_tokens=8)
+        five, four = (torch.tensor([n], dtype=torch.int32) for n in (5, 4))
+        router.init_forward_metadata(
+            2,
+            1,
+            torch.arange(2, dtype=torch.int32),
+            torch.tensor([9, 4], dtype=torch.int32),
+            ForwardMode.MIXED,
+            block_tables=self._tables(),
+            extend_seq_lens=five,
+            extend_seq_lens_cpu=five.clone(),
+            extend_prefix_lens=four,
+            extend_prefix_lens_cpu=four.clone(),
+            extend_replay_lens_cpu=torch.zeros_like(four),
+            extend_prompt_lens_cpu=four + five,
+            extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
+        )
+        padded = router.padded_write_locations(_layer(FULL), ForwardMode.MIXED, 8)
+        self.assertEqual(padded.tolist(), [24, 25, 26, 27, 0, 39, 0, 0])
+        self.assertEqual(padded.data_ptr(), router.stacks.extend_locs[0].data_ptr())
 
     def test_draft_step_zero_local_decode_writes_the_full_extend_span(self):
         router, leaves = self._router(is_draft=True, spec=1)
@@ -708,6 +956,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens),
             extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             1,
@@ -726,6 +976,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             1,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0])
 
@@ -748,6 +999,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(prefix),
             extend_prompt_lens_cpu=prefix + one,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             1,
@@ -759,10 +1012,12 @@ class CacheGroupRouterTest(unittest.TestCase):
             num_extends=1,
         )
         q = torch.zeros(1)
-        router.forward_decode(q, q, q, _layer(FULL), None, 1)
+        router.forward_decode(q, q, q, _layer(FULL), None, 1, save_kv_cache=False)
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24])
 
-    def test_draft_step_zero_mixed_decode_composes_both_windows(self):
+    def _mixed_draft_router(self):
+        """A draft router after a MIXED round's refresh: request 0 extends five
+        tokens, request 1 decodes one verify row."""
         router, leaves = self._router(is_draft=True, spec=1)
         seq_lens = torch.tensor([9, 4], dtype=torch.int32)
         extend_seq_lens = torch.tensor([5], dtype=torch.int32)
@@ -781,6 +1036,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(extend_prefix_lens),
             extend_prompt_lens_cpu=extend_prefix_lens + extend_seq_lens,
             extend_with_prefix=True,
+            query_shard=None,
+            block_tables_cpu={},
         )
         router.refresh_decode_metadata(
             2,
@@ -791,6 +1048,10 @@ class CacheGroupRouterTest(unittest.TestCase):
             block_tables=self._tables(),
             num_extends=1,
         )
+        return router, leaves
+
+    def test_draft_step_zero_mixed_decode_composes_both_windows(self):
+        router, leaves = self._mixed_draft_router()
         router.forward(
             torch.zeros(2),
             torch.zeros(6),
@@ -799,6 +1060,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             2,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].tolist(), [24, 25, 26, 27, 0, 39])
 
@@ -813,9 +1075,16 @@ class CacheGroupRouterTest(unittest.TestCase):
             None,
             ForwardMode.DECODE,
             2,
+            save_kv_cache=False,
         )
         self.assertEqual(leaves[FULL].calls[-1][2].data_ptr(), later.data_ptr())
         self.assertEqual(later.tolist(), [24, 36])
+
+    def test_draft_step_zero_mixed_dispatch_writes_every_row(self):
+        """Eagle3 prepares a MIXED round's step 0 in the round's own mode."""
+        router, _ = self._mixed_draft_router()
+        slots = router.forward_write_locations(_layer(FULL), ForwardMode.MIXED)
+        self.assertEqual(slots.tolist(), [24, 25, 26, 27, 0, 39])
 
     def test_capture_seeds_with_idle_rows_then_calls_leaf_capture_hooks(self):
         router, leaves = self._router()
@@ -873,6 +1142,33 @@ class CacheGroupRouterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
             _ = multi.chunked_prefill_metadata
 
+    def test_dsa_query_shard_surface_proxies_to_the_sole_leaf(self):
+        """A DSA model's own selection over KVP pages reaches the leaf's
+        sharded-extend plan and index-K history gather through the router."""
+        leaf = _StubLeaf(4)
+        meta = object()
+        gathered = (object(), None)
+        calls = []
+        leaf.require_query_shard_metadata = lambda: meta
+        leaf.gather_history_index_k = lambda layer_id, pool, group: (
+            calls.append((layer_id, pool, group)) or gathered
+        )
+        router = CacheGroupRouter(
+            None,
+            is_draft=False,
+            spec_num_tokens=1,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), {FULL: leaf})
+        self.assertIs(router.require_query_shard_metadata(), meta)
+        pool, group = object(), object()
+        self.assertIs(router.gather_history_index_k(3, pool, group), gathered)
+        self.assertEqual(calls, [(3, pool, group)])
+        multi, _ = self._router()
+        with self.assertRaisesRegex(RuntimeError, "single attention cache group"):
+            multi.require_query_shard_metadata()
+
     def test_draft_write_locations_ride_the_history_stack(self):
         """The drafters' in-graph slot math reads the router's address-stable
         full-history table in the stack: page-size invariant vs the raw table,
@@ -925,6 +1221,37 @@ class CacheGroupRouterTest(unittest.TestCase):
         self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 7])
         self.assertEqual(router.child_backends(), (leaves[FULL], leaves[SWA]))
 
+    def test_mtp_frontier_reaches_each_leaf_through_its_own_hook(self):
+        """The MTP re-anchor is dispatched to the leaf's
+        ``update_draft_forward_metadata``: a leaf with per-row metadata (DSA)
+        re-expands its k-row shape there, while the leaf default is the plain
+        seq_lens edit, so leaves without an override keep today's behavior."""
+
+        class _KRowLeaf(_StubLeaf):
+            def __init__(self, kernel_page_size):
+                super().__init__(kernel_page_size)
+                self.frontiers: list[list[int]] = []
+
+            def update_draft_forward_metadata(self, frontier):
+                self.frontiers.append(frontier.tolist())
+
+        leaves = {FULL: _KRowLeaf(4), SWA: _StubLeaf(2)}
+        router = CacheGroupRouter(
+            None,
+            is_draft=True,
+            spec_num_tokens=4,
+            device="cpu",
+            consumed_group_ids=None,
+        )
+        router.bind(_geometry(), leaves)
+        router.init_cuda_graph_state(4)
+
+        router.update_draft_forward_metadata(torch.tensor([7, 3], dtype=torch.int32))
+
+        self.assertEqual(leaves[FULL].frontiers, [[7, 3]])
+        self.assertEqual(leaves[FULL].seq_lens_buf[:2].tolist(), [0, 0])
+        self.assertEqual(leaves[SWA].seq_lens_buf[:2].tolist(), [7, 3])
+
     def test_every_metadata_build_clears_the_sparse_topk_share(self):
         """The sparse layers' shared selection is per forward: extend init,
         decode refresh and capture seeding each start it empty, so a "shared"
@@ -954,6 +1281,8 @@ class CacheGroupRouterTest(unittest.TestCase):
             extend_replay_lens_cpu=torch.zeros_like(prefix),
             extend_prompt_lens_cpu=prefix + new,
             extend_with_prefix=False,
+            query_shard=None,
+            block_tables_cpu={},
         )
         self.assertEqual((share.prefill, share.decode), (None, None))
 
@@ -1303,6 +1632,7 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "forward_prefill_metadata",
                 "forward_decode_metadata",
                 "spec_cache_seqlens_buf",
+                "tree_prefix_lens_buf",
             ],
         )
 
@@ -1390,6 +1720,7 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "chunked_prefill_metadata",
                 "_block_page_table_buf",
                 "_block_seq_lens_buf",
+                "_dcp",
             ],
         )
 

@@ -1,5 +1,7 @@
 import os
+import shlex
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -251,21 +253,49 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
     assert all((REPO_ROOT / choice).is_file() for choice in choices)
 
 
-def test_amd_pr_workflow_orders_kernel_benchmarks_before_model_tests():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/pr-test-amd.yml")
+def test_kernel_ut_parts_cover_every_test_once():
+    root = REPO_ROOT / "tokenspeed-kernel/test"
+    files = {
+        path
+        for path in root.rglob("*.py")
+        if path.name.startswith("test_") or path.name.endswith("_test.py")
+    }
+    assert files
+    executions = Counter()
+    for part in ("i", "ii"):
+        task = load_yaml(
+            REPO_ROOT / f"test/ci/ut/ut-tokenspeed-kernel-part-{part}.yaml"
+        )
+        for command in task["ut"]["commands"]:
+            tokens = shlex.split(command)
+            arguments = tokens[tokens.index("pytest") + 1 :]
+            targets = [REPO_ROOT / arg for arg in arguments if not arg.startswith("-")]
+            ignores = [
+                REPO_ROOT / arg.removeprefix("--ignore=")
+                for arg in arguments
+                if arg.startswith("--ignore=")
+            ]
+            executions.update(
+                path
+                for path in files
+                if any(path.is_relative_to(target) for target in targets)
+                and not any(path.is_relative_to(ignore) for ignore in ignores)
+            )
+
+    assert executions == Counter({path: 1 for path in files})
+
+
+def test_amd_pr_workflow_runs_kernel_benchmarks_alongside_model_tests():
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")
     jobs = workflow["jobs"]
 
     assert jobs["kernel-benchmark"]["needs"] == ["scan", "unit-test"]
-    expected_model_needs = ["scan", "unit-test", "kernel-benchmark"]
     normal_model = jobs["model-test"]
-    assert normal_model["needs"] == expected_model_needs
+    assert normal_model["needs"] == ["scan", "unit-test"]
     assert "!cancelled()" in normal_model["if"]
     assert "needs.unit-test.result == 'success'" in normal_model["if"]
     assert "needs.scan.outputs.unit_has_tasks != 'true'" in normal_model["if"]
-    assert "needs.kernel-benchmark.result == 'success'" in normal_model["if"]
-    assert (
-        "needs.scan.outputs.kernel_benchmark_has_tasks != 'true'" in normal_model["if"]
-    )
+    assert "needs.kernel-benchmark" not in normal_model["if"]
 
     eager_model = jobs["model-test-eager"]
     assert eager_model["needs"] == "scan"
@@ -296,7 +326,8 @@ def test_kernel_benchmark_task_uses_shared_ci_contract():
     assert task["type"] == "perf"
     assert task["workflow_stage"] == "kernel-benchmark"
     assert task["triggers"] == ["per-commit", "manual"]
-    assert task["runner"]["labels"] == ["amd-mi355-1gpu-bench"]
+    assert task["runner"]["labels"] == ["amd-mi350-1gpu-bench"]
+    assert task["env"]["TOKENSPEED_KERNEL_BENCHMARK_PROFILER"] == "none"
     assert ".ci-artifacts/published" in task["perf"]["command"]
     for variable in ("BASE_REF", "CANDIDATE_REF", "PR_NUMBER", "MERGE_SHA"):
         assert variable in task["perf"]["command"]
@@ -562,7 +593,7 @@ def test_slurm_dispatch_maps_b200_yaml_to_gb300_runners(tmp_path):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
-        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
+        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel-part-i.yaml",
     )
 
     assert result.returncode == 0, result.stderr
@@ -630,7 +661,7 @@ def test_slurm_dispatch_rejects_mismatched_or_multiple_gb300_runners(
 
 
 def test_slurm_dispatch_accepts_multiple_native_gb300_runners(tmp_path):
-    task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel.yaml")
+    task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-part-i.yaml")
     task["runner"]["labels"] = ["gb300-1gpu", "gb300-4gpu"]
     config = tmp_path / "ambiguous.yaml"
     config.write_text(yaml.safe_dump(task))
@@ -715,7 +746,7 @@ def test_kimi_k3_dflash2_gb300_uses_a_window_aware_drafter_backend():
 
 
 def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-nightly.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-gb300-nightly-tests.yml")
     triggers = workflow.get("on") or workflow.get(True)
     scan = workflow["jobs"]["scan"]
     submit = workflow["jobs"]["submit"]
@@ -816,7 +847,7 @@ def test_gb300_slurm_nightly_matrix_selects_the_nightly_kimi_k3_tasks(monkeypatc
 
 
 def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-gb300-tests.yml")
     triggers = workflow.get("on") or workflow.get(True)
     submit = workflow["jobs"]["submit"]
     scan_steps = workflow["jobs"]["scan"]["steps"]
@@ -976,7 +1007,7 @@ def test_nvidia_arm_model_tests_allow_runner_wait_time():
 
 
 def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-ci-task-matrix.yml")
     job = workflow["jobs"]["test"]
 
     assert job["runs-on"] == "${{ matrix.runner }}"
@@ -998,7 +1029,7 @@ def test_mi450_sim_uses_direct_runner_and_bounded_timeout():
 def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
     tmp_path, workflow_stage, task_type
 ):
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-pr-test-stage.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/run-ci-task-matrix.yml")
     steps = workflow["jobs"]["test"]["steps"]
     setup = next(step for step in steps if step["name"] == "Set work directory")
     cleanup = next(step for step in steps if step["name"] == "Cleanup work directory")
@@ -1080,7 +1111,7 @@ def test_pr_task_caches_are_isolated_and_cleaned_with_their_job(
 
 
 def test_gb300_per_commit_forwards_the_tokenspeed_mla_override():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/gb300-slurm-per-commit.yml")
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/nvidia-gb300-tests.yml")
     step = next(
         step
         for step in workflow["jobs"]["submit"]["steps"]
@@ -1104,7 +1135,7 @@ def test_slurm_dispatch_takes_a_dispatched_pr_from_its_own_tree():
     )
 
     assert step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
-        "${{ inputs.pr && '1' || '0' }}"
+        "${{ (inputs.pr || inputs.commit) && '1' || '0' }}"
     )
 
 

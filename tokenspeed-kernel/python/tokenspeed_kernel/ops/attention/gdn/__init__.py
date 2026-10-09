@@ -300,6 +300,23 @@ def gdn_decode_step(
         )
 
 
+# ReplaySSM draft trees of these sizes verify in the chunked form, which keeps no node states.
+GDN_TREE_VERIFY_CHUNKED_MIN_NODES = 8
+GDN_TREE_VERIFY_CHUNKED_MAX_NODES = 16
+
+
+def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
+    """Whether a ReplaySSM draft-tree ``gdn_decode_mtp`` of ``num_nodes`` nodes takes
+    an ``intermediate_states_buffer``: trees outside
+    ``GDN_TREE_VERIFY_CHUNKED_MIN_NODES`` to ``GDN_TREE_VERIFY_CHUNKED_MAX_NODES``
+    nodes verify step by step and reload their branch points' states from it."""
+    return not (
+        GDN_TREE_VERIFY_CHUNKED_MIN_NODES
+        <= num_nodes
+        <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+    )
+
+
 def gdn_decode_mtp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -316,6 +333,7 @@ def gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    tree_ancestors: torch.Tensor | None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -348,7 +366,8 @@ def gdn_decode_mtp(
         intermediate_states_buffer: Optional batch-scoped ``[B, T,
             num_v_heads, head_v_dim, head_dim]`` (K-last, same dtype as
             ``initial_state``) buffer that receives every step's post-update
-            state at ``buffer[i_n, step]``.
+            state at ``buffer[i_n, step]`` (for a ReplaySSM tree, only the
+            branch points' states).
         output_state_indices: Optional per-token state-pool destinations shaped
             ``[B, T]`` with dtype ``torch.int32``. When provided, each
             post-update state ``h_{t+1}`` is written directly to
@@ -358,6 +377,16 @@ def gdn_decode_mtp(
             non-negative. This is mutually exclusive with
             ``intermediate_states_buffer`` and requires
             ``disable_state_update=False``.
+        tree_ancestors: Optional contiguous int64 ``[B, T]`` draft-tree
+            ancestor-or-self bitmask, ``T <= 64``: bit ``s`` of row ``t`` is
+            set when step ``s`` is ``t`` or one of its ancestors, and ancestors
+            precede their descendants. Step ``t`` continues from its parent's
+            state (the initial state for a root) instead of step ``t - 1``.
+            With ``output_state_indices`` every node's state goes to the pool;
+            without it (ReplaySSM verify) the pool is left untouched, which
+            needs ``disable_state_update``, and an ``intermediate_states_buffer``
+            is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
+            Runs the Triton solution; ``None`` is a chain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -384,6 +413,38 @@ def gdn_decode_mtp(
             )
         if disable_state_update:
             raise ValueError("output_state_indices requires disable_state_update=False")
+
+    if tree_ancestors is not None:
+        if (
+            tree_ancestors.shape != q.shape[:2]
+            or tree_ancestors.dtype != torch.int64
+            or not tree_ancestors.is_contiguous()
+            or q.shape[1] > 64
+        ):
+            raise ValueError(
+                f"tree_ancestors must be contiguous int64 {tuple(q.shape[:2])} with "
+                f"T <= 64, got {tree_ancestors.dtype} {tuple(tree_ancestors.shape)} "
+                f"strides {tree_ancestors.stride()}"
+            )
+        if output_state_indices is None:
+            if not disable_state_update:
+                raise ValueError(
+                    "a draft tree without output_state_indices leaves the pool "
+                    "untouched: disable_state_update must be True"
+                )
+            if gdn_tree_verify_needs_node_states(q.shape[1]) != (
+                intermediate_states_buffer is not None
+            ):
+                raise ValueError(
+                    f"a ReplaySSM tree of {q.shape[1]} nodes takes an "
+                    "intermediate_states_buffer exactly when "
+                    "gdn_tree_verify_needs_node_states"
+                )
+        if solution not in (None, "triton"):
+            raise ValueError(
+                f"draft-tree GDN verify runs the Triton solution, got {solution}"
+            )
+        solution = "triton"
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
@@ -421,7 +482,102 @@ def gdn_decode_mtp(
             use_qk_l2norm=use_qk_l2norm,
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
+            tree_ancestors=tree_ancestors,
         )
+
+
+def validate_replay_commit_args(
+    payload: torch.Tensor,
+    parameters: torch.Tensor,
+    *,
+    state_addresses: torch.Tensor,
+    state_row_strides: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    draft_token_num: int,
+    geometry: tuple[int, int, int, int],
+    state_dtype: torch.dtype,
+) -> bool:
+    """Validate a recurrent replay call against the shared ``[K | V | a | b]`` layout.
+
+    Arguments are those of ``gdn_replay_commit``, with ``geometry`` read as
+    ``(key_heads, value_heads, key_dim, value_dim)``.
+
+    Returns:
+        ``False`` when there is no layer or request to replay.
+    """
+    if payload.dim() != 3 or not payload.is_contiguous():
+        raise ValueError("replay payload must be contiguous [L, rows, width]")
+    num_layers = payload.shape[0]
+    batch_size = accepted_length.numel()
+    if num_layers == 0 or batch_size == 0:
+        return False
+    num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
+    if draft_token_num <= 0:
+        raise ValueError("draft_token_num must be positive")
+    if num_v_heads <= 0 or num_k_heads <= 0 or num_v_heads % num_k_heads:
+        raise ValueError("num_v_heads must be divisible by num_k_heads")
+    if head_k_dim <= 0 or head_v_dim <= 0:
+        raise ValueError("replay head dimensions must be positive")
+    payload_width = (
+        num_k_heads * head_k_dim + num_v_heads * head_v_dim + 2 * num_v_heads
+    )
+    if payload.shape[1] < batch_size * draft_token_num:
+        raise ValueError("replay payload has insufficient token capacity")
+    if payload.shape[2] != payload_width:
+        raise ValueError(
+            f"replay payload width must be {payload_width}, got {payload.shape[2]}"
+        )
+    if parameters.shape != (num_layers, 2, num_v_heads):
+        raise ValueError(
+            "replay parameters must have shape "
+            f"{(num_layers, 2, num_v_heads)}, got {tuple(parameters.shape)}"
+        )
+    if parameters.dtype != torch.float32 or not parameters.is_contiguous():
+        raise ValueError("replay parameters must be contiguous torch.float32")
+    if state_addresses.shape != (num_layers,) or state_addresses.dtype != torch.uint64:
+        raise ValueError(
+            "state_addresses must be torch.uint64 with one entry per layer"
+        )
+    if (
+        state_row_strides.shape != (num_layers,)
+        or state_row_strides.dtype != torch.int64
+    ):
+        raise ValueError(
+            "state_row_strides must be torch.int64 with one entry per layer"
+        )
+    if read_indices.shape != (num_layers, batch_size):
+        raise ValueError(
+            "read_indices must have shape "
+            f"{(num_layers, batch_size)}, got {tuple(read_indices.shape)}"
+        )
+    if write_indices.shape != (num_layers, batch_size):
+        raise ValueError(
+            "write_indices must have shape "
+            f"{(num_layers, batch_size)}, got {tuple(write_indices.shape)}"
+        )
+    if read_indices.dtype != torch.int32 or write_indices.dtype != torch.int32:
+        raise ValueError("replay page tables must have dtype torch.int32")
+    if accepted_length.shape != (batch_size,) or accepted_length.dtype != torch.int32:
+        raise ValueError("accepted_length must be a one-dimensional torch.int32 tensor")
+    if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(f"unsupported replay state dtype: {state_dtype}")
+    tensors = (
+        parameters,
+        state_addresses,
+        state_row_strides,
+        read_indices,
+        write_indices,
+        accepted_length,
+    )
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError(
+            "replay address, stride, index, and parameter tables must be contiguous"
+        )
+    if any(tensor.device != payload.device for tensor in tensors):
+        raise ValueError("all replay tensors must reside on the payload device")
+    return True
 
 
 def gdn_replay_commit(
@@ -464,76 +620,22 @@ def gdn_replay_commit(
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
     """
-    if payload.dim() != 3 or not payload.is_contiguous():
-        raise ValueError("GDN layer replay payload must be contiguous [L, rows, width]")
+    if not validate_replay_commit_args(
+        payload,
+        parameters,
+        state_addresses=state_addresses,
+        state_row_strides=state_row_strides,
+        read_indices=read_indices,
+        write_indices=write_indices,
+        accepted_length=accepted_length,
+        draft_token_num=draft_token_num,
+        geometry=geometry,
+        state_dtype=state_dtype,
+    ):
+        return
     num_layers = payload.shape[0]
     batch_size = accepted_length.numel()
-    if num_layers == 0 or batch_size == 0:
-        return
     num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
-    if draft_token_num <= 0:
-        raise ValueError("draft_token_num must be positive")
-    if num_v_heads <= 0 or num_k_heads <= 0 or num_v_heads % num_k_heads:
-        raise ValueError("num_v_heads must be divisible by num_k_heads")
-    if head_k_dim <= 0 or head_v_dim <= 0:
-        raise ValueError("GDN replay head dimensions must be positive")
-    payload_width = (
-        num_k_heads * head_k_dim + num_v_heads * head_v_dim + 2 * num_v_heads
-    )
-    if payload.shape[1] < batch_size * draft_token_num:
-        raise ValueError("GDN replay payload has insufficient token capacity")
-    if payload.shape[2] != payload_width:
-        raise ValueError(
-            f"GDN replay payload width must be {payload_width}, got {payload.shape[2]}"
-        )
-    if parameters.shape != (num_layers, 2, num_v_heads):
-        raise ValueError(
-            "GDN replay parameters must have shape "
-            f"{(num_layers, 2, num_v_heads)}, got {tuple(parameters.shape)}"
-        )
-    if parameters.dtype != torch.float32 or not parameters.is_contiguous():
-        raise ValueError("GDN replay parameters must be contiguous torch.float32")
-    if state_addresses.shape != (num_layers,) or state_addresses.dtype != torch.uint64:
-        raise ValueError(
-            "state_addresses must be torch.uint64 with one entry per layer"
-        )
-    if (
-        state_row_strides.shape != (num_layers,)
-        or state_row_strides.dtype != torch.int64
-    ):
-        raise ValueError(
-            "state_row_strides must be torch.int64 with one entry per layer"
-        )
-    if read_indices.shape != (num_layers, batch_size):
-        raise ValueError(
-            "read_indices must have shape "
-            f"{(num_layers, batch_size)}, got {tuple(read_indices.shape)}"
-        )
-    if write_indices.shape != (num_layers, batch_size):
-        raise ValueError(
-            "write_indices must have shape "
-            f"{(num_layers, batch_size)}, got {tuple(write_indices.shape)}"
-        )
-    if read_indices.dtype != torch.int32 or write_indices.dtype != torch.int32:
-        raise ValueError("GDN replay page tables must have dtype torch.int32")
-    if accepted_length.shape != (batch_size,) or accepted_length.dtype != torch.int32:
-        raise ValueError("accepted_length must be a one-dimensional torch.int32 tensor")
-    if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ValueError(f"unsupported GDN replay state dtype: {state_dtype}")
-    tensors = (
-        parameters,
-        state_addresses,
-        state_row_strides,
-        read_indices,
-        write_indices,
-        accepted_length,
-    )
-    if any(not tensor.is_contiguous() for tensor in tensors):
-        raise ValueError(
-            "GDN replay address, stride, index, and parameter tables must be contiguous"
-        )
-    if any(tensor.device != payload.device for tensor in tensors):
-        raise ValueError("all GDN replay tensors must reside on the payload device")
 
     signature = _attention_format_signature(q=payload, k=payload, v=payload)
     kernel = select_kernel(
@@ -611,6 +713,8 @@ import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
 # isort: on
 
 __all__ = [
+    "GDN_TREE_VERIFY_CHUNKED_MIN_NODES",
+    "GDN_TREE_VERIFY_CHUNKED_MAX_NODES",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "gdn_chunk_prefill",
@@ -618,4 +722,6 @@ __all__ = [
     "gdn_decode_mtp",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
+    "gdn_tree_verify_needs_node_states",
+    "validate_replay_commit_args",
 ]

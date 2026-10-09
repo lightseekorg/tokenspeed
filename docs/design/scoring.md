@@ -55,12 +55,21 @@ A score request is an ordinary generation request with
 - The readout lives in the eager forward step
   (`ModelExecutor._forward_step`), gathering from the sanitized logits
   before sampling. Extend batches never replay a captured CUDA graph
-  (`ForwardStepRunner` requires decode mode), so no graph contract is
-  involved and there is no padding/buffer story for scoring.
+  (`ForwardStepRunner` requires decode mode), but the shared forward return contract still carries both prompt
+  logprobs and scores. Capture, replay, eager, idle and pipeline-parallel
+  placeholders return the same five fields. Pipeline stages receive score
+  rows with the existing commit-time result broadcast; decode graphs return `None`
+  for both prefill-only readouts.
 - The payload flows `ModelExecutionResult.score_logprobs` →
   `RequestState.score_vals` → `BatchTokenIDOut.output_score_vals` →
   `BatchTokenIDOutSlim` for the msgpack frontend. Wire fields are
   appended tails with defaults (older peers decode `None`).
+- PD handoff: the committed score row follows the existing bootstrap
+  metadata transfer as an optional trailing float64 status frame. Decode
+  publishes it only after every expected Prefill rank completes, before
+  finishing a zero-budget request. Room cleanup also drops pending rows.
+- Aborted items fail `async_score` and `async_decision`, even if a row was
+  computed before the abort. Numerical-abort outputs suppress that row.
 - SIS execution: each `query + item` is an independent logical sequence.
   The shared query is reused through the ordinary radix cache — item 1
   computes it, items 2..N prefix-match it. No new cache-group or
@@ -96,17 +105,19 @@ A score request is an ordinary generation request with
   `score_label_token_ids` / `score_apply_softmax` scores the prompt; the
   row appears as `scores` in the response dict alongside the (contract-
   irrelevant) bootstrap token.
-- SMG gateway: `/v1/score` is served by the external gateway (separate
-  repo), driving the engine over the msgpack wire
-  (`TokenizedGenerateReqInput` with the score fields in
-  `SamplingParams`; scores come back in `BatchTokenIDOutSlim`). The
-  control server proxies `/v1/score` unchanged.
+- SMG gateway: the control server proxies `/v1/score` unchanged, but
+  the pinned `tokenspeed-smg==1.10.1.post20260920` does not implement
+  that endpoint or decode the score column. HTTP Score serving requires
+  the separate gateway follow-up and a matching dependency pin. Its
+  decoder skips unknown trailing columns, preserving ordinary generation
+  with the appended score column. The in-process Engine APIs are usable
+  independently of that HTTP follow-up.
 
 ## Explicitly out of scope (v1)
 
 - MIS / shared-query fused attention, and setwise anchor extraction
   (`score_extraction_token`-style mid-sequence readout). Both need the
-  input-position scoring path, which is currently stubbed off.
+  input-position scoring integration for decisions, which v1 does not expose.
 - SequenceClassification (classification-head) models. Only causal-LM
   next-token label scoring is supported.
 - Calibration. `apply_softmax` yields the model's single-forward

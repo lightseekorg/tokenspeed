@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -738,12 +739,12 @@ def triton_dsa_prefill_topk_fp8(
     softmax_scale: float,
     index_k_cache: torch.Tensor | None = None,
     page_size: int | None = None,
-    index_k_fp8: torch.Tensor | None = None,
-    index_k_scale: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # Reads the plane only: the leaf declares no INDEX_K_WORKSPACE_ROWS_FEATURE,
+    # so the facade never hands it rows in workspace-row order.
     return _triton_dsa_prefill_topk_fp8_impl(
         q=q,
         weights=weights,
@@ -754,8 +755,6 @@ def triton_dsa_prefill_topk_fp8(
         softmax_scale=softmax_scale,
         index_k_cache=index_k_cache,
         page_size=page_size,
-        index_k_fp8=index_k_fp8,
-        index_k_scale=index_k_scale,
         max_logits_bytes=max_logits_bytes,
         out=out,
         lens_out=lens_out,
@@ -866,11 +865,8 @@ def triton_dsa_sharded_index_candidates(
     initial_tokens: int,
     local_tokens: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
-    from tokenspeed_kernel.platform import current_platform
-
     if current_platform().is_nvidia:
-        quantized, scale = quantize_fp8_with_scale(
+        quantized, scale = quantize_fp8(
             q.reshape(-1, q.shape[-1]),
             granularity="token_group",
             group_size=128,

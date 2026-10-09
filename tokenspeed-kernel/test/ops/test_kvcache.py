@@ -23,6 +23,9 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
+    _copy_state_rows_kernel,
+    _state_verify_commit_rows_kernel,
+    _zero_page_fields_kernel,
     copy_state_rows,
     fused_fp8_set_kv_buffer,
     index_k_block_split_scatter,
@@ -32,8 +35,51 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
     zero_byte_ranges,
+    zero_page_fields,
+)
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    _local_visible_lengths,
+    dcp_local_visible_lengths,
 )
 from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
+
+
+def test_dcp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> None:
+    def run(batch, cols, queries, padding):
+        owned = torch.arange(cols) % 3 == 0
+        prefix = torch.zeros((batch, cols + 1 + padding), dtype=torch.int32)
+        prefix[:, 1 : cols + 1] = owned.int().cumsum(0)
+        visible = torch.zeros((batch, queries + padding), dtype=torch.int32)
+        visible[:, :queries] = torch.linspace(0, cols * 64, queries).int()
+        endpoints = visible[:, :queries]
+        # Count each owned page's intersection with [0, endpoint).
+        expected = (
+            ((endpoints[..., None] - torch.arange(cols) * 64).clamp(0, 64) * owned)
+            .sum(-1)
+            .int()
+        )
+        prefix = prefix.to(device)[:, : cols + 1]
+        visible = visible.to(device)[:, :queries]
+        backing = torch.full(
+            (batch, queries + padding), -1, dtype=torch.int32, device=device
+        )
+        out = backing[:, :queries]
+        local = torch.empty(batch, dtype=torch.int32, device=device)
+        dcp_local_visible_lengths(
+            prefix, visible, page_size=64, out=out, local_lengths=local
+        )
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(local.cpu(), expected[:, -1], rtol=0, atol=0)
+        assert (backing[:, queries:] == -1).all()
+
+    # Queries 3 and 4 share the BLOCK=4 bucket. Exact widths and row strides,
+    # including their integer alignment classes, must not select new binaries.
+    run(1, 17, 3, 0)
+    with assert_no_triton_compile(_local_visible_lengths):
+        run(3, 63, 4, 0)
+        run(2, 129, 3, 13)
+        run(5, 1024, 4, 16)
 
 
 @pytest.mark.parametrize("extra_ranges", [0, 60])
@@ -54,6 +100,56 @@ def test_zero_byte_ranges_strides_and_preserves_neighbors(
 
     # Compare every byte, including leading/trailing guards and inter-range gaps.
     torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+
+
+def test_zero_page_fields_matches_host_expansion_without_recompiling(
+    device: str,
+) -> None:
+    # Three fields with page-major strides: one short plane, one that spans
+    # several 1 KiB tiles, and one wide enough for the tile loop to repeat.
+    fields = [(64, 4096, 48), (1_000_000, 8192, 3000), (3_000_000, 70_000, 65_537)]
+    field_table = torch.tensor(fields, dtype=torch.int64, device=device)
+    backing = torch.full((8_000_000,), 173, dtype=torch.uint8, device=device)
+
+    def run(page_ids: list[int], table: torch.Tensor) -> None:
+        expected = backing.cpu()
+        rows = table.tolist()
+        for page in page_ids:
+            for base, stride, size in rows:
+                expected[base + page * stride : base + page * stride + size] = 0
+        zero_page_fields(
+            backing,
+            torch.tensor(page_ids, dtype=torch.int32, device=device),
+            table,
+            max_field_bytes=max(size for _, _, size in rows),
+        )
+        torch.testing.assert_close(backing.cpu(), expected, rtol=0, atol=0)
+        backing.fill_(173)
+
+    run([1], field_table)
+    with assert_no_triton_compile(_zero_page_fields_kernel):
+        # Page and field counts vary per batch and per group; neither may
+        # trigger a compile (num_fields is do_not_specialize, so 1 and 16
+        # share the binary too).
+        run([3, 0, 3, 7], field_table)
+        run(list(range(1, 60)), field_table[:2])
+        run([5], field_table[:1])
+        run(list(range(60)), field_table.repeat(6, 1)[:16])
+
+    with pytest.raises(ValueError):
+        zero_page_fields(
+            backing,
+            torch.zeros(1, dtype=torch.float32, device=device),
+            field_table,
+            max_field_bytes=1,
+        )
+    with pytest.raises(ValueError, match="aligned"):
+        zero_page_fields(
+            backing,
+            torch.zeros(4, dtype=torch.int32, device=device)[1:],
+            field_table,
+            max_field_bytes=1,
+        )
 
 
 @pytest.mark.parametrize("tokens", [1, 4, 32])
@@ -408,6 +504,69 @@ def test_state_verify_commit_rows_matches_torch(
     ).repeat(num_layers)
     assert torch.equal(src_rows.to(torch.int64), expected_src)
     assert torch.equal(dst_rows.to(torch.int64), expected_dst)
+
+
+def test_verify_commit_rows_compile_once_across_batch_sizes(device: str) -> None:
+    """Batch and row counts follow the batch every round; neither keys a binary."""
+    num_layers, verify_width, words = 2, 3, 40
+
+    def table(tensors: list[torch.Tensor], value) -> torch.Tensor:
+        dtype = torch.uint64 if value == "address" else torch.int64
+        return torch.tensor(
+            [t.data_ptr() if value == "address" else t.stride(0) for t in tensors],
+            device=device,
+            dtype=dtype,
+        )
+
+    def run(batch_size: int) -> None:
+        accepted = torch.randint(
+            0, verify_width + 2, (batch_size,), device=device, dtype=torch.int32
+        )
+        pages = torch.arange(1, batch_size + 1, device=device, dtype=torch.int64)
+        src_rows = torch.empty(
+            num_layers * batch_size, device=device, dtype=torch.int64
+        )
+        dst_rows = torch.empty_like(src_rows)
+        state_verify_commit_rows(
+            accepted,
+            pages,
+            src_rows,
+            dst_rows,
+            verify_width=verify_width,
+            num_layers=num_layers,
+            group_indices=None,
+        )
+        scratch = [
+            torch.randint(
+                0, 1000, (batch_size * (verify_width + 1), words), device=device
+            ).int()
+            for _ in range(num_layers)
+        ]
+        committed = [
+            torch.full((batch_size + 1, words), -1, device=device, dtype=torch.int32)
+            for _ in range(num_layers)
+        ]
+        copy_state_rows(
+            table(scratch, "address"),
+            table(committed, "address"),
+            src_rows,
+            dst_rows,
+            row_bytes=words * 4,
+            src_row_strides=table(scratch, "stride"),
+            dst_row_strides=table(committed, "stride"),
+        )
+        rows = torch.arange(batch_size, device=device) * (
+            verify_width + 1
+        ) + accepted.long().clamp(1, verify_width)
+        for layer in range(num_layers):
+            assert torch.equal(committed[layer][1:], scratch[layer][rows])
+
+    run(4)
+    with assert_no_triton_compile(
+        _state_verify_commit_rows_kernel, _copy_state_rows_kernel
+    ):
+        for batch_size in (1, 16, 17, 33, 64):
+            run(batch_size)
 
 
 def test_state_verify_commit_rows_single_layer_matches_tiled_prefix(

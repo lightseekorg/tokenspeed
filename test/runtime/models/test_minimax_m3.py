@@ -22,6 +22,7 @@ from tokenspeed.runtime.models.minimax_m3 import (
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 def _tiny_config() -> MiniMaxM3Config:
@@ -95,7 +96,6 @@ def _tp4_mapping() -> Mapping:
         rank=0,
         world_size=4,
         attn_tp_size=4,
-        attn_cp_size=1,
         attn_dp_size=1,
         dense_tp_size=4,
         dense_dp_size=1,
@@ -159,7 +159,7 @@ def test_minimax_m3_attention_family_selects_msa() -> None:
     assert spec.default_backend is None
 
     model_config = SimpleNamespace(attention_arch=None)
-    spec.configure(model_config)
+    spec.configure(model_config, ServerArgs(model="x"))
     assert model_config.attention_arch is AttentionArch.MSA
 
 
@@ -231,7 +231,9 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
         }
 
     # Parameter layout and checkpoint loading do not require an executable kernel.
-    monkeypatch.setattr("tokenspeed_kernel.moe_plan", meta_moe_plan)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.moe.expert.kernel_moe_plan", meta_moe_plan
+    )
     model = _build_model(monkeypatch, quant_config=_mxfp8_config())
 
     assert isinstance(model.model.layers[0].mlp, MiniMaxM3MLP)

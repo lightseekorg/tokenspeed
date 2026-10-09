@@ -43,14 +43,14 @@ std::int64_t SnapshotStateReserveTokens(std::int64_t block_granularity, std::int
 namespace {
 
 std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillReserve& reserve) {
-    if (group.IsSnapshotStateGroup()) {
+    if (group.Kind() == AttnKind::kMambaState) {
         if (!reserve.reserve_snapshot_state_growth) {
             return 0;
         }
         return static_cast<std::int32_t>(
             SnapshotStateReserveTokens(group.block_granularity, reserve.decode_input_tokens));
     }
-    if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
+    if (group.Kind() == AttnKind::kSlidingWindow) {
         return reserve.DecodeTokens();
     }
     return std::max(reserve.DecodeTokens(), reserve.prompt_headroom_tokens);
@@ -84,7 +84,7 @@ void MakeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<co
     _assert(before_tokens >= 0 && after_tokens > before_tokens,
             "snapshot-state prefill requires a positive advancing extent");
     for (std::size_t i = 0; i < demands.size(); ++i) {
-        if (!cache_groups[i].IsSnapshotStateGroup()) {
+        if (cache_groups[i].Kind() != AttnKind::kMambaState) {
             continue;
         }
         const std::int32_t block_granularity = coordinator.GroupBlockGranularity(static_cast<std::int32_t>(i));

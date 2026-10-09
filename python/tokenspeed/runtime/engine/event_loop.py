@@ -40,6 +40,11 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.engine.batch_log import BatchLogger
 from tokenspeed.runtime.engine.cache_hooks import L2CacheHooks
+from tokenspeed.runtime.engine.eplb_hooks import (
+    EplbHooks,
+    make_expert_rebalance_controller,
+    rebalance_release_refusal,
+)
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
 from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender, NullSender
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
@@ -51,6 +56,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     RequestHistoryRows,
     advance_scheduler,
     engram_context_len,
+    input_logprob_plan_for_forward,
     make_config,
     ngram_inputs_for_forward,
     resolve_dspark_prefix_replay_tokens,
@@ -92,7 +98,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
     get_zmq_socket,
 )
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict_update
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.jit_compile_check import (
     install_jit_compile_check,
@@ -101,6 +107,7 @@ from tokenspeed.runtime.utils.jit_compile_check import (
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.startup_timing import startup_phase
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
@@ -239,6 +246,8 @@ class EventLoop:
         specs = device.specs
         self.multimodal_encoder_dtype = specs.multimodal_encoder_dtype
         self.cache_storage = specs.cache_storage
+        # Republished to the ingress (engine ready info, msgpack handshake).
+        self.supports_prompt_logprobs: bool = specs.supports_prompt_logprobs
         self._scheduler_cache_geometry = specs.cache_geometry
         geometry = self._scheduler_cache_geometry
         # The contract is the one source of admitted capacity.
@@ -248,18 +257,14 @@ class EventLoop:
         cache_groups = specs.cache_groups
         # The builder may have lowered this to the cache-group checkpoint grain.
         max_scheduled_tokens = server_args.chunked_prefill_size
+        # The forward token bound also caps each multimodal encoder call.
+        self._max_encoder_tokens = max_scheduled_tokens
 
         self.attn_tp_size = server_args.attn_tp_size or mapping.attn.tp_size
         self.world_size = server_args.world_size or mapping.world_size
         self.attn_tp_rank = attn_tp_rank
         self.attn_tp_cpu_group = pg_manager.get_process_group(
             "gloo", server_args.mapping.attn.tp_group
-        )
-        self.attn_cp_size = mapping.attn.cp_size
-        self.attn_cp_cpu_group = (
-            pg_manager.get_process_group("gloo", mapping.attn.cp_group)
-            if mapping.has_attn_cp
-            else None
         )
         self.pp_size = mapping.pp_size
         self.pp_cpu_group = (
@@ -277,6 +282,9 @@ class EventLoop:
             self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
             self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
         num_host_pages = specs.num_host_pages
+        # The cache hooks gather over the TP CPU group, so the gather is sized
+        # by that group, which --emulate-rank-zero backs with this process alone.
+        cache_replica_tp_size = self.attn_tp_cpu_group.size()
         # L2 cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when kvstore is disabled. The hooks
         # get the handle, not the L2 executor: polling goes through it.
@@ -284,10 +292,8 @@ class EventLoop:
             self._device if server_args.enable_kvstore else None,
             speculative_algorithm=server_args.speculative_algorithm,
             attn_tp_rank=attn_tp_rank,
-            attn_tp_size=self.attn_tp_size,
+            attn_tp_size=cache_replica_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
-            attn_cp_size=self.attn_cp_size,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
             pp_size=self.pp_size,
             pp_cpu_group=self.pp_cpu_group,
             global_rank=global_rank,
@@ -374,10 +380,8 @@ class EventLoop:
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             self._device if scheduler_cfg.enable_l3_storage else None,
-            attn_tp_size=self.attn_tp_size,
+            attn_tp_size=cache_replica_tp_size,
             attn_tp_cpu_group=self.attn_tp_cpu_group,
-            attn_cp_size=self.attn_cp_size,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
             pp_size=self.pp_size,
             pp_cpu_group=self.pp_cpu_group,
         )
@@ -442,12 +446,21 @@ class EventLoop:
         self._pause = PauseController(self.send_to_tokenizer)
         self._pause_hooks = PauseHooks(self, self._pause, self._device)
 
+        # Online expert rebalance (--enable-eplb): the controller is the
+        # self-contained state machine (moe/expert_rebalance.py); EplbHooks
+        # below is the loop-side glue. None without the flag.
+        self._eplb = make_expert_rebalance_controller(
+            self.server_args, specs.expert_rebalance
+        )
+
         # GPU-memory data plane (release/resume_memory_occupation). Reuses the
         # pause controller's drain machinery; frees memory via the memory-saver
         # adapter once the scheduler drains. See memory_occupation.py.
         # Releasing KV is only safe if any prefix cache it backs can be cleared:
         # either prefix caching is off, or the scheduler exposes a clear. Decide
         # once here (static config) and let the controller reject unsafe releases.
+        # A release is refused while an expert rebalance is in progress, and a
+        # drained release waits while chunk ops still write the weights.
         kv_cache_release_allowed = (
             not self.server_args.enable_prefix_caching
             or callable(getattr(self.scheduler, "clear_l1_cache", None))
@@ -462,6 +475,12 @@ class EventLoop:
             reset_caches_fn=self._pause_hooks.reset_caches_for_release,
             kv_repair_fn=self._pause_hooks.kv_repair_after_wake,
             kv_cache_release_allowed=kv_cache_release_allowed,
+            weights_release_refusal_fn=rebalance_release_refusal(self._eplb),
+            weights_busy_fn=(
+                (lambda: False)
+                if self._eplb is None
+                else (lambda: self._eplb.is_applying)
+            ),
         )
 
         self.metrics = EngineMetrics(
@@ -491,6 +510,21 @@ class EventLoop:
             pause_controller=self._pause,
             memory_controller=self._memory,
             device=self._device,
+        )
+
+        # The rebalance's loop-side glue: the controller's ops ride the request
+        # handler's internal-op FIFO through the same-round gate and complete
+        # through the handle's named operations (see eplb_hooks.py).
+        self._eplb_hooks = EplbHooks(
+            self._eplb,
+            self.request_handler,
+            self._device,
+            ep_cpu_group=(
+                pg_manager.get_process_group("gloo", mapping.moe.ep_group)
+                if self._eplb is not None and len(mapping.moe.ep_group) > 1
+                else None
+            ),
+            ep_group_ranks=tuple(mapping.moe.ep_group),
         )
 
         self.output_processor = OutputProcesser(
@@ -574,6 +608,7 @@ class EventLoop:
     # Helpers
     # ------------------------------------------------------------------
 
+    @startup_phase("model.config")
     def _load_model_config(
         self, model_path: str, is_draft_worker: bool = False
     ) -> ModelConfig:
@@ -598,7 +633,13 @@ class EventLoop:
             is_draft_worker=is_draft_worker,
         )
 
+    @startup_phase("distributed.init")
     def _init_distributed(self) -> float:
+        # The communication backend reads the resolved launch (node spans,
+        # RS/AG buffer capacity, the collective switches) from this dict, and
+        # the distributed init already probes it; publish before probing. The
+        # model runner republishes after its own resolution.
+        global_server_args_dict_update(self.server_args)
         max_num_input_tokens = (
             self.server_args.chunked_prefill_size
             if self.server_args.chunked_prefill_size > 0
@@ -617,24 +658,21 @@ class EventLoop:
     def _owns_request_io(self) -> bool:
         """True when this rank owns the tokenizer ZMQ pair and load reports.
 
-        PP: only global rank 0. Otherwise attention TP rank 0 and CP rank 0,
-        because ``ENABLE_CP`` leaves every worker at ``attn_tp_rank == 0``.
-        Load reporting must use this same predicate: nonowners get a
-        ``NullSender`` with no ``set_load_snapshot``.
+        PP: only global rank 0. Otherwise attention TP rank 0. Load reporting
+        must use this same predicate: nonowners get a ``NullSender`` with no
+        ``set_load_snapshot``.
         """
 
         mapping = self.server_args.mapping
         if mapping.has_pp:
             return mapping.rank == 0
-        return self.attn_tp_rank == 0 and mapping.attn.cp_rank == 0
+        return self.attn_tp_rank == 0
 
     def _init_interprocess_comm(self):
         context = zmq.Context(2)
         # Chunk-pipeline: request I/O is owned by GLOBAL rank 0 only —
         # every stage's tp_rank-0 would otherwise try to open the one
         # frontend socket pair. recv_reqs broadcasts over the world group.
-        # ENABLE_CP without PP: every worker is attn_tp_rank 0, so only
-        # cp_rank 0 owns the socket; RequestHandler fans recv_reqs across CP.
         if self._owns_request_io():
             if self.server_args.zmq_msgpack:
                 # SMG drives the scheduler directly: it binds the sockets and
@@ -792,10 +830,18 @@ class EventLoop:
         outputs. Every rank's C++ scheduler expects the REAL bootstrap
         payload in the final chunk's ExtendResult — the sampled first token
         (read back as LastToken) and the drafter candidates its remote
-        decode will carry — so the last stage broadcasts (output_tokens,
-        output_lengths, next_input_ids) over the PP gloo group and the
-        others adopt them. Runs on the commit path (queue head), off the
-        dispatch hot path.
+        decode will carry — and every rank's output processor owns the
+        request state the logprobs land in and takes the abort-or-finish
+        branch the NaN guard decides, so the last stage broadcasts
+        (output_tokens, output_lengths, next_input_ids, output_logprobs,
+        input_token_logprobs, output_nan_flags, score_logprobs) over the PP gloo group and
+        the others adopt them. The flags travel with the values they audit:
+        only the last stage holds logits and prompt logprobs to flag, and a
+        stage recording the adopted (sanitized) logprobs as healthy while
+        the last stage aborts the request would leave the stages' schedulers
+        disagreeing on it. The prompt-logprob plan the flat vector follows
+        is mirrored on every rank already. Runs on the commit path (queue
+        head), off the dispatch hot path.
         """
         mapping = self.server_args.mapping
         if not mapping.has_pp:
@@ -811,14 +857,23 @@ class EventLoop:
                     results.output_tokens,
                     results.output_lengths,
                     results.next_input_ids,
+                    results.output_logprobs,
+                    results.input_token_logprobs,
+                    results.output_nan_flags,
+                    results.score_logprobs,
                 )
             ]
         dist.broadcast_object_list(payload, src=src_global_rank, group=group)
         if not mapping.is_last_pp_rank:
-            tokens, lengths, next_ids = payload[0]
-            results.output_tokens = tokens
-            results.output_lengths = lengths
-            results.next_input_ids = next_ids
+            (
+                results.output_tokens,
+                results.output_lengths,
+                results.next_input_ids,
+                results.output_logprobs,
+                results.input_token_logprobs,
+                results.output_nan_flags,
+                results.score_logprobs,
+            ) = payload[0]
 
     def _commit_forward_results(
         self,
@@ -1101,6 +1156,9 @@ class EventLoop:
                             if self._request_history_rows is not None
                             else None
                         )
+                        input_logprob_plan = input_logprob_plan_for_forward(
+                            forward_op, self.output_processor.rid_to_state
+                        )
                         self._batch_logger.log_dispatch(forward_op, stats)
 
                         if in_flight and self._dispatch_depends_on_pending_commit(
@@ -1116,9 +1174,12 @@ class EventLoop:
                             grammar_inputs=grammar_inputs,
                             ngram_inputs=ngram_inputs,
                             request_history_seeds=request_history_seeds,
+                            input_logprob_plan=input_logprob_plan,
                             multimodal_context=(
                                 multimodal_context_for_forward(
-                                    forward_op, self.output_processor.rid_to_state
+                                    forward_op,
+                                    self.output_processor.rid_to_state,
+                                    self._max_encoder_tokens,
                                 )
                                 if self.model_config.is_multimodal_active
                                 else None
@@ -1144,6 +1205,12 @@ class EventLoop:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:
                         in_flight.append((forward_op, pending))
+                    # Online expert rebalance: count this rank's forward (real
+                    # or DP-idle, rank-identical) and enqueue the ops it makes
+                    # due; they complete through the request handler's gate.
+                    self._eplb_hooks.note_round(
+                        forwarded=pending is not None or need_idle_forward
+                    )
 
                 if not paused_round:
                     # Commit from the head once the queue exceeds the depth
@@ -1234,6 +1301,7 @@ class EventLoop:
 
     def close(self) -> None:
         self.load_reporter.close()
+        self._eplb_hooks.close()
         # Best-effort: tell an attached SMG frontend this engine is going away
         # (msgpack mode only; the pickle sender has no such helper) so the
         # worker is marked dead instead of staying healthy-idle.
@@ -1257,7 +1325,16 @@ def run_event_loop(
     dp_rank = mapping.attn.dp_rank
     global_rank = mapping.rank
 
-    setproctitle.setproctitle(f"tokenspeed::scheduler_{dp_rank}")
+    process_title = f"tokenspeed::scheduler_tp{attn_tp_rank}"
+    if mapping.moe.has_ep:
+        process_title += f"_ep{mapping.moe.ep_rank}"
+    if mapping.attn.has_dp:
+        process_title += f"_dp{dp_rank}"
+    if mapping.attn.has_dcp:
+        process_title += f"_dcp{mapping.attn.dcp_rank}"
+    if mapping.has_pp:
+        process_title += f"_pp{mapping.pp_rank}"
+    setproctitle.setproctitle(process_title)
     # Re-assert the NVSHMEM IB traffic class in every inference process:
     # NVSHMEM reads it from the process environment at bootstrap, and worker
     # processes may be spawned without inheriting the launcher's setting.
@@ -1302,17 +1379,20 @@ def run_event_loop(
             previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
             signal.signal(signal.SIGTERM, request_shutdown)
 
-        maybe_warm_cupti_for_graph_capture()
+        with startup_phase(
+            "scheduler.init", rank=global_rank, role=server_args.disaggregation_mode
+        ):
+            maybe_warm_cupti_for_graph_capture()
 
-        event_loop = EventLoop(
-            server_args,
-            port_args,
-            gpu_id,
-            attn_tp_rank,
-            dp_rank,
-            global_rank,
-            shutdown_event,
-        )
+            event_loop = EventLoop(
+                server_args,
+                port_args,
+                gpu_id,
+                attn_tp_rank,
+                dp_rank,
+                global_rank,
+                shutdown_event,
+            )
         pipe_writer.send(
             {
                 "status": "ready",
@@ -1324,6 +1404,7 @@ def run_event_loop(
                 "max_model_len": event_loop.max_model_len,
                 "multimodal_encoder_dtype": event_loop.multimodal_encoder_dtype,
                 "cache_storage": getattr(event_loop, "cache_storage", None),
+                "supports_prompt_logprobs": event_loop.supports_prompt_logprobs,
             }
         )
 

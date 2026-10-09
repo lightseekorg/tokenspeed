@@ -1033,30 +1033,6 @@ def triton_bmm_fp8_blockscale(
     return C
 
 
-def _triton_dsv4_grouped_output_projection_weights(
-    *,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    num_groups: int,
-    output_dim: int,
-    input_dim: int,
-    block_size: tuple[int, int],
-    recipe: tuple[int, int, int],
-) -> torch.Tensor:
-    del weight, recipe
-    block_n, block_k = block_size
-    expected_shape = (
-        num_groups * (output_dim // block_n),
-        input_dim // block_k,
-    )
-    if tuple(weight_scale.shape) != expected_shape:
-        raise ValueError(
-            "grouped output projection scale shape mismatch: "
-            f"expected {expected_shape}, got {tuple(weight_scale.shape)}"
-        )
-    return weight_scale
-
-
 @register_kernel(
     "gemm",
     "dsv4_grouped_output_projection",
@@ -1072,7 +1048,6 @@ def _triton_dsv4_grouped_output_projection_weights(
     ),
     traits={},
     priority=Priority.PERFORMANT + 3,
-    weight_preprocessor=_triton_dsv4_grouped_output_projection_weights,
 )
 def triton_dsv4_grouped_output_projection(
     *,
@@ -1280,8 +1255,11 @@ def triton_mm_mxfp4(
     name="triton_mm_fp8_scaled",
     solution="triton",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        vendors=frozenset({"nvidia"}),
+        vendors=frozenset({"nvidia", "amd"}),
+        vendor_min_arch_versions={
+            "nvidia": ArchVersion(10, 0),
+            "amd": ArchVersion(9, 5),
+        },
     ),
     signatures=_FP8_SCALED_FORMAT_SIGNATURES,
     traits={
@@ -1301,6 +1279,22 @@ def triton_mm_fp8_scaled(
     bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """FP8 E4M3 GEMM with per-token/per-tensor A and per-channel/per-tensor B scales.
+
+    Args:
+        A: ``[M, K]`` FP8 activations.
+        B: ``[K, N]`` FP8 weights (a transposed ``[N, K]`` view is accepted).
+        A_scales: FP32 ``[M, 1]`` per-token or ``[1, 1]`` per-tensor scales.
+        B_scales: FP32 ``[N, 1]`` per-channel or ``[1, 1]`` per-tensor scales.
+        out_dtype: Output dtype.
+        alpha: Unused; accepted for the ``gemm.mm`` calling convention.
+        block_size: Unused; accepted for the ``gemm.mm`` calling convention.
+        bias: Optional ``[N]`` bias added in the epilogue.
+        out: Optional ``[M, N]`` output buffer.
+
+    Returns:
+        ``[M, N]`` tensor ``(A * A_scales) @ (B * B_scales^T)`` in ``out_dtype``.
+    """
     return triton_scaled_mm(
         A,
         B,

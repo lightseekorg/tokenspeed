@@ -37,6 +37,9 @@ import math
 import msgspec
 import pytest
 import torch
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.decision import (
     STYLE_FUSED_CHOICE,
@@ -45,12 +48,6 @@ from tokenspeed.runtime.decision import (
     GenericDecisionAdapter,
     get_decision_adapter,
 )
-from tokenspeed.runtime.engine.io_struct import (
-    BatchTokenIDOut,
-    BatchTokenIDOutSlim,
-)
-from tokenspeed.runtime.entrypoints.engine import Engine
-from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.sampling.score_utils import (
     build_score_label_ids,
@@ -188,6 +185,8 @@ def test_finalize_score_row_softmax_normalizes_across_labels():
 
 def test_sampling_batch_info_slices_score_label_ids():
     label_ids = torch.tensor([[5, 9], [0, 0], [1, 2]])
+    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+
     info = SamplingBatchInfo(score_label_ids=label_ids)
     assert info[:2].score_label_ids.tolist() == [[5, 9], [0, 0]]
     assert info[2:].score_label_ids.tolist() == [[1, 2]]
@@ -326,7 +325,9 @@ class _StubTokenizerManager:
         yield self._outputs
 
 
-def _engine_with(outputs, tokenizer=None) -> Engine:
+def _engine_with(outputs, tokenizer=None):
+    from tokenspeed.runtime.entrypoints.engine import Engine
+
     engine = Engine.__new__(Engine)
     engine.tokenizer_manager = _StubTokenizerManager(outputs, tokenizer)
     return engine
@@ -356,7 +357,7 @@ def test_engine_async_score_joins_rows_in_items_order():
 
 
 def test_engine_async_score_missing_row_raises():
-    engine = _engine_with([{"meta_info": {"finish_reason": {"type": "abort"}}}])
+    engine = _engine_with([{"meta_info": {"finish_reason": {"type": "length"}}}])
     with pytest.raises(RuntimeError, match="without a score readout"):
         asyncio.run(
             engine.async_score(
@@ -366,6 +367,28 @@ def test_engine_async_score_missing_row_raises():
                 apply_softmax=False,
             )
         )
+
+
+@pytest.mark.parametrize("row", ([0.75, 0.25], None))
+def test_engine_async_score_rejects_aborted_item(row):
+    engine = _engine_with(
+        [{"scores": row, "meta_info": {"finish_reason": {"type": "abort"}}}]
+    )
+    with pytest.raises(RuntimeError, match="score item 0 aborted"):
+        asyncio.run(
+            engine.async_score(
+                query="Q?", items=["i0"], label_token_ids=[100, 200], apply_softmax=True
+            )
+        )
+
+
+def test_engine_async_decision_rejects_aborted_scores():
+    engine = _engine_with(
+        [{"scores": [0.75, 0.25], "meta_info": {"finish_reason": {"type": "abort"}}}],
+        tokenizer=_StubTokenizer(),
+    )
+    with pytest.raises(RuntimeError, match="aborted"):
+        asyncio.run(engine.async_decision(_request()))
 
 
 def test_engine_async_score_validates_arguments():
@@ -410,7 +433,9 @@ def test_engine_async_decision_requires_tokenizer():
 # ---------------------------------------------------------------------------
 
 
-def _batch_out(score_vals) -> BatchTokenIDOut:
+def _batch_out(score_vals):
+    from tokenspeed.runtime.engine.io_struct import BatchTokenIDOut
+
     return BatchTokenIDOut(
         rids=["a", "b"],
         finished_reasons=[None, None],
@@ -447,6 +472,8 @@ def _batch_out(score_vals) -> BatchTokenIDOut:
 
 
 def test_batch_token_id_out_slim_carries_scores():
+    from tokenspeed.runtime.engine.io_struct import BatchTokenIDOutSlim
+
     slim = BatchTokenIDOutSlim.from_full(_batch_out([[0.8, 0.2], []]))
     assert slim.output_score_vals == [[0.8, 0.2], []]
     decoded = msgspec.msgpack.decode(
@@ -456,6 +483,12 @@ def test_batch_token_id_out_slim_carries_scores():
 
 
 def test_batch_token_id_out_slim_defaults_score_column():
+    from tokenspeed.runtime.engine.io_struct import BatchTokenIDOutSlim
+
     # A full batch without score metadata yields a non-ragged empty column.
     slim = BatchTokenIDOutSlim.from_full(_batch_out(None))
     assert slim.output_score_vals == [[], []]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

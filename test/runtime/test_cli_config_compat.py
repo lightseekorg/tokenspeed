@@ -62,7 +62,6 @@ class TestCLIConfigCompat(unittest.TestCase):
         return (
             mapping.world_size,
             mapping.attn.tp_size,
-            mapping.attn.cp_size,
             mapping.attn.dp_size,
             mapping.dense.tp_size,
             mapping.dense.dp_size,
@@ -179,7 +178,7 @@ class TestCLIConfigCompat(unittest.TestCase):
         )[:2]
         dense_tp = self._parallelism_snapshot(
             ["--model", "test/model", "--attn-tp-size", "8"]
-        )[4]
+        )[3]
         self.assertEqual((world, attn_tp), (8, 8))
         self.assertEqual(dense_tp, 8)
 
@@ -196,7 +195,7 @@ class TestCLIConfigCompat(unittest.TestCase):
                 "2",
             ]
         )
-        world, attn_tp, _attn_cp, attn_dp, dense_tp = snap[:5]
+        world, attn_tp, attn_dp, dense_tp = snap[:4]
         self.assertEqual((world, attn_tp, attn_dp), (8, 4, 2))
         self.assertEqual(dense_tp, 4)
 
@@ -213,29 +212,8 @@ class TestCLIConfigCompat(unittest.TestCase):
                 "--dense-tp-size",
                 "8",
             ]
-        )[4]
+        )[3]
         self.assertEqual(dense_tp, 8)
-
-    def test_dense_tp_default_tracks_replica_width_under_cp(self):
-        # Under ENABLE_CP the attention TP size is reinterpreted as CP, so the
-        # replica width is attn_tp x attn_cp; the dense default must use the
-        # product, not the post-swap attn_tp (which is 1 here).
-        import tokenspeed.runtime.utils.server_args as server_args_mod
-
-        with patch.object(server_args_mod, "ENABLE_CP", True):
-            snap = self._parallelism_snapshot(
-                [
-                    "--model",
-                    "test/model",
-                    "--attn-tp-size",
-                    "4",
-                    "--data-parallel-size",
-                    "2",
-                ]
-            )
-        world, attn_tp, attn_cp, attn_dp, dense_tp = snap[:5]
-        self.assertEqual((world, attn_tp, attn_cp, attn_dp), (8, 1, 4, 2))
-        self.assertEqual(dense_tp, 4)
 
     # ---- vLLM config names ----
 
@@ -254,6 +232,34 @@ class TestCLIConfigCompat(unittest.TestCase):
             ["--model", "test/model", "--gpu-memory-utilization", "0.9"]
         )
         self.assertEqual(args.gpu_memory_utilization, 0.9)
+
+    def test_gpu_memory_utilization_default_is_one_value_at_every_world_size(self):
+        for tp in ("1", "2", "8", "16"):
+            sa = self._from_cli_args_no_init(
+                self._parse_args(
+                    ["--model", "test/model", "--tensor-parallel-size", tp]
+                )
+            )
+            sa.resolve_basic_defaults()
+            sa.resolve_parallelism()
+            sa.resolve_memory_and_scheduling()
+            self.assertEqual(sa.gpu_memory_utilization, 0.95, tp)
+        sa = self._from_cli_args_no_init(
+            self._parse_args(
+                [
+                    "--model",
+                    "test/model",
+                    "--tensor-parallel-size",
+                    "16",
+                    "--gpu-memory-utilization",
+                    "0.8",
+                ]
+            )
+        )
+        sa.resolve_basic_defaults()
+        sa.resolve_parallelism()
+        sa.resolve_memory_and_scheduling()
+        self.assertEqual(sa.gpu_memory_utilization, 0.8)
 
     def test_seed_arg(self):
         args = self._parse_args(["--model", "test/model", "--seed", "42"])
@@ -376,6 +382,11 @@ class TestCLIConfigCompat(unittest.TestCase):
         args = self._parse_args(["--model", "test/model", "--enable-log-requests"])
         self.assertTrue(args.enable_log_requests)
 
+    def test_log_requests_default_on(self):
+        args = self._parse_args(["--model", "test/model"])
+        self.assertTrue(args.enable_log_requests)
+        self.assertEqual(args.log_requests_level, 0)
+
     def test_disable_log_requests_arg(self):
         args = self._parse_args(["--model", "test/model", "--no-enable-log-requests"])
         self.assertFalse(args.enable_log_requests)
@@ -442,8 +453,12 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_speculative_decoding()
         self.assertIsNone(sa.speculative_draft_model_quantization)
 
-    def test_replay_ssm_defaults_to_disabled(self):
+    def test_replay_ssm_defaults_to_enabled(self):
         args = self._parse_args(["--model", "test/model"])
+        self.assertTrue(self._from_cli_args_no_init(args).enable_replay_ssm)
+
+    def test_replay_ssm_can_be_disabled(self):
+        args = self._parse_args(["--model", "test/model", "--disable-replay-ssm"])
         self.assertFalse(self._from_cli_args_no_init(args).enable_replay_ssm)
 
     def test_replay_ssm_can_be_enabled(self):
@@ -704,28 +719,93 @@ class TestCLIConfigCompat(unittest.TestCase):
         self.assertEqual(sa.speculative_num_steps, 1)
         self.assertEqual(sa.speculative_num_draft_tokens, 2)
 
-    def test_speculative_eagle_topk_cli_rejects_non_1(self):
-        # Only chain spec (topk=1) is wired end-to-end; the CLI choices
-        # set is the gate, so non-1 values must fail at parse time.
-        with self.assertRaises(SystemExit):
-            self._parse_args(["--model", "test/model", "--speculative-eagle-topk", "4"])
+    def _resolve_tree(self, algorithm, topk, steps, nodes, **overrides):
+        args = self._parse_args(
+            [
+                "--model",
+                "test/model",
+                "--speculative-algorithm",
+                algorithm,
+                "--speculative-eagle-topk",
+                str(topk),
+                "--speculative-num-steps",
+                str(steps),
+                "--speculative-num-draft-tokens",
+                str(nodes),
+            ]
+        )
+        sa = self._from_cli_args_no_init(args)
+        sa.resolve_basic_defaults()
+        for name, value in overrides.items():
+            setattr(sa, name, value)
+        sa.resolve_parallelism()
+        sa.resolve_speculative_decoding()
+        return sa
 
-    def test_speculative_eagle_topk_runtime_rejects_non_1_when_spec_on(self):
-        # ServerArgs can be built programmatically (e.g. by smg_grpc_servicer),
-        # bypassing argparse — keep the resolve-time defensive check covered.
+    def test_speculative_eagle_topk_accepts_draft_trees(self):
+        for algorithm in ("EAGLE3", "MTP"):
+            sa = self._resolve_tree(algorithm, 4, 5, 16)
+            self.assertEqual(sa.speculative_eagle_topk, 4)
+        # Largest budgets: 16 children per node; 64 nodes and 64 lane slots.
+        self._resolve_tree("EAGLE3", 16, 5, 64)
+        self._resolve_tree("EAGLE3", 8, 9, 64)
+
+    def test_speculative_eagle_topk_rejects_unsupported_trees(self):
+        cases = [
+            (("DFLASH", 4, 15, 16), {}, "needs --speculative-algorithm EAGLE3 or MTP"),
+            (("EAGLE3", 17, 2, 16), {}, "1..16 children"),
+            (("EAGLE3", 0, 3, 4), {}, "1..16 children"),
+            (("EAGLE3", 4, 11, 16), {}, "1..10 steps"),
+            (("EAGLE3", 16, 6, 64), {}, "lane slots"),
+            (("EAGLE3", 4, 5, 8), {}, "lane slots"),
+            (("EAGLE3", 4, 5, 65), {}, "speculative_num_draft_tokens=65"),
+            (("EAGLE3", 2, 2, 8), {}, "speculative_num_draft_tokens=8"),
+            (("EAGLE3", 4, 5, 16), {"grammar_backend": "xgrammar"}, "structured"),
+            (("EAGLE3", 4, 5, 16), {"enable_mixed_batch": True}, "mixed batches"),
+            (("EAGLE3", 4, 5, 16), {"disaggregation_mode": "decode"}, "disaggregation"),
+            (("EAGLE3", 4, 5, 16), {"pipeline_parallel_size": 2}, "pipeline stages"),
+            (
+                ("EAGLE3", 4, 5, 16),
+                {"world_size": 2, "data_parallel_size": 2},
+                "attention data parallelism",
+            ),
+            # Attention DP derived from the world and attention TP sizes, not set explicitly.
+            (
+                ("EAGLE3", 4, 5, 16),
+                {"world_size": 4, "attn_tp_size": 2},
+                "attention data parallelism",
+            ),
+        ]
+        for (algorithm, topk, steps, nodes), overrides, message in cases:
+            with self.subTest(algorithm=algorithm, topk=topk, steps=steps, nodes=nodes):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._resolve_tree(algorithm, topk, steps, nodes, **overrides)
+
+    def test_speculative_eagle_topk_requires_algorithm_and_node_budget(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--speculative-eagle-topk", "4"]
+        )
+        sa = self._from_cli_args_no_init(args)
+        with self.assertRaisesRegex(ValueError, "needs --speculative-algorithm"):
+            sa.resolve_basic_defaults()
         args = self._parse_args(
             [
                 "--model",
                 "test/model",
                 "--speculative-algorithm",
                 "EAGLE3",
+                "--speculative-eagle-topk",
+                "4",
             ]
         )
         sa = self._from_cli_args_no_init(args)
-        sa.speculative_eagle_topk = 4
-        sa.resolve_basic_defaults()
-        with self.assertRaisesRegex(ValueError, "speculative_eagle_topk"):
-            sa.resolve_speculative_decoding()
+        with self.assertRaisesRegex(ValueError, "node budget"):
+            sa.resolve_basic_defaults()
+
+    def test_speculative_chain_rejects_mismatched_draft_tokens(self):
+        with self.assertRaisesRegex(ValueError, "draft chain verifies"):
+            self._resolve_tree("EAGLE3", 1, 3, 8)
+        self._resolve_tree("EAGLE3", 1, 3, 4)
 
     def test_dp_sampling_is_opt_in(self):
         args = self._parse_args(["--model", "test/model"])

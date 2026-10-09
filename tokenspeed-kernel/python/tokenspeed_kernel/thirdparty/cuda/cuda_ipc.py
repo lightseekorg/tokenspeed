@@ -124,6 +124,7 @@ class CudaRTLibrary:
             cudaError_t,
             [ctypes.POINTER(ctypes.c_void_p), cudaIpcMemHandle_t, ctypes.c_uint],
         ),
+        Function("cudaIpcCloseMemHandle", cudaError_t, [ctypes.c_void_p]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -205,6 +206,9 @@ class CudaRTLibrary:
         )
         return devPtr
 
+    def cudaIpcCloseMemHandle(self, devPtr: ctypes.c_void_p) -> None:
+        self.CUDART_CHECK(self.funcs["cudaIpcCloseMemHandle"](devPtr))
+
 
 if current_platform().is_nvidia:
     cudart = CudaRTLibrary()
@@ -234,9 +238,17 @@ if current_platform().is_nvidia:
     def free_shared_buffer(
         pointers: List[int], group: Optional[ProcessGroup] = None
     ) -> None:
+        """Collectively close peer mappings before freeing the exported allocation."""
         if group is None:
             group = dist.group.WORLD
         rank = dist.get_rank(group=group)
+        cudart.cudaDeviceSynchronize()
+        for peer, pointer in enumerate(pointers):
+            if peer != rank and pointer is not None:
+                cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(pointer))
+        # CUDA requires all importers to close their mappings before the owner
+        # calls cudaFree; freeing an allocation with open imports is undefined.
+        dist.barrier(group=group)
         if pointers and len(pointers) > rank and pointers[rank] is not None:
             cudart.cudaFree(ctypes.c_void_p(pointers[rank]))
         dist.barrier(group=group)

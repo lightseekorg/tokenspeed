@@ -33,6 +33,9 @@ import math
 
 import pytest
 import torch
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.engine.generation_output_processor import (
     OutputProcesser,
@@ -89,6 +92,8 @@ class _ExecutionResult:
     output_nan_flags = None
     grammar_completion = None
     next_input_ids = None
+    input_token_logprobs = None
+    input_logprob_plan = None
     score_logprobs = torch.tensor([[-0.5, -2.0]])
 
 
@@ -102,6 +107,7 @@ def _score_state(apply_softmax: bool) -> RequestState:
         ),
         stream=False,
         tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
     )
 
 
@@ -169,3 +175,26 @@ def test_score_request_without_readout_finishes_without_scores():
     assert len(sender.items) == 1
     assert sender.items[0].output_score_vals == [[]]
     assert sender.items[0].finished_reasons[0] == {"type": "length", "length": 0}
+
+
+def test_numerical_abort_suppresses_score_row():
+    processor, sender = _processor_with(_score_state(apply_softmax=True))
+    result = _ExecutionResult()
+    result.output_nan_flags = torch.tensor([True])
+    processor.post_process_forward_op(_ForwardOp(), result, is_prefill_instance=False)
+    assert sender.items[0].finished_reasons[0]["type"] == "abort"
+    assert sender.items[0].output_score_vals == [[]]
+
+
+def test_remote_prefill_score_is_attached_before_zero_budget_finish():
+    processor, sender = _processor_with(_score_state(apply_softmax=True))
+    processor.on_remote_prefill_done("score", 11, 2, None, [0.8, 0.2])
+    events = processor.finish_remote_prefill_only_request("score")
+    assert sender.items[0].output_score_vals == [[0.8, 0.2]]
+    assert sender.items[0].finished_reasons[0] == {"type": "length", "length": 0}
+    assert "score" not in processor.rid_to_state
+    assert [type(event).__name__ for event in events] == ["Finish"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

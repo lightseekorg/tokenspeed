@@ -65,6 +65,12 @@ class SamplingBatchInfo:
     # index_select inside the captured graph.
     valid_cache_lengths: torch.Tensor | None = None
 
+    # fp32[pool_rows, N, vocab] — RuntimeStates.draft_probs, read-only
+    # reference, present only under --enable-speculative-sampling. Verify
+    # gathers its rows by `req_pool_indices` inside the captured graph and
+    # runs the draft-prob accept rule; None selects the target-only rule.
+    draft_probs: torch.Tensor | None = None
+
     # First batch row this info covers, relative to the step's full batch.
     # Per-step row-indexed backend buffers (the coin buffers a mixed round's
     # prepare_step filled in prefill-then-decode order) must be read at this

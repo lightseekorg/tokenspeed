@@ -108,6 +108,12 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
         "LongcatFlashForCausalLM",
     }
 )
+# Architectures whose config numbers only the cache-owning blocks as layers.
+_CACHE_LAYER_VIEW_ARCHITECTURES = frozenset(
+    {
+        "NemotronHForCausalLM",
+    }
+)
 
 
 class AttentionArch(IntEnum):
@@ -121,7 +127,7 @@ class AttentionArch(IntEnum):
 class _AttentionFamilySpec:
     name: str
     architectures: frozenset[str]
-    configure: Callable[[object], None]
+    configure: Callable[[object, ServerArgs], None]
     default_backend: str | None = None
     default_prefix_granularity: int | None = None
 
@@ -158,8 +164,9 @@ def is_deepseek_v4_nextn(config: PretrainedConfig) -> bool:
     return resolve_architecture(config) == "DeepseekV4ForCausalLMNextN"
 
 
-def configure_deepseek_v4_attention(model_config) -> None:
+def configure_deepseek_v4_attention(model_config, server_args: ServerArgs) -> None:
     """Derive DeepSeek V4's MLA-like dimensions for runtime setup."""
+    del server_args  # the geometry follows the checkpoint alone
 
     hf_config = model_config.hf_config
     model_config.head_dim = hf_config.head_dim
@@ -178,8 +185,9 @@ def configure_deepseek_v4_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
-def configure_deepseek_v41_attention(model_config) -> None:
+def configure_deepseek_v41_attention(model_config, server_args: ServerArgs) -> None:
     """V4.1 latent dimensions; YaRN changes RoPE, not the attention scale."""
+    del server_args  # the geometry follows the checkpoint alone
     hf = model_config.hf_text_config
     model_config.head_dim = hf.head_dim
     model_config.attention_arch = AttentionArch.MLA
@@ -191,8 +199,14 @@ def configure_deepseek_v41_attention(model_config) -> None:
     model_config.scaling = hf.head_dim**-0.5
 
 
-def configure_dsa_attention(model_config) -> None:
-    """Derive MLA latent plus DSA indexer geometry (GLM-DSA, DeepSeek-V3.2)."""
+def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
+    """Derive MLA latent plus DSA indexer geometry (GLM-DSA, DeepSeek-V3.2).
+
+    Every attention hook takes the resolved launch so a hook can key a choice
+    on it (``ModelProfile.configure_attention``); the in-tree ones plan the
+    same geometry under every launch.
+    """
+    del server_args
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -231,6 +245,10 @@ def configure_dsa_attention(model_config) -> None:
     model_config.index_n_heads = mla_config.index_n_heads
     model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
+    # The indexer's key plane: the FP8-with-scale rows every in-tree scoring
+    # leaf reads. A plugin hook that scores the checkpoint's bf16 keys sets
+    # "bf16" after this (layers/attention/configs/dsa.py INDEX_K_FORMATS).
+    model_config.index_k_format = "fp8_scaled"
 
     model_config.scaling = 1 / math.sqrt(
         model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
@@ -243,7 +261,8 @@ def configure_dsa_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
-def configure_mla_attention(model_config) -> None:
+def configure_mla_attention(model_config, server_args: ServerArgs) -> None:
+    del server_args  # the geometry follows the checkpoint alone
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -267,7 +286,8 @@ def configure_mla_attention(model_config) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
-def configure_minimax_m3_attention(model_config) -> None:
+def configure_minimax_m3_attention(model_config, server_args: ServerArgs) -> None:
+    del server_args  # the geometry follows the checkpoint alone
     model_config.attention_arch = AttentionArch.MSA
 
 
@@ -438,6 +458,8 @@ def _derive_num_attention_layers(
         num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
         num_attention_layers = num_hidden_layers * 2
+    if any(arch in _CACHE_LAYER_VIEW_ARCHITECTURES for arch in architectures):
+        num_attention_layers = len(hf_config.cache_layer_types)
     return num_attention_layers
 
 
@@ -644,19 +666,6 @@ class ModelConfig:
                 "Running in encoder-only mode: the language model will not "
                 "be constructed or loaded (encode role)."
             )
-        # Cap gpu_memory_utilization for VLMs in mm mode — the vision encoder
-        # needs headroom that the global default doesn't account for.
-        if (
-            self.is_multimodal_active
-            and getattr(server_args, "_gpu_memory_utilization_defaulted", False)
-            and server_args.gpu_memory_utilization > 0.9
-        ):
-            logger.info(
-                "Clamping gpu_memory_utilization "
-                f"{server_args.gpu_memory_utilization:.2f} -> 0.9 to leave headroom "
-                "for the vision encoder.",
-            )
-            server_args.gpu_memory_utilization = 0.9
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -691,6 +700,12 @@ class ModelConfig:
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
 
+        # Storage of the DSA index-key plane, one of INDEX_K_FORMATS
+        # (layers/attention/configs/dsa.py). A DSA model's configure-attention
+        # hook names it (configure_dsa_attention: "fp8_scaled"); None for a
+        # model without an indexer, and DSAConfig refuses None.
+        self.index_k_format: str | None = None
+
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.
         attention_family = _resolve_attention_family(
@@ -707,7 +722,7 @@ class ModelConfig:
                 ),
                 is_draft_worker=bool(is_draft_worker),
             )
-            self.model_profile.configure_attention(self)
+            self.model_profile.configure_attention(self, server_args)
         elif attention_family is not None:
             _apply_attention_defaults(
                 server_args,
@@ -716,9 +731,9 @@ class ModelConfig:
                 default_prefix_granularity=attention_family.default_prefix_granularity,
                 is_draft_worker=bool(is_draft_worker),
             )
-            attention_family.configure(self)
+            attention_family.configure(self, server_args)
         elif _is_dflash2_mla(self.hf_config, self.hf_text_config):
-            configure_mla_attention(self)
+            configure_mla_attention(self, server_args)
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -766,6 +781,13 @@ class ModelConfig:
 
         # Verify quantization
         self._verify_quantization()
+        if server_args is not None and not is_draft_worker:
+            # The decode TP layouts need unquantized o_proj / down_proj; judge
+            # the checkpoint's resolved method, not only --quantization.
+            server_args.validate_tp_batch_invariant_weights(
+                self.quantization,
+                getattr(self.hf_text_config, "disable_quant_module", None) or (),
+            )
 
         # Cache attributes
         self.hf_eos_token_id = self.get_hf_eos_token_id()

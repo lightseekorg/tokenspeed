@@ -43,6 +43,14 @@ global_server_args_dict: dict = {
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
     "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
     "numerics": ServerArgs.numerics,
+    "yarn_ramp_mask_device": ServerArgs.yarn_ramp_mask_device,
+    "mla_lora_scale": ServerArgs.mla_lora_scale,
+    "layer_boundary_norm": ServerArgs.layer_boundary_norm,
+    "router_topk": ServerArgs.router_topk,
+    "logprob_order": ServerArgs.logprob_order,
+    "moe_combine_order": ServerArgs.moe_combine_order,
+    "dsa_slot_order": ServerArgs.dsa_slot_order,
+    "tp_batch_invariant": ServerArgs.tp_batch_invariant,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
@@ -93,6 +101,14 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
             "batch_invariant_collectives": server_args.batch_invariant_collectives,
             "numerics": server_args.numerics,
+            "yarn_ramp_mask_device": server_args.yarn_ramp_mask_device,
+            "mla_lora_scale": server_args.mla_lora_scale,
+            "layer_boundary_norm": server_args.layer_boundary_norm,
+            "router_topk": server_args.router_topk,
+            "logprob_order": server_args.logprob_order,
+            "moe_combine_order": server_args.moe_combine_order,
+            "dsa_slot_order": server_args.dsa_slot_order,
+            "tp_batch_invariant": server_args.tp_batch_invariant,
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
@@ -264,6 +280,7 @@ class Envs:
     # values (a per-batch constexpr, one JIT compile on the forward thread per
     # batch shape), "error" raises on such a parameter, "off" disables the
     # monitor. CI serves with "error".
+    TOKENSPEED_STARTUP_TIMING = EnvBool(False)
     TOKENSPEED_JIT_COMPILE_CHECK = EnvStr("warn")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
@@ -306,9 +323,6 @@ class Envs:
     # Quantization
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
 
-    # EPLB
-    TOKENSPEED_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
-
     # Communication
     # InfiniBand traffic class for NVSHMEM (DeepEP all-to-all). Read in every
     # inference process entry so the value reaches NVSHMEM regardless of how
@@ -329,6 +343,13 @@ class Envs:
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
+    # "uniform" routes each token to a fixed random set of experts, so dummy
+    # weights spread MoE traffic like a trained router does.
+    TOKENSPEED_MOE_ROUTING_SIMULATION = EnvStr("")
+    # Tokens per request each speculative verify step keeps, on average, in
+    # place of what verification accepted. A raw string so malformed input
+    # fails at startup instead of silently turning the simulation off.
+    TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN = EnvStr("")
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
@@ -345,6 +366,8 @@ class Envs:
     TOKENSPEED_LOG_MM_TIMING = EnvBool(False)
     TOKENSPEED_MM_ENABLE_ENCODER_CUDA_GRAPH = EnvBool(False)
     TOKENSPEED_MM_VIDEO_ENCODER_CUDA_GRAPH_MAX_SEQUENCES_PER_BATCH = EnvInt(None)
+    # Eager V4.1 vision input tokens, before spatial merging.
+    TOKENSPEED_DEEPSEEK_V41_VISION_MAX_BATCH_TOKENS = EnvInt(16384)
     TOKENSPEED_MM_SKIP_COMPUTE_HASH = EnvBool(False)
 
     # fmt: on

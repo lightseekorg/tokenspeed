@@ -33,6 +33,9 @@ import os
 
 import pytest
 import torch
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="score e2e requires a GPU"
@@ -185,3 +188,24 @@ def test_score_rejects_decode_budget(engine_and_tokenizer):
                 "score_label_token_ids": label_ids,
             },
         )
+
+
+def test_ordinary_decode_graph_after_scoring(engine_and_tokenizer):
+    engine, tokenizer = engine_and_tokenizer
+    label_ids = [_single_token_id(tokenizer, t) for t in ("Yes", "No")]
+    engine.score(
+        query=_QUERY,
+        items=[_ITEM_CORRECT],
+        label_token_ids=label_ids,
+        apply_softmax=True,
+    )
+    out = engine.generate(
+        prompt="Count from one to five:",
+        sampling_params={"max_new_tokens": 8, "temperature": 0, "ignore_eos": True},
+    )
+    assert out["meta_info"]["completion_tokens"] == 8
+    assert "scores" not in out
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

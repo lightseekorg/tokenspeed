@@ -22,9 +22,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import cached_property
 from typing import ClassVar
 
+import numpy as np
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.base import (
@@ -103,7 +105,7 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             return recurrent
         raise ValueError(f"unknown state component {component_name!r}")
 
-    def zero_new_blocks(self, new_page_ids: dict[str, list[int]]) -> None:
+    def zero_new_blocks(self, new_page_ids: Mapping[str, np.ndarray]) -> None:
         if new_page_ids:
             self.arena.zero_blocks(new_page_ids)
 

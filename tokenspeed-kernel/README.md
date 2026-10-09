@@ -11,6 +11,27 @@ performant kernels for multi-silicon AI inference. It features:
 TokenSpeed-kernel is pip-installable on its own and can be directly used by
 others.
 
+## Nightly installation
+
+CUDA 13 nightly wheels are published daily from `main` for Linux x86_64 and
+ARM64, with Python 3.10–3.13. Versions append the UTC build date to the base
+version, for example `0.1.3.post20260929`.
+
+```bash
+pip install --upgrade tokenspeed-kernel \
+  --extra-index-url https://lightseek.org/whl/nightly
+```
+
+PyPI supplies dependencies that are absent from the nightly index. To select a
+specific nightly, use `tokenspeed-kernel==0.1.3.post20260929`. Post releases sort
+above the corresponding base release and do not require `--pre`.
+
+The `Build and Release tokenspeed-kernel` workflow also supports manual nightly
+builds from pull request branches. To publish manually, run it from `main` with
+both `nightly` and `publish_github` enabled. Same-day reruns preserve already
+published wheels.
+Historical nightlies are retained; automatic cleanup is deferred.
+
 ## Design Goals
 
 TokenSpeed-kernel is designed with the following functionality goals in mind:
@@ -126,7 +147,8 @@ iteration.
   graph replay, with raw samples, resolved registration metadata, and explicit
   failure outcomes.
 - Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
-  scopes are visible in Proton/Chrome traces.
+  scopes are visible in Proton/Chrome traces. The joint BF16 `mm` fast path
+  records the same shape metadata and scopes as registry-selected kernels.
 - End-to-end serving: POST `/start_profile` with
   `{"activities": ["PROTON"]}`, run the workload, then POST `/stop_profile`.
   Each scheduler process — the process where
@@ -164,6 +186,22 @@ which CI serving jobs use). Kernel tests guard batch-varying launches with
 `assert_no_triton_compile` in `test/utils.py`. JITs outside Triton, such as
 DeepGEMM's per-shape kernels, are not observed and need the same discipline
 at their call sites.
+A runtime argument still keys the cache: Triton specializes an integer on
+whether it is 1 or divisible by 16, and a pointer on 16-byte alignment. Startup
+warms only the classes graph capture happens to see, so on the serving path a
+per-batch count (tokens, rows, requests) belongs in `do_not_specialize`, and a
+pointer into a buffer sliced at a per-batch offset in
+`do_not_specialize_on_alignment`. A stride that changes between call sites but
+stays a multiple of 16, such as a projection's row width, stays a plain runtime
+argument: one class covers it, and the hint keeps row loads vectorized. A
+batch-derived block size is a fixed block with a loop rather than a
+power-of-two bucket, which still compiles once per new bucket while serving.
+The end-of-startup mark is also the package's compile switch, set whether or
+not the monitor is installed. A kernel whose library compiles once per batch
+shape and cannot bucket it, such as FlashInfer's joint BF16 GEMM (some runners
+compile per exact row count) or the ll_bf16 router's dot-product kernel, checks
+`compile_monitor.is_serving()` where it is dispatched: startup tuning and graph capture use it, and eager calls while
+serving take a GEMM that never compiles (cuBLAS through torch on NVIDIA).
 
 ### Plugins
 

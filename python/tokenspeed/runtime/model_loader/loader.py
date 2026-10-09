@@ -55,10 +55,12 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     filter_safetensors_files_by_weight_names,
     get_quant_config,
+    initialize_dummy_integer_weights,
     initialize_dummy_weights,
     instanttensor_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    require_unit_kv_scales,
     safetensors_filtered_weights_iterator,
     safetensors_weights_iterator,
 )
@@ -109,6 +111,8 @@ def device_loading_context(
                     p.data = p.data.to(original_device)
         # New parameters or parameters already on target device are untouched
 
+
+from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
 
@@ -394,8 +398,9 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        return require_unit_kv_scales(
+            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
+        )
 
     def _get_all_weights(
         self,
@@ -414,7 +419,11 @@ class DefaultModelLoader(BaseModelLoader):
                 getattr(model, "fall_back_to_pt_during_load", False),
             )
             bind_checkpoint_dir(hf_folder)
+        # A model that reads a stage-specific checkpoint subset names its own
+        # group; otherwise the caller says which ranks load this model at all.
         checkpoint_load_group = getattr(model, "checkpoint_load_group", None)
+        if checkpoint_load_group is None:
+            checkpoint_load_group = self.load_config.checkpoint_load_group
 
         primary_weights = DefaultModelLoader.Source(
             model_config.model_path,
@@ -447,33 +456,39 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> nn.Module:
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                )
+            with startup_phase("weights.allocate"):
+                with target_device:
+                    model = _initialize_model(
+                        model_config,
+                        self.load_config,
+                    )
 
-            model.load_weights(self._get_all_weights(model_config, model))
+            with startup_phase("weights.read_copy"):
+                model.load_weights(self._get_all_weights(model_config, model))
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    # When quant methods need to process weights after loading
-                    # (for repacking, quantizing, etc), they expect parameters
-                    # to be on the global target device. This scope is for the
-                    # case where cpu offloading is used, where we will move the
-                    # parameters onto device for processing and back off after.
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            with startup_phase("weights.postprocess"):
+                for _, module in model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        # When quant methods need to process weights after loading
+                        # (for repacking, quantizing, etc), they expect parameters
+                        # to be on the global target device. This scope is for the
+                        # case where cpu offloading is used, where we will move the
+                        # parameters onto device for processing and back off after.
+                        with device_loading_context(module, target_device):
+                            quant_method.process_weights_after_loading(module)
 
-                process_method = getattr(module, "process_weights_after_loading", None)
-                if process_method is not None:
-                    with device_loading_context(module, target_device):
-                        module.process_weights_after_loading(module)
+                    process_method = getattr(
+                        module, "process_weights_after_loading", None
+                    )
+                    if process_method is not None:
+                        with device_loading_context(module, target_device):
+                            module.process_weights_after_loading(module)
 
-            post_quant_warmup = getattr(model, "post_quant_warmup", None)
-            if callable(post_quant_warmup):
-                post_quant_warmup()
+            with startup_phase("weights.post_quant_warmup"):
+                post_quant_warmup = getattr(model, "post_quant_warmup", None)
+                if callable(post_quant_warmup):
+                    post_quant_warmup()
 
         return model.eval()
 
@@ -524,6 +539,14 @@ class DummyModelLoader(BaseModelLoader):
                     model_config,
                     self.load_config,
                 )
+            # Post-processing can read integer weights, such as index tables,
+            # so they need valid values before it runs.
+            initialize_dummy_integer_weights(model)
+            # An EAGLE3 draft cannot share a vocab-sharded target embedding,
+            # and its own dummy embedding is as valid as a loaded one.
+            mark_initialized = getattr(model, "mark_embedding_initialized", None)
+            if callable(mark_initialized):
+                mark_initialized()
             if getattr(model, "post_load_weights", None):
                 model.post_load_weights()
 

@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.activation.triton as activation_triton
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
+    _relu2_kernel,
     fused_gate_sigmoid_mul_add,
+    relu2,
     sigmoid_mul,
     silu_and_mul,
     situ_and_mul,
     swiglu_oai,
 )
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from utils import assert_no_triton_compile
 
 platform = current_platform()
 torch.manual_seed(42)
@@ -122,6 +127,101 @@ def test_sigmoid_mul_rejects_4d_gate(device: str) -> None:
     gate = torch.randn(4, 2, 4, 4, device=device, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="gate must be 2D or 3D"):
         sigmoid_mul(x, gate)
+
+
+def _headed_gate(
+    layout: str, tokens: int, heads: int, head_dim: int, dtype: torch.dtype, device
+) -> torch.Tensor:
+    """A gate for ``[tokens, heads * head_dim]``: 2D, 3D, or the strided 3D gate
+    half of a packed ``[tokens, heads, 2 * head_dim]`` tensor."""
+    packed = (4 * torch.randn(tokens, heads, 2 * head_dim, device=device)).to(dtype)
+    gate = packed[..., head_dim:]
+    if layout == "strided":
+        return gate
+    gate = gate.contiguous()
+    return gate.reshape(tokens, -1) if layout == "2d" else gate
+
+
+@pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("layout", ["2d", "3d", "strided"])
+def test_sigmoid_mul_head_bias_matches_eager(
+    layout: str, dtype: torch.dtype, bias_dtype: torch.dtype, device: str
+) -> None:
+    tokens, heads, head_dim = 19, 8, 128
+    x = torch.randn(tokens, heads * head_dim, device=device, dtype=dtype)
+    gate = _headed_gate(layout, tokens, heads, head_dim, dtype, device)
+    bias = torch.randn(heads, device=device)
+    # Saturate two heads to cover exp overflow and underflow.
+    bias[:2] = torch.tensor([100.0, -100.0])
+    bias = bias.to(bias_dtype)
+    z = gate.float().reshape(tokens, heads, head_dim) + bias.float()[:, None]
+    ref = (x.float() * (1.0 / (1.0 + torch.exp(-z))).reshape(x.shape)).to(dtype)
+
+    out = sigmoid_mul(x.clone(), gate, head_bias=bias)
+
+    # On NVIDIA the kernel rounds each FP32 operation as the eager expression does.
+    tol = 0 if platform.is_nvidia else (1e-2 if dtype == torch.bfloat16 else 5e-3)
+    torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("head_bias", [False, True])
+@pytest.mark.parametrize("layout", ["2d", "3d", "strided"])
+def test_sigmoid_mul_launch_arguments(
+    layout: str, head_bias: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Host side only, with the launch recorded: without ``head_bias`` the launch
+    is the one existing callers had; with it the bias and the per-head split of a
+    2D gate reach the kernel."""
+    launches = []
+
+    class _Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((args, kwargs))
+
+    monkeypatch.setattr(activation_triton, "_sigmoid_mul_kernel", _Kernel())
+    tokens, heads, head_dim = 3, 4, 64
+    gate = _headed_gate(layout, tokens, heads, head_dim, torch.bfloat16, "cpu")
+    x = torch.randn(tokens, heads * head_dim, dtype=torch.bfloat16)
+    bias = torch.randn(heads) if head_bias else None
+
+    assert sigmoid_mul(x, gate, bias) is x
+
+    ((args, kwargs),) = launches
+    assert args[0] is x and args[1] is gate and args[2] == x.numel()
+    assert args[3] is bias
+    width = heads * head_dim
+    split_2d = head_dim if head_bias else width
+    assert kwargs == {
+        "hidden_dim": width,
+        "head_dim": split_2d if layout == "2d" else head_dim,
+        "gate_row_stride": gate.stride(0),
+        "gate_head_stride": split_2d if layout == "2d" else gate.stride(1),
+        "BLOCK_SIZE": 1024,
+        "ENABLE_PDL": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "gate_shape,bias,match",
+    [
+        ((4, 4, 8), torch.ones(2), "num_heads mismatch"),
+        ((4, 32), torch.ones(5), "hidden_dim mismatch"),
+        ((4, 32), torch.ones(0), "hidden_dim mismatch"),
+        ((4, 4, 8), torch.ones(4, 2)[:, 0], "contiguous 1D"),
+        ((4, 4, 8), torch.ones(1, 4), "contiguous 1D"),
+        ((4, 4, 8), torch.ones(4, dtype=torch.int32), "bf16, fp16 or fp32"),
+    ],
+    ids=["3d_heads", "2d_split", "empty", "strided", "2d_bias", "int32"],
+)
+def test_sigmoid_mul_rejects_bad_head_bias(
+    gate_shape: tuple[int, ...], bias: torch.Tensor, match: str
+) -> None:
+    # Host-side checks run before any launch, so CPU tensors suffice.
+    x = torch.randn(4, 32, dtype=torch.bfloat16)
+    gate = torch.randn(gate_shape, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=match):
+        sigmoid_mul(x, gate, head_bias=bias)
 
 
 # --- silu_and_mul tests ---
@@ -413,3 +513,61 @@ def test_fused_swiglu_fp8_ue8m0_partial_pack_keeps_padding_zero(device: str) -> 
     _, packed_scale = fused_swiglu_fp8_ue8m0(gate_up, enable_pdl=False)
     tail = packed_scale[:, 1]
     assert bool(((tail >> 8) == 0).all()), "padding scale bytes must remain zero"
+
+
+@pytest.mark.parametrize("shape", [(1, 5376), (33, 1024), (7, 100)])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_relu2_matches_eager(shape: tuple[int, int], pdl: bool, device: str) -> None:
+    if pdl and not platform.is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA SM90+")
+    pdl_enabled(overwrite=pdl)
+    x = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    out = relu2(x, torch.empty_like(x), fp8_scale=None)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.relu(x).square())
+
+
+@pytest.mark.skipif(not platform.is_nvidia, reason="requires float8_e4m3fn CUDA")
+@pytest.mark.parametrize("pdl", [False, True])
+def test_relu2_fp8_quantizes_the_bf16_square(pdl: bool, device: str) -> None:
+    """Bit-identical to the BF16 activation followed by the linear's static quantization."""
+    if pdl and not platform.is_hopper_plus:
+        pytest.skip("PDL requires NVIDIA SM90+")
+    pdl_enabled(overwrite=pdl)
+    x = torch.randn(9, 5376, device=device, dtype=torch.bfloat16) * 3
+    # 1.03125**2 rounds to BF16 1.0625 and then FP8 1.0, but straight to FP8 1.125.
+    x[0, :4] = 1.03125
+    scale = torch.tensor([16.0 / 448.0], device=device)
+    for fp8_scale in (scale, torch.ones(1, device=device)):
+        out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        relu2(x, out, fp8_scale=fp8_scale)
+        expected, _ = quantize_fp8(torch.relu(x).square(), scale=fp8_scale)
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_relu2_in_place_from_strided_rows(device: str) -> None:
+    wide = torch.randn(4, 2048, device=device, dtype=torch.bfloat16)
+    x = wide[:, :1500]
+    expected = torch.relu(x).square()
+    untouched = wide[:, 1500:].clone()
+    relu2(x, x, fp8_scale=None)
+    assert torch.equal(x, expected)
+    assert torch.equal(wide[:, 1500:], untouched)
+
+
+def test_relu2_compiles_once_across_batch_sizes(device: str) -> None:
+    x = torch.randn(300, 1536, device=device, dtype=torch.bfloat16)
+    relu2(x[:3], torch.empty_like(x[:3]), fp8_scale=None)
+    with assert_no_triton_compile(_relu2_kernel):
+        for rows in (1, 16, 37, 300):
+            relu2(x[:rows], torch.empty_like(x[:rows]), fp8_scale=None)
+
+
+def test_relu2_contract(device: str) -> None:
+    x = torch.randn(3, 64, device=device, dtype=torch.bfloat16)
+    assert relu2(x[:0], x[:0], fp8_scale=None).shape == (0, 64)
+    with pytest.raises(ValueError, match="FP8 exactly"):
+        relu2(x, torch.empty_like(x), fp8_scale=torch.ones(1, device=device))
+    with pytest.raises(ValueError, match="dense columns"):
+        relu2(x.t(), x.t(), fp8_scale=None)

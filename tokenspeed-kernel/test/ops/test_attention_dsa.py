@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
 from tokenspeed_kernel.ops.attention.dsv4 import dsv4_plan
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 torch.manual_seed(42)
 
@@ -115,6 +116,7 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
         batch_invariant=False,
         index_k_cache=packed_index_k,
         solution="triton",
+        slot_order="selection",
     )
 
     expected = torch.full_like(topk_slots, -1)
@@ -174,6 +176,7 @@ def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> No
         q_len_per_req=q_len_per_req,
         index_k_cache=packed_index_k,
         solution="triton",
+        slot_order="selection",
     )
 
     for r in range(num_reqs):
@@ -223,6 +226,7 @@ def test_dsa_prefill_topk_fp8(device: str, require) -> None:
         index_k_cache=packed_index_k,
         page_size=page_size,
         solution="triton",
+        slot_order="selection",
     )
 
     expected = torch.full_like(workspace_indices, -1)
@@ -508,6 +512,7 @@ def test_dsa_with_kvcache(
         softmax_scale=softmax_scale,
         page_size=64,
         solution=solution,
+        slot_order="selection",
     )
 
     ref = _dsa_reference(
@@ -573,6 +578,7 @@ def test_dsa_decode_dense_kvcache(device: str, q_dtype: torch.dtype, require) ->
         softmax_scale=softmax_scale,
         page_size=64,
         solution="triton",
+        slot_order="selection",
     )
 
     ref = _dsa_reference(
@@ -618,6 +624,7 @@ def test_dsa_lse_partials_reconstruct_full_attention(packed, degree):
         page_size=64,
         return_lse=True,
         solution="triton",
+        slot_order="selection",
     )
     reference, ref_lse = dsa_decode(topk_slots=slots, **kwargs)
     assert reference.dtype == query.dtype
@@ -738,7 +745,6 @@ def test_dsa_sharded_index_candidates_global_windows(device, degree):
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
     from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
-    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
     from tokenspeed_kernel.platform import current_platform
 
     if not current_platform().is_hopper_plus:
@@ -758,7 +764,7 @@ def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
         torch.randn(10 * page_size, dim, device=device), page_size
     )
     logical_k = dequant.reshape(10, page_size, dim)[table[0].long()].reshape(-1, dim)
-    quantized, scales = quantize_fp8_with_scale(
+    quantized, scales = quantize_fp8(
         q.reshape(-1, dim),
         granularity="token_group",
         group_size=128,

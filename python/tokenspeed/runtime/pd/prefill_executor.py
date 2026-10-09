@@ -281,6 +281,18 @@ class DisaggPrefillExecutor:
         if sender is not None:
             self.kv_manager.record_cached_tokens(sender.bootstrap_room, cached_tokens)
 
+    def record_bootstrap_logprob(self, request_id: str, logprob: float) -> None:
+        """Publish the committed bootstrap token's logprob for the status message."""
+        sender = self.senders.get(request_id)
+        if sender is not None:
+            self.kv_manager.record_bootstrap_logprob(sender.bootstrap_room, logprob)
+
+    def record_score_vals(self, request_id: str, score_vals: list[float]) -> None:
+        """Publish final label readout before the remote-decode status message."""
+        sender = self.senders.get(request_id)
+        if sender is not None:
+            self.kv_manager.record_score_vals(sender.bootstrap_room, score_vals)
+
     def register(
         self,
         request_id: str,

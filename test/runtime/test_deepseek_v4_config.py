@@ -113,11 +113,15 @@ from tokenspeed.runtime.layers.attention.page_table import (
     mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+from tokenspeed.runtime.layers.moe import topk as topk_module
 from tokenspeed.runtime.layers.paged_attention import bind_cache_groups
 from tokenspeed.runtime.layers.quantization import (
     QUANTIZATION_METHODS,
     Fp8Config,
     Mxfp4Config,
+)
+from tokenspeed.runtime.model_loader.weight_utils import (
+    initialize_dummy_integer_weights,
 )
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
@@ -252,6 +256,7 @@ def _extend_kwargs(
         extend_prompt_lens_cpu=extend_prefix_lens_cpu
         + extend_seq_lens_cpu[: extend_prefix_lens_cpu.numel()],
         extend_with_prefix=bool(extend_prefix_lens_cpu.any()),
+        query_shard=None,
     )
 
 
@@ -620,6 +625,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertTrue(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -648,6 +654,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertFalse(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -680,6 +687,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         runner._model_forward_accepts_spec_step_idx = (
             ModelRunner._forward_accepts_kwarg(runner.model, "spec_step_idx")
         )
+        self.assertFalse(runner.forward_accepts_spec_step_idx)
 
         empty = torch.empty(0, dtype=torch.int32)
         result = runner.forward(
@@ -804,6 +812,32 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertIs(output.router_logits, router_logits)
         self.assertEqual(calls[0][0][2:6], ("sqrt_softplus", "topk", True, 2.0))
 
+    def test_deepseek_v4_topk_routes_simulated_logits(self):
+        router_logits = torch.zeros((2, 4))
+        seen = []
+
+        def fake_moe_topk(logits, *args, **kwargs):
+            seen.append(logits)
+            return torch.ones((2, 2)), torch.zeros((2, 2), dtype=torch.int32)
+
+        with (
+            patch.dict(os.environ, {"TOKENSPEED_MOE_ROUTING_SIMULATION": "uniform"}),
+            patch.dict(topk_module._simulated_logits, clear=True),
+            patch.object(deepseek_v4_model, "moe_topk", fake_moe_topk),
+        ):
+            output = DeepseekV4TopK(
+                top_k=2,
+                renormalize=True,
+                correction_bias=torch.zeros(4),
+                routed_scaling_factor=1.0,
+                hash_routing=False,
+            )(torch.ones((2, 3)), router_logits)
+            expected = topk_module.simulated_router_logits(router_logits)
+
+        torch.testing.assert_close(seen[0], expected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(seen[0], router_logits))
+        self.assertIs(output.router_logits, seen[0])
+
     def test_deepseek_v4_moe_stream_fork_disabled_order(self):
         calls = []
         hidden_states = torch.ones(2, 3)
@@ -871,6 +905,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         backend = SimpleNamespace(
             is_mega_moe=lambda: False,
+            is_gluon_petit=lambda: False,
             is_flashinfer_trtllm=lambda: True,
         )
         config = SimpleNamespace(
@@ -1575,6 +1610,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_algorithm=None,
                 load_format="auto",
                 ext_yaml=None,
+                validate_tp_batch_invariant_weights=lambda *args: None,
             )
             hf_config = make_hf_config()
             with (
@@ -1702,7 +1738,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertTrue(is_deepseek_v4(model_config.hf_config))
 
-        configure_deepseek_v4_attention(model_config)
+        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
         self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
         self.assertEqual(model_config.head_dim, 512)
@@ -1742,7 +1778,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             )
         )
 
-        configure_deepseek_v4_attention(model_config)
+        configure_deepseek_v4_attention(model_config, ServerArgs(model="x"))
 
         self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
         self.assertEqual(model_config.head_dim, 512)
@@ -2239,17 +2275,12 @@ class TestDeepseekV4Config(unittest.TestCase):
         target_model.set_dspark_layers_to_capture.assert_not_called()
 
     def test_dspark_tp_only_contract_uses_resolved_mapping(self):
-        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
+        mapping = SimpleNamespace(attn=SimpleNamespace(dp_size=1))
         DeepseekV4DSpark._validate_tp_only_mapping(mapping)
 
-        for field in ("dp_size", "cp_size"):
-            invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=1, cp_size=1))
-            setattr(invalid.attn, field, 2)
-            with (
-                self.subTest(field=field),
-                self.assertRaisesRegex(ValueError, "tensor parallelism only"),
-            ):
-                DeepseekV4DSpark._validate_tp_only_mapping(invalid)
+        invalid = SimpleNamespace(attn=SimpleNamespace(dp_size=2))
+        with self.assertRaisesRegex(ValueError, "tensor parallelism only"):
+            DeepseekV4DSpark._validate_tp_only_mapping(invalid)
 
     def test_dspark_padding_slots_reset_before_every_graph_replay(self):
         drafter = object.__new__(DeepseekV4DSpark)
@@ -6680,6 +6711,24 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertEqual(logits.dtype, torch.float32)
         self.assertTrue(torch.allclose(logits, expected))
+
+    def test_deepseek_v4_dummy_hash_table_spreads_tokens_over_experts(self):
+        config = SimpleNamespace(
+            n_routed_experts=16,
+            hidden_size=8,
+            num_hash_layers=1,
+            vocab_size=64,
+            num_experts_per_tok=4,
+        )
+        gate = DeepseekV4MoEGate(config, layer_index=0)
+        gate.tid2eid.data.fill_(-1)
+
+        initialize_dummy_integer_weights(gate)
+
+        table = gate.tid2eid
+        self.assertTrue(bool(((table >= 0) & (table < 16)).all()))
+        self.assertTrue(all(row.unique().numel() == 4 for row in table))
+        self.assertEqual(table.unique().numel(), 16)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_deepseek_v4_gate_dsv3_router_gemm_shape(self):

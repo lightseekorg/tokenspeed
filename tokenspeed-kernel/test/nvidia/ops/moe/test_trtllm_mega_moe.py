@@ -42,7 +42,11 @@ if not is_nvidia():
     pytest.skip("NVIDIA GPU required", allow_module_level=True)
 
 from flashinfer.autotuner import AutoTuner  # noqa: E402
-from tokenspeed_kernel import moe_apply, moe_plan, moe_process_weights  # noqa: E402
+from tokenspeed_kernel.ops.moe import (  # noqa: E402
+    moe_apply,
+    moe_plan,
+    moe_process_weights,
+)
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize  # noqa: E402
 from tokenspeed_kernel.ops.tuning import (  # noqa: E402
     autotune,
@@ -237,6 +241,7 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     w, ref = _weights(plan)
     tokens = live_tokens if dist.get_rank() == 0 else max(1, live_tokens - 2)
@@ -271,7 +276,9 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
             side_effect=AssertionError("MegaMoE tuning requires explicit opt-in"),
         )
     )
-    with guard, autotune(), torch.inference_mode():
+    with guard, autotune(
+        tune_mode=True, tuning_buckets=None, round_up=None
+    ), torch.inference_mode():
         output = run()
     torch.cuda.synchronize()
     _check(output, expected, "eager")
@@ -311,7 +318,7 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
         with patch.object(
             tuner, "_profile_single_kernel", wraps=tuner._profile_single_kernel
         ) as profile:
-            with autotune():
+            with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
                 output = run()
             profile.assert_not_called()
     else:

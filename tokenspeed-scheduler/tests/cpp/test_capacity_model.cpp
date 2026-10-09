@@ -81,8 +81,8 @@ SchedulerConfig SizingConfig(Role role, std::int32_t prefix_granularity, std::in
     cfg.disable_l2_cache = true;
     for (CacheGroupConfig& group : groups) {
         if (role != Role::kFused) {
-            group.transfer_policy =
-                group.IsSnapshotStateGroup() ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+            group.transfer_policy = group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot
+                                                                          : CacheTransferPolicy::FullSuffix;
         }
         cfg.cache_groups.push_back(std::move(group));
     }
@@ -195,8 +195,8 @@ TEST(CapacityModelTest, ConcurrentDemandByRetention) {
     SchedulerConfig prefill = cfg;
     prefill.role = Role::kP;
     for (CacheGroupConfig& group : prefill.cache_groups) {
-        group.transfer_policy =
-            group.IsSnapshotStateGroup() ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+        group.transfer_policy = group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot
+                                                                      : CacheTransferPolicy::FullSuffix;
     }
     const std::vector<std::int64_t> prefill_pages = CapacityModel{prefill}.ConcurrentGroupPages(65536, 4096);
     EXPECT_EQ(prefill_pages[0], 1024 + 16 * 1);

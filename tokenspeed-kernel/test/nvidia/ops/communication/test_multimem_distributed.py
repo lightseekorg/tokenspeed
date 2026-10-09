@@ -38,8 +38,8 @@ import torch
 import torch.distributed as dist
 
 LATENT, HIDDEN = 3584, 7168
-# Spans the runtime MULTIMEM_AR window floor (256), the staging module's
-# _MIN_BUFFER_ROWS (2048), and the window ceiling (8192), both sides of each.
+# Covers K3's Multimem threshold (1024), staging granularity (2048),
+# and larger payloads through 8192 tokens.
 M_VALUES = [17, 255, 256, 1024, 2047, 2048, 4096, 8192]
 
 
@@ -83,7 +83,7 @@ def _require_multimem():
 
 
 def _group_name() -> str:
-    # Mirrors the runtime call site in kimi_k3._tail_multimem_ar.
+    # Exercise the generic staged collective independently of model dispatch.
     return dist.group.WORLD.group_name
 
 

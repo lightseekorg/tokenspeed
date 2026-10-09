@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "kimi_k3_tp8",
+    "heads": 12,
+    "key_dim": 128,
+    "value_dim": 128,
+    "dtype": "bfloat16",
+    "lower_bound": -5.0,
+    "recurrent_layout": "v_major"
+  },
+  "cases": [
+    {
+      "id": "kimi_k3.attention.kda_paged_prefill/chunk-8k-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_prefill",
+        "parameters": {
+          "batch": 1,
+          "tokens_per_sequence": 8192
+        },
+        "cold_cache": true,
+        "seed": 4701
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.kda_paged_prefill/prompt-4k-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_prefill",
+        "parameters": {
+          "batch": 1,
+          "tokens_per_sequence": 4096
+        },
+        "cold_cache": true,
+        "seed": 4702
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.kda_paged_prefill/tail-848-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_paged_prefill",
+        "parameters": {
+          "batch": 1,
+          "tokens_per_sequence": 848
+        },
+        "cold_cache": true,
+        "seed": 4703
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.kda_fused_paged_decode/decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_fused_paged_decode",
+        "parameters": {
+          "batch": [1, 2, 4, 8, 16],
+          "conv_kernel_size": 4,
+          "state_page_bytes": 884736,
+          "state_pages": 1025,
+          "state_page_relation": "in_place",
+          "norm_eps": 1e-05
+        },
+        "cold_cache": true,
+        "seed": 4711
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.kda_fused_paged_decode/decode-large-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_fused_paged_decode",
+        "parameters": {
+          "batch": [32, 64],
+          "conv_kernel_size": 4,
+          "state_page_bytes": 884736,
+          "state_pages": 1025,
+          "state_page_relation": "in_place",
+          "norm_eps": 1e-05
+        },
+        "cold_cache": true,
+        "seed": 4712
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.kda_fused_paged_verify/verify-t4-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_fused_paged_verify",
+        "parameters": {
+          "batch": [1, 2, 4, 8, 16],
+          "draft_token_num": 4,
+          "conv_kernel_size": 4,
+          "state_page_bytes": 884736,
+          "state_pages": 1025,
+          "capture_replay": true,
+          "store_states": false
+        },
+        "cold_cache": true,
+        "seed": 4721
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "kimi_k3.attention.kda_replay_commit/replay-t4-l69-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "kda_replay_commit",
+        "parameters": {
+          "batch": [1, 2, 4, 8, 16],
+          "draft_token_num": 4,
+          "accepted_length": [1, 4],
+          "layers": 69,
+          "state_groups": 3,
+          "conv_kernel_size": 4,
+          "state_page_bytes": 884736,
+          "state_pages": 33
+        },
+        "cold_cache": true,
+        "seed": 4731
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}

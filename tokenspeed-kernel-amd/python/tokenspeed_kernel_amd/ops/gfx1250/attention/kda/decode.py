@@ -774,7 +774,8 @@ def gluon_kda_fused_replay_gfx1250(
     STATE_POOL_PAGE_STRIDE: gl.constexpr,
     HAS_LOWER_BOUND: gl.constexpr,
     LOWER_BOUND: gl.constexpr,
-    BATCH_SIZE: gl.constexpr,
+    # Follows the batch; runtime so every batch size shares one binary.
+    BATCH_SIZE,
 ):
     """Replay accepted raw-g prefixes for every descriptor layer.
 

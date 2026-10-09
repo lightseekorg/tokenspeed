@@ -125,7 +125,9 @@ def _pack_kernel(
     CB: tl.constexpr,
     SS,
     PAGE_ROWS: tl.constexpr,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -243,7 +245,9 @@ def _gather_kernel(
     OS0,
     OS1,
     PAGE_ROWS: tl.constexpr,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -538,7 +542,9 @@ def _compressor_tail_scatter_kernel(
     TK,
     TD,
     LS,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
 ):
     row = tl.program_id(0)
     slot = tl.load(Slots + row * LS).to(tl.int64)
@@ -1881,7 +1887,7 @@ def triton_dsv41_dspark_rows(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["EXTENDS", "PREFILL_OUTPUTS"])
 def _dspark_anchors_kernel(
     TOKENS,
     ACCEPT,
@@ -1890,6 +1896,7 @@ def _dspark_anchors_kernel(
     START,
     N0,
     EXTENDS,
+    PREFILL_OUTPUTS,
     WIDTH: tl.constexpr,
     SPEC: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -1899,10 +1906,15 @@ def _dspark_anchors_kernel(
     decode = row >= EXTENDS
     index = row - EXTENDS
     accepted = tl.minimum(tl.maximum(tl.load(ACCEPT + row).to(tl.int64), 1), WIDTH)
-    verify = EXTENDS + index * WIDTH + accepted - 1
-    bonus = tl.load(TOKENS + tl.where(decode, verify, row)).to(tl.int32)
+    active = (row < PREFILL_OUTPUTS) | decode
+    verify = PREFILL_OUTPUTS + index * WIDTH + accepted - 1
+    bonus = tl.load(TOKENS + tl.where(decode, verify, row), active, 0).to(tl.int32)
     columns = tl.arange(0, BLOCK)
-    tl.store(NEXT + row * N0 + columns, tl.zeros_like(columns) + bonus, columns < SPEC)
+    tl.store(
+        NEXT + row * N0 + columns,
+        tl.zeros_like(columns) + bonus,
+        active & (columns < SPEC),
+    )
     anchor_mask = decode & (one == 0)
     anchor = tl.load(POSITIONS + index * WIDTH + accepted - 1 + one, anchor_mask, -1)
     tl.store(START + index + one, anchor.to(tl.int64), anchor_mask)
@@ -1919,7 +1931,14 @@ def _dspark_anchors_kernel(
     priority=Priority.PORTABLE,
 )
 def triton_dsv41_dspark_anchors(
-    output_tokens, accept_lengths, positions, num_extends, width, next_tokens, start_pos
+    output_tokens,
+    accept_lengths,
+    positions,
+    num_extends,
+    num_prefill_outputs,
+    width,
+    next_tokens,
+    start_pos,
 ):
     rows = accept_lengths.shape[0]
     if rows == 0:
@@ -1932,6 +1951,7 @@ def triton_dsv41_dspark_anchors(
         start_pos,
         next_tokens.stride(0),
         num_extends,
+        num_prefill_outputs,
         WIDTH=width,
         SPEC=next_tokens.shape[1],
         BLOCK=triton.next_power_of_2(next_tokens.shape[1]),
@@ -2831,7 +2851,7 @@ def decode_rows(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS"])
 def _decode_window_kernel(
     Positions,
     Requests,
@@ -2907,7 +2927,7 @@ def decode_window(
         )
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
 def _global_slots_kernel(
     Rows,
     P,
@@ -2975,7 +2995,7 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     return out
 
 
-@triton.jit(do_not_specialize=["N", "TC"])
+@triton.jit(do_not_specialize=["N", "TC", "TR", "TS0", "TS1"])
 def _selection_table_kernel(
     P,
     Req,
@@ -3036,7 +3056,7 @@ def selection_table(positions, requests, table, ratio):
     return out, lengths
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
 def _compressor_metadata(
     Positions,
     Requests,

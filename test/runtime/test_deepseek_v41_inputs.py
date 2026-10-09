@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.types import (
@@ -186,6 +187,9 @@ def _sample(ib, runtime, ids, num_extends, accept_lengths, has_drafter):
         torch.tensor(accept_lengths, dtype=torch.int32, device=ib.device),
         ib.input_lengths_buf[:bs],
         num_extends,
+        output_layout=ForwardOutputLayout(
+            num_extends, num_extends, bs - num_extends, executor.config.output_length
+        ),
     )
 
 
@@ -226,10 +230,15 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         "valid_cache_lengths",
         "future_input_map",
         "remote_spec_candidate_ready",
+        "draft_probs",
+        "draft_probs_sentinel",
+        "chain_parents",
+        "future_parent_map",
         "ngram_accepted_tokens",
         "ngram_needs_seed",
         "ngram_request_ids",
         "request_token_history_ids",
+        "draft_request_token_history_ids",
     }
     assert not runtime.has_request_token_history
     assert runtime.ngram_accepted_tokens.shape == (6, 3)
@@ -561,6 +570,7 @@ def test_runtime_update_replay_shrink_idle_and_slot_reuse(buffers, record_update
             accepts,
             ib.input_lengths_buf[:4],
             0,
+            output_layout=ForwardOutputLayout(0, 0, 4, 4),
         )
 
     graph = None
@@ -659,6 +669,7 @@ def test_executor_input_capacity_covers_decode_capture(
         vocab_size=VOCAB_SIZE,
         output_length=width,
         enable_nan_detection=False,
+        enable_speculative_sampling=False,
     )
     runner = SimpleNamespace(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
@@ -716,7 +727,9 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     executor._active_positions_override = None
     executor._active_multimodal_context = None
     executor.prefill_graph = SimpleNamespace(can_run=lambda ctx, mm: False)
-    ctx = SimpleNamespace(input_num_tokens=num_tokens, forward_mode=mode, bs=1)
+    ctx = SimpleNamespace(
+        input_num_tokens=num_tokens, forward_mode=mode, bs=1, query_shard=None
+    )
     original = vars(ctx).copy()
     result = executor._run_target_forward(ctx)
     assert result["engram_previous_tokens"].shape == (num_tokens, 3)
@@ -747,8 +760,9 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         value.fill_(1)
 
     @contextmanager
-    def tuner():
+    def tuner(*, tune_mode, tuning_buckets, round_up):
         nonlocal tuning
+        assert (tune_mode, tuning_buckets, round_up) == (True, None, None)
         events.append("tuner-enter")
         tuning = True
         yield
@@ -804,6 +818,11 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         physical_context_len=context_len,
         pp_size=1,
         world_size=1,
+        world_group=(),
+        global_rank=0,
+        autotune_cache_key=None,
+        prefill_only=False,
+        decode_only_attention=False,
         disable_autotune=False,
         model_is_mrope=False,
         device=ib.device,
@@ -832,7 +851,14 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         lambda group: events.append(("group", group)),
     )
     monkeypatch.setattr(
-        model_executor.dist, "barrier", lambda: events.append("barrier")
+        model_executor,
+        "load_autotune_cache",
+        lambda path, group, rank: events.append(("load", path, group, rank)),
+    )
+    monkeypatch.setattr(
+        model_executor,
+        "save_autotune_cache",
+        lambda path, group, rank: events.append(("save", path, group, rank)),
     )
 
     executor.autotune()
@@ -842,13 +868,14 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     assert len(metadata) == 1
     assert events == [
         ("max_tokens", num_tokens),
+        ("load", None, None, 0),
         ("group", None),
         "tuner-enter",
         "metadata",
         "forward",
         "tuner-exit",
         ("group", None),
-        "barrier",
+        ("save", None, None, 0),
     ]
 
 
@@ -890,7 +917,7 @@ def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
         assert x.dtype == layer.input_dtype
         return x
 
-    monkeypatch.setattr(model_executor.tokenspeed_kernel, "moe_apply", fake_apply)
+    monkeypatch.setattr(model_executor, "kernel_moe_apply", fake_apply)
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = torch.device("cpu")
     executor.drafter = SimpleNamespace(
@@ -1002,6 +1029,7 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         multimodal_context=None,
         ngram_inputs=snapshot,
         request_history_seeds=None,
+        input_logprob_plan=None,
     )
     pending = handle._submit_forward(planned, capture_next_input_ids=False)
     states["a"].prompt_input_ids.clear()
@@ -1077,6 +1105,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         device="cpu",
         gpu_id=0,
         memory_saver_adapter=SimpleNamespace(region=region),
+        checkpoint_load_group=None,
     )
     assert result is model
     assert events == (
@@ -1084,3 +1113,21 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         if has_engram
         else ["enter", "load", "exit"]
     )
+
+
+def test_forced_single_token_resets_draft_tree_parents(buffers):
+    """A row reset to its dummy tail (bootstrap override) drops its drafted tree:
+    its next-round parents return to the chain; other slots keep theirs."""
+    ib, _ = buffers
+    runtime = _spec_runtime(ib, 4)
+    runtime.init_draft_trees(4)
+    tree = torch.tensor([-1, 0, 0, 1], dtype=torch.int32, device=ib.device)
+    runtime.future_parent_map[:] = tree
+    states = {"decode": _state([40, 41, 42], [43])}
+    runtime.valid_cache_lengths[0] = 3
+    runtime.future_input_map[0] = torch.tensor([43, 44, 45, 46], device=ib.device)
+    op = _op(states, ["decode"], [0], [4], [], [], [43])
+    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    assert ib.force_single_token_verify_buf[0].item()
+    assert runtime.future_parent_map[0].tolist() == [-1, 0, 1, 2]
+    assert runtime.future_parent_map[1].tolist() == tree.tolist()

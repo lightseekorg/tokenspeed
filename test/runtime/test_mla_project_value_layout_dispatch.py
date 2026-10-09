@@ -76,15 +76,10 @@ def test_caller_does_not_need_a_vendor_branch():
 
 
 def test_fused_mla_kv_write_is_not_amd_only():
-    import torch
-    from tokenspeed_kernel.ops.embedding import supports_fused_mla_kv_write
+    from tokenspeed_kernel.registry import KernelRegistry
 
-    assert supports_fused_mla_kv_write(
-        q_dtype=torch.bfloat16,
-        k_dtype=torch.bfloat16,
-        has_rope=True,
-        is_neox=False,
-    ), "no registered kernel offers the fused MLA KV write on this platform"
+    spec = KernelRegistry.get().get_by_name("triton_mla_prologue")
+    assert {"amd", "nvidia"} <= spec.capability.vendors
 
 
 def test_model_no_longer_vendor_gates_the_fused_kv_write():
@@ -109,6 +104,9 @@ def test_weight_layout_matches_what_the_kernel_wants():
     class _Attn:
         qk_nope_head_dim = 128
         v_head_dim = 128
+        # First build: nothing to copy into (see bind_or_copy).
+        w_kc = None
+        w_vc = None
 
     heads, latent = 16, 512
     w = torch.randn(

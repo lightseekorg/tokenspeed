@@ -30,6 +30,8 @@ from __future__ import annotations
 import pytest
 import torch
 from kimi3_reference import mxfp4_moe_reference
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from utils import make_mxfp4_moe_weights
 
 NUM_EXPERTS = 8
@@ -229,9 +231,8 @@ def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
 
 @requires_flashinfer_situ
 def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
-    import tokenspeed_kernel
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -244,7 +245,76 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
     assert plan["supports_precomputed_topk"] is True
+
+
+@requires_flashinfer_situ
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_situ_dispatch_autotune_preserves_normal_output(
+    monkeypatch, precomputed
+) -> None:
+
+    from tokenspeed_kernel.ops import tuning
+
+    raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
+        _kernel_routing_case(20260913, 16)
+    )
+    w = _prepare_kernel_routing_weights(raw, bias)
+    hidden_states, router_logits = hidden_states.cuda(), router_logits.cuda()
+    topk_ids, topk_weights = topk_ids.cuda(), topk_weights.cuda()
+    w._situ_output_buffer = torch.empty_like(hidden_states)
+    plan = kernel_moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        requires_deferred_finalize=True,
+        routing_mode=None,
+        a2a_backend=None,
+        ep_size=1,
+        ispp=ISPP,
+        hidden=HIDDEN,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+        fp8_scale_block_shape=None,
+        internal_activation_dtype="fp8",
+        with_bias=False,
+        process_group=None,
+        deepep_mode=None,
+        deepep_low_latency_max_num_tokens_per_gpu=None,
+        solution="flashinfer_trtllm",
+    )
+    # Bound memory/time while leaving FI's native bucket policy unchanged.
+    monkeypatch.setattr(tuning, "_autotune_max_num_tokens", 32)
+
+    def apply():
+        return kernel_moe_apply(
+            plan,
+            hidden_states,
+            w,
+            router_logits,
+            topk_weights=topk_weights if precomputed else None,
+            topk_ids=topk_ids if precomputed else None,
+            num_tokens_global=16,
+            max_num_tokens_per_gpu=16,
+            do_finalize=True,
+            low_latency=False,
+            overlap_fn=None,
+            shared_input=None,
+            shared_weight=None,
+            shared_out=None,
+        )
+
+    with torch.no_grad():
+        expected = apply().clone()
+        with tuning.autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+            actual = apply()
+        torch.cuda.synchronize()
+    assert actual.data_ptr() == w._situ_output_buffer.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=8e-2, rtol=8e-2)

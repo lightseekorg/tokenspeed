@@ -1,4 +1,5 @@
 name: K8s Dispatch
+run-name: "K8s ${{ inputs.commit || inputs.pr || github.sha }} | ${{ inputs.match }} | ${{ inputs.runner }}"
 
 on:
   workflow_dispatch:
@@ -51,7 +52,7 @@ on:
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/qwen3.5-397b-a17b-nvfp4-pd-1p1d-evalscope-aime25.yaml
           - test/ci/eval/qwen3.8-flash-next-fp8-evalscope-gsm8k.yaml
-          - test/ci/perf/gpt-oss-120b-mxfp4-evalscope-mi355.yaml
+          - test/ci/perf/gpt-oss-120b-mxfp4-evalscope-mi350.yaml
           - test/ci/perf/kernel-benchmark-amd-gfx950.yaml
           - test/ci/perf/kimi-k2.5-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml
@@ -67,7 +68,8 @@ on:
           - test/ci/ut/ut-runtime-2gpu.yaml
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml
-          - test/ci/ut/ut-tokenspeed-kernel.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
       runner_pool:
         description: "Runner pool selected from the YAML labels"
         required: true
@@ -79,6 +81,11 @@ on:
           - gb200
           - b300
           - all
+      runner:
+        description: "Optional exact runner label within the selected pool"
+        required: false
+        default: ""
+        type: string
       task_types:
         description: "Comma-separated task types"
         required: true
@@ -107,7 +114,7 @@ on:
           - per-commit
 
 concurrency:
-  group: k8s-dispatch-${{ inputs.commit || inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runner_pool }}-${{ inputs.match }}
+  group: k8s-dispatch-${{ inputs.commit || inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runner_pool }}-${{ inputs.runner }}-${{ inputs.match }}
   cancel-in-progress: false
 
 jobs:
@@ -229,6 +236,7 @@ jobs:
         id: matrix
         env:
           YAML_SELECTION: ${{ inputs.yaml }}
+          EXACT_RUNNER: ${{ inputs.runner }}
           RUNNER_POOL: ${{ inputs.runner_pool }}
           TASK_TYPES: ${{ inputs.task_types }}
           MATCH: ${{ inputs.match }}
@@ -278,6 +286,8 @@ jobs:
               runner = task["runner"]
               if runner.startswith("slurm-"):
                   continue
+              if os.environ["EXACT_RUNNER"] and runner != os.environ["EXACT_RUNNER"]:
+                  continue
               pool = os.environ["RUNNER_POOL"]
               runner_families = {
                   "b200v2": runner.startswith("b200v2-"),
@@ -310,7 +320,7 @@ jobs:
   run:
     needs: scan
     if: needs.scan.outputs.has_tasks == 'true'
-    uses: ./.github/workflows/run-pr-test-stage.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.scan.outputs.matrix }}
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}

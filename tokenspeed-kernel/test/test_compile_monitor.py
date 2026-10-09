@@ -24,8 +24,8 @@ import logging
 import os
 
 import pytest
+import tokenspeed_kernel.compile_monitor as compile_monitor
 import torch
-from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.compile_monitor import (
     CompileMonitor,
@@ -34,6 +34,12 @@ from tokenspeed_kernel.compile_monitor import (
 
 KERNEL = "ops.example._kernel"
 SITE = "runtime/models/example.py:12 (forward)"
+
+
+@pytest.fixture(autouse=True)
+def startup(monkeypatch):
+    # mark_serving() closes the process-wide compile switch; reopen it afterwards.
+    monkeypatch.setattr(compile_monitor, "_serving", False)
 
 
 def _record(monitor, n, block=64, site=SITE):
@@ -156,6 +162,13 @@ def test_error_mode_raises():
         _record(monitor, 7)
 
 
+def test_serving_mark_closes_the_compile_switch_without_a_monitor(monkeypatch):
+    monkeypatch.setattr(compile_monitor, "_hooks", None)
+    assert not compile_monitor.is_serving()
+    compile_monitor.mark_serving()
+    assert compile_monitor.is_serving()
+
+
 def test_rejects_unknown_mode():
     with pytest.raises(ValueError, match="on_unbounded"):
         CompileMonitor("loud", 8)
@@ -265,3 +278,38 @@ def test_install_chains_and_uninstall_restores_hooks(device):
         compile_monitor.uninstall_compile_monitor()
         runtime.jit_cache_hook = None
         runtime.jit_post_compile_hook = None
+
+
+def test_launch_options_are_plain_values():
+    # With a compile hook installed, Triton serializes the launch options to
+    # JSON, so a constexpr object passed as e.g. num_warps fails every compile.
+    import ast
+    from pathlib import Path
+
+    options = {"num_warps", "num_stages", "num_ctas", "waves_per_eu", "maxnreg"}
+    roots = [Path(compile_monitor.__file__).parent]
+    amd = importlib.util.find_spec("tokenspeed_kernel_amd")
+    if amd is not None and amd.submodule_search_locations:
+        roots += [Path(path) for path in amd.submodule_search_locations]
+    offenders = []
+    for path in (p for root in roots for p in root.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        constexprs = {
+            target.id
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func).endswith("constexpr")
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript):
+                offenders += [
+                    f"{path}:{node.lineno} {kw.arg}={kw.value.id}"
+                    for kw in node.keywords
+                    if kw.arg in options
+                    and isinstance(kw.value, ast.Name)
+                    and kw.value.id in constexprs
+                ]
+    assert not offenders, offenders

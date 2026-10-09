@@ -1,0 +1,213 @@
+name: Run CI Task Matrix
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        description: "JSON matrix for this CI stage"
+        required: true
+        type: string
+      install_tokenspeed_mla_from_source:
+        description: "Whether to install the in-tree tokenspeed-mla package"
+        required: true
+        type: string
+      b200_runner_label:
+        description: "Runner family used to resolve b200 task labels"
+        required: false
+        default: ""
+        type: string
+      checkout_ref:
+        description: "Optional commit to check out"
+        required: false
+        default: ""
+        type: string
+      timeout_minutes:
+        description: "Maximum task runtime"
+        required: false
+        default: 60
+        type: number
+      comparison_base_ref:
+        description: "Optional immutable baseline revision for paired tasks"
+        required: false
+        type: string
+      comparison_candidate_ref:
+        description: "Optional immutable candidate revision for paired tasks"
+        required: false
+        type: string
+    secrets:
+      HF_TOKEN:
+        required: false
+
+env:
+  PIP_BREAK_SYSTEM_PACKAGES: 1
+  CUDA_VERSION: 13.0.1
+  TOKENSPEED_B200_RUNNER_LABEL: ${{ inputs.b200_runner_label }}
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.matrix) }}
+    name: ${{ matrix.name }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 30 || inputs.timeout_minutes }}
+    continue-on-error: ${{ matrix.optional }}
+    env:
+      INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
+      BASE_REF: ${{ inputs.comparison_base_ref }}
+      CANDIDATE_REF: ${{ inputs.comparison_candidate_ref }}
+      PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+      MERGE_SHA: ${{ github.event_name == 'pull_request' && github.sha || '' }}
+      # Authenticate model downloads so cold runners do not hit anonymous
+      # Hugging Face rate limits while starting `ts serve`.
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # Cross-repository PRs cannot receive repository secrets.
+      TOKENSPEED_CI_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+          fetch-depth: ${{ matrix.workflow_stage == 'kernel-benchmark' && '0' || '1' }}
+          persist-credentials: ${{ matrix.workflow_stage != 'kernel-benchmark' }}
+          path: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}
+
+      - name: Set work directory
+        run: |
+          work_dir="${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}"
+          echo "WORK_DIR=$work_dir" >> "$GITHUB_ENV"
+          # Keep project dependencies job-local, but reuse EvalScope downloads
+          # from the model cache when the runner provides one.
+          if [ "${{ matrix.workflow_stage }}" = "model-test" ]; then
+            evalscope_uv_cache_dir="${EVALSCOPE_UV_CACHE_DIR:-}"
+            if [ -z "$evalscope_uv_cache_dir" ] && [ -n "${HF_HOME:-}" ]; then
+              evalscope_uv_cache_dir="${HF_HOME%/}/.uv-cache/evalscope"
+            fi
+            if [ -n "$evalscope_uv_cache_dir" ]; then
+              echo "EVALSCOPE_UV_CACHE_DIR=$evalscope_uv_cache_dir" >> "$GITHUB_ENV"
+            fi
+            echo "UV_CACHE_DIR=$work_dir/.uv-cache" >> "$GITHUB_ENV"
+            # Accuracy jobs must be able to compile on full shared volumes.
+            # Performance jobs retain their established warm kernel cache.
+            if [ "${{ matrix.type }}" = "eval" ]; then
+              echo "TRITON_CACHE_DIR=$work_dir/.triton-cache" >> "$GITHUB_ENV"
+            fi
+            # MIOpen's writable SQLite databases also need job-local storage.
+            mkdir -p "$work_dir/.miopen-db" "$work_dir/.miopen-kernels"
+            echo "MIOPEN_USER_DB_PATH=$work_dir/.miopen-db" >> "$GITHUB_ENV"
+            echo "MIOPEN_CUSTOM_CACHE_DIR=$work_dir/.miopen-kernels" >> "$GITHUB_ENV"
+          fi
+
+      - name: Restore MI450 simulator cache
+        # The current amd-mi45x-cpu-test base image already contains the matching
+        # ROCm, Torch, and prebuilt rocJITsu source/build tree.
+        if: ${{ false }}
+        id: mi450-simulator-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/uv
+            ${{ runner.temp }}/tokenspeed-mi450-sim
+          key: mi450-sim-${{ runner.os }}-rocjitsu-9083cc2a-rocm-20260822-v1
+
+      - name: Install pipeline dependency
+        # pypi.org occasionally returns "Content-Type: Unknown" for the simple
+        # index, which strict pip>=22 refuses to parse. Retry a few times.
+        run: |
+          for i in 1 2 3 4 5; do
+            python3 -m pip install pyyaml && exit 0
+            echo "pyyaml install attempt $i failed, retrying in 10s..."
+            sleep 10
+          done
+          exit 1
+
+      - name: Install CI task
+        run: |
+          cd "${{ env.WORK_DIR }}"
+          mkdir -p .ci-artifacts
+          python3 test/ci_system/pipeline.py execute \
+            --config "${{ matrix.config }}" \
+            --runner "${{ matrix.runner }}" \
+            --work-dir "${{ env.WORK_DIR }}" \
+            --print-plan \
+            --only-stage install \
+            --keep-runner-state \
+            --result-json .ci-artifacts/result.json
+
+      - name: Save MI450 simulator cache
+        # Keep disabled while the simulator toolchain is baked into the
+        # amd-mi45x-cpu-test base image.
+        if: ${{ false }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/uv
+            ${{ runner.temp }}/tokenspeed-mi450-sim
+          key: ${{ steps.mi450-simulator-cache.outputs.cache-primary-key }}
+
+      - name: Execute CI task
+        run: |
+          cd "${{ env.WORK_DIR }}"
+          mkdir -p .ci-artifacts
+          python3 test/ci_system/pipeline.py execute \
+            --config "${{ matrix.config }}" \
+            --runner "${{ matrix.runner }}" \
+            --work-dir "${{ env.WORK_DIR }}" \
+            --print-plan \
+            --skip-stage install \
+            --reuse-runner-state \
+            --result-json .ci-artifacts/result.json
+
+      - name: Checkout source reporter
+        if: always()
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ${{ env.WORK_DIR }}-source
+          sparse-checkout: .github/scripts/ci_result_source.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Record checked-out source
+        if: always()
+        env:
+          EXPECTED_SOURCE: ${{ inputs.checkout_ref || github.sha }}
+          CONFIG: ${{ matrix.config }}
+          RUNNER: ${{ matrix.runner }}
+        run: >-
+          python3 "${{ env.WORK_DIR }}-source/.github/scripts/ci_result_source.py"
+          --work-dir "$WORK_DIR" --expected "$EXPECTED_SOURCE"
+          --config "$CONFIG" --runner "$RUNNER"
+
+      - name: Upload task result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.WORK_DIR }}/.ci-artifacts/result.json
+            ${{ env.WORK_DIR }}/.ci-artifacts/source.json
+            ${{ env.WORK_DIR }}/.ci-artifacts/published/
+          include-hidden-files: true
+
+      - name: Upload task logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}-logs
+          path: ${{ env.WORK_DIR }}/.ci-artifacts/
+          # .ci-artifacts is a dot-directory; without this the default
+          # hidden-file filter drops everything under it.
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+      - name: Cleanup work directory
+        if: always()
+        run: |
+          case "${{ matrix.runner }}" in
+            gb200*) python3 "${{ env.WORK_DIR }}/test/ci_system/process_group_manager.py" cleanup-stale || true ;;
+          esac
+          rm -rf "${{ env.WORK_DIR }}"
+          rm -rf "${{ env.WORK_DIR }}-source"

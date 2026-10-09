@@ -169,6 +169,7 @@ class MultimodalDataItem(msgspec.Struct, eq=False, kw_only=True, array_like=True
     # tied to the request: when the request finishes the item is GC'd and
     # these tensors are released. ``encoded_deepstack`` is set only for
     # deepstack-enabled modalities. Scheduler-local: always None on the wire.
+    # Pinned host memory once every encoder token of the item is prefilled.
     encoded: torch.Tensor | None = None
     encoded_deepstack: torch.Tensor | None = None
     # EPD (encode-prefill-decode): when set, this item's embedding is received
@@ -296,6 +297,8 @@ class MultimodalForwardContext:
     mm_inputs: list[MultimodalInputs | None]
     extend_prefix_lens: list[int]
     extend_seq_lens: list[int]
+    # The forward token bound, which caps each encoder call; a larger item runs alone.
+    max_encoder_tokens: int
 
     def has_inputs(self) -> bool:
         return bool(self.mm_inputs and any(x is not None for x in self.mm_inputs))
@@ -325,7 +328,7 @@ def _resolve_mrope_delta_scalar(mm_input: MultimodalInputs) -> None:
         mm_input.mrope_position_delta_scalar = int(delta.flatten()[0].item())
 
 
-def multimodal_context_for_forward(forward_op, rid_to_state):
+def multimodal_context_for_forward(forward_op, rid_to_state, max_encoder_tokens: int):
     """Assemble the batch's :class:`MultimodalForwardContext` from per-request
     state.
 
@@ -334,6 +337,7 @@ def multimodal_context_for_forward(forward_op, rid_to_state):
             request ids and extend geometry.
         rid_to_state: The output processor's request-id -> state map, whose
             states carry each request's ``multimodal_inputs``.
+        max_encoder_tokens: The forward token bound, which caps each encoder call.
 
     Returns:
         A ``MultimodalForwardContext`` aligned to the batch order, or ``None``
@@ -371,4 +375,5 @@ def multimodal_context_for_forward(forward_op, rid_to_state):
         mm_inputs=mm_inputs,
         extend_prefix_lens=list(forward_op.extend_prefix_lens),
         extend_seq_lens=list(forward_op.input_lengths[:num_extends]),
+        max_encoder_tokens=max_encoder_tokens,
     )

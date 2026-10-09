@@ -29,6 +29,11 @@ class _DefaultStream:
         self._trace.append(("wait", stream))
 
 
+def _as_lists(pages):
+    """Translated pages arrive as per-group arrays; compare them as lists."""
+    return {group: list(map(int, ids)) for group, ids in pages.items()}
+
+
 class ZeroCachePagesContractTest(unittest.TestCase):
     # Group-keyed requests are translated from scheduler (virtual) IDs before
     # any pool sees them; every group here is replicated, so the translation
@@ -113,7 +118,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         seen = []
         pool = types.SimpleNamespace(
             requires_page_zeroing=True,
-            zero_new_blocks=lambda pages: seen.append(dict(pages)),
+            zero_new_blocks=lambda pages: seen.append(_as_lists(pages)),
         )
         pages = {"full": [4, 5], "state": [9]}
         self.assertIsNone(self._call(pool, pages))
@@ -123,7 +128,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         seen = []
         pool = types.SimpleNamespace(
             requires_page_zeroing=True,
-            zero_new_blocks=lambda pages: seen.append(dict(pages)),
+            zero_new_blocks=lambda pages: seen.append(_as_lists(pages)),
         )
         self.assertIsNone(self._call(pool, {"full": [0, 4], "state": [0]}))
         self.assertEqual(seen, [{"full": [4], "state": []}])
@@ -141,7 +146,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
         draft_seen = []
         target = types.SimpleNamespace(
             requires_page_zeroing=True,
-            zero_new_blocks=lambda pages: target_seen.append(dict(pages)),
+            zero_new_blocks=lambda pages: target_seen.append(_as_lists(pages)),
         )
         draft = types.SimpleNamespace(
             requires_page_zeroing=True,
@@ -151,7 +156,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
                     types.SimpleNamespace(group_id="state"),
                 ),
             ),
-            zero_new_blocks=lambda pages: draft_seen.append(dict(pages)),
+            zero_new_blocks=lambda pages: draft_seen.append(_as_lists(pages)),
         )
         pages = {"history": [4], "state": [9], "target_only": [12]}
 

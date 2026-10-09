@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.gemm.kimi3 import (
-    _use_gluon_largem,
-    _use_gluon_mediumm,
-    _use_gluon_smallm,
+from tokenspeed_kernel.ops.activation import situ_and_mul as kernel_situ_and_mul
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection as kernel_kimi3_latent_projection,
 )
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection_add3 as kernel_kimi3_latent_projection_add3,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_qkvfab_projection as kernel_kimi3_qkvfab_projection,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_router_projection as kernel_kimi3_router_projection,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_shared_down_projection as kernel_kimi3_shared_down_projection,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_shared_situ_projection as kernel_kimi3_shared_situ_projection,
+)
+from tokenspeed_kernel.ops.gemm.kimi3 import _use_gluon_largem, _use_gluon_mediumm
+from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.ops.moe.sigmoid_topk import (
     _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
 )
@@ -54,10 +69,13 @@ def test_kimi3_latent_projection_matches_torch(
     weight = torch.randn(output_size, input_size, device="cuda", dtype=torch.bfloat16)
 
     expected = torch.nn.functional.linear(hidden_states, weight)
-    actual = tokenspeed_kernel.kimi3_latent_projection(hidden_states, weight)
+    actual = kernel_kimi3_latent_projection(hidden_states, weight)
 
     if _use_gluon_largem(num_tokens, input_size, output_size):
-        assert torch.equal(actual, expected)
+        # FP32 accumulation rounded once to BF16, as the vendor GEMM does;
+        # its accumulation order varies by kernel, so allow one BF16 ULP plus
+        # FP32 reordering noise on near-zero outputs.
+        torch.testing.assert_close(actual, expected, rtol=2**-7, atol=1e-3)
     else:
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
@@ -89,19 +107,29 @@ def test_kimi3_latent_projection_dispatch_boundaries(
 
 
 @pytest.mark.parametrize(
-    "m,k,n,expected",
+    "m,n,k,expected",
     [
-        (1, 3584, 7168, False),
-        (2, 3584, 7168, True),
-        (4, 3584, 7168, True),
-        (4, 7168, 3584, False),
-        (8, 3584, 7168, False),
+        # M == 1 keeps the GEMV kernels.
+        (1, 7168, 3584, False),
+        (2, 7168, 3584, True),
+        (4, 7168, 1536, True),
+        (64, 1536, 7168, True),
+        # Buckets slower than hipBLASLt and M past the decode band keep torch.
+        (8, 8448, 7168, False),
+        (65, 7168, 1536, False),
     ],
 )
-def test_kimi3_latent_projection_smallm_dispatch(
-    m: int, k: int, n: int, expected: bool
+def test_decode_gemm_routes_measured_k3_shapes(
+    m: int, n: int, k: int, expected: bool
 ) -> None:
-    assert _use_gluon_smallm(m, k, n) is expected
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+
+    assert use_decode_gemv(x, w) is expected
+    if expected:
+        torch.testing.assert_close(
+            decode_gemv(x, w), torch.mm(x, w.T), rtol=2**-7, atol=1e-3
+        )
 
 
 @pytest.mark.parametrize("input_size,output_size", [(7168, 3584), (3584, 7168)])
@@ -116,9 +144,7 @@ def test_kimi3_latent_projection_writes_out_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        returned = tokenspeed_kernel.kimi3_latent_projection(
-            hidden_states, weight, out=output
-        )
+        returned = kernel_kimi3_latent_projection(hidden_states, weight, out=output)
     assert returned.data_ptr() == output.data_ptr()
     graph.replay()
     torch.cuda.synchronize()
@@ -126,7 +152,7 @@ def test_kimi3_latent_projection_writes_out_and_captures(
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 16])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 24, 32, 64])
 def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     num_tokens: int,
 ) -> None:
@@ -142,7 +168,7 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = tokenspeed_kernel.kimi3_latent_projection_add3(
+        actual = kernel_kimi3_latent_projection_add3(
             hidden_states,
             weight,
             prefix,
@@ -154,7 +180,7 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4])
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 16, 17, 32, 64])
 def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures(
     num_tokens: int,
 ) -> None:
@@ -176,7 +202,7 @@ def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = tokenspeed_kernel.kimi3_latent_projection_add3(
+        actual = kernel_kimi3_latent_projection_add3(
             latent,
             projection_weight,
             prefix,
@@ -194,7 +220,7 @@ def test_kimi3_latent_projection_rejects_forced_kernel_for_non_k3_shape() -> Non
     hidden_states = torch.empty(1, 128, device="cuda", dtype=torch.bfloat16)
     weight = torch.empty(64, 128, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="requires a contiguous gfx950"):
-        tokenspeed_kernel.kimi3_latent_projection(
+        kernel_kimi3_latent_projection(
             hidden_states,
             weight,
             solution="triton_gemv",
@@ -209,9 +235,7 @@ def test_kimi3_qkvfab_projection_matches_torch_and_captures() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        returned = tokenspeed_kernel.kimi3_qkvfab_projection(
-            hidden_states, weight, out=output
-        )
+        returned = kernel_kimi3_qkvfab_projection(hidden_states, weight, out=output)
     assert returned.data_ptr() == output.data_ptr()
     graph.replay()
     torch.cuda.synchronize()
@@ -226,7 +250,7 @@ def test_kimi3_qkvfab_projection_dispatches_all_token_counts(
     hidden_states = torch.randn(num_tokens, 7168, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(6288, 7168, device="cuda", dtype=torch.bfloat16)
     expected = torch.nn.functional.linear(hidden_states, weight)
-    actual = tokenspeed_kernel.kimi3_qkvfab_projection(hidden_states, weight)
+    actual = kernel_kimi3_qkvfab_projection(hidden_states, weight)
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
@@ -241,9 +265,7 @@ def test_kimi3_router_projection_matches_torch_and_captures() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        returned = tokenspeed_kernel.kimi3_router_projection(
-            hidden_states, weight, out=output
-        )
+        returned = kernel_kimi3_router_projection(hidden_states, weight, out=output)
     assert returned.data_ptr() == output.data_ptr()
     graph.replay()
     torch.cuda.synchronize()
@@ -274,8 +296,10 @@ def test_kimi3_router_projection_dispatches_all_token_counts(
     hidden_states = torch.randn(num_tokens, 7168, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(896, 7168, device="cuda", dtype=torch.bfloat16)
     expected = torch.nn.functional.linear(hidden_states.float(), weight.float())
-    actual = tokenspeed_kernel.kimi3_router_projection(hidden_states, weight)
-    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    actual = kernel_kimi3_router_projection(hidden_states, weight)
+    # Outputs reach ~100 here; atol covers FP32 summation-order differences
+    # between split-K partial sums and the reference over K=7168.
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-3)
 
 
 @pytest.mark.parametrize("linear_beta", [None, 2.5])
@@ -287,7 +311,7 @@ def test_kimi3_shared_situ_projection_matches_reference_and_captures(
     weight = torch.randn(1536, 7168, device="cuda", dtype=torch.bfloat16) * 0.01
     output = torch.empty(1, 768, device="cuda", dtype=torch.bfloat16)
     gate_up = torch.nn.functional.linear(hidden_states, weight)
-    expected = tokenspeed_kernel.situ_and_mul(
+    expected = kernel_situ_and_mul(
         gate_up,
         beta=1.5,
         linear_beta=linear_beta,
@@ -295,7 +319,7 @@ def test_kimi3_shared_situ_projection_matches_reference_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        returned = tokenspeed_kernel.kimi3_shared_situ_projection(
+        returned = kernel_kimi3_shared_situ_projection(
             hidden_states,
             weight,
             beta=1.5,
@@ -318,7 +342,7 @@ def test_kimi3_shared_down_projection_matches_torch_and_captures() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        returned = tokenspeed_kernel.kimi3_shared_down_projection(
+        returned = kernel_kimi3_shared_down_projection(
             hidden_states,
             weight,
             out=output,

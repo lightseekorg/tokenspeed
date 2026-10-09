@@ -31,23 +31,21 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
     trtllm_batch_context_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
 )
-from tokenspeed_kernel.ops.kvcache.triton import (
-    fused_fp8_set_kv_buffer,
-)
+from tokenspeed_kernel.ops.attention.tree import tree_window_attention
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.execution.breakable_cuda_graph import (
-    is_breakable_capture_active,
-)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.workspace import workspace_pool
+from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.paged.mha import trim_kv_to_locs
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
@@ -128,6 +126,28 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # over the whole block; target verify and plain decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
 
+        # trtllm-gen's multi-CTA KV mode keeps one completion counter per
+        # (request, q head). Without a counter buffer FlashInfer zero-fills a
+        # fresh one on every call, one extra kernel per layer. The kernel
+        # resets its counters at the end of each launch, so a buffer zeroed
+        # once here serves every call; a batch it cannot hold falls back to
+        # FlashInfer's own allocation. It is pool-independent, so a rebind
+        # keeps it.
+        self._kv_counter_buffer = None
+        if torch.device(config.device).type == "cuda":
+            self._sm_count = torch.cuda.get_device_properties(
+                config.device
+            ).multi_processor_count
+            self._kv_counter_buffer = torch.zeros(
+                get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                    config.max_bs * self.block_decode_expansion,
+                    self.tp_q_head_num,
+                    self._sm_count,
+                ),
+                dtype=torch.uint8,
+                device=config.device,
+            )
+
         # Separate slots for prefill-kernel vs decode-kernel forward paths:
         # forward_extend reads prefill; forward_decode picks by q_len (target
         # verify is DECODE mode but rides the prefill slot's uniform stride).
@@ -138,6 +158,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # Padded decode requests have seq_len=1; with q_len=spec_num_tokens
         # they'd hit an empty causal span and the kernel returns NaN.
         self.spec_cache_seqlens_buf: torch.Tensor | None = None
+        # Draft-tree verify: committed keys per request, the cascade's prefix.
+        self.tree_prefix_lens_buf: torch.Tensor | None = None
         # Pure aranges per bs: pool-independent, so a rebind keeps them.
         self._cu_seqlens_by_bs: dict[int, torch.Tensor] = {}
         self._verify_views_by_bs: dict[int, TRTLLMMHAMetadata] = {}
@@ -147,17 +169,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.forward_prefill_metadata = None
         self.forward_decode_metadata = None
         self.spec_cache_seqlens_buf = None
+        self.tree_prefix_lens_buf = None
         self._verify_views_by_bs = {}
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
-        # Under a breakable prefill-graph capture the prewrite would bake this
-        # forward's write locations into the graph (stale on every replay) --
-        # bake the non-prewrite branch instead: the eager attention break
-        # writes KV from fresh metadata.
-        if is_breakable_capture_active():
-            return False
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        del forward_mode
         return True
 
     # ------------------------------------------------------------------
@@ -177,8 +193,12 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
+        page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
+        reject_query_shard(query_shard, "TRTLLMMHAAttnBackend")
+        del page_table_cpu
         if not forward_mode.is_extend_or_mixed():
             raise RuntimeError(
                 "trtllm decode metadata goes through refresh_decode_metadata; "
@@ -187,9 +207,13 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         assert (
             seq_lens.dtype == torch.int32
         ), f"seq_lens must be int32, got {seq_lens.dtype}"
-        cache_seqlens_int32 = seq_lens[:bs]
+        # Draft decode metadata is refreshed separately, so its prefill slot
+        # only describes the leading extend requests. Target MHA still sends
+        # the full packed batch through forward_extend.
+        prefill_bs = num_extends if self.is_draft else bs
+        cache_seqlens_int32 = seq_lens[:prefill_bs]
         cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(seq_lens[:bs], dim=0, dtype=torch.int32), (1, 0)
+            torch.cumsum(seq_lens[:prefill_bs], dim=0, dtype=torch.int32), (1, 0)
         )
 
         # Read the max from the pinned-CPU mirror — avoids a per-iter
@@ -198,10 +222,10 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # max(new tokens per request); for a no-prefix extend that's
         # seq_lens, for a prefix-cached extend it's seq_lens-prefix_lens —
         # extend_seq_lens_cpu holds those new-token counts in either case.
-        max_seq_len_q = int(extend_seq_lens_cpu[:bs].max().item())
+        max_seq_len_q = int(extend_seq_lens_cpu[:prefill_bs].max().item())
 
-        if extend_with_prefix and bool(extend_prefix_lens_cpu[:bs].any()):
-            extend_lens = seq_lens[:bs] - extend_prefix_lens[:bs]
+        if extend_with_prefix and bool(extend_prefix_lens_cpu[:prefill_bs].any()):
+            extend_lens = seq_lens[:prefill_bs] - extend_prefix_lens[:prefill_bs]
             cu_seqlens_q = torch.nn.functional.pad(
                 torch.cumsum(extend_lens, dim=0, dtype=torch.int32), (1, 0)
             )
@@ -213,7 +237,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             max_seq_len_q=max_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            page_table=page_table[:bs],
+            page_table=page_table[:prefill_bs],
         )
 
     # ------------------------------------------------------------------
@@ -223,6 +247,9 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
         self.spec_cache_seqlens_buf = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
+        self.tree_prefix_lens_buf = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
         self._cu_seqlens_by_bs = {}
@@ -312,6 +339,12 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 self.spec_num_tokens,
                 out=self.spec_cache_seqlens_buf[:bs],
             )
+            if self.tree_verify is not None:
+                torch.sub(
+                    self.spec_cache_seqlens_buf[:bs],
+                    self.tree_verify.num_nodes,
+                    out=self.tree_prefix_lens_buf[:bs],
+                )
             self.forward_prefill_metadata = self._verify_views(bs)
 
     # ------------------------------------------------------------------
@@ -327,6 +360,17 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         the block is safe, and a held view would go stale if the block grew.
         """
         (buf,) = self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
+        return buf
+
+    def _kv_counter_buffer_for(
+        self, batch_size: int, num_qo_heads: int
+    ) -> torch.Tensor | None:
+        """The persistent multi-CTA KV counter buffer if it holds this batch."""
+        buf = self._kv_counter_buffer
+        if buf is None or buf.numel() < get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            batch_size, num_qo_heads, self._sm_count
+        ):
+            return None
         return buf
 
     def _get_kv_cache_permuted(self, layer: PagedAttention, token_to_kv_pool):
@@ -346,46 +390,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
         return k_cache, v_cache
 
-    def _compute_scales(self, layer: PagedAttention):
-        """Compute bmm1/bmm2 scales for the fused kernel."""
-        q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
-        bmm1_scale = q_scale * k_scale * layer.scaling
-        bmm2_scale = 1.0
-        return bmm1_scale, bmm2_scale
-
-    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k) -> bool:
-        return (
-            save_kv_cache
-            and k is not None
-            and self.kv_cache_dtype == torch.float8_e4m3fn
-        )
-
-    def _save_kv_and_prepare_q(
-        self, q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
-    ):
-        k, v = trim_kv_to_locs(out_cache_loc, k, v)
-        if self._should_use_fused_fp8_path(save_kv_cache, k):
-            k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
-            fused_fp8_set_kv_buffer(
-                k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                v=v.view(-1, layer.tp_k_head_num, layer.head_dim),
-                k_cache=k_cache,
-                v_cache=v_cache,
-                cache_loc=out_cache_loc,
-                k_scale=layer.k_scale,
-                v_scale=layer.v_scale,
-                page_size=self.kernel_page_size,
-            )
-        elif save_kv_cache and k is not None:
-            token_to_kv_pool.set_kv_buffer(
-                layer, out_cache_loc, k, v, layer.k_scale, layer.v_scale
-            )
-
+    def _prepare_q(self, q: torch.Tensor, layer: PagedAttention) -> torch.Tensor:
         if self.kv_cache_dtype == torch.float8_e4m3fn:
             q = fp8_cast_contiguous(q)
         else:
@@ -406,9 +411,22 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
+        if self.tree_lane_step_active:
+            lanes = self.tree_draft
+            return self._tree_cascade(
+                q,
+                layer,
+                token_to_kv_pool,
+                page_table=self.page_table_buf[:bs],
+                seq_lens=lanes.window_seq_lens[:bs],
+                prefix_lens=lanes.frontier[:bs],
+                mask=lanes.lane_mask[: bs * lanes.topk],
+                rows=lanes.topk,
+                window=lanes.num_slots,
+                sinks=kwargs.get("sinks"),
+            )
         if self.block_decode_active:
             # DFLASH draft block: metadata is expanded to bs*spec_num_tokens
             # single-query entries, so use the decode slot directly. Inferring
@@ -425,11 +443,22 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 else self.forward_decode_metadata
             )
 
-        q = self._save_kv_and_prepare_q(
-            q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
-        )
+        if self.tree_verify is not None and metadata.max_seq_len_q > 1:
+            nodes = self.tree_verify.num_nodes
+            return self._tree_cascade(
+                q,
+                layer,
+                token_to_kv_pool,
+                page_table=metadata.page_table,
+                seq_lens=metadata.cache_seqlens_int32,
+                prefix_lens=self.tree_prefix_lens_buf[:bs],
+                mask=self.tree_verify.mask[: bs * nodes],
+                rows=nodes,
+                window=nodes,
+                sinks=kwargs.get("sinks"),
+            )
+        q = self._prepare_q(q, layer)
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
-        bmm1_scale, bmm2_scale = self._compute_scales(layer)
 
         attention_sink = kwargs.get("sinks", None)
         if attention_sink is not None:
@@ -442,14 +471,84 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             block_tables=metadata.page_table,
             seq_lens=metadata.cache_seqlens_int32,
             max_seq_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
+            bmm1_scale=layer.scaling,
+            bmm2_scale=1.0,
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out_dtype=self.dtype,
             q_len_per_req=metadata.max_seq_len_q,
+            multi_ctas_kv_counter_buffer=self._kv_counter_buffer_for(
+                q.shape[0] // metadata.max_seq_len_q, q.shape[1]
+            ),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def tree_support(self) -> TreeSupport:
+        if self.kv_cache_dtype in (self.dtype, torch.float8_e4m3fn):
+            return TreeSupport(verify_blocker=None, draft_blocker=None)
+        return TreeSupport(
+            verify_blocker=f"{type(self).__name__} reads the verify window K/V in the "
+            f"model dtype or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype} is not supported",
+            draft_blocker=f"{type(self).__name__} reads the lane window K/V in the "
+            f"model dtype or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype} is not supported",
+        )
+
+    def _tree_cascade(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        *,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        mask: torch.Tensor,
+        rows: int,
+        window: int,
+        sinks: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Draft-tree attention (verify nodes or drafting lanes): trtllm-gen's causal
+        ``rows``-token decode over the committed prefix, then the tree window
+        and the prefix tail merged into it (``tree_window_attention``).
+
+        ``q`` is unquantized: trtllm-gen takes it cast like any decode query,
+        and the window kernel takes it as is, widening an FP8 cache's K/V."""
+        if layer.sliding_window_size >= 0 or sinks is not None:
+            raise NotImplementedError(
+                "draft trees have no sliding-window or attention-sink path yet"
+            )
+        k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
+        # trtllm-gen also loads the key right after the prefix: the window's first slot, written this forward.
+        prefix_out, prefix_lse = trtllm_batch_decode_with_kv_cache(
+            query=self._prepare_q(q, layer),
+            kv_cache=(k_cache, v_cache),
+            workspace_buffer=self.workspace_buffer,
+            block_tables=page_table,
+            seq_lens=prefix_lens,
+            max_seq_len=self.max_context_len,
+            bmm1_scale=layer.scaling,
+            bmm2_scale=1.0,
+            out_dtype=self.dtype,
+            q_len_per_req=rows,
+            return_lse=True,
+        )
+        kv_heads, dim = layer.tp_k_head_num, layer.head_dim
+        k_rows, v_rows = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        out = tree_window_attention(
+            q.contiguous().view(-1, layer.tp_q_head_num, dim),
+            k_rows.view(-1, kv_heads, dim),
+            v_rows.view(-1, kv_heads, dim),
+            page_table,
+            seq_lens,
+            mask,
+            prefix_out,
+            prefix_lse,
+            rows_per_req=rows,
+            window=window,
+            page_size=self.kernel_page_size,
+            sm_scale=layer.scaling,
+        )
+        return out.view(-1, layer.tp_q_head_num * dim)
 
     def forward_extend(
         self,
@@ -460,15 +559,11 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         out_cache_loc: torch.Tensor,
         token_to_kv_pool,
         bs: int,
-        save_kv_cache: bool = True,
         **kwargs,
     ) -> torch.Tensor:
         metadata = self.forward_prefill_metadata
-        q = self._save_kv_and_prepare_q(
-            q, k, v, layer, out_cache_loc, token_to_kv_pool, save_kv_cache
-        )
+        q = self._prepare_q(q, layer)
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
-        bmm1_scale, bmm2_scale = self._compute_scales(layer)
 
         attention_sink = kwargs.get("sinks", None)
         if attention_sink is not None:
@@ -482,14 +577,17 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             seq_lens=metadata.cache_seqlens_int32,
             max_q_len=metadata.max_seq_len_q,
             max_kv_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
+            bmm1_scale=layer.scaling,
+            bmm2_scale=1.0,
             batch_size=metadata.cu_seqlens_q.shape[0] - 1,
             cum_seq_lens_q=metadata.cu_seqlens_q,
             cum_seq_lens_kv=metadata.cu_seqlens_k,
             window_left=layer.sliding_window_size,
             sinks=attention_sink,
             out_dtype=self.dtype,
+            multi_ctas_kv_counter_buffer=self._kv_counter_buffer_for(
+                metadata.cu_seqlens_q.shape[0] - 1, q.shape[1]
+            ),
         )
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

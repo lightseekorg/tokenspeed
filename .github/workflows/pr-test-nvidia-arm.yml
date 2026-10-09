@@ -13,10 +13,10 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/pr-test-amd.yml"
-      - ".github/workflows/pr-test-nvidia.yml"
+      - ".github/workflows/amd-tests.yml"
+      - ".github/workflows/nvidia-b200-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
-      - ".github/workflows/run-pr-test-stage.yml"
+      - ".github/workflows/run-ci-task-matrix.yml"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled]
     branches: [main]
@@ -28,10 +28,10 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/pr-test-amd.yml"
-      - ".github/workflows/pr-test-nvidia.yml"
+      - ".github/workflows/amd-tests.yml"
+      - ".github/workflows/nvidia-b200-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
-      - ".github/workflows/run-pr-test-stage.yml"
+      - ".github/workflows/run-ci-task-matrix.yml"
   workflow_dispatch:
     inputs:
       trigger:
@@ -157,7 +157,7 @@ jobs:
         github.event_name != 'pull_request' ||
         github.event.pull_request.draft == false
       )
-    uses: ./.github/workflows/run-pr-test-stage.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.scan.outputs.unit_matrix }}
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
@@ -177,7 +177,7 @@ jobs:
         needs.scan.outputs.unit_has_tasks != 'true'
       ) &&
       needs.scan.outputs.model_has_tasks == 'true'
-    uses: ./.github/workflows/run-pr-test-stage.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.scan.outputs.model_matrix }}
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
@@ -193,9 +193,10 @@ jobs:
       needs.scan.outputs.eager_model == 'true' &&
       github.event.pull_request.draft == false &&
       needs.scan.outputs.model_has_tasks == 'true'
-    uses: ./.github/workflows/run-pr-test-stage.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.scan.outputs.model_matrix }}
+      timeout_minutes: 120
       install_tokenspeed_mla_from_source: ${{ needs.scan.outputs.install_tokenspeed_mla_from_source }}
       b200_runner_label: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
     secrets: inherit

@@ -100,7 +100,7 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
         const std::int64_t lookback = groups_[i].lookback_pages;
         const CacheGroupConfig& group = config_.cache_groups[i];
         const auto local_prefill_peak = [&] {
-            if (group.IsSnapshotStateGroup()) {
+            if (group.Kind() == AttnKind::kMambaState) {
                 if (token_limit == 0) return std::int64_t{0};
                 // Peak = retained input checkpoint (a later chunk's, or a prefix-cache hit)
                 // + aligned checkpoint + its materialized suffix/reserve. The
@@ -143,7 +143,7 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
                 // recomputing its suffix. Old State checkpoints are
                 // evictable, but one recovery chunk and its lookback must fit.
                 child_pages = std::max(snapshot_pages, local_prefill_peak());
-            } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
+            } else if (group.Kind() == AttnKind::kSlidingWindow) {
                 const std::int64_t dense_pages =
                     ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
                 const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
@@ -195,7 +195,7 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
         const std::int64_t dense_pages =
             ceilDiv(max_total_tokens, block_granularity) +
             live_requests * ceilDiv(block_granularity - 1 + protected_tokens, block_granularity);
-        if (group.IsSnapshotStateGroup()) {
+        if (group.Kind() == AttnKind::kMambaState) {
             group_pages[i] = live_requests * single_request_pages[i];
         } else if (groups_[i].prefix_closed) {
             group_pages[i] = dense_pages;

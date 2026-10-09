@@ -27,6 +27,7 @@ until the HCA/CSA cache kernels are wired into TokenSpeed.
 
 from __future__ import annotations
 
+import functools
 import gc
 import re
 from collections.abc import Iterable
@@ -34,22 +35,10 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import (
-    dsv4_grouped_output_projection,
-    dsv4_grouped_output_projection_plan,
-    dsv4_grouped_output_projection_warmup_model,
-    dsv4_linear_fp32,
-)
-from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
-from tokenspeed_kernel import mhc_post as fast_mhc_post
-from tokenspeed_kernel import mhc_pre as fast_mhc_pre
-from tokenspeed_kernel import (
-    moe_topk,
-)
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
-from tokenspeed_kernel.ops.attention.dsa.triton import triton_dsa_index_candidates
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode_topk,
+    dsv4_index_candidates,
     dsv4_indexer_cache_format,
     dsv4_padded_heads,
     dsv4_plan,
@@ -59,8 +48,17 @@ from tokenspeed_kernel.ops.attention.dsv4 import (
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
-    triton_dsv4_index_candidates,
 )
+from tokenspeed_kernel.ops.gemm import (
+    dsv4_grouped_output_projection,
+    dsv4_grouped_output_projection_plan,
+    dsv4_grouped_output_projection_warmup_model,
+    dsv4_linear_fp32,
+)
+from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.residual import mhc_fused_hc as fast_mhc_fused_hc
+from tokenspeed_kernel.ops.residual import mhc_post as fast_mhc_post
+from tokenspeed_kernel.ops.residual import mhc_pre as fast_mhc_pre
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -119,15 +117,23 @@ from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    warmup_prepared_fp8_linears,
 )
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopK, TopKOutput
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
+from tokenspeed.runtime.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutput,
+    simulated_router_logits,
+)
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    get_moe_backend,
+)
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -1555,6 +1561,16 @@ class DeepseekV4MLP(nn.Module):
         return out
 
 
+def _random_expert_ids(
+    param: torch.Tensor, generator: torch.Generator, num_experts: int
+) -> None:
+    """Give each token distinct experts, chosen uniformly at random."""
+    scores = torch.rand(
+        param.shape[0], num_experts, generator=generator, device=param.device
+    )
+    param.data.copy_(scores.topk(param.shape[1], dim=1).indices)
+
+
 class DeepseekV4MoEGate(nn.Module):
     def __init__(
         self,
@@ -1575,6 +1591,9 @@ class DeepseekV4MoEGate(nn.Module):
                     dtype=hash_indices_dtype,
                 ),
                 requires_grad=False,
+            )
+            self.tid2eid.dummy_initializer = functools.partial(
+                _random_expert_ids, num_experts=config.n_routed_experts
             )
             self.e_score_correction_bias = None
         elif getattr(config, "topk_method", None) == "noaux_tc":
@@ -1624,6 +1643,8 @@ class DeepseekV4TopK(TopK):
             if routing_correction_bias is None
             else routing_correction_bias
         )
+        if self.simulate_routing:
+            router_logits = simulated_router_logits(router_logits)
         topk_weights, topk_ids = moe_topk(
             router_logits,
             self.topk_config.top_k,
@@ -1690,9 +1711,13 @@ class DeepseekV4MoE(nn.Module):
             raise ValueError(
                 f"Unsupported DeepSeek V4 MoE scoring: {self.scoring_func}"
             )
-        self.stream_fork = StreamFork(aux_stream)
-
-        self.use_mega_moe = get_moe_backend().is_mega_moe()
+        moe_backend = get_moe_backend()
+        self.use_mega_moe = moe_backend.is_mega_moe()
+        self.use_gluon_petit = moe_backend.is_gluon_petit()
+        self.owns_ep_communication = self.use_mega_moe or self.use_gluon_petit
+        # Petit's VMM-backed collective and auxiliary-stream shared experts do
+        # not replay safely together. Keep both branches on the main stream.
+        self.stream_fork = StreamFork(None if self.use_gluon_petit else aux_stream)
         if mapping.moe.ep_size > 1:
             if global_server_args_dict.get("enable_eplb", False):
                 raise ValueError(
@@ -1753,9 +1778,9 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=getattr(config, "swiglu_limit", None),
                 reduce_results=False,
                 # Normal EP sums routed and shared partials over the same TPxEP
-                # group. MegaMoE retains its existing dense placement and
-                # CommManager-owned shared-expert communication.
-                is_shared_expert=not self.use_mega_moe,
+                # group. Fused MegaMoE paths return complete routed outputs and
+                # therefore keep the shared expert dense and local.
+                is_shared_expert=not (self.use_mega_moe or self.use_gluon_petit),
             )
         else:
             self.shared_experts = None
@@ -1770,8 +1795,7 @@ class DeepseekV4MoE(nn.Module):
         )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=config.n_routed_experts
-            + global_server_args_dict["ep_num_redundant_experts"],
+            num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=routed_quant_config,
@@ -1920,7 +1944,7 @@ class DeepseekV4MoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
+        if hidden_states.shape[0] == 0 and not self.use_gluon_petit:
             return hidden_states
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
@@ -2343,6 +2367,7 @@ class DeepseekV4Indexer(nn.Module):
                 page_size=indexer_block_size,
                 max_logits_bytes=max_logits_mb * 1024 * 1024,
                 out=topk_out[token_slice],
+                slot_order=global_server_args_dict["dsa_slot_order"],
             )
             selected_i64 = selected.to(torch.int64)
             row_starts_i64 = row_starts.to(torch.int64)
@@ -2376,6 +2401,7 @@ class DeepseekV4Indexer(nn.Module):
             index_k_cache=indexer_cache,
             topk_layout="logical_offsets",
             out=topk_out[decode_slice],
+            slot_order=global_server_args_dict["dsa_slot_order"],
         )
         return topk_out
 
@@ -2412,34 +2438,19 @@ class DeepseekV4Indexer(nn.Module):
         )
         for start in range(0, positions.numel(), tile):
             end = min(positions.numel(), start + tile)
-            if self.use_fp4_cache:
-                offsets, scores = triton_dsv4_index_candidates(
-                    (
-                        packed_q[0][start:end].contiguous(),
-                        packed_q[1][start:end].contiguous(),
-                    ),
-                    weights[start:end],
-                    indexer_cache,
-                    table,
-                    requests[start:end],
-                    lengths[start:end],
-                    page_size=page_size,
-                    topk=self.topk_tokens,
-                )
-            else:
-                offsets, scores = triton_dsa_index_candidates(
-                    packed_q[0][start:end],
-                    weights[start:end],
-                    indexer_cache,
-                    table,
-                    requests[start:end],
-                    lengths[start:end],
-                    page_size=page_size,
-                    topk=self.topk_tokens,
-                    softmax_scale=self.softmax_scale,
-                    initial_tokens=0,
-                    local_tokens=0,
-                )
+            offsets, scores = dsv4_index_candidates(
+                (packed_q[0][start:end], packed_q[1][start:end]),
+                weights[start:end],
+                indexer_cache,
+                table,
+                requests[start:end],
+                lengths[start:end],
+                page_size=page_size,
+                topk=self.topk_tokens,
+                softmax_scale=self.softmax_scale,
+                index_k_format="mxfp4" if self.use_fp4_cache else "fp8_scaled",
+                solution=None,
+            )
             indices, _ = merge_index_candidates(
                 offsets, scores, topk=self.topk_tokens, group=group
             )
@@ -2869,9 +2880,6 @@ class DeepseekV4Attention(nn.Module):
             block_size=wo_a_quant_config.weight_block_size,
             scale_format=getattr(wo_a_quant_config, "scale_fmt", None),
         )
-        self.wo_a._dsv4_grouped_output_projection_plan = (
-            self._wo_a_output_projection_plan
-        )
         self.wo_b = RowParallelLinear(
             self.o_groups * self.o_lora_rank,
             config.hidden_size,
@@ -3247,6 +3255,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=True,
             prev_is_moe=True,
+            dense_batch_invariant=False,
+            query_sharded=False,
         )
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -3272,6 +3282,8 @@ class DeepseekV4DecoderLayer(nn.Module):
     def _pre_mlp_input_ids_comm(
         self, input_ids: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
+        if get_all2all_backend().is_gluon_petit():
+            return input_ids
         if not self.mapping.moe.has_tp_ep:
             return input_ids
         if self.comm_manager.use_all_reduce(is_moe=True):
@@ -3355,7 +3367,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_input_ids = input_ids
         use_mega_moe = getattr(self.ffn, "use_mega_moe", False)
-        if use_mega_moe:
+        owns_ep_communication = getattr(self.ffn, "owns_ep_communication", False)
+        if owns_ep_communication:
             token_counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
             num_global_tokens = sum(token_counts)
             max_num_tokens_per_gpu = max(token_counts) if token_counts else 0
@@ -3379,7 +3392,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 ctx=ctx if use_mega_moe else None,
                 comm_manager=self.comm_manager if use_mega_moe else None,
             )
-        if not use_mega_moe:
+        if not owns_ep_communication:
             with nvtx_range("post_mlp_comm"):
                 hidden_states, _ = self.comm_manager.post_mlp_comm(
                     hidden_states, None, ctx
@@ -3807,9 +3820,6 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def post_quant_warmup(self) -> None:
         """Called by the weight loader after all quant process_weights_after_loading."""
         dsv4_grouped_output_projection_warmup_model(
-            self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
-        )
-        warmup_prepared_fp8_linears(
             self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
         )
 

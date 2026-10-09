@@ -24,6 +24,8 @@ Run with torchrun --standalone --nproc-per-node=2 (or 4/8) and this file.
 Exercises the production collectives, candidate selection and attention merge.
 """
 
+from tokenspeed_kernel.ops.quantization import quantize_fp8
+
 
 def main() -> None:
     import os
@@ -31,7 +33,6 @@ def main() -> None:
     import torch
     import torch.distributed as dist
     from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
     from tokenspeed.runtime.distributed.comm_backend.registry import (
         initialize_comm_backend,
@@ -65,7 +66,7 @@ def main() -> None:
     torch.manual_seed(912)
     page_size, topk, pages = 64, 512, 17
     keys = torch.randn(pages * page_size, 128, device="cuda", dtype=torch.bfloat16)
-    values, scales = quantize_fp8_with_scale(
+    values, scales = quantize_fp8(
         keys, granularity="token_group", group_size=128, scale_encoding="float32"
     )
     full = torch.zeros(pages * page_size, 132, device="cuda", dtype=torch.uint8)
@@ -143,6 +144,7 @@ def main() -> None:
         seq_lens_2d=seq2d,
         plan=dsa_plan(page_size=64, seq_lens_2d=seq2d),
         solution="deep_gemm",
+        slot_order="selection",
     )
     # Main's native indexer has no forced-window arguments. Compare its
     # unforced policy separately; the checks above exercise mandatory windows.
@@ -234,6 +236,7 @@ def main() -> None:
         softmax_scale=0.1,
         page_size=64,
         return_lse=True,
+        slot_order="selection",
     )
     ref_out, _ = dsa_decode(
         q=all_q, kv_cache=latent, topk_slots=virtual_slots, **kwargs
@@ -244,7 +247,9 @@ def main() -> None:
     partial, lse = dsa_decode(
         q=gathered, kv_cache=local_latent, topk_slots=local_slots, **kwargs
     )
-    output = combine_attention_partials(partial, lse, group=group, rank=rank, sink=None)
+    output = combine_attention_partials(
+        partial, lse, group=group, rank=rank, sink=None, keep_all_heads=False
+    )
     torch.testing.assert_close(
         output, ref_out[:, rank * 2 : (rank + 1) * 2], rtol=0.01, atol=0.005
     )

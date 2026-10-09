@@ -82,6 +82,8 @@ class _ExecutionResult:
     output_nan_flags = None
     grammar_completion = None
     next_input_ids = None
+    input_token_logprobs = None
+    input_logprob_plan = None
     score_logprobs = None
 
 
@@ -91,6 +93,7 @@ def _state(input_ids: list[int], *, computed_length: int = 0) -> RequestState:
         sampling_params=SamplingParams(max_new_tokens=8, stop=[], ignore_eos=True),
         stream=False,
         tokenizer=_Tokenizer(),
+        computes_prompt_logprobs=True,
     )
     state.computed_length = computed_length
     return state
@@ -595,6 +598,8 @@ class _PrefillExecutionResult:
     output_nan_flags = None
     grammar_completion = None
     next_input_ids = torch.tensor([[101, 102, 103]], dtype=torch.int32)
+    input_token_logprobs = None
+    input_logprob_plan = None
     score_logprobs = None
 
 
@@ -685,7 +690,7 @@ def test_pd_one_token_request_finishes_at_remote_prefill_done():
     state.sampling_params.max_new_tokens = 1
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101, 2)
+    processor.on_remote_prefill_done("decode", 101, 2, None, None)
     events = processor.finish_remote_prefill_only_request("decode")
 
     assert state.output_ids == [101]
@@ -724,7 +729,7 @@ def test_pd_decode_matcher_accepts_the_prefill_nodes_token():
     state.grammar = _Matcher()
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101, 2)
+    processor.on_remote_prefill_done("decode", 101, 2, None, None)
 
     assert state.output_ids == [101]
     assert state.grammar.accepted == [101]
@@ -738,7 +743,7 @@ def test_pd_decode_drops_the_grammar_when_the_bootstrap_token_is_lost():
     state.grammar = _Matcher()
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", -1, 2)
+    processor.on_remote_prefill_done("decode", -1, 2, None, None)
 
     assert state.output_ids == []
     assert state.grammar is None
@@ -751,7 +756,7 @@ def test_pd_multi_token_request_continues_after_remote_prefill_done():
     state.sampling_params.max_new_tokens = 2
     processor.rid_to_state["decode"] = state
 
-    processor.on_remote_prefill_done("decode", 101, 2)
+    processor.on_remote_prefill_done("decode", 101, 2, None, None)
     events = processor.finish_remote_prefill_only_request("decode")
 
     assert state.output_ids == [101]
@@ -807,7 +812,7 @@ def test_remote_prefill_usage_merges_overlapping_prefixes(
     state = _state(list(range(2048)), computed_length=2048)
     state.cached_tokens = local_hits
     processor.rid_to_state["decode"] = state
-    processor.on_remote_prefill_done("decode", 101, remote_hits)
+    processor.on_remote_prefill_done("decode", 101, remote_hits, None, None)
     assert state.cached_tokens == expected
 
 
