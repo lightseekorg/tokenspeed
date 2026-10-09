@@ -83,7 +83,6 @@ jobs:
         with:
           name: repair-request
           path: ${{ runner.temp }}/pr-ci-assist/request.json
-          retention-days: 1
 
   repair:
     needs: control

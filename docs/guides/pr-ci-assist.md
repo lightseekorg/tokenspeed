@@ -37,13 +37,17 @@ Then run **PR CI Assist** manually with the PR number and `repair_run` left empt
 This gives reconciliation a 15-minute window to verify the existing results and
 publish the same candidate. It starts no new repair or GPU validation, and still
 requires the original command, PR source, and validation branch to match.
+The candidate keeps its original repair plan; later plan comments do not replace
+its selected checks or start additional tasks.
 
 A new main commit does not by itself invalidate a repair. Assistance reuses the
 candidate when main advances without touching the PR or repair files or the
 inputs of its selected checks. Documentation and independent components or
 backends follow the existing CI path rules. Shared CI controls, build and
 dependency inputs, unknown paths, rewritten history, and merge conflicts still
-require fresh validation. The original validation base and result source remain
+require fresh validation. Changes to the repair controller and its own tests do
+not invalidate GPU results unless the PR or a selected native check covers them.
+The original validation base and result source remain
 unchanged; promotion checks compatibility again and publishes the same repair.
 Explicit reconciliation also accepts a retained candidate previously marked stale
 when these compatibility checks pass.

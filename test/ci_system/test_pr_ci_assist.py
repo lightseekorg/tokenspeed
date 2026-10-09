@@ -243,6 +243,7 @@ def test_targeted_fix_enters_repair_and_waits_for_target_validation(
     assert request["state"]["target"] == state["target"]
     assert request["plan"]["tasks"][-1] == b200
     assert repair.allowed_paths(request) == {"model.py", "test/test_model.py"}
+    monkeypatch.setattr(assist, "repair_plan", lambda _: request["plan"])
     candidate = dict(
         patch="c" * 40,
         validation="d" * 40,
@@ -1729,6 +1730,17 @@ def test_main_advance_preserves_source_and_validation_boundaries(
     source, git, commit, state, path, shared = main_advance_repo
     original = copy.deepcopy(state)
     docs = commit("docs/guide.md", "Documentation\n")
+    commit(".github/scripts/pr_ci_assist.py", "controller = True\n")
+    commit(".github/scripts/pr_ci_repair.py", "controller = True\n")
+    commit(".github/workflows/pr-ci-assist.yml", "name: repair controller\n")
+    controller = commit(
+        "test/ci_system/test_pr_ci_assist.py", "controller_test = True\n"
+    )
+    state["native_checks"] = [
+        dict(workflow="nvidia-kernel-library-tests.yml", status="passed", run=1)
+    ]
+    assert assist.main_advance_compatible(state, controller, source=source)
+    state["native_checks"] = []
     other_vendor = commit("tokenspeed-mla/python/kernel.py", "value = 1\n")
     assert assist.main_advance_compatible(state, other_vendor, source=source)
     assert state == original
@@ -1808,6 +1820,33 @@ def test_promotion_reuses_original_tree_but_rechecks_latest_main(
     assert len(pushed) == 1
 
 
+def test_repair_plan_requires_the_original_authorized_source(monkeypatch, selected):
+    _, state = selected
+    state.update(action="fix", repair_run=201)
+    request = dict(state=copy.deepcopy(state), plan={"run": 55})
+    run = dict(id=201, path=".github/workflows/pr-ci-assist.yml", event="issue_comment")
+    monkeypatch.setattr(assist, "api", lambda _: run)
+
+    def download(owner, name, target):
+        assert owner == run and name == "repair-request"
+        target.joinpath("request.json").write_text(json.dumps(request))
+
+    monkeypatch.setattr(assist, "download", download)
+    assert assist.repair_plan(state) == request["plan"]
+    run.update(path=".github/workflows/pr-ci-assist-dispatch.yml", event="workflow_run")
+    assert assist.repair_plan(state) == request["plan"]
+    run["event"] = "issue_comment"
+    with pytest.raises(ValueError, match="Unexpected repair workflow"):
+        assist.repair_plan(state)
+    run["event"] = "workflow_run"
+    request["state"]["command"] += 1
+    with pytest.raises(ValueError, match="another authorized source"):
+        assist.repair_plan(state)
+    run["path"] = ".github/workflows/pr-ci-plan.yml"
+    with pytest.raises(ValueError, match="Unexpected repair workflow"):
+        assist.repair_plan(state)
+
+
 def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     monkeypatch, tmp_path, selected
 ):
@@ -1852,6 +1891,14 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     monkeypatch.setattr(assist, "load_state", lambda *args: copy.deepcopy(live[0]))
     monkeypatch.setattr(assist, "latest_command", lambda *args: author)
 
+    def download(owner, name, target):
+        request = json.loads(tmp_path.joinpath("request.json").read_text())
+        assert owner["id"] == request["state"]["repair_run"]
+        assert name == "repair-request"
+        target.joinpath("request.json").write_text(json.dumps(request))
+
+    monkeypatch.setattr(assist, "download", download)
+
     def publish(s, message):
         live[0] = copy.deepcopy(s)
 
@@ -1864,7 +1911,13 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
         lambda path: (
             {
                 "name": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
-                "path": ".github/workflows/pr-ci-plan.yml",
+                "id": int(path.rsplit("/", 1)[-1]),
+                "event": "workflow_dispatch",
+                "path": (
+                    ".github/workflows/pr-ci-plan.yml"
+                    if path == "actions/runs/55"
+                    else ".github/workflows/pr-ci-assist.yml"
+                ),
                 "conclusion": "success",
                 "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
                 "status": "completed",
@@ -1978,6 +2031,14 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
         json.loads(tmp_path.joinpath("request.json").read_text())["check_only"] is True
     )
     monkeypatch.delenv("REPAIR_CHECK_ONLY")
+    # A newer plan for the same PR source must not change an existing candidate's
+    # checks, even when reconciliation recovers state written by an old monitor.
+    comments.append(
+        {
+            "user": {"login": BOT, "id": BOT_ID},
+            "body": marker("plan", {**plan, "run": 56, "tasks": []}),
+        }
+    )
     # The validation branch has a different immutable source; an old head pass
     # must not authorize promotion of that candidate.
     live[0].update(
@@ -2101,6 +2162,8 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assert promoted[-1]["repair_run"] == promoted[0]["repair_run"]
     assert promoted[-1]["validation_base"] == validation_base
     assert len(dispatched) == 2 and not emitted
+    assert promoted[-1]["tasks"] == [plain]
+    comments.pop()
     monkeypatch.setattr(assist, "task_status", original_task_status)
     # Explicitly continue a failed candidate from its owning repair artifact.
     # Old candidate diagnostics survive, but none of its passes authorize the

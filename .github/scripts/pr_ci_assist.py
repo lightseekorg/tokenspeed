@@ -432,6 +432,15 @@ def main_advance_compatible(state: dict, main: str, *, source: Path) -> bool:
     workflows = {check["workflow"] for check in state.get("native_checks", [])}
     runtime_paths = set()
     for path in paths:
+        # These orchestrate repairs; selected GPU/native tasks do not execute them.
+        # Native workflow path filters below still apply to every changed path.
+        if path in {
+            ".github/scripts/pr_ci_assist.py",
+            ".github/scripts/pr_ci_repair.py",
+            ".github/workflows/pr-ci-assist.yml",
+            "test/ci_system/test_pr_ci_assist.py",
+        }:
+            continue
         parts = Path(path).parts
         if (
             not re.fullmatch(r"[A-Za-z0-9_./-]+", path)
@@ -458,7 +467,7 @@ def main_advance_compatible(state: dict, main: str, *, source: Path) -> bool:
             return False
         runtime_paths.add(path)
     if workflows.intersection(
-        check["workflow"] for check in native_checks(list(runtime_paths))
+        check["workflow"] for check in native_checks(list(paths))
     ):
         return False
     # Inspect both versions: removing a cross-vendor reference must not make
@@ -1158,6 +1167,38 @@ def repair_deadline(state: dict) -> int:
     )
 
 
+def repair_plan(state: dict) -> dict:
+    """Recover the plan that produced this candidate, not a later plan comment."""
+    run = api(f"actions/runs/{state['repair_run']}")
+    workflows = {".github/workflows/pr-ci-assist.yml"}
+    if run["event"] == "workflow_run":
+        workflows.add(".github/workflows/pr-ci-assist-dispatch.yml")
+    if run["path"] not in workflows or run["event"] not in {
+        "issue_comment",
+        "workflow_dispatch",
+        "workflow_run",
+    }:
+        raise ValueError("Unexpected repair workflow.")
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory)
+        download(run, "repair-request", target)
+        request = json.loads(target.joinpath("request.json").read_text())
+    if any(
+        request["state"].get(key) != state.get(key)
+        for key in (
+            "repository",
+            "pr",
+            "head",
+            "base",
+            "command",
+            "repair_run",
+            "target",
+        )
+    ):
+        raise ValueError("Repair plan belongs to another authorized source.")
+    return request["plan"]
+
+
 def control(number: int, *, expected_command: int | None = None):
     public_gate()
     pr = pull(number)
@@ -1340,25 +1381,50 @@ def control(number: int, *, expected_command: int | None = None):
                 state["phase"] = "manual"
                 publish(state, "CI plan refresh failed. Human intervention required.")
                 return
+    if state["phase"] == "repairing":
+        owner = api(f"actions/runs/{state['repair_run']}")
+        if owner["status"] == "completed":
+            state["phase"] = "manual"
+            publish(
+                state,
+                "Repair workflow ended before staging. Human intervention required; request a fresh fix.",
+            )
+        return
     source = checkout(state["head"], state["base"])
     os.environ.update(PR_NUMBER=str(number), GITHUB_REPOSITORY=REPO)
     data = context(source, state["head"], state["base"])
-    plans = [
-        p
-        for c in reversed(comments)
-        if (p := record(c, "plan"))
-        and p["pr"] == number
-        and p["head"] == state["head"]
-        and p["base"] == state["base"]
-    ]
-    if not plans:
-        if initial:
-            refresh_plan(
-                state,
-                "Refreshing the CI plan for this head and base; only its selected tasks will be watched.",
+    if "candidate" in state:
+        try:
+            plan = repair_plan(state)
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            subprocess.CalledProcessError,
+        ):
+            state["phase"] = "manual"
+            publish(
+                state, "The original repair plan could not be verified; PR unchanged."
             )
-        return
-    plan = plans[0]
+            return
+    else:
+        plans = [
+            p
+            for c in reversed(comments)
+            if (p := record(c, "plan"))
+            and p["pr"] == number
+            and p["head"] == state["head"]
+            and p["base"] == state["base"]
+        ]
+        if not plans:
+            if initial:
+                refresh_plan(
+                    state,
+                    "Refreshing the CI plan for this head and base; only its selected tasks will be watched.",
+                )
+            return
+        plan = plans[0]
     plan_run = api(f"actions/runs/{plan['run']}")
     if (
         plan_run["path"] != ".github/workflows/pr-ci-plan.yml"
@@ -1414,15 +1480,6 @@ def control(number: int, *, expected_command: int | None = None):
         )
     }
     state["submitted"] = [t for t in state["submitted"] if t in titles]
-    if state["phase"] == "repairing":
-        owner = api(f"actions/runs/{state['repair_run']}")
-        if owner["status"] == "completed":
-            state["phase"] = "manual"
-            publish(
-                state,
-                "Repair workflow ended before staging. Human intervention required; request a fresh fix.",
-            )
-        return
     runs = runs_for(state)
     previous_checks = state.get("native_checks", [])
     # Preserve failed-check evidence while resolving merge conflicts.
