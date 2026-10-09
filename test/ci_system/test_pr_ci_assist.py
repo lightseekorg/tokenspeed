@@ -1062,70 +1062,19 @@ def test_source_screen_retains_public_parents_and_rejects_new_private_text(tmp_p
     repair.identity(tmp_path)
     file = tmp_path / "model.py"
     file.write_text("# head https://example.com/v1\nvalue = 1\n")
-    root_api = tmp_path / repair.ROOT_API
-    root_api.parent.mkdir(parents=True)
-    old_exports = 'from package.ops import mm\n__all__ = ["mm"]\n'
-    bootstrap = "from package import bootstrap as _bootstrap\n_bootstrap()\n"
-    root_api.write_text(old_exports)
-    fp8_api = tmp_path / repair.FP8_API
-    fp8_api.parent.mkdir(parents=True)
-    fp8_api.write_text("value = 1\n")
-    fp8_reference = tmp_path / repair.FP8_REFERENCE
-    fp8_reference.write_text(
-        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return native_quantizer(x)\n"
-    )
     git("add", ".")
     git("commit", "-s", "-m", "initial")
     head = git("rev-parse", "HEAD")
     file.write_text("# main https://example.com/v1\nvalue = 2\n")
-    root_api.write_text(bootstrap)
     git("add", ".")
     git("commit", "-s", "-m", "base")
     base = git("rev-parse", "HEAD")
     file.write_text("# main https://example.com/v1\nvalue = 3\n")
-    assert repair.guard(
-        tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
-    )
-    root_api.write_text(old_exports)
-    with pytest.raises(repair.RepairRejected, match="removed root operator exports"):
-        repair.guard(
-            tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
-        )
-    root_api.write_text(bootstrap)
+    assert repair.guard(tmp_path, head, {"model.py"}, validation_base=base)
     assert repair.new_source_text(tmp_path, head, base, {"model.py"}) == "value = 3"
-    fp8_api.write_text(
-        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return x / x.abs().amax()\n"
-    )
-    with pytest.raises(repair.RepairRejected, match="Reuse main's prepacked quantizer"):
-        repair.guard(
-            tmp_path,
-            head,
-            {"model.py", repair.ROOT_API, repair.FP8_API},
-            validation_base=base,
-        )
-    fp8_api.write_text(
-        "from tokenspeed_kernel.ops.gemm.fp8_utils import flashinfer_fp8_blockscale_quantize_prepacked\n"
-    )
-    assert repair.guard(
-        tmp_path,
-        head,
-        {"model.py", repair.ROOT_API, repair.FP8_API},
-        validation_base=base,
-    )
-    fp8_reference.unlink()
-    with pytest.raises(repair.RepairRejected, match="merged source has no"):
-        repair.guard_prepacked_reference(tmp_path, head, base)
-    fp8_api.write_text(
-        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return registered_quantizer(x)\n"
-    )
-    repair.guard_prepacked_reference(tmp_path, head, base)
-    fp8_reference.write_text(git("show", f"{base}:{repair.FP8_REFERENCE}") + "\n")
-    fp8_api.write_text("value = 1\n")
     file.write_text("# new https://example.com/v1\nvalue = 3\n")
     with pytest.raises(repair.RepairRejected, match="public-output"):
-        repair.guard(
-            tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
-        )
+        repair.guard(tmp_path, head, {"model.py"}, validation_base=base)
 
 
 def test_native_dispatch_rejects_changed_workflow_controls(

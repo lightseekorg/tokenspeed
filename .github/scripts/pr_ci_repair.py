@@ -84,18 +84,12 @@ CONFIG_NAMES = {
     ".clang-tidy",
 }
 NATIVE_CONFIG = NATIVE_CHECKS["nvidia-kernel-library-tests.yml"]["config"]
-ROOT_API = "tokenspeed-kernel/python/tokenspeed_kernel/__init__.py"
-FP8_API = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/flashinfer.py"
-FP8_REFERENCE = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/fp8_utils.py"
 REPAIR_FEEDBACK = {
     "runtime-lint": "Required runtime Ruff checks failed. Correct the supplied source diagnostics without changing the lint policy.",
     "native-task": "Native repair must retain the original tests and every original byte except appending ${PYTHONPATH:+:$PYTHONPATH} inside an existing quoted PYTHONPATH prefix.",
     "test-syntax": "Test conflict resolution is not valid Python.",
     "source-syntax": "Source conflict resolution is not valid Python. Correct the supplied syntax error before validation.",
     "test-assertions": "Conflict resolution removed or changed test assertions. Preserve current main and PR-added assertions with their original behavior and thresholds.",
-    "retired-api": "Main deliberately removed root operator exports. Preserve that removal and migrate callers to operator modules instead of restoring the exports.",
-    "quantization-reference": "Reuse main's prepacked quantizer from ops/gemm/fp8_utils.py instead of reconstructing it in ops/gemm/flashinfer.py. Its native/Triton rounding, zero-group scales and padding are part of the supported contract; migrate callers to the existing implementation.",
-    "missing-reference": "The merged source has no ops/gemm/fp8_utils.py module. Preserve the PR's refactor and adapt consumers through available registered backends. Read the main-side reference snapshot for native/Triton rounding, zero-group scales and padding; do not import a deleted module or reconstruct quantization with plain division.",
     "scope": "Repair changes files outside its scope.",
     "file-size": "Repair deletes a file or exceeds the size limit.",
     "file-mode": "Repair changes file type or mode.",
@@ -369,88 +363,6 @@ def guard_targeted_tests(source: Path, request: dict):
             raise RepairRejected("test-assertions", path=path)
 
 
-def guard_retired_exports(source: Path, head: str, base: str):
-    def exports(content):
-        names = set()
-        for node in ast.parse(content).body:
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names.update(
-                    alias.asname or alias.name.split(".")[0] for alias in node.names
-                )
-            elif isinstance(
-                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
-                names.add(node.name)
-            elif isinstance(node, ast.Assign):
-                names.update(
-                    target.id for target in node.targets if isinstance(target, ast.Name)
-                )
-                if any(
-                    isinstance(target, ast.Name) and target.id == "__all__"
-                    for target in node.targets
-                ):
-                    names.update(
-                        item.value
-                        for item in ast.walk(node.value)
-                        if isinstance(item, ast.Constant)
-                        and isinstance(item.value, str)
-                    )
-        return {name for name in names if not name.startswith("_")}
-
-    parents = []
-    for ref in (command("git", "merge-base", head, base, cwd=source), head, base):
-        if not command(
-            "git", "ls-tree", "--name-only", ref, "--", ROOT_API, cwd=source
-        ):
-            return
-        parents.append(exports(command("git", "show", f"{ref}:{ROOT_API}", cwd=source)))
-    restored = (parents[0] & parents[1] - parents[2]) & exports(
-        source.joinpath(ROOT_API).read_text()
-    )
-    if restored:
-        raise RepairRejected("retired-api", path=ROOT_API, details=sorted(restored))
-
-
-def guard_prepacked_reference(source: Path, head: str, base: str, path: str = FP8_API):
-    symbol = "flashinfer_fp8_blockscale_quantize_prepacked"
-    if not source.joinpath(FP8_REFERENCE).is_file():
-        if any(
-            isinstance(node, ast.ImportFrom)
-            and node.module == "tokenspeed_kernel.ops.gemm.fp8_utils"
-            for node in ast.walk(ast.parse(source.joinpath(path).read_text()))
-        ):
-            raise RepairRejected(
-                "missing-reference", path=path, details={"reference": FP8_REFERENCE}
-            )
-        return
-    if path != FP8_API:
-        return
-
-    def defines(content):
-        return any(
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == symbol
-            for node in ast.parse(content).body
-        )
-
-    if not defines(source.joinpath(FP8_API).read_text()):
-        return
-    if defines(command("git", "show", f"{head}:{FP8_API}", cwd=source)):
-        return
-    if not command(
-        "git", "ls-tree", "--name-only", base, "--", FP8_REFERENCE, cwd=source
-    ):
-        return
-    if defines(
-        command("git", "show", f"{base}:{FP8_REFERENCE}", cwd=source)
-    ) and not defines(command("git", "show", f"{base}:{FP8_API}", cwd=source)):
-        raise RepairRejected(
-            "quantization-reference",
-            path=FP8_API,
-            details={"symbol": symbol, "reference": FP8_REFERENCE},
-        )
-
-
 def guard_file(source: Path, head: str, p: str, validation_base: str | None):
     file = source / p
     if not file.is_file():
@@ -501,7 +413,6 @@ def guard(
     allowed: set[str],
     *,
     validation_base: str | None = None,
-    check_main_contracts: bool = True,
 ):
     no_symlinks(source)
     names = command(
@@ -519,18 +430,10 @@ def guard(
         if Path(p).suffix == ".py"
         and {"test", "tests"}.intersection(Path(p).parts[:-1])
     }
-    if ROOT_API in allowed:
-        checked.add(ROOT_API)
-    if FP8_API in allowed:
-        checked.add(FP8_API)
     issues = []
     for p in sorted(checked):
         try:
             guard_file(source, head, p, validation_base)
-            if p == ROOT_API and validation_base and check_main_contracts:
-                guard_retired_exports(source, head, validation_base)
-            if Path(p).suffix == ".py" and validation_base and check_main_contracts:
-                guard_prepacked_reference(source, head, validation_base, p)
         except RepairRejected as error:
             issues.append(error)
     if issues:
@@ -947,9 +850,7 @@ def model():
     parents = sandbox_root / "parents"
     parents.mkdir()
     for name, ref in (("head", state["head"]), ("main", base)):
-        for path in sorted(
-            conflicts | ({FP8_REFERENCE} if FP8_API in allowed else set())
-        ):
+        for path in sorted(conflicts):
             if command("git", "ls-tree", "--name-only", ref, "--", path, cwd=source):
                 target = parents / name / path
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -995,8 +896,6 @@ the allowed source does not complete this task.
     prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Complete read-only conflict parents: {parents}/head/<relative path> and {parents}/main/<relative path>; an absent file does not exist on that parent. Read these paired snapshots to preserve assertions and deliberate removals. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Try to complete source edits within 15 minutes to reserve time for required checks, GPU queues and validation. Finish the smallest substantiated repair promptly. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
     if state.get("target"):
         prompt += f" The user explicitly requested repair of job {state['target']['job']} from run {state['target']['run']}. Use the supplied failure evidence in diagnostics.txt. Diagnose that failure from the evidence and source; a different backend passing does not resolve it. Fix only the supported platform's behavior and preserve test assertions and coverage."
-    if FP8_API in allowed and parents.joinpath("main", FP8_REFERENCE).is_file():
-        prompt += f" The PR may remove a module that exists on main. Read {parents}/main/{FP8_REFERENCE} for authoritative prepacked FP8 behavior, but check actual merged-source module availability before importing it. Preserve the PR's refactor and adapt callers to available registered/native/Triton backends. Zero-group scales, padding and backend rounding must match that reference; ad hoc tensor arithmetic is not an equivalent implementation."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
     guard_root = WORK / "guard"
     guard_root.mkdir()
