@@ -928,6 +928,7 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
         autotune_bf16_gemm=probe,
         flashinfer_bf16_gemm=joint,
         flashinfer_joint_bf16_supported=lambda *args: True,
+        is_serving=lambda: False,
         BF16_GEMM_MAX_M=32,
         resolve_kernel_override=lambda family, mode, explicit: override,
         pdl_enabled=lambda: False,
