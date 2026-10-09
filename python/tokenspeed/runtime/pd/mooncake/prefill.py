@@ -33,9 +33,6 @@ import numpy as np
 import requests
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
-from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
-    owned_local_pages,
-)
 from tokenspeed.runtime.pd.base.status import TransferPoll
 from tokenspeed.runtime.pd.cache_protocol import (
     CachePDBlockManifest,
@@ -56,12 +53,14 @@ from tokenspeed.runtime.pd.mooncake.pack import (
     PackedCopy,
     PageFieldCopies,
     PrefillPackScratch,
+    coalesce_transfer_blocks,
     flatten_transfer_blocks,
 )
 from tokenspeed.runtime.pd.transfer_plan import (
     CachePageOwnerFilter,
     CacheTransferFragment,
     CacheTransferPlanner,
+    local_transfer_pages,
     validate_rank_owner_filters,
 )
 from tokenspeed.runtime.pd.utils import (
@@ -464,7 +463,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         else:
             sges = flatten_transfer_blocks(pending)
         ret = 0
-        block_iter = iter(sges)
+        block_iter = iter(coalesce_transfer_blocks(sges))
         while batch := tuple(islice(block_iter, _TRANSFER_DESCRIPTOR_BATCH_SIZE)):
             src_addrs, dst_addrs, lengths = zip(*batch, strict=True)
             ret = self.engine.batch_transfer_sync(
@@ -481,6 +480,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         self,
         *,
         dst_ptr: int,
+        dst_tp_rank: int,
         src_block_manifest: CachePDBlockManifest | None,
         dst_block_manifest: CachePDBlockManifest,
         transfer_fragments: tuple[CacheTransferFragment, ...] = (),
@@ -547,30 +547,32 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 if block_selection is not None
                 else dst_group.block_ids
             )
-            if len(source_block_ids) != len(destination_block_ids):
-                raise ValueError(
-                    "cache transfer source and destination pages differ in count"
+            if (
+                group_spec.shard_count > 1
+                and owner_filters[group_spec.group_id] is None
+            ):
+                continue
+            src_pages, dst_pages = local_transfer_pages(
+                source_block_ids,
+                destination_block_ids,
+                group_id=group_spec.group_id,
+                source_layout=layout,
+                destination_layout=dst_cache_layout,
+                source_tp_rank=(
+                    owner_filters[group_spec.group_id].owner_rank
+                    if group_spec.shard_count > 1
+                    else 0
+                ),
+                destination_tp_rank=dst_tp_rank,
+            )
+            if src_pages.size:
+                group_transfers.append(
+                    (
+                        group_spec,
+                        src_pages,
+                        dst_pages,
+                    )
                 )
-            if group_spec.shard_count == 1:
-                src_pages = np.asarray(source_block_ids, dtype=np.int64)
-                dst_pages = np.asarray(destination_block_ids, dtype=np.int64)
-            else:
-                owner_filter = owner_filters[group_spec.group_id]
-                if owner_filter is None:
-                    continue
-                # This rank holds only the blocks whose (v - 1) % shard_count
-                # == owner_rank, in its local pages; the destination holds
-                # every block, so keep the destination entries at the same
-                # manifest positions.
-                owned, src_pages = owned_local_pages(
-                    source_block_ids,
-                    shard_count=owner_filter.owner_count,
-                    rank=owner_filter.owner_rank,
-                    virtual_block_count=layout.virtual_block_count(group_spec.group_id),
-                )
-                dst_pages = np.asarray(destination_block_ids, dtype=np.int64)[owned]
-            if len(src_pages):
-                group_transfers.append((group_spec, src_pages, dst_pages))
 
         # Per-field constants are hoisted out of the page loops: a long
         # prompt moves thousands of pages per field, and this generator runs
@@ -748,6 +750,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 assert req.block_manifest is not None
                 blocks = self._cache_transfer_blocks(
                     dst_ptr=registration.dst_kv_ptr,
+                    dst_tp_rank=registration.decode_tp_rank,
                     src_block_manifest=None,
                     dst_block_manifest=req.block_manifest,
                     transfer_fragments=registration.transfer_fragments,
@@ -960,6 +963,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     assert req.block_manifest is not None
                     blocks = self._cache_transfer_blocks(
                         dst_ptr=registration.dst_kv_ptr,
+                        dst_tp_rank=registration.decode_tp_rank,
                         src_block_manifest=kv_chunk.block_manifest,
                         dst_block_manifest=req.block_manifest,
                         transfer_fragments=registration.transfer_fragments,

@@ -2,6 +2,7 @@ import os
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 # CPU-only tests scheduled in runtime-1gpu because they import the full runtime.
@@ -22,6 +23,7 @@ from tokenspeed.runtime.pd.transfer_plan import (
     CachePageOwnerFilter,
     CacheTransferPlanner,
     UnsupportedPDLayoutError,
+    local_transfer_pages,
 )
 
 
@@ -226,10 +228,6 @@ def test_composite_partition_on_inner_axis_keeps_full_parent_row_stride():
     assert all(fragment.rows_per_page == 2 for fragment in fragments)
     assert all(fragment.src_row_stride_bytes == 48 for fragment in fragments)
     assert all(fragment.dst_row_stride_bytes == 24 for fragment in fragments)
-
-
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
 
 
 # ---- prefill chunk-pipeline (PP) layer-window routing ----
@@ -540,6 +538,7 @@ def test_equal_tp_sharded_route_sends_through_the_pages_api():
     def grids(rank):
         items = list(
             _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                dst_tp_rank=0,
                 dst_ptr=dst_ptr,
                 src_block_manifest=source_manifest,
                 dst_block_manifest=destination_manifest,
@@ -614,13 +613,16 @@ def test_equal_tp_stage_subset_routes_gqa_replicas_like_the_full_plan():
             assert decode_rank in stage.decode_ranks_by_prefill_rank[prefill_rank]
 
 
-def test_sharded_decode_destination_is_rejected():
-    with pytest.raises(UnsupportedPDLayoutError, match="sharded on Decode"):
-        _planner(2, 2, _latent_layout(shard_count=1), _latent_layout(shard_count=2))
+def test_sharded_decode_destination_is_routed():
+    planner = _planner(
+        2, 2, _latent_layout(shard_count=1), _latent_layout(shard_count=2)
+    )
+    for rank in range(2):
+        assert planner.plan_for_decode_rank(rank).target_prefill_ranks == (rank,)
 
 
 def test_shard_count_must_divide_prefill_tp():
-    with pytest.raises(UnsupportedPDLayoutError, match="does not divide"):
+    with pytest.raises(UnsupportedPDLayoutError, match="must divide"):
         _planner(3, 1, _latent_layout(shard_count=2), _latent_layout(shard_count=1))
 
 
@@ -761,6 +763,7 @@ def test_every_target_rank_of_a_hybrid_route_can_send_with_its_own_decisions():
                 assert decisions["history"] is None
             copies = _copies(
                 _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+                    dst_tp_rank=0,
                     dst_ptr=dst_ptr,
                     src_block_manifest=source_manifest,
                     dst_block_manifest=destination_manifest,
@@ -831,6 +834,7 @@ def test_pipeline_stage_without_a_sharded_group_decides_none_and_sends_rest():
     src_ptr, dst_ptr = 0x10000, 0x20000
     copies = _copies(
         _sender(prefill_layout, src_ptr)._cache_transfer_blocks(
+            dst_tp_rank=0,
             dst_ptr=dst_ptr,
             src_block_manifest=block_manifest(("history", (1, 2)), ("index", (3, 4))),
             dst_block_manifest=block_manifest(("history", (5, 6)), ("index", (7, 8))),
@@ -864,3 +868,70 @@ def test_receiver_calc_targets_every_rank_of_a_sharded_prefill():
 
     assert route.target_tp_ranks == (0, 1, 2, 3)
     assert route.dummy_tp_ranks == ()
+
+
+@pytest.mark.parametrize(
+    "source_degree,destination_degree", [(1, 1), (1, 4), (4, 1), (2, 4)]
+)
+@pytest.mark.parametrize("empty", [False, True])
+def test_local_transfer_pages_preserves_paired_positions(
+    source_degree, destination_degree, empty
+):
+    source = () if empty else (1, 3, 2, 1)
+    destination = () if empty else (3, 1, 2, 3)
+    for source_rank in range(source_degree):
+        for destination_rank in range(destination_degree):
+            expected = [
+                ((src - 1) // source_degree + 1, (dst - 1) // destination_degree + 1)
+                for src, dst in zip(source, destination, strict=True)
+                if (src - 1) % source_degree == source_rank
+                and (dst - 1) % destination_degree == destination_rank
+            ]
+            src_pages, dst_pages = local_transfer_pages(
+                source,
+                destination,
+                group_id="history",
+                source_layout=_latent_layout(shard_count=source_degree),
+                destination_layout=_latent_layout(shard_count=destination_degree),
+                source_tp_rank=source_rank + source_degree,
+                destination_tp_rank=destination_rank + destination_degree,
+            )
+            assert src_pages.dtype == dst_pages.dtype == np.dtype(np.int64)
+            assert (
+                list(zip(src_pages.tolist(), dst_pages.tolist(), strict=True))
+                == expected
+            )
+
+
+@pytest.mark.parametrize(
+    "source,destination",
+    [((0,), (1,)), ((1,), (0,)), ((-1,), (1,)), ((1,), (999999,)), ((999999,), (1,))],
+)
+def test_local_transfer_pages_rejects_invalid_blocks(source, destination):
+    with pytest.raises(UnsupportedPDLayoutError, match="virtual address space"):
+        local_transfer_pages(
+            source,
+            destination,
+            group_id="history",
+            source_layout=_latent_layout(shard_count=2),
+            destination_layout=_latent_layout(shard_count=4),
+            source_tp_rank=1,
+            destination_tp_rank=3,
+        )
+
+
+def test_local_transfer_pages_rejects_unpaired_blocks():
+    with pytest.raises(ValueError, match="differ in count"):
+        local_transfer_pages(
+            (1,),
+            (),
+            group_id="history",
+            source_layout=_latent_layout(shard_count=1),
+            destination_layout=_latent_layout(shard_count=1),
+            source_tp_rank=0,
+            destination_tp_rank=0,
+        )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
