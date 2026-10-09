@@ -1211,6 +1211,12 @@ window the first decode consumes. Under PD the retained tail of the SWA group
 ships to the decode node like any sliding window, draft rows included, and
 the decode node re-feeds nothing.
 
+K3 DSpark context injection uses the draft backend's cache placement to
+resolve virtual slots and mask nonowner writes before storing MLA KV. It
+therefore follows the same KVP ownership contract as attention writes; the
+architecture alone must not reject KVP. Backend capability and shared-group
+storage checks still apply.
+
 Capacity has three shapes, all on the base class. The default is the flat
 product (`parents × tightest packing × P`). A probe arena is the third and
 narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe
@@ -1311,18 +1317,15 @@ collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. GPU DSA sparse
 prefill instead combines local sparse-attention partials.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
-KVP does not make unsupported kernels portable. KVP excludes speculative
-decoding for every model on the ordinary MLA/DSA recipe, whichever dense
-kernel runs it: `OrdinaryRecipe.groups()` refuses to shard a cache that holds
-a draft group, so a CuTe MLA engine that would accept the draft kernels still
-cannot combine KVP with a draft; FlashMLA and GPU DSA `AttnConfig` additionally
-reject any speculative width, draft or target, in their DCP decode. Only the recipes
-that declare their own groups shard with a draft present: DeepSeek V4 (its
-draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
-the sharded MLA history group), each subject to its backend's `AttnConfig`
-gate. The draft's decode steps would run the same sparse/dense DCP branches as
-the target's, but that path has not been validated for the ordinary recipe, so
-its exclusion is a gate rather than a geometry limit.
+KVP does not make unsupported kernels portable. Speculative decoding runs
+on sharded caches: `OrdinaryRecipe.groups()` shards a draft group like the
+target's, and the DeepSeek V4 and Kimi K3 recipes shard with their draft
+layers in the compressed-KV chains and the MLA history group respectively,
+each subject to its backend's `AttnConfig` gate. FlashMLA verify maps each
+query's causal bound to a local length (`dcp_query_lengths`) and runs one
+kernel row per query; GPU DSA selects causal Top-K before mapping cache slots.
+Non-causal DSA block drafts remain unsupported (`AttnConfig` rejects
+`draft_block_decode` under GPU DSA KVP).
 
 **Tier transfers under sharding pair blocks of equal residue.** The Host L2
 pool and the snapshot pool are registered with the same `shard_count` as the

@@ -34,6 +34,7 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -462,10 +463,16 @@ class DFlash2DraftModel(DFlashDraftModel):
         positions: torch.Tensor,
         cache_locs: torch.Tensor,
         token_to_kv_pool,
+        *,
+        attn_backend,
     ) -> None:
         if not self._uses_mla:
             return super().write_context_kv(
-                ctx_hidden, positions, cache_locs, token_to_kv_pool
+                ctx_hidden,
+                positions,
+                cache_locs,
+                token_to_kv_pool,
+                attn_backend=attn_backend,
             )
         if ctx_hidden.shape[0] == 0:
             return
@@ -473,12 +480,21 @@ class DFlash2DraftModel(DFlashDraftModel):
             attn = layer.self_attn
             latent = attn.project_latent_kv(ctx_hidden)
             latent = attn.apply_latent_rope(positions, latent)
+            # Context injection writes the same sharded cache as attention.
+            local_locs, write_mask = resolve_cache_slots(
+                cache_locs,
+                (
+                    attn_backend.cache_placement(attn.attn_mqa)
+                    if attn_backend is not None
+                    else None
+                ),
+            )
             token_to_kv_pool.set_mla_kv_buffer(
                 attn.attn_mqa,
-                cache_locs,
+                local_locs,
                 latent[..., : attn.kv_lora_rank].contiguous(),
                 latent[..., attn.kv_lora_rank :].contiguous(),
-                write_mask=None,
+                write_mask=write_mask,
             )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

@@ -410,3 +410,42 @@ def test_k3_per_tap_projection_uses_local_checkpoint_columns(capture_idx, with_n
     torch.testing.assert_close(model.project_target_tap(capture_idx, hidden), expected)
     with pytest.raises(ValueError):
         model.project_target_tap(1, hidden)
+
+
+def test_context_kv_write_respects_dcp_ownership():
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+    slots = torch.tensor([0, 128, 129, 256, 384, 512, 896, 1024, -1])
+    latent = torch.arange(slots.numel() * 6).reshape(-1, 6).float()
+    attn = SimpleNamespace(
+        attn_mqa=object(),
+        kv_lora_rank=4,
+        project_latent_kv=lambda hidden: hidden,
+        apply_latent_rope=lambda positions, hidden: hidden,
+    )
+    model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])
+    owner_counts = torch.zeros_like(slots)
+    for rank in range(4):
+
+        def write(layer, local, key, rope, *, write_mask):
+            expected = (
+                (slots >= 128) & (slots < 1024) & (((slots // 128 - 1) % 4) == rank)
+            )
+            torch.testing.assert_close(write_mask, expected)
+            expected_local = ((slots // 128 - 1) // 4 + 1) * 128 + slots % 128
+            torch.testing.assert_close(local[expected], expected_local[expected])
+            torch.testing.assert_close(torch.cat((key, rope), dim=-1), latent)
+            owner_counts.add_(write_mask)
+
+        backend = SimpleNamespace(
+            cache_placement=lambda layer: CachePlacement(128, 8, (0, 1, 2, 3), rank)
+        )
+        K3DSparkModel.write_context_kv(
+            model,
+            latent,
+            torch.arange(slots.numel()),
+            slots,
+            SimpleNamespace(set_mla_kv_buffer=write),
+            attn_backend=backend,
+        )
+    torch.testing.assert_close(owner_counts, ((slots >= 128) & (slots < 1024)).long())

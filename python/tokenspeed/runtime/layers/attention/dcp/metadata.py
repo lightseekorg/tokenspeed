@@ -285,3 +285,44 @@ def refresh_dcp_page_table_metadata(
         )
         result.local_page_table.masked_fill_(~result.owner_mask, -1)
     return result
+
+
+def dcp_query_lengths(
+    metadata: CompactDCPMetadata,
+    seq_lens: torch.Tensor,
+    *,
+    query_width: int,
+    causal: bool,
+) -> torch.Tensor:
+    """Return local visible token counts [requests, query_width].
+
+    The compact table contains the full request history. A causal verify row
+    excludes only the later query tokens owned by this rank; subtracting the
+    global query offset would incorrectly remove tokens on other ranks.
+    Non-causal block drafts see the same local history for every query.
+    """
+    if query_width < 1 or seq_lens.shape != metadata.local_seq_lens.shape:
+        raise ValueError("DCP query lengths must match request metadata")
+    full = metadata.local_seq_lens[:, None]
+    if not causal or query_width == 1:
+        return full.expand(-1, query_width)
+    positions = (
+        seq_lens[:, None]
+        - query_width
+        + torch.arange(query_width, device=seq_lens.device)
+    )
+    table = metadata.virtual_page_table
+    columns = positions.div(metadata.page_size, rounding_mode="floor")
+    pages = table.gather(1, columns.clamp(0, table.shape[1] - 1).long())
+    blocks = pages.div(
+        metadata.block_granularity // metadata.page_size, rounding_mode="floor"
+    )
+    owned = (
+        (positions >= 0)
+        & (columns < table.shape[1])
+        & (blocks > 0)
+        & (blocks < metadata.virtual_block_count)
+        & ((blocks - 1) % metadata.degree == metadata.rank)
+    )
+    prefix = owned.cumsum(dim=1, dtype=seq_lens.dtype)
+    return full - (prefix[:, -1:] - prefix)

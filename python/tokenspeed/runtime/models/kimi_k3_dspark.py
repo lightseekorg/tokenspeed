@@ -55,6 +55,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -515,6 +516,8 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         positions: torch.Tensor,
         cache_locs: torch.Tensor,
         token_to_kv_pool,
+        *,
+        attn_backend,
     ) -> None:
         """Project target-derived context into each draft layer's latent cache.
 
@@ -528,12 +531,21 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             attn = layer.self_attn
             latent = attn.project_latent_kv(ctx_hidden)
             latent = attn.apply_latent_rope(positions, latent)
+            # Context injection writes the same sharded cache as attention.
+            local_locs, write_mask = resolve_cache_slots(
+                cache_locs,
+                (
+                    attn_backend.cache_placement(attn.attn_mqa)
+                    if attn_backend is not None
+                    else None
+                ),
+            )
             token_to_kv_pool.set_mla_kv_buffer(
                 attn.attn_mqa,
-                cache_locs,
+                local_locs,
                 latent[..., : attn.kv_lora_rank].contiguous(),
                 latent[..., attn.kv_lora_rank :].contiguous(),
-                write_mask=None,
+                write_mask=write_mask,
             )
 
     @torch.no_grad()

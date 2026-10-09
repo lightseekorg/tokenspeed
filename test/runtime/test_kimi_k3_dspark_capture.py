@@ -172,12 +172,12 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             mapping=mapping,
             project_target_tap=lambda index, rows: rows,
             finalize_target_projection=lambda rows: rows,
-            write_context_kv=lambda rows, positions, locations, pool: writes.append(
+            write_context_kv=lambda rows, positions, locations, pool, *, attn_backend: writes.append(
                 (rows.clone(), locations)
             ),
         )
         producer = DSparkContextProducer(
-            projector, object() if mapping.is_last_pp_rank else None
+            projector, object() if mapping.is_last_pp_rank else None, attn_backend=None
         )
         model = SimpleNamespace(
             config=SimpleNamespace(num_hidden_layers=4, attn_res_block_size=2),
