@@ -84,6 +84,9 @@ def test_qwen4_exp_prefetch_starts_at_preceding_layer(
         for layer_id in range(4)
     )
     model.hyper_connection_mixer = _RecordingMixer()
+    model.dspark_layers_to_capture = ()
+    model.dspark_capture_hc = None
+    model._dspark_capture_idx_map = {}
     capture = _RecordingCapture() if capturing else None
     monkeypatch.setattr(
         qwen4_exp_module.BreakableCapture,

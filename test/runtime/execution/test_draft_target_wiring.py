@@ -748,6 +748,37 @@ def test_block_drafter_wire_target_only_binds_resources(drafter_class):
     target.set_dflash_aux_hidden_stream.assert_not_called()
 
 
+@pytest.mark.parametrize("owns_embedding", [False, True])
+@pytest.mark.parametrize("owns_head", [False, True])
+def test_dspark_binds_each_checkpoint_resource_independently(owns_embedding, owns_head):
+    from tokenspeed.runtime.models.dspark import DSparkDraftModel
+
+    model = DSparkDraftModel.__new__(DSparkDraftModel)
+    torch.nn.Module.__init__(model)
+    own_embedding, own_head, own_processor = object(), object(), object()
+    model.embed_tokens = own_embedding if owns_embedding else None
+    model.lm_head = own_head if owns_head else None
+    model.logits_processor = own_processor if owns_head else None
+    target_embedding, target_head, target_processor = object(), object(), object()
+    target = SimpleNamespace(
+        get_input_embeddings=lambda: target_embedding,
+        lm_head=target_head,
+        logits_processor=target_processor,
+    )
+    drafter = DSpark.__new__(DSpark)
+    drafter.model = model
+
+    drafter.wire_target(target)
+
+    assert drafter.embed_tokens is (
+        own_embedding if owns_embedding else target_embedding
+    )
+    assert drafter.lm_head is (own_head if owns_head else target_head)
+    assert drafter.logits_processor is (
+        own_processor if owns_head else target_processor
+    )
+
+
 def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
     drafter = DSpark.__new__(DSpark)
     embedding = object()
@@ -848,6 +879,25 @@ def _incremental_dflash(enabled: bool) -> DFlash:
 def test_base_prepare_target_forward_attaches_nothing():
     ctx = _target_ctx(num_extends=0, num_tokens=4)
     BaseDrafter.prepare_target_forward(mock.MagicMock(spec=BaseDrafter), ctx)
+    assert ctx.target_capture_sink is None
+
+
+def test_hyper_dspark_never_arms_linear_incremental_projection():
+    from tokenspeed.runtime.models.dspark import HyperDSparkDraftModel
+
+    model = HyperDSparkDraftModel.__new__(HyperDSparkDraftModel)
+    torch.nn.Module.__init__(model)
+    drafter = _incremental_dflash(enabled=True)
+    drafter.draft_model_runner = SimpleNamespace(model=model)
+
+    # Even with a fused KV writer and an auxiliary stream, raw HC taps need
+    # the trained nonlinear reducers before any FC projection can run.
+    drafter._init_incremental_proj()
+    ctx = _target_ctx(num_extends=0, num_tokens=4)
+    drafter.prepare_target_forward(ctx)
+
+    assert drafter._incremental_proj_enabled is False
+    assert drafter._incremental_kv_write_done is False
     assert ctx.target_capture_sink is None
 
 

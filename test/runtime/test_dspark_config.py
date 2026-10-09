@@ -35,7 +35,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTEN
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
 from tokenspeed.runtime.models.dspark import _get_markov_params
-from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+from tokenspeed.runtime.utils.hf_transformers_utils import (
+    get_config,
+    get_hf_text_config,
+)
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_RULES,
     read_checkpoint_block_size,
@@ -291,15 +294,120 @@ def _write_config(tmp_path, **fields) -> str:
     return str(tmp_path)
 
 
-def test_qwen3_dspark_arch_is_rewritten_to_the_entry_class(tmp_path) -> None:
-    path = _write_config(tmp_path, architectures=["Qwen3DSparkModel"])
-    config = get_config(path, trust_remote_code=False, is_draft_worker=True)
-    assert config.architectures[0] == "DSparkDraftModel"
+@pytest.mark.parametrize(
+    ("architecture", "entry_class"),
+    (
+        ("Qwen3DSparkModel", "DSparkDraftModel"),
+        ("Qwen3DSparkForCausalLM", "DSparkDraftModel"),
+        ("Qwen3HyperDSparkModel", "HyperDSparkDraftModel"),
+        ("Qwen3HyperDSparkForCausalLM", "HyperDSparkDraftModel"),
+    ),
+)
+def test_qwen3_dspark_arch_is_rewritten_to_the_entry_class(
+    tmp_path, architecture: str, entry_class: str
+) -> None:
+    path = _write_config(tmp_path, architectures=[architecture])
+    config = get_config(
+        path,
+        trust_remote_code=False,
+        is_draft_worker=True,
+        speculative_algorithm="DSPARK",
+    )
+    assert config.architectures == [entry_class]
+
+
+def test_hyper_dspark_config_preserves_projector_metadata(tmp_path) -> None:
+    projector_config = {
+        "projector_type": "hyperdspark",
+        "hc_count": 4,
+        "hc_lowrank": 8,
+        "target_layer_ids": [1, 3],
+        "markov_rank": 16,
+        "mask_token_id": 127,
+    }
+    path = _write_config(
+        tmp_path,
+        architectures=["Qwen3HyperDSparkForCausalLM"],
+        num_target_layers=4,
+        target_hidden_size=64,
+        dflash_config=projector_config,
+        block_size=7,
+        **projector_config,
+    )
+
+    config = get_config(
+        path,
+        trust_remote_code=False,
+        is_draft_worker=True,
+        speculative_algorithm="DSPARK",
+    )
+
+    assert config.dflash_config == projector_config
+    assert config.projector_type == "hyperdspark"
+    assert (config.hc_count, config.hc_lowrank) == (4, 8)
+    assert config.target_layer_ids == [1, 3]
+    assert config.target_hidden_size == 64
+    assert config.num_target_layers == 4
+    assert read_checkpoint_block_size(config) == 7
+
+
+@pytest.mark.parametrize(
+    ("architecture", "model_type"),
+    (
+        ("Qwen4ExpForCausalLM", "qwen4_exp_text"),
+        ("Qwen4ExpForConditionalGeneration", "qwen4_exp"),
+        ("Qwen4ExpForCausalLMNextN", "qwen4_exp_text"),
+    ),
+)
+def test_qwen4_dspark_requires_an_external_draft(
+    tmp_path, architecture: str, model_type: str
+) -> None:
+    path = _write_config(tmp_path, model_type=model_type, architectures=[architecture])
+
+    with pytest.raises(ValueError, match="--speculative-draft-model-path"):
+        get_config(
+            path,
+            trust_remote_code=False,
+            is_draft_worker=True,
+            speculative_algorithm="DSPARK",
+        )
+
+
+@pytest.mark.parametrize(
+    ("architecture", "model_type"),
+    (
+        ("Qwen4ExpForCausalLM", "qwen4_exp_text"),
+        ("Qwen4ExpForConditionalGeneration", "qwen4_exp"),
+    ),
+)
+def test_qwen4_mtp_keeps_the_embedded_nextn_head(
+    tmp_path, architecture: str, model_type: str
+) -> None:
+    path = _write_config(
+        tmp_path,
+        model_type=model_type,
+        architectures=[architecture],
+        layer_types=["linear_attention", "full_attention"],
+        ple_layer_ids=[1],
+    )
+
+    config = get_config(
+        path,
+        trust_remote_code=False,
+        is_draft_worker=True,
+        speculative_algorithm="MTP",
+    )
+
+    assert config.architectures == ["Qwen4ExpForCausalLMNextN"]
+    text_config = get_hf_text_config(config)
+    assert text_config.num_hidden_layers == 1
+    assert text_config.layer_types == ["full_attention"]
+    assert text_config.ple_layer_ids == []
 
 
 def test_dspark_archs_are_never_suffixed_with_nextn(tmp_path) -> None:
     """The NextN rewrite must not fire for a DSpark draft checkpoint."""
-    for arch in ("DSparkDraftModel", "K3DSparkModel"):
+    for arch in ("DSparkDraftModel", "HyperDSparkDraftModel", "K3DSparkModel"):
         path = _write_config(tmp_path, architectures=[arch])
         config = get_config(path, trust_remote_code=False, is_draft_worker=True)
         assert config.architectures[0] == arch

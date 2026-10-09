@@ -26,6 +26,7 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
+from tokenspeed.runtime.models.dspark import DSparkDraftModel
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -37,6 +38,20 @@ class DSpark(DFlash):
 
     sample_from_anchor = True
     spec_algorithm = "DSPARK"
+
+    def wire_target(self, target_model) -> None:
+        """Use checkpoint-owned embedding/head tensors when the draft ships them."""
+        super().wire_target(target_model)
+        if isinstance(self.model, DSparkDraftModel):
+            if self.model.embed_tokens is not None:
+                self.embed_tokens = self.model.embed_tokens
+            if self.model.lm_head is not None:
+                if self.model.logits_processor is None:
+                    raise RuntimeError(
+                        "DSpark checkpoint head has no logits processor."
+                    )
+                self.lm_head = self.model.lm_head
+                self.logits_processor = self.model.logits_processor
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

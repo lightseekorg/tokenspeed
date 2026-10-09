@@ -432,6 +432,9 @@ def _tail_fusion_model(
     torch.nn.Module.__init__(model)
     model.config = config
     model.hidden_size = config.hidden_size
+    model.dspark_layers_to_capture = ()
+    model.dspark_capture_hc = None
+    model._dspark_capture_idx_map = {}
     model.embed_tokens = torch.nn.Embedding(32, config.hidden_size)
     model.layers = torch.nn.ModuleList(
         _TailFusionLayer(

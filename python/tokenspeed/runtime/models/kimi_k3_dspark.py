@@ -313,6 +313,11 @@ class K3DSparkDecoderLayer(nn.Module):
 class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
     """The draft network. Interface-compatible with ``DFlashDraftModel``."""
 
+    @property
+    def supports_incremental_target_projection(self) -> bool:
+        """K3 owns its per-tap normalization and context projection."""
+        return False
+
     def __init__(
         self,
         config,

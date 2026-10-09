@@ -528,6 +528,58 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             for layer in self.layers
             if getattr(layer, "indexer", None) is not None
         )
+        self.dspark_layers_to_capture: tuple[int, ...] = ()
+        self.dspark_capture_hc: bool | None = None
+        self._dspark_capture_idx_map: dict[int, int] = {}
+
+    def set_dspark_layers_to_capture(
+        self, layer_ids: list[int], *, capture_hc: bool
+    ) -> None:
+        """Select completed decoder outputs in checkpoint concatenation order.
+
+        Args:
+            layer_ids: Strictly increasing zero-based decoder indices,
+                including the final layer when required by the draft checkpoint.
+            capture_hc: Return the complete flat HC stream when true, or the
+                unweighted mean of its branches when false.
+        """
+        if not layer_ids:
+            raise ValueError("DSpark target layers must not be empty")
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError("DSpark target layers must be unique")
+        if any(left >= right for left, right in zip(layer_ids, layer_ids[1:])):
+            raise ValueError("DSpark target layers must be strictly increasing")
+        invalid = [value for value in layer_ids if not 0 <= value < len(self.layers)]
+        if invalid:
+            raise ValueError(f"DSpark target layers contain invalid ids: {invalid}")
+        self.dspark_layers_to_capture = tuple(layer_ids)
+        self.dspark_capture_hc = capture_hc
+        self._dspark_capture_idx_map = {
+            layer_id: index for index, layer_id in enumerate(layer_ids)
+        }
+
+    def _capture_dspark_hidden(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        residual,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Snapshot a completed layer without changing its deferred HC update."""
+        layer = self.layers[layer_id]
+        if residual is not None:
+            # The ordinary forward injects this MLP output at the next layer's
+            # entry. Resolve a separate copy so capturing does not change that
+            # fused execution or omit the final layer's MLP contribution.
+            hidden_states = layer.mlp_hyper_connection.combine(hidden_states, residual)
+        if not self.dspark_capture_hc:
+            hidden_states = hidden_states.unflatten(
+                -1, (self.config.hc_count, self.hidden_size)
+            ).mean(dim=-2)
+        hidden_states, _ = layer.comm_manager.post_final_norm_comm(
+            hidden_states, hidden_states, ctx
+        )
+        return hidden_states.clone()
 
     def _start_ple_prefetch(
         self, ple: Qwen4ExpPLELayer, input_ids: torch.Tensor, ctx: ForwardContext
@@ -555,6 +607,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         if self.layers and self.layers[0].ple is not None:
             self._start_ple_prefetch(self.layers[0].ple, input_ids, ctx)
         residual = None
+        dspark_captures: dict[int, torch.Tensor] = {}
         for layer_id, layer in enumerate(self.layers):
             if layer_id + 1 < len(self.layers):
                 next_ple = self.layers[layer_id + 1].ple
@@ -582,6 +635,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     :, start : start + self.hidden_size
                 ].repeat(1, self.config.hc_count)
                 hidden_states.add_(deepstack)
+            if layer_id in self._dspark_capture_idx_map:
+                capture_idx = self._dspark_capture_idx_map[layer_id]
+                captured = self._capture_dspark_hidden(
+                    layer_id, hidden_states, residual, ctx
+                )
+                dspark_captures[capture_idx] = captured
+                if ctx.target_capture_sink is not None:
+                    ctx.target_capture_sink.on_target_capture(capture_idx, captured)
 
         if self.layers and self.layers[-1].comm_manager.needs_final_all_gather():
             if residual is not None:
@@ -600,6 +661,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states, residuals = self.hyper_connection_mixer.mix(
             hidden_states, normalized=normalized
         )
+        if self.dspark_layers_to_capture:
+            return hidden_states, [
+                dspark_captures[index]
+                for index in range(len(self.dspark_layers_to_capture))
+            ]
         return hidden_states, [residuals[0]]
 
 
@@ -796,6 +862,13 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
         text_config = getattr(config, "text_config", config)
         super().__init__(text_config, mapping, quant_config, prefix)
 
+    def set_dspark_layers_to_capture(
+        self, layer_ids: list[int], *, capture_hc: bool
+    ) -> None:
+        """Configure completed target-layer captures for the DSpark draft."""
+        self.model.set_dspark_layers_to_capture(layer_ids, capture_hc=capture_hc)
+        self.capture_aux_hidden_states = True
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return load_qwen4_exp_weights(
             self, self.config, self.mapping, weights, include_visual=False
@@ -835,6 +908,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             is_multimodal_active,
             mm_attention_backend,
         )
+
+    def set_dspark_layers_to_capture(
+        self, layer_ids: list[int], *, capture_hc: bool
+    ) -> None:
+        """Configure completed target-layer captures for the DSpark draft."""
+        self.model.set_dspark_layers_to_capture(layer_ids, capture_hc=capture_hc)
+        self.capture_aux_hidden_states = True
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return load_qwen4_exp_weights(
