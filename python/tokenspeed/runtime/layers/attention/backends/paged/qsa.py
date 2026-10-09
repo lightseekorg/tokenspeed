@@ -26,7 +26,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
+from tokenspeed_kernel.ops.attention.qsa import QSAPrefillMetadata, qsa_sparse_attention
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -34,7 +34,11 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
-from tokenspeed.runtime.layers.attention.qsa.metadata import decode_query_lengths
+from tokenspeed.runtime.layers.attention.qsa.metadata import (
+    QSALayout,
+    QSASelection,
+    decode_query_lengths,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
@@ -60,6 +64,7 @@ class QSAAttnBackend(MHAAttnBackend):
             dataclasses.replace(spec, backend_name="mha"),
             kernel_page_size=kernel_page_size,
         )
+        self._metadata_capacity_rows = 0
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
@@ -87,6 +92,32 @@ class QSAAttnBackend(MHAAttnBackend):
             q.shape[0],
             force_uniform=ctx.draft_narrowing is not None,
         )
+        prefill_metadata = None
+        if max_seqlen_q is None:
+            selection = ctx.attn_backend.sparse_topk.prefill
+            if selection is not None:
+                layout = ctx.attn_backend.sparse_topk.qsa_metadata
+                metadata = self.forward_extend_metadata
+                if (
+                    not isinstance(selection, QSASelection)
+                    or not isinstance(layout, QSALayout)
+                    or metadata is None
+                ):
+                    raise RuntimeError(
+                        "QSA prefill requires the current indexer and extend metadata"
+                    )
+                # Graph breaks may copy physical slots into a stable handoff
+                # buffer. The per-forward memo owns the logical selection.
+                rows = q.shape[0]
+                prefill_metadata = QSAPrefillMetadata(
+                    selected_blocks=selection.selected_blocks[:rows],
+                    block_table=layout.full_page_table,
+                    token_to_request=layout.request_indices[:rows].to(torch.int32),
+                    query_positions=layout.logical_positions[:rows],
+                    query_start_loc=tuple(metadata.cu_extend_seq_lens_cpu),
+                    page_size=layout.full_kernel_page_size,
+                    block_size=selection.block_size,
+                )
         output = qsa_sparse_attention(
             q,
             k_cache,
@@ -99,6 +130,7 @@ class QSAAttnBackend(MHAAttnBackend):
             v_scale=1.0 if v_cache.dtype == torch.float8_e4m3fn else None,
             override=None,
             solution=None,
+            prefill_metadata=prefill_metadata,
         )
         return output.reshape(q.shape[0], -1)
 

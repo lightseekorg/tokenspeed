@@ -86,6 +86,7 @@ from tokenspeed.runtime.layers.attention.qsa import (
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
     QSALayout,
+    QSASelection,
     qsa_forward_layout,
 )
 from tokenspeed.runtime.layers.hyperconnection import (
@@ -782,8 +783,9 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     indexer._write_and_compress = write_and_compress
 
     selections = []
-    indexer._select_slots = lambda *args, **kwargs: (
-        selections.append((args, kwargs)) or rows
+    blocks = torch.zeros((2, 1), dtype=torch.int32)
+    indexer._select = lambda *args, **kwargs: (
+        selections.append((args, kwargs)) or QSASelection(rows, blocks, 4)
     )
     ctx = SimpleNamespace(
         bs=2,
@@ -799,6 +801,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     torch.testing.assert_close(actual, rows)
     # The MTP-shared selection is published on the router, not the context.
     torch.testing.assert_close(router.sparse_topk.decode, rows)
+    assert router.sparse_topk.prefill.selected_blocks is blocks
     assert cache_accesses == [("wait", 3), ("fields", 3)]
     assert len(updates) == 1
     assert updates[0][1]["query"] is not None
@@ -819,7 +822,7 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
     def fail_selection(*args, **kwargs):
         raise AssertionError("top-k selection must be skipped")
 
-    indexer._select_slots = fail_selection
+    indexer._select = fail_selection
     actual = indexer(torch.zeros((2, 4)), torch.tensor([9, 10]), ctx)
 
     torch.testing.assert_close(actual, rows)
@@ -852,9 +855,10 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
 
     def select(q, *args, **kwargs):
         selection_widths.append(kwargs["queries_per_request"])
-        return torch.zeros((q.shape[0], 1), dtype=torch.int32)
+        selected = torch.zeros((q.shape[0], 1), dtype=torch.int32)
+        return QSASelection(selected, selected, 4)
 
-    indexer._select_slots = select
+    indexer._select = select
     draft_scratch = tuple(torch.empty(2) for _ in range(3))
     indexer._draft_scratch_buffers = lambda *args: draft_scratch
     prepared = SimpleNamespace(
@@ -1427,7 +1431,7 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
     ratio = indexer.compress_ratio
     complete = (logical + 1) // ratio
 
-    selected = indexer._select_slots(
+    selection = indexer._select(
         q,
         logical,
         requests,
@@ -1438,6 +1442,10 @@ def test_qwen4_exp_qsa_select_slots_matches_reference() -> None:
         complete_blocks=complete.to(torch.int32),
         queries_per_request=1,
     )
+    selected = selection.selected_slots
+    for row in range(2):
+        count = int(complete[row])
+        assert set(selection.selected_blocks[row, :count].tolist()) == set(range(count))
 
     # Only blocks before ``complete_blocks`` hold valid compressed keys, so
     # the selection is deterministic; compare selected token sets per row
@@ -1697,6 +1705,61 @@ def test_qwen4_exp_qsa_sparse_attention_reads_the_cache(
     assert kwargs["metadata_capacity_rows"] == 32
     unit = 1.0 if cache_dtype == torch.float8_e4m3fn else None
     assert kwargs["k_scale"] == unit and kwargs["v_scale"] == unit
+
+
+def test_qsa_prefill_passes_logical_selection_to_kernel(monkeypatch):
+    backend = object.__new__(QSAAttnBackend)
+    backend._metadata_capacity_rows = 0
+    backend.is_mxfp8 = False
+    backend.forward_extend_metadata = SimpleNamespace(cu_extend_seq_lens_cpu=[0, 3, 5])
+    slots = torch.ones((5, 2051), dtype=torch.int32)
+    blocks = torch.zeros((5, 512), dtype=torch.int32)
+    layout = QSALayout(
+        seq_lens=torch.tensor([19, 34], dtype=torch.int32),
+        logical_positions=torch.tensor([16, 17, 18, 32, 33]),
+        request_indices=torch.tensor([0, 0, 0, 1, 1], dtype=torch.int64),
+        qsa_locs=torch.empty(5, dtype=torch.int32),
+        recent_locs=torch.empty(5, dtype=torch.int32),
+        complete_blocks=torch.empty(5, dtype=torch.int32),
+        qsa_page_table=torch.ones((2, 1), dtype=torch.int32),
+        full_page_table=torch.tensor([[1], [2]], dtype=torch.int32),
+        full_kernel_page_size=64,
+        reset_draft_tags=None,
+    )
+    shared = SimpleNamespace(
+        prefill=QSASelection(slots, blocks, 4), qsa_metadata=layout
+    )
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(sparse_topk=shared),
+        bs=2,
+        forward_mode=ForwardMode.EXTEND,
+        draft_narrowing=None,
+    )
+    cache = torch.empty((192, 1, 256), dtype=torch.bfloat16)
+    pool = SimpleNamespace(get_kv_buffer=lambda layer_id: (cache, cache))
+    layer = SimpleNamespace(layer_id=0, tp_q_head_num=6, head_dim=256, scaling=1 / 16)
+
+    def attention(q, k, v, selected, **kwargs):
+        metadata = kwargs["prefill_metadata"]
+        assert kwargs["max_seqlen_q"] is None
+        assert metadata.query_start_loc == (0, 3, 5)
+        assert metadata.block_table is layout.full_page_table
+        assert metadata.selected_blocks.data_ptr() == blocks.data_ptr()
+        assert (
+            metadata.query_positions.data_ptr() == layout.logical_positions.data_ptr()
+        )
+        assert metadata.page_size == 64 and metadata.block_size == 4
+        assert metadata.token_to_request.dtype == torch.int32
+        assert metadata.token_to_request.tolist() == [0, 0, 0, 1, 1]
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(qsa_backend_module, "qsa_sparse_attention", attention)
+    q = torch.empty((5, 6 * 256), dtype=torch.bfloat16)
+    assert backend._sparse_attention(q, layer, pool, slots, ctx).shape == q.shape
+    # A breakable-graph handoff may copy the indexer's output to stable storage.
+    assert (
+        backend._sparse_attention(q, layer, pool, slots.clone(), ctx).shape == q.shape
+    )
 
 
 def test_qwen4_exp_ple_lengths_accept_a_padded_row_count() -> None:

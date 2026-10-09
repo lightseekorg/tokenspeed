@@ -838,11 +838,15 @@ and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
 The QSA API preserves `decode_query_lengths`: uniform decode/verification
-uses a positive width, as does every single-request forward. Multi-request
-prefill and mixed/ragged queries use `None`.
-Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
-single-token prefill. Adapting ragged rows to one-token queries must retain
-this distinction. Both use the same cache writer and sparse-attention call.
+uses a positive width; prefill and mixed/ragged queries use `None`, including
+single-request and single-token prefill. Only decode may select CuTe. On
+SM100/SM103, supported BF16 prefill uses FlashInfer PrimTS with the indexer's
+logical block selection and existing request/page metadata. Query groups must
+stop at request boundaries. Other supported NVIDIA inputs retain FA2 over
+the equivalent physical slots. Adapting ragged rows to one-token queries must
+retain this distinction. All kernels use the same cache writer and
+sparse-attention call; the indexer still returns physical slots across graph
+breaks and keeps logical candidates in the existing per-forward share.
 
 `QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
 target. Registry construction binds the cache plan and preallocates its

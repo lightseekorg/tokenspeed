@@ -23,6 +23,8 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel.ops.attention.qsa.metadata import QSAPrefillMetadata
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
@@ -101,6 +103,7 @@ def qsa_sparse_attention(
     v_scale: float | torch.Tensor | None,
     override: str | None,
     solution: str | None,
+    prefill_metadata: QSAPrefillMetadata | None = None,
 ) -> torch.Tensor:
     """Attend to a per-query list of physical QSA KV-cache slots.
 
@@ -125,16 +128,19 @@ def qsa_sparse_attention(
         override: Optional registered kernel name or solution override.
         solution: Optional kernel solution selected through normal capability
             and shape filtering.
+        prefill_metadata: Optional logical representation of the same slots,
+            enabling grouped prefill kernels. Without it, direct-slot kernels
+            remain available. Unsupported geometries use the physical slots.
 
     Returns:
         Attention output shaped
         ``[tokens, query_heads, value_head_dim]`` with the query dtype.
 
     The SM100/SM103 CuTe DSL implementation is preferred when its specialization
-    matches a uniform decode. Prefill and mixed/ragged queries use FlashInfer
-    FA2 on supported NVIDIA architectures; other decode geometries retain
-    the registered fallback. Kernel selection preserves this distinction
-    before adapting ragged inputs to independent one-token query rows.
+    matches a uniform decode. On Blackwell, BF16 prefill with logical metadata
+    prefers FlashInfer PrimTS QSA. Other supported inputs retain FlashInfer
+    FA2. Selection preserves prefill versus decode before adapting ragged
+    inputs to independent one-token query rows.
     """
 
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
@@ -146,6 +152,10 @@ def qsa_sparse_attention(
         raise ValueError("QSA max_seqlen_q must be positive")
     if q.shape[0] % query_width:
         raise ValueError("QSA query rows must be divisible by max_seqlen_q")
+    if prefill_metadata is not None:
+        if max_seqlen_q is not None:
+            raise ValueError("QSA prefill metadata cannot be used with uniform decode")
+        prefill_metadata.validate(q.shape[0], selected_slots.shape[1])
     if q.shape[0] == 0:
         return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
     traits = {
@@ -155,8 +165,24 @@ def qsa_sparse_attention(
         "num_kv_heads": k_cache.shape[1],
         "head_dim": q.shape[-1],
         "value_head_dim": v_cache.shape[-1],
+        "equal_head_dims": q.shape[-1] == k_cache.shape[-1] == v_cache.shape[-1],
         "selected_width": selected_slots.shape[1],
         "is_decode": max_seqlen_q is not None,
+        "has_prefill_metadata": prefill_metadata is not None,
+        "block_size": None if prefill_metadata is None else prefill_metadata.block_size,
+        "block_topk": (
+            None
+            if prefill_metadata is None
+            else prefill_metadata.selected_blocks.shape[1]
+        ),
+        "q_heads_per_kv": (
+            q.shape[1] // k_cache.shape[1]
+            if q.shape[1] % k_cache.shape[1] == 0
+            else None
+        ),
+        "page_size": None if prefill_metadata is None else prefill_metadata.page_size,
+        "scalar_scales": not isinstance(k_scale, torch.Tensor)
+        and not isinstance(v_scale, torch.Tensor),
     }
     signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
     kernel = select_kernel(
@@ -167,6 +193,9 @@ def qsa_sparse_attention(
         solution=solution,
         override=override,
     )
+    metadata_kwargs = {}
+    if "qsa_prefill_metadata" in KernelRegistry.get().get_by_name(kernel.name).features:
+        metadata_kwargs["prefill_metadata"] = prefill_metadata
     return kernel(
         q,
         k_cache,
@@ -177,6 +206,7 @@ def qsa_sparse_attention(
         metadata_capacity_rows=metadata_capacity_rows,
         k_scale=k_scale,
         v_scale=v_scale,
+        **metadata_kwargs,
     )
 
 
@@ -185,10 +215,12 @@ def qsa_sparse_attention(
 import tokenspeed_kernel.ops.attention.qsa.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.qsa.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.qsa.flashinfer_prims  # noqa: E402,F401
 
 # isort: on
 
 
 __all__ = [
     "qsa_sparse_attention",
+    "QSAPrefillMetadata",
 ]
