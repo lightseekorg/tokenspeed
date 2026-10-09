@@ -24,7 +24,7 @@ from collections.abc import Callable
 from functools import partial
 
 import torch
-from tokenspeed_kernel.ops.gemm.fp8_utils import per_block_quant_fp8
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 
@@ -59,7 +59,9 @@ def copy_expert_shard(
         dst.copy_(src)
         return
 
-    quantized, scales = per_block_quant_fp8(src.to(dst.device), block_shape)
+    quantized, scales = quantize_fp8(
+        src.to(dst.device), granularity="block", block_size=block_shape
+    )
     dst.copy_(quantized)
     scale_dst.copy_(scales)
 

@@ -5,11 +5,20 @@ import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.quantization.triton import _fp8_swizzled_scale_offset
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
-_FP8_E4M3_MAX = tl.constexpr(448.0)
 _FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
+
+
+@triton.jit
+def _fp8_swizzled_scale_offset(row, column, K_TILES: tl.constexpr):
+    # Equivalent to [Mtiles,4,32,Ktiles,4].transpose(1,3).contiguous().
+    return (
+        (row // 128 * K_TILES + column // 4) * 512
+        + row % 32 * 16
+        + row // 32 % 4 * 4
+        + column % 4
+    )
 
 
 @triton.jit
@@ -999,11 +1008,8 @@ def _add_rmsnorm_kernel(
         normed = (totals[c] * rstd * weights[c]).to(out_ptr.dtype.element_ty)
         tl.store(out_ptr + row * stride_out + offsets, normed, mask=mask)
         if HAS_FP8:
-            # max then min, as static_quant_fp8 lowers its clamp: NaN becomes the lower bound.
-            quant = tl.minimum(
-                tl.maximum(normed.to(tl.float32) * inv_scale, -_FP8_E4M3_MAX),
-                _FP8_E4M3_MAX,
-            )
+            # The cast saturates like quantize_fp8's, so NaN stays NaN as it does there.
+            quant = normed.to(tl.float32) * inv_scale
             tl.store(
                 out_fp8_ptr + row * stride_out_fp8 + offsets,
                 quant.to(out_fp8_ptr.dtype.element_ty),

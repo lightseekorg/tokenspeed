@@ -48,13 +48,6 @@ if platform.is_nvidia:
             )
         return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
 
-    def _per_tensor_quant_fp8(
-        input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor
-    ) -> None:
-        q, s = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(input)
-        output.copy_(q)
-        scale.copy_(s.float().squeeze())
-
     def _per_token_quant_fp8(
         input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor
     ) -> None:
@@ -74,12 +67,6 @@ if platform.is_nvidia:
         _per_token_quant_fp8(x, output, scale)
         return output.float()
 
-    def trtllm_fp8_tensor(x: torch.Tensor) -> torch.Tensor:
-        output = torch.empty_like(x, dtype=_FP8_DTYPE)
-        scale = torch.zeros(1, dtype=torch.float32, device=x.device)
-        _per_tensor_quant_fp8(x, output, scale)
-        return output.float()
-
     @register_kernel(
         "quantization",
         "fp8_with_scale",
@@ -91,43 +78,38 @@ if platform.is_nvidia:
         ),
         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
         traits={
-            "granularity": frozenset({"tensor", "token", "token_group_128"}),
+            "granularity": frozenset({"token", "token_group_128"}),
             "scale_encoding": frozenset({"float32", "ue8m0"}),
         },
         priority=Priority.PERFORMANT,
     )
     def trtllm_quantize_fp8_with_scale(
         x: torch.Tensor,
-        granularity: str = "tensor",
+        granularity: str = "token",
         group_size: int | None = None,
         scale_encoding: str = "float32",
         enable_pdl: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if granularity in {"tensor", "token"}:
+        if granularity == "token":
             if scale_encoding != "float32":
-                raise ValueError(f"TRT-LLM {granularity} FP8 requires float32 scales")
+                raise ValueError("TRT-LLM token FP8 requires float32 scales")
 
             q = torch.empty_like(x, dtype=_FP8_DTYPE)
-            if granularity == "tensor":
-                scale = torch.empty(1, dtype=torch.float32, device=x.device)
-                _per_tensor_quant_fp8(x, q, scale)
-            else:
-                scale = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device)
-                _per_token_quant_fp8(x, q, scale)
-                scale = scale.unsqueeze(-1)
-            return q, scale
+            scale = torch.empty(x.shape[:-1], dtype=torch.float32, device=x.device)
+            _per_token_quant_fp8(x, q, scale)
+            return q, scale.unsqueeze(-1)
 
         if granularity == "token_group":
-            return _per_token_group_quant_8bit(
+            q, scale = _per_token_group_quant_8bit(
                 x,
                 group_size=group_size,
                 use_ue8m0=scale_encoding == "ue8m0",
             )
+            return q, scale.t().contiguous()
 
         raise ValueError(f"unsupported TRT-LLM FP8 granularity: {granularity!r}")
 
     __all__ = [
         "trtllm_fp8_token_group_128",
         "trtllm_fp8_token",
-        "trtllm_fp8_tensor",
     ]

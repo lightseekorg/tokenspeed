@@ -36,6 +36,10 @@ from tokenspeed.runtime.distributed.comm_backend.base import (
     Group,
 )
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+from tokenspeed.runtime.distributed.comm_backend.projection import (
+    ProjectionBackend,
+    ProjectionWorkspace,
+)
 from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
     TritonAllReduceBackend,
 )
@@ -102,6 +106,8 @@ class AutoBackend(CommBackend):
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
         self._triton_ar = TritonAllReduceBackend(fallback=self._nccl)
         self._rsag = TritonRSAGBackend(fallback=self._nccl)
+        # Projection fallbacks retain Auto's ordinary routing and numerics.
+        self._projection = ProjectionBackend(fallback=self)
         # Groups the startup self-check moved off the in-switch reduction
         # (``pin_ordered_fold``); set once, world-uniformly, before serving.
         self._fold_pinned_groups: set[Group] = set()
@@ -530,6 +536,58 @@ class AutoBackend(CommBackend):
             output_split_sizes=output_split_sizes,
             input_split_sizes=input_split_sizes,
         )
+
+    def prepare_projection(self, spec, scratch_pool=None):
+        """Prepare optional Lamport paths without changing ordinary routing.
+
+        Projection collectives have an explicit pre-capture lifetime. Their
+        large-message and unsupported-topology paths return to this backend;
+        batch-invariant reductions retain the rank-ordered fold at every size.
+        """
+        use_lamport = (
+            current_platform().is_nvidia
+            and spec.device.type == "cuda"
+            and spec.dtype == torch.bfloat16
+            and not self._force_deterministic_rsag()
+        )
+        return self._projection.prepare(
+            spec,
+            use_lamport,
+            use_lamport and not self._batch_invariant_collectives(),
+            scratch_pool,
+        )
+
+    def projection_all_gather(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        quantize: bool,
+        workspace: ProjectionWorkspace,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._projection.all_gather(tensor, rows, quantize, workspace)
+
+    def projection_all_to_all(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        inverse: bool,
+        quantize: bool,
+        out: torch.Tensor | None,
+        workspace: ProjectionWorkspace,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._projection.all_to_all(
+            tensor, rows, inverse, quantize, out, workspace
+        )
+
+    def acquire_projection_output(
+        self, rows: int, workspace: ProjectionWorkspace
+    ) -> torch.Tensor:
+        return self._projection.acquire_output(rows, workspace)
+
+    def projection_reduce_scatter(
+        self, tensor: torch.Tensor, rows: int, workspace: ProjectionWorkspace
+    ) -> torch.Tensor:
+        return self._projection.reduce_scatter(tensor, rows, workspace)
 
     def send(self, tensor: torch.Tensor, dst: int, group: Group) -> None:
         return self._nccl.send(tensor, dst, group)

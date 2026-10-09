@@ -47,7 +47,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     try_kda_fused_paged_verify,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import capture_replay_payload
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
@@ -70,6 +70,44 @@ if TYPE_CHECKING:
 
 
 KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
+
+
+def resolve_kda_backend(kda_backend: str) -> str:
+    """Resolve the KDA prefill backend policy for runtime construction.
+
+    On AMD, the backend policy is ignored and compatible kernels are selected
+    using registry priority. On NVIDIA, ``auto`` picks ``cutedsl_kda`` when its
+    device-specific implementation is available, ``flashkda`` on SM90+, and
+    ``fla`` otherwise. Explicit CuteDSL selection is validated against device
+    support. Decode is unaffected.
+
+    Args:
+        kda_backend: Normalized prefill backend name from the launch arguments.
+
+    Returns:
+        The resolved prefill backend name passed to ``KdaAttnBackend``.
+    """
+    platform = current_platform()
+    if platform.is_amd:
+        # Named backend policies are NVIDIA-specific; let the registry decide.
+        return "auto"
+
+    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
+
+    if kda_backend == "auto":
+        if cutedsl_kda_supported():
+            resolved = "cutedsl_kda"
+        elif platform.is_hopper_plus:
+            resolved = "flashkda"
+        else:
+            resolved = "fla"
+        logger.info(f"KDA prefill backend auto-resolved to {resolved!s}")
+        return resolved
+    if kda_backend == "cutedsl_kda" and not cutedsl_kda_supported():
+        raise ValueError(
+            "--kda-backend cutedsl_kda requires an NVIDIA sm_100 or sm_103 device"
+        )
+    return kda_backend
 
 
 def _slice_kda_prefill_inputs(

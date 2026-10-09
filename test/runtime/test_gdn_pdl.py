@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
+    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import fused_qkv_split_gdn_prefill
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -258,7 +259,7 @@ def test_gdn_chain_pdl_toggle(
                 disable_state_update=False,
                 output_state_indices=writes,
                 intermediate_states_buffer=None,
-                parent_indices=None,
+                tree_ancestors=None,
             )
         return rmsnorm_fn(
             out.reshape(-1, dim),
@@ -352,6 +353,80 @@ def test_tree_conv_waits_for_initial_windows(width, restore_pdl):
         graph.replay()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("target", ["rows", "mask", "reads", "A_log", "dt_bias"])
+@pytest.mark.parametrize("nodes", [7, 14])
+def test_gdn_tree_verify_waits_for_its_inputs(nodes, target, restore_pdl):
+    # A ReplaySSM tree verify, step by step at 7 nodes and chunked at 14, reads nothing the kernel before it writes until its PDL wait.
+    torch.manual_seed(nodes)
+    bs, heads, value_heads, dim = 2, 4, 12, 128
+    qk_width = heads * dim
+    v_end = 2 * qk_width + value_heads * dim
+    projection = torch.randn(
+        bs * nodes, v_end + 2 * value_heads, device="cuda", dtype=torch.bfloat16
+    )
+    state = torch.randn(bs, value_heads, dim, dim, device="cuda") * 0.02
+    A_log = torch.randn(value_heads, device="cuda")
+    dt_bias = torch.randn(value_heads, device="cuda")
+    reads = torch.arange(bs, device="cuda", dtype=torch.int32)
+    chain = torch.tensor([[(2 << t) - 1 for t in range(nodes)]] * bs, device="cuda")
+    states = None
+    if gdn_tree_verify_needs_node_states(nodes):
+        states = torch.empty(bs, nodes, value_heads, dim, dim, device="cuda")
+    written = {
+        "rows": projection,
+        "mask": chain,
+        "reads": reads,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+    }[target]
+    source = written.clone()
+    poison = {"mask": 0, "reads": -1}.get(target, float("nan"))
+
+    def forward():
+        _delayed_projection[(triton.cdiv(source.numel(), 1024),)](
+            source, written, N=source.numel(), BLOCK=1024, launch_pdl=True
+        )
+        rows = projection.view(bs, nodes, -1)
+        return gdn_decode_mtp(
+            q=rows[..., :qk_width].unflatten(-1, (heads, dim)),
+            k=rows[..., qk_width : 2 * qk_width].unflatten(-1, (heads, dim)),
+            v=rows[..., 2 * qk_width : v_end].unflatten(-1, (value_heads, dim)),
+            a=rows[..., v_end : v_end + value_heads],
+            b=rows[..., v_end + value_heads :],
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=state,
+            initial_state_indices=reads,
+            scale=dim**-0.5,
+            use_qk_l2norm=True,
+            disable_state_update=True,
+            intermediate_states_buffer=states,
+            output_state_indices=None,
+            tree_ancestors=chain,
+            solution="triton",
+            override=None,
+        )
+
+    pdl_enabled(True)
+    forward()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    with torch.cuda.graph(graph):
+        actual = forward()
+    _, edges = _graph_kernel_edges(graph)
+    verify = "_gdn_tree_verify_chunked_kernel"
+    if states is not None:
+        verify = "_fused_gdn_decode_update_kernel"
+    assert edges == [("_delayed_projection", verify, 1)]
+    for _ in range(2):
+        if target == "rows":
+            source.normal_()
+        pdl_enabled(False)
+        expected = forward().clone()
+        written.fill_(poison)
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("solution", ["triton", "flashinfer"])

@@ -2,10 +2,10 @@ from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
+from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from utils import (
     is_amd,
     is_cdna4,
@@ -45,9 +45,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (  # n
 
 
 def _dequantize_dynamic_mxfp4(x: torch.Tensor) -> torch.Tensor:
-    packed, scale = tokenspeed_kernel.quantize_mxfp4(
-        x, scale_layout="linear", solution="triton"
-    )
+    packed, scale = kernel_quantize_mxfp4(x, scale_layout="linear", solution="triton")
     return dequantize_mxfp4(packed, scale).to(torch.bfloat16)
 
 
@@ -523,12 +521,17 @@ def _assert_gfx1250_large_route(
         assert torch.all(metadata.block_schedule(block_size)[num_blocks:] == -1)
 
 
-def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64() -> None:
+@pytest.mark.parametrize(
+    ("tokens", "topk", "experts"),
+    [(37, 7, 11), (1024, 16, 257), (1024, 16, 896), (8192, 16, 896)],
+)
+def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64(
+    tokens: int, topk: int, experts: int
+) -> None:
     if not is_cdna5():
         pytest.skip("gfx1250 is required for the CDNA5 fused route")
 
     torch.manual_seed(43)
-    tokens, topk, experts = 37, 7, 11
     ids = (
         torch.arange(tokens * topk, device="cuda", dtype=torch.int32).reshape(
             tokens, topk

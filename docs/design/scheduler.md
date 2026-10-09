@@ -660,7 +660,7 @@ no victim and nothing could free that page.
   re-fed rows are forward input that debits the token budget but never
   advances `num_computed_tokens`; only a hit's first chunk re-feeds, and no
   final chunk is shorter than the replay window (`ChunkKeepingFinalWindow`).
-- A prefill demand's reserve is decided once per group, by retention, in
+- A prefill demand's reserve is decided once per group, by kind, in
   `ReservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
   helper asserts it found none set.
 - An incomplete local prefill is not overtaken (1.1). Decodes are never hostage

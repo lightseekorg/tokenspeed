@@ -33,7 +33,7 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 from ci_system.ci_register import register_cuda_ci
-from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.platform import current_platform
 
@@ -95,7 +95,7 @@ def test_add_norm_with_fp8_matches_forward(rows: int, hidden: int) -> None:
         norm, x, residual, norm.add_norm_with_fp8, scale
     )
 
-    quantized, _ = static_quant_fp8(normed, scale)
+    quantized, _ = quantize_fp8(normed, scale=scale)
     assert torch.equal(normed_fp8.view(torch.uint8), quantized.view(torch.uint8))
 
 
@@ -332,7 +332,7 @@ def test_decoder_layer_hands_each_projection_its_own_quant(
     monkeypatch.setattr(dense_nvfp4, "fp4_quantize", fp4_quantize)
     monkeypatch.setattr(qwen3_5_moe, "fp4_quantize", fp4_quantize)
     monkeypatch.setattr(
-        dense_fp8, "static_quant_fp8", counting("fp8", dense_fp8.static_quant_fp8)
+        dense_fp8, "quantize_fp8", counting("fp8", dense_fp8.quantize_fp8)
     )
 
     torch.manual_seed(1)

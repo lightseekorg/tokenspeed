@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
 from tokenspeed_kernel.ops.layernorm import add_rmsnorm, grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     _add_rmsnorm_kernel,
@@ -10,6 +9,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     qk_rmsnorm,
     rmsnorm,
 )
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from utils import assert_no_triton_compile
 
@@ -375,11 +375,11 @@ def test_add_rmsnorm_matches_unfused_reference(
     # Another summation order may flip only the rare value next to a rounding boundary.
     assert (out != ref.to(torch.bfloat16)).sum().item() <= out.numel() // 1000
     if with_fp8:
-        expected, _ = static_quant_fp8(out, scale)
+        expected, _ = quantize_fp8(out, scale=scale)
         assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 
-def test_add_rmsnorm_fp8_copy_of_nan_rows_matches_static_quant(device: str) -> None:
+def test_add_rmsnorm_fp8_copy_of_nan_rows_matches_quantize_fp8(device: str) -> None:
     if not platform.is_nvidia:
         pytest.skip("requires float8_e4m3fn CUDA")
     x = torch.randn(3, 4096, device=device, dtype=torch.bfloat16)
@@ -405,7 +405,7 @@ def test_add_rmsnorm_fp8_copy_of_nan_rows_matches_static_quant(device: str) -> N
         gemma=False,
     )
 
-    expected, _ = static_quant_fp8(out, scale)
+    expected, _ = quantize_fp8(out, scale=scale)
     assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 

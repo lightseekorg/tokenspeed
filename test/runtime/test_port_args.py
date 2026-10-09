@@ -34,6 +34,7 @@ def test_distributed_config_uses_resolved_dist_init_addr():
         distributed_timeout_seconds=None,
         force_deterministic_rsag=False,
         batch_invariant_collectives=False,
+        emulate_rank_zero=False,
     )
     port_args = PortArgs(
         tokenizer_ipc_name="tcp://127.0.0.1:8295",

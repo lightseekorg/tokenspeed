@@ -183,6 +183,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
         self.linear_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
 
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        return self.linear_attn_backend.preallocate_verify_workspace(
+            max_bs, draft_token_num
+        )
+
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
         # including both full-attention and mamba layers. Normal attention
