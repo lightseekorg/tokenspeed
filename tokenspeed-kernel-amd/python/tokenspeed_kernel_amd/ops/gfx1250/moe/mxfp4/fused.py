@@ -61,6 +61,9 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     ragged_metadata_fields,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import _matmul_decode
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
+    launch_triton_quantize_mxfp4_activation_gfx1250,
+)
 
 
 @dataclass
@@ -161,11 +164,7 @@ class MoESliceKProgram:
         if cfg.WITH_X_MX_SCALE:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
-                shape=[
-                    NUM_BUFFERS,
-                    cfg.BLOCK_M_PRESHUFFLED,
-                    cfg.BLOCK_K_SCALE_PRESHUFFLED,
-                ],
+                shape=[NUM_BUFFERS, cfg.BLOCK_M, cfg.BLOCK_K // cfg.SCALE_BLOCK],
                 layout=cfg.shared_layout_x_scale,
             )
         else:
@@ -239,20 +238,6 @@ class MoESliceKProgram:
 
         if cfg.WITH_X_MX_SCALE:
             x_scale_buffer_slice = self.x_scale_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
-            if cfg.SCALE_PRESHUFFLE:
-                x_scale_buffer_slice = (
-                    x_scale_buffer_slice.reshape(
-                        (
-                            cfg.BLOCK_M_PRESHUFFLED,
-                            BLOCK_K_SCALE // cfg.SCALE_KWIDTH,
-                            cfg.PRESHUFFLE_FACTOR // 4,
-                            4,
-                            cfg.SCALE_KWIDTH,
-                        )
-                    )
-                    .permute((0, 3, 2, 1, 4))
-                    .reshape((cfg.BLOCK_M, BLOCK_K_SCALE))
-                )
             x_scale_buffer_slice = x_scale_buffer_slice.slice(
                 subtile_start // cfg.SCALE_BLOCK, SUBTILE_LEN_SCALE, 1
             )
@@ -452,11 +437,7 @@ class MoESliceNKProgram:
         if cfg.WITH_X_MX_SCALE:
             x_scale_buffer = gl.allocate_shared_memory(
                 gl.uint8,
-                shape=[
-                    NUM_BUFFERS,
-                    cfg.BLOCK_M_PRESHUFFLED,
-                    cfg.BLOCK_K_SCALE_PRESHUFFLED,
-                ],
+                shape=[NUM_BUFFERS, cfg.BLOCK_M, cfg.BLOCK_K // cfg.SCALE_BLOCK],
                 layout=cfg.shared_layout_x_scale,
             )
         else:
@@ -533,7 +514,7 @@ class MoESliceNKProgram:
             else:
                 gl.amd.cdna5.tdm.async_load(
                     self.x_scale_desc,
-                    [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
+                    [0, load_idx * BLOCK_K_SCALE],
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
                     pred=pred,
                 )
@@ -573,7 +554,6 @@ class MoESliceNKProgram:
         cfg = self.cfg
         NUM_SUBTILES_K: gl.constexpr = cfg.NUM_SUBTILES[2]
         SUBTILE_LEN: gl.constexpr = cfg.BLOCK_K // NUM_SUBTILES_K
-        BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
         subtile_start: gl.constexpr = subtile_start_idx * SUBTILE_LEN
 
         x = (
@@ -586,20 +566,6 @@ class MoESliceNKProgram:
 
         if cfg.WITH_X_MX_SCALE:
             x_scale_buffer_slice = self.x_scale_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
-            if cfg.SCALE_PRESHUFFLE:
-                x_scale_buffer_slice = (
-                    x_scale_buffer_slice.reshape(
-                        (
-                            cfg.BLOCK_M_PRESHUFFLED,
-                            BLOCK_K_SCALE // cfg.SCALE_KWIDTH,
-                            cfg.PRESHUFFLE_FACTOR // 4,
-                            4,
-                            cfg.SCALE_KWIDTH,
-                        )
-                    )
-                    .permute((0, 3, 2, 1, 4))
-                    .reshape((cfg.BLOCK_M, BLOCK_K_SCALE))
-                )
             x_scale_buffer_slice = x_scale_buffer_slice.slice(
                 subtile_start // cfg.SCALE_BLOCK, SUBTILE_LEN // cfg.SCALE_BLOCK, 1
             )
@@ -955,6 +921,8 @@ def _matmul(
         # Rows left in this expert fit i32 even when the weight slab needs the
         # wide index type.
         descriptor_m = (eM - off_m).to(gl.int32)
+    # The weight descriptors start at this N tile, so their bounds must too.
+    descriptor_n = (N - pid_n * BLOCK_N).to(gl.int32)
     x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
         cfg,
         X_ptr,
@@ -966,7 +934,7 @@ def _matmul(
         w_offs,
         w_scale_offs,
         descriptor_m,
-        N,
+        descriptor_n,
         K,
         stride_x_m,
         stride_x_k,
@@ -2748,6 +2716,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     *,
     w13_mx_scale: torch.Tensor,
     w2_mx_scale: torch.Tensor,
+    activation_dtype: str,
     w13_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
@@ -2766,13 +2735,17 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
 
     Args:
         hidden_states: Token activations in bf16/fp16/fp8, shaped
-            ``(n_tokens, hidden_size)``.
+            ``(n_tokens, hidden_size)``. The MXFP4 path takes bf16/fp16 only.
         topk_weights: Route weights, shaped ``(n_tokens, top_k)``.
         topk_ids: Expert ids, shaped ``(n_tokens, top_k)``.
         w13_weight: gfx1250-preprocessed interleaved gate/up expert weight.
         w2_weight: gfx1250-preprocessed down-projection expert weight.
         w13_mx_scale: gfx1250-swizzled MXFP4 scale for ``w13_weight``.
         w2_mx_scale: gfx1250-swizzled MXFP4 scale for ``w2_weight``.
+        activation_dtype: ``"fp8"`` feeds both projections FP8 activations
+            with the weights' static per-tensor scales. ``"mxfp4"`` quantizes
+            the input and the BF16 intermediate to MXFP4 with dynamic
+            per-32-value e8m0 scales.
         w13_bias: Optional expert bias for the gate/up projection.
         w2_bias: Optional expert bias for the down projection.
         out_dtype: Final output dtype.
@@ -2792,6 +2765,11 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     Returns:
         Tensor shaped ``(n_tokens, hidden_size)``.
     """
+    if activation_dtype not in ("fp8", "mxfp4"):
+        raise ValueError(
+            "gfx1250 Gluon MXFP4 MoE supports activation_dtype 'fp8' or "
+            f"'mxfp4', got {activation_dtype!r}"
+        )
     if topk_ids.ndim != 2:
         raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
     if topk_weights.shape != topk_ids.shape:
@@ -2818,10 +2796,6 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         num_experts,
     )
 
-    x_fp8 = _quantize_fp8_activation(
-        hidden_states,
-        w13_weight.act_scale,
-    )
     if activation == "situ":
         fused_activation = FusedActivation(
             FnSpecs("situ", None, ("beta", "linear_beta"), reduction_n=2),
@@ -2842,22 +2816,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             "gfx1250 Gluon MXFP4 MoE supports activation 'silu', "
             f"'swiglu', or 'situ', got {activation!r}"
         )
-    # The second matmul wants its activation in FP8, so the first one divides
-    # by that scale and casts in its epilogue. Quantizing separately would
-    # re-read and rewrite the whole intermediate for no other reason.
-    intermediate_fp8 = gluon_mxfp_ragged_matmul(
-        x_fp8,
-        w13_weight,
-        w13_bias,
-        w_mx_scale=w13_mx_scale,
-        x_format="e4m3",
-        x_global_scale=w13_weight.act_scale,
-        y_global_scale=w2_weight.act_scale,
-        a_ragged_metadata=ragged_metadata,
-        gather_indx=gather_indx,
-        out_dtype=torch.float8_e4m3fn,
-        fused_activation=fused_activation,
-        scale_preshuffle=True,
+    launch = dict(
         block_m=block_m,
         block_n=256,
         block_k=256,
@@ -2866,24 +2825,63 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         decode=decode,
         partial_tdm=partial_tdm,
     )
+    if activation_dtype == "mxfp4":
+        x_mxfp4, x_mx_scale = launch_triton_quantize_mxfp4_activation_gfx1250(
+            hidden_states
+        )
+        intermediate = gluon_mxfp_ragged_matmul(
+            x_mxfp4,
+            w13_weight,
+            w13_bias,
+            w_mx_scale=w13_mx_scale,
+            x_mx_scale=x_mx_scale,
+            x_format="e2m1",
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            out_dtype=torch.bfloat16,
+            fused_activation=fused_activation,
+            scale_preshuffle=True,
+            **launch,
+        )
+        intermediate, intermediate_mx_scale = (
+            launch_triton_quantize_mxfp4_activation_gfx1250(intermediate)
+        )
+        stage2_kwargs = dict(
+            x_scale=intermediate_mx_scale, x_format="e2m1", x_global_scale=None
+        )
+    else:
+        x_fp8 = _quantize_fp8_activation(hidden_states, w13_weight.act_scale)
+        # The second matmul wants its activation in FP8, so the first one
+        # divides by that scale and casts in its epilogue. Quantizing
+        # separately would re-read and rewrite the whole intermediate for no
+        # other reason.
+        intermediate = gluon_mxfp_ragged_matmul(
+            x_fp8,
+            w13_weight,
+            w13_bias,
+            w_mx_scale=w13_mx_scale,
+            x_format="e4m3",
+            x_global_scale=w13_weight.act_scale,
+            y_global_scale=w2_weight.act_scale,
+            a_ragged_metadata=ragged_metadata,
+            gather_indx=gather_indx,
+            out_dtype=torch.float8_e4m3fn,
+            fused_activation=fused_activation,
+            scale_preshuffle=True,
+            **launch,
+        )
+        stage2_kwargs = dict(x_format="e4m3", x_global_scale=w2_weight.act_scale)
     flat = gluon_mxfp_combine(
-        intermediate_fp8,
+        intermediate,
         w2_weight,
         w2_mx_scale,
-        x_format="e4m3",
-        x_global_scale=w2_weight.act_scale,
+        **stage2_kwargs,
         bias=w2_bias,
         a_ragged_metadata=ragged_metadata,
         scatter_indx=scatter_indx,
         out_dtype=out_dtype,
-        block_m=block_m,
-        block_n=256,
-        block_k=256,
-        num_warps=4,
-        num_buffers=3,
         scale_load_mode="swizzle",
-        decode=decode,
-        partial_tdm=partial_tdm,
+        **launch,
     )
     return _weighted_topk_reduce_gfx1250(
         flat,

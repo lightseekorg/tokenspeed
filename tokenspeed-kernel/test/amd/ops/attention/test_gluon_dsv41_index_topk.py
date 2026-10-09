@@ -168,7 +168,7 @@ def test_index_topk_large_head_count_auto_fallback(device, require):
     ("arch", "dtype", "width", "metric", "kernel_name"),
     [
         ("gfx950", torch.uint8, 64, "flops4", "gluon_dsv41_index_topk_gfx950"),
-        ("gfx1250", torch.bfloat16, 128, "flops16", "gluon_dsv41_index_topk_gfx1250"),
+        ("gfx1250", torch.uint8, 64, "flops8", "gluon_dsv41_index_topk_gfx1250"),
     ],
 )
 def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
@@ -190,25 +190,26 @@ def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
 
 
 @pytest.mark.parametrize(
-    ("arch", "entry_name", "kernel_name"),
+    ("arch", "entry_name", "kernel_name", "tile_n"),
     [
-        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950"),
-        ("gfx1250", "dsv41_index_logits_gfx1250", "gluon_dsv41_index_topk_gfx1250"),
+        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950", 32),
+        ("gfx1250", "dsv41_index_logits_gfx1250", "gluon_dsv41_index_topk_gfx1250", 64),
     ],
 )
 @pytest.mark.parametrize(
-    ("requested_chunk", "score_chunk", "hardware_chunk"),
-    [(8, 8, 32), (64, 64, 64), (512, 256, 256)],
+    ("requested_chunk", "score_chunk"),
+    [(8, 8), (64, 64), (512, 256)],
 )
 def test_indexer_score_chunk_bound(
     monkeypatch,
     arch,
     entry_name,
     kernel_name,
+    tile_n,
     requested_chunk,
     score_chunk,
-    hardware_chunk,
 ):
+    hardware_chunk = (score_chunk + tile_n - 1) // tile_n * tile_n
     module = importlib.import_module(
         f"tokenspeed_kernel_amd.ops.{arch}.attention.dsv41.indexer"
     )
@@ -228,18 +229,10 @@ def test_indexer_score_chunk_bound(
     table = torch.empty((tokens, 5), dtype=torch.int32)
     visible = torch.empty((tokens,), dtype=torch.int32)
     logits = torch.empty((tokens, width), dtype=torch.float32)
-    args = (
-        (
-            torch.empty((tokens, 32, 64), dtype=torch.uint8),
-            torch.empty((tokens, 32), dtype=torch.int32),
-            weights,
-        )
-        if arch == "gfx950"
-        else (torch.empty((tokens, 32, 128), dtype=torch.bfloat16), weights)
-    )
-
     getattr(module, entry_name)(
-        *args,
+        torch.empty((tokens, 32, 64), dtype=torch.uint8),
+        torch.empty((tokens, 32), dtype=torch.int32),
+        weights,
         cache,
         table,
         visible,

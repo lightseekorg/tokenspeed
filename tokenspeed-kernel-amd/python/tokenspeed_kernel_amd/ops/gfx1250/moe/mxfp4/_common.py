@@ -358,7 +358,6 @@ class MoEConfig:
     WITH_W_MX_SCALE: gl.constexpr
     SCALE_PRESHUFFLE: gl.constexpr
     PRESHUFFLE_FACTOR: gl.constexpr
-    BLOCK_M_PRESHUFFLED: gl.constexpr
     BLOCK_N_PRESHUFFLED: gl.constexpr
     BLOCK_K_SCALE_PRESHUFFLED: gl.constexpr
     SCALE_KWIDTH: gl.constexpr
@@ -460,7 +459,6 @@ class MoEConfig:
         self.index_type = gl.constexpr(index_type)
         self.SCALE_KWIDTH = gl.constexpr(4 if BLOCK_K_SCALE >= 4 else BLOCK_K_SCALE)
         self.PRESHUFFLE_FACTOR = gl.constexpr(128 if SCALE_PRESHUFFLE else 1)
-        self.BLOCK_M_PRESHUFFLED = gl.constexpr(BLOCK_M // self.PRESHUFFLE_FACTOR)
         self.BLOCK_N_PRESHUFFLED = gl.constexpr(BLOCK_N // self.PRESHUFFLE_FACTOR)
         self.BLOCK_K_SCALE_PRESHUFFLED = gl.constexpr(
             BLOCK_K_SCALE * self.PRESHUFFLE_FACTOR
@@ -552,11 +550,10 @@ class MoEConfig:
             )
 
         if self.USE_WMMA_SCALED and WITH_X_MX_SCALE:
+            PAD_INTERVAL_X_SCALE = BLOCK_K_SCALE if USE_GATHER else 256
             self.shared_layout_x_scale = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
-                    [[256, 8]],
-                    [self.BLOCK_M_PRESHUFFLED, self.BLOCK_K_SCALE_PRESHUFFLED],
-                    [1, 0],
+                    [[PAD_INTERVAL_X_SCALE, 8]], [BLOCK_M, BLOCK_K_SCALE], [1, 0]
                 )
             )
         else:
@@ -649,15 +646,11 @@ def create_descriptor(
         )
 
         if cfg.WITH_X_MX_SCALE:
-            x_scale_offs = off_m * stride_x_scale_m // PRESHUFFLE_FACTOR
             x_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
-                base=x_scale_ptr + x_scale_offs,
-                shape=(
-                    (M + PRESHUFFLE_FACTOR - 1) // PRESHUFFLE_FACTOR,
-                    K // SCALE_BLOCK * PRESHUFFLE_FACTOR,
-                ),
+                base=x_scale_ptr + off_m * stride_x_scale_m,
+                shape=(M, K // SCALE_BLOCK),
                 strides=(stride_x_scale_m, stride_x_scale_k),
-                block_shape=(cfg.BLOCK_M_PRESHUFFLED, cfg.BLOCK_K_SCALE_PRESHUFFLED),
+                block_shape=(cfg.BLOCK_M, cfg.BLOCK_K // SCALE_BLOCK),
                 layout=cfg.shared_layout_x_scale,
             )
         else:
@@ -834,7 +827,7 @@ class MoEProgramBase:
             else:
                 gl.amd.cdna5.tdm.async_load(
                     self.x_scale_desc,
-                    [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED],
+                    [0, load_idx * BLOCK_K_SCALE],
                     self.x_scale_buffer.index(load_idx % cfg.NUM_BUFFERS),
                     pred=pred,
                     warp_used_hint=cfg.TDM_WARP_USED_HINT_X,
@@ -930,23 +923,11 @@ class MoEPipelinedProgram:
         )
 
         if cfg.WITH_X_MX_SCALE:
-            if cfg.USE_GATHER:
-                BLOCK_K_SCALE: gl.constexpr = cfg.BLOCK_K // cfg.SCALE_BLOCK
-                x_scale_buffer = gl.allocate_shared_memory(
-                    gl.uint8,
-                    shape=[NUM_BUFFERS, cfg.BLOCK_M, BLOCK_K_SCALE],
-                    layout=cfg.shared_layout_x_scale,
-                )
-            else:
-                x_scale_buffer = gl.allocate_shared_memory(
-                    gl.uint8,
-                    shape=[
-                        NUM_BUFFERS,
-                        cfg.BLOCK_M_PRESHUFFLED,
-                        cfg.BLOCK_K_SCALE_PRESHUFFLED,
-                    ],
-                    layout=cfg.shared_layout_x_scale,
-                )
+            x_scale_buffer = gl.allocate_shared_memory(
+                gl.uint8,
+                shape=[NUM_BUFFERS, cfg.BLOCK_M, cfg.BLOCK_K // cfg.SCALE_BLOCK],
+                layout=cfg.shared_layout_x_scale,
+            )
         else:
             x_scale_buffer = gl.constexpr(0)
 
@@ -1002,20 +983,6 @@ class MoEPipelinedProgram:
             w_scale_buffer_slice = self.w_scale_buffer.index(wmma_idx % cfg.NUM_BUFFERS)
 
         if cfg.SCALE_PRESHUFFLE:
-            if cfg.WITH_X_MX_SCALE and not cfg.USE_GATHER:
-                x_scale_buffer_slice = (
-                    x_scale_buffer_slice.reshape(
-                        (
-                            cfg.BLOCK_M_PRESHUFFLED,
-                            BLOCK_K_SCALE // cfg.SCALE_KWIDTH,
-                            cfg.PRESHUFFLE_FACTOR // 4,
-                            4,
-                            cfg.SCALE_KWIDTH,
-                        )
-                    )
-                    .permute((0, 3, 2, 1, 4))
-                    .reshape((cfg.BLOCK_M, BLOCK_K_SCALE))
-                )
             if cfg.WITH_W_MX_SCALE:
                 w_scale_buffer_slice = (
                     w_scale_buffer_slice.reshape(

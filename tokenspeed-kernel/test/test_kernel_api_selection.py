@@ -568,17 +568,20 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
 
 
 @pytest.mark.parametrize(
-    "contract,online,expected_name",
+    "contract,online,m,expected_name",
     [
-        ("ue8m0", False, "gluon_mm_mxfp8_ue8m0_gfx1250"),
-        ("ue8m0", True, "gluon_mm_mxfp8_ue8m0_gfx1250"),
-        ("fp32", False, "gluon_mm_fp8_blockscale_gfx1250"),
-        ("fp32", True, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("ue8m0", False, 1, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", True, 1, "gluon_mm_mxfp8_ue8m0_gfx1250"),
+        ("ue8m0", False, 32, "gluon_mm_mxfp8_ue8m0_largem_gfx1250"),
+        ("ue8m0", True, 32, "gluon_mm_mxfp8_ue8m0_largem_gfx1250"),
+        ("fp32", False, 1, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", True, 1, "gluon_mm_fp8_blockscale_gfx1250"),
     ],
 )
 def test_public_mm_selects_gfx1250_decode_kernel(
     contract: str,
     online: bool,
+    m: int,
     expected_name: str,
     mi450_platform: PlatformInfo,
     monkeypatch,
@@ -592,7 +595,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
     assert expected_spec.capability.satisfied_by(mi450_platform)
 
-    m, n, k = 1, 128, 256
+    n, k = 128, 256
     a_dtype = torch.bfloat16 if online else _fp8_dtype()
     a = torch.empty((m, k), dtype=a_dtype)
     b = torch.empty((n, k), dtype=_fp8_dtype())
@@ -614,6 +617,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
             selected_block_size: list[int],
             scale_encoding: str,
             enable_pdl: bool,
+            kernel_name: str,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             assert selected_block_size == block_size
             assert scale_encoding == ("ue8m0" if contract == "ue8m0" else "float32")
@@ -3649,6 +3653,43 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
     assert plan["support_routing"] is False
 
 
+def test_dsv41_mxfp4_swiglu_tp_selection_on_cdna5(
+    mi450_platform: PlatformInfo,
+) -> None:
+    kernel_name = "gluon_mxfp4_gfx1250_precomputed_moe_apply"
+    registry = KernelRegistry.get()
+    if registry.get_by_name(kernel_name) is None:
+        pytest.skip(f"{kernel_name} is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi450_platform)
+        registry.clear_cache()
+        plan = kernel_moe_plan(
+            "mxfp4",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            routing_mode="precomputed_topk",
+            ep_size=1,
+            ispp=576,
+            internal_activation_dtype="input",
+            hidden=5120,
+            swiglu_form="standard",
+            activation_clamped=True,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        plan,
+        apply=kernel_name,
+        preprocessor="gluon_mxfp4_gfx1250_moe_weights",
+    )
+
+
 def _make_fake_gluon_mxfp4_layer(top_k: int) -> torch.nn.Module:
     """Minimal ``w`` exposing only the attributes the apply wrapper reads.
 
@@ -3782,6 +3823,51 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
 
     assert out == "sentinel"
     assert captured["decode"] is expected_decode
+
+
+@pytest.mark.parametrize(
+    "internal_activation_dtype,expected",
+    [("fp8", "fp8"), ("input", "mxfp4"), ("mxfp4", "mxfp4")],
+)
+def test_gluon_mxfp4_gfx1250_apply_forwards_activation_dtype(
+    internal_activation_dtype: str,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_gfx1250_precomputed_moe_apply"):
+        pytest.skip("gfx1250 Gluon MXFP4 apply is AMD-only")
+
+    captured: dict[str, object] = {}
+
+    def fake_fused_moe(*args, **kwargs):
+        captured["activation_dtype"] = kwargs.get("activation_dtype")
+        return "sentinel"
+
+    monkeypatch.setattr(
+        _moe_gluon_mxfp4.fused_mxfp_gfx1250,
+        "gluon_mxfp_precomputed_mxfp4_fused_moe",
+        fake_fused_moe,
+    )
+
+    w = torch.nn.Module()
+    w.w13_weight_triton_tensor = torch.empty((4, 0, 0))
+    w.w2_weight_triton_tensor = object()
+    w.w13_precision_config = type("PC", (), {"b_mx_scale": object()})()
+    w.w2_precision_config = type(
+        "PC", (), {"b_mx_scale": object(), "out_dtype": torch.bfloat16}
+    )()
+
+    out = _moe_gluon_mxfp4.gluon_mxfp4_gfx1250_precomputed_moe_apply(
+        {"internal_activation_dtype": internal_activation_dtype},
+        torch.empty((2, 16), dtype=torch.bfloat16),
+        w,
+        torch.empty((2, 4), dtype=torch.float32),
+        topk_weights=torch.ones((2, 2), dtype=torch.float32),
+        topk_ids=torch.zeros((2, 2), dtype=torch.int32),
+    )
+
+    assert out == "sentinel"
+    assert captured["activation_dtype"] == expected
 
 
 def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
@@ -5752,6 +5838,14 @@ _CASES = [
         "gemm",
         "dsv4_linear_fp32",
         "cuda_dsv3_dsv4_linear_fp32",
+        _dsv4_linear_fp32,
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "gemm",
+        "dsv4_linear_fp32",
+        "gluon_dsv4_linear_fp32_gfx1250",
         _dsv4_linear_fp32,
     ),
     # Quantization API x architecture golden cases.

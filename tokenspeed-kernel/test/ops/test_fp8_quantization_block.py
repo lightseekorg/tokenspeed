@@ -106,7 +106,7 @@ def test_fp8_block_quantization_feeds_block_scaled_gemm(device: str) -> None:
 
     # Compare against the activation as mm() quantized it online.
     q_a, a_scales = _online_quantize_mxfp8(
-        a, list(block_size), "float32", enable_pdl=False
+        a, list(block_size), "float32", enable_pdl=False, kernel_name=None
     )
     activation = q_a.float() * a_scales.repeat_interleave(block_size[1], dim=1)[:, :k]
     reference = activation @ _dequantize(q_weight, weight_scales, block_size).t()

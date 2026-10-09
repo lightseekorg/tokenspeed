@@ -20,46 +20,30 @@
 
 """GFX1250 DeepSeek V4.1 CSA2 indexer.
 
-Wave32 WMMA port of the GFX950 CSA2 scorer. MXFP4 index-K is dequantized to
-BF16; 32 padded heads score a 32-wide history tile. The tokenspeed-kernel
-adapter owns query preparation, bounded query tiling, and selection.
+Scores page-planar MXFP4 index-K with the V4 ``wmma_scaled`` e2m1 tile.
+The tokenspeed-kernel adapter owns query packing, bounded query tiling, and
+selection.
 """
 
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4.indexer import (
+    _BLOCK_N,
+    _PACKED_DIM,
+    _PAGE_SIZE,
+    _SCALE_DIM,
+    _indexer_wmma_layouts,
+    _load_query_group,
+    _score_query_group,
+)
 
 __all__ = ["dsv41_index_logits_gfx1250"]
 
-_HEAD_DIM = 128
-_PACKED_DIM = gl.constexpr(_HEAD_DIM // 2)
-_SCALE_DIM = gl.constexpr(_HEAD_DIM // 32)
-_BLOCK_N = 32
+_WMMA_HEADS = 32
 _CHUNK_N = 256
-_NUM_WARPS = 2
-
-
-@gluon.jit
-def _e2m1_decode(code):
-    a = code & 7
-    value = gl.where(
-        a < 4,
-        a.to(gl.float32) * 0.5,
-        gl.where(a == 4, 2.0, gl.where(a == 5, 3.0, gl.where(a == 6, 4.0, 6.0))),
-    )
-    return gl.where((code & 8) != 0, -value, value)
-
-
-@gluon.constexpr_function
-def _wmma_layout(NUM_WARPS: gl.constexpr):
-    return gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=[[1, 0]] if NUM_WARPS == 2 else [[1, 0], [0, 1]],
-        reg_bases=[],
-        instr_shape=[16, 16, 32],
-    )
+_NUM_WARPS = 4
 
 
 @gluon.jit
@@ -102,31 +86,83 @@ def _csa2_page_rows(
 
 
 @gluon.jit
-def _load_query(
-    q,
-    weights,
+def _load_csa2_key_tile(
+    index_k_cache,
+    page_table,
+    candidates,
     token,
-    stride_q_token,
-    stride_q_head,
-    stride_w_token,
-    stride_w_head,
-    q_load_layout: gl.constexpr,
-    q_dot_layout: gl.constexpr,
-    wmma_layout: gl.constexpr,
-    HEAD_DIM: gl.constexpr,
+    tile_start,
+    candidate_end,
+    table_stride,
+    cand_stride,
+    page_stride_bytes,
+    num_pages,
+    visible,
+    dot_b_layout: gl.constexpr,
+    b_scale_layout: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    table_width,
+    CANDIDATES: gl.constexpr,
 ):
-    heads = gl.arange(0, 32, layout=gl.SliceLayout(1, q_load_layout))[:, None]
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))[None, :]
-    query = gl.amd.cdna5.buffer_load(
-        q,
-        (token * stride_q_token + heads * stride_q_head + dims).to(gl.int32),
+    packed_dims = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, dot_b_layout))[
+        :, None
+    ]
+    columns = gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(0, dot_b_layout))[None, :]
+    positions = tile_start + columns
+    pages, page_rows, valid = _csa2_page_rows(
+        positions,
+        positions < candidate_end,
+        page_table,
+        candidates,
+        token,
+        table_stride,
+        cand_stride,
+        num_pages,
+        visible,
+        PAGE_SIZE,
+        table_width,
+        CANDIDATES,
     )
-    weight_heads = gl.arange(0, 32, layout=gl.SliceLayout(1, wmma_layout))
-    head_weights = gl.amd.cdna5.buffer_load(
-        weights,
-        (token * stride_w_token + weight_heads * stride_w_head).to(gl.int32),
-    ).to(gl.float32)
-    return gl.convert_layout(query, q_dot_layout), head_weights
+    key = gl.load(
+        index_k_cache
+        + pages * page_stride_bytes
+        + page_rows.to(gl.int64) * _PACKED_DIM
+        + packed_dims,
+        mask=valid,
+        other=0,
+    )
+
+    scale_columns = gl.arange(0, _BLOCK_N, layout=gl.SliceLayout(1, b_scale_layout))[
+        :, None
+    ]
+    scale_groups = gl.arange(0, _SCALE_DIM, layout=gl.SliceLayout(0, b_scale_layout))[
+        None, :
+    ]
+    scale_positions = tile_start + scale_columns
+    scale_pages, scale_page_rows, scale_valid = _csa2_page_rows(
+        scale_positions,
+        scale_positions < candidate_end,
+        page_table,
+        candidates,
+        token,
+        table_stride,
+        cand_stride,
+        num_pages,
+        visible,
+        PAGE_SIZE,
+        table_width,
+        CANDIDATES,
+    )
+    key_scales = gl.load(
+        index_k_cache
+        + scale_pages * page_stride_bytes
+        + PAGE_SIZE * _PACKED_DIM
+        + scale_page_rows.to(gl.int64) * _SCALE_DIM
+        + scale_groups,
+        mask=scale_valid,
+        other=127,
+    )
+    return key, key_scales
 
 
 def _index_launch_metadata(grid, kernel, args):
@@ -135,7 +171,7 @@ def _index_launch_metadata(grid, kernel, args):
     heads = args["q"].shape[1]
     return {
         "name": kernel.name,
-        "flops16": 2 * queries * heads * width * 128,
+        "flops8": 2 * queries * heads * width * 128,
         "bytes": queries * width * 68
         + args["q"].numel() * args["q"].element_size() * grid[1]
         + args["logits"].numel() * args["logits"].element_size(),
@@ -147,6 +183,8 @@ def _index_launch_metadata(grid, kernel, args):
     do_not_specialize=(
         "stride_q_token",
         "stride_q_head",
+        "stride_q_scale_token",
+        "stride_q_scale_head",
         "stride_w_token",
         "stride_w_head",
         "table_stride",
@@ -159,6 +197,7 @@ def _index_launch_metadata(grid, kernel, args):
 )
 def gluon_dsv41_index_topk_gfx1250(
     q,
+    q_scales,
     weights,
     index_k_cache,
     visible,
@@ -167,6 +206,8 @@ def gluon_dsv41_index_topk_gfx1250(
     logits,
     stride_q_token,
     stride_q_head,
+    stride_q_scale_token,
+    stride_q_scale_head,
     stride_w_token,
     stride_w_head,
     table_stride,
@@ -178,9 +219,7 @@ def gluon_dsv41_index_topk_gfx1250(
     PAGE_SIZE: gl.constexpr,
     table_width,
     CANDIDATES: gl.constexpr,
-    HEAD_DIM: gl.constexpr,
     SCORE_CHUNK: gl.constexpr,
-    BLOCK_N: gl.constexpr,
     CHUNK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
@@ -200,85 +239,62 @@ def gluon_dsv41_index_topk_gfx1250(
     if candidate_start >= candidate_end:
         return
 
-    wmma_layout: gl.constexpr = _wmma_layout(NUM_WARPS)
-    k_width: gl.constexpr = 8
-    q_dot_layout: gl.constexpr = gl.DotOperandLayout(0, wmma_layout, k_width=k_width)
-    k_dot_layout: gl.constexpr = gl.DotOperandLayout(1, wmma_layout, k_width=k_width)
-    q_load_layout: gl.constexpr = gl.BlockedLayout(
-        [1, k_width],
-        [4, 8],
-        [NUM_WARPS, 1],
-        [1, 0],
-    )
-    query, head_weights = _load_query(
+    layouts: gl.constexpr = _indexer_wmma_layouts(NUM_WARPS)
+    wmma_layout: gl.constexpr = layouts[0]
+    dot_a_layout: gl.constexpr = layouts[1]
+    dot_b_layout: gl.constexpr = layouts[2]
+    a_scale_layout: gl.constexpr = layouts[3]
+    b_scale_layout: gl.constexpr = layouts[4]
+    query, query_scales, head_weights = _load_query_group(
         q,
+        q_scales,
         weights,
         token,
+        0,
         stride_q_token,
         stride_q_head,
+        stride_q_scale_token,
+        stride_q_scale_head,
         stride_w_token,
         stride_w_head,
-        q_load_layout,
-        q_dot_layout,
         wmma_layout,
-        HEAD_DIM,
+        dot_a_layout,
+        a_scale_layout,
     )
     output_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
-    output_columns = gl.arange(0, BLOCK_N, layout=output_layout)
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, k_dot_layout))[:, None]
-    columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, k_dot_layout))[None, :]
-
-    for tile_offset in range(0, CHUNK_N, BLOCK_N):
+    output_columns = gl.arange(0, _BLOCK_N, layout=output_layout)
+    for tile_offset in range(0, CHUNK_N, _BLOCK_N):
         tile_start = candidate_start + tile_offset
-        positions = tile_start + columns
-        valid = positions < candidate_end
-        pages, page_rows, valid = _csa2_page_rows(
-            positions,
-            valid,
+        key, key_scales = _load_csa2_key_tile(
+            index_k_cache,
             page_table,
             candidates,
             token,
+            tile_start,
+            candidate_end,
             table_stride,
             cand_stride,
+            page_stride_bytes,
             num_pages,
             vis,
+            dot_b_layout,
+            b_scale_layout,
             PAGE_SIZE,
             table_width,
             CANDIDATES,
         )
-        packed = gl.load(
-            index_k_cache
-            + pages * page_stride_bytes
-            + page_rows.to(gl.int64) * _PACKED_DIM
-            + dims // 2,
-            mask=valid,
-            other=0,
+        scores = _score_query_group(
+            query,
+            query_scales,
+            head_weights,
+            key,
+            key_scales,
+            wmma_layout,
         )
-        value = _e2m1_decode((packed.to(gl.int32) >> ((dims % 2) * 4)) & 15)
-        scale_u8 = gl.load(
-            index_k_cache
-            + pages * page_stride_bytes
-            + PAGE_SIZE * _PACKED_DIM
-            + page_rows.to(gl.int64) * _SCALE_DIM
-            + dims // 32,
-            mask=valid,
-            other=0,
-        )
-        scale = gl.where(
-            scale_u8 == 0,
-            2.0**-127,
-            (scale_u8.to(gl.int32) << 23).to(gl.float32, bitcast=True),
-        )
-        key = gl.where(valid, (value * scale).to(gl.bfloat16), 0.0)
-        acc = gl.zeros([32, BLOCK_N], gl.float32, layout=wmma_layout)
-        head_scores = gl.amd.cdna5.wmma(query, key, acc)
-        head_scores = gl.maximum(head_scores, 0.0, propagate_nan=tl.PropagateNan.ALL)
-        scores = gl.sum(head_scores * head_weights[:, None], axis=0)
-        store_pos = tile_start + output_columns
-        live = store_pos < candidate_end
+        positions = tile_start + output_columns
         _, _, live = _csa2_page_rows(
-            store_pos,
-            live,
+            positions,
+            positions < candidate_end,
             page_table,
             candidates,
             token,
@@ -291,14 +307,15 @@ def gluon_dsv41_index_topk_gfx1250(
             CANDIDATES,
         )
         gl.store(
-            logits + token * logits_stride + store_pos,
+            logits + token * logits_stride + positions,
             scores,
-            mask=(store_pos < max_candidates) & live,
+            mask=(positions < max_candidates) & live,
         )
 
 
 def dsv41_index_logits_gfx1250(
-    q,
+    values,
+    scales,
     w,
     cache_2d,
     table,
@@ -307,10 +324,11 @@ def dsv41_index_logits_gfx1250(
     logits,
     score_chunk_size,
 ):
-    """Score prepared 32-head BF16 queries into caller-owned CSA2 logits.
+    """Score prepared 32-head MXFP4 queries into caller-owned CSA2 logits.
 
     Args:
-        q: Quantized/dequantized BF16 queries shaped [T, 32, 128].
+        values: Packed E2M1 query values shaped [T, 32, 64].
+        scales: E8M0 query scales as int32 words shaped [T, 32].
         w: FP32 head weights shaped [T, 32].
         cache_2d: Page-planar MXFP4 bytes shaped [pages, 64 * 68].
         table: Physical page IDs shaped [T, logical_pages].
@@ -326,19 +344,24 @@ def dsv41_index_logits_gfx1250(
     if score_chunk_size < 8 or score_chunk_size % 8:
         raise ValueError("score_chunk_size must be a positive multiple of 8")
     score_chunk_size = min(score_chunk_size, _CHUNK_N)
-    chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
+    block_n = _BLOCK_N.value
+    chunk_n = triton.cdiv(score_chunk_size, block_n) * block_n
     queries, width = logits.shape
     cand = table if candidates is None else candidates
+    scale_dim = _SCALE_DIM.value
     gluon_dsv41_index_topk_gfx1250[(queries, triton.cdiv(width, score_chunk_size))](
-        q,
+        values,
+        scales.view(torch.uint8).reshape(queries, _WMMA_HEADS, scale_dim),
         w,
         cache_2d,
         visible,
         table,
         cand,
         logits,
-        q.stride(0),
-        q.stride(1),
+        values.stride(0),
+        values.stride(1),
+        scale_dim * _WMMA_HEADS,
+        scale_dim,
         w.stride(0),
         w.stride(1),
         table.stride(0),
@@ -347,12 +370,10 @@ def dsv41_index_logits_gfx1250(
         int(cache_2d.stride(0)),
         int(cache_2d.shape[0]),
         width,
-        PAGE_SIZE=64,
+        PAGE_SIZE=_PAGE_SIZE,
         table_width=int(table.shape[1]),
         CANDIDATES=-1 if candidates is None else int(candidates.shape[1]),
-        HEAD_DIM=_HEAD_DIM,
         SCORE_CHUNK=score_chunk_size,
-        BLOCK_N=_BLOCK_N,
         CHUNK_N=chunk_n,
         NUM_WARPS=_NUM_WARPS,
         num_warps=_NUM_WARPS,
