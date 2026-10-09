@@ -550,7 +550,7 @@ def test_engine_async_decision_end_to_end():
 
 def test_engine_async_decision_requires_tokenizer():
     engine = _engine_with([], tokenizer=None)
-    with pytest.raises(ValueError, match="skip_tokenizer_init"):
+    with pytest.raises(ValueError, match="async_generate\\(input_ids="):
         asyncio.run(engine.async_decision(_request()))
 
 

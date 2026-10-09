@@ -375,8 +375,11 @@ class Engine(EngineBase):
             raise ValueError(
                 "async_decision requires the engine tokenizer to resolve "
                 "label strings to token ids; this engine runs with "
-                "skip_tokenizer_init=True. Compile the request yourself and "
-                "call async_score with explicit label_token_ids."
+                "skip_tokenizer_init=True. Tokenize the complete inputs "
+                "externally and call async_generate(input_ids=..., "
+                "sampling_params={'max_new_tokens': 0, "
+                "'score_label_token_ids': [...], 'score_apply_softmax': ...}). "
+                "async_score requires text tokenization."
             )
         adapter = get_decision_adapter(request.adapter)
         call = adapter.compile(request, tokenizer)

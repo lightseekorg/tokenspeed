@@ -175,7 +175,7 @@ def test_generate_passthrough_attaches_scores(engine_and_tokenizer):
     label_ids = [_single_token_id(tokenizer, t) for t in ("Yes", "No")]
 
     out = engine.generate(
-        prompt=_QUERY + _ITEM_CORRECT,
+        input_ids=tokenizer.encode(_QUERY + _ITEM_CORRECT),
         sampling_params={
             "max_new_tokens": 0,
             "score_label_token_ids": label_ids,
@@ -199,6 +199,26 @@ def test_score_rejects_decode_budget(engine_and_tokenizer):
                 "score_label_token_ids": label_ids,
             },
         )
+
+
+def test_score_late_context_failure_retires_admitted_items(engine_and_tokenizer):
+    engine, tokenizer = engine_and_tokenizer
+    label_ids = [_single_token_id(tokenizer, t) for t in ("Yes", "No")]
+    with pytest.raises(ValueError, match="maximum input length"):
+        engine.score(
+            query=_QUERY,
+            items=[_ITEM_CORRECT, " too long" * 4096],
+            label_token_ids=label_ids,
+            apply_softmax=True,
+        )
+    assert not engine.tokenizer_manager.rid_to_state
+    out = engine.score(
+        query=_QUERY,
+        items=[_ITEM_CORRECT],
+        label_token_ids=label_ids,
+        apply_softmax=True,
+    )
+    assert len(out["scores"][0]) == 2
 
 
 def test_ordinary_decode_graph_after_scoring(engine_and_tokenizer):

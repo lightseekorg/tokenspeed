@@ -443,13 +443,20 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            # Send all requests
-            for i in range(batch_size):
-                tmp_obj = obj[i]
-                tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                generators.append(self._wait_one_response(tmp_obj))
-                rids.append(tmp_obj.rid)
+            # A later child's validation may fail after earlier children were
+            # admitted. Their wait generators have not started, so their
+            # finally blocks cannot retire those requests yet.
+            try:
+                for i in range(batch_size):
+                    tmp_obj = obj[i]
+                    tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                    rids.append(tmp_obj.rid)
+                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj))
+            except BaseException:
+                for rid in rids:
+                    self.abort_request(rid)
+                raise
         else:
             # Batched parallel sampling still follows a conservative path and
             # can be slower than duplicating requests explicitly.

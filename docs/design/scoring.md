@@ -119,6 +119,11 @@ A score request is an ordinary generation request with
   `score_label_token_ids` / `score_apply_softmax` scores the prompt; the
   row appears as `scores` in the response dict alongside the (contract-
   irrelevant) bootstrap token.
+- Tokenizer-free engines (`skip_tokenizer_init=True`) use
+  `Engine.generate` / `async_generate` with externally tokenized `input_ids`
+  and explicit `max_new_tokens=0`, `score_label_token_ids`, and
+  `score_apply_softmax` sampling parameters. The text-based Score and Decision
+  helpers require a tokenizer; supplying label IDs does not tokenize inputs.
 - SMG gateway: the control server proxies `/v1/score` unchanged, but
   the pinned `tokenspeed-smg==1.10.1.post20260920` does not implement
   that endpoint or decode the score column. HTTP Score serving requires
