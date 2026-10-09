@@ -120,6 +120,7 @@ def _sched_group_probe(x, out, SCHED_LIBRARY_HASH: gl.constexpr):
     y = gl.exp2(gl.load(x + offset))
     sched_group(("trans",), 2)
     sched_group("mfma", 1)
+    sched_group("valu", 4)
     gl.store(out + offset, y)
 
 
@@ -132,4 +133,5 @@ def test_sched_group_accepts_class_names():
     llir = compiled.asm["llir"]
     assert "@llvm.amdgcn.sched.group.barrier(i32 1024, i32 2, i32 0)" in llir
     assert "@llvm.amdgcn.sched.group.barrier(i32 8, i32 1, i32 0)" in llir
+    assert "@llvm.amdgcn.sched.group.barrier(i32 2, i32 4, i32 0)" in llir
     torch.testing.assert_close(out, torch.exp2(x), atol=0, rtol=0)

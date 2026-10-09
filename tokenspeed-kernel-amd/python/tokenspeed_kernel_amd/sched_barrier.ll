@@ -39,7 +39,7 @@ entry:
 ; the value is already in an SGPR.
 declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
 
-define i32 @__tokenspeed_readfirstlane_i32(i32 %x) alwaysinline {
+define i32 @__tokenspeed_sched_readfirstlane_i32(i32 %x) alwaysinline {
 entry:
   %r = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %x)
   ret i32 %r
@@ -57,6 +57,13 @@ entry:
   ret i32 0
 }
 
+; Four VALU instructions.
+define i32 @__tokenspeed_sched_group_barrier_2_4() alwaysinline {
+entry:
+  call void @llvm.amdgcn.sched.group.barrier(i32 2, i32 4, i32 0)
+  ret i32 0
+}
+
 ; Three VMEM instructions.
 define i32 @__tokenspeed_sched_group_barrier_16_3() alwaysinline {
 entry:
@@ -68,5 +75,28 @@ entry:
 define i32 @__tokenspeed_sched_group_barrier_1024_2() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 1024, i32 2, i32 0)
+  ret i32 0
+}
+
+; One LDS read.
+define i32 @__tokenspeed_sched_group_barrier_256_1() alwaysinline {
+entry:
+  call void @llvm.amdgcn.sched.group.barrier(i32 256, i32 1, i32 0)
+  ret i32 0
+}
+
+declare void @llvm.amdgcn.s.setreg(i32 immarg, i32)
+
+; SCHED_MODE bit 2 (DISABLE_VALU_ARB_STALL): restore default WMMA arbitration.
+define i32 @__tokenspeed_sched_set_wmma_issue_mode_0() alwaysinline {
+entry:
+  call void @llvm.amdgcn.s.setreg(i32 154, i32 0)
+  ret i32 0
+}
+
+; SCHED_MODE bit 2 (DISABLE_VALU_ARB_STALL): allow back-to-back WMMA issue.
+define i32 @__tokenspeed_sched_set_wmma_issue_mode_1() alwaysinline {
+entry:
+  call void @llvm.amdgcn.s.setreg(i32 154, i32 1)
   ret i32 0
 }

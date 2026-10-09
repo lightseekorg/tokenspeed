@@ -60,8 +60,11 @@ def test_scheduler_library_is_package_data(schedule):
     assert f"define i32 @{schedule._SCHED_SYMBOL}() alwaysinline" in text
     # Triton links the library only for calls whose symbol contains its name.
     symbols = set(re.findall(r"^define \S+ @(\w+)", text, re.M))
-    hints = symbols - {schedule._READFIRSTLANE_SYMBOL}
-    assert hints and all(schedule._SCHED_LIBRARY_NAME in s for s in hints)
+    assert symbols and all(schedule._SCHED_LIBRARY_NAME in symbol for symbol in symbols)
+    assert {
+        f"{schedule._WMMA_ISSUE_MODE_SYMBOL_PREFIX}0",
+        f"{schedule._WMMA_ISSUE_MODE_SYMBOL_PREFIX}1",
+    } <= symbols
 
 
 def test_normal_compile_options_pin_library_path(schedule):

@@ -30,7 +30,8 @@ from tokenspeed_kernel_amd._triton import tl
 
 _SCHED_LIBRARY_NAME = "tokenspeed_sched"
 _SCHED_SYMBOL = "__tokenspeed_sched_barrier0"
-_READFIRSTLANE_SYMBOL = "__tokenspeed_readfirstlane_i32"
+_READFIRSTLANE_SYMBOL = "__tokenspeed_sched_readfirstlane_i32"
+_WMMA_ISSUE_MODE_SYMBOL_PREFIX = "__tokenspeed_sched_set_wmma_issue_mode_"
 _SCHED_LIBRARY_PATH = str(Path(__file__).with_name("sched_barrier.ll"))
 
 
@@ -88,6 +89,28 @@ def wave_uniform_i32(value, _semantic):
         [value],
         {(tl.int32,): (_READFIRSTLANE_SYMBOL, tl.int32)},
         is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def set_wmma_issue_mode(allow_back_to_back, _semantic):
+    """Control back-to-back WMMA issue on gfx1250.
+
+    ``True`` sets ``HW_REG_WAVE_SCHED_MODE.DISABLE_VALU_ARB_STALL`` and
+    ``False`` restores the default. Launch with
+    :func:`sched_barrier_compile_options`.
+    """
+    allow_back_to_back = tl.core._unwrap_if_constexpr(allow_back_to_back)
+    if not isinstance(allow_back_to_back, bool):
+        raise TypeError("allow_back_to_back must be a constexpr bool")
+    value = int(allow_back_to_back)
+    return tl.core.extern_elementwise(
+        _SCHED_LIBRARY_NAME,
+        _SCHED_LIBRARY_PATH,
+        [],
+        {(): (f"{_WMMA_ISSUE_MODE_SYMBOL_PREFIX}{value}", tl.int32)},
+        is_pure=False,
         _semantic=_semantic,
     )
 

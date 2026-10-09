@@ -31,6 +31,12 @@ import math
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._scheduling import (
+    sched_barrier,
+    sched_barrier_compile_options,
+    sched_group,
+    set_wmma_issue_mode,
+)
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
     _INV_LN2,
@@ -65,6 +71,7 @@ class AttentionConfig:
     DEEP_PIPELINE: gl.constexpr
     PACKED_GQA: gl.constexpr
     GUARDED_QUERY_ROWS: gl.constexpr
+    COMPACT_RAGGED: gl.constexpr
     WIDE_ADDRESSING: gl.constexpr
     q_strides: InputStrides
     k_strides: InputStrides
@@ -99,6 +106,7 @@ class AttentionConfig:
         DEEP_PIPELINE,
         PACKED_GQA,
         GUARDED_QUERY_ROWS,
+        COMPACT_RAGGED,
         WIDE_ADDRESSING,
         q_strides,
         k_strides,
@@ -150,6 +158,7 @@ class AttentionConfig:
         self.DEEP_PIPELINE = gl.constexpr(DEEP_PIPELINE)
         self.PACKED_GQA = gl.constexpr(PACKED_GQA)
         self.GUARDED_QUERY_ROWS = gl.constexpr(GUARDED_QUERY_ROWS)
+        self.COMPACT_RAGGED = gl.constexpr(COMPACT_RAGGED)
         self.WIDE_ADDRESSING = gl.constexpr(WIDE_ADDRESSING)
         self.q_strides = q_strides
         self.k_strides = k_strides
@@ -244,12 +253,37 @@ class AttentionProgram:
 
     @gluon.jit
     def create(cfg, q_ptr, k_ptr, v_ptr, output_ptr, sink_ptr, lse_ptr, cu_seqlens_ptr):
-        batch = gl.program_id(0)
         head_program = gl.program_id(1)
-        q_block = gl.program_id(2)
-        if cfg.REVERSE_Q_BLOCKS:
-            q_block = gl.num_programs(axis=2) - 1 - q_block
         group_size: gl.constexpr = cfg.N_HEADS // cfg.N_KV_HEADS
+        if cfg.COMPACT_RAGGED:
+            # The measured ragged route has four sequences. Compact their live
+            # query blocks onto axis 2 instead of launching a max-seqlen
+            # rectangle with empty workgroups for every shorter sequence.
+            task = gl.program_id(2)
+            q_block = task * 0
+            seq_base = gl.load(cu_seqlens_ptr)
+            seq_end = gl.load(cu_seqlens_ptr + 1)
+            prefix = task * 0
+            for batch_idx in gl.static_range(4):
+                batch_base = gl.load(cu_seqlens_ptr + batch_idx)
+                batch_end = gl.load(cu_seqlens_ptr + batch_idx + 1)
+                batch_len = batch_end - batch_base
+                num_q_blocks = (batch_len * group_size + cfg.BLOCK_M - 1) // cfg.BLOCK_M
+                selected = (task >= prefix) & (task < prefix + num_q_blocks)
+                local_q_block = task - prefix
+                if cfg.REVERSE_Q_BLOCKS:
+                    local_q_block = num_q_blocks - 1 - local_q_block
+                q_block = gl.where(selected, local_q_block, q_block)
+                seq_base = gl.where(selected, batch_base, seq_base)
+                seq_end = gl.where(selected, batch_end, seq_end)
+                prefix += num_q_blocks
+        else:
+            batch = gl.program_id(0)
+            q_block = gl.program_id(2)
+            if cfg.REVERSE_Q_BLOCKS:
+                q_block = gl.num_programs(axis=2) - 1 - q_block
+            seq_base = gl.load(cu_seqlens_ptr + batch)
+            seq_end = gl.load(cu_seqlens_ptr + batch + 1)
         if cfg.PACKED_GQA:
             kv_head = head_program
             q_head = kv_head * group_size
@@ -258,8 +292,6 @@ class AttentionProgram:
             q_head = head_program
             kv_head = q_head // group_size
             q_start = q_block * cfg.BLOCK_M
-        seq_base = gl.load(cu_seqlens_ptr + batch)
-        seq_end = gl.load(cu_seqlens_ptr + batch + 1)
         seq_len = seq_end - seq_base
         if cfg.WIDE_ADDRESSING:
             query_token_base = seq_base + q_start
@@ -428,6 +460,28 @@ class AttentionProgram:
             [kv_start, 0],
             self.v_buffer.index(buffer_index),
             warp_used_hint=warp_used_hint,
+        )
+
+    @gluon.jit
+    def tdm_load_global_to_shared_kv_fused(self, kv_start, buffer_index):
+        k_desc = cdna5.tdm.update_tensor_descriptor(
+            self.k_desc,
+            add_offsets=[kv_start, 0],
+            pred=True,
+            clamp_bounds=True,
+        )
+        v_desc = cdna5.tdm.update_tensor_descriptor(
+            self.v_desc,
+            add_offsets=[kv_start, 0],
+            pred=True,
+            clamp_bounds=True,
+        )
+        cdna5.tdm.async_load_fused(
+            [
+                (k_desc, self.k_buffer.index(buffer_index), 0x03),
+                (v_desc, self.v_buffer.index(buffer_index), 0x0C),
+            ],
+            cache_modifier=".cg",
         )
 
     @gluon.jit
@@ -828,11 +882,22 @@ def process_attention_tile(program: AttentionProgram, kv_start, num_tiles):
 
 
 @gluon.jit
-def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
+def process_attention_tile_deep(
+    program: AttentionProgram,
+    kv_start,
+    num_tiles,
+    QK_VALU_GROUP_SIZE: gl.constexpr,
+    QK_DS_GROUP_STRIDE: gl.constexpr,
+):
     """Three-tile K-ahead/V-behind schedule from dense FAv3."""
     cfg = program.cfg
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_attention_state()
+    qk_wmmas_per_wave: gl.constexpr = (
+        (cfg.BLOCK_M // (16 * cfg.NUM_WARPS))
+        * (cfg.BLOCK_N // 16)
+        * (cfg.HEAD_DIM // 32)
+    )
 
     program.tdm_load_global_to_shared_k(kv_start, 0)
     program.tdm_load_global_to_shared_k(kv_start + cfg.BLOCK_N, 1)
@@ -855,6 +920,8 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
     for tile_idx in range(1, num_tiles - 2):
         cur_kv_start = kv_start + tile_idx * cfg.BLOCK_N
 
+        if QK_VALU_GROUP_SIZE > 0:
+            sched_barrier()
         qk = program.compute_qk(q, k)
         if cfg.WINDOW_LEFT < 0:
             if cur_kv_start + cfg.BLOCK_N > program.q_start:
@@ -862,7 +929,18 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
         else:
             qk = program.apply_mask(qk, cur_kv_start)
         p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
-        v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
+        if QK_DS_GROUP_STRIDE > 0:
+            v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
+        if QK_VALU_GROUP_SIZE > 0 or QK_DS_GROUP_STRIDE > 0:
+            for group_idx in gl.static_range(qk_wmmas_per_wave):
+                sched_group("mfma", 1)
+                if QK_VALU_GROUP_SIZE > 0:
+                    sched_group("valu", QK_VALU_GROUP_SIZE)
+                if QK_DS_GROUP_STRIDE > 0 and (group_idx + 1) % QK_DS_GROUP_STRIDE == 0:
+                    sched_group("ds_read", 1)
+            sched_barrier()
+        if QK_DS_GROUP_STRIDE == 0:
+            v = program.tdm_shared_load_v(iter_id % cfg.NUM_BUFFERS, wait_count=2)
 
         program.tdm_load_global_to_shared_k(
             cur_kv_start + 2 * cfg.BLOCK_N,
@@ -918,6 +996,293 @@ def process_attention_tile_deep(program: AttentionProgram, kv_start, num_tiles):
 
 
 @gluon.jit
+def _clone_program_with_buffers(program, cfg, k_buffer, v_buffer):
+    return AttentionProgram(
+        cfg,
+        program.q_ptr,
+        program.k_ptr,
+        program.v_ptr,
+        program.output_ptr,
+        program.sink_ptr,
+        program.lse_ptr,
+        program.seq_base,
+        program.seq_len,
+        program.q_start,
+        program.q_head,
+        program.kv_head,
+        program.k_desc,
+        k_buffer,
+        program.v_desc,
+        v_buffer,
+    )
+
+
+@gluon.jit
+def _wide_transport_load_k(
+    loader,
+    program,
+    buffer_index,
+    HALF: gl.constexpr,
+):
+    return (
+        loader.k_buffer.index(buffer_index)
+        .slice(HALF * program.cfg.BLOCK_N, program.cfg.BLOCK_N, 0)
+        .permute([1, 0])
+        .load(layout=program.cfg.k_layout)
+    )
+
+
+@gluon.jit
+def _wide_transport_load_v(
+    loader,
+    program,
+    buffer_index,
+    HALF: gl.constexpr,
+):
+    return (
+        loader.v_buffer.index(buffer_index)
+        .slice(HALF * program.cfg.BLOCK_N, program.cfg.BLOCK_N, 0)
+        .load(layout=program.cfg.v_layout)
+    )
+
+
+@gluon.jit
+def _process_wide_transport_half(
+    loader,
+    program,
+    q,
+    state,
+    kv_start,
+    buffer_index,
+    HALF: gl.constexpr,
+):
+    m_i, l_i, acc, sink_log2 = state
+    qk = program.compute_qk(
+        q,
+        _wide_transport_load_k(loader, program, buffer_index, HALF),
+    )
+    if kv_start + program.cfg.BLOCK_N > program.q_start:
+        qk = program.apply_mask(qk, kv_start)
+    p, alpha, m_i = program.softmax_part0_full_rows(qk, m_i)
+    p, l_i, acc = program.softmax_part1(p, l_i, acc, alpha)
+    acc = program.compute_pv(
+        p,
+        _wide_transport_load_v(loader, program, buffer_index, HALF),
+        acc,
+    )
+    return m_i, l_i, acc, sink_log2
+
+
+@gluon.jit
+def process_attention_wide_transport(
+    loader,
+    program,
+    num_tiles,
+    FUSED_TDM: gl.constexpr,
+):
+    """Pipeline BN128 TDM transfers while computing one BN64 half at a time."""
+    cfg = program.cfg
+    q = program.load_q()
+    state = program.init_attention_state()
+    full_loads = num_tiles // 2
+
+    if full_loads > 0:
+        if FUSED_TDM:
+            loader.tdm_load_global_to_shared_kv_fused(0, 0)
+        else:
+            loader.tdm_load_global_to_shared_k(0, 0)
+            loader.tdm_load_global_to_shared_v(0, 0)
+        for load_idx in range(full_loads):
+            buffer_index = load_idx % cfg.NUM_BUFFERS
+            cdna5.tdm.async_wait(0)
+            next_load = load_idx + 1
+            if next_load < (num_tiles + 1) // 2:
+                next_buffer = next_load % cfg.NUM_BUFFERS
+                next_start = next_load * 2 * cfg.BLOCK_N
+                if FUSED_TDM:
+                    loader.tdm_load_global_to_shared_kv_fused(
+                        next_start,
+                        next_buffer,
+                    )
+                else:
+                    loader.tdm_load_global_to_shared_k(next_start, next_buffer)
+                    loader.tdm_load_global_to_shared_v(next_start, next_buffer)
+
+            kv_start = load_idx * 2 * cfg.BLOCK_N
+            state = _process_wide_transport_half(
+                loader,
+                program,
+                q,
+                state,
+                kv_start,
+                buffer_index,
+                HALF=0,
+            )
+            state = _process_wide_transport_half(
+                loader,
+                program,
+                q,
+                state,
+                kv_start + cfg.BLOCK_N,
+                buffer_index,
+                HALF=1,
+            )
+
+    if num_tiles % 2:
+        buffer_index = full_loads % cfg.NUM_BUFFERS
+        if full_loads == 0:
+            if FUSED_TDM:
+                loader.tdm_load_global_to_shared_kv_fused(0, buffer_index)
+            else:
+                loader.tdm_load_global_to_shared_k(0, buffer_index)
+                loader.tdm_load_global_to_shared_v(0, buffer_index)
+        cdna5.tdm.async_wait(0)
+        state = _process_wide_transport_half(
+            loader,
+            program,
+            q,
+            state,
+            full_loads * 2 * cfg.BLOCK_N,
+            buffer_index,
+            HALF=0,
+        )
+
+    m_i, l_i, acc, sink_log2 = state
+    l_i = program.apply_sinks(l_i, m_i, sink_log2)
+    denom = gl.where(l_i > 0.0, l_i, 1.0)
+    output = acc * (1.0 / denom)[:, None]
+    output = gl.convert_layout(
+        output.to(program.output_ptr.dtype.element_ty),
+        cfg.store_layout,
+    )
+    program.store_output(output)
+
+
+@gluon.constexpr_function
+def _make_wide_transport_config(
+    n_heads,
+    n_kv_heads,
+    head_dim,
+    sm_scale,
+    block_n,
+    num_warps,
+    num_buffers,
+    q_strides,
+    k_strides,
+    v_strides,
+):
+    return AttentionConfig(
+        N_HEADS=n_heads,
+        N_KV_HEADS=n_kv_heads,
+        HEAD_DIM=head_dim,
+        SM_SCALE=sm_scale,
+        BLOCK_M=128,
+        BLOCK_N=block_n,
+        NUM_BUFFERS=num_buffers,
+        NUM_WARPS=num_warps,
+        IS_FP8=False,
+        HAS_SINK=False,
+        HAS_LSE=False,
+        WINDOW_LEFT=-1,
+        TDM_WARP_HINT=False,
+        REVERSE_Q_BLOCKS=True,
+        DEEP_PIPELINE=True,
+        PACKED_GQA=True,
+        GUARDED_QUERY_ROWS=False,
+        COMPACT_RAGGED=False,
+        WIDE_ADDRESSING=False,
+        q_strides=q_strides,
+        k_strides=k_strides,
+        v_strides=v_strides,
+    )
+
+
+@gluon.jit
+def gluon_mha_prefill_gfx1250_wide_transport(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    cu_seqlens_ptr,
+    output_ptr,
+    Q_STRIDE_T: gl.constexpr,
+    Q_STRIDE_H: gl.constexpr,
+    Q_STRIDE_D: gl.constexpr,
+    K_STRIDE_T: gl.constexpr,
+    K_STRIDE_H: gl.constexpr,
+    K_STRIDE_D: gl.constexpr,
+    V_STRIDE_T: gl.constexpr,
+    V_STRIDE_H: gl.constexpr,
+    V_STRIDE_D: gl.constexpr,
+    N_HEADS: gl.constexpr,
+    N_KV_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    SM_SCALE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    WMMA_BACK_TO_BACK: gl.constexpr,
+    FUSED_TDM: gl.constexpr,
+    SCHED_LIBRARY_HASH: gl.constexpr,
+):
+    if WMMA_BACK_TO_BACK:
+        set_wmma_issue_mode(True)
+    q_strides = InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D)
+    k_strides = InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D)
+    v_strides = InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D)
+    load_cfg = _make_wide_transport_config(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        SM_SCALE,
+        128,
+        NUM_WARPS,
+        NUM_BUFFERS,
+        q_strides,
+        k_strides,
+        v_strides,
+    )
+    compute_cfg = _make_wide_transport_config(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        SM_SCALE,
+        64,
+        NUM_WARPS,
+        NUM_BUFFERS,
+        q_strides,
+        k_strides,
+        v_strides,
+    )
+    loader = AttentionProgram.create(
+        load_cfg,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        output_ptr,
+        q_ptr,
+        q_ptr,
+        cu_seqlens_ptr,
+    )
+    program = _clone_program_with_buffers(
+        loader,
+        compute_cfg,
+        loader.k_buffer,
+        loader.v_buffer,
+    )
+
+    if loader.q_start < loader.seq_len:
+        group_size: gl.constexpr = N_HEADS // N_KV_HEADS
+        q_span: gl.constexpr = 128 // group_size
+        kv_end = gl.minimum(loader.q_start + q_span, loader.seq_len)
+        kv_end = ((kv_end + 63) // 64) * 64
+        process_attention_wide_transport(
+            loader,
+            program,
+            kv_end // 64,
+            FUSED_TDM,
+        )
+
+
+@gluon.jit
 def gluon_mha_prefill_gfx1250(
     q_ptr,
     k_ptr,
@@ -950,32 +1315,40 @@ def gluon_mha_prefill_gfx1250(
     DEEP_PIPELINE: gl.constexpr,
     PACKED_GQA: gl.constexpr,
     GUARDED_QUERY_ROWS: gl.constexpr,
+    COMPACT_RAGGED: gl.constexpr,
     WIDE_ADDRESSING: gl.constexpr,
+    WMMA_BACK_TO_BACK: gl.constexpr,
+    QK_VALU_GROUP_SIZE: gl.constexpr,
+    QK_DS_GROUP_STRIDE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    SCHED_LIBRARY_HASH: gl.constexpr,
 ):
+    if WMMA_BACK_TO_BACK:
+        set_wmma_issue_mode(True)
     cfg = AttentionConfig(
-        N_HEADS,
-        N_KV_HEADS,
-        HEAD_DIM,
-        SM_SCALE,
-        BLOCK_M,
-        BLOCK_N,
-        NUM_BUFFERS,
-        NUM_WARPS,
-        IS_FP8,
-        HAS_SINK,
-        HAS_LSE,
-        WINDOW_LEFT,
-        TDM_WARP_HINT,
-        REVERSE_Q_BLOCKS,
-        DEEP_PIPELINE,
-        PACKED_GQA,
-        GUARDED_QUERY_ROWS,
-        WIDE_ADDRESSING,
-        InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
-        InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
-        InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
+        N_HEADS=N_HEADS,
+        N_KV_HEADS=N_KV_HEADS,
+        HEAD_DIM=HEAD_DIM,
+        SM_SCALE=SM_SCALE,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        NUM_BUFFERS=NUM_BUFFERS,
+        NUM_WARPS=NUM_WARPS,
+        IS_FP8=IS_FP8,
+        HAS_SINK=HAS_SINK,
+        HAS_LSE=HAS_LSE,
+        WINDOW_LEFT=WINDOW_LEFT,
+        TDM_WARP_HINT=TDM_WARP_HINT,
+        REVERSE_Q_BLOCKS=REVERSE_Q_BLOCKS,
+        DEEP_PIPELINE=DEEP_PIPELINE,
+        PACKED_GQA=PACKED_GQA,
+        GUARDED_QUERY_ROWS=GUARDED_QUERY_ROWS,
+        COMPACT_RAGGED=COMPACT_RAGGED,
+        WIDE_ADDRESSING=WIDE_ADDRESSING,
+        q_strides=InputStrides(Q_STRIDE_T, Q_STRIDE_H, Q_STRIDE_D),
+        k_strides=InputStrides(K_STRIDE_T, K_STRIDE_H, K_STRIDE_D),
+        v_strides=InputStrides(V_STRIDE_T, V_STRIDE_H, V_STRIDE_D),
     )
     program = AttentionProgram.create(
         cfg, q_ptr, k_ptr, v_ptr, output_ptr, sink_ptr, lse_ptr, cu_seqlens_ptr
@@ -999,10 +1372,22 @@ def gluon_mha_prefill_gfx1250(
         num_tiles = (kv_end - kv_start) // cfg.BLOCK_N
         if cfg.DEEP_PIPELINE:
             if not cfg.PACKED_GQA:
-                process_attention_tile_deep(program, kv_start, num_tiles)
+                process_attention_tile_deep(
+                    program,
+                    kv_start,
+                    num_tiles,
+                    QK_VALU_GROUP_SIZE,
+                    QK_DS_GROUP_STRIDE,
+                )
             else:
                 if num_tiles >= 3:
-                    process_attention_tile_deep(program, kv_start, num_tiles)
+                    process_attention_tile_deep(
+                        program,
+                        kv_start,
+                        num_tiles,
+                        QK_VALU_GROUP_SIZE,
+                        QK_DS_GROUP_STRIDE,
+                    )
                 elif num_tiles == 1:
                     process_single_attention_tile(program, kv_start)
                 else:
@@ -1142,11 +1527,12 @@ def _select_packed_gqa(
     packed_q_block_bytes: int,
 ) -> bool:
     """Select packed query-head rows only on measured gfx1250 workloads."""
+    primary_tuple = (n_heads, n_kv_heads) == (8, 1)
+    bf16_head_tuple = (n_heads, n_kv_heads) in ((8, 8), (32, 8), (32, 1))
     if (
         dtype not in (torch.bfloat16, torch.float16)
         or head_dim != 128
-        or n_heads != 8
-        or n_kv_heads != 1
+        or not (primary_tuple or bf16_head_tuple)
         or has_sink
         or has_lse
         or packed_q_block_bytes > 2**32
@@ -1156,6 +1542,13 @@ def _select_packed_gqa(
 
     uniform = all(seqlen == max_seqlen for seqlen in seqlens)
     batch_size = len(seqlens)
+    if bf16_head_tuple:
+        return (
+            dtype == torch.bfloat16
+            and window_left < 0
+            and uniform
+            and (batch_size, max_seqlen) == (4, 4096)
+        )
     if window_left == 512:
         return uniform and batch_size == 4 and max_seqlen == 4096
     if window_left >= 0:
@@ -1167,6 +1560,134 @@ def _select_packed_gqa(
         )
         return short or long_bf16
     return batch_size == 4 and max_seqlen == 4096
+
+
+def _select_wide_transport(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    seqlens: list[int],
+    max_seqlen: int,
+    window_left: int,
+    has_sink: bool,
+    has_lse: bool,
+    wide_addressing: bool,
+) -> bool:
+    """Select BN128 transport with sequential BN64 compute on measured routes."""
+    if (
+        dtype not in (torch.bfloat16, torch.float16)
+        or head_dim != 128
+        or not seqlens
+        or not all(seqlen == max_seqlen for seqlen in seqlens)
+        or window_left >= 0
+        or has_sink
+        or has_lse
+        or wide_addressing
+    ):
+        return False
+    if (n_heads, n_kv_heads) == (8, 1):
+        return len(seqlens) == 8 and max_seqlen == 1024
+    return (
+        dtype == torch.bfloat16
+        and (n_heads, n_kv_heads) in ((32, 8), (32, 1))
+        and len(seqlens) == 4
+        and max_seqlen == 4096
+    )
+
+
+def _select_wmma_back_to_back(
+    *,
+    dtype: torch.dtype,
+    window_left: int,
+    uniform: bool,
+    guarded_query_rows: bool,
+    num_warps: int,
+    waves_per_eu: int,
+) -> bool:
+    """Allow back-to-back WMMA issue only for measured schedules."""
+    if num_warps != 4:
+        return False
+    if dtype == torch.bfloat16 and window_left < 0:
+        return (uniform and not guarded_query_rows and waves_per_eu == 0) or (
+            guarded_query_rows and waves_per_eu == 2
+        )
+    return (
+        dtype == torch.float16
+        and window_left == 512
+        and uniform
+        and not guarded_query_rows
+        and waves_per_eu == 2
+    )
+
+
+def _select_qk_valu_group_size(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    seqlens: list[int],
+    max_seqlen: int,
+    window_left: int,
+    has_sink: bool,
+    has_lse: bool,
+    wide_addressing: bool,
+) -> int:
+    """Interleave QK WMMAs with independent prior-tile VALU on measured routes."""
+    if (
+        dtype != torch.bfloat16
+        or head_dim != 128
+        or window_left >= 0
+        or has_sink
+        or has_lse
+        or wide_addressing
+        or not seqlens
+        or not all(seqlen == max_seqlen for seqlen in seqlens)
+    ):
+        return 0
+    shape = (len(seqlens), max_seqlen)
+    if (n_heads, n_kv_heads) == (8, 1) and shape in ((4, 4096), (2, 8192)):
+        return 4
+    if (n_heads, n_kv_heads) == (8, 8) and shape == (4, 4096):
+        return 4
+    if (n_heads, n_kv_heads) == (32, 1) and shape == (4, 4096):
+        return 4
+    return 0
+
+
+def _select_qk_ds_group_stride(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    n_heads: int,
+    n_kv_heads: int,
+    seqlens: list[int],
+    max_seqlen: int,
+    window_left: int,
+    has_sink: bool,
+    has_lse: bool,
+    wide_addressing: bool,
+) -> int:
+    """Interleave independent V LDS reads into QK WMMA issue slots."""
+    if (
+        dtype != torch.bfloat16
+        or head_dim != 128
+        or window_left >= 0
+        or has_sink
+        or has_lse
+        or wide_addressing
+        or not seqlens
+        or not all(seqlen == max_seqlen for seqlen in seqlens)
+    ):
+        return 0
+    shape = (len(seqlens), max_seqlen)
+    if (n_heads, n_kv_heads) == (8, 1) and shape in ((4, 4096), (2, 8192)):
+        return 8
+    if (n_heads, n_kv_heads) == (8, 8) and shape == (4, 4096):
+        return 8
+    return 0
 
 
 def _select_m_tile(
@@ -1337,19 +1858,39 @@ def launch_gluon_mha_prefill_gfx1250(
         )
         * q.element_size(),
     )
+    wide_transport = selected_packed_gqa and _select_wide_transport(
+        dtype=q.dtype,
+        head_dim=config.head_dim,
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
+        window_left=config.window_left,
+        has_sink=sinks is not None,
+        has_lse=return_lse,
+        wide_addressing=wide_addressing,
+    )
+    fast_four_wave = False
+    uniform = all(seqlen == config.max_seqlen for seqlen in seqlens)
     if selected_packed_gqa:
-        wide_packed_gqa = (
+        fast_four_wave = (
             q.dtype == torch.bfloat16
             and config.window_left < 0
-            and (config.batch_size, config.max_seqlen) in ((4, 4096), (2, 8192))
+            and uniform
+            and (config.batch_size, config.max_seqlen)
+            in ((4, 2048), (4, 4096), (2, 8192))
+        )
+        group_size = config.n_heads // config.n_kv_heads
+        wide_packed_gqa = (
+            fast_four_wave and config.max_seqlen >= 4096 and group_size in (1, 8)
         )
         block_m = 256 if wide_packed_gqa else 128
         block_n = 32 if config.window_left == 512 else 64
         config = config._replace(
             block_m=block_m,
             block_n=block_n,
-            num_warps=8 if wide_packed_gqa else 4,
-            waves_per_eu=1 if wide_packed_gqa else 2,
+            num_warps=4,
+            waves_per_eu=0 if wide_packed_gqa else 2,
             packed_gqa=True,
             grid=(
                 config.batch_size,
@@ -1395,8 +1936,32 @@ def launch_gluon_mha_prefill_gfx1250(
         max_seqlen=config.max_seqlen,
         block_m=config.block_m,
     )
+    # Compact task mapping is specialized for the measured four-sequence
+    # ragged batch. Other batch sizes retain the guarded rectangular mapping.
+    compact_ragged = (
+        selected_packed_gqa and guarded_query_rows and config.batch_size == 4
+    )
+    if compact_ragged:
+        config = config._replace(
+            grid=(
+                1,
+                config.n_kv_heads,
+                sum(
+                    triton_cdiv(seqlen * packed_group_size, config.block_m)
+                    for seqlen in seqlens
+                ),
+            )
+        )
+    wmma_back_to_back = selected_packed_gqa and _select_wmma_back_to_back(
+        dtype=q.dtype,
+        window_left=config.window_left,
+        uniform=uniform,
+        guarded_query_rows=guarded_query_rows,
+        num_warps=config.num_warps,
+        waves_per_eu=config.waves_per_eu,
+    )
     if selected_packed_gqa:
-        tdm_warp_hint = guarded_query_rows or wide_packed_gqa
+        tdm_warp_hint = guarded_query_rows or fast_four_wave
         reverse_q_blocks = True
         deep_pipeline = config.window_left < 0
     elif config.packed_gqa:
@@ -1405,10 +1970,19 @@ def launch_gluon_mha_prefill_gfx1250(
         deep_pipeline = False
     if selected_packed_gqa:
         if config.window_left >= 0:
+            llvm_fn_attrs = (
+                "amdgpu-sched-strategy=coexec"
+                if config.window_left == 512
+                else "amdgpu-sched-strategy=max-memory-clause"
+            )
+        elif guarded_query_rows and q.dtype == torch.bfloat16:
+            llvm_fn_attrs = "amdgpu-sched-strategy=coexec"
+        elif q.dtype == torch.bfloat16 and (
+            config.n_heads,
+            config.n_kv_heads,
+        ) == (32, 8):
             llvm_fn_attrs = "amdgpu-sched-strategy=max-memory-clause"
-        elif guarded_query_rows or (
-            q.dtype == torch.float16 and config.max_seqlen > 1024
-        ):
+        elif q.dtype == torch.float16 and config.max_seqlen > 1024:
             llvm_fn_attrs = "amdgpu-sched-strategy=max-ilp"
         else:
             llvm_fn_attrs = "amdgpu-sched-strategy=coexec"
@@ -1427,45 +2001,132 @@ def launch_gluon_mha_prefill_gfx1250(
             )
         )
 
-    gluon_mha_prefill_gfx1250[config.grid](
-        q,
-        k,
-        v,
-        cu_seqlens,
-        output,
-        sink_arg,
-        lse_arg,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
+    qk_valu_group_size = _select_qk_valu_group_size(
+        dtype=q.dtype,
+        head_dim=config.head_dim,
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
+        window_left=config.window_left,
+        has_sink=sinks is not None,
+        has_lse=return_lse,
+        wide_addressing=wide_addressing,
+    )
+    qk_ds_group_stride = _select_qk_ds_group_stride(
+        dtype=q.dtype,
+        head_dim=config.head_dim,
+        n_heads=config.n_heads,
+        n_kv_heads=config.n_kv_heads,
+        seqlens=seqlens,
+        max_seqlen=config.max_seqlen,
+        window_left=config.window_left,
+        has_sink=sinks is not None,
+        has_lse=return_lse,
+        wide_addressing=wide_addressing,
+    )
+    wide_wmma_back_to_back = (config.n_heads, config.n_kv_heads) in (
+        (8, 1),
+        (32, 1),
+    )
+    wide_fused_tdm = q.dtype == torch.bfloat16 and (
         config.n_heads,
         config.n_kv_heads,
-        config.head_dim,
-        config.sm_scale,
-        config.block_m,
-        config.block_n,
-        is_fp8,
-        sinks is not None,
-        return_lse,
-        config.window_left,
-        tdm_warp_hint,
-        reverse_q_blocks,
-        deep_pipeline,
-        config.packed_gqa,
-        guarded_query_rows,
-        wide_addressing,
-        config.num_warps,
-        config.num_buffers,
-        num_warps=config.num_warps,
-        waves_per_eu=config.waves_per_eu,
-        llvm_fn_attrs=llvm_fn_attrs,
-    )
+    ) == (32, 8)
+
+    if wide_transport:
+        valid_wide_contract = (
+            selected_packed_gqa
+            and config.packed_gqa
+            and q.dtype in (torch.bfloat16, torch.float16)
+            and not is_fp8
+            and config.head_dim == 128
+            and config.window_left < 0
+            and sinks is None
+            and not return_lse
+            and uniform
+            and not guarded_query_rows
+            and not compact_ragged
+            and not wide_addressing
+            and config.grid[:2] == (config.batch_size, config.n_kv_heads)
+        )
+        if not valid_wide_contract:
+            raise AssertionError("wide transport preconditions are not satisfied")
+        gluon_mha_prefill_gfx1250_wide_transport[config.grid](
+            q,
+            k,
+            v,
+            cu_seqlens,
+            output,
+            Q_STRIDE_T=q.stride(0),
+            Q_STRIDE_H=q.stride(1),
+            Q_STRIDE_D=q.stride(2),
+            K_STRIDE_T=k.stride(0),
+            K_STRIDE_H=k.stride(1),
+            K_STRIDE_D=k.stride(2),
+            V_STRIDE_T=v.stride(0),
+            V_STRIDE_H=v.stride(1),
+            V_STRIDE_D=v.stride(2),
+            N_HEADS=config.n_heads,
+            N_KV_HEADS=config.n_kv_heads,
+            HEAD_DIM=config.head_dim,
+            SM_SCALE=config.sm_scale,
+            NUM_WARPS=config.num_warps,
+            NUM_BUFFERS=config.num_buffers,
+            WMMA_BACK_TO_BACK=wide_wmma_back_to_back,
+            FUSED_TDM=wide_fused_tdm,
+            num_warps=config.num_warps,
+            waves_per_eu=config.waves_per_eu,
+            llvm_fn_attrs="amdgpu-sched-strategy=coexec",
+            enable_fp_fusion=True,
+            **sched_barrier_compile_options(),
+        )
+    else:
+        gluon_mha_prefill_gfx1250[config.grid](
+            q,
+            k,
+            v,
+            cu_seqlens,
+            output,
+            sink_arg,
+            lse_arg,
+            Q_STRIDE_T=q.stride(0),
+            Q_STRIDE_H=q.stride(1),
+            Q_STRIDE_D=q.stride(2),
+            K_STRIDE_T=k.stride(0),
+            K_STRIDE_H=k.stride(1),
+            K_STRIDE_D=k.stride(2),
+            V_STRIDE_T=v.stride(0),
+            V_STRIDE_H=v.stride(1),
+            V_STRIDE_D=v.stride(2),
+            N_HEADS=config.n_heads,
+            N_KV_HEADS=config.n_kv_heads,
+            HEAD_DIM=config.head_dim,
+            SM_SCALE=config.sm_scale,
+            BLOCK_M=config.block_m,
+            BLOCK_N=config.block_n,
+            IS_FP8=is_fp8,
+            HAS_SINK=sinks is not None,
+            HAS_LSE=return_lse,
+            WINDOW_LEFT=config.window_left,
+            TDM_WARP_HINT=tdm_warp_hint,
+            REVERSE_Q_BLOCKS=reverse_q_blocks,
+            DEEP_PIPELINE=deep_pipeline,
+            PACKED_GQA=config.packed_gqa,
+            GUARDED_QUERY_ROWS=guarded_query_rows,
+            COMPACT_RAGGED=compact_ragged,
+            WIDE_ADDRESSING=wide_addressing,
+            WMMA_BACK_TO_BACK=wmma_back_to_back,
+            QK_VALU_GROUP_SIZE=qk_valu_group_size,
+            QK_DS_GROUP_STRIDE=qk_ds_group_stride,
+            NUM_WARPS=config.num_warps,
+            NUM_BUFFERS=config.num_buffers,
+            num_warps=config.num_warps,
+            waves_per_eu=config.waves_per_eu,
+            llvm_fn_attrs=llvm_fn_attrs,
+            enable_fp_fusion=True,
+            **sched_barrier_compile_options(),
+        )
     if return_lse:
         return output, lse
     return output

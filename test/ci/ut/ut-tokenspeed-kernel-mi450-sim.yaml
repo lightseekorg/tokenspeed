@@ -26,18 +26,29 @@ env:
   # reduced-size MXFP4 MoE cases run here.
   MI450_SIM_TEST_ROOT: tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tile_shapes
   MI450_SIM_TESTS: |
-    # MHA prefill beyond the root's tile shapes: selected packed GQA on full,
-    # ragged and 512-window rows, forced packed FP16, the TDM warp hint and
-    # reversed Q blocks at two heads, and host selectors no other lane runs.
+    # MHA prefill beyond the root's tile shapes: packed GQA, compact and
+    # non-compact ragged batches, both wide-transport variants, local WMMA mode,
+    # QK interleave, fallback routes, and host selectors no other lane runs.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[full-tiles]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[guarded-rows]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[five-ragged]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[window512]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_compact_ragged
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_wide_transport[sim]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_wide_transport_fused_tdm[sim]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_wmma_issue_mode[sim]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_qk_interleave[sim]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_fp8_fallback[dtype0]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_sinks_and_lse_fallback
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_packed_gqa[2-dtype1]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tdm_warp_hint_remainder[sim]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_reverse_q_blocks_ragged[sim]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_llvm_fn_attrs
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_deep_pipeline
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_packed_gqa
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_wide_transport_rejects_unsupported_contracts
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_wide_transport_requires_packed_route
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_wide_transport_rechecks_launch_preconditions
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_tdm_warp_hint
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_reverse_q_blocks
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_m_tile_gates
