@@ -46,6 +46,94 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 _GFX1250_COMPUTE_UNITS = 256
 
 
+@gluon.constexpr_function
+def _key_parallel_warp_bases(block_k, num_warps):
+    # Spread warps over 16-key WMMA tiles, then 16-head tiles; head bases past
+    # BLOCK_H replicate the rows.
+    bases = []
+    key_tiles = 1
+    head_tiles = 1
+    while (1 << len(bases)) < num_warps:
+        if key_tiles * 2 * 16 <= block_k:
+            bases.append([0, key_tiles])
+            key_tiles *= 2
+        else:
+            bases.append([head_tiles, 0])
+            head_tiles *= 2
+    return bases
+
+
+@gluon.constexpr_function
+def _warp_split_slot_layout(block_k, num_warps, warp_size):
+    # TDM gathers take lane-uniform row indices; each warp gathers its own rows.
+    rows_per_warp = block_k // num_warps
+    return gl.DistributedLinearLayout(
+        reg_bases=[[1 << i] for i in range(rows_per_warp.bit_length() - 1)],
+        lane_bases=[[0]] * (warp_size.bit_length() - 1),
+        warp_bases=[[rows_per_warp << i] for i in range(num_warps.bit_length() - 1)],
+        block_bases=[],
+        shape=[block_k],
+    )
+
+
+@gluon.jit
+def _dsa_selected_dense_wmma_tile(
+    q_lora_dot,
+    q_rope_dot,
+    lora_buffer,
+    rope_buffer,
+    valid,
+    m_i,
+    l_i,
+    acc,
+    qk_layout: gl.constexpr,
+    softmax_layout: gl.constexpr,
+    pv_layout: gl.constexpr,
+    k_dot_layout: gl.constexpr,
+    p_dot_layout: gl.constexpr,
+    v_dot_layout: gl.constexpr,
+    SOFTMAX_SCALE: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    HAS_ROPE: gl.constexpr,
+    IS_FP8: gl.constexpr,
+):
+    # Invalid rows were gathered from out-of-range slots, which TDM zero-fills.
+    k_lora = lora_buffer.permute([1, 0]).load(k_dot_layout)
+    if not IS_FP8:
+        k_lora = k_lora.to(gl.bfloat16)
+    scores = gl.amd.cdna5.wmma(
+        q_lora_dot,
+        k_lora,
+        gl.zeros([BLOCK_H, BLOCK_K], gl.float32, layout=qk_layout),
+    )
+    if HAS_ROPE:
+        k_rope = rope_buffer.permute([1, 0]).load(k_dot_layout)
+        if not IS_FP8:
+            k_rope = k_rope.to(gl.bfloat16)
+        scores = gl.amd.cdna5.wmma(q_rope_dot, k_rope, scores)
+    scores = gl.convert_layout(scores, softmax_layout)
+    if IS_FP8:
+        scores *= SOFTMAX_SCALE * _INV_LN2
+    valid_col = gl.convert_layout(valid, gl.SliceLayout(0, softmax_layout))
+    scores = gl.where(valid_col[None, :], scores, -float("inf"))
+    m_new = gl.maximum(m_i, gl.max(scores, axis=1))
+    alpha = gl.where(l_i > 0.0, gl.exp2(m_i - m_new), 0.0)
+    probs = gl.exp2(scores - m_new[:, None])
+    probs = gl.where(valid_col[None, :], probs, 0.0)
+    l_i = l_i * alpha + gl.sum(probs, axis=1)
+    acc = acc * gl.convert_layout(alpha[:, None], pv_layout)
+    if IS_FP8:
+        probs = probs.to(lora_buffer.dtype, fp_downcast_rounding="rtne")
+        v_lora = lora_buffer.load(v_dot_layout)
+    else:
+        probs = probs.to(gl.bfloat16)
+        v_lora = lora_buffer.load(v_dot_layout).to(gl.bfloat16)
+    p_dot = gl.convert_layout(probs, p_dot_layout)
+    acc = gl.amd.cdna5.wmma(p_dot, v_lora, acc)
+    return m_new, l_i, acc
+
+
 @gluon.jit
 def _dsa_selected_dense_wmma_kernel(
     q,
@@ -92,6 +180,13 @@ def _dsa_selected_dense_wmma_kernel(
     qk_layout: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
+        warp_bases=_key_parallel_warp_bases(BLOCK_K, NUM_WARPS),
+        reg_bases=[],
+        instr_shape=[16, 16, INSTR_K],
+    )
+    softmax_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
         warp_bases=[[1, 0], [2, 0]],
         reg_bases=[],
         instr_shape=[16, 16, INSTR_K],
@@ -127,13 +222,10 @@ def _dsa_selected_dense_wmma_kernel(
     k_rope_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[ROPE_LAYOUT_DIM, K_WIDTH]], [BLOCK_K, ROPE_LAYOUT_DIM], [1, 0]
     )
-    slot_layout: gl.constexpr = gl.BlockedLayout(
-        [BLOCK_K], [WARP_SIZE], [NUM_WARPS], [0]
-    )
+    slot_layout: gl.constexpr = _warp_split_slot_layout(BLOCK_K, NUM_WARPS, WARP_SIZE)
     slot_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
-    valid_col_layout: gl.constexpr = gl.SliceLayout(0, qk_layout)
 
     token = gl.program_id(0)
     head_block = gl.program_id(1)
@@ -178,6 +270,8 @@ def _dsa_selected_dense_wmma_kernel(
             other=0.0,
         )
         q_rope_dot = gl.convert_layout(q_rope_val, q_dot_layout)
+    else:
+        q_rope_dot = q_lora_dot
     if not IS_FP8:
         q_lora_dot = (q_lora_dot.to(gl.float32) * (SOFTMAX_SCALE * _INV_LN2)).to(
             gl.bfloat16
@@ -198,6 +292,8 @@ def _dsa_selected_dense_wmma_kernel(
             [2, BLOCK_K, ROPE_LAYOUT_DIM],
             k_rope_shared_layout,
         )
+    else:
+        rope_buffers = lora_buffers
     slot_buffers = gl.allocate_shared_memory(
         topk_slots.dtype.element_ty,
         [2, 1, BLOCK_K],
@@ -230,9 +326,9 @@ def _dsa_selected_dense_wmma_kernel(
         [BLOCK_H],
         -float("inf"),
         gl.float32,
-        layout=gl.SliceLayout(1, qk_layout),
+        layout=gl.SliceLayout(1, softmax_layout),
     )
-    l_i = gl.full([BLOCK_H], 0.0, gl.float32, layout=gl.SliceLayout(1, qk_layout))
+    l_i = gl.full([BLOCK_H], 0.0, gl.float32, layout=gl.SliceLayout(1, softmax_layout))
     acc = gl.zeros([BLOCK_H, KV_LORA_RANK], gl.float32, layout=pv_layout)
 
     num_tiles = (valid_len + BLOCK_K - 1) // BLOCK_K
@@ -252,8 +348,8 @@ def _dsa_selected_dense_wmma_kernel(
         )
         gl.amd.cdna5.tdm.async_wait(1)
         slots = slot_buffers.index(0).reshape([BLOCK_K]).load(slot_layout)
-        cur_valid = slots >= 0
-        safe_slots = gl.where(cur_valid, slots, 0)
+        cur_valid = (slots >= 0) & (tile_start * BLOCK_K + slot_offsets < valid_len)
+        safe_slots = gl.where(cur_valid, slots, total_slots)
         gl.amd.cdna5.tdm.async_gather(lora_desc, safe_slots, lora_buffers.index(0))
         if HAS_ROPE:
             gl.amd.cdna5.tdm.async_gather(rope_desc, safe_slots, rope_buffers.index(0))
@@ -261,8 +357,10 @@ def _dsa_selected_dense_wmma_kernel(
 
         # Slot loads run one tile ahead of the KV gathers. Keep the current
         # latent and optional RoPE gathers plus the next slot load outstanding.
+        # The last tile prefetches only out-of-range rows.
         TDM_PIPELINE_DEPTH: gl.constexpr = 3 if HAS_ROPE else 2
-        for tile in tl.range(0, split_tiles - 1):
+        split_len = gl.minimum(valid_len, tile_end * BLOCK_K)
+        for tile in tl.range(0, split_tiles):
             next_buffer = 1 - buffer_index
             gl.amd.cdna5.tdm.async_load(
                 slot_desc,
@@ -276,8 +374,10 @@ def _dsa_selected_dense_wmma_kernel(
             next_slots = (
                 slot_buffers.index((tile + 1) % 2).reshape([BLOCK_K]).load(slot_layout)
             )
-            next_valid = next_slots >= 0
-            safe_next_slots = gl.where(next_valid, next_slots, 0)
+            next_valid = (next_slots >= 0) & (
+                (tile_start + tile + 1) * BLOCK_K + slot_offsets < split_len
+            )
+            safe_next_slots = gl.where(next_valid, next_slots, total_slots)
             gl.amd.cdna5.tdm.async_gather(
                 lora_desc, safe_next_slots, lora_buffers.index(next_buffer)
             )
@@ -286,108 +386,30 @@ def _dsa_selected_dense_wmma_kernel(
                     rope_desc, safe_next_slots, rope_buffers.index(next_buffer)
                 )
             gl.amd.cdna5.tdm.async_wait(TDM_PIPELINE_DEPTH)
-
-            k_lora = lora_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
-            k_valid = gl.convert_layout(
-                cur_valid,
-                gl.SliceLayout(0, k_dot_layout),
-            )
-            k_lora = gl.where(k_valid[None, :], k_lora, 0.0)
-            if not IS_FP8:
-                k_lora = k_lora.to(gl.bfloat16)
-            scores = gl.amd.cdna5.wmma(
+            m_i, l_i, acc = _dsa_selected_dense_wmma_tile(
                 q_lora_dot,
-                k_lora,
-                gl.zeros([BLOCK_H, BLOCK_K], gl.float32, layout=qk_layout),
-            )
-            if HAS_ROPE:
-                k_rope = (
-                    rope_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
-                )
-                k_rope = gl.where(k_valid[None, :], k_rope, 0.0)
-                if not IS_FP8:
-                    k_rope = k_rope.to(gl.bfloat16)
-                scores = gl.amd.cdna5.wmma(q_rope_dot, k_rope, scores)
-            if IS_FP8:
-                scores *= SOFTMAX_SCALE * _INV_LN2
-            valid_col = gl.convert_layout(cur_valid, valid_col_layout)
-            scores = gl.where(valid_col[None, :], scores, -float("inf"))
-            m_new = gl.maximum(m_i, gl.max(scores, axis=1))
-            alpha = gl.where(l_i > 0.0, gl.exp2(m_i - m_new), 0.0)
-            probs = gl.exp2(scores - m_new[:, None])
-            probs = gl.where(valid_col[None, :], probs, 0.0)
-            l_i = l_i * alpha + gl.sum(probs, axis=1)
-            acc = acc * gl.convert_layout(alpha[:, None], pv_layout)
-            if IS_FP8:
-                probs = probs.to(
-                    kv_lora.dtype.element_ty,
-                    fp_downcast_rounding="rtne",
-                )
-                v_lora = lora_buffers.index(buffer_index).load(v_dot_layout)
-            else:
-                probs = probs.to(gl.bfloat16)
-                v_lora = (
-                    lora_buffers.index(buffer_index).load(v_dot_layout).to(gl.bfloat16)
-                )
-            v_valid = gl.convert_layout(
+                q_rope_dot,
+                lora_buffers.index(buffer_index),
+                rope_buffers.index(buffer_index),
                 cur_valid,
-                gl.SliceLayout(1, v_dot_layout),
+                m_i,
+                l_i,
+                acc,
+                qk_layout,
+                softmax_layout,
+                pv_layout,
+                k_dot_layout,
+                p_dot_layout,
+                v_dot_layout,
+                SOFTMAX_SCALE,
+                BLOCK_H,
+                BLOCK_K,
+                HAS_ROPE,
+                IS_FP8,
             )
-            v_lora = gl.where(v_valid[:, None], v_lora, 0.0)
-            p_dot = gl.convert_layout(probs, p_dot_layout)
-            acc = gl.amd.cdna5.wmma(p_dot, v_lora, acc)
-            m_i = m_new
             cur_valid = next_valid
             buffer_index = next_buffer
-
         gl.amd.cdna5.tdm.async_wait(0)
-        final_valid = ((tile_end - 1) * BLOCK_K + slot_offsets < valid_len) & cur_valid
-        k_lora = lora_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
-        k_valid = gl.convert_layout(
-            final_valid,
-            gl.SliceLayout(0, k_dot_layout),
-        )
-        k_lora = gl.where(k_valid[None, :], k_lora, 0.0)
-        if not IS_FP8:
-            k_lora = k_lora.to(gl.bfloat16)
-        scores = gl.amd.cdna5.wmma(
-            q_lora_dot,
-            k_lora,
-            gl.zeros([BLOCK_H, BLOCK_K], gl.float32, layout=qk_layout),
-        )
-        if HAS_ROPE:
-            k_rope = rope_buffers.index(buffer_index).permute([1, 0]).load(k_dot_layout)
-            k_rope = gl.where(k_valid[None, :], k_rope, 0.0)
-            if not IS_FP8:
-                k_rope = k_rope.to(gl.bfloat16)
-            scores = gl.amd.cdna5.wmma(q_rope_dot, k_rope, scores)
-        if IS_FP8:
-            scores *= SOFTMAX_SCALE * _INV_LN2
-        valid_col = gl.convert_layout(final_valid, valid_col_layout)
-        scores = gl.where(valid_col[None, :], scores, -float("inf"))
-        m_new = gl.maximum(m_i, gl.max(scores, axis=1))
-        alpha = gl.where(l_i > 0.0, gl.exp2(m_i - m_new), 0.0)
-        probs = gl.exp2(scores - m_new[:, None])
-        probs = gl.where(valid_col[None, :], probs, 0.0)
-        l_i = l_i * alpha + gl.sum(probs, axis=1)
-        acc = acc * gl.convert_layout(alpha[:, None], pv_layout)
-        if IS_FP8:
-            probs = probs.to(
-                kv_lora.dtype.element_ty,
-                fp_downcast_rounding="rtne",
-            )
-            v_lora = lora_buffers.index(buffer_index).load(v_dot_layout)
-        else:
-            probs = probs.to(gl.bfloat16)
-            v_lora = lora_buffers.index(buffer_index).load(v_dot_layout).to(gl.bfloat16)
-        v_valid = gl.convert_layout(
-            final_valid,
-            gl.SliceLayout(1, v_dot_layout),
-        )
-        v_lora = gl.where(v_valid[:, None], v_lora, 0.0)
-        p_dot = gl.convert_layout(probs, p_dot_layout)
-        acc = gl.amd.cdna5.wmma(p_dot, v_lora, acc)
-        m_i = m_new
 
     h_out = head_base + gl.arange(
         0, BLOCK_H, layout=gl.SliceLayout(1, q_lora_load_layout)
@@ -1063,7 +1085,7 @@ def _select_num_kv_splits(
     # Choose how many full waves of CTAs are needed to occupy the GPU.
     base_ctas = max(1, int(num_tokens) * triton.cdiv(int(num_heads), block_h))
     if kv_lora_rank == 512:
-        target_waves = 1
+        target_waves = 2 if block_k == 64 else 1
     elif block_k == 64:
         target_waves = 2
     else:
@@ -1177,6 +1199,7 @@ def _run_dense(
         OUTPUT_WITHIN_2GB=_output_within_2gb(out),
         KV_SPLITS=num_kv_splits,
         num_warps=4,
+        waves_per_eu=4 if is_fp8 else 0,
     )
     if num_kv_splits > 1:
         _dsa_selected_wmma_reduce_kernel[(q.shape[0], q.shape[1])](
@@ -1484,7 +1507,7 @@ def launch_gluon_dsa_prefill_gfx1250(
             qk_rope_head_dim=qk_rope_head_dim,
             block_h=16,
             max_seqlen_k=max_seqlen_k,
-            split_kv=False,
+            split_kv=True,
         )
     else:
         raise ValueError("Gluon DSA requires kv_cache or sparse_kv_cache")

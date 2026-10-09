@@ -22,6 +22,7 @@ from __future__ import annotations
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.transform.faster_hadamard_transform  # noqa: F401
+import tokenspeed_kernel.ops.transform.gluon  # noqa: F401
 import tokenspeed_kernel.ops.transform.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope

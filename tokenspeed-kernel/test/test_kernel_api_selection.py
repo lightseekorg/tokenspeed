@@ -576,6 +576,7 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
         ("ue8m0", True, 32, "gluon_mm_mxfp8_ue8m0_largem_gfx1250"),
         ("fp32", False, 1, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", True, 1, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", False, 64, "gluon_mm_fp8_blockscale_gfx1250"),
     ],
 )
 def test_public_mm_selects_gfx1250_decode_kernel(
@@ -644,7 +645,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         "mm",
         expected_name,
         lambda: None,
-        id_suffix=f"{contract}-{'online' if online else 'prequantized'}",
+        id_suffix=f"{contract}-{'online' if online else 'prequantized'}-m{m}",
     )
     active_case, calls = selected_kernel_spy
     active_case["case"] = case
@@ -3270,6 +3271,20 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
             ),
             traits={"tokens": 16, "experts": 896, "topk": 16},
         )
+        reduced_precision_decode = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            format_signature(
+                router_logits=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={"tokens": 1, "experts": 256, "topk": 8},
+        )
+        too_many_experts = select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": 16, "experts": 2048, "topk": 8},
+        )
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
@@ -3278,8 +3293,10 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
     assert batched.name == "triton_kimi3_packed_sigmoid_bias_topk_gfx1250"
     assert forced_gluon.name == "gluon_sigmoid_bias_topk_gfx1250"
     assert past_packed.name == "gluon_sigmoid_bias_topk_gfx1250"
-    assert other_shape.name == "torch_sigmoid_bias_topk"
-    assert reduced_precision.name == "torch_sigmoid_bias_topk"
+    assert other_shape.name == "gluon_sigmoid_bias_topk_route_gfx1250"
+    assert reduced_precision.name == "gluon_sigmoid_bias_topk_route_gfx1250"
+    assert reduced_precision_decode.name == "gluon_sigmoid_bias_topk_route_gfx1250"
+    assert too_many_experts.name == "torch_sigmoid_bias_topk"
 
 
 def test_amd_softmax_topk_selects_triton_on_gfx1250(
@@ -6183,6 +6200,19 @@ _CASES = [
         "triton_fp8_block_precomputed_moe_apply",
         partial(
             _moe_apply_fp8_block, 256, "triton_fp8_block_precomputed_moe_apply", None
+        ),
+    ),
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "moe",
+        "apply",
+        "gluon_fp8_block_precomputed_moe_apply_gfx1250",
+        partial(
+            _moe_apply_fp8_block,
+            512,
+            "gluon_fp8_block_precomputed_moe_apply_gfx1250",
+            None,
         ),
     ),
     _case(

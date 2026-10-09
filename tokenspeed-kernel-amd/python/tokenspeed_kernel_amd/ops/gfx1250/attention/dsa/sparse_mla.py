@@ -51,19 +51,27 @@ _RADIX0_BITS = gl.constexpr(_RADIX_BITS[0])
 _RADIX1_BITS = gl.constexpr(_RADIX_BITS[1])
 _RADIX2_BITS = gl.constexpr(_RADIX_BITS[2])
 _MAX_BUCKETS = gl.constexpr(1 << max(_RADIX_BITS))
-_TOPK_BLOCK_N = 2048
-_TOPK_NUM_WARPS = 8
+_TOPK_BLOCK_N = 4096
+_TOPK_NUM_WARPS = 16
 _TOPK_WAVES_PER_EU = 1
-_DECODE_TOPK_BLOCK_N = 4096
+_TOPK_HIST_REPLICAS = 4
+_TOPK_SHORT_HIST_REPLICAS = 2
+_TOPK_SHORT_MAX_COLS = 8192
+_TOPK_COMPACT_MIN_COLS = 32768
+_DECODE_TOPK_BLOCK_N = 8192
 _DECODE_TOPK_NUM_WARPS = 32
 _DECODE_TOPK_WAVES_PER_EU = 1
-_STANDARD_DECODE_BLOCK_N = 64
+_DECODE_TOPK_HIST_REPLICAS = 8
+_STANDARD_DECODE_BLOCK_N = 32
 _STANDARD_DECODE_CHUNK_N = 64
-_STANDARD_DECODE_NUM_WARPS = 4
-_STANDARD_DECODE_WAVES_PER_EU = 2
+_STANDARD_DECODE_NUM_WARPS = 1
+_STANDARD_DECODE_WAVES_PER_EU = 4
 _STANDARD_PREFILL_BLOCK_N = 128
 _STANDARD_PREFILL_NUM_WARPS = 8
 _STANDARD_PREFILL_WAVES_PER_EU = 1
+_STANDARD_PREFILL_MANY_ROWS = 1024
+_STANDARD_PREFILL_MANY_ROWS_BLOCK_N = 32
+_STANDARD_PREFILL_MANY_ROWS_NUM_WARPS = 1
 _KPOOL_SCORE_BLOCK_N = 128
 _KPOOL_SCORE_NUM_WARPS = 4
 _KPOOL_SCORE_WAVES_PER_EU = 4
@@ -91,6 +99,64 @@ def _topk_add(a, b):
 
 
 @gluon.jit
+def _load_topk_tile(
+    candidate_logits,
+    tile_start,
+    candidate_len,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    IS_TAIL: gl.constexpr,
+):
+    """Load one tile; only the tail is masked, so full tiles keep 128-bit loads.
+
+    These loads run inside the tile loops, where gfx1250 buffer loads lower to
+    32-bit accesses, so they use global loads.
+    """
+    offsets = tile_start + gl.arange(0, BLOCK_N, layout=value_layout)
+    offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
+    if IS_TAIL:
+        valid = offsets < candidate_len
+        values = gl.load(candidate_logits + offsets, mask=valid, other=-float("inf"))
+    else:
+        valid = gl.full([BLOCK_N], True, gl.int1, layout=value_layout)
+        values = gl.load(candidate_logits + offsets)
+    return offsets, values, valid
+
+
+@gluon.jit
+def _add_histogram_tile(
+    values,
+    valid,
+    prefix,
+    shared_histogram,
+    shift: gl.constexpr,
+    radix_bits: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+    HIST_REPLICAS: gl.constexpr,
+    FIRST_PASS: gl.constexpr,
+):
+    keys = _fp32_to_topk_key(values)
+    if FIRST_PASS:
+        prefix_match = valid
+    else:
+        prefix_match = valid & ((keys >> (shift + radix_bits)) == prefix)
+    slots = ((keys >> shift) & ((1 << radix_bits) - 1)).to(gl.int32)
+    if FIRST_PASS and HIST_REPLICAS > 1:
+        # Lanes of one wave that share a bucket would serialize on one LDS word;
+        # spreading them over adjacent replicas puts them in different banks.
+        lanes = gl.arange(0, BLOCK_N, layout=value_layout) // LOAD_ELEMS
+        slots = slots * HIST_REPLICAS + (lanes & (HIST_REPLICAS - 1))
+    shared_histogram.atomic_scatter_add(
+        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+        slots,
+        axis=0,
+        mask=prefix_match,
+    )
+
+
+@gluon.jit
 def _accumulate_histogram_tile(
     candidate_logits,
     tile_start,
@@ -101,28 +167,81 @@ def _accumulate_histogram_tile(
     radix_bits: gl.constexpr,
     value_layout: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+    HIST_REPLICAS: gl.constexpr,
+    FIRST_PASS: gl.constexpr,
+    IS_TAIL: gl.constexpr,
+):
+    _, values, valid = _load_topk_tile(
+        candidate_logits, tile_start, candidate_len, value_layout, BLOCK_N, IS_TAIL
+    )
+    _add_histogram_tile(
+        values,
+        valid,
+        prefix,
+        shared_histogram,
+        shift,
+        radix_bits,
+        value_layout,
+        BLOCK_N,
+        LOAD_ELEMS,
+        HIST_REPLICAS,
+        FIRST_PASS,
+    )
+
+
+@gluon.jit
+def _accumulate_histogram_tile_pair(
+    candidate_logits,
+    tile_start,
+    candidate_len,
+    prefix,
+    shared_histogram,
+    shift: gl.constexpr,
+    radix_bits: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    LOAD_ELEMS: gl.constexpr,
+    HIST_REPLICAS: gl.constexpr,
     FIRST_PASS: gl.constexpr,
 ):
-    offsets = tile_start + gl.arange(0, BLOCK_N, layout=value_layout)
-    offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
-    valid = offsets < candidate_len
-    values = gl.amd.cdna5.buffer_load(
-        candidate_logits,
-        offsets,
-        mask=valid,
-        other=-float("inf"),
+    """Issue two full tiles' loads before either tile's LDS atomics."""
+    _, first_values, first_valid = _load_topk_tile(
+        candidate_logits, tile_start, candidate_len, value_layout, BLOCK_N, False
     )
-    keys = _fp32_to_topk_key(values)
-    if FIRST_PASS:
-        prefix_match = valid
-    else:
-        prefix_match = valid & ((keys >> (shift + radix_bits)) == prefix)
-    buckets = (keys >> shift) & ((1 << radix_bits) - 1)
-    shared_histogram.atomic_scatter_add(
-        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
-        buckets.to(gl.int32),
-        axis=0,
-        mask=prefix_match,
+    _, second_values, second_valid = _load_topk_tile(
+        candidate_logits,
+        tile_start + BLOCK_N,
+        candidate_len,
+        value_layout,
+        BLOCK_N,
+        False,
+    )
+    _add_histogram_tile(
+        first_values,
+        first_valid,
+        prefix,
+        shared_histogram,
+        shift,
+        radix_bits,
+        value_layout,
+        BLOCK_N,
+        LOAD_ELEMS,
+        HIST_REPLICAS,
+        FIRST_PASS,
+    )
+    _add_histogram_tile(
+        second_values,
+        second_valid,
+        prefix,
+        shared_histogram,
+        shift,
+        radix_bits,
+        value_layout,
+        BLOCK_N,
+        LOAD_ELEMS,
+        HIST_REPLICAS,
+        FIRST_PASS,
     )
 
 
@@ -131,6 +250,91 @@ def _emit_topk_tile(
     candidate_logits,
     block_table,
     tile_start,
+    candidate_len,
+    candidate_start,
+    threshold,
+    count_greater,
+    remaining,
+    written_greater,
+    written_equal,
+    shared_output_counters,
+    out,
+    row,
+    req,
+    block_table_cols: gl.constexpr,
+    page_size: gl.constexpr,
+    out_stride: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    PREFIX_SHIFT: gl.constexpr,
+    IS_DECODE: gl.constexpr,
+    SCAN_EMIT: gl.constexpr,
+    IS_TAIL: gl.constexpr,
+):
+    """Write one tile's selected keys and return the running output counts.
+
+    SCAN_EMIT ranks keys with an exclusive scan of the greater and equal flags
+    plus the running counts, which the block carries because it walks tiles in
+    order; ties keep the lowest offsets. Otherwise keys reserve positions with
+    LDS atomics on two counters: lanes then serialize on one word, but each
+    tile skips the block-wide scan, which suits latency-bound decode rows.
+    """
+    offsets, values, valid = _load_topk_tile(
+        candidate_logits, tile_start, candidate_len, value_layout, BLOCK_N, IS_TAIL
+    )
+    keys = _fp32_to_topk_key(values)
+    compared_keys = keys if PREFIX_SHIFT == 0 else keys >> PREFIX_SHIFT
+    greater = valid & (compared_keys < threshold)
+    equal = valid & (compared_keys == threshold)
+    if SCAN_EMIT:
+        # A tile holds at most BLOCK_N <= 65535 keys, so both counts pack in 32 bits.
+        flags = greater.to(gl.int32) | (equal.to(gl.int32) << 16)
+        ranks = gl.associative_scan(flags, 0, _topk_add) - flags
+        greater_position = written_greater + (ranks & 0xFFFF)
+        equal_rank = written_equal + (ranks >> 16)
+        tile_counts = gl.sum(flags, axis=0)
+        written_greater += tile_counts & 0xFFFF
+        written_equal += tile_counts >> 16
+    else:
+        reservation = shared_output_counters.atomic_scatter_add(
+            gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
+            gl.where(greater, 0, 1).to(gl.int32),
+            axis=0,
+            mask=greater | equal,
+        )
+        greater_position = reservation
+        equal_rank = reservation
+    greater_write = greater & (greater_position < count_greater)
+    equal_write = equal & (equal_rank < remaining)
+    logical_offsets = candidate_start + offsets.to(gl.int32)
+    if IS_DECODE:
+        block_idx = logical_offsets // page_size
+        block_offset = logical_offsets - block_idx * page_size
+        page = gl.load(
+            block_table + req * block_table_cols + block_idx,
+            mask=(greater_write | equal_write) & (block_idx < block_table_cols),
+            other=0,
+        ).to(gl.int32)
+        output_values = page * page_size + block_offset
+    else:
+        output_values = logical_offsets
+    gl.store(
+        out + row * out_stride + greater_position,
+        output_values,
+        mask=greater_write,
+    )
+    gl.store(
+        out + row * out_stride + count_greater + equal_rank,
+        output_values,
+        mask=equal_write,
+    )
+    return written_greater, written_equal
+
+
+@gluon.jit
+def _emit_topk(
+    candidate_logits,
+    block_table,
     candidate_len,
     candidate_start,
     threshold,
@@ -147,49 +351,256 @@ def _emit_topk_tile(
     BLOCK_N: gl.constexpr,
     PREFIX_SHIFT: gl.constexpr,
     IS_DECODE: gl.constexpr,
+    SCAN_EMIT: gl.constexpr,
 ):
-    offsets = tile_start + gl.arange(0, BLOCK_N, layout=value_layout)
-    offsets = gl.max_contiguous(gl.multiple_of(offsets.to(gl.int32), 4), 4)
-    valid = offsets < candidate_len
-    values = gl.amd.cdna5.buffer_load(
-        candidate_logits,
-        offsets,
-        mask=valid,
-        other=-float("inf"),
+    written_greater = gl.full([], 0, gl.int32)
+    written_equal = gl.full([], 0, gl.int32)
+    full_end = candidate_len & -BLOCK_N
+    for tile_start in range(0, full_end, BLOCK_N):
+        written_greater, written_equal = _emit_topk_tile(
+            candidate_logits,
+            block_table,
+            tile_start,
+            candidate_len,
+            candidate_start,
+            threshold,
+            count_greater,
+            remaining,
+            written_greater,
+            written_equal,
+            shared_output_counters,
+            out,
+            row,
+            req,
+            block_table_cols,
+            page_size,
+            out_stride,
+            value_layout,
+            BLOCK_N,
+            PREFIX_SHIFT,
+            IS_DECODE,
+            SCAN_EMIT,
+            False,
+        )
+    if full_end < candidate_len:
+        _emit_topk_tile(
+            candidate_logits,
+            block_table,
+            full_end,
+            candidate_len,
+            candidate_start,
+            threshold,
+            count_greater,
+            remaining,
+            written_greater,
+            written_equal,
+            shared_output_counters,
+            out,
+            row,
+            req,
+            block_table_cols,
+            page_size,
+            out_stride,
+            value_layout,
+            BLOCK_N,
+            PREFIX_SHIFT,
+            IS_DECODE,
+            SCAN_EMIT,
+            True,
+        )
+
+
+@gluon.jit
+def _select_bucket(
+    counts,
+    remaining,
+    bucket_offsets,
+    group_layout: gl.constexpr,
+):
+    """Return the bucket holding the remaining-th key, the count before it, and its count."""
+    count_pairs = counts.reshape([_MAX_BUCKETS // 2, 2])
+    count_low, count_high = gl.split(count_pairs)
+    count_low = gl.convert_layout(count_low, group_layout)
+    count_high = gl.convert_layout(count_high, group_layout)
+    group_counts = count_low + count_high
+    cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+    before_group = cumulative - group_counts
+    selected_group = (before_group < remaining) & (cumulative >= remaining)
+
+    bucket_pairs = bucket_offsets.reshape([_MAX_BUCKETS // 2, 2])
+    bucket_low, bucket_high = gl.split(bucket_pairs)
+    bucket_low = gl.convert_layout(bucket_low, group_layout)
+    bucket_high = gl.convert_layout(bucket_high, group_layout)
+    select_low = before_group + count_low >= remaining
+    selected_bucket = gl.where(select_low, bucket_low, bucket_high)
+    selected_greater = before_group + gl.where(select_low, 0, count_low)
+    selected_count = gl.where(select_low, count_low, count_high)
+    # Only one group is selected, so sums publish its fields; the greater count
+    # is below topk <= 2048 and fits beside the 12-bit bucket.
+    packed = selected_bucket.to(gl.uint32) | (selected_greater.to(gl.uint32) << 12)
+    packed = gl.sum(gl.where(selected_group, packed, 0), axis=0)
+    bucket_count = gl.sum(gl.where(selected_group, selected_count, 0), axis=0)
+    return packed & 0xFFF, ((packed >> 12) & 0x7FF).to(gl.int32), bucket_count
+
+
+@gluon.jit
+def _compact_topk_tile(
+    candidate_logits,
+    tile_start,
+    candidate_len,
+    candidate_start,
+    threshold,
+    written_winners,
+    written_candidates,
+    candidate_keys,
+    candidate_offsets,
+    out,
+    row,
+    out_stride: gl.constexpr,
+    value_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    IS_TAIL: gl.constexpr,
+):
+    """Write keys above the first-pass bucket and stash the bucket's keys in LDS."""
+    offsets, values, valid = _load_topk_tile(
+        candidate_logits, tile_start, candidate_len, value_layout, BLOCK_N, IS_TAIL
     )
     keys = _fp32_to_topk_key(values)
-    compared_keys = keys if PREFIX_SHIFT == 0 else keys >> PREFIX_SHIFT
-    greater = valid & (compared_keys < threshold)
-    equal = valid & (compared_keys == threshold)
-    reservation_mask = greater | equal
-    counter = gl.where(greater, 0, 1).to(gl.int32)
-    reservation = shared_output_counters.atomic_scatter_add(
-        gl.full([BLOCK_N], 1, gl.int32, layout=value_layout),
-        counter,
-        axis=0,
-        mask=reservation_mask,
-    )
+    high = keys >> (32 - _RADIX0_BITS)
+    winner = valid & (high < threshold)
+    candidate = valid & (high == threshold)
+    flags = winner.to(gl.int32) | (candidate.to(gl.int32) << 16)
+    ranks = gl.associative_scan(flags, 0, _topk_add) - flags
+    candidate_position = written_candidates + (ranks >> 16)
     logical_offsets = candidate_start + offsets.to(gl.int32)
-    if IS_DECODE:
-        block_idx = logical_offsets // page_size
-        block_offset = logical_offsets - block_idx * page_size
-        page = gl.load(
-            block_table + req * block_table_cols + block_idx,
-            mask=reservation_mask & (block_idx < block_table_cols),
-            other=0,
-        ).to(gl.int32)
-        output_values = page * page_size + block_offset
-    else:
-        output_values = logical_offsets
     gl.store(
-        out + row * out_stride + reservation,
-        output_values,
-        mask=greater & (reservation < count_greater),
+        out + row * out_stride + written_winners + (ranks & 0xFFFF),
+        logical_offsets,
+        mask=winner,
+    )
+    candidate_keys.atomic_scatter_xchg(
+        keys.to(gl.int32, bitcast=True), candidate_position, axis=0, mask=candidate
+    )
+    candidate_offsets.atomic_scatter_xchg(
+        logical_offsets, candidate_position, axis=0, mask=candidate
+    )
+    tile_counts = gl.sum(flags, axis=0)
+    return written_winners + (tile_counts & 0xFFFF), written_candidates + (
+        tile_counts >> 16
+    )
+
+
+@gluon.jit
+def _finish_from_candidates(
+    candidate_logits,
+    candidate_len,
+    candidate_start,
+    prefix,
+    remaining,
+    candidate_count,
+    shared_histogram,
+    out,
+    row,
+    topk: gl.constexpr,
+    out_stride: gl.constexpr,
+    value_layout: gl.constexpr,
+    histogram_layout: gl.constexpr,
+    group_layout: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    COMPACT_CAP: gl.constexpr,
+):
+    """Finish a row whose first-pass bucket holds at most COMPACT_CAP keys.
+
+    One more sweep writes the keys above that bucket and compacts the bucket
+    into LDS, so the last two radix passes and the emit never reread the row.
+    The candidates live in histogram slots past the first-pass bucket counts,
+    which only the replicated first pass uses.
+    """
+    candidate_keys = shared_histogram.slice(_MAX_BUCKETS, COMPACT_CAP)
+    candidate_offsets = shared_histogram.slice(_MAX_BUCKETS + COMPACT_CAP, COMPACT_CAP)
+    written_winners = gl.full([], 0, gl.int32)
+    written_candidates = gl.full([], 0, gl.int32)
+    full_end = candidate_len & -BLOCK_N
+    for tile_start in range(0, full_end, BLOCK_N):
+        written_winners, written_candidates = _compact_topk_tile(
+            candidate_logits,
+            tile_start,
+            candidate_len,
+            candidate_start,
+            prefix,
+            written_winners,
+            written_candidates,
+            candidate_keys,
+            candidate_offsets,
+            out,
+            row,
+            out_stride,
+            value_layout,
+            BLOCK_N,
+            False,
+        )
+    if full_end < candidate_len:
+        _compact_topk_tile(
+            candidate_logits,
+            full_end,
+            candidate_len,
+            candidate_start,
+            prefix,
+            written_winners,
+            written_candidates,
+            candidate_keys,
+            candidate_offsets,
+            out,
+            row,
+            out_stride,
+            value_layout,
+            BLOCK_N,
+            True,
+        )
+
+    candidate_layout: gl.constexpr = _vector_layout(
+        gl.num_warps(), COMPACT_CAP // (32 * gl.num_warps())
+    )
+    positions = gl.arange(0, COMPACT_CAP, layout=candidate_layout)
+    valid = positions < candidate_count
+    keys = candidate_keys.load(candidate_layout).to(gl.uint32, bitcast=True)
+    histogram = shared_histogram.slice(0, _MAX_BUCKETS)
+    bucket_offsets = gl.arange(0, _MAX_BUCKETS, layout=histogram_layout)
+    count_greater = topk - remaining
+    for pass_index in gl.static_range(1, 3):
+        radix_bits = _RADIX1_BITS
+        shift = 32 - _RADIX0_BITS - _RADIX1_BITS
+        if pass_index == 2:
+            radix_bits = _RADIX2_BITS
+            shift = 0
+        histogram.store(gl.zeros([_MAX_BUCKETS], gl.int32, layout=histogram_layout))
+        histogram.atomic_scatter_add(
+            gl.full([COMPACT_CAP], 1, gl.int32, layout=candidate_layout),
+            ((keys >> shift) & ((1 << radix_bits) - 1)).to(gl.int32),
+            axis=0,
+            mask=valid & ((keys >> (shift + radix_bits)) == prefix),
+        )
+        bucket, greater, _ = _select_bucket(
+            histogram.load(histogram_layout), remaining, bucket_offsets, group_layout
+        )
+        prefix = (prefix << radix_bits) | bucket
+        remaining -= greater
+
+    logical_offsets = candidate_offsets.load(candidate_layout)
+    greater = valid & (keys < prefix)
+    equal = valid & (keys == prefix)
+    flags = greater.to(gl.int32) | (equal.to(gl.int32) << 16)
+    ranks = gl.associative_scan(flags, 0, _topk_add) - flags
+    equal_rank = ranks >> 16
+    gl.store(
+        out + row * out_stride + count_greater + (ranks & 0xFFFF),
+        logical_offsets,
+        mask=greater,
     )
     gl.store(
-        out + row * out_stride + count_greater + reservation,
-        output_values,
-        mask=equal & (reservation < remaining),
+        out + row * out_stride + topk - remaining + equal_rank,
+        logical_offsets,
+        mask=equal & (equal_rank < remaining),
     )
 
 
@@ -210,11 +621,18 @@ def _dsa_wave32_radix_topk_kernel(
     IS_DECODE: gl.constexpr,
     BLOCK_N: gl.constexpr,
     LOAD_ELEMS: gl.constexpr,
+    HIST_REPLICAS: gl.constexpr,
+    SCAN_EMIT: gl.constexpr,
+    COMPACT_CAP: gl.constexpr,
 ):
     row = gl.program_id(0)
     value_layout: gl.constexpr = _vector_layout(gl.num_warps(), LOAD_ELEMS)
     histogram_layout: gl.constexpr = _vector_layout(
         gl.num_warps(), _MAX_BUCKETS // (32 * gl.num_warps())
+    )
+    histogram_slots: gl.constexpr = _MAX_BUCKETS * HIST_REPLICAS
+    slot_layout: gl.constexpr = _vector_layout(
+        gl.num_warps(), histogram_slots // (32 * gl.num_warps())
     )
     group_layout: gl.constexpr = _vector_layout(
         gl.num_warps(), (_MAX_BUCKETS // 2) // (32 * gl.num_warps())
@@ -223,32 +641,34 @@ def _dsa_wave32_radix_topk_kernel(
         gl.num_warps(), topk // (32 * gl.num_warps())
     )
     histogram_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[_MAX_BUCKETS, 1]],
-        [_MAX_BUCKETS],
-        [0],
-    )
-    counter_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[2, 1]],
-        [2],
+        [[histogram_slots, 1]],
+        [histogram_slots],
         [0],
     )
     shared_histogram = gl.allocate_shared_memory(
         gl.int32,
-        [_MAX_BUCKETS],
+        [histogram_slots],
         histogram_shared_layout,
     )
-    shared_output_counters = gl.allocate_shared_memory(
-        gl.int32,
-        [2],
-        counter_shared_layout,
-    )
+    if SCAN_EMIT:
+        shared_output_counters = shared_histogram
+    else:
+        counter_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[2, 1]], [2], [0]
+        )
+        shared_output_counters = gl.allocate_shared_memory(
+            gl.int32, [2], counter_shared_layout
+        )
     histogram_zeros = gl.zeros(
         [_MAX_BUCKETS],
         gl.int32,
         layout=histogram_layout,
     )
-    counter_layout: gl.constexpr = _vector_layout(gl.num_warps(), 1)
-    counter_zeros = gl.zeros([2], gl.int32, layout=counter_layout)
+    slot_zeros = gl.zeros(
+        [histogram_slots],
+        gl.int32,
+        layout=slot_layout,
+    )
 
     if IS_DECODE:
         req = row // q_len_per_req
@@ -291,111 +711,157 @@ def _dsa_wave32_radix_topk_kernel(
     bucket_offsets = gl.arange(0, _MAX_BUCKETS, layout=histogram_layout)
     prefix = gl.full([], 0, gl.uint32)
     remaining = gl.full([], topk, gl.int32)
-    shared_output_counters.store(counter_zeros)
+    if not SCAN_EMIT:
+        shared_output_counters.store(
+            gl.zeros([2], gl.int32, layout=_vector_layout(gl.num_warps(), 1))
+        )
 
-    # The three-pass schedule resolves the full ordered FP32 key.
+    # The three-pass schedule resolves the full ordered FP32 key. Only the first
+    # pass replicates the histogram: its buckets are the exponent bits, where
+    # nearby scores collide; later passes bucket mantissa bits.
     for pass_index in gl.static_range(3):
-        shared_histogram.store(histogram_zeros)
         radix_bits = _RADIX0_BITS
         shift = 32 - _RADIX0_BITS
+        histogram = shared_histogram
+        if pass_index == 0:
+            histogram.store(slot_zeros)
+        else:
+            histogram = shared_histogram.slice(0, _MAX_BUCKETS)
+            histogram.store(histogram_zeros)
         if pass_index == 1:
             radix_bits = _RADIX1_BITS
             shift = 32 - _RADIX0_BITS - _RADIX1_BITS
         elif pass_index == 2:
             radix_bits = _RADIX2_BITS
             shift = 0
-        for tile_start in range(0, candidate_len, BLOCK_N):
+        full_end = candidate_len & -BLOCK_N
+        paired_end = candidate_len & -(2 * BLOCK_N)
+        for tile_start in range(0, paired_end, 2 * BLOCK_N):
+            _accumulate_histogram_tile_pair(
+                candidate_logits,
+                tile_start,
+                candidate_len,
+                prefix,
+                histogram,
+                shift,
+                radix_bits,
+                value_layout,
+                BLOCK_N,
+                LOAD_ELEMS,
+                HIST_REPLICAS,
+                pass_index == 0,
+            )
+        for tile_start in range(paired_end, full_end, BLOCK_N):
             _accumulate_histogram_tile(
                 candidate_logits,
                 tile_start,
                 candidate_len,
                 prefix,
-                shared_histogram,
+                histogram,
                 shift,
                 radix_bits,
                 value_layout,
                 BLOCK_N,
+                LOAD_ELEMS,
+                HIST_REPLICAS,
                 pass_index == 0,
+                False,
+            )
+        if full_end < candidate_len:
+            _accumulate_histogram_tile(
+                candidate_logits,
+                full_end,
+                candidate_len,
+                prefix,
+                histogram,
+                shift,
+                radix_bits,
+                value_layout,
+                BLOCK_N,
+                LOAD_ELEMS,
+                HIST_REPLICAS,
+                pass_index == 0,
+                True,
             )
 
-        counts = shared_histogram.load(histogram_layout)
-        count_pairs = counts.reshape([_MAX_BUCKETS // 2, 2])
-        count_low, count_high = gl.split(count_pairs)
-        count_low = gl.convert_layout(count_low, group_layout)
-        count_high = gl.convert_layout(count_high, group_layout)
-        group_counts = count_low + count_high
-        cumulative = gl.associative_scan(group_counts, 0, _topk_add)
-        before_group = cumulative - group_counts
-        selected_group = (before_group < remaining) & (cumulative >= remaining)
-
-        bucket_pairs = bucket_offsets.reshape([_MAX_BUCKETS // 2, 2])
-        bucket_low, bucket_high = gl.split(bucket_pairs)
-        bucket_low = gl.convert_layout(bucket_low, group_layout)
-        bucket_high = gl.convert_layout(bucket_high, group_layout)
-        select_low = before_group + count_low >= remaining
-        selected_bucket = gl.where(select_low, bucket_low, bucket_high)
-        selected_greater = before_group + gl.where(select_low, 0, count_low)
+        if pass_index == 0 and HIST_REPLICAS > 1:
+            counts = histogram.load(slot_layout)
+            counts = gl.sum(counts.reshape([_MAX_BUCKETS, HIST_REPLICAS]), axis=1)
+            counts = gl.convert_layout(counts, histogram_layout)
+        else:
+            counts = histogram.load(histogram_layout)
+        bucket, greater, bucket_count = _select_bucket(
+            counts, remaining, bucket_offsets, group_layout
+        )
+        prefix = (prefix << radix_bits) | bucket
+        remaining -= greater
+        if pass_index == 0 and COMPACT_CAP > 0:
+            if bucket_count <= COMPACT_CAP:
+                _finish_from_candidates(
+                    candidate_logits,
+                    candidate_len,
+                    candidate_start,
+                    prefix,
+                    remaining,
+                    bucket_count,
+                    shared_histogram,
+                    out,
+                    row,
+                    topk,
+                    out_stride,
+                    value_layout,
+                    histogram_layout,
+                    group_layout,
+                    BLOCK_N,
+                    COMPACT_CAP,
+                )
+                return
         if pass_index == 1:
-            selected_bucket_count = gl.where(select_low, count_low, count_high)
-        packed = selected_bucket.to(gl.uint32) | (selected_greater.to(gl.uint32) << 12)
-        if pass_index == 1:
-            selected_bucket_complete = selected_bucket_count == (
-                remaining - selected_greater
-            )
-            packed |= selected_bucket_complete.to(gl.uint32) << 23
-        packed = gl.sum(gl.where(selected_group, packed, 0), axis=0)
-        prefix = (prefix << radix_bits) | (packed & 0xFFF)
-        remaining -= ((packed >> 12) & 0x7FF).to(gl.int32)
-        if pass_index == 1:
-            if ((packed >> 23) & 1) != 0:
-                count_greater = topk - remaining
-                for tile_start in range(0, candidate_len, BLOCK_N):
-                    _emit_topk_tile(
-                        candidate_logits,
-                        block_table,
-                        tile_start,
-                        candidate_len,
-                        candidate_start,
-                        prefix,
-                        count_greater,
-                        remaining,
-                        shared_output_counters,
-                        out,
-                        row,
-                        req,
-                        block_table_cols,
-                        page_size,
-                        out_stride,
-                        value_layout,
-                        BLOCK_N,
-                        shift,
-                        IS_DECODE,
-                    )
+            if bucket_count == remaining:
+                _emit_topk(
+                    candidate_logits,
+                    block_table,
+                    candidate_len,
+                    candidate_start,
+                    prefix,
+                    topk - remaining,
+                    remaining,
+                    shared_output_counters,
+                    out,
+                    row,
+                    req,
+                    block_table_cols,
+                    page_size,
+                    out_stride,
+                    value_layout,
+                    BLOCK_N,
+                    shift,
+                    IS_DECODE,
+                    SCAN_EMIT,
+                )
                 return
 
-    count_greater = topk - remaining
-    for tile_start in range(0, candidate_len, BLOCK_N):
-        _emit_topk_tile(
-            candidate_logits,
-            block_table,
-            tile_start,
-            candidate_len,
-            candidate_start,
-            prefix,
-            count_greater,
-            remaining,
-            shared_output_counters,
-            out,
-            row,
-            req,
-            block_table_cols,
-            page_size,
-            out_stride,
-            value_layout,
-            BLOCK_N,
-            0,
-            IS_DECODE,
-        )
+    _emit_topk(
+        candidate_logits,
+        block_table,
+        candidate_len,
+        candidate_start,
+        prefix,
+        topk - remaining,
+        remaining,
+        shared_output_counters,
+        out,
+        row,
+        req,
+        block_table_cols,
+        page_size,
+        out_stride,
+        value_layout,
+        BLOCK_N,
+        0,
+        IS_DECODE,
+        SCAN_EMIT,
+    )
 
 
 def _check_score_input_contract(
@@ -488,6 +954,16 @@ def _check_standard_scorer_inputs(
     return row_bytes, page_stride_bytes, q_is_fp8
 
 
+def _compact_cap(hist_replicas: int) -> int:
+    """Return the most first-pass bucket keys that fit in the spare replica slots.
+
+    Each candidate takes a key and an offset slot past the first
+    ``1 << max(_RADIX_BITS)`` bucket counts; the cap is a power of two.
+    """
+    spare = (hist_replicas - 1) * (1 << max(_RADIX_BITS)) // 2
+    return 1 << (spare.bit_length() - 1) if spare else 0
+
+
 def _check_topk_contract(topk: int) -> None:
     if topk not in (512, 1024, 2048):
         raise ValueError(
@@ -518,10 +994,22 @@ def _dsa_topk_indices(
         block_n = _DECODE_TOPK_BLOCK_N
         num_warps = min(_DECODE_TOPK_NUM_WARPS, topk // 32)
         waves_per_eu = _DECODE_TOPK_WAVES_PER_EU
+        hist_replicas = _DECODE_TOPK_HIST_REPLICAS
+        compact_cap = 0
     else:
         block_n = _TOPK_BLOCK_N
         num_warps = _TOPK_NUM_WARPS
         waves_per_eu = _TOPK_WAVES_PER_EU
+        hist_replicas = (
+            _TOPK_SHORT_HIST_REPLICAS
+            if logits.shape[1] <= _TOPK_SHORT_MAX_COLS
+            else _TOPK_HIST_REPLICAS
+        )
+        compact_cap = (
+            _compact_cap(hist_replicas)
+            if logits.shape[1] >= _TOPK_COMPACT_MIN_COLS
+            else 0
+        )
     rows = logits.shape[0]
     _dsa_wave32_radix_topk_kernel[(rows,)](
         logits,
@@ -539,6 +1027,9 @@ def _dsa_topk_indices(
         IS_DECODE=is_decode,
         BLOCK_N=block_n,
         LOAD_ELEMS=block_n // (32 * num_warps),
+        HIST_REPLICAS=hist_replicas,
+        SCAN_EMIT=not is_decode,
+        COMPACT_CAP=compact_cap,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
     )
@@ -1437,8 +1928,6 @@ def launch_gluon_dsa_prefill_topk_standard_gfx1250(
     else:
         max_query_rows = max(1, int(max_logits_bytes) // (max(workspace_rows, 1) * 4))
 
-    block_n = _STANDARD_PREFILL_BLOCK_N
-    num_warps = _STANDARD_PREFILL_NUM_WARPS
     q_scale_arg = q_scales if q_scales is not None else weights
     cache_span = (
         0
@@ -1449,6 +1938,15 @@ def launch_gluon_dsa_prefill_topk_standard_gfx1250(
     dummy_table = row_starts
     for start in range(0, q.shape[0], max_query_rows):
         end = min(start + max_query_rows, q.shape[0])
+        if end - start > _STANDARD_PREFILL_MANY_ROWS:
+            block_n = _STANDARD_PREFILL_MANY_ROWS_BLOCK_N
+            num_warps = _STANDARD_PREFILL_MANY_ROWS_NUM_WARPS
+            # A 64-head query is two register tiles and spills at four waves.
+            waves_per_eu = 4 if q.shape[1] == 32 else 2
+        else:
+            block_n = _STANDARD_PREFILL_BLOCK_N
+            num_warps = _STANDARD_PREFILL_NUM_WARPS
+            waves_per_eu = _STANDARD_PREFILL_WAVES_PER_EU
         logits = torch.empty(
             (end - start, workspace_rows),
             dtype=torch.float32,
@@ -1485,7 +1983,7 @@ def launch_gluon_dsa_prefill_topk_standard_gfx1250(
             USE_BUFFER_LOAD=cache_span < 2**31,
             USE_BUFFER_STORE=logits.nbytes < 2**31,
             num_warps=num_warps,
-            waves_per_eu=_STANDARD_PREFILL_WAVES_PER_EU,
+            waves_per_eu=waves_per_eu,
         )
         _dsa_topk_indices(
             logits,

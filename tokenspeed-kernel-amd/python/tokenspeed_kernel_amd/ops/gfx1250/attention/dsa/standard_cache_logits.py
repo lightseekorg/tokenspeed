@@ -39,15 +39,12 @@ def _make_wmma_layout(
     NUM_WARPS: gl.constexpr,
     Q_IS_FP8: gl.constexpr,
 ):
-    """Map Wave32 workgroups over 32 scoring heads and candidate columns."""
-    if NUM_WARPS == 2:
-        warp_bases = [[1, 0]]
-    elif NUM_WARPS == 4:
-        warp_bases = [[1, 0], [0, 1]]
-    elif NUM_WARPS == 8:
-        warp_bases = [[1, 0], [0, 1], [0, 2]]
-    else:
-        warp_bases = []
+    """Split candidate columns across Wave32 warps; each warp holds all 32 heads.
+
+    Keeping the heads inside one warp makes the per-column head reduction
+    register-local instead of a cross-warp shared-memory reduction.
+    """
+    warp_bases = [[0, 1 << i] for i in range(NUM_WARPS.bit_length() - 1)]
     return gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,

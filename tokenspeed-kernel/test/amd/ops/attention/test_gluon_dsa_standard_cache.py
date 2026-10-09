@@ -381,6 +381,80 @@ def test_standard_cache_prefill_uses_workspace_rows_not_global_slots(
     assert (actual[-1] == -1).all()
 
 
+@pytest.mark.parametrize(
+    ("heads", "q_dtype", "weight_dtype"),
+    (
+        (32, torch.bfloat16, torch.bfloat16),
+        (64, torch.float8_e4m3fn, torch.float32),
+    ),
+)
+def test_standard_cache_prefill_many_rows_selects_oracle_scores(
+    heads: int,
+    q_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+) -> None:
+    generator = _generator(250 + heads)
+    num_slots = 48 * _PAGE_SIZE
+    keys = (
+        torch.randn(
+            (num_slots, _HEAD_DIM),
+            device=_DEVICE,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        * 0.15
+    )
+    cache, key_reference, _, _ = _pack_standard_cache(keys)
+    workspace_rows = 2816
+    workspace_slots = torch.randperm(num_slots, device=_DEVICE, generator=generator)
+    workspace_slots = workspace_slots[:workspace_rows].to(torch.int64).contiguous()
+    rows = 1536
+    row_starts = torch.arange(rows, device=_DEVICE, dtype=torch.int32) % 7
+    row_ends = (workspace_rows - rows + 1 + torch.arange(rows, device=_DEVICE)).to(
+        torch.int32
+    )
+    query, q_scales, query_reference = _prepared_query(rows, heads, q_dtype, generator)
+    weights = _noncompact_weights(rows, heads, weight_dtype, generator)
+
+    actual, actual_lens = _prefill_topk(
+        query,
+        weights,
+        workspace_slots,
+        row_starts,
+        row_ends,
+        topk=_TOPK,
+        softmax_scale=_SOFTMAX_SCALE,
+        index_k_cache=cache,
+        page_size=_PAGE_SIZE,
+        q_scales=q_scales,
+        max_logits_bytes=1280 * workspace_rows * 4,
+    )
+
+    assert (actual_lens == _TOPK).all()
+    assert (actual.sort(dim=1).values.diff(dim=1) > 0).all()
+    candidates = key_reference[workspace_slots]
+    positions = torch.arange(workspace_rows, device=_DEVICE)
+    selected = torch.empty((rows, _TOPK), device=_DEVICE)
+    expected = torch.empty((rows, _TOPK), device=_DEVICE)
+    for begin in range(0, rows, 256):
+        block = slice(begin, begin + 256)
+        per_head = query_reference[block].float() @ candidates.transpose(0, 1)
+        scores = (per_head.relu() * weights[block].float()[:, :, None]).sum(dim=1)
+        valid = (positions[None, :] >= row_starts[block, None]) & (
+            positions[None, :] < row_ends[block, None]
+        )
+        scores = (scores * _SOFTMAX_SCALE).masked_fill(~valid, float("-inf"))
+        expected[block] = scores.topk(_TOPK, dim=1).values
+        selected[block] = scores.gather(1, actual[block].long())
+    # Compare selected scores, not ids: near-ties may resolve differently.
+    torch.testing.assert_close(
+        selected.sort(dim=1, descending=True).values,
+        expected,
+        rtol=1.0e-4,
+        atol=1.0e-5,
+    )
+
+
 def test_standard_cache_decode_accepts_block_split_writer_output() -> None:
     generator = _generator(301)
     num_slots = 11 * _PAGE_SIZE

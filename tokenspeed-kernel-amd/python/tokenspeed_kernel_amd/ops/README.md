@@ -881,6 +881,29 @@ divide out that factor at normalization. The projected-value API applies
 the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
 
+### gfx1250 general biased-sigmoid top-k
+
+`gluon_sigmoid_bias_topk_route_gfx1250` selects experts for shapes outside
+the Kimi K3 specialists: FP16, BF16, or FP32, 1 to 1024 experts, and top-k
+1 to 16.
+
+#### Contract
+
+- Logits are `[tokens, experts]` with a unit expert stride. The bias is a
+  contiguous `[experts]` vector on the same device.
+- Selection scores are FP32 `sigmoid(logit) + bias`. NaN scores are excluded.
+  Equal scores take the lowest expert id.
+- Route weights are the FP32 sigmoid of the selected logits, optionally
+  divided by their sum, then multiplied by the routed scaling factor.
+- It stays below the single-token decode kernel, the packed 896-expert K3
+  kernel, and `gluon_sigmoid_bias_topk_gfx1250`, which keep those shapes.
+
+#### Algorithm
+
+One program handles one token with four warps. It walks the expert vector
+once per selected route, keeps the maximum finite score, and breaks ties by
+the minimum expert id. The weight is the sigmoid captured for that expert.
+
 ## Quantization
 
 ### gfx1250 group-32 FP8 activation quantization
@@ -929,3 +952,26 @@ give the FP32 projection up to accumulation order. Each program covers 64 rows
 and one K partition, pipelines K tiles through three or four TDM buffers, and
 pads the 24 mixes to two 16-wide WMMA tiles. The token count and tiles per
 partition are runtime arguments.
+
+## Transforms
+
+### gfx1250 length-128 Hadamard
+
+`gluon_hadamard_transform_128_gfx1250` applies the Sylvester Hadamard along
+the last dimension for BF16, FP16, and FP32.
+
+#### Contract
+
+- The last dimension is 128. Leading dimensions flatten into rows.
+- Fewer than 256 rows use `triton_hadamard_transform_128`. Larger row counts
+  use the WMMA kernel. The row count and output scale are runtime arguments,
+  so those larger shapes share one binary per input dtype.
+- BF16 products are a single BF16 WMMA. FP16 and FP32 values split into a
+  BF16 rounding and two BF16 remainders, so the products match the FP32
+  value up to WMMA accumulation order.
+
+#### Algorithm
+
+One wave owns 16 rows and 16 of the 128 outputs. The contraction steps
+through K in four 32-wide tiles. Signs are `(-1) ** popcount(k & n)` and are
+exact `+-1` in BF16.

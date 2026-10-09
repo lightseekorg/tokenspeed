@@ -101,7 +101,18 @@ def test_mxfp8_ue8m0_gemv_matches_dequantized_reference(
 
 @pytest.mark.parametrize(
     "m,n,k",
-    [(1, 128, 128), (1, 128, 256), (16, 256, 512), (1, 128, 4096)],
+    [
+        (1, 128, 128),
+        (1, 128, 256),
+        (16, 256, 512),
+        (1, 128, 4096),
+        # 64-row tiles: a 17-row tail with split K, GLM-5.3's padded fused
+        # QKV-A, a K=256 shared-expert down, and 32-column tiles.
+        (17, 128, 6144),
+        (64, 2688, 6144),
+        (48, 6144, 256),
+        (64, 4096, 2048),
+    ],
 )
 def test_fp8_blockscale_gemv_matches_dequantized_reference(
     m: int,
@@ -219,6 +230,55 @@ def test_mxfp8_split_k_selection(
     expected: int,
 ) -> None:
     assert mxfp8_mm._select_split_k(contract, m, n, k) == expected
+
+
+@pytest.mark.parametrize(
+    "n,k,expected",
+    [
+        (128, 6144, (16, 4, 512)),
+        (512, 6144, (16, 4, 512)),
+        (2688, 6144, (16, 1, 1024)),
+        (2048, 2048, (16, 1, 1024)),
+        (6144, 2048, (32, 1, 1024)),
+        (6144, 1536, (32, 1, 512)),
+        (6144, 256, (32, 1, 256)),
+    ],
+)
+def test_fp8_blockscale_wide_tile_selection(
+    n: int, k: int, expected: tuple[int, int, int]
+) -> None:
+    assert mxfp8_mm._select_fp32_wide_tile(n, k) == expected
+
+
+def test_fp8_blockscale_wide_tile_preserves_strided_out() -> None:
+    torch.manual_seed(4)
+    m, n, k = 40, 256, 2048
+    a = _random_fp8((m, k))
+    b = _random_fp8((n, k))
+    a_scales = torch.rand((m, k // 128), device="cuda") + 0.5
+    b_scales = torch.rand((n // 128, k // 128), device="cuda") + 0.5
+    backing = torch.full((m, n + 17), -1.0, device="cuda", dtype=torch.bfloat16)
+    out = backing[:, :n]
+
+    actual = launch_gluon_mm_fp8_blockscale_gfx1250(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        block_size=[128, 128],
+        out=out,
+    )
+    expected = (
+        _fp32_block_dequantize(a, a_scales, 1)
+        @ _fp32_block_dequantize(b, b_scales, 128).T
+    )
+
+    assert actual is out
+    torch.testing.assert_close(
+        actual.float(), expected, atol=_BF16_ATOL, rtol=_BF16_RTOL
+    )
+    assert torch.all(backing[:, n:] == -1.0)
 
 
 @pytest.mark.parametrize(
