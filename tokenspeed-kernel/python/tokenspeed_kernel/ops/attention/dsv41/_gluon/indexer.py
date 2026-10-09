@@ -121,6 +121,7 @@ def run_dsv41_csa2_index_topk(
     process_group,
     out,
     launch_logits,
+    launch_select=None,
 ):
     """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch."""
     out = _index_topk_outputs(
@@ -208,6 +209,19 @@ def run_dsv41_csa2_index_topk(
                 logits,
                 score_chunk_size,
             )
+            if launch_select is not None:
+                launch_select(
+                    logits,
+                    tile_visible,
+                    tile_candidates,
+                    topk,
+                    candidate_topk if make_blocks else 0,
+                    row_out[output_begin:output_end],
+                    row_lens[output_begin:output_end],
+                    block_out[output_begin:output_end],
+                    block_lens[output_begin:output_end],
+                )
+                continue
             values_topk, columns = logits.topk(
                 min(int(topk), width), dim=1, sorted=False
             )

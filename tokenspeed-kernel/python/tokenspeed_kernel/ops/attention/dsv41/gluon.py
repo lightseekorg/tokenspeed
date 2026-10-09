@@ -40,6 +40,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
         launch_gluon_dsv41_selected_attention_gfx950 as _dsv41_selected_gfx950,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.select import (
+        launch_dsv41_index_select_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
         launch_gluon_dsv41_selected_attention_gfx1250 as _dsv41_selected_gfx1250,
     )
@@ -84,7 +87,10 @@ if current_platform().is_amd:
     )
     def gluon_dsv41_index_topk_gfx950(*args, **kwargs):
         return run_dsv41_csa2_index_topk(
-            *args, **kwargs, launch_logits=launch_gfx950_logits
+            *args,
+            **kwargs,
+            launch_logits=launch_gfx950_logits,
+            launch_select=launch_dsv41_index_select_gfx950,
         )
 
     @register_kernel(
