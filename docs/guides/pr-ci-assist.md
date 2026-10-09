@@ -32,22 +32,18 @@ Passing another backend does not satisfy the requested task. Required PR CI
 still applies after the update. Status comments are created at the start and
 at completion or a blocker; intermediate progress updates the same comment.
 
-If queueing exhausts the one-hour repair budget, let the candidate checks finish.
-Then run **PR CI Assist** manually with the PR number and `repair_run` left empty.
-This gives reconciliation a 15-minute window to verify the existing results and
-publish the same candidate. It starts no new repair or GPU validation, and still
-requires the original command, PR source, and validation branch to match.
-The candidate keeps its original repair plan; later plan comments do not replace
-its selected checks or start additional tasks.
+Each repair and validation attempt has a one-hour budget. The overrun is
+recognized the next time the workflow runs — on a completion event or a manual
+trigger — and stops the attempt for manual intervention. Running **PR CI
+Assist** manually with the PR number retries from the current state: with a
+retained candidate it gets a 15-minute window to verify the existing results
+and publish the same repair, starting no new repair or GPU validation; without
+a candidate it starts a fresh repair. The candidate keeps its original repair
+plan; later plan comments do not replace its selected checks or start
+additional tasks.
 
-A new main commit does not by itself invalidate a repair. Assistance reuses the
-candidate when main advances without touching the PR or repair files or the
-inputs of its selected checks. Documentation and independent components or
-backends follow the existing CI path rules. Shared CI controls, build and
-dependency inputs, unknown paths, rewritten history, and merge conflicts still
-require fresh validation. Changes to the repair controller and its own tests do
-not invalidate GPU results unless the PR or a selected native check covers them.
-The original validation base and result source remain
-unchanged; promotion checks compatibility again and publishes the same repair.
-Explicit reconciliation also accepts a retained candidate previously marked stale
-when these compatibility checks pass.
+A new main commit does not by itself invalidate a repair. The candidate stays
+valid while a trial merge against the current main is clean; a conflict stops
+assistance for manual intervention and requires a retry. Promotion repeats the
+trial merge immediately before publishing the same repair. Required PR CI
+still applies after the update.

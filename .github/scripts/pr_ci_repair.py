@@ -47,7 +47,7 @@ from pr_ci_assist import (
     dispatch_native_checks,
     latest_command,
     load_state,
-    main_advance_compatible,
+    main_merge_clean,
     native_check,
     pages,
     pr_source_matches,
@@ -635,14 +635,7 @@ def configure():
     WORK.joinpath("model").mkdir(parents=True, exist_ok=True)
     request = json.loads(WORK.joinpath("request.json").read_text())
     diagnostics = []
-    evidence = request.get("diagnostics")
-    if evidence is None and request.get("resume_run"):
-        evidence = previous_repair(request).get("diagnostics")
-        if evidence is not None:
-            request["diagnostics"] = evidence
-            WORK.joinpath("request.json").write_text(json.dumps(request))
-    if evidence is None:
-        evidence = request["state"]
+    evidence = request["state"]
     native = {
         c["run"]: NATIVE_CHECKS[c["workflow"]]
         for c in evidence.get("native_checks", [])
@@ -652,7 +645,7 @@ def configure():
     if request.get("lint_run"):
         run_ids.add(request["lint_run"])
     target = request["state"].get("target")
-    if target and "diagnostics" not in request:
+    if target:
         job = api(f"actions/jobs/{target['job']}")
         diagnostics.append(
             "Requested failed job (untrusted diagnostic data):\n"
@@ -669,7 +662,7 @@ def configure():
     for run_id in run_ids:
         # The completed job log is available before the whole workflow ends.
         # Still collect its native artifacts below, including Slurm task logs.
-        if target and run_id == target["run"] and "diagnostics" not in request:
+        if target and run_id == target["run"]:
             continue
         jobs = pages(f"actions/runs/{run_id}/jobs?filter=latest", "jobs")
         names = {t["name"] for t in validate_plan(request["plan"], request["data"])}
@@ -902,88 +895,6 @@ def proposed_patch(source, request, allowed, conflicts, before, guard_root):
             command("git", "worktree", "remove", "--force", str(review), cwd=ROOT)
 
 
-def previous_repair(request: dict):
-    if not request.get("resume_run"):
-        raise ValueError("No previous repair was authorized.")
-    previous = WORK / "previous-repair"
-    old = json.loads(previous.joinpath("request.json").read_text())
-    state = request["state"]
-    prior = old["state"]
-    if prior.get("repair_run") != request["resume_run"] or any(
-        prior[key] != state[key]
-        for key in ("repository", "pr", "head", "base", "command")
-    ):
-        raise ValueError("Previous repair source differs from the authorized PR.")
-    base = prior.get("validation_base", prior["base"])
-    if not SHA.fullmatch(base):
-        raise ValueError("Invalid previous repair base.")
-    if previous.joinpath("patch.diff").stat().st_size > 200000:
-        raise RepairRejected("patch-size")
-    return old
-
-
-def reuse():
-    request = json.loads(WORK.joinpath("request.json").read_text())
-    remaining_time(request)
-    if not request.get("check_only"):
-        raise ValueError("Source recheck was not requested.")
-    old = previous_repair(request)
-    request["conflicted_tests"] = old.get("conflicted_tests", [])
-    WORK.joinpath("patch.diff").write_bytes(
-        WORK.joinpath("previous-repair/patch.diff").read_bytes()
-    )
-    WORK.joinpath("request.json").write_text(json.dumps(request))
-    print(
-        "Repair: accepted patch reused; all source checks and validation must run again.",
-        flush=True,
-    )
-
-
-def seed_repair(source: Path, request: dict, allowed: set[str], conflicts: set[str]):
-    if not request.get("resume_run"):
-        return False
-    old = previous_repair(request)
-    previous = WORK / "previous-repair"
-    state = request["state"]
-    prior = old["state"]
-    base = prior.get("validation_base", prior["base"])
-    command("git", "fetch", "origin", base, cwd=source)
-    with tempfile.TemporaryDirectory(prefix="repair-seed-", dir=WORK) as work:
-        review = Path(work) / "source"
-        command(
-            "git", "worktree", "add", "--detach", str(review), state["head"], cwd=ROOT
-        )
-        try:
-            command("git", "apply", "--index", str(previous / "patch.diff"), cwd=review)
-            names = set(
-                command(
-                    "git", "diff", "--name-only", state["head"], cwd=review
-                ).splitlines()
-            )
-            if not names.issubset(allowed):
-                raise RepairRejected("scope")
-            # Prior accepted edits seed a new model turn that can correct
-            # restored exports. Every completed proposal still enforces removal.
-            guard(
-                review,
-                state["head"],
-                names,
-                validation_base=base,
-                check_main_contracts=False,
-            )
-            for path in names | conflicts:
-                parent = review / path
-                if parent.is_file():
-                    source.joinpath(path).write_bytes(parent.read_bytes())
-        finally:
-            command("git", "worktree", "remove", "--force", str(review), cwd=ROOT)
-    print(
-        "Repair: continuing accepted source edits; current main and checks still required.",
-        flush=True,
-    )
-    return True
-
-
 def model():
     request = json.loads(WORK.joinpath("request.json").read_text())
     state = request["state"]
@@ -1022,7 +933,6 @@ def model():
         for p in allowed
         if source.joinpath(p).is_file()
     }
-    resumed = seed_repair(source, request, allowed, conflicts)
     plan_root = sandbox_root / "model"
     plan_root.mkdir(exist_ok=True)
     shutil.copyfile(WORK / "model/diagnostics.txt", plan_root / "diagnostics.txt")
@@ -1053,21 +963,6 @@ def model():
                 )
     feedback = plan_root / "feedback.json"
     feedback.write_text("{}")
-    if resumed:
-        issues = []
-        if ROOT_API in allowed:
-            try:
-                guard_retired_exports(source, state["head"], base)
-            except RepairRejected as error:
-                issues.append(error.feedback)
-        for path in sorted(allowed):
-            if Path(path).suffix == ".py" and source.joinpath(path).is_file():
-                try:
-                    guard_prepacked_reference(source, state["head"], base, path)
-                except RepairRejected as error:
-                    issues.append(error.feedback)
-        if issues:
-            feedback.write_text(json.dumps({**issues[0], "issues": issues}))
     # Corrective turns must reuse a trusted tool definition. The model can read
     # this runner-owned file, but cannot replace it through its writable inputs.
     agent = sandbox_root / "repair.md"
@@ -1098,10 +993,6 @@ Apply the repair with Edit or Write. Describing a proposed change without editin
 the allowed source does not complete this task.
 """)
     prompt = f"Source: {source}. Allowed relative files: {json.dumps(sorted(allowed))}. Conflicted files: {json.dumps(sorted(conflicts))}. Complete read-only conflict parents: {parents}/head/<relative path> and {parents}/main/<relative path>; an absent file does not exist on that parent. Read these paired snapshots to preserve assertions and deliberate removals. Failed selected tasks: {json.dumps([t for t, s in zip(request['plan']['tasks'], state['statuses']) if s == 'failed'])}. Failed native checks: {json.dumps([c for c in state.get('native_checks', []) if c['status'] == 'failed'])}. The entire repair, required checks, GPU queue and validation share a hard one-hour budget; {remaining_time(request)} seconds remain. Try to complete source edits within 15 minutes to reserve time for required checks, GPU queues and validation. Finish the smallest substantiated repair promptly. Start with the actual failed step in diagnostics.txt and its CI specification. Check whether pinned main already fixes that failure, and preserve those fixes while resolving conflicts. Keep investigation focused and avoid repeated broad reads. Repair only a substantiated source or import-environment cause. Resolve conflicts first. Read relevant callers and assertions before editing."
-    if resumed:
-        prompt += " The existing source contains the previous accepted edits. Read feedback.json first for known material issues in those edits, and correct them before proposing a patch. Complete their verification against current main and correct the remaining conflict resolutions. A retained test missing from the prior patch still has its main-side contents; migrate its imports or calls only if required by the PR's supported API. Preserve already completed edits and avoid restarting the broad investigation."
-    if "diagnostics" in request:
-        prompt += " The diagnostics now describe validation of the previous accepted candidate. Repair that observed failure while preserving the accepted edits; passing original-head checks do not resolve this candidate failure."
     if state.get("target"):
         prompt += f" The user explicitly requested repair of job {state['target']['job']} from run {state['target']['run']}. Use the supplied failure evidence in diagnostics.txt. Diagnose that failure from the evidence and source; a different backend passing does not resolve it. Fix only the supported platform's behavior and preserve test assertions and coverage."
     if FP8_API in allowed and parents.joinpath("main", FP8_REFERENCE).is_file():
@@ -1224,48 +1115,6 @@ the allowed source does not complete this task.
     WORK.joinpath("patch.diff").write_text(diff + "\n")
 
 
-def refresh_validation_base(source: Path, request: dict, base: str):
-    state = request["state"]
-    prior = state.get("validation_base", state["base"])
-    if base == prior:
-        return
-    if not SHA.fullmatch(base):
-        raise ValueError("Invalid validation base.")
-    command("git", "fetch", "origin", base, cwd=source)
-    selected = set(
-        command("git", "diff", "--name-only", state["head"], cwd=source).splitlines()
-    ) | set(request.get("conflicted_paths", request.get("conflicted_tests", [])))
-    changed = set(
-        command(
-            "git", "diff", "--name-only", "--no-renames", prior, base, cwd=source
-        ).splitlines()
-    )
-    if selected & changed:
-        raise ValueError(
-            "Main changed repaired files; a fresh source repair is required."
-        )
-    contents = {p: source.joinpath(p).read_bytes() for p in selected}
-    command("git", "reset", "--hard", state["head"], cwd=source)
-    conflicts = merge(source, base, commit=False)
-    if not set(conflicts).issubset(selected):
-        raise ValueError(
-            "Main introduced new conflicts; a fresh source repair is required."
-        )
-    for path, content in contents.items():
-        source.joinpath(path).write_bytes(content)
-    restore_patch(source, state["head"], selected)
-    request["conflicted_paths"] = sorted(conflicts)
-    request["conflicted_tests"] = sorted(
-        p for p in conflicts if {"test", "tests"}.intersection(Path(p).parts[:-1])
-    )
-    request["repair_base"] = prior
-    state["validation_base"] = base
-    print(
-        "Repair: refreshing checks on an updated main with unchanged repaired files.",
-        flush=True,
-    )
-
-
 def check():
     request = json.loads(WORK.joinpath("request.json").read_text())
     remaining_time(request)
@@ -1279,13 +1128,6 @@ def check():
     request["conflicted_paths"] = sorted(conflicts)
     restore_patch(source, state["head"], set())
     command("git", "apply", "--index", str(WORK / "patch.diff"), cwd=source)
-    allowed = allowed_paths(request)
-    guard(source, state["head"], allowed, validation_base=base)
-    latest_base = command(
-        "git", "ls-remote", "origin", "refs/heads/main", cwd=source
-    ).partition("\t")[0]
-    refresh_validation_base(source, request, latest_base)
-    base = state.get("validation_base", state["base"])
     allowed = allowed_paths(request)
     guard(source, state["head"], allowed, validation_base=base)
     WORK.joinpath("request.json").write_text(json.dumps(request))
@@ -1371,19 +1213,11 @@ def check():
     )
 
 
-def current_request(request: dict, *, check_base: bool = True) -> dict:
+def current_request(request: dict) -> dict:
     state = request["state"]
     remaining_time(request)
     if request["deadline"] != repair_deadline(state):
         raise ValueError("Repair deadline changed.")
-    if (
-        check_base
-        and "validation_base" in state
-        and not main_advance_compatible(
-            state, api("git/ref/heads/main")["object"]["sha"], source=ROOT
-        )
-    ):
-        raise ValueError("Main changed before validation.")
     pr = pull(state["pr"])
     comments = pages(f"issues/{state['pr']}/comments", None)
     live = load_state(comments, pr)
@@ -1474,20 +1308,6 @@ def guard_native_dispatch(state: dict):
 def stage():
     public_gate()
     request = json.loads(WORK.joinpath("request.json").read_text())
-    if "repair_base" in request:
-        original = {
-            **request,
-            "state": {**request["state"], "validation_base": request["repair_base"]},
-        }
-        current_request(original, check_base=False)
-        if not main_advance_compatible(
-            request["state"], api("git/ref/heads/main")["object"]["sha"], source=ROOT
-        ):
-            raise ValueError("Main changed after the refreshed checks.")
-        publish(
-            request["state"],
-            "Repair checks refreshed on current main; validation remains required.",
-        )
     current_request(request)
     state = request["state"]
     base = state.get("validation_base", state["base"])
@@ -1570,66 +1390,16 @@ def stage():
     dispatch_native_checks(state)
     for task in validate_plan(request["plan"], data):
         task_status(task, state, runs, submit=True)
-    wait_for_validation(request)
-
-
-def wait_for_validation(request: dict):
-    """Reconcile queued dispatches with the pinned controller until the deadline."""
-    state = request["state"]
-    while time.time() < request["deadline"]:
-        with tempfile.TemporaryDirectory(prefix="pr-ci-validation-") as work:
-            env = dict(os.environ, RUNNER_TEMP=work)
-            try:
-                subprocess.run(
-                    [
-                        sys.executable,
-                        str(ROOT / ".github/scripts/pr_ci_assist.py"),
-                        "control",
-                        "--pr",
-                        str(state["pr"]),
-                        "--command",
-                        str(state["command"]),
-                    ],
-                    env=env,
-                    check=True,
-                    timeout=remaining_time(request),
-                )
-            except subprocess.TimeoutExpired:
-                break
-        pr = pull(state["pr"])
-        comments = pages(f"issues/{state['pr']}/comments", None)
-        live = load_state(comments, pr)
-        latest = latest_command(comments)
-        if (
-            not live
-            or not latest
-            or latest["id"] != state["command"]
-            or live["command"] != state["command"]
-            or live["phase"] != "validating"
-        ):
-            return
-        time.sleep(max(0, min(60, request["deadline"] - time.time())))
-    pr = pull(state["pr"])
-    comments = pages(f"issues/{state['pr']}/comments", None)
-    live = load_state(comments, pr)
-    latest = latest_command(comments)
-    if (
-        live
-        and latest
-        and latest["id"] == state["command"]
-        and live["phase"] == "validating"
-    ):
-        live["phase"] = "manual"
-        publish(
-            live, "The one-hour repair and validation budget expired; PR unchanged."
-        )
 
 
 def promote(state: dict, *, deadline: int):
     public_gate()
     base = state.get("validation_base", state["base"])
-    if "validation_base" in state and not main_advance_compatible(
-        state, api("git/ref/heads/main")["object"]["sha"], source=ROOT
+    candidate = state["candidate"]
+    if not main_merge_clean(
+        candidate["validation"],
+        api("git/ref/heads/main")["object"]["sha"],
+        source=ROOT,
     ):
         raise ValueError("Main changed before promotion.")
     if time.time() >= deadline:
@@ -1640,7 +1410,6 @@ def promote(state: dict, *, deadline: int):
     latest = latest_command(pages(f"issues/{state['pr']}/comments", None))
     if not latest or latest["id"] != state["command"]:
         raise ValueError("Repair was superseded before promotion.")
-    candidate = state["candidate"]
     if candidate["branch"] not in {
         f"bot/pr-ci-assist-{state['pr']}-{state['command']}",
         f"bot/pr-ci-assist-{state['pr']}-{state['command']}-{state['repair_run']}",
@@ -1695,26 +1464,19 @@ def promote(state: dict, *, deadline: int):
     current = pull(state["pr"])
     if not pr_source_matches(state, current, source=source):
         raise ValueError("PR or main moved during promotion.")
-    if "validation_base" in state:
-        main = api("git/ref/heads/main")["object"]["sha"]
-        if not main_advance_compatible(state, main, source=source):
-            raise ValueError("Relevant main inputs changed during promotion.")
-        if main != base:
-            result = subprocess.run(
-                ["git", "merge-tree", "--write-tree", "HEAD", main],
-                cwd=source,
-                capture_output=True,
-                check=False,
-            )
-            if result.returncode:
-                raise ValueError("Promoted repair conflicts with current main.")
+    if not main_merge_clean(
+        candidate["validation"],
+        api("git/ref/heads/main")["object"]["sha"],
+        source=source,
+    ):
+        raise ValueError("Promoted repair conflicts with current main.")
     push(source, pr["head"]["ref"], deadline=deadline)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "stage", choices=("configure", "model", "reuse", "check", "stage", "failed")
+        "stage", choices=("configure", "model", "check", "stage", "failed")
     )
     args = parser.parse_args()
     try:
@@ -1737,7 +1499,6 @@ if __name__ == "__main__":
             {
                 "configure": configure,
                 "model": model,
-                "reuse": reuse,
                 "check": check,
                 "stage": stage,
             }[args.stage]()
