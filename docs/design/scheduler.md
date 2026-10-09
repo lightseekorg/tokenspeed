@@ -344,6 +344,12 @@ protected tokens that may spill past it; a sliding group, per request,
 pages, plus one in-flight prefill chunk behind its lookback (or, on the
 decode role, the landing bound `min(dense, lookback + window)` per request).
 
+Speculative decode admission grows from the committed token frontier plus the verify
+spans still in flight and the span being scheduled. Already reserved slots
+cover that extent first. A prefill interruption must not charge the same
+speculative slots again when decode resumes; otherwise rejected draft tokens
+accumulate in the logical tables beyond the context-length bound.
+
 For an internal checkpoint followed by `tail` tokens, the forward holds
 both the tail and the ordinary growth reserve: the output working set is
 `1 + ceil((tail + reserve) / block_granularity)` blocks. Admission and the
