@@ -46,6 +46,8 @@ register_cuda_ci(est_time=120, suite="runtime-2gpu")
         (("1", "3"), {}, "positive divisors"),
         (("0", "1"), {}, "positive divisors"),
         (("2", "1"), {"attn_tp_size": 2}, "attention TP1/DPworld"),
+        (("2", "1"), {"linear_attn_tp_size": 2}, "linear attention TP1"),
+        (("2", "1"), {"attn_head_tp_size": 2}, "attention TP1/DPworld"),
         (("1", "2"), {"moe_ep_size": 2}, "MoE TP1/EPworld"),
         (("2", "2"), {"pp_size": 2, "moe_ep_size": 2}, "PP1"),
     ],

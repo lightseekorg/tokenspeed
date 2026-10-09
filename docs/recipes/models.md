@@ -225,7 +225,8 @@ DSpark and decode CUDA graphs, see the
 [K3 Hopper PD configuration and validation guide](../guides/kimi-k3-hopper-pd.md).
 
 For attention-DP serving with independently sharded QKV, output projections,
-and shared experts, see [Kimi-K3 DEP tensor parallelism](kimi-k3-dep-tp.md).
+and shared experts, see
+[Kimi-K3 DP with TP subgroups](../serving/parallelism.md#tensor-parallel-subgroups-within-dp).
 
 Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA
 (linear-attention) / NoPE-MLA (full-attention) decoder and a

@@ -554,44 +554,32 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             gate: Local output-gate shard.
             absorbed_query: Optional decode query projected into latent key space.
         """
-        if self.qkv_parallel is not None or hidden_states.shape[0] == 0:
-            # DP Linear owns the collectives and returns complete local rows.
-            # Raw-weight producer fusions must never consume a column shard.
-            if attnres_partial_args is not None:
+        dp_or_empty = self.qkv_parallel is not None or hidden_states.shape[0] == 0
+        if (
+            dp_or_empty
+            or block_scale is not None
+            or self.fused_qkv_a_proj_with_mqa.weight.dtype in _FP8_WEIGHT_DTYPES
+        ):
+            # Sharded and quantized weights must go through the Linear module,
+            # not the raw-BF16 producer fusions below. Keep standalone partials
+            # after the prequantized GEMM, and before it on the other paths.
+            prequantized = block_scale is not None and not dp_or_empty
+            if attnres_partial_args is not None and not prequantized:
                 attnres_partial_dual(*attnres_partial_args)
             qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(
-                hidden_states, block_scale, None, ctx=ctx
+                hidden_states,
+                block_scale,
+                torch.bfloat16 if prequantized else None,
+                ctx=ctx,
             )
-            q_a, latent_cache, gate = self._split_fused_qkv_a(
-                qkv_gate[..., : self._qkv_a_width + self._gate_width]
-            )
-        elif block_scale is not None:
-            qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(
-                hidden_states, block_scale, torch.bfloat16, ctx=ctx
-            )
-            if attnres_partial_args is not None:
+            if attnres_partial_args is not None and prequantized:
                 attnres_partial_dual(*attnres_partial_args)
-            if self._fused_qkv_a_pad_rows:
-                # Drop the zero pad rows of the 128-aligned FP8 projection
-                # before anything consumes the output.
+            if dp_or_empty or self._fused_qkv_a_pad_rows:
                 qkv_gate = qkv_gate[..., : self._qkv_a_width + self._gate_width]
-            qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
-            q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
-        elif self.fused_qkv_a_proj_with_mqa.weight.dtype in _FP8_WEIGHT_DTYPES:
-            # FP8-resident fused projection (FP8_PB_WO w8a8): the bf16 fast
-            # kernels below cannot consume the quantized weight, so run the
-            # quantized module GEMM and keep any hoisted dual-partials as a
-            # standalone kernel — the same recipe as the block_scale branch.
-            # (can_fuse_attnres_partials already returns False for FP8
-            # weights, so args are normally None here.)
-            if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args)
-            qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(hidden_states, ctx=ctx)
-            if self._fused_qkv_a_pad_rows:
-                # Drop the zero pad rows of the 128-aligned FP8 projection
-                # before anything consumes the output.
-                qkv_gate = qkv_gate[..., : self._qkv_a_width + self._gate_width]
-            qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
+            # DP Linear already restores complete local rows. Empty owners
+            # likewise skip the ordinary attention communication.
+            if not dp_or_empty:
+                qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
             q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
         elif attnres_partial_args is not None:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args

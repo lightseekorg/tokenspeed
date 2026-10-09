@@ -69,14 +69,12 @@ def validate_projection_settings(
             f"Kimi projection TP sizes {sizes} must be positive divisors of "
             f"world size {mapping.world_size}"
         )
+    # Full-world DP implies TP1 and PP1; head and expert sharding are independent.
     if max(sizes) > 1 and (
-        mapping.attn.tp_size != 1
-        or mapping.attn.dp_size != mapping.world_size
+        mapping.attn.dp_size != mapping.world_size
+        or mapping.linear_attn.dp_size != mapping.world_size
         or mapping.attn.head_tp_size != 1
-        or mapping.linear_attn.tp_size != 1
-        or mapping.moe.tp_size != 1
         or mapping.moe.ep_size != mapping.world_size
-        or mapping.pp_size != 1
     ):
         raise ValueError(
             "Kimi projection TP requires attention TP1/DPworld, "

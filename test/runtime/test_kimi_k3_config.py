@@ -1213,9 +1213,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.weight = torch.nn.Parameter(torch.arange(50.0).reshape(10, 5))
                 self.calls = 0
 
-            def forward(self, hidden, block_scale, output_dtype):
+            def forward(self, hidden, block_scale, output_dtype, *, ctx):
                 self.calls += 1
-                return torch.nn.functional.linear(hidden, self.weight)
+                value = hidden if block_scale is None else hidden * block_scale
+                output = torch.nn.functional.linear(value, self.weight.to(value.dtype))
+                if output_dtype is not None:
+                    output = output.to(output_dtype)
+                return output, None
 
         class IdentityComm:
             @staticmethod
@@ -1285,6 +1289,51 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
         self.assertIsNone(decode_absorbed)
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
+
+        # The module paths must trim padding and preserve both canonical
+        # Q/KV/gate order and the FP8 checkpoint's gate/Q/KV order.
+        projection = attention.fused_qkv_a_proj_with_mqa
+        weight = torch.nn.functional.pad(projection.weight.detach(), (0, 0, 0, 2))
+        attention._fused_qkv_a_pad_rows = 2
+        for fp8 in (False, True):
+            with self.subTest(fp8=fp8):
+                attention._fused_qkv_a_fp8_layout = fp8
+                projection.weight = torch.nn.Parameter(
+                    weight.to(torch.float8_e4m3fn if fp8 else torch.float32),
+                    requires_grad=False,
+                )
+                output_dtype = torch.float32 if fp8 else torch.bfloat16
+                attention.q_b_proj.to(output_dtype)
+                attention.fused_qk_layernorm.to(output_dtype)
+                scale = None if fp8 else torch.full((prefill.shape[0], 1), 0.5)
+                with torch.no_grad():
+                    q, latent, gate, absorbed = attention._project_q_latent_gated(
+                        prefill, None, comm, scale
+                    )
+                expected = torch.nn.functional.linear(
+                    prefill if fp8 else prefill * scale, projection.weight.float()
+                )[:, :10]
+                if fp8:
+                    expected_gate, expected_q, expected_latent = expected.split(
+                        [4, 2, 4], dim=-1
+                    )
+                else:
+                    expected_q, expected_latent, expected_gate = expected.to(
+                        torch.bfloat16
+                    ).split([2, 4, 4], dim=-1)
+                expected_q = torch.nn.functional.rms_norm(
+                    expected_q, (2,), eps=attention.q_a_layernorm.variance_epsilon
+                )
+                expected_latent = expected_latent.clone()
+                expected_latent[:, :3] = torch.nn.functional.rms_norm(
+                    expected_latent[:, :3],
+                    (3,),
+                    eps=attention.q_a_layernorm.variance_epsilon,
+                )
+                torch.testing.assert_close(q, expected_q)
+                torch.testing.assert_close(latent, expected_latent)
+                torch.testing.assert_close(gate, expected_gate)
+                self.assertIsNone(absorbed)
 
     def test_ungated_mla_does_not_select_attnres_projection_fusion(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
