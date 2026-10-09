@@ -844,6 +844,11 @@ Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
 single-token prefill. Adapting ragged rows to one-token queries must retain
 this distinction. Both use the same cache writer and sparse-attention call.
 
+QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
+candidates from the zero-initialized slot 1 of the reserved null page.
+Writers must leave that read slot untouched. The indexer retains its `-1`
+sentinel, and consumers derive their masks from the original selection.
+
 `QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
 target. Registry construction binds the cache plan and preallocates its
 workspace before model forward or graph capture. Draft and non-speculative

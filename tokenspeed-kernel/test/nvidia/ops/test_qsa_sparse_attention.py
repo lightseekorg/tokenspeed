@@ -269,6 +269,84 @@ def test_qsa_sparse_attention_validates_uniform_query_length(device: str) -> Non
         )
 
 
+@pytest.mark.parametrize("solution", ["flashinfer", "cute_dsl"])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("query_width", [1, 4])
+def test_qsa_sparse_attention_ignores_nan_in_padding_write_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+    solution: str,
+    cache_dtype: torch.dtype,
+    query_width: int,
+) -> None:
+    platform = current_platform()
+    if not platform.is_nvidia or platform.arch_version < ArchVersion(9, 0):
+        pytest.skip("QSA padding test requires NVIDIA Hopper or newer")
+    if solution == "cute_dsl" and platform.arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+    ):
+        pytest.skip("CuTe DSL QSA requires SM100 or SM103")
+    if solution == "flashinfer":
+        runner = _FlashInferQSASparseRunner(torch.device(device))
+        monkeypatch.setattr(
+            "tokenspeed_kernel.ops.attention.qsa.flashinfer.get_flashinfer_qsa_sparse_runner",
+            lambda device: runner,
+        )
+
+    torch.manual_seed(113)
+    rows, live_rows = 4 * query_width, 3 * query_width
+    q = torch.randn(rows, 6, 256, device=device, dtype=torch.bfloat16)
+    q[live_rows:].fill_(float("nan"))
+    k_cache = (torch.randn(512, 1, 256, device=device, dtype=torch.bfloat16) * 0.25).to(
+        cache_dtype
+    )
+    v_cache = (torch.randn(512, 1, 256, device=device, dtype=torch.bfloat16) * 0.25).to(
+        cache_dtype
+    )
+    # The reserved page starts at zero. Padding writes may poison slot 0,
+    # while slot 1 remains a finite read target for invalid sparse entries.
+    k_cache[:64].zero_()
+    v_cache[:64].zero_()
+    selected = torch.full((rows, 2051), -1, device=device, dtype=torch.int32)
+    selected[:live_rows, :19] = torch.arange(64, 83, device=device)
+    selected[:live_rows, 32:40] = 0
+    selected[:live_rows, -3] = 128
+    kwargs = dict(
+        scale=1 / 16,
+        max_seqlen_q=query_width,
+        metadata_capacity_rows=None,
+        k_scale=1.0 if cache_dtype is torch.float8_e4m3fn else None,
+        v_scale=1.0 if cache_dtype is torch.float8_e4m3fn else None,
+        override=None,
+        solution=solution,
+    )
+    qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
+
+    # Reproduce a later ReplaySSM forward and refresh the candidate mask.
+    k_cache[0].fill_(float("nan"))
+    v_cache[0].fill_(float("nan"))
+    selected[:live_rows, 1] = -1
+    selected[:live_rows, 33] = 129
+    expected = _reference(
+        q,
+        k_cache,
+        v_cache,
+        selected,
+        1 / 16,
+    )
+    eager = qsa_sparse_attention(q, k_cache, v_cache, selected, **kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+    for output in (eager, captured):
+        torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-2)
+        assert torch.count_nonzero(output[live_rows:]) == 0
+
+
 @pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
 @pytest.mark.parametrize("rows", [1, 4, 9])
 @pytest.mark.parametrize(

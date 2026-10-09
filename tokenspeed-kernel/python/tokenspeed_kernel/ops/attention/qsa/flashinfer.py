@@ -71,9 +71,11 @@ def _prepare_flashinfer_qsa_metadata_kernel(
         other=-1,
     ).to(tl.int32)
     valid = column_mask & (slots > 0)
+    # Padding writes can leave NaN in slot 0. Slot 1 is the finite read
+    # target; validity still comes from the original selected slots.
     tl.store(
         indices + row * stride_i_n + columns,
-        tl.where(valid, slots, 0),
+        tl.where(valid, slots, 1),
         mask=column_mask,
     )
     packed = tl.sum(valid.to(tl.int32) << bit_offsets[None, :], axis=1)

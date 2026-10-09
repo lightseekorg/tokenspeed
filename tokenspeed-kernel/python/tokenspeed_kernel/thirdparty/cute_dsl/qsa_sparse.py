@@ -58,6 +58,8 @@ _HEAD_DIM = 256
 _GROUPED_HEAD_TILE = 8
 _CONVERT_WARPGROUPS = 2
 _SELECTED_WIDTH = 2051
+# Slot 0 receives padding writes; callers keep slot 1 finite for masked reads.
+_PADDING_READ_SLOT = 1
 _SMALL_MAX_CLUSTERS = 8
 _SMALL_NUM_SPLITS = 8
 _WIDE_NUM_SPLITS = 16
@@ -274,7 +276,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             row = vector // 8
             col = (vector - row * 8) * 16
             selected_idx = selected_tile * 128 + row
-            slot = cutlass.Int32(0)
+            slot = cutlass.Int32(_PADDING_READ_SLOT)
             if lane_idx % 8 == 0 and selected_idx < selected_slots.shape[1]:
                 candidate = selected_slots[batch_idx, selected_idx]
                 if candidate > 0:
@@ -315,7 +317,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             (warpgroup_tidx // warp_threads) * 2 + lane_idx % 2 + (lane_idx // 2) * 8
         )
         index_column = selected_tile * 128 + index_row
-        lane_slot = cutlass.Int32(0)
+        lane_slot = cutlass.Int32(_PADDING_READ_SLOT)
         if index_column < selected_slots.shape[1]:
             candidate = selected_slots[batch_idx, index_column]
             if candidate > 0:
@@ -459,7 +461,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             cache_iter = v_iter
             selected_tile = kv_split_idx + (stream_item // 2 - 1) * kv_splits
         selected_idx = selected_tile * 128 + warpgroup_tidx
-        slot = cutlass.Int32(0)
+        slot = cutlass.Int32(_PADDING_READ_SLOT)
         if selected_idx < selected_slots.shape[1]:
             candidate = selected_slots[row_idx, selected_idx]
             if candidate > 0:
@@ -1562,9 +1564,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         cute.arch.fence_view_async_tmem_load()
                         s_handle.release()
 
-                        # Gather4 maps invalid sparse entries to slot zero for memory
-                        # safety.  Mask those logits again here so slot zero never
-                        # contributes to the softmax.
+                        # Invalid entries load slot 1, which the caller keeps finite.
+                        # Mask their logits using the original selection so
+                        # they never contribute to the softmax.
                         tSrValid = cute.make_rmem_tensor(tSrS.shape, cutlass.Int32)
                         selected_tile = kv_split_idx + s * kv_splits
                         for i in cutlass.range_constexpr(cute.size(tSrS)):
