@@ -21,36 +21,42 @@
 """Prepare, generate, and publish the PR CI plan in separate credential scopes."""
 
 import argparse
-import base64
 import json
 import os
-import re
 import shutil
 import subprocess
-import tomllib
 from pathlib import Path
-from urllib.parse import urlparse
 
-from pr_ci_plan import context, proposal, render, source_url
+from pr_ci_common import check_model_output as _check_public_output
+from pr_ci_common import (
+    mask_secret,
+    planner_config,
+    published_matches,
+    require_bot,
+    require_public_repo,
+    run_command,
+)
+from pr_ci_plan import (  # noqa: F401  source_url stays re-exported for tests
+    context,
+    proposal,
+    render,
+    source_url,
+)
 from pr_ci_state import marker
 
 
 def _command(*args: str) -> str:
-    try:
-        return subprocess.run(args, check=True, capture_output=True, text=True).stdout
-    except subprocess.CalledProcessError as error:
-        # Keep provider configuration and API response bodies out of public logs.
-        status = re.search(r"HTTP [0-9]{3}", error.stderr or "")
-        detail = status[0] if status else f"exit {error.returncode}"
-        raise SystemExit(
-            f"CI planning command failed: {' '.join(args[:2])} ({detail})."
-        ) from None
+    return run_command(
+        args, cwd=None, strip=False, failure="CI planning command failed"
+    )
 
 
 def _check_bot() -> None:
-    _command("gh", "auth", "status")
-    if _command("gh", "api", "user", "--jq", ".login").strip() != "lightseek-bot":
-        raise SystemExit("GitHub authentication must use lightseek-bot.")
+    require_bot(
+        _command,
+        error=SystemExit,
+        message="GitHub authentication must use lightseek-bot.",
+    )
 
 
 def prepare(root: Path) -> None:
@@ -74,8 +80,7 @@ def prepare(root: Path) -> None:
     if not url or not model:
         raise SystemExit("Set the KIMI_API_URL and KIMI_MODEL organization variables.")
     for value in (url, model):
-        mask = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-        print(f"::add-mask::{mask}", flush=True)
+        mask_secret(value)
 
     home = Path(os.environ["RUNNER_TEMP"], "ci-assist-home")
     home.mkdir(parents=True, exist_ok=True)
@@ -91,19 +96,7 @@ def prepare(root: Path) -> None:
             check=True,
             stdout=diff,
         )
-    config = f"""default_model = "planner"
-telemetry = false
-[providers.planner]
-type = "openai"
-base_url = {json.dumps(url)}
-api_key_env = "KIMI_API_KEY"
-[models.planner]
-provider = "planner"
-model = {json.dumps(model)}
-max_context_size = 262144
-capabilities = ["thinking", "tool_use"]
-"""
-    home.joinpath("config.toml").write_text(config)
+    home.joinpath("config.toml").write_text(planner_config(url, model))
     shutil.copyfile(Path(__file__).with_name("pr-ci-planner.md"), root / "planner.md")
     data = context(
         Path.cwd(),
@@ -148,67 +141,6 @@ def _model_body(root: Path) -> str:
     return body.strip()
 
 
-def _check_public_output(
-    body: str, root: Path, *, source_links: bool = False, max_length: int = 60000
-) -> None:
-    config = tomllib.loads(
-        Path(os.environ["KIMI_CODE_HOME"], "config.toml").read_text()
-    )
-    url = config["providers"]["planner"]["base_url"]
-    key = os.environ["KIMI_API_KEY"]
-    private = [
-        key,
-        key[:8],
-        base64.b64encode(key.encode()).decode(),
-        url,
-        urlparse(url).hostname,
-        os.environ["RUNNER_TEMP"],
-        os.environ["GITHUB_WORKSPACE"],
-        str(Path.cwd()),
-    ]
-    # Public task identifiers can contain the configured model's name. Allow
-    # only exact catalog identifiers; free text still cannot identify it.
-    data = json.loads(root.joinpath("context.json").read_text())
-    scanned = body
-    for task in data["catalog"]:
-        for field in ("config", "name"):
-            scanned = scanned.replace(task[field], "")
-    model = config["models"]["planner"]["model"]
-    links = body
-    if source_links:
-        allowed = {source_url(data)} | {
-            source_url(data, path)
-            for path in [
-                *data["test_files"],
-                *(t["config"] for t in data["catalog"]),
-                *(
-                    f".github/workflows/{c['workflow']}"
-                    for c in data.get("native_checks", [])
-                ),
-            ]
-        }
-        links = re.sub(
-            r"https?://[^\s)<>]+",
-            lambda match: "SOURCE_LINK" if match[0] in allowed else match[0],
-            links,
-        )
-    if (
-        any(value and value in body for value in private)
-        or (model and model in scanned)
-        or re.search(r"https?://|github\.com|\bwww\.", links)
-        or re.search(
-            r"\b(?:sk-|ghp_|gho_|github_pat_)|"
-            r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|/(?:home|root|tmp|proc)/",
-            body,
-        )
-    ):
-        raise SystemExit(
-            "CI plan failed the public-output check; no plan was published."
-        )
-    if len(body) > max_length:
-        raise SystemExit("CI plan exceeds the comment size limit.")
-
-
 def _generate(root: Path, source: str, correction: str = "") -> str:
     # A neutral working directory avoids loading the PR's CLI/MCP configuration.
     with (
@@ -232,6 +164,7 @@ def _generate(root: Path, source: str, correction: str = "") -> str:
             cwd=root,
             stdout=events,
             stderr=errors,
+            check=False,
         )
     if result.returncode:
         raise SystemExit("CI planning failed or timed out; no plan was published.")
@@ -283,13 +216,12 @@ def publish(root: Path) -> None:
     _check_bot()
     repo = os.environ["GITHUB_REPOSITORY"]
     number = os.environ["PR_NUMBER"]
-    if (
-        _command(
-            "gh", "repo", "view", repo, "--json", "visibility", "--jq", ".visibility"
-        ).strip()
-        != "PUBLIC"
-    ):
-        raise SystemExit("The plan destination must be a public repository.")
+    require_public_repo(
+        _command,
+        repo,
+        error=SystemExit,
+        message="The plan destination must be a public repository.",
+    )
     head = _command(
         "gh",
         "pr",
@@ -326,7 +258,7 @@ def publish(root: Path) -> None:
     )
     root.joinpath("published.md").write_text(published)
     # gh's --jq output adds a newline; compare after trimming it.
-    if published.rstrip() != root.joinpath("comment.md").read_text().rstrip():
+    if not published_matches(published, root.joinpath("comment.md").read_text()):
         raise SystemExit("Published plan differs from the checked body.")
 
 

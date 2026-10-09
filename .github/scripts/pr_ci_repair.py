@@ -23,7 +23,6 @@
 import argparse
 import ast
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -60,6 +59,12 @@ from pr_ci_assist import (
     targeted_plan,
     task_status,
     validate_plan,
+)
+from pr_ci_common import (
+    check_model_output,
+    mask_secret,
+    planner_config,
+    screen_public_output,
 )
 from pr_ci_state import NATIVE_CHECKS, SHA
 
@@ -106,9 +111,12 @@ class RepairRejected(ValueError):
     def __init__(self, category: str, *, path: str = "", details=None):
         super().__init__(REPAIR_FEEDBACK[category])
         self.category = category
-        self.feedback = dict(
-            category=category, reason=str(self), path=path, details=details
-        )
+        self.feedback = {
+            "category": category,
+            "reason": str(self),
+            "path": path,
+            "details": details,
+        }
 
 
 def repair_with_feedback(request: dict, run_model, proposal, feedback: Path):
@@ -266,9 +274,14 @@ def scan(diff: str, *, additions: str | None = None):
             if line.startswith("+") and not line.startswith("+++")
         )
     )
-    if re.search(
-        r"https?://|\bwww\.|\b(?:sk-|ghp_|gho_|github_pat_)|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|/(?:home|tmp|root|proc)/",
+    if screen_public_output(
         added,
+        url_indicators=r"https?://|\bwww\.",
+        secret_indicators=(
+            r"\b(?:sk-|ghp_|gho_|github_pat_)|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}"
+            r"|/(?:home|tmp|root|proc)/"
+        ),
+        max_length=None,
     ):
         raise RepairRejected("public-output")
     if len(diff.encode()) > 200000:
@@ -407,7 +420,7 @@ def guard_prepacked_reference(source: Path, head: str, base: str, path: str = FP
             for node in ast.walk(ast.parse(source.joinpath(path).read_text()))
         ):
             raise RepairRejected(
-                "missing-reference", path=path, details=dict(reference=FP8_REFERENCE)
+                "missing-reference", path=path, details={"reference": FP8_REFERENCE}
             )
         return
     if path != FP8_API:
@@ -434,7 +447,7 @@ def guard_prepacked_reference(source: Path, head: str, base: str, path: str = FP
         raise RepairRejected(
             "quantization-reference",
             path=FP8_API,
-            details=dict(symbol=symbol, reference=FP8_REFERENCE),
+            details={"symbol": symbol, "reference": FP8_REFERENCE},
         )
 
 
@@ -539,7 +552,9 @@ def merge(source: Path, base: str, *, commit: bool):
         if commit
         else ["--no-commit"]
     )
-    result = subprocess.run([*args, base], cwd=source, capture_output=True, text=True)
+    result = subprocess.run(
+        [*args, base], cwd=source, capture_output=True, text=True, check=False
+    )
     if result.returncode and not command(
         "git", "diff", "--name-only", "--diff-filter=U", cwd=source
     ):
@@ -572,7 +587,10 @@ def effective_merge(
 
 def commit_merge(source: Path, subject: str):
     pending = subprocess.run(
-        ["git", "rev-parse", "--verify", "MERGE_HEAD"], cwd=source, capture_output=True
+        ["git", "rev-parse", "--verify", "MERGE_HEAD"],
+        cwd=source,
+        capture_output=True,
+        check=False,
     )
     if pending.returncode == 0:
         command(
@@ -598,6 +616,7 @@ def restore_patch(source: Path, head: str, selected: set[str]):
         ["git", "-c", "core.hooksPath=/dev/null", "merge", "--abort"],
         cwd=source,
         capture_output=True,
+        check=False,
     )
     command("git", "reset", "--hard", head, cwd=source)
     for p, content in contents.items():
@@ -612,13 +631,7 @@ def configure():
         for v in pages("actions/organization-variables", "variables")
     }
     for name in ("KIMI_API_URL", "KIMI_MODEL"):
-        value = (
-            variables[name]
-            .replace("%", "%25")
-            .replace("\r", "%0D")
-            .replace("\n", "%0A")
-        )
-        print(f"::add-mask::{value}", flush=True)
+        mask_secret(variables[name])
     WORK.joinpath("model").mkdir(parents=True, exist_ok=True)
     request = json.loads(WORK.joinpath("request.json").read_text())
     diagnostics = []
@@ -722,18 +735,9 @@ def configure():
     WORK.joinpath("model/diagnostics.txt").write_text("\n".join(diagnostics))
     home = Path(os.environ["KIMI_CODE_HOME"])
     home.mkdir(parents=True, exist_ok=True)
-    home.joinpath("config.toml").write_text(f"""default_model = "planner"
-telemetry = false
-[providers.planner]
-type = "openai"
-base_url = {json.dumps(variables["KIMI_API_URL"])}
-api_key_env = "KIMI_API_KEY"
-[models.planner]
-provider = "planner"
-model = {json.dumps(variables["KIMI_MODEL"])}
-max_context_size = 262144
-capabilities = ["thinking", "tool_use"]
-""")
+    home.joinpath("config.toml").write_text(
+        planner_config(variables["KIMI_API_URL"], variables["KIMI_MODEL"])
+    )
 
 
 def edit_sandbox(
@@ -830,6 +834,7 @@ def runtime_lint(source: Path, request: dict):
         cwd=source,
         capture_output=True,
         text=True,
+        check=False,
         timeout=remaining_time(request),
     )
     if result.returncode == 0:
@@ -837,18 +842,18 @@ def runtime_lint(source: Path, request: dict):
     if result.returncode != 1:
         raise ValueError("Required runtime lint could not run.")
     issues = [
-        dict(
-            code=i["code"],
-            message=i["message"],
-            path=str(Path(i["filename"]).relative_to(source)),
-            line=i["location"]["row"],
-        )
+        {
+            "code": i["code"],
+            "message": i["message"],
+            "path": str(Path(i["filename"]).relative_to(source)),
+            "line": i["location"]["row"],
+        }
         for i in json.loads(result.stdout)
     ]
     raise RepairRejected("runtime-lint", path=issues[0]["path"], details=issues)
 
 
-def proposed_patch(source, request, allowed, conflicts, before, planner, guard_root):
+def proposed_patch(source, request, allowed, conflicts, before, guard_root):
     state = request["state"]
     base = state.get("validation_base", state["base"])
     print("Repair: checking proposed patch.", flush=True)
@@ -885,7 +890,7 @@ def proposed_patch(source, request, allowed, conflicts, before, planner, guard_r
             runtime_lint(source, request)
             os.environ["KIMI_CODE_HOME"] = str(guard_root)
             try:
-                planner._check_public_output(
+                check_model_output(
                     new_source_text(review, state["head"], base, selected),
                     guard_root,
                     max_length=200000,
@@ -1018,12 +1023,6 @@ def model():
         if source.joinpath(p).is_file()
     }
     resumed = seed_repair(source, request, allowed, conflicts)
-    # Reuse provider configuration and output screening, without a GitHub token.
-    spec = importlib.util.spec_from_file_location(
-        "pr_ci_model", ROOT / ".github/scripts/pr-ci-model.py"
-    )
-    planner = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(planner)
     plan_root = sandbox_root / "model"
     plan_root.mkdir(exist_ok=True)
     shutil.copyfile(WORK / "model/diagnostics.txt", plan_root / "diagnostics.txt")
@@ -1131,7 +1130,7 @@ the allowed source does not complete this task.
         (plan_root / "diagnostics.txt", "failure evidence"),
         (home / "config.toml", "provider configuration"),
     ):
-        if subprocess.run([*sandbox, "test", "-r", str(path)]).returncode:
+        if subprocess.run([*sandbox, "test", "-r", str(path)], check=False).returncode:
             print(f"Repair input access denied: {label}.", flush=True)
             raise ValueError("Repair inputs are inaccessible.")
     session = []
@@ -1219,9 +1218,7 @@ the allowed source does not complete this task.
     diff = repair_with_feedback(
         request,
         run_model,
-        lambda: proposed_patch(
-            source, request, allowed, conflicts, before, planner, guard_root
-        ),
+        lambda: proposed_patch(source, request, allowed, conflicts, before, guard_root),
         feedback,
     )
     WORK.joinpath("patch.diff").write_text(diff + "\n")
@@ -1311,6 +1308,7 @@ def check():
             cwd=source,
             env=env,
             capture_output=True,
+            check=False,
             timeout=remaining_time(request),
         )
         if result.returncode == 0:
@@ -1354,6 +1352,7 @@ def check():
         cwd=source,
         env=env,
         capture_output=True,
+        check=False,
         timeout=remaining_time(request),
     )
     if result.returncode or command("git", "diff", "--name-only", cwd=source):
@@ -1547,16 +1546,16 @@ def stage():
     branch = f"bot/pr-ci-assist-{state['pr']}-{state['command']}-{state['repair_run']}"
     current_request(request)
     push(source, branch, deadline=request["deadline"])
-    state["candidate"] = dict(
-        patch=patch,
-        validation=validation,
-        tree=command("git", "rev-parse", "HEAD^{tree}", cwd=source),
-        branch=branch,
-    )
+    state["candidate"] = {
+        "patch": patch,
+        "validation": validation,
+        "tree": command("git", "rev-parse", "HEAD^{tree}", cwd=source),
+        "branch": branch,
+    }
     state["phase"] = "validating"
     state["statuses"] = ["waiting"] * len(state["tasks"])
     state["native_checks"] = [
-        dict(workflow=c["workflow"], status="waiting", run=0)
+        {"workflow": c["workflow"], "status": "waiting", "run": 0}
         for c in data.get("native_checks", [])
     ]
     state["native_submitted"] = []
@@ -1689,7 +1688,9 @@ def promote(state: dict, *, deadline: int):
         # Preserve merge ancestry so GitHub recognises the conflict resolution.
         commit_merge(source, "fix: reconcile PR with main")
     else:
-        subprocess.run(["git", "merge", "--abort"], cwd=source, capture_output=True)
+        subprocess.run(
+            ["git", "merge", "--abort"], cwd=source, capture_output=True, check=False
+        )
         command("git", "reset", "--hard", promoted, cwd=source)
     current = pull(state["pr"])
     if not pr_source_matches(state, current, source=source):
@@ -1703,6 +1704,7 @@ def promote(state: dict, *, deadline: int):
                 ["git", "merge-tree", "--write-tree", "HEAD", main],
                 cwd=source,
                 capture_output=True,
+                check=False,
             )
             if result.returncode:
                 raise ValueError("Promoted repair conflicts with current main.")

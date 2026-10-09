@@ -33,6 +33,15 @@ from pathlib import Path
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
+from pr_ci_common import (
+    manifest_task_result,
+    published_matches,
+    require_bot,
+    require_public_repo,
+    result_status,
+    run_command,
+    screen_public_output,
+)
 from pr_ci_plan import (
     CoverageError,
     context,
@@ -48,9 +57,7 @@ FINISHED_PHASES = {"done", "manual", "stale", "promoted"}
 
 
 def command(*args: str, cwd: Path = ROOT) -> str:
-    return subprocess.run(
-        args, cwd=cwd, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    return run_command(args, cwd=cwd, strip=True, failure=None)
 
 
 def api(path: str):
@@ -221,16 +228,13 @@ def plan_source():
 
 
 def public_gate():
-    command("gh", "auth", "status")
-    if json.loads(command("gh", "api", "user"))["login"] != BOT:
-        raise ValueError("Bot authentication required.")
-    if (
-        command(
-            "gh", "repo", "view", REPO, "--json", "visibility", "--jq", ".visibility"
-        )
-        != "PUBLIC"
-    ):
-        raise ValueError("Public destination verification failed.")
+    require_bot(command, error=ValueError, message="Bot authentication required.")
+    require_public_repo(
+        command,
+        REPO,
+        error=ValueError,
+        message="Public destination verification failed.",
+    )
 
 
 def publish(state: dict, message: str):
@@ -289,13 +293,17 @@ def publish(state: dict, message: str):
                 f"| [{Path(task['config']).stem}]({link}) | `{sha[:8]}` | {result} |\n"
             )
     body += marker("assist", state)
-    scanned = re.sub(
-        rf"https://github\.com/{REPO}/(?:blob/[0-9a-f]{{40}}/[A-Za-z0-9_./%-]+|actions/runs/[0-9]+)",
-        "PUBLIC_SOURCE",
+    if screen_public_output(
         body,
-    )
-    if re.search(
-        r"https?://|\bwww\.|(?:sk-|ghp_|github_pat_)|/(?:home|tmp|root)/", scanned
+        substitute=[
+            (
+                rf"https://github\.com/{REPO}/(?:blob/[0-9a-f]{{40}}/[A-Za-z0-9_./%-]+|actions/runs/[0-9]+)",
+                "PUBLIC_SOURCE",
+            )
+        ],
+        url_indicators=r"https?://|\bwww\.",
+        secret_indicators=r"(?:sk-|ghp_|github_pat_)|/(?:home|tmp|root)/",
+        max_length=None,
     ):
         raise ValueError("Public output rejected.")
     WORK.mkdir(parents=True, exist_ok=True)
@@ -331,7 +339,7 @@ def publish(state: dict, message: str):
         with urlopen(request, timeout=30) as response:
             response.read()
     live = api(f"issues/comments/{comment_id}")
-    if live["body"].rstrip() != body.rstrip() or record(live, "assist") != state:
+    if not published_matches(live["body"], body) or record(live, "assist") != state:
         raise ValueError("Published state differs from reviewed content.")
 
 
@@ -355,6 +363,7 @@ def fetch_commits(source: Path, *refs: str):
             ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
             cwd=source,
             capture_output=True,
+            check=False,
         )
         if present.returncode:
             command("git", "fetch", "origin", ref, cwd=source)
@@ -366,6 +375,7 @@ def ancestor(source: Path, before: str, after: str) -> bool:
             ["git", "merge-base", "--is-ancestor", before, after],
             cwd=source,
             capture_output=True,
+            check=False,
         ).returncode
         == 0
     )
@@ -482,6 +492,7 @@ def main_advance_compatible(state: dict, main: str, *, source: Path) -> bool:
                         ["git", "show", f"{revision}:{path}"],
                         cwd=source,
                         capture_output=True,
+                        check=False,
                     )
                     if contents.returncode == 0:
                         target = snapshot / path
@@ -498,6 +509,7 @@ def main_advance_compatible(state: dict, main: str, *, source: Path) -> bool:
             ["git", "merge-tree", "--write-tree", candidate["validation"], main],
             cwd=source,
             capture_output=True,
+            check=False,
         )
         if merge.returncode:
             return False
@@ -627,14 +639,14 @@ def run_title(task: dict, sha: str, cluster: str) -> str:
 
 def dispatch(task: dict, sha: str, cluster: str):
     public_gate()
-    fields = dict(
-        commit=sha,
-        yaml="off" if cluster else "all",
-        match=task["config"],
-        task_types=task["type"],
-        trigger="all",
-        include_mmlu="true",
-    )
+    fields = {
+        "commit": sha,
+        "yaml": "off" if cluster else "all",
+        "match": task["config"],
+        "task_types": task["type"],
+        "trigger": "all",
+        "include_mmlu": "true",
+    }
     if cluster:
         fields.update(cluster=cluster, runners=task["runner"], require_idle="true")
     else:
@@ -670,7 +682,7 @@ def runs_for(state: dict) -> list[dict]:
 
 
 def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
-    result = dict(workflow=check["workflow"], status="waiting", run=0)
+    result = {"workflow": check["workflow"], "status": "waiting", "run": 0}
     candidate = state.get("candidate")
     for run in runs:
         if run["path"] != f".github/workflows/{check['workflow']}":
@@ -821,22 +833,6 @@ def download(run: dict, name: str, target: Path):
     )
 
 
-def result_status(result: dict, task: dict, sha: str, runner: str) -> str:
-    if (
-        result.get("source_sha") != sha
-        or result.get("config") != task["config"]
-        or result.get("task") != task["name"]
-        or result.get("runner") != runner
-    ):
-        return "missing"
-    stages = result.get("executed_stages", [])
-    if result.get("ok") is True and any(
-        stage not in {"install", "server", "cleanup"} for stage in stages
-    ):
-        return "passed"
-    return "failed" if result.get("ok") is False else "missing"
-
-
 def report(run: dict, task: dict, sha: str, cluster: str) -> str:
     if run["status"] != "completed":
         created = datetime.datetime.fromisoformat(
@@ -865,29 +861,9 @@ def report(run: dict, task: dict, sha: str, cluster: str) -> str:
                 "availability": "unavailable",
             }:
                 return "unavailable"
-            manifest = json.loads((target / "manifest.json").read_text())
-            rows = [
-                r
-                for r in manifest
-                if r["task"]["config"] == task["config"]
-                and r["task"]["runner"] == effective_runner(task, cluster)
-            ]
-            if len(rows) != 1 or not re.fullmatch(r"[0-9]+", rows[0]["job_id"]):
-                return "missing"
-            row = rows[0]
-            result = {
-                "source_sha": sha,
-                "config": task["config"],
-                **json.loads((target / f"{row['job_id']}-result.json").read_text()),
-            }
-            status = result_status(result, task, sha, effective_runner(task, cluster))
-            if (
-                status == "passed"
-                and row["state"] == "COMPLETED"
-                and row["exit_code"] == "0:0"
-            ):
-                return "passed"
-            return "failed" if status == "failed" else "missing"
+            return manifest_task_result(
+                target, task, sha, runner=effective_runner(task, cluster)
+            )
         name = (
             f"pr-test-{task['name']}-{task['runner']}-{run['id']}-{run['run_attempt']}"
         )
@@ -940,27 +916,11 @@ def native_result(run: dict, task: dict, state: dict, job: dict) -> str:
             if not any(a["name"] == name and not a["expired"] for a in artifacts):
                 return "missing"
             download(run, name, target)
-            manifest = json.loads((target / "manifest.json").read_text())
             source = json.loads((target / "source.json").read_text())["source_sha"]
             if not source_matches(source, state):
                 return "missing"
-            rows = [r for r in manifest if r["task"]["config"] == task["config"]]
-            if len(rows) != 1 or not re.fullmatch(r"[0-9]+", rows[0]["job_id"]):
-                return "missing"
-            row = rows[0]
-            result = {
-                "source_sha": source,
-                "config": task["config"],
-                **json.loads((target / f"{row['job_id']}-result.json").read_text()),
-            }
-            status = result_status(result, task, source, row["task"]["runner"])
-            return (
-                "passed"
-                if status == "passed"
-                and row["state"] == "COMPLETED"
-                and row["exit_code"] == "0:0"
-                else "missing"
-            )
+            status = manifest_task_result(target, task, source, runner=None)
+            return "passed" if status == "passed" else "missing"
         for artifact in artifacts:
             runner = names.get(artifact["name"])
             if (
@@ -1277,22 +1237,22 @@ def control(number: int, *, expected_command: int | None = None):
     if initial:
         action = permitted(comment)
         prior = state
-        state = dict(
-            version=1,
-            repository=REPO,
-            pr=number,
-            head=pr["head"]["sha"],
-            base=pr["base"]["sha"],
-            command=comment["id"],
-            action=action,
-            phase="watching",
-            tasks=[],
-            statuses=[],
-            run_ids={},
-            conflicts=pr["mergeable"] is False,
-            since=comment["id"],
-            submitted=[],
-        )
+        state = {
+            "version": 1,
+            "repository": REPO,
+            "pr": number,
+            "head": pr["head"]["sha"],
+            "base": pr["base"]["sha"],
+            "command": comment["id"],
+            "action": action,
+            "phase": "watching",
+            "tasks": [],
+            "statuses": [],
+            "run_ids": {},
+            "conflicts": pr["mergeable"] is False,
+            "since": comment["id"],
+            "submitted": [],
+        }
         target = command_target(comment, number)
         if target:
             state["target"] = target
