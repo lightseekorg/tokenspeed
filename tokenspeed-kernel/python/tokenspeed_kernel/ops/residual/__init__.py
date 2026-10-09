@@ -289,6 +289,44 @@ def _same_tensor_contract(
         )
 
 
+def pad_gated_residual_projection_weight(
+    projection_weight: _torch.Tensor,
+    *,
+    projection_rows: int,
+) -> _torch.Tensor:
+    """Prepare the down/inject weight once during model loading.
+
+    Args:
+        projection_weight: Down/inject weight shaped
+            ``[stored_rows, hc_count * hidden_size]``, with or without padding.
+        projection_rows: Number of logical down/inject rows before padding.
+
+    Returns:
+        BF16/FP16 storage aligned to a 16-byte GEMM output width, with newly
+        appended rows zeroed. Other dtypes use the original logical extent.
+        Weights already at the desired extent are returned unchanged. Pass
+        the same ``projection_rows`` to :func:`gated_residual_mix`.
+    """
+    if (
+        projection_weight.ndim != 2
+        or not 0 < projection_rows <= projection_weight.shape[0]
+    ):
+        raise ValueError(
+            "projection_rows must fit the two-dimensional projection weight"
+        )
+    alignment = 8 if projection_weight.dtype in (_torch.bfloat16, _torch.float16) else 1
+    padded_rows = (projection_rows + alignment - 1) // alignment * alignment
+    if padded_rows == projection_weight.shape[0]:
+        return projection_weight
+    if padded_rows == projection_rows:
+        return projection_weight[:projection_rows]
+    with _torch.no_grad():
+        return _torch.nn.functional.pad(
+            projection_weight[:projection_rows],
+            (0, 0, 0, padded_rows - projection_rows),
+        )
+
+
 def gated_residual_mix(
     normalized: _torch.Tensor,
     projection_weight: _torch.Tensor,
@@ -297,6 +335,7 @@ def gated_residual_mix(
     hidden_size: int,
     lowrank: int,
     *,
+    projection_rows: int,
     weights_independent: bool,
     projection_scale: float = 1.0,
     override: str | None = None,
@@ -305,20 +344,25 @@ def gated_residual_mix(
     """Mix normalized hyperconnection branches and optionally form inject logits.
 
     The first projection is stored as one matrix. Its leading ``lowrank`` rows
-    are the mix-down weight and, when present, its final ``hc_count`` rows are
+    are the mix-down weight and, when present, its next ``hc_count`` rows are
     the block-injection weight. This preserves a single read of the wide input.
+    Loading may append padding rows; forward never copies or pads weights.
 
     Args:
         normalized: Normalized GPU residual streams shaped
             ``[..., hc_count * hidden_size]``.
-        projection_weight: Fused down/inject weight shaped either
-            ``[lowrank, hc_count * hidden_size]`` or
-            ``[lowrank + hc_count, hc_count * hidden_size]``.
+        projection_weight: Fused down/inject weight shaped
+            ``[stored_rows, hc_count * hidden_size]``. ``stored_rows`` is
+            ``projection_rows`` or, for BF16/FP16, rounded up to eight rows
+            by :func:`pad_gated_residual_projection_weight` during loading.
         up_weight: Mix-up weight shaped
             ``[hc_count * hidden_size, lowrank]``.
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
+        projection_rows: Logical weight rows, either ``lowrank`` without
+            injection or ``lowrank + hc_count`` with injection. Storage
+            padding does not contribute inject logits.
         weights_independent: Whether both weights are already ready and remain
             unchanged within forward, permitting weight TMA before the activation
             producer completes. Pass False when a preceding PDL kernel may write
@@ -346,11 +390,17 @@ def gated_residual_mix(
             f"[{lowrank} or {lowrank + hc_count}, {wide}], got "
             f"{tuple(projection_weight.shape)}"
         )
-    projection_rows = int(projection_weight.shape[0])
     if projection_rows not in (lowrank, lowrank + hc_count):
         raise ValueError(
-            f"projection_weight has {projection_rows} rows; expected {lowrank} "
+            f"projection_rows is {projection_rows}; expected {lowrank} "
             f"or {lowrank + hc_count}"
+        )
+    alignment = 8 if projection_weight.dtype in (_torch.bfloat16, _torch.float16) else 1
+    padded_rows = (projection_rows + alignment - 1) // alignment * alignment
+    if projection_weight.shape[0] not in (projection_rows, padded_rows):
+        raise ValueError(
+            f"projection_weight has {projection_weight.shape[0]} stored rows; "
+            f"expected {projection_rows} or {padded_rows}"
         )
     if up_weight.shape != (wide, lowrank):
         raise ValueError(
@@ -421,6 +471,7 @@ def gated_residual_mix(
             hc_count,
             hidden_size,
             lowrank,
+            projection_rows,
             projection_scale,
             weights_independent,
         )
@@ -780,6 +831,7 @@ __all__ = [
     "attn_res_fwd_available",
     "gated_residual_combine",
     "gated_residual_mix",
+    "pad_gated_residual_projection_weight",
     "mhc_fused_hc",
     "mhc_mixes",
     "mhc_post",

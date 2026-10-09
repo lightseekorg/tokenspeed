@@ -57,6 +57,7 @@ def _mix(inputs):
         4,
         2560,
         320,
+        projection_rows=324,
         weights_independent=True,
         projection_scale=1.0,
         override="cute_fused_hyperconnection_mix",

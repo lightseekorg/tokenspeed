@@ -317,6 +317,14 @@ preloads the all-gathered residual before its wait, so that collective must
 not trigger early. FlashInfer adapters preserve the upstream CuTe body and
 keep PDL compilation caches separate.
 
+Gated residual projection weights separate logical rows from stored rows.
+Model loading extends BF16/FP16 down/inject storage for GEMM output alignment;
+later shards and reloads write into the same parameter storage. Forward passes
+the logical count explicitly and never repacks weights. The GEMM implementation
+computes the stored width and consumes only logical columns, while CuTe gives
+TMA a logical view of that same storage. Eager and CUDA graph calls therefore
+share both the weight layout and its update semantics.
+
 QSA logits scoring uses the same paged kernel for every query layout. A batch
 whose request lengths are all available on the host may shorten its compressed
 block-table view to the maximum prefix-plus-query length, rounded to the cache

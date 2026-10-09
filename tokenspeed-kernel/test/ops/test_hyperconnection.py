@@ -31,10 +31,15 @@ from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
     grouped_gemma_rmsnorm,
 )
-from tokenspeed_kernel.ops.residual import gated_residual_combine, gated_residual_mix
+from tokenspeed_kernel.ops.residual import (
+    gated_residual_combine,
+    gated_residual_mix,
+    pad_gated_residual_projection_weight,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.registry import KernelRegistry
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="a CUDA/ROCm device is required"
@@ -164,6 +169,9 @@ def _mix(
         HC_COUNT,
         HIDDEN_SIZE,
         LOWRANK,
+        projection_rows=(
+            LOWRANK if inputs[1].shape[0] == LOWRANK else LOWRANK + HC_COUNT
+        ),
         override=override,
         solution=None,
         projection_scale=projection_scale,
@@ -227,6 +235,144 @@ def test_general_triton_mix_matches_fp64_reference(rows: int) -> None:
     _assert_mix_close((actual, actual_inject), (normalized, projection, up), 1.0, 0.03)
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize(
+    ("hc_count", "hidden_size", "lowrank", "has_inject", "dtype", "strided"),
+    [
+        (4, 2560, 320, True, torch.bfloat16, False),
+        (4, 2560, 320, True, torch.float16, False),
+        (4, 2560, 320, True, torch.float32, False),
+        (3, 37, 5, False, torch.bfloat16, False),
+        (3, 37, 5, True, torch.bfloat16, False),
+        (3, 37, 7, True, torch.float16, True),
+        (3, 37, 5, False, torch.float32, False),
+    ],
+)
+def test_general_triton_mix_projection_storage(
+    prepared: bool,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    has_inject: bool,
+    dtype: torch.dtype,
+    strided: bool,
+    monkeypatch,
+) -> None:
+    if dtype is torch.float32:
+        monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0")
+        monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
+    generator = torch.Generator(device="cuda").manual_seed(19)
+    wide = hc_count * hidden_size
+    normalized = torch.randn(17, wide, dtype=dtype, device="cuda", generator=generator)
+    projection = (
+        torch.randn(
+            lowrank + (hc_count if has_inject else 0),
+            wide,
+            dtype=dtype,
+            device="cuda",
+            generator=generator,
+        )
+        * 0.01
+    )
+    if strided:
+        projection = projection.T.contiguous().T
+    projection_rows = projection.shape[0]
+    if prepared:
+        projection = pad_gated_residual_projection_weight(
+            projection, projection_rows=projection_rows
+        )
+    up = (
+        torch.randn(wide, lowrank, dtype=dtype, device="cuda", generator=generator)
+        * 0.01
+    )
+    scale = 1.0 / hc_count
+    linear = torch.nn.functional.linear
+    projection_widths = []
+
+    def record_linear(value, weight, *args, **kwargs):
+        if not projection_widths:
+            assert weight.data_ptr() == projection.data_ptr()
+        projection_widths.append(weight.shape[0])
+        return linear(value, weight, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "linear", record_linear)
+    actual = gated_residual_mix(
+        normalized,
+        projection,
+        up,
+        hc_count,
+        hidden_size,
+        lowrank,
+        projection_rows=projection_rows,
+        projection_scale=scale,
+        weights_independent=False,
+        override="triton_hyperconnection_mix",
+        solution=None,
+    )
+    assert projection_widths[0] == projection.shape[0]
+    if prepared and dtype is not torch.float32:
+        assert projection_widths[0] * projection.element_size() % 16 == 0
+    x = normalized.cpu().double()
+    projected = (x @ projection[:projection_rows].cpu().double().T) * scale
+    gate = torch.nn.functional.silu(projected[:, :lowrank]) @ up.cpu().double().T
+    mixed = (gate.sigmoid() * x).reshape(-1, hc_count, hidden_size).mean(1)
+    inject = projected[:, lowrank:] if has_inject else None
+    expected = tuple(
+        None if value is None else value.to(device="cuda", dtype=dtype)
+        for value in (mixed, inject)
+    )
+    tolerance = {
+        torch.bfloat16: 0.01,
+        torch.float16: 0.002,
+        torch.float32: 1e-5,
+    }[dtype]
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("rows", [8192, 16384])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_general_triton_mix_prefill_projection_padding(
+    rows: int, dtype: torch.dtype
+) -> None:
+    from tokenspeed_kernel.ops.residual.triton import (
+        _mix_epilogue_kernel,
+        _projection_epilogue_kernel,
+    )
+
+    normalized, projection, up = _inputs(rows, dtype, seed=23)
+    projection = pad_gated_residual_projection_weight(
+        projection, projection_rows=LOWRANK + HC_COUNT
+    )
+    scale = 0.25
+    _mix(
+        (normalized[:17], projection, up),
+        override="triton_hyperconnection_mix",
+        projection_scale=scale,
+        weights_independent=False,
+    )
+    capture = ShapeCapture.get()
+    capture.enabled = True
+    with assert_no_triton_compile(_projection_epilogue_kernel, _mix_epilogue_kernel):
+        actual = _mix(
+            (normalized, projection, up),
+            override=None,
+            projection_scale=scale,
+            weights_independent=False,
+        )
+    assert capture._records[-1].kernel_name == "triton_hyperconnection_mix"
+    assert actual[0].shape == (rows, HIDDEN_SIZE)
+    assert actual[1].shape == (rows, HC_COUNT)
+    # Check the first, middle and final rows without a full prefill CPU GEMM.
+    indices = torch.linspace(0, rows - 1, 17, device="cuda").long()
+    expected = _mix_reference(
+        normalized[indices], projection[: LOWRANK + HC_COUNT], up, scale
+    )
+    sampled = tuple(value[indices] for value in actual)
+    tolerance = 0.01 if dtype is torch.bfloat16 else 0.002
+    torch.testing.assert_close(sampled, expected, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize(
     (
         "rows",
@@ -245,6 +391,7 @@ def test_general_triton_mix_matches_fp64_reference(rows: int) -> None:
     ],
 )
 def test_fused_cute_mix_matches_fp64_and_graph(
+    padded: bool,
     rows: int,
     dtype: torch.dtype,
     has_inject: bool,
@@ -268,6 +415,13 @@ def test_fused_cute_mix_matches_fp64_and_graph(
 
     tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
     expected = _mix_reference(normalized, projection, up, projection_scale)
+    if padded:
+        projection = pad_gated_residual_projection_weight(
+            projection, projection_rows=projection.shape[0]
+        )
+        # Padding never contributes to down or inject outputs. CuTe should
+        # expose only logical rows to its TMA descriptor.
+        projection[LOWRANK + (HC_COUNT if has_inject else 0) :].fill_(float("nan"))
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -699,6 +853,7 @@ def _publish_mix_inputs_kernel(
 @pytest.mark.parametrize(
     ("rows", "dtype", "has_inject", "backend", "weights_independent", "scale"),
     [
+        (17, torch.bfloat16, True, "triton", False, 0.25),
         (4, torch.bfloat16, True, "cute_fused", False, 0.25),
         (1, torch.float16, False, "cute_fused", True, 0.25),
         (16, torch.bfloat16, True, "cute_fused", True, 0.25),
@@ -724,6 +879,11 @@ def test_mix_prefetch_observes_pdl_producer_updates(
     x_source, projection_source, up_source = _inputs(rows, dtype, seed=139 + rows)
     if not has_inject:
         projection_source = projection_source[:LOWRANK]
+    logical_rows = projection_source.shape[0]
+    if backend == "triton":
+        projection_source = pad_gated_residual_projection_weight(
+            projection_source, projection_rows=logical_rows
+        )
     projection_source.mul_(2.0)
     up_source.mul_(4.0)
     normalized = torch.full_like(x_source, float("nan"))
@@ -782,7 +942,9 @@ def test_mix_prefetch_observes_pdl_producer_updates(
             projection.fill_(float("nan"))
             up.fill_(float("nan"))
         graph.replay()
-        expected = _mix_reference(x_source, projection_source, up_source, scale)
+        expected = _mix_reference(
+            x_source, projection_source[:logical_rows], up_source, scale
+        )
         tolerance = 4e-2 if dtype is torch.bfloat16 else 8e-3
         for actual in outputs:
             torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
