@@ -139,7 +139,8 @@ def _select_launch_config(
                 ) * head_tiles_per_row
                 if candidate_rows <= num_rows and ctas * 2 >= sm_count * 3:
                     query_rows_per_cta = candidate_rows
-        return query_rows_per_cta, splits, 2, True
+        # Three shared K/V buffers let copies run ahead of the QK/PV consumers.
+        return query_rows_per_cta, splits, 3, True
     splits = _num_splits(output_tiles, wide_cluster_capacity)
     return 1, splits, 3 if splits == _WIDE_NUM_SPLITS else 1, False
 
@@ -798,7 +799,11 @@ class MixedInputFusedMultiHeadAttentionDecode:
         softmax_nbar = pipeline.NamedBarrier(
             barrier_id=1, num_threads=warpgroup_threads
         )
-        mma_kq_nbar = pipeline.NamedBarrier(barrier_id=2, num_threads=64)
+        # QK can announce K0 and K1 before its first VP wait. Give the two
+        # S/P stages separate barriers; later reuse is ordered by the VP wait.
+        # IDs 4 and 5 belong to the FP8 conversion warpgroups.
+        mma_kq_even_nbar = pipeline.NamedBarrier(barrier_id=2, num_threads=64)
+        mma_kq_odd_nbar = pipeline.NamedBarrier(barrier_id=6, num_threads=64)
         mma_vp_nbar = pipeline.NamedBarrier(barrier_id=3, num_threads=64)
 
         # Alias thread cooperatives
@@ -1382,7 +1387,10 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 cute.arch.fence_view_async_shared()
                             # Signal BMM2 to start
                             if is_last_iter:
-                                mma_kq_nbar.arrive()
+                                if s & 1:
+                                    mma_kq_odd_nbar.arrive()
+                                else:
+                                    mma_kq_even_nbar.arrive()
                             for mma_k in cutlass.range_constexpr(
                                 cute.size(tAtK_cvt, mode=[2])
                             ):
@@ -1423,7 +1431,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     # Advance and wait for BMM1
                     for _ in cutlass.range_constexpr(tiles_dk):
                         cvt_consumer.advance()
-                    mma_kq_nbar.arrive_and_wait()
+                    mma_kq_even_nbar.arrive_and_wait()
 
                     # Sequence loop
                     p_token = False
@@ -1433,7 +1441,11 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         if s < iters_s - 1:
                             for _ in cutlass.range_constexpr(tiles_dk):
                                 cvt_consumer.advance()
-                            mma_kq_nbar.arrive_and_wait()
+                            # V_s follows K_{s+1} in the shared K/V stream.
+                            if (s + 1) & 1:
+                                mma_kq_odd_nbar.arrive_and_wait()
+                            else:
+                                mma_kq_even_nbar.arrive_and_wait()
                             p_token = p_consumer.try_wait()
 
                         # BMM2

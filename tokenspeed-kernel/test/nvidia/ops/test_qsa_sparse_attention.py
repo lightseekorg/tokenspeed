@@ -727,16 +727,24 @@ def test_qsa_sparse_attention_blackwell_long_context_tail_replay(
 
 
 @pytest.mark.parametrize(
-    ("cache_dtype", "splits", "query_rows_per_cta"),
+    (
+        "cache_dtype",
+        "splits",
+        "query_rows_per_cta",
+        "bf16_smem_slots",
+        "bf16_async_ready",
+    ),
     [
-        (torch.bfloat16, 4, 1),
-        (torch.bfloat16, 8, 1),
-        (torch.bfloat16, 16, 1),
-        (torch.float8_e4m3fn, 4, 1),
-        (torch.float8_e4m3fn, 8, 1),
-        (torch.float8_e4m3fn, 16, 1),
-        (torch.bfloat16, 1, 2),
-        (torch.bfloat16, 1, 4),
+        (torch.bfloat16, 4, 1, 1, False),
+        (torch.bfloat16, 8, 1, 1, False),
+        (torch.bfloat16, 16, 1, 3, False),
+        (torch.float8_e4m3fn, 4, 1, 1, False),
+        (torch.float8_e4m3fn, 8, 1, 1, False),
+        (torch.float8_e4m3fn, 16, 1, 3, False),
+        (torch.bfloat16, 1, 2, 3, True),
+        (torch.bfloat16, 1, 4, 3, True),
+        (torch.bfloat16, 2, 1, 3, True),
+        (torch.bfloat16, 4, 1, 3, True),
     ],
 )
 def test_qsa_sparse_attention_blackwell_changed_kv_replay(
@@ -745,6 +753,8 @@ def test_qsa_sparse_attention_blackwell_changed_kv_replay(
     cache_dtype: torch.dtype,
     splits: int,
     query_rows_per_cta: int,
+    bf16_smem_slots: int,
+    bf16_async_ready: bool,
 ) -> None:
     """KV staging and partial query tiles must observe changes on graph replay."""
     if current_platform().arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
@@ -765,8 +775,7 @@ def test_qsa_sparse_attention_blackwell_changed_kv_replay(
         wide_cluster_capacity: int,
     ) -> tuple[int, int, int, bool]:
         del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
-        slots = 2 if splits == 1 else (3 if splits == 16 else 1)
-        return query_rows_per_cta, splits, slots, splits == 1
+        return query_rows_per_cta, splits, bf16_smem_slots, bf16_async_ready
 
     monkeypatch.setattr(sparse_module, "_select_launch_config", select_config)
     torch.manual_seed(217 + splits)
@@ -847,14 +856,15 @@ def test_qsa_sparse_attention_blackwell_cluster_capacity(
 @pytest.mark.parametrize(
     ("rows", "head_tiles", "bf16", "sm_count", "expected"),
     [
-        (32, 1, True, 152, (1, 4, 2, True)),
-        (64, 1, True, 152, (1, 2, 2, True)),
-        (128, 1, True, 152, (1, 1, 2, True)),
-        (256, 1, True, 152, (1, 1, 2, True)),
-        (512, 1, True, 152, (2, 1, 2, True)),
-        (513, 1, True, 152, (2, 1, 2, True)),
-        (128, 4, True, 152, (2, 1, 2, True)),
-        (512, 1, True, 80, (4, 1, 2, True)),
+        (32, 1, True, 152, (1, 4, 3, True)),
+        (64, 1, True, 152, (1, 2, 3, True)),
+        (128, 1, True, 152, (1, 1, 3, True)),
+        (256, 1, True, 152, (1, 1, 3, True)),
+        (512, 1, True, 152, (2, 1, 3, True)),
+        (513, 1, True, 152, (2, 1, 3, True)),
+        (128, 4, True, 152, (2, 1, 3, True)),
+        (416, 4, True, 152, (4, 1, 3, True)),
+        (512, 1, True, 80, (4, 1, 3, True)),
         (512, 1, False, 152, (1, 4, 1, False)),
     ],
 )

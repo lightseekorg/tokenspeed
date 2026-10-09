@@ -86,9 +86,9 @@ def cute_dsl_blackwell_qsa_sparse_attention(
 
     The launch policy counts independent query/head outputs and queries the
     device SM count before jointly choosing query rows per CTA, KV splits and
-    operand stages. Large BF16 launches use one split and two asynchronous
+    operand stages. Large BF16 launches use one split and three asynchronous
     K-or-V slots; sufficiently large outputs group two or four query rows per
-    CTA. Intermediate BF16 launches use two or four splits with two slots.
+    CTA. Intermediate BF16 launches use two or four splits with three slots.
     Smaller launches retain the sixteen/eight/four split policy, subject to
     the device's wide-cluster capacity. Actual compiled-kernel occupancy must
     be queried separately from these measured scheduling thresholds.
