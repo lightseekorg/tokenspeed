@@ -214,10 +214,6 @@ class LinearMethodBase(QuantizeMethodBase):
         """
         return self.apply(layer, activation(x), bias)
 
-    def prepared_linear_plan(self, layer: nn.Module) -> object | None:
-        """Return an opaque backend warmup plan, if this layer prepared one."""
-        return None
-
     def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
         """Apply into caller-owned storage; methods may override to avoid staging.
 

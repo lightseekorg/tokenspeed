@@ -77,7 +77,6 @@ import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
 import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
-import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
@@ -151,9 +150,7 @@ from tokenspeed_kernel.ops.moe.triton import (
     kimi3_sigmoid_topk as _moe_triton_kimi3_sigmoid_topk,
 )
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
-from tokenspeed_kernel.ops.quantization import (
-    fp8_quantize_dequantize as kernel_fp8_quantize_dequantize,
-)
+from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
 from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
@@ -211,7 +208,6 @@ _RELOAD_MODULES = [
     # GEMM registration modules.
     _gemm_reference,
     _gemm_cuda,
-    _gemm_deep_gemm,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
@@ -474,15 +470,16 @@ def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
     return kernel_quantize_mxfp8(x)
 
 
-def _fp8_quantize_dequantize() -> torch.Tensor:
+def _quantize_fp8() -> torch.Tensor:
     x = torch.empty((4, 128), dtype=torch.bfloat16)
-    return kernel_fp8_quantize_dequantize(
+    output, _ = kernel_quantize_fp8(
         x,
+        granularity="token_group",
         group_size=128,
         scale_encoding="ue8m0",
-        override=None,
-        solution=None,
+        dequantize=True,
     )
+    return output
 
 
 def _mm_dense() -> torch.Tensor:
@@ -509,10 +506,10 @@ def _dsv4_linear_fp32() -> torch.Tensor:
     return kernel_dsv4_linear_fp32(hidden_states, weight)
 
 
-def _mm_mxfp8() -> torch.Tensor:
-    a = torch.empty((4, 128), dtype=_fp8_dtype())
+def _mm_mxfp8(m: int) -> torch.Tensor:
+    a = torch.empty((m, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
-    a_scales = torch.empty((4, 1), dtype=torch.float32)
+    a_scales = torch.empty((m, 1), dtype=torch.float32)
     b_scales = torch.empty((1, 1), dtype=torch.float32)
     return kernel_mm(
         a,
@@ -523,6 +520,24 @@ def _mm_mxfp8() -> torch.Tensor:
         block_size=[128, 128],
         quant="mxfp8",
     )
+
+
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.uint8])
+@pytest.mark.parametrize("batched", [False, True])
+def test_mxfp8_online_scale_signature_matches_weight_encoding(
+    scale_dtype: torch.dtype, batched: bool
+) -> None:
+    batch = (2,) if batched else ()
+    signature = _gemm_pkg._gemm_format_signature(
+        torch.empty((*batch, 4, 128), dtype=torch.bfloat16),
+        torch.empty((*batch, 128, 128), dtype=_fp8_dtype()),
+        None,
+        torch.empty((*batch, 128, 4), dtype=scale_dtype),
+        torch.bfloat16,
+        "mxfp8",
+        [1, 32],
+    )
+    assert signature.format_for("a").scale.storage_dtype == scale_dtype
 
 
 def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
@@ -597,11 +612,11 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         def fake_online_quantize_mxfp8(
             activation: torch.Tensor,
             selected_block_size: list[int],
-            kernel_name: str,
+            scale_encoding: str,
             enable_pdl: bool,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             assert selected_block_size == block_size
-            assert kernel_name == expected_name
+            assert scale_encoding == ("ue8m0" if contract == "ue8m0" else "float32")
             assert not enable_pdl
             return (
                 torch.empty_like(activation, dtype=_fp8_dtype()),
@@ -647,6 +662,8 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         registry.clear_cache()
 
     assert calls == [expected_name]
+    kernel_name = calls[0]
+    assert kernel_name == expected_name
     assert actual.shape == (m, n)
 
 
@@ -866,12 +883,7 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
 
 
 @pytest.mark.parametrize("b_layout", ["KN", "NK"])
-def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> None:
-    monkeypatch.setattr(
-        _gemm_pkg,
-        "select_kernel",
-        partial(_gemm_pkg.select_kernel, solution="reference"),
-    )
+def test_mm_fp8_reference_selection_follows_b_layout(b_layout) -> None:
     gen = torch.Generator().manual_seed(0)
     a = torch.randn((4, 256), generator=gen).to(_fp8_dtype())
     b_kn = torch.randn((256, 128), generator=gen).to(_fp8_dtype())
@@ -879,7 +891,13 @@ def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> N
     scale = torch.ones((1,), dtype=torch.float32)
 
     out = kernel_mm(
-        a, b, A_scales=scale, B_scales=scale, out_dtype=torch.float32, quant="fp8"
+        a,
+        b,
+        A_scales=scale,
+        B_scales=scale,
+        out_dtype=torch.float32,
+        quant="fp8",
+        solution="reference",
     )
 
     torch.testing.assert_close(out, a.float() @ b_kn.float())
@@ -2514,6 +2532,21 @@ def test_workspace_rows_fail_at_selection_without_a_declaring_leaf(
                 solution="triton",
                 slot_order="selection",
             )
+        with pytest.raises(kernel_NoKernelFoundError):
+            _attention_dsa_pkg.dsa_prefill_topk(
+                torch.empty((1, 32, 128), dtype=torch.bfloat16),
+                torch.empty((1, 32), dtype=torch.float32),
+                torch.arange(16, dtype=torch.int64),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([16], dtype=torch.int32),
+                topk=512,
+                softmax_scale=1.0,
+                batch_invariant=False,
+                index_k_fp8=torch.empty((16, 128), dtype=torch.float8_e4m3fn),
+                index_k_scale=torch.ones((16, 1), dtype=torch.float32),
+                solution="triton",
+                slot_order="selection",
+            )
     finally:
         Platform.override(real_platform)
 
@@ -3071,6 +3104,8 @@ def test_gluon_dsa_prefill_topk_rejects_unsupported_page_size() -> None:
     if registry.get_by_name("gluon_dsa_prefill_topk_fp8_gfx950") is None:
         pytest.skip("Gluon DSA top-k is AMD-only")
 
+    with pytest.raises(kernel_NoKernelFoundError, match="traits"):
+        _attention_dsa_prefill_topk(page_size=32, solution="gluon")
     with pytest.raises(kernel_NoKernelFoundError, match="traits"):
         _attention_dsa_prefill_topk(page_size=32, solution="gluon")
 
@@ -4074,6 +4109,14 @@ def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
             solution=None,
             activation_clamped=False,
         )
+    with pytest.raises(kernel_NoKernelFoundError):
+        _moe_apply_mxfp4_plan(
+            activation="swiglu",
+            ispp=2304,
+            internal_activation_dtype="fp8",
+            solution=None,
+            activation_clamped=False,
+        )
     plan = _moe_apply_mxfp4_plan(
         activation="swiglu",
         ispp=2304,
@@ -4090,6 +4133,13 @@ def test_mxfp4_fp8_activation_fails_closed_on_backends_without_a_w4a8_kernel() -
     if not _is_hopper(Platform.get()):
         pytest.skip("Hopper registrations only")
     for solution in ("marlin", "triton"):
+        with pytest.raises(kernel_NoKernelFoundError):
+            _moe_apply_mxfp4_plan(
+                activation="swiglu",
+                ispp=2304,
+                internal_activation_dtype="fp8",
+                solution=solution,
+            )
         with pytest.raises(kernel_NoKernelFoundError):
             _moe_apply_mxfp4_plan(
                 activation="swiglu",
@@ -4606,6 +4656,22 @@ def _case(
 
 
 _CASES = [
+    *[
+        _case(
+            _is_blackwell_sm100,
+            "blackwell-sm100",
+            "gemm",
+            "mm",
+            (
+                "triton_mm_fp8_blockscale"
+                if 17 <= m <= 32
+                else "flashinfer_mm_fp8_blockscale"
+            ),
+            partial(_mm_mxfp8, m),
+            id_suffix=f"fp8-rows-{m}",
+        )
+        for m in (16, 17, 24, 32, 33)
+    ],
     # Attention API x architecture golden cases.
     _case(
         _is_cdna4,
@@ -5600,8 +5666,8 @@ _CASES = [
         "hopper",
         "gemm",
         "mm",
-        "deep_gemm_mm_fp8_blockscale",
-        _mm_mxfp8,
+        "triton_mm_fp8_blockscale",
+        lambda: _mm_mxfp8(4),
     ),
     _case(
         _is_blackwell_sm100,
@@ -5609,7 +5675,7 @@ _CASES = [
         "gemm",
         "mm",
         "flashinfer_mm_fp8_blockscale",
-        _mm_mxfp8,
+        lambda: _mm_mxfp8(4),
     ),
     _case(
         _is_blackwell_sm100,
@@ -5678,7 +5744,7 @@ _CASES = [
         "gemm",
         "mm",
         "triton_mm_fp8_blockscale",
-        _mm_mxfp8,
+        lambda: _mm_mxfp8(4),
     ),
     _case(
         _is_hopper_plus,
@@ -5693,9 +5759,9 @@ _CASES = [
         _is_supported_gpu,
         "supported-gpu",
         "quantization",
-        "fp8_quantize_dequantize",
-        "triton_fp8_quantize_dequantize",
-        _fp8_quantize_dequantize,
+        "fp8",
+        "triton_quantize_fp8_roundtrip",
+        _quantize_fp8,
     ),
     _case(
         _is_hopper,

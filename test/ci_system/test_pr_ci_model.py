@@ -94,6 +94,11 @@ def test_escaped_sensitive_summary_cannot_be_published(tmp_path, monkeypatch):
     for text in (f"[CI]({link}) example.com", f"[CI]({link}?extra=1)"):
         with pytest.raises(SystemExit, match="public-output check"):
             module._check_public_output(text, tmp_path, source_links=True)
+    with pytest.raises(SystemExit, match="comment size limit"):
+        module._check_public_output("x" * 60001, tmp_path)
+    module._check_public_output("x" * 60001, tmp_path, max_length=200000)
+    with pytest.raises(SystemExit, match="public-output check"):
+        module._check_public_output("example.com", tmp_path, max_length=200000)
 
 
 def test_invalid_proposal_gets_one_bounded_correction(tmp_path, monkeypatch):

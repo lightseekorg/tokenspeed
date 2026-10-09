@@ -23,7 +23,6 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.quantization import (
-    fp8_quantize_dequantize,
     quantize_fp8,
     quantize_fp8_with_scale,
     quantize_mxfp4,
@@ -62,15 +61,27 @@ def _dequantize_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor
     return out * scale_values.repeat_interleave(32, dim=-1)
 
 
+def test_fp8_roundtrip_rejects_pdl() -> None:
+    with pytest.raises(ValueError, match="does not support enable_pdl"):
+        quantize_fp8(
+            torch.empty((2, 128), dtype=torch.bfloat16),
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="ue8m0",
+            dequantize=True,
+            enable_pdl=True,
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("group_size", [64, 128])
-def test_fp8_quantize_dequantize_ue8m0(
+def test_quantize_fp8_ue8m0(
     device: str,
     dtype: torch.dtype,
     group_size: int,
     require,
 ) -> None:
-    require("quantization", "fp8_quantize_dequantize", "triton", dtype, "x")
+    require("quantization", "fp8", "triton", dtype, "x")
     torch.manual_seed(41)
     base = torch.randn(3, 2, group_size * 3 + 17, device=device, dtype=dtype)
     x = base[..., : group_size * 3]
@@ -87,31 +98,34 @@ def test_fp8_quantize_dequantize_ue8m0(
         .to(dtype)
     )
 
-    actual = fp8_quantize_dequantize(
+    actual, returned_scale = quantize_fp8(
         x,
+        granularity="token_group",
         group_size=group_size,
         scale_encoding="ue8m0",
-        override=None,
+        dequantize=True,
         solution="triton",
     )
     torch.cuda.synchronize()
 
+    assert returned_scale is None
     assert actual.shape == x.shape
     assert actual.dtype == x.dtype
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_fp8_quantize_dequantize_cuda_graph_replay(device: str, require) -> None:
+def test_quantize_fp8_cuda_graph_replay(device: str, require) -> None:
     dtype = torch.bfloat16
-    require("quantization", "fp8_quantize_dequantize", "triton", dtype, "x")
+    require("quantization", "fp8", "triton", dtype, "x")
     x = torch.randn(8, 384, device=device, dtype=dtype)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = fp8_quantize_dequantize(
+        actual, returned_scale = quantize_fp8(
             x,
+            granularity="token_group",
             group_size=128,
             scale_encoding="ue8m0",
-            override=None,
+            dequantize=True,
             solution="triton",
         )
 
@@ -119,6 +133,7 @@ def test_fp8_quantize_dequantize_cuda_graph_replay(device: str, require) -> None
     graph.replay()
     torch.cuda.synchronize()
 
+    assert returned_scale is None
     blocks = x.float().unflatten(-1, (-1, 128))
     absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
     scales = torch.exp2(torch.ceil(torch.log2(absmax / 448.0)))
@@ -158,9 +173,10 @@ def test_quantize_fp8_pure_cast_bf16(
     x = torch.randn(shape, device=device, dtype=dtype) * 50
     ref = x.to(_FP8_DTYPE)
 
-    out = quantize_fp8(x, solution=solution)
+    out, scale = quantize_fp8(x, solution=solution)
     torch.cuda.synchronize()
 
+    assert scale is None
     assert out.shape == ref.shape
     assert out.dtype == _FP8_DTYPE
     assert _bitwise_equal(out, ref)
@@ -233,9 +249,10 @@ def test_quantize_fp8_strided_slice(
 
     ref = v.to(_FP8_DTYPE)
 
-    out = quantize_fp8(v, solution=solution)
+    out, scale = quantize_fp8(v, solution=solution)
     torch.cuda.synchronize()
 
+    assert scale is None
     assert _bitwise_equal(out, ref)
 
 
@@ -259,10 +276,19 @@ def test_quantize_fp8_scale_float(
         .to(_FP8_DTYPE)
     )
 
-    out = quantize_fp8(x, scale=scale, solution=solution)
+    out, returned_scale = quantize_fp8(x, scale=scale, solution=solution)
     torch.cuda.synchronize()
 
+    assert returned_scale.item() == scale
     assert _bitwise_equal(out, ref)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured, captured_scale = quantize_fp8(x, scale=scale, solution=solution)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert captured_scale.item() == scale
+    assert _bitwise_equal(captured, ref)
 
 
 @pytest.mark.parametrize("solution", ["triton"])
@@ -284,7 +310,34 @@ def test_quantize_fp8_scale_tensor(
         .to(_FP8_DTYPE)
     )
 
-    out = quantize_fp8(x, scale=scale, solution=solution)
+    out, returned_scale = quantize_fp8(x, scale=scale, solution=solution)
+    torch.cuda.synchronize()
+
+    assert returned_scale is scale
+    assert _bitwise_equal(out, ref)
+
+
+@pytest.mark.parametrize(("m", "n"), [(17, 5120), (2049, 6144), (16385, 2048)])
+def test_quantize_fp8_scale_tensor_wide_rows(
+    device: str,
+    m: int,
+    n: int,
+    require,
+) -> None:
+    # Wide rows take one to eight rows per program, so odd row counts leave a tail.
+    torch.manual_seed(4)
+    dtype = torch.bfloat16
+    require("quantization", "fp8", "triton", dtype, "x")
+
+    x = torch.randn(m, n, device=device, dtype=dtype) * 100
+    scale = torch.tensor([0.125], device=device, dtype=torch.float32)
+    ref = (
+        (x.to(torch.float32) * (1.0 / scale).reshape(()))
+        .clamp(min=_FP8_FINFO.min, max=_FP8_FINFO.max)
+        .to(_FP8_DTYPE)
+    )
+
+    out, _ = quantize_fp8(x, scale=scale, solution="triton")
     torch.cuda.synchronize()
 
     assert _bitwise_equal(out, ref)
@@ -379,6 +432,77 @@ def test_quantize_fp8_with_scale_token_group(
     assert scale.numel() == expected_num_scales
     if solution == "triton":
         assert scale.shape == (x.shape[0], x.shape[1] // group_size)
+
+
+@pytest.mark.parametrize("solution", [None, "trtllm", "triton"])
+def test_quantize_fp8_dynamic_token(
+    device: str,
+    solution: str | None,
+    require,
+) -> None:
+    torch.manual_seed(4)
+    dtype = torch.bfloat16
+    require("quantization", "fp8_with_scale", solution, dtype, "x")
+
+    x = torch.randn(16, 128, device=device, dtype=dtype) * 10
+    out, scale = quantize_fp8(
+        x,
+        granularity="token",
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert out.dtype == _FP8_DTYPE
+    assert scale.dtype == torch.float32
+    assert scale.shape == (x.shape[0], 1)
+    expected_scales = x.float().abs().amax(-1, keepdim=True) / _FP8_FINFO.max
+    # TRT-LLM stores its native scales in the input dtype before the adapter
+    # promotes them to FP32. Either representation is valid for auto dispatch.
+    rounded_scales = expected_scales.to(dtype).float()
+    if solution == "trtllm" or (
+        solution is None and torch.equal(scale, rounded_scales)
+    ):
+        expected_scales = rounded_scales
+    torch.testing.assert_close(scale, expected_scales)
+    reconstructed = out.float() * scale
+    assert torch.norm(reconstructed - x.float()) / torch.norm(x.float()) < 0.04
+
+
+@pytest.mark.parametrize(
+    "solution,group_size",
+    [(None, 128), (None, 32), ("trtllm", 128), ("triton", 128), ("triton", 32)],
+)
+@pytest.mark.parametrize("rows", [1, 13, 16, 17])
+def test_quantize_fp8_dynamic_token_group(
+    device: str,
+    rows: int,
+    solution: str | None,
+    group_size: int,
+    require,
+) -> None:
+    torch.manual_seed(5)
+    dtype = torch.bfloat16
+    require("quantization", "fp8_with_scale", solution, dtype, "x")
+
+    x = torch.randn(rows, 256, device=device, dtype=dtype) * 10
+    out, scale = quantize_fp8(
+        x,
+        granularity="token_group",
+        group_size=group_size,
+        solution=solution,
+    )
+    torch.cuda.synchronize()
+
+    assert out.shape == x.shape
+    assert out.dtype == _FP8_DTYPE
+    assert scale.dtype == torch.float32
+    assert scale.shape == (x.shape[0], x.shape[1] // group_size)
+    assert scale.is_contiguous()
+    expected_scales = x.float().unflatten(-1, (-1, group_size)).abs().amax(-1) / 448
+    torch.testing.assert_close(scale, expected_scales)
+    reconstructed = out.float() * scale.repeat_interleave(group_size, dim=-1)
+    assert torch.norm(reconstructed - x.float()) / torch.norm(x.float()) < 0.04
 
 
 @pytest.mark.parametrize("solution", ["flashinfer"])

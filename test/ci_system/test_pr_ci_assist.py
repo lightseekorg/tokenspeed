@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import copy
+import io
 import json
 import sys
 from pathlib import Path
@@ -226,6 +227,98 @@ def test_state_is_typed_and_bot_owned(selected):
     assert record(comment, "assist") is None
 
 
+@pytest.fixture
+def published_comments(monkeypatch, tmp_path):
+    comments = []
+
+    def get_comment(path):
+        return next(c for c in comments if path == f"issues/comments/{c['id']}")
+
+    def command(*args):
+        if args == ("gh", "auth", "token", "--hostname", "github.com"):
+            return "test-token"
+        assert args[:3] == ("gh", "pr", "comment")
+        assert args[4:6] == ("--repo", REPO)
+        comment = dict(
+            id=len(comments) + 1,
+            user={"login": BOT, "id": BOT_ID},
+            body=Path(args[-1]).read_text(),
+        )
+        comments.append(comment)
+        return f"https://github.com/{REPO}/pull/123#issuecomment-{comment['id']}"
+
+    def patch(request, *, timeout):
+        assert request.method == "PATCH" and timeout == 30
+        assert request.get_header("Authorization") == "Bearer test-token"
+        prefix = f"https://api.github.com/repos/{REPO}/"
+        assert request.full_url.startswith(prefix)
+        get_comment(request.full_url.removeprefix(prefix))["body"] = json.loads(
+            request.data
+        )["body"]
+        return io.BytesIO()
+
+    monkeypatch.setattr(assist, "WORK", tmp_path)
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pages", lambda *args: comments)
+    monkeypatch.setattr(assist, "api", get_comment)
+    monkeypatch.setattr(assist, "command", command)
+    monkeypatch.setattr(assist, "urlopen", patch)
+    return comments
+
+
+def test_publish_saves_progress_without_new_comments(selected, published_comments):
+    task, state = selected
+    assist.publish(state, "Watching selected tasks.")
+    initial = published_comments[0]["body"].split("<!--")[0]
+    # A newer bot comment must not redirect edits away from the state record.
+    unrelated = dict(id=2, user={"login": BOT, "id": BOT_ID}, body="Other update.")
+    published_comments.append(unrelated)
+
+    state["submitted"].append(assist.run_title(task, state["head"], "gb200"))
+    assist.publish(state, "Selected task dispatch requested.")
+    state["statuses"] = ["waiting"]
+    state["run_ids"][assist.task_key(task)] = 101
+    assist.publish(state, "1 waiting.")
+    assert len(published_comments) == 2
+    assert unrelated["body"] == "Other update."
+    assert published_comments[0]["body"].split("<!--")[0] == initial
+    assert record(published_comments[0], "assist") == state
+
+    state.update(phase="done", statuses=["passed"])
+    assist.publish(state, "1 passed.")
+    assert len(published_comments) == 3
+    assert "1 passed." in published_comments[-1]["body"]
+    assert "| Check | Source | Result |" in published_comments[-1]["body"]
+    assist.publish(state, "1 passed.")
+    assert len(published_comments) == 3
+
+
+def test_publish_keeps_latest_record_readable(selected, published_comments):
+    _, state = selected
+    assist.publish(state, "Started.")
+    first = published_comments[0]["body"]
+    newer = {**state, "command": 43}
+    assist.publish(newer, "Started.")
+    assert len(published_comments) == 2
+    second = published_comments[1]["body"]
+    state["statuses"] = ["waiting"]
+    assist.publish(state, "1 waiting.")
+    assert len(published_comments) == 3
+    assert [c["body"] for c in published_comments[:2]] == [first, second]
+    latest = assist.latest_state_comment(published_comments, state["pr"])
+    assert record(latest, "assist") == state
+
+
+def test_publish_verifies_edited_state(monkeypatch, selected, published_comments):
+    _, state = selected
+    assist.publish(state, "Started.")
+    stale = copy.deepcopy(published_comments[0])
+    state["statuses"] = ["waiting"]
+    monkeypatch.setattr(assist, "api", lambda path: stale)
+    with pytest.raises(ValueError, match="Published state differs"):
+        assist.publish(state, "1 waiting.")
+
+
 @pytest.mark.parametrize(
     "workflow", ["scheduler-cpp-test.yml", "nvidia-kernel-library-tests.yml"]
 )
@@ -308,7 +401,9 @@ def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
     monkeypatch.setattr(assist, "load_state", lambda *args: state)
     monkeypatch.setattr(assist, "latest_command", lambda *args: None)
     monkeypatch.setattr(assist, "checkout", lambda *args: tmp_path)
-    monkeypatch.setattr(assist, "context", lambda *args: {"native_checks": [check]})
+    monkeypatch.setattr(
+        assist, "context", lambda *args: {"native_checks": [check], "paths": []}
+    )
     tasks = [task]
     monkeypatch.setattr(assist, "validate_plan", lambda *args: tasks)
     monkeypatch.setattr(assist, "runs_for", lambda *args: [])
@@ -319,6 +414,8 @@ def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
             path=".github/workflows/pr-ci-plan.yml",
             conclusion="success",
             display_title=f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+            run_started_at="2030-01-01T00:00:00Z",
+            object={"sha": "c" * 40},
         ),
     )
     monkeypatch.setattr(assist, "task_status", lambda *args, **kwargs: "passed")
@@ -332,6 +429,8 @@ def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
     assist.control(state["pr"])
     assert state["phase"] == "watching" and "1 waiting" in messages[-1]
     cpu["status"] = "failed"
+    if action == "fix":
+        pr["mergeable"] = False
     emitted = []
     monkeypatch.setattr(assist, "output", lambda *args: emitted.append(args))
     assist.control(state["pr"])
@@ -339,7 +438,16 @@ def test_native_check_waits_and_hands_off_failure_without_gpu_retry(
         assert state["phase"] == "repairing" and emitted == [("repair", "true")]
         request = json.loads(tmp_path.joinpath("request.json").read_text())
         assert request["state"]["native_checks"] == [cpu]
-        assert request["state"]["statuses"] == ["passed"]
+        assert request["state"]["statuses"] == ["waiting"]
+        assert request["state"]["validation_base"] == "c" * 40
+        assert repair.NATIVE_CONFIG in repair.allowed_paths(request)
+        assert (
+            record(
+                {"user": {"login": BOT, "id": BOT_ID}, "body": marker("assist", state)},
+                "assist",
+            )
+            == state
+        )
         return
     assert state["phase"] == "manual" and "human intervention" in messages[-1]
     # A fresh CPU-only watch can finish without inventing a GPU task.
@@ -463,6 +571,51 @@ def test_native_dispatch_reservation_prevents_duplicate_submission(
     assert published[0]["native_submitted"] == [workflow]
     comment = dict(user=dict(login=BOT, id=BOT_ID), body=marker("assist", state))
     assert record(comment, "assist") == state
+    state["repair_run"] = 201
+    state["candidate"]["branch"] += "-201"
+    comment["body"] = marker("assist", state)
+    assert record(comment, "assist") == state
+    state["repair_run"] = 202
+    comment["body"] = marker("assist", state)
+    assert record(comment, "assist") is None
+
+
+def test_repair_progress_withholds_model_text_arguments_and_errors(capsys):
+    seen = set()
+    repair.repair_progress(
+        json.dumps(
+            dict(
+                type="turn.step.retrying",
+                error_name="APIConnectionError",
+                error_message="OUTBOUND_SENTINEL",
+            )
+        ),
+        seen,
+    )
+    repair.repair_progress(
+        json.dumps(
+            dict(
+                role="assistant",
+                content="OUTBOUND_SENTINEL",
+                tool_calls=[
+                    dict(function=dict(name="Read", arguments="OUTBOUND_SENTINEL"))
+                ],
+            )
+        ),
+        seen,
+    )
+    repair.repair_progress(
+        json.dumps(
+            dict(
+                role="tool",
+                content=json.dumps(dict(type="error", message="OUTBOUND_SENTINEL")),
+            )
+        ),
+        seen,
+    )
+    output = capsys.readouterr().out
+    assert "OUTBOUND_SENTINEL" not in output
+    assert "APIConnectionError" in output and "tool requested: Read" in output
 
 
 def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
@@ -475,7 +628,17 @@ def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
     repair.identity(tmp_path)
     task = tmp_path / repair.NATIVE_CONFIG
     task.parent.mkdir(parents=True)
-    original = assist.ROOT.joinpath(repair.NATIVE_CONFIG).read_text()
+    prefix = 'PYTHONPATH="python:tokenspeed-kernel/python"'
+    suffix = "$" + "{PYTHONPATH:+:$PYTHONPATH}"
+    original = (
+        assist.ROOT.joinpath(repair.NATIVE_CONFIG)
+        .read_text()
+        .replace(prefix[:-1] + suffix + '"', prefix)
+        .replace(
+            'PYTHONPATH="tokenspeed-mla/python' + suffix + '" ',
+            "PYTHONPATH=tokenspeed-mla/python ",
+        )
+    )
     task.write_text(original)
     git("add", ".")
     git("commit", "-s", "-m", "initial")
@@ -494,8 +657,6 @@ def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
     )
     allowed = repair.allowed_paths(request)
     assert allowed == {"model.py", repair.NATIVE_CONFIG}
-    prefix = 'PYTHONPATH="python:tokenspeed-kernel/python"'
-    suffix = "$" + "{PYTHONPATH:+:$PYTHONPATH}"
     candidate = original.replace(prefix, prefix[:-1] + suffix + '"')
     task.write_text(candidate)
     assert repair.guard(tmp_path, head, allowed)
@@ -505,11 +666,203 @@ def test_native_task_repair_preserves_commands_and_protected_controls(tmp_path):
     )
     with pytest.raises(ValueError, match="retain the original tests"):
         repair.guard(tmp_path, head, allowed)
+    # Main may update another command while this older PR needs its import fix.
+    main_task = original.replace(
+        "PYTHONPATH=tokenspeed-mla/python ",
+        'PYTHONPATH="tokenspeed-mla/python${PYTHONPATH:+:$PYTHONPATH}" ',
+    )
+    task.write_text(main_task)
+    assist.command("git", "add", ".", cwd=tmp_path)
+    assist.command(
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "commit",
+        "-s",
+        "-m",
+        "base",
+        cwd=tmp_path,
+    )
+    base = assist.command("git", "rev-parse", "HEAD", cwd=tmp_path)
+    task.write_text(main_task.replace(prefix, prefix[:-1] + suffix + '"'))
+    assert repair.guard(tmp_path, head, allowed, validation_base=base)
+    task.write_text(candidate)
+    with pytest.raises(ValueError, match="retain the original tests"):
+        repair.guard(tmp_path, head, allowed, validation_base=base)
     task.write_text(candidate.replace(suffix, ":$PYTHONPATH"))
     with pytest.raises(ValueError, match="retain the original tests"):
         repair.guard(tmp_path, head, allowed)
     request["state"]["native_checks"][0]["status"] = "passed"
     assert repair.NATIVE_CONFIG not in repair.allowed_paths(request)
+
+
+def test_runtime_lint_returns_unused_import_to_corrective_turn(monkeypatch, tmp_path):
+    import time
+
+    path = "python/tokenspeed/runtime/model.py"
+    source = tmp_path / path
+    source.parent.mkdir(parents=True)
+    source.write_text("import math\n")
+    # Repository files must not replace the installed checker in the model runner.
+    tmp_path.joinpath("ruff.py").write_text('raise RuntimeError("untrusted checker")\n')
+    request = dict(deadline=int(time.time()) + 60, data=dict(paths=[path]))
+    feedback = tmp_path / "feedback.json"
+    turns = []
+
+    def edit(attempt):
+        turns.append(attempt)
+        if attempt:
+            issue = json.loads(feedback.read_text())
+            assert issue["category"] == "runtime-lint"
+            assert issue["path"] == path
+            assert issue["details"][0]["code"] == "F401"
+            source.write_text("VALUE = 1\n")
+
+    def proposal():
+        repair.runtime_lint(tmp_path, request)
+        return source.read_text()
+
+    assert (
+        repair.repair_with_feedback(request, edit, proposal, feedback) == "VALUE = 1\n"
+    )
+    assert turns == [0, 1]
+
+
+def test_conflicted_test_resolution_preserves_both_sides_assertions(tmp_path, selected):
+    def git(*args):
+        return assist.command(
+            "git", "-c", "core.hooksPath=/dev/null", *args, cwd=tmp_path
+        )
+
+    git("init", "-b", "main")
+    repair.identity(tmp_path)
+    path = "test/runtime/test_model.py"
+    file = tmp_path / path
+    file.parent.mkdir(parents=True)
+    file.write_text("def test_result():\n    assert value == 0\n")
+    other_path = "test/runtime/test_other.py"
+    other = tmp_path / other_path
+    other.write_text("assert other_value == 3\n")
+    git("add", ".")
+    git("commit", "-s", "-m", "initial")
+    ancestor = git("rev-parse", "HEAD")
+    file.write_text(
+        "def test_result():\n    assert value == 0\n    assert value == 1\n"
+    )
+    git("add", ".")
+    git("commit", "-s", "-m", "head")
+    head = git("rev-parse", "HEAD")
+    git("checkout", "--detach", ancestor)
+    file.write_text(
+        "def test_result():\n    torch.testing.assert_close(actual, expected, atol=0)\n"
+    )
+    other.write_text("assert other_value == 3\nassert other_value == 5\n")
+    git("add", ".")
+    git("commit", "-s", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    git("checkout", "--detach", head)
+    _, state = selected
+    state.update(action="fix", validation_base=base, repair_run=201)
+    request = dict(
+        state=state,
+        data=dict(paths=[path, "test/runtime/test_other.py"]),
+        conflicts=True,
+    )
+    assert path not in repair.allowed_paths(request)
+    request["conflicted_tests"] = [path]
+    assert repair.allowed_paths(request) == {path}
+    candidate = "def test_result():\n    assert value == 1\n    torch.testing.assert_close(actual, expected, atol=0)\n"
+    file.write_text(candidate)
+    repair.guard_test_assertions(tmp_path, head, base, path)
+    file.write_text(candidate.replace("atol=0", "atol=1"))
+    with pytest.raises(ValueError, match="test assertions"):
+        repair.guard_test_assertions(tmp_path, head, base, path)
+    file.write_text(candidate.replace("    assert value == 1\n", ""))
+    with pytest.raises(repair.RepairRejected, match="test assertions") as rejection:
+        repair.guard_test_assertions(tmp_path, head, base, path)
+    assert rejection.value.feedback["details"] == ["assert value == 1"]
+    other.write_text("assert other_value == 3\n")
+    with pytest.raises(repair.RepairRejected) as rejection:
+        repair.guard(tmp_path, head, {path, other_path}, validation_base=base)
+    issues = rejection.value.feedback["issues"]
+    assert {issue["path"] for issue in issues} == {path, other_path}
+    assert issues[1]["details"] == ["assert other_value == 5"]
+
+
+def test_source_screen_retains_public_parents_and_rejects_new_private_text(tmp_path):
+    def git(*args):
+        return assist.command(
+            "git", "-c", "core.hooksPath=/dev/null", *args, cwd=tmp_path
+        )
+
+    git("init", "-b", "main")
+    repair.identity(tmp_path)
+    file = tmp_path / "model.py"
+    file.write_text("# head https://example.com/v1\nvalue = 1\n")
+    root_api = tmp_path / repair.ROOT_API
+    root_api.parent.mkdir(parents=True)
+    old_exports = 'from package.ops import mm\n__all__ = ["mm"]\n'
+    bootstrap = "from package import bootstrap as _bootstrap\n_bootstrap()\n"
+    root_api.write_text(old_exports)
+    fp8_api = tmp_path / repair.FP8_API
+    fp8_api.parent.mkdir(parents=True)
+    fp8_api.write_text("value = 1\n")
+    fp8_reference = tmp_path / repair.FP8_REFERENCE
+    fp8_reference.write_text(
+        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return native_quantizer(x)\n"
+    )
+    git("add", ".")
+    git("commit", "-s", "-m", "initial")
+    head = git("rev-parse", "HEAD")
+    file.write_text("# main https://example.com/v1\nvalue = 2\n")
+    root_api.write_text(bootstrap)
+    git("add", ".")
+    git("commit", "-s", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    file.write_text("# main https://example.com/v1\nvalue = 3\n")
+    assert repair.guard(
+        tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
+    )
+    root_api.write_text(old_exports)
+    with pytest.raises(repair.RepairRejected, match="removed root operator exports"):
+        repair.guard(
+            tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
+        )
+    root_api.write_text(bootstrap)
+    assert repair.new_source_text(tmp_path, head, base, {"model.py"}) == "value = 3"
+    fp8_api.write_text(
+        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return x / x.abs().amax()\n"
+    )
+    with pytest.raises(repair.RepairRejected, match="Reuse main's prepacked quantizer"):
+        repair.guard(
+            tmp_path,
+            head,
+            {"model.py", repair.ROOT_API, repair.FP8_API},
+            validation_base=base,
+        )
+    fp8_api.write_text(
+        "from tokenspeed_kernel.ops.gemm.fp8_utils import flashinfer_fp8_blockscale_quantize_prepacked\n"
+    )
+    assert repair.guard(
+        tmp_path,
+        head,
+        {"model.py", repair.ROOT_API, repair.FP8_API},
+        validation_base=base,
+    )
+    fp8_reference.unlink()
+    with pytest.raises(repair.RepairRejected, match="merged source has no"):
+        repair.guard_prepacked_reference(tmp_path, head, base)
+    fp8_api.write_text(
+        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return registered_quantizer(x)\n"
+    )
+    repair.guard_prepacked_reference(tmp_path, head, base)
+    fp8_reference.write_text(git("show", f"{base}:{repair.FP8_REFERENCE}") + "\n")
+    fp8_api.write_text("value = 1\n")
+    file.write_text("# new https://example.com/v1\nvalue = 3\n")
+    with pytest.raises(repair.RepairRejected, match="public-output"):
+        repair.guard(
+            tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
+        )
 
 
 def test_native_dispatch_rejects_changed_workflow_controls(
@@ -606,6 +959,45 @@ def test_native_failure_diagnostics_include_slurm_artifact(monkeypatch, tmp_path
     diagnostics = tmp_path.joinpath("model/diagnostics.txt").read_text()
     assert "native job failure evidence" in diagnostics
     assert "native Slurm failure evidence" in diagnostics
+    request["diagnostics"] = {
+        "run_ids": {},
+        "native_checks": [
+            dict(workflow="nvidia-kernel-library-tests.yml", status="failed", run=102)
+        ],
+    }
+    tmp_path.joinpath("request.json").write_text(json.dumps(request))
+    requested = []
+    monkeypatch.setattr(
+        repair, "api", lambda path: requested.append(path) or dict(run_attempt=1)
+    )
+    repair.configure()
+    assert requested == ["actions/runs/102"]
+    prior = {
+        **request,
+        "state": {
+            "repair_run": 201,
+            "repository": REPO,
+            "pr": 123,
+            "head": "a" * 40,
+            "base": "b" * 40,
+            "command": 43,
+        },
+    }
+    prior["state"]["validation_base"] = "b" * 40
+    previous = tmp_path / "previous-repair"
+    previous.mkdir()
+    previous.joinpath("request.json").write_text(json.dumps(prior))
+    previous.joinpath("patch.diff").write_text("accepted source edits")
+    request.update(resume_run=201, state={**prior["state"], "repair_run": 202})
+    request.pop("diagnostics")
+    tmp_path.joinpath("request.json").write_text(json.dumps(request))
+    requested.clear()
+    repair.configure()
+    assert requested == ["actions/runs/102"]
+    assert (
+        json.loads(tmp_path.joinpath("request.json").read_text())["diagnostics"]
+        == prior["diagnostics"]
+    )
 
 
 def test_failed_task_retries_once_and_falls_back_only_before_submission(
@@ -854,7 +1246,7 @@ def test_promotion_needs_nonempty_matching_task_result(selected):
     )
 
 
-def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
+def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path, monkeypatch):
     def git(*args):
         return assist.command(
             "git", "-c", "core.hooksPath=/dev/null", *args, cwd=tmp_path
@@ -864,10 +1256,24 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     repair.identity(tmp_path)
     file = tmp_path / "model.py"
     file.write_text("value = 1\n")
+    unchanged = tmp_path / "context.py"
+    unchanged.write_text("context = 1\n")
+    test_path = "test/test_model.py"
+    resolved = tmp_path / test_path
+    resolved.parent.mkdir()
+    resolved.write_text("assert value == 1\n")
+    legacy = tmp_path / "test/test_legacy.py"
+    legacy.write_text("# preserved\n" * 8 + "assert value == 1\n")
+    renamed_path = "test/test_retained.py"
+    retained = tmp_path / renamed_path
     git("add", ".")
     git("commit", "-s", "-m", "initial")
     common = git("rev-parse", "HEAD")
     file.write_text("value = 2\n")
+    unchanged.write_text("context = 2\n")
+    resolved.unlink()
+    legacy.rename(retained)
+    retained.write_text(retained.read_text() + "assert value == 2\n")
     other = tmp_path / "base.py"
     other.write_text("base_only = True\n")
     git("add", ".")
@@ -875,26 +1281,92 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     base = git("rev-parse", "HEAD")
     git("checkout", "-b", "bot/test", common)
     file.write_text("value = 3\n")
+    unchanged.write_text("context = 3\n")
+    resolved.write_text("assert value == 1\nassert value == 3\n")
+    legacy.unlink()
     git("add", ".")
     git("commit", "-s", "-m", "head")
     head = git("rev-parse", "HEAD")
-    assert repair.merge(tmp_path, base, commit=False) == ["model.py"]
+    conflicts = {"model.py", "context.py", test_path, renamed_path}
+    assert set(repair.merge(tmp_path, base, commit=False)) == conflicts
     file.write_text("value = 4\n")
-    repair.restore_patch(tmp_path, head, {"model.py"})
+    repair.restore_patch(tmp_path, head, {"model.py", renamed_path})
     assert not other.exists()  # no wholesale main changes in the PR patch
-    repair.guard(tmp_path, head, {"model.py"})
+    file.write_text("value =\n")
+    with pytest.raises(repair.RepairRejected, match="not valid Python"):
+        repair.guard(tmp_path, head, {"model.py", renamed_path}, validation_base=base)
+    file.write_text("value = 4\n")
+    allowed = conflicts
+    diff = repair.guard(tmp_path, head, allowed, validation_base=base)
+    assert f"b/{renamed_path}" in diff
+    retained.chmod(0o755)
+    with pytest.raises(repair.RepairRejected, match="file type or mode"):
+        repair.guard(tmp_path, head, allowed, validation_base=base)
+    retained.chmod(0o644)
+    seed_work = tmp_path.parent / (tmp_path.name + "-seed")
+    previous = seed_work / "previous-repair"
+    previous.mkdir(parents=True)
+    previous.joinpath("patch.diff").write_text(diff + "\n")
+    state = dict(
+        repository=REPO,
+        pr=123,
+        head=head,
+        base=common,
+        command=43,
+        validation_base=base,
+        repair_run=201,
+    )
+    previous.joinpath("request.json").write_text(json.dumps({"state": state}))
+    request = dict(state={**state, "repair_run": 202}, resume_run=201)
+    monkeypatch.setattr(repair, "ROOT", tmp_path)
+    monkeypatch.setattr(repair, "WORK", seed_work)
+    git("remote", "add", "origin", str(tmp_path))
+    git("reset", "--hard", head)
+    assert not retained.exists()
+    git("apply", "--index", str(previous / "patch.diff"))
+    assert repair.guard(tmp_path, head, allowed, validation_base=base) == diff
+    git("reset", "--hard", head)
+    repair.merge(tmp_path, base, commit=False)
+    previous.joinpath("request.json").write_text(
+        json.dumps({"state": {**state, "command": 42}})
+    )
+    with pytest.raises(ValueError, match="authorized PR"):
+        repair.seed_repair(tmp_path, request, allowed, conflicts)
+    previous.joinpath("request.json").write_text(json.dumps({"state": state}))
+    assert repair.seed_repair(tmp_path, request, allowed, conflicts)
+    request.update(check_only=True, deadline=1893459600)
+    seed_work.joinpath("request.json").write_text(json.dumps(request))
+    repair.reuse()
+    replay = json.loads(seed_work.joinpath("request.json").read_text())
+    assert replay["deadline"] == request["deadline"]
+    assert replay["state"] == request["state"]
+    assert (
+        seed_work.joinpath("patch.diff").read_bytes()
+        == previous.joinpath("patch.diff").read_bytes()
+    )
+    repair.restore_patch(tmp_path, head, allowed)
+    assert file.read_text() == "value = 4\n"
+    assert retained.read_text().endswith("assert value == 2\n")
+    repair.guard(tmp_path, head, allowed, validation_base=base)
     git("add", ".")
     git("commit", "-s", "-m", "repair")
     patch = git("rev-parse", "HEAD")
-    tree = repair.effective_merge(tmp_path, base, head)
+    with pytest.raises(ValueError, match="beyond the reviewed patch"):
+        repair.effective_merge(tmp_path, base, head, resolved_paths=set())
+    git("merge", "--abort")
+    tree = repair.effective_merge(tmp_path, base, head, resolved_paths=conflicts)
     assert other.read_text() == "base_only = True\n"
     assert file.read_text() == "value = 4\n"
+    assert unchanged.read_text() == "context = 3\n"
+    assert resolved.read_text() == "assert value == 1\nassert value == 3\n"
     repair.commit_merge(tmp_path, "validation")
     assert git("rev-parse", "HEAD^{tree}") == tree
     git("checkout", "--detach", head)
     git("cherry-pick", "--signoff", patch)
     assert git("rev-parse", "HEAD^1") == head
-    assert repair.effective_merge(tmp_path, base, head) == tree
+    assert (
+        repair.effective_merge(tmp_path, base, head, resolved_paths=conflicts) == tree
+    )
     repair.commit_merge(tmp_path, "reconcile main")
     assert git("rev-parse", "HEAD^2") == base
     assert git("rev-parse", "HEAD^{tree}") == tree
@@ -903,6 +1375,40 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     assert proof["source_sha"] == git("rev-parse", "HEAD")
     with pytest.raises(ValueError, match="selected commit"):
         write_source(tmp_path, "f" * 40, "test/ci/example.yaml", "amd-1gpu")
+
+    # A main update outside the model's patch can refresh checks while keeping
+    # the resolved source; an overlapping change needs a fresh model repair.
+    git("checkout", "--detach", base)
+    other.write_text("base_only = False\n")
+    git("add", "--", "base.py")
+    git("commit", "-s", "-m", "updated base")
+    updated = git("rev-parse", "HEAD")
+    git("checkout", "--detach", head)
+    file.write_text("value = 4\n")
+    request = {
+        "state": {"head": head, "base": common, "validation_base": base},
+        "conflicted_tests": sorted([test_path, renamed_path]),
+        "conflicted_paths": sorted(conflicts),
+    }
+    retained.write_text(git("show", f"{base}:{renamed_path}") + "\n")
+    git("add", "--", renamed_path)
+    repair.refresh_validation_base(tmp_path, request, updated)
+    assert file.read_text() == "value = 4\n" and not other.exists()
+    assert request["state"]["validation_base"] == updated
+    assert request["repair_base"] == base
+    assert repair.guard(tmp_path, head, allowed, validation_base=updated)
+    git("reset", "--hard", head)
+    git("checkout", "--detach", updated)
+    file.write_text("value = 5\n")
+    git("add", "--", "model.py")
+    git("commit", "-s", "-m", "overlapping base")
+    overlapping = git("rev-parse", "HEAD")
+    git("checkout", "--detach", head)
+    file.write_text("value = 4\n")
+    request["state"]["validation_base"] = base
+    with pytest.raises(ValueError, match="Main changed repaired files"):
+        repair.refresh_validation_base(tmp_path, request, overlapping)
+    assert file.read_text() == "value = 4\n"
 
 
 def test_source_change_stops_before_dispatch(monkeypatch, tmp_path, selected):
@@ -988,9 +1494,16 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
                 "path": ".github/workflows/pr-ci-plan.yml",
                 "conclusion": "success",
                 "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+                "status": "completed",
+                "run_started_at": "2030-01-01T00:00:00Z",
+                "object": {"sha": state["base"]},
             }
             if "actions/runs" in path
-            else author
+            else (
+                {"object": {"sha": state["base"]}}
+                if path == "git/ref/heads/main"
+                else author
+            )
         ),
     )
     runs = []
@@ -1014,6 +1527,19 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assist.control(state["pr"])
     assert live[0]["phase"] == "manual" and len(dispatched) == 1
     author.update(id=43, body="fix")
+    # Lint alone must enter repair even when the selected GPU task passed.
+    runs.append(
+        dict(
+            id=102,
+            path=".github/workflows/lint.yml",
+            event="pull_request",
+            head_sha=state["head"],
+            status="completed",
+            conclusion="failure",
+            pull_requests=[dict(number=state["pr"], head=dict(sha=state["head"]))],
+        )
+    )
+    monkeypatch.setattr(assist, "report", lambda *args: "passed")
     event.write_text(json.dumps({"comment": {"id": 43}}))
     monkeypatch.setenv("GITHUB_EVENT_NAME", "issue_comment")
     emitted = []
@@ -1022,6 +1548,63 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
     assert tmp_path.joinpath("request.json").is_file()
     assert live[0]["repair_run"] == 200
+    assert json.loads(tmp_path.joinpath("request.json").read_text())["lint_run"] == 102
+    # A legacy monitor can leave an unowned manual state after cancellation of
+    # the redundant original-head native run. Explicit dispatch still repairs
+    # the current lint failure; the fresh candidate must run its native checks.
+    workflow = "nvidia-kernel-library-tests.yml"
+    data["native_checks"] = [{"workflow": workflow, **NATIVE_CHECKS[workflow]}]
+    monkeypatch.setattr(
+        assist, "native_check", lambda *args: dict(workflow=workflow, status="missing")
+    )
+    live[0]["phase"] = "manual"
+    del live[0]["repair_run"]
+    emitted.clear()
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
+    assert live[0]["repair_run"] == 200
+    assert json.loads(tmp_path.joinpath("request.json").read_text())["lint_run"] == 102
+    del data["native_checks"]
+    runs.pop()
+    monkeypatch.setattr(assist, "report", lambda *args: "failed")
+    assert (
+        json.loads(tmp_path.joinpath("request.json").read_text())["deadline"]
+        == 1893459600
+    )
+    # A failed repair waits for an explicit dispatch before trying again with
+    # the existing authorized fix; completion events must not create retries.
+    live[0]["phase"] = "manual"
+    emitted.clear()
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "manual" and not emitted
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "201")
+    pr["head"]["sha"] = "f" * 40
+    assist.control(state["pr"])
+    assert not emitted and live[0]["phase"] == "manual"
+    pr["head"]["sha"] = state["head"]
+    # An explicit retry may refresh main while retaining the authorized PR head.
+    live[0].update(phase="stale", validation_base="f" * 40)
+    monkeypatch.setenv("REPAIR_CHECK_ONLY", "true")
+    with pytest.raises(ValueError, match="authorized previous repair"):
+        assist.control(state["pr"])
+    monkeypatch.setenv("REPAIR_RUN", "199")
+    with pytest.raises(ValueError, match="authorized retry"):
+        assist.control(state["pr"])
+    monkeypatch.setenv("REPAIR_RUN", "200")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
+    assert live[0]["command"] == 43 and live[0]["repair_run"] == 201
+    assert (
+        json.loads(tmp_path.joinpath("request.json").read_text())["resume_run"] == 200
+    )
+    monkeypatch.delenv("REPAIR_RUN")
+    assert (
+        json.loads(tmp_path.joinpath("request.json").read_text())["check_only"] is True
+    )
+    monkeypatch.delenv("REPAIR_CHECK_ONLY")
     # The validation branch has a different immutable source; an old head pass
     # must not authorize promotion of that candidate.
     live[0].update(
@@ -1062,8 +1645,110 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
         "native_check",
         lambda *args: dict(workflow=workflow, status="passed", run=103),
     )
+    # Completed checks cannot authorize a late promotion after queueing consumed
+    # the shared hour; the same candidate can promote inside its original budget.
+    monkeypatch.setattr(assist.time, "time", lambda: 1893459600)
+    assist.control(state["pr"])
+    assert not promoted and live[0]["phase"] == "manual"
+    live[0]["phase"] = "validating"
+    monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "promoted"
+    # Recover a controller failure using the same checked candidate and hour.
+    live[0]["phase"] = "manual"
+    assist.control(state["pr"])
+    assert len(promoted) == 1 and live[0]["phase"] == "manual"
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setattr(assist.time, "time", lambda: 1893459600)
+    assist.control(state["pr"])
+    assert len(promoted) == 1 and live[0]["phase"] == "manual"
+    monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
+    assist.control(state["pr"])
+    assert len(promoted) == 2 and live[0]["phase"] == "promoted"
+    assert promoted[-1]["candidate"] == promoted[0]["candidate"]
+    assert promoted[-1]["repair_run"] == promoted[0]["repair_run"]
+    # Explicitly continue a failed candidate from its owning repair artifact.
+    # Old candidate diagnostics survive, but none of its passes authorize the
+    # fresh candidate or skip the model turn.
+    failed = dict(workflow=workflow, status="failed", run=103)
+    live[0].update(phase="manual", native_checks=[failed])
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "202")
+    monkeypatch.setenv("REPAIR_RUN", "201")
+    monkeypatch.setenv("REPAIR_CHECK_ONLY", "true")
+    with pytest.raises(ValueError, match="authorized retry"):
+        assist.control(state["pr"])
+    monkeypatch.delenv("REPAIR_CHECK_ONLY")
+    emitted.clear()
+    assist.control(state["pr"])
+    retry = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
+    assert retry["resume_run"] == 201 and retry["state"]["repair_run"] == 202
+    assert retry["diagnostics"]["native_checks"] == [failed]
+    assert "candidate" not in retry["state"] and not retry["check_only"]
+    live[0].update(
+        phase="manual",
+        statuses=["waiting"],
+        native_checks=[dict(workflow=workflow, status="waiting", run=104)],
+        candidate=dict(
+            patch="c" * 40,
+            validation="d" * 40,
+            tree="e" * 40,
+            branch="bot/pr-ci-assist-123-43-202",
+        ),
+    )
+    monkeypatch.setenv("GITHUB_RUN_ID", "203")
+    monkeypatch.setenv("REPAIR_RUN", "202")
+    assist.control(state["pr"])
+    retry = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert "diagnostics" not in retry
+    # A native failure arriving after the old deadline replaces stale inputs.
+    live[0].update(
+        phase="manual",
+        native_checks=[dict(workflow=workflow, status="waiting", run=105)],
+        candidate=dict(
+            patch="c" * 40,
+            validation="d" * 40,
+            tree="e" * 40,
+            branch="bot/pr-ci-assist-123-43-203",
+        ),
+    )
+    late = dict(workflow=workflow, status="failed", run=105)
+    monkeypatch.setattr(assist, "native_check", lambda *args: late)
+    monkeypatch.setenv("REPAIR_RUN", "203")
+    monkeypatch.setenv("GITHUB_RUN_ID", "204")
+    assist.control(state["pr"])
+    retry = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert retry["diagnostics"]["native_checks"] == [late]
+    assert retry["resume_run"] == 203 and not retry["check_only"]
+
+
+def test_owned_request_recovers_only_an_unowned_monitor_update(monkeypatch, selected):
+    _, state = selected
+    state.update(action="fix", phase="repairing", repair_run=201)
+    request = dict(state=state, deadline=100)
+    pr = dict(head=dict(sha=state["head"]), base=dict(sha=state["base"]))
+    live = copy.deepcopy(state)
+    live["phase"] = "manual"
+    del live["repair_run"]
+    monkeypatch.setenv("GITHUB_RUN_ID", "201")
+    monkeypatch.setattr(repair.time, "time", lambda: 50)
+    monkeypatch.setattr(repair, "repair_deadline", lambda _: 100)
+    monkeypatch.setattr(repair, "pull", lambda _: pr)
+    monkeypatch.setattr(repair, "pages", lambda *args: [])
+    monkeypatch.setattr(repair, "load_state", lambda *args: live)
+    monkeypatch.setattr(repair, "latest_command", lambda _: dict(id=state["command"]))
+    published = []
+    monkeypatch.setattr(
+        repair, "publish", lambda s, _: published.append(copy.deepcopy(s))
+    )
+    assert repair.current_request(request) == pr
+    assert published == [state] and request["deadline"] == 100
+    # A different owner must never be overwritten by the previous repair.
+    live["repair_run"] = 202
+    with pytest.raises(ValueError, match="authorization or source changed"):
+        repair.current_request(request)
+    assert published == [state]
 
 
 def test_cancelled_repair_is_recovered_on_next_reconciliation(
@@ -1091,7 +1776,11 @@ def test_cancelled_repair_is_recovered_on_next_reconciliation(
         assist,
         "api",
         lambda path: (
-            {"status": "completed", "conclusion": "cancelled"}
+            {
+                "status": "completed",
+                "conclusion": "cancelled",
+                "run_started_at": "2030-01-01T00:00:00Z",
+            }
             if path.endswith("/201")
             else {
                 "name": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
@@ -1108,6 +1797,107 @@ def test_cancelled_repair_is_recovered_on_next_reconciliation(
     )
     assist.control(state["pr"])
     assert state["phase"] == "manual" and len(messages) == 1
+
+
+def test_queued_validation_expires_without_a_completion_event(monkeypatch, selected):
+    _, state = selected
+    state.update(action="fix", phase="validating")
+    request = {"state": state, "deadline": 100}
+    now = [40]
+    monkeypatch.setattr(repair.time, "time", lambda: now[0])
+    monkeypatch.setattr(
+        repair.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds)
+    )
+    reconciled = []
+    monkeypatch.setattr(
+        repair.subprocess,
+        "run",
+        lambda args, **kwargs: reconciled.append((args, kwargs)),
+    )
+    monkeypatch.setattr(repair, "pull", lambda number: {})
+    monkeypatch.setattr(repair, "pages", lambda *args: [])
+    monkeypatch.setattr(repair, "load_state", lambda *args: state)
+    monkeypatch.setattr(
+        repair, "latest_command", lambda *args: {"id": state["command"]}
+    )
+    messages = []
+    monkeypatch.setattr(repair, "publish", lambda *args: messages.append(args[1]))
+    repair.wait_for_validation(request)
+    assert len(reconciled) == 1 and reconciled[0][1]["timeout"] == 60
+    assert reconciled[0][0][1] == str(repair.ROOT / ".github/scripts/pr_ci_assist.py")
+    assert reconciled[0][0][-2:] == ["--command", str(state["command"])]
+    assert state["phase"] == "manual" and "one-hour" in messages[0]
+
+
+def test_validation_poll_does_not_consume_a_new_repair_command(monkeypatch, selected):
+    _, state = selected
+    state.update(action="fix", phase="validating")
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pull", lambda number: {})
+    monkeypatch.setattr(assist, "pages", lambda *args: [])
+    monkeypatch.setattr(assist, "load_state", lambda *args: state)
+    monkeypatch.setattr(
+        assist, "latest_command", lambda *args: {"id": state["command"] + 1}
+    )
+    monkeypatch.setattr(
+        assist, "permitted", lambda *args: pytest.fail("Poll consumed a new command")
+    )
+    assist.control(state["pr"], expected_command=state["command"])
+    assert state["phase"] == "validating"
+
+
+def test_rejected_patch_receives_feedback_within_the_original_budget(
+    monkeypatch, tmp_path, capsys
+):
+    request = {"deadline": 100, "data": {"paths": ["test/example.py"]}}
+    now = [40]
+    monkeypatch.setattr(repair.time, "time", lambda: now[0])
+    feedback = tmp_path / "feedback.json"
+    turns = []
+
+    def run_model(attempt):
+        turns.append(repair.remaining_time(request))
+        if attempt:
+            assert (
+                json.loads(feedback.read_text())["reason"]
+                == repair.REPAIR_FEEDBACK["test-assertions"]
+            )
+        now[0] += 10
+
+    def proposal():
+        if len(turns) < 4:
+            raise repair.RepairRejected(
+                "test-assertions",
+                path="test/example.py",
+                details=["private diagnostic"],
+            )
+        return "accepted patch"
+
+    assert (
+        repair.repair_with_feedback(request, run_model, proposal, feedback)
+        == "accepted patch"
+    )
+    assert turns == [60, 50, 40, 30] and request["deadline"] == 100
+    output = capsys.readouterr().out
+    assert "test/example.py" in output and "private diagnostic" not in output
+    turns.clear()
+
+    def rejected():
+        raise repair.RepairRejected("test-syntax")
+
+    with pytest.raises(repair.RepairRejected):
+        repair.repair_with_feedback(
+            request, lambda attempt: turns.append(attempt), rejected, feedback
+        )
+    assert turns == list(range(8))
+    now[0] = request["deadline"]
+    with pytest.raises(ValueError, match="budget expired"):
+        repair.repair_with_feedback(
+            request,
+            lambda attempt: pytest.fail("Started an expired turn"),
+            rejected,
+            feedback,
+        )
 
 
 def test_dispatch_event_uses_tested_source_not_main_controller(
@@ -1209,3 +1999,42 @@ def test_dispatch_event_uses_tested_source_not_main_controller(
     assert not emitted
     with pytest.raises(ValueError, match="open same-repository"):
         assist.pull(123)
+
+
+def test_promotion_accepts_only_owned_validation_branch(
+    monkeypatch, tmp_path, selected
+):
+    _, state = selected
+    state.update(action="fix", phase="validating", repair_run=200)
+    state["candidate"] = dict(
+        patch="c" * 40,
+        validation="d" * 40,
+        tree="e" * 40,
+        branch="bot/pr-ci-assist-123-42-200",
+    )
+    monkeypatch.setattr(repair, "WORK", tmp_path)
+    monkeypatch.setattr(repair, "public_gate", lambda: None)
+    monkeypatch.setattr(repair, "repair_deadline", lambda s: 1893459600)
+    monkeypatch.setattr(repair.time, "time", lambda: 1893459599)
+    monkeypatch.setattr(
+        repair,
+        "pull",
+        lambda n: dict(head={"sha": state["head"]}, base={"sha": state["base"]}),
+    )
+    monkeypatch.setattr(repair, "pages", lambda *a: [])
+    monkeypatch.setattr(repair, "latest_command", lambda c: {"id": state["command"]})
+    monkeypatch.setattr(repair, "api", lambda p: {"object": {"sha": "d" * 40}})
+
+    class FetchReached(Exception):
+        pass
+
+    def command(*args, **kwargs):
+        assert args == ("git", "fetch", "origin", "d" * 40)
+        raise FetchReached
+
+    monkeypatch.setattr(repair, "command", command)
+    with pytest.raises(FetchReached):
+        repair.promote(state)
+    state["candidate"]["branch"] = "bot/pr-ci-assist-123-42-199"
+    with pytest.raises(ValueError, match="Invalid candidate record"):
+        repair.promote(state)

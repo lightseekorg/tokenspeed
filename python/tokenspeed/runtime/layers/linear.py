@@ -26,10 +26,6 @@
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.gemm import (
-    fp8_linear_accepts_prepacked_input,
-    fp8_linear_prepacked,
-)
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.distributed.comm_backend import CommBackend, get_global_backend
@@ -93,25 +89,6 @@ if TYPE_CHECKING:
 # These methods create parameters implementing the V2 sharded-loading protocol.
 # Subclasses must preserve that contract; other methods retain the legacy loader.
 WEIGHT_LOADER_V2_METHODS = (Fp8LinearMethod, CompressedTensorsLinearMethod)
-
-
-def warmup_prepared_fp8_linears(model: torch.nn.Module, max_tokens: int) -> None:
-    """Warm the backend implementations prepared by block-FP8 linear layers."""
-    plans: list[object] = []
-    for module in model.modules():
-        quant_method = getattr(module, "quant_method", None)
-        if quant_method is None:
-            continue
-        prepared_linear_plan = getattr(quant_method, "prepared_linear_plan", None)
-        if prepared_linear_plan is None:
-            continue
-        plan = prepared_linear_plan(module)
-        if plan is not None:
-            plans.append(plan)
-
-    from tokenspeed_kernel.ops.gemm import warmup_prepared_fp8_linears as warmup
-
-    warmup(plans, max_tokens)
 
 
 def adjust_marlin_shard(param, shard_size, shard_offset):
@@ -1475,21 +1452,10 @@ class DPColumnParallelLinear(ColumnParallelLinear):
         rows = _projection_rows(inputs, ctx, self.parallel, self.projection_workspace)
         if rows == 0:
             return inputs.new_empty((0, self.logical_output_size)), None
-        plan = self.quant_method.prepared_linear_plan(self)
-        num_tokens = self.tp_size * rows
-        values, scales = projection_all_gather(
-            inputs,
-            rows,
-            fp8_linear_accepts_prepacked_input(plan, num_tokens),
-            self.projection_workspace,
-            self.comm_backend,
+        values, _ = projection_all_gather(
+            inputs, rows, False, self.projection_workspace, self.comm_backend
         )
-        if scales is None:
-            local, _ = super().forward(values, block_scale=None, output_dtype=None)
-        else:
-            local = fp8_linear_prepacked(
-                plan, values, self.weight, scales, num_tokens, inputs.dtype, out=None
-            )
+        local, _ = super().forward(values, block_scale=None, output_dtype=None)
         output = inputs.new_empty((rows, self.output_size))
         output, _ = projection_all_to_all(
             local,
@@ -1555,13 +1521,11 @@ class DPRowParallelLinear(RowParallelLinear):
         rows = _projection_rows(inputs, ctx, self.parallel, self.projection_workspace)
         if rows == 0:
             return inputs.new_empty((0, self.output_size)), None
-        plan = self.quant_method.prepared_linear_plan(self)
-        num_tokens = self.tp_size * rows
-        values, scales = projection_all_to_all(
+        values, _ = projection_all_to_all(
             inputs,
             rows,
             False,
-            fp8_linear_accepts_prepacked_input(plan, num_tokens),
+            False,
             None,
             self.projection_workspace,
             self.comm_backend,
@@ -1569,18 +1533,7 @@ class DPRowParallelLinear(RowParallelLinear):
         destination = acquire_projection_output(
             rows, self.projection_workspace, self.comm_backend
         )
-        if scales is None:
-            partial, _ = super().forward(values, scale=None, out=destination)
-        else:
-            partial = fp8_linear_prepacked(
-                plan,
-                values,
-                self.weight,
-                scales,
-                num_tokens,
-                inputs.dtype,
-                out=destination,
-            )
+        partial, _ = super().forward(values, scale=None, out=destination)
         output = projection_reduce_scatter(
             partial, rows, self.projection_workspace, self.comm_backend
         )
