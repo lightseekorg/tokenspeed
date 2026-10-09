@@ -22,7 +22,10 @@
 import json
 import queue
 
-from tokenspeed.runtime.engine.cache_trace import CacheTraceWriter
+from tokenspeed.runtime.engine.cache_trace import (
+    CacheTraceWriter,
+    collect_cache_trace_epochs,
+)
 
 
 def test_cache_trace_close_finishes_when_sentinel_enqueue_times_out(
@@ -82,3 +85,31 @@ def test_cache_trace_history_requires_native_empty_start_and_no_gap(tmp_path):
     assert all(
         record["epoch"] == writer.epoch and record["schema"] == 2 for record in records
     )
+
+
+def test_scheduler_epochs_match_captures_across_replicas(tmp_path):
+    writers = [
+        CacheTraceWriter(str(tmp_path / "capture"), {"global_rank": rank})
+        for rank in range(2)
+    ]
+    try:
+        infos = [{"cache_trace_epochs": [writer.epoch]} for writer in writers]
+        # Non-leaders and disabled capture advertise no identity; a DP
+        # controller may already have collected several scheduler epochs.
+        epochs = collect_cache_trace_epochs(
+            [
+                *infos,
+                {"cache_trace_epochs": []},
+                {"cache_trace_epochs": [writers[0].epoch]},
+            ]
+        )
+        assert epochs == sorted(writer.epoch for writer in writers)
+        for writer in writers:
+            writer.close()
+            with open(writer.path) as stream:
+                metadata = json.loads(stream.readline())
+            assert metadata["epoch"] in epochs
+            assert metadata["page_event_semantics"] == "separate_publication_v1"
+    finally:
+        for writer in writers:
+            writer.close()

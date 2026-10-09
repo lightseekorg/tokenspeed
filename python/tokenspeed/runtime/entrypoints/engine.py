@@ -62,6 +62,7 @@ from tokenspeed.runtime.cache.l3.backend import (
     resolve_l3_weight_version,
 )
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.engine.cache_trace import collect_cache_trace_epochs
 from tokenspeed.runtime.engine.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -720,8 +721,9 @@ def _launch_subprocesses(
             )
         scheduler_infos.append(data)
 
-    # Assume all schedulers have the same scheduler_info
-    scheduler_info = scheduler_infos[0]
+    # Capacity is shared, but trace epochs belong to individual schedulers.
+    scheduler_info = dict(scheduler_infos[0])
+    scheduler_info["cache_trace_epochs"] = collect_cache_trace_epochs(scheduler_infos)
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     tokenizer_manager.max_single_request_tokens = scheduler_info[
         "max_single_request_tokens"

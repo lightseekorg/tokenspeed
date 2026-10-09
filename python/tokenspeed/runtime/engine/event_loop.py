@@ -1443,6 +1443,11 @@ def run_event_loop(
         pipe_writer.send(
             {
                 "status": "ready",
+                "cache_trace_epochs": (
+                    [event_loop._cache_trace.epoch]
+                    if event_loop._cache_trace is not None
+                    else []
+                ),
                 "max_total_num_tokens": event_loop.max_total_num_tokens,
                 "max_req_input_len": event_loop.max_req_input_len,
                 "max_single_request_tokens": event_loop.max_single_request_tokens,

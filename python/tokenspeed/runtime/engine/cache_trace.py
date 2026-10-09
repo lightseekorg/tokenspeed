@@ -34,6 +34,13 @@ import uuid
 logger = logging.getLogger(__name__)
 
 
+def collect_cache_trace_epochs(scheduler_infos: list[dict]) -> list[str]:
+    """Collect actual trace identities from every scheduler/replica startup."""
+    return sorted(
+        {epoch for info in scheduler_infos for epoch in info["cache_trace_epochs"]}
+    )
+
+
 class CacheTraceWriter:
     def __init__(self, path: str, metadata: dict):
         self.epoch = uuid.uuid4().hex
@@ -45,6 +52,7 @@ class CacheTraceWriter:
             "schema": 2,
             "epoch": self.epoch,
             "clock": "unix_ns",
+            "page_event_semantics": "separate_publication_v1",
             "compatibility_fingerprint": (
                 hashlib.sha256(
                     json.dumps(

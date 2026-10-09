@@ -521,3 +521,15 @@ For orientation, one iteration of `event_loop`:
   exception or malformed existence / prefetch result is a local miss so
   every cache-owning rank still enters the replica MIN; raising would
   hang healthy peers. Clients are not failed.
+
+### Cache trace identity
+
+When cache capture is enabled, startup `scheduler_info.cache_trace_epochs`
+contains the actual capture UUIDs from all attention TP leaders, pipeline stages
+and data parallel replicas. Disabled capture advertises an empty list. A worker
+address with several epochs does not identify the replica that served a request;
+join admission records using their epoch and request ID.
+
+Capture metadata `page_event_semantics=separate_publication_v1` means page
+publication/removal has its own `stored`/`removed` events. Producer frontiers such
+as `computed` alone do not prove cache residency. Gaps still invalidate replay.
