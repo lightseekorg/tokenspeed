@@ -210,6 +210,7 @@ def _model_worker(rank, size, rendezvous):
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
     from tokenspeed.runtime.layers.linear import prepare_dp_linear_communication
+    from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
     from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA, KimiLinearMLAAttention
     from tokenspeed.runtime.models.kimi_k3_projection import (
         validate_projection_settings,
@@ -295,13 +296,26 @@ def _model_worker(rank, size, rendezvous):
             # Ungated MLA supports O-only TP, including empty token owners.
             projection_mappings = ((None, None), (None, parallel))
         for qkv_tp, output_tp in projection_mappings:
+            # Exercise the resolved BF16 method under an FP8 config. Re-resolving
+            # get_quant_method would bypass LinearBase's ignored-layer handling.
+            quant_config = (
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    activation_scheme="dynamic",
+                    ignored_layers=[r"re:self_attn\..*"],
+                    weight_block_size=[128, 128],
+                    scale_fmt=None,
+                )
+                if qkv_tp is None and output_tp is not None
+                else None
+            )
             with torch.device(device):
                 if kind == "kda":
                     module = KimiLinearKDA(
                         config,
                         mapping,
                         0,
-                        quant_config=None,
+                        quant_config=quant_config,
                         prefix="self_attn",
                         qkv_parallel=qkv_tp,
                         output_parallel=output_tp,
@@ -318,7 +332,7 @@ def _model_worker(rank, size, rendezvous):
                         v_head_dim=128,
                         q_lora_rank=1536,
                         kv_lora_rank=512,
-                        quant_config=None,
+                        quant_config=quant_config,
                         prefix="self_attn",
                         qkv_parallel=qkv_tp,
                         output_parallel=output_tp,

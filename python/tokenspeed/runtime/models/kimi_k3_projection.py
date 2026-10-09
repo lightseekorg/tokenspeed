@@ -32,7 +32,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import DPColumnParallelLinear, LinearBase
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3FusedQkvAProjWithMqa
 from tokenspeed.runtime.utils import ceil_div
@@ -110,14 +110,14 @@ def projection_fp8_config() -> Fp8Config:
 
 
 def validate_projection_quantization(
-    linear: LinearBase, quant_config: QuantizationConfig | None, prefix: str
+    linear: LinearBase, method: QuantizeMethodBase | None, prefix: str
 ) -> None:
-    """Require the checkpoint route to match the supported BF16/block-FP8 buffer.
+    """Require the method to match the supported BF16/block-FP8 buffer.
 
-    Synthetic fused names may not resolve the source checkpoint's precision;
-    callers pass an original checkpoint prefix when validating those layouts.
+    Output projections pass their resolved quant_method. Merged QKV projections
+    pass methods resolved from the original checkpoint config and prefixes to
+    check that their source formats match the locally configured merged buffer.
     """
-    method = quant_config.get_quant_method(linear, prefix) if quant_config else None
     if method is None or isinstance(method, UnquantizedLinearMethod):
         supported = linear.weight.dtype == torch.bfloat16
     else:

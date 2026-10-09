@@ -463,7 +463,12 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                     block_fp8=self._fused_qkv_a_fp8_layout,
                     prefix=fused_prefix,
                 )
-                validate_projection_quantization(projection, quant_config, fused_prefix)
+                method = (
+                    quant_config.get_quant_method(projection, fused_prefix)
+                    if quant_config is not None
+                    else None
+                )
+                validate_projection_quantization(projection, method, fused_prefix)
                 return projection
             return KimiMLAReplicatedProj(
                 self.hidden_size,
@@ -492,7 +497,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 prefix=add_prefix("o_proj", prefix),
             )
             validate_projection_quantization(
-                projection, quant_config, add_prefix("o_proj", prefix)
+                projection, projection.quant_method, add_prefix("o_proj", prefix)
             )
             return projection
         return super()._make_output_projection(
@@ -1316,9 +1321,13 @@ class KimiLinearKDA(nn.Module):
                 prefix=add_prefix("qkvgb_proj", prefix),
             )
             for name in ("q_proj", "k_proj", "v_proj", "g_proj", "f_a_proj", "b_proj"):
-                validate_projection_quantization(
-                    self.qkvgb_proj, quant_config, add_prefix(name, prefix)
+                source_prefix = add_prefix(name, prefix)
+                method = (
+                    quant_config.get_quant_method(self.qkvgb_proj, source_prefix)
+                    if quant_config is not None
+                    else None
                 )
+                validate_projection_quantization(self.qkvgb_proj, method, source_prefix)
         # Decay-gate up projection (f_a and beta ride in the merged GEMM).
         self.f_b_proj = _col(self.head_dim, proj, "f_b_proj")
 
@@ -1376,7 +1385,7 @@ class KimiLinearKDA(nn.Module):
                 prefix=add_prefix("o_proj", prefix),
             )
             validate_projection_quantization(
-                self.o_proj, quant_config, add_prefix("o_proj", prefix)
+                self.o_proj, self.o_proj.quant_method, add_prefix("o_proj", prefix)
             )
 
         if (
