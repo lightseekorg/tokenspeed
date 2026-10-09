@@ -18,11 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.ops.gemm.deep_gemm import _warmup_m_values
+"""NVIDIA CUDA communication kernels with caller-managed persistent state.
 
+The Lamport A2A APIs exchange TP2/4/8 BF16 channel shards directly, optionally
+quantizing received 128-element groups for a prepared FP8 GEMM. Callers must
+construct the state collectively before CUDA-graph capture, serialize calls
+and consumers on one stream, pad empty owners so every peer participates, and
+select any fallback outside this module. Returned buffers are borrowed until
+the next call unless an explicit destination is supplied.
+"""
 
-def test_warmup_m_values_covers_dense_and_tail_ranges() -> None:
-    assert _warmup_m_values(3) == [1, 2, 3]
-    values = _warmup_m_values(2050)
-    assert values[:3] == [1, 2, 3]
-    assert values[-2:] == [2048, 2050]
+from tokenspeed_kernel.ops.communication._cuda.lamport_a2a import (
+    TokenSpeedA2ALamportState,
+    tokenspeed_a2a_lamport,
+    tokenspeed_a2a_lamport_fp8_quantize,
+)
+
+__all__ = [
+    "TokenSpeedA2ALamportState",
+    "tokenspeed_a2a_lamport",
+    "tokenspeed_a2a_lamport_fp8_quantize",
+]

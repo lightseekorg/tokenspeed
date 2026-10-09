@@ -186,6 +186,22 @@ which CI serving jobs use). Kernel tests guard batch-varying launches with
 `assert_no_triton_compile` in `test/utils.py`. JITs outside Triton, such as
 DeepGEMM's per-shape kernels, are not observed and need the same discipline
 at their call sites.
+A runtime argument still keys the cache: Triton specializes an integer on
+whether it is 1 or divisible by 16, and a pointer on 16-byte alignment. Startup
+warms only the classes graph capture happens to see, so on the serving path a
+per-batch count (tokens, rows, requests) belongs in `do_not_specialize`, and a
+pointer into a buffer sliced at a per-batch offset in
+`do_not_specialize_on_alignment`. A stride that changes between call sites but
+stays a multiple of 16, such as a projection's row width, stays a plain runtime
+argument: one class covers it, and the hint keeps row loads vectorized. A
+batch-derived block size is a fixed block with a loop rather than a
+power-of-two bucket, which still compiles once per new bucket while serving.
+The end-of-startup mark is also the package's compile switch, set whether or
+not the monitor is installed. A kernel whose library compiles once per batch
+shape and cannot bucket it, such as FlashInfer's joint BF16 GEMM (some runners
+compile per exact row count) or the ll_bf16 router's dot-product kernel, checks
+`compile_monitor.is_serving()` where it is dispatched: startup tuning and graph capture use it, and eager calls while
+serving take a GEMM that never compiles (cuBLAS through torch on NVIDIA).
 
 ### Plugins
 

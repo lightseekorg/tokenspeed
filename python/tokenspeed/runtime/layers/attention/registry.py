@@ -25,7 +25,6 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import (
@@ -472,7 +471,6 @@ def _apply_backend_overrides(
                 is_kda=True,
                 is_dsa=False,
                 is_qsa=False,
-                has_cache_plan=True,
             )
     elif server_args.attention_backend == HYBRID_LINEAR_ATTN_BACKEND:
         logger.warning(
@@ -505,7 +503,6 @@ def _resolve_full_attn_backend_name(
             is_kda=profile.is_kda,
             is_dsa=profile.is_dsa_kda,
             is_qsa=profile.is_qsa,
-            has_cache_plan=True,
         )
     return softmax_attn.backend_name
 
@@ -784,60 +781,27 @@ def _create_attn_backend_with_name(
     return cls(config, spec)
 
 
-def _resolve_kda_backend(kda_backend: str) -> str:
-    """Resolve the KDA prefill backend policy.
-
-    On AMD, the backend policy is ignored and compatible kernels are selected
-    using registry priority. On NVIDIA, ``auto`` picks ``cutedsl_kda`` when its
-    device-specific implementation is available, ``flashkda`` on SM90+, and
-    ``fla`` otherwise. Explicit CuteDSL selection is validated against device
-    support. Decode is unaffected.
-    """
-    platform = current_platform()
-    if platform.is_amd:
-        # Named backend policies are NVIDIA-specific; let the registry decide.
-        return "auto"
-
-    from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
-
-    if kda_backend == "auto":
-        if cutedsl_kda_supported():
-            resolved = "cutedsl_kda"
-        elif platform.is_hopper_plus:
-            resolved = "flashkda"
-        else:
-            resolved = "fla"
-        logger.info(f"KDA prefill backend auto-resolved to {resolved!s}")
-        return resolved
-    if kda_backend == "cutedsl_kda" and not cutedsl_kda_supported():
-        raise ValueError(
-            "--kda-backend cutedsl_kda requires an NVIDIA sm_100 or sm_103 device"
-        )
-    return kda_backend
-
-
 def _resolve_hybrid_full_backend_name(
     requested_name: str | None,
     *,
     is_kda: bool,
     is_dsa: bool,
     is_qsa: bool,
-    has_cache_plan: bool,
 ) -> str | None:
     """Resolve the compute backend that consumes the hybrid history cache."""
     name = None if requested_name == HYBRID_LINEAR_ATTN_BACKEND else requested_name
-    if has_cache_plan and is_qsa:
+    if is_qsa:
         if name is not None:
             logger.warning(
                 "Qwen4-Exp QSA pins its sparse dispatch to the qsa backend; "
                 f"ignoring explicit attention backend {requested_name!r}",
             )
         return "qsa"
-    if has_cache_plan and is_dsa and name is None:
+    if is_dsa and name is None:
         return "dsa"
     # NVIDIA K3 defaults to its CuteDSL history consumer. AMD keeps the
     # generic MLA backend; explicit user choices remain authoritative.
-    if has_cache_plan and is_kda and name is None and not current_platform().is_amd:
+    if is_kda and name is None and not current_platform().is_amd:
         return "tokenspeed_mla"
     return name
 
@@ -847,13 +811,14 @@ def _kda_linear_attn_backend(
 ) -> AttentionBackend:
     from tokenspeed.runtime.layers.attention.backends.state.kda import (
         KdaAttnBackend,
+        resolve_kda_backend,
     )
 
     return KdaAttnBackend(
         config,
         config.component(SoftmaxAttnConfig),
         enable_prefill_graph=not server_args.disable_kda_prefill_graph,
-        kda_backend=_resolve_kda_backend(server_args.kda_backend.strip().lower()),
+        kda_backend=resolve_kda_backend(server_args.kda_backend.strip().lower()),
     )
 
 
@@ -972,108 +937,11 @@ def _create_hybrid_linear_attn_backend(
             f"{'LCM state fields'!s}",
         )
     if is_qwen4_exp(hf_config):
-        backend = _compose_qwen4_exp_backend(config, pool, backend)
-    return backend
-
-
-def _compose_qwen4_exp_backend(config, pool, attention_backend) -> AttentionBackend:
-    """Attach each Qwen4 consumer only when this pool view publishes its fields."""
-    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-        HybridLinearAttnBackend,
-    )
-    from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
-        QSAIndexerBackend,
-    )
-    from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
-        Qwen4ExpBackend,
-    )
-    from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
-        Qwen4ExpPLEBackend,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
-        QWEN4_EXP_PLE_CACHE_GROUP,
-        QWEN4_EXP_QSA_CACHE_GROUP,
-        QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-        cache_field_layer_id,
-    )
-
-    local_groups = {
-        field.group_id
-        for field in pool.arena.plan.fields
-        if cache_field_layer_id(field.field_id) in pool.field_layer_range
-    }
-    ple = (
-        Qwen4ExpPLEBackend(config, config.component(SoftmaxAttnConfig))
-        if QWEN4_EXP_PLE_CACHE_GROUP in local_groups
-        else None
-    )
-    qsa_groups = {QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP}
-    if local_groups & qsa_groups and not qsa_groups <= local_groups:
-        raise ValueError(
-            "QSA consumer requires both compressed and recent cache groups"
+        from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
+            Qwen4ExpBackend,
         )
-    full_attn_backend = (
-        attention_backend.full_attn_backend
-        if isinstance(attention_backend, HybridLinearAttnBackend)
-        else attention_backend
-    )
-    indexer = (
-        QSAIndexerBackend(config, full_attn_backend)
-        if qsa_groups <= local_groups
-        else None
-    )
-    return Qwen4ExpBackend(config, attention_backend, ple, indexer)
 
-
-def _wrap_inkling_backend(
-    inner,
-    text_config,
-    attn_config,
-    *,
-    num_layers,
-    is_draft,
-    enable_layerwise_cache_ready=False,
-):
-    """Wrap a dense backend with the engine-side Inkling sconv state pool.
-
-    The wrapper only adds conv metadata; all attention delegates to ``inner``.
-    """
-    from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
-    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
-        InklingAttnBackend,
-        InklingConvStatePool,
-    )
-
-    kernel_size = text_config.sconv_kernel_size
-    spec_tokens = attn_config.speculative_num_draft_tokens
-    # Ring row of absolute position p is p % R. R must keep a round's
-    # pre-chunk tap reads and chunk-row writes disjoint mod R: (W-1) history
-    # taps + K chunk rows. Uniform across target and draft.
-    ring_size = (kernel_size - 1) + spec_tokens
-    conv_pool = InklingConvStatePool(
-        num_layers=num_layers,
-        # Row 0 is reserved (1-based indices); +2 covers it plus a padding slot
-        num_slots=attn_config.max_bs + 2,
-        conv_dim=inkling_conv_total_dim(
-            text_config, attn_config.component(SoftmaxAttnConfig).attn_tp_size
-        ),
-        ring_size=ring_size,
-        dtype=torch.bfloat16,
-        device=attn_config.device,
-    )
-    logger.info(
-        f"Inkling {('draft ' if is_draft else '')!s}conv state pool: {num_layers:d} "
-        f"layers x {attn_config.max_bs + 2:d} slots, "
-        f"{conv_pool.mem_usage_bytes() / (1 << 20):.1f} MiB",
-    )
-    backend = InklingAttnBackend(
-        inner,
-        conv_pool,
-        spec_num_tokens=spec_tokens,
-        enable_layerwise_cache_ready=enable_layerwise_cache_ready,
-    )
+        backend = Qwen4ExpBackend.from_cache_view(config, pool, backend)
     return backend
 
 
@@ -1121,8 +989,12 @@ def _create_target_components(
     if not is_inkling:
         return backend, pool
 
+    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+        InklingAttnBackend,
+    )
+
     text_config = model_config.hf_config.get_text_config()
-    backend = _wrap_inkling_backend(
+    backend = InklingAttnBackend.from_config(
         backend,
         text_config,
         config,
@@ -1191,16 +1063,21 @@ def _create_draft_components(
 
     backend = _create_attn_backend(model_config.attention_arch, config)
     if is_inkling:
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+            InklingAttnBackend,
+        )
+
         # Depth layers carry conv checkpoint fields as continuation tenants
         # of the target's kvconv/hiddenconv groups; the draft gets the same
         # paged bridges (publish/restore) the target wrapper gets.
         text_config = model_config.hf_config.get_text_config()
-        backend = _wrap_inkling_backend(
+        backend = InklingAttnBackend.from_config(
             backend,
             text_config,
             config,
             num_layers=num_layers,
             is_draft=True,
+            enable_layerwise_cache_ready=False,
         )
     return backend, draft_pool
 
@@ -1231,13 +1108,10 @@ def _prepare_fixed_workspaces(
     width = int(server_args.speculative_num_draft_tokens or 1)
     allocated = False
     actual_bytes = 0
-    if isinstance(backend, Qwen4ExpBackend):
+    if isinstance(backend, Qwen4ExpBackend) or (
+        uses_paged_state_verify and expected_bytes
+    ):
         actual_bytes += backend.preallocate_verify_workspace(config.max_bs, width)
-        allocated = True
-    elif uses_paged_state_verify and expected_bytes:
-        actual_bytes += backend.linear_attn_backend.preallocate_verify_workspace(
-            config.max_bs, width
-        )
         allocated = True
     elif is_inkling:
         actual_bytes += backend.fixed_workspace_bytes()
@@ -1324,6 +1198,7 @@ def create_attn_components(
     overlap_schedule_depth: int = 0,
     *,
     graph_reserve_bytes: int,
+    post_profile_bytes: int,
     probe_batch_rows: int | None,
     profiled_cache_bytes: int | None,
     reuse_target_backend: AttentionBackend | None,
@@ -1356,8 +1231,6 @@ def create_attn_components(
 
     config = _create_attn_config(server_args, model_config)
     softmax_attn = config.component(SoftmaxAttnConfig)
-    if target.is_deepseek_v4:
-        softmax_attn.sliding_window_tokens = int(model_config.hf_config.sliding_window)
     cache_family = _resolve_cache_family(target, config)
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
@@ -1395,10 +1268,6 @@ def create_attn_components(
         if draft_attn_config is not None
         else None
     )
-    if draft is not None and draft.is_deepseek_v4:
-        draft_softmax_attn.sliding_window_tokens = int(
-            draft_model_config.hf_config.sliding_window
-        )
     draft_full_attn_backend_name = (
         # The draft's hybrid sub-backend request is its config's own
         # resolution, not the user's target choice.
@@ -1430,6 +1299,7 @@ def create_attn_components(
             tp_size=server_args.mapping.world_size,
             gpu_memory_utilization=server_args.gpu_memory_utilization,
             total_gpu_memory=gpu_memory,
+            post_profile_bytes=post_profile_bytes,
             world_group=server_args.mapping.world_group,
         )
     cache_memory = reserve_cache_budget(profiled_cache_bytes, graph_reserve_bytes)

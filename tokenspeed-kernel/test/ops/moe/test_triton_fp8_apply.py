@@ -3,9 +3,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from utils import (
     assert_no_triton_compile,
@@ -80,7 +82,7 @@ def _plan(
     hidden_size: int,
     intermediate_size: int,
 ) -> dict:
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "fp8",
         input_dtype=torch.bfloat16,
         activation=activation,
@@ -131,8 +133,8 @@ def test_triton_fp8_moe_matches_torch(
     if swiglu_limit is not None:
         weights.swiglu_arg = SimpleNamespace(alpha=None, limit=swiglu_limit)
     plan = _plan(activation, swiglu_limit, hidden_size, intermediate_size)
-    tokenspeed_kernel.moe_process_weights(plan, weights)
-    actual = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, weights)
+    actual = kernel_moe_apply(
         plan,
         x,
         weights,
@@ -176,7 +178,7 @@ def test_triton_fp8_moe_token_count():
         num_experts, top_k, hidden_size, intermediate_size, generator
     )
     plan = _plan("silu", None, hidden_size, intermediate_size)
-    tokenspeed_kernel.moe_process_weights(plan, weights)
+    kernel_moe_process_weights(plan, weights)
     x = torch.randn(
         max_tokens,
         hidden_size,
@@ -190,7 +192,7 @@ def test_triton_fp8_moe_token_count():
     )
 
     def run(tokens):
-        return tokenspeed_kernel.moe_apply(
+        return kernel_moe_apply(
             plan,
             x[:tokens],
             weights,

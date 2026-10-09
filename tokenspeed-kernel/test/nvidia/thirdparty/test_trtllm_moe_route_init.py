@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compatibility and isolation checks for the private routing initializer."""
+"""Compatibility and isolation checks for the private MoE tactic policy."""
 
 import functools
 import inspect
@@ -28,60 +28,13 @@ import torch
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _entrypoints,
-    _initialize_routing_map,
     _prefer_qwen38_decode_tile_32,
     _register_private,
     _require_runner_rebinding,
     _require_tactic_hooks,
 )
 
-_ALLOCATION = """
-namespace flashinfer {
-  void prepare_routing_common() {
-    expanded_idx_to_permuted_idx = alloc_tensor({num_tokens * top_k}, dl_int32, device);
-    permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
-    prepare_other_workspace();
-  }
-"""
-
 _CLONE_VALUE = object()
-
-
-@pytest.mark.parametrize("guard", [" + 1", ""])
-def test_initializer_uses_native_capacity_and_stream(guard):
-    source = _ALLOCATION.replace(" + 1", guard)
-    actual = _initialize_routing_map(source)
-    launch = "tokenspeed_launch_fill_route_map(\n"
-    assert actual.count(launch) == 1
-    assert "cudaMemsetAsync" not in actual
-    assert "permuted_idx_to_token_idx.numel()" in actual
-    assert "get_stream(hidden_states.device())" in actual
-    assert "map[i] = -1;" in actual
-    assert "programmaticStreamSerializationAllowed = 1" in actual
-    assert actual.index("__global__ void tokenspeed_fill_route_map") < actual.index(
-        "namespace flashinfer {"
-    )
-    assert actual.index(launch) > actual.index("alloc_tensor({max_num")
-    assert actual.index(launch) < actual.index("prepare_other_workspace()")
-    # The original allocation, including upstream's optional guard, is retained.
-    body = source[
-        source.index("namespace") : source.index("    prepare_other_workspace")
-    ]
-    assert body in actual
-
-
-def test_initializer_requires_the_launcher_namespace():
-    with pytest.raises(RuntimeError, match="no flashinfer namespace"):
-        _initialize_routing_map(_ALLOCATION.replace("namespace flashinfer {", ""))
-
-
-@pytest.mark.parametrize(
-    "source", ["", _ALLOCATION * 2, _ALLOCATION.replace("dl_int32", "dl_int64")]
-)
-def test_unrecognized_native_allocation_fails_closed(source):
-    with pytest.raises(RuntimeError, match="expected exactly one"):
-        _initialize_routing_map(source)
 
 
 def test_function_rebinding_does_not_mutate_upstream():

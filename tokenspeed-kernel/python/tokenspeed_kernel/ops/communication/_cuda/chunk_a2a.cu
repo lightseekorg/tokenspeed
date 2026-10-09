@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include "a2a_fp8.cuh"
 #include "tvm_ffi_utils.h"
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -66,32 +67,36 @@ __device__ __forceinline__ uint64_t acquire_flag(const uint64_t *p) {
                : "memory");
   return value;
 }
-template <bool Inverse>
+template <int NRanks, bool Inverse, bool Quantize>
 __global__ __launch_bounds__(1024, 1) void chunk_a2a(
-    const uint4 *input, uint4 *output, uint64_t **peers, uint64_t **flag_peers,
-    uint32_t *control, int capacity, int rows, int channels, int rank) {
+    const uint4 *input, uint4 *output, float *scales, uint64_t **peers,
+    uint64_t **flag_peers, uint32_t *control, int capacity, int rows,
+    int channels, int rank) {
   const uint32_t epoch = begin_epoch(control);
-  const int ring = epoch % 3, width = channels / 32, count = rows * width;
-  uint4 *buffers[4];
+  const int ring = epoch % 3, width = channels / (8 * NRanks),
+            count = rows * width;
+  const int valid_rows = NRanks * rows;
+  const int padded_rows = (valid_rows + 3) / 4 * 4;
+  uint4 *buffers[NRanks];
 #pragma unroll
-  for (int p = 0; p < 4; ++p)
+  for (int p = 0; p < NRanks; ++p)
     buffers[p] = reinterpret_cast<uint4 *>(peers[p] + ring * capacity);
   const int tid = blockIdx.x * blockDim.x + threadIdx.x,
             stride = gridDim.x * blockDim.x;
   // A CTA owns a striped chunk of every peer segment.
   for (int i = tid; i < count; i += stride) {
     const int row = i / width, col = i % width;
-    uint4 values[4];
+    uint4 values[NRanks];
 #pragma unroll
-    for (int p = 0; p < 4; ++p) {
+    for (int p = 0; p < NRanks; ++p) {
       const int src =
-          Inverse ? p * count + i : row * 4 * width + p * width + col;
+          Inverse ? p * count + i : row * NRanks * width + p * width + col;
       values[p] = input[src];
     }
 #pragma unroll
-    for (int p = 0; p < 4; ++p) {
-      const int dst =
-          Inverse ? row * 4 * width + rank * width + col : rank * count + i;
+    for (int p = 0; p < NRanks; ++p) {
+      const int dst = Inverse ? row * NRanks * width + rank * width + col
+                              : rank * count + i;
       write4(buffers[p] + dst, values[p]);
     }
   }
@@ -99,11 +104,11 @@ __global__ __launch_bounds__(1024, 1) void chunk_a2a(
   // announce completion. Their fences alone would not order peers' writes.
   __threadfence_system();
   __syncthreads();
-  if (threadIdx.x < 4) {
+  if (threadIdx.x < NRanks) {
     const int p = threadIdx.x;
-    release_flag(flag_peers[p] + (ring * 4 + rank) * gridDim.x + blockIdx.x,
-                 epoch);
-    while (acquire_flag(flag_peers[rank] + (ring * 4 + p) * gridDim.x +
+    release_flag(
+        flag_peers[p] + (ring * NRanks + rank) * gridDim.x + blockIdx.x, epoch);
+    while (acquire_flag(flag_peers[rank] + (ring * NRanks + p) * gridDim.x +
                         blockIdx.x) != epoch) {
     }
   }
@@ -113,46 +118,58 @@ __global__ __launch_bounds__(1024, 1) void chunk_a2a(
   for (int i = tid; i < count; i += stride) {
     const int row = i / width, col = i % width;
 #pragma unroll
-    for (int p = 0; p < 4; ++p) {
+    for (int p = 0; p < NRanks; ++p) {
       const int dst =
-          Inverse ? row * 4 * width + p * width + col : p * count + i;
-      output[dst] = read4(buffers[rank] + dst);
+          Inverse ? row * NRanks * width + p * width + col : p * count + i;
+      const uint4 value = read4(buffers[rank] + dst);
+      if constexpr (Quantize) {
+        const uint32_t words[4] = {value.x, value.y, value.z, value.w};
+        quantize_a2a_group(words, reinterpret_cast<uint32_t *>(output), scales,
+                           4 * dst, padded_rows, channels / NRanks,
+                           valid_rows != padded_rows);
+      } else {
+        output[dst] = value;
+      }
     }
   }
+  if constexpr (Quantize)
+    pad_a2a_fp8<NRanks>(reinterpret_cast<uint32_t *>(output), scales, rows,
+                        channels);
   end_epoch(control, epoch);
 }
-void exchange_chunk(TensorView flags, TensorView input, TensorView output,
-                    TensorView peers, TensorView control, int64_t capacity,
-                    int64_t rows, int64_t channels, int64_t rank,
-                    int64_t blocks, bool inverse) {
+template <int NRanks>
+void exchange_chunk_impl(TensorView flags, TensorView input, TensorView output,
+                         TensorView peers, TensorView control, int64_t capacity,
+                         int64_t rows, int64_t channels, int64_t rank,
+                         int64_t blocks, bool inverse) {
   ffi::CUDADeviceGuard guard(input.device().device_id);
   CHECK_INPUT(input);
   CHECK_INPUT(output);
   CHECK_INPUT(peers);
   CHECK_INPUT(control);
   CHECK_INPUT(flags);
-  TVM_FFI_ICHECK(channels >= 32 && channels % 32 == 0 && rows > 0);
+  TVM_FFI_ICHECK(channels > 0 && channels % (8 * NRanks) == 0 && rows > 0);
   TVM_FFI_ICHECK(input.dtype().code == kDLBfloat && input.dtype().bits == 16);
   TVM_FFI_ICHECK_EQ(input.dtype(), output.dtype());
   TVM_FFI_ICHECK_EQ(input.numel(), rows * channels);
   TVM_FFI_ICHECK_EQ(output.numel(), input.numel());
-  TVM_FFI_ICHECK(rank >= 0 && rank < 4 && blocks > 0);
+  TVM_FFI_ICHECK(rank >= 0 && rank < NRanks && blocks > 0);
   TVM_FFI_ICHECK(capacity >= rows * channels / 4 && capacity <= INT32_MAX / 3);
   TVM_FFI_ICHECK_EQ(input.device().device_id, output.device().device_id);
   TVM_FFI_ICHECK_EQ(input.device().device_id, peers.device().device_id);
   TVM_FFI_ICHECK_EQ(input.device().device_id, flags.device().device_id);
   TVM_FFI_ICHECK_EQ(input.device().device_id, control.device().device_id);
   TVM_FFI_ICHECK(peers.dtype().code == kDLInt && peers.dtype().bits == 64 &&
-                 peers.numel() == 4);
+                 peers.numel() == NRanks);
   TVM_FFI_ICHECK(flags.dtype().code == kDLInt && flags.dtype().bits == 64 &&
-                 flags.numel() == 4);
+                 flags.numel() == NRanks);
   TVM_FFI_ICHECK(control.dtype().code == kDLInt && control.dtype().bits == 32 &&
                  control.numel() == 2);
   auto stream = get_stream(input.device());
 #define CHUNK(INVERSE)                                                         \
-  chunk_a2a<INVERSE><<<blocks, 1024, 0, stream>>>(                             \
+  chunk_a2a<NRanks, INVERSE, false><<<blocks, 1024, 0, stream>>>(              \
       static_cast<const uint4 *>(input.data_ptr()),                            \
-      static_cast<uint4 *>(output.data_ptr()),                                 \
+      static_cast<uint4 *>(output.data_ptr()), nullptr,                        \
       static_cast<uint64_t **>(peers.data_ptr()),                              \
       static_cast<uint64_t **>(flags.data_ptr()),                              \
       static_cast<uint32_t *>(control.data_ptr()), capacity, rows, channels,   \
@@ -166,4 +183,92 @@ void exchange_chunk(TensorView flags, TensorView input, TensorView output,
   TVM_FFI_ICHECK(cudaGetLastError() == cudaSuccess);
 }
 
+void exchange_chunk(TensorView flags, TensorView input, TensorView output,
+                    TensorView peers, TensorView control, int64_t capacity,
+                    int64_t rows, int64_t channels, int64_t rank,
+                    int64_t blocks, bool inverse) {
+#define DISPATCH(N)                                                            \
+  exchange_chunk_impl<N>(flags, input, output, peers, control, capacity, rows, \
+                         channels, rank, blocks, inverse)
+  switch (peers.numel()) {
+  case 2:
+    DISPATCH(2);
+    break;
+  case 4:
+    DISPATCH(4);
+    break;
+  case 8:
+    DISPATCH(8);
+    break;
+  default:
+    TVM_FFI_ICHECK(false) << "Lamport A2A requires TP2, TP4 or TP8";
+  }
+#undef DISPATCH
+}
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(exchange_chunk, exchange_chunk);
+
+template <int NRanks>
+void exchange_chunk_fp8_impl(TensorView flags, TensorView input,
+                             TensorView output, TensorView scales,
+                             TensorView peers, TensorView control,
+                             int64_t capacity, int64_t rows, int64_t channels,
+                             int64_t rank, int64_t blocks) {
+  ffi::CUDADeviceGuard guard(input.device().device_id);
+  CHECK_INPUT(input);
+  CHECK_INPUT(output);
+  CHECK_INPUT(scales);
+  CHECK_INPUT(peers);
+  CHECK_INPUT(control);
+  CHECK_INPUT(flags);
+  TVM_FFI_ICHECK_EQ(input.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(output.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(scales.dtype(), dl_float32);
+  TVM_FFI_ICHECK(channels > 0 && channels % (128 * NRanks) == 0 && rows > 0);
+  const int64_t padded_rows = (NRanks * rows + 3) / 4 * 4;
+  TVM_FFI_ICHECK_EQ(input.numel(), rows * channels);
+  TVM_FFI_ICHECK_EQ(output.numel(), padded_rows * (channels / NRanks));
+  TVM_FFI_ICHECK_EQ(scales.numel(), output.numel() / 128);
+  TVM_FFI_ICHECK(rank >= 0 && rank < NRanks && blocks > 0);
+  TVM_FFI_ICHECK(capacity >= rows * channels / 4 && capacity <= INT32_MAX / 3);
+  TVM_FFI_ICHECK_EQ(peers.dtype(), dl_int64);
+  TVM_FFI_ICHECK_EQ(peers.numel(), NRanks);
+  TVM_FFI_ICHECK_EQ(flags.dtype(), dl_int64);
+  TVM_FFI_ICHECK_EQ(flags.numel(), NRanks);
+  TVM_FFI_ICHECK_EQ(control.dtype(), dl_int32);
+  TVM_FFI_ICHECK_EQ(control.numel(), 2);
+  for (auto tensor : {output, scales, peers, flags, control})
+    TVM_FFI_ICHECK_EQ(input.device().device_id, tensor.device().device_id);
+  chunk_a2a<NRanks, false, true>
+      <<<blocks, 1024, 0, get_stream(input.device())>>>(
+          static_cast<const uint4 *>(input.data_ptr()),
+          static_cast<uint4 *>(output.data_ptr()),
+          static_cast<float *>(scales.data_ptr()),
+          static_cast<uint64_t **>(peers.data_ptr()),
+          static_cast<uint64_t **>(flags.data_ptr()),
+          static_cast<uint32_t *>(control.data_ptr()), capacity, rows, channels,
+          rank);
+  TVM_FFI_ICHECK(cudaGetLastError() == cudaSuccess);
+}
+void exchange_chunk_fp8(TensorView flags, TensorView input, TensorView output,
+                        TensorView scales, TensorView peers, TensorView control,
+                        int64_t capacity, int64_t rows, int64_t channels,
+                        int64_t rank, int64_t blocks) {
+#define DISPATCH(N)                                                            \
+  exchange_chunk_fp8_impl<N>(flags, input, output, scales, peers, control,     \
+                             capacity, rows, channels, rank, blocks)
+  switch (peers.numel()) {
+  case 2:
+    DISPATCH(2);
+    break;
+  case 4:
+    DISPATCH(4);
+    break;
+  case 8:
+    DISPATCH(8);
+    break;
+  default:
+    TVM_FFI_ICHECK(false) << "Lamport A2A requires TP2, TP4 or TP8";
+  }
+#undef DISPATCH
+}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(exchange_chunk_fp8, exchange_chunk_fp8);

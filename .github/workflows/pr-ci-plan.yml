@@ -1,0 +1,105 @@
+name: PR CI Plan
+run-name: "CI plan #${{ github.event.pull_request.number || inputs.pr }} | ${{ github.event.pull_request.head.sha || inputs.head }} | ${{ github.event.pull_request.base.sha || inputs.base }}"
+
+on:
+  # Dispatch refreshes a specific open PR for watch/fix; main pushes never plan.
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Same-repository PR to refresh"
+        required: true
+        type: string
+
+      head:
+        description: "Exact PR head SHA to plan"
+        required: true
+        type: string
+      base:
+        description: "Exact main SHA to plan"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-ci-plan-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: CI Coverage Plan
+    if: >-
+      github.repository == 'lightseekorg/tokenspeed'
+      && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository)
+      && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout trusted planner
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || 'main' }}
+          path: controller
+          persist-credentials: false
+
+      - name: Resolve current PR source
+        id: source
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+        run: python3 controller/.github/scripts/pr_ci_assist.py plan-source
+
+      - name: Checkout source commit
+        if: steps.source.outputs.active == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.source.outputs.head }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: steps.source.outputs.active == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install planning CLI
+        if: steps.source.outputs.active == 'true'
+        run: npm install --global @moonshot-ai/kimi-code@2.1.1
+
+      - name: Install task catalog dependency
+        if: steps.source.outputs.active == 'true'
+        run: python3 -m pip install pyyaml
+
+      - name: Prepare CI plan
+        if: steps.source.outputs.active == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          PR_BASE_SHA: ${{ steps.source.outputs.base }}
+          PR_HEAD_SHA: ${{ steps.source.outputs.head }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL || 'b200v2' }}
+        working-directory: source
+        run: python3 ../controller/.github/scripts/pr-ci-model.py prepare
+
+      - name: Generate CI plan
+        if: steps.source.outputs.active == 'true'
+        env:
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          KIMI_CODE_HOME: ${{ runner.temp }}/ci-assist-home
+          PR_HEAD_SHA: ${{ steps.source.outputs.head }}
+        working-directory: source
+        run: python3 ../controller/.github/scripts/pr-ci-model.py plan
+
+      - name: Publish CI plan
+        if: steps.source.outputs.active == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          PR_NUMBER: ${{ steps.source.outputs.pr }}
+          PR_HEAD_SHA: ${{ steps.source.outputs.head }}
+        working-directory: source
+        run: python3 ../controller/.github/scripts/pr-ci-model.py publish

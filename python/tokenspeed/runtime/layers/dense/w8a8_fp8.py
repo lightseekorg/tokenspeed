@@ -20,9 +20,9 @@
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
-from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.parameter import (
@@ -51,8 +51,8 @@ def w8a8_fp8_per_channel_mm(
         ``[M, N]`` output in ``out_dtype``.
     """
     # One quantization group spanning the row is per-token scaling.
-    qinput, x_scale = per_token_group_quant_fp8(x, x.shape[-1])
-    return tokenspeed_kernel.mm(
+    qinput, x_scale = quantize_fp8(x, granularity="token")
+    return mm(
         qinput,
         weight_kn,
         A_scales=x_scale,
@@ -77,8 +77,9 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
         else:
             # use per-channel quantization on weight
-            qweight, weight_scale = per_token_group_quant_fp8(
-                layer.weight, layer.weight.shape[-1]
+            qweight, weight_scale = quantize_fp8(
+                layer.weight,
+                granularity="token",
             )
             weight_scale = weight_scale.t().contiguous()
 

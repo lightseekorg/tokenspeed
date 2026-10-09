@@ -197,6 +197,7 @@ jobs:
           import sys
           import zipfile
           from email.parser import BytesParser
+          from pathlib import Path
 
           from packaging.requirements import Requirement
           from packaging.utils import canonicalize_name
@@ -218,7 +219,11 @@ jobs:
           expected = {
               "tokenspeed-kernel-amd": (
                   "==" + os.environ["AMD_NIGHTLY_VERSION"]
-                  if os.environ["AMD_NIGHTLY_VERSION"] else ">=0.1.3"
+                  if os.environ["AMD_NIGHTLY_VERSION"] else str(next(
+                      Requirement(line).specifier
+                      for line in Path("requirements/rocm-thirdparty.txt").read_text().splitlines()
+                      if line.startswith("tokenspeed-kernel-amd")
+                  ))
               ),
           }
           for name, specifier in expected.items():
@@ -319,6 +324,10 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           release_tag="${TAG_NAME}-${ROCM_VARIANT}"
+          test "$(gh api user --jq .login)" = lightseek-bot
+          for repository in "$RELEASE_REPOSITORY" lightseekorg/tokenspeed; do
+            test "$(gh repo view "$repository" --json visibility --jq .visibility)" = PUBLIC
+          done
           release_title="tokenspeed-kernel ${VERSION} ROCm 7.2"
           prerelease_args=()
           if [ "$NIGHTLY" = "true" ] || [ "$PRERELEASE" = "true" ] || [[ "$VERSION" == *.dev* ]] || [[ "$VERSION" == *+* ]]; then

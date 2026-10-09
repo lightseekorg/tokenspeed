@@ -113,11 +113,15 @@ from tokenspeed.runtime.layers.attention.page_table import (
     mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+from tokenspeed.runtime.layers.moe import topk as topk_module
 from tokenspeed.runtime.layers.paged_attention import bind_cache_groups
 from tokenspeed.runtime.layers.quantization import (
     QUANTIZATION_METHODS,
     Fp8Config,
     Mxfp4Config,
+)
+from tokenspeed.runtime.model_loader.weight_utils import (
+    initialize_dummy_integer_weights,
 )
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
@@ -807,6 +811,32 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertIs(output.topk_ids, topk_ids)
         self.assertIs(output.router_logits, router_logits)
         self.assertEqual(calls[0][0][2:6], ("sqrt_softplus", "topk", True, 2.0))
+
+    def test_deepseek_v4_topk_routes_simulated_logits(self):
+        router_logits = torch.zeros((2, 4))
+        seen = []
+
+        def fake_moe_topk(logits, *args, **kwargs):
+            seen.append(logits)
+            return torch.ones((2, 2)), torch.zeros((2, 2), dtype=torch.int32)
+
+        with (
+            patch.dict(os.environ, {"TOKENSPEED_MOE_ROUTING_SIMULATION": "uniform"}),
+            patch.dict(topk_module._simulated_logits, clear=True),
+            patch.object(deepseek_v4_model, "moe_topk", fake_moe_topk),
+        ):
+            output = DeepseekV4TopK(
+                top_k=2,
+                renormalize=True,
+                correction_bias=torch.zeros(4),
+                routed_scaling_factor=1.0,
+                hash_routing=False,
+            )(torch.ones((2, 3)), router_logits)
+            expected = topk_module.simulated_router_logits(router_logits)
+
+        torch.testing.assert_close(seen[0], expected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(seen[0], router_logits))
+        self.assertIs(output.router_logits, seen[0])
 
     def test_deepseek_v4_moe_stream_fork_disabled_order(self):
         calls = []
@@ -6681,6 +6711,24 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         self.assertEqual(logits.dtype, torch.float32)
         self.assertTrue(torch.allclose(logits, expected))
+
+    def test_deepseek_v4_dummy_hash_table_spreads_tokens_over_experts(self):
+        config = SimpleNamespace(
+            n_routed_experts=16,
+            hidden_size=8,
+            num_hash_layers=1,
+            vocab_size=64,
+            num_experts_per_tok=4,
+        )
+        gate = DeepseekV4MoEGate(config, layer_index=0)
+        gate.tid2eid.data.fill_(-1)
+
+        initialize_dummy_integer_weights(gate)
+
+        table = gate.tid2eid
+        self.assertTrue(bool(((table >= 0) & (table < 16)).all()))
+        self.assertTrue(all(row.unique().numel() == 4 for row in table))
+        self.assertEqual(table.unique().numel(), 16)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_deepseek_v4_gate_dsv3_router_gemm_shape(self):

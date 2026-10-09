@@ -35,7 +35,11 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 __all__ = ["triton_tree_window_attention"]
 
@@ -133,7 +137,7 @@ def _tree_window_merge_kernel(
             + dims[None, :] * stride_kd,
             mask=col_ok[:, None],
             other=0.0,
-        )
+        ).to(q.dtype)
         v = tl.load(
             v_ptr
             + slot[:, None] * stride_vt
@@ -141,7 +145,7 @@ def _tree_window_merge_kernel(
             + dims[None, :] * stride_vd,
             mask=col_ok[:, None],
             other=0.0,
-        )
+        ).to(q.dtype)
         scores = tl.dot(q, tl.trans(k)) * sm_scale_log2
         in_window = col >= R - 1
         bit = (
@@ -180,9 +184,18 @@ def _tree_window_merge_kernel(
     solution="triton",
     # Its prefix partial comes from trtllm-gen, so trees run it on NVIDIA only.
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    # An FP8 KV cache is unscaled (every factor 1.0): its K/V widen to the query dtype.
     signatures=format_signatures(
         ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
+    )
+    | {
+        format_signature(
+            q=dense_tensor_format(dtype),
+            k_cache=dense_tensor_format(torch.float8_e4m3fn),
+            v_cache=dense_tensor_format(torch.float8_e4m3fn),
+        )
+        for dtype in (torch.float16, torch.bfloat16)
+    },
     priority=Priority.PORTABLE,
 )
 def triton_tree_window_attention(

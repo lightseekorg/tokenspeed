@@ -1593,6 +1593,19 @@ def write_detailed_step_summary(result: Dict[str, Any]) -> None:
         )
 
 
+def source_sha(repo_root: Path) -> str | None:
+    # Slurm snapshots have no .git directory; the trusted launcher supplies
+    # their archive SHA, without requiring a git binary inside the container.
+    value = os.environ.get("TOKENSPEED_CI_SOURCE_SHA", "")
+    if re.fullmatch(r"[0-9a-f]{40}", value):
+        return value
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, capture_output=True, text=True
+    )
+    value = result.stdout.strip() if result.returncode == 0 else ""
+    return value if re.fullmatch(r"[0-9a-f]{40}", value) else None
+
+
 def write_result(path: str | None, payload: Dict[str, Any]) -> None:
     if not path:
         return
@@ -2068,6 +2081,8 @@ def execute_task(
     result = {
         "ok": error is None,
         "task": task["name"],
+        "config": os.path.relpath(repo_root / config, repo_root),
+        "source_sha": source_sha(repo_root),
         "type": task["type"],
         "runner": runner,
         "setup_mode": setup_mode,

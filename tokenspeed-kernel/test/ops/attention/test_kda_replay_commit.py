@@ -23,6 +23,7 @@ What has to hold for that to be lossless:
 
 import pytest
 import torch
+from utils import is_cdna4, is_cdna5
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -283,11 +284,11 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
 
 
 @pytest.mark.skipif(
-    not current_platform().is_cdna4,
-    reason="AMD CDNA4 is required for GFX950 KDA replay execution",
+    not (is_cdna4() or is_cdna5()),
+    reason="AMD CDNA4 or CDNA5 is required for Gluon KDA replay execution",
 )
 def test_gluon_batched_replay_uneven_groups_match_per_layer_launches():
-    """The GFX950 all-layer launch honors each descriptor's cache-group row."""
+    """The Gluon all-layer launch honors each descriptor's cache-group row."""
     layers, n, t, pages, num_heads = 5, 2, 8, 10, 12
     groups = [0, 0, 0, 1, 1]
     source = [
@@ -308,7 +309,8 @@ def test_gluon_batched_replay_uneven_groups_match_per_layer_launches():
     accepted = torch.tensor([1, t], device=DEV, dtype=torch.int32)
     kernel = resolve_kda_batched_replay_commit()
     assert kernel is not None
-    assert kernel.name == "gluon_kda_fused_replay_gfx950"
+    arch = "gfx950" if is_cdna4() else "gfx1250"
+    assert kernel.name == f"gluon_kda_fused_replay_{arch}"
 
     def launch(xs, group_indices, read_indices, write_indices):
         kernel(

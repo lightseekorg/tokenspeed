@@ -80,7 +80,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     rope_pad_query,
 )
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32, grouped_bf16_projection
-from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -169,7 +169,7 @@ def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             "V4.1 FP8 activations require a last dimension divisible by 32"
         )
     if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
-        return quantize_fp8_with_scale(
+        return quantize_fp8(
             x.reshape(-1, x.shape[-1]),
             granularity="token_group",
             group_size=32,
@@ -305,19 +305,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     ) -> torch.Tensor:
         if x.shape[0] == 0:
             return x.new_empty((*x.shape[:-1], layer.weight.shape[0]))
-        plan = getattr(layer, "_prepared_fp8_linear", None)
-        if (
-            x.is_cuda
-            and x.dtype in (torch.bfloat16, torch.float16)
-            and plan is not None
-        ):
-            from tokenspeed_kernel.ops.gemm import quantize_fp8_group32_for_linear
-
-            codes, scales = quantize_fp8_group32_for_linear(
-                plan, x.reshape(-1, x.shape[-1])
-            )
-        else:
-            codes, scales = v41_quantize_fp8(x)
+        codes, scales = v41_quantize_fp8(x)
         return super().apply(layer, codes, bias, scales, x.dtype)
 
     def apply_with_activation(
@@ -561,7 +549,7 @@ def v41_hc_post(
     if not x.is_cuda:
         mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
         return (post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed).to(x.dtype)
-    from tokenspeed_kernel import mhc_post
+    from tokenspeed_kernel.ops.residual import mhc_post
 
     return mhc_post(x, residual, post.unsqueeze(-1), comb, override=None, solution=None)
 
@@ -1104,6 +1092,9 @@ class DeepseekV41DecoderLayer(nn.Module):
                 self.register_parameter(f"hc_{name}_{suffix}", param)
 
     def forward(self, hidden_states, pre_mix, positions, image_mask, ctx):
+        if hidden_states.shape[0] == 0:
+            self._forward_ffn(hidden_states[:, 0, :], image_mask, ctx)
+            return hidden_states, pre_mix
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         residual = hidden_states
         if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
@@ -1111,6 +1102,10 @@ class DeepseekV41DecoderLayer(nn.Module):
             # every decoder consumer are unnecessary for an open chunk.
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
             self.attn(positions, x, ctx)
+            if self.ffn.owns_ep_communication:
+                self._forward_ffn(
+                    x[:0], None if image_mask is None else image_mask[:0], ctx
+                )
             return residual[:0], pre_mix[:0]
         overlap = (
             residual.is_cuda
@@ -1165,22 +1160,27 @@ class DeepseekV41DecoderLayer(nn.Module):
                 for tensor in (ffn_pre, post, comb):
                     tensor.record_stream(consumer)
             x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
-            if self.ffn.use_mega_moe:
-                counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
-                x = self.ffn(
-                    x,
-                    image_mask,
-                    sum(counts),
-                    max(counts),
-                    ctx=ctx,
-                    comm_manager=self.comm_manager,
-                )
-            else:
-                x = self.comm_manager.pre_mlp_comm(x, ctx)
-                total, maximum = self.comm_manager.get_num_tokens(ctx)
-                x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
-                x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
+            x = self._forward_ffn(x, image_mask, ctx)
         return v41_hc_post(x, residual, post, comb), ffn_pre
+
+    def _forward_ffn(self, x, image_mask, ctx):
+        # Fused EP returns this rank's rows, including an empty tensor on idle
+        # ranks. HC residuals therefore stay local across dispatch/combine.
+        if self.ffn.owns_ep_communication:
+            counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
+            return self.ffn(
+                x,
+                image_mask,
+                sum(counts),
+                max(counts),
+                ctx=ctx if self.ffn.use_mega_moe else None,
+                comm_manager=self.comm_manager if self.ffn.use_mega_moe else None,
+            )
+        x = self.comm_manager.pre_mlp_comm(x, ctx)
+        total, maximum = self.comm_manager.get_num_tokens(ctx)
+        x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
+        x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
+        return x
 
 
 def _ced_decoder_start(config) -> int:
@@ -1289,9 +1289,16 @@ class DeepseekV41Model(nn.Module):
         super().__init__()
         if mapping.pp_size != 1:
             raise NotImplementedError("V4.1 full-prompt baseline requires PP=1")
-        if mapping.attn.tp_size != mapping.moe.tp_ep_size:
+        local_petit = (
+            get_moe_backend().is_gluon_petit()
+            and mapping.attn.tp_size
+            == mapping.dense.tp_size
+            == mapping.moe.tp_size
+            == 1
+        )
+        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_petit:
             raise NotImplementedError(
-                "V4.1 HC residuals require attention TP == MoE TPxEP"
+                "V4.1 requires attention TP == MoE TPxEP or Gluon Petit with attention/dense/MoE TP1"
             )
         if config.hc_mult != 4 or config.hc_sinkhorn_iters < 1:
             raise ValueError(
@@ -1402,6 +1409,15 @@ class DeepseekV41Model(nn.Module):
         forward; the prefill graph calls them individually.
         """
         if input_ids.numel() == 0:
+            if self.mapping.attn.has_dp:
+                hidden = self.embed_tokens.weight.new_empty(
+                    (0, self.config.hc_mult, self.config.hidden_size)
+                )
+                pre_mix = torch.empty(
+                    (0, self.config.hc_mult), dtype=torch.float32, device=hidden.device
+                )
+                for layer in self.layers:
+                    hidden, pre_mix = layer(hidden, pre_mix, positions, image_mask, ctx)
             return (
                 self.embed_tokens.weight.new_empty((0, self.config.hidden_size)),
                 None,
@@ -1511,12 +1527,19 @@ class DeepseekV41Model(nn.Module):
         view = backend.decoder_view()
         # Checked here, in the stage that always runs eagerly: a replayed
         # encoder graph would skip a check placed before it.
-        if view.keep_rows is not None and ctx.global_num_tokens is not None:
+        if (
+            view.keep_rows is not None
+            and ctx.global_num_tokens is not None
+            and not self.layers[start].ffn.use_gluon_petit
+        ):
             raise NotImplementedError(
                 "V4.1 CED narrowing under attention data parallelism needs the "
                 "narrowed row counts exchanged across ranks"
             )
         captured = list(state.captured)
+        # Petit exchanges actual local row counts inside its dispatch. The
+        # original DP counts remain valid capacity bounds after CED narrowing;
+        # no host exchange is needed for its routed or rank-local shared experts.
         with report_collective_sizing(ctx, view.metadata.positions.numel(), None):
             hidden, pre_mix = self._run_layer(
                 self.layers[start], state.hidden, state.pre_mix, state, ctx, captured
@@ -1555,7 +1578,7 @@ class DeepseekV41Model(nn.Module):
         start = self.ced_decoder_start
         captured = list(state.captured)
         h, pre_mix = state.hidden, state.pre_mix
-        if state.rows == 0:
+        if state.rows == 0 and not self.mapping.attn.has_dp:
             hidden = h[:, 0, :]
             captured.extend(
                 hidden for layer_id in self.dspark_capture_layers if layer_id > start
@@ -1836,7 +1859,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     self.mapping.moe.ep_rank * count,
                     (self.mapping.moe.ep_rank + 1) * count,
                 ):
-                    for shard in (("w1", "w3") if projection == "w13" else ("w2",)):
+                    for shard in ("w1", "w3") if projection == "w13" else ("w2",):
                         field = "scale" if suffix == "weight_scale" else "weight"
                         targets[f"{prefix}.experts.{expert}.{shard}.{field}"] = (
                             name,

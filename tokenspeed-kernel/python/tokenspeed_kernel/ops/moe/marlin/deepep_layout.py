@@ -86,7 +86,7 @@ def _pack_kernel(
     expert_ptr,
     RECV_M: tl.constexpr,
     HIDDEN: tl.constexpr,
-    ROW_CAPACITY: tl.constexpr,
+    row_capacity,
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
@@ -110,7 +110,7 @@ def _pack_kernel(
         if tl.program_id(1) == 0:
             # Marlin's sentinel is >= size_m * top_k. Padded rows are never
             # read by either GEMM, so their activation storage stays untouched.
-            ids = tl.where(row < count, offset + row, ROW_CAPACITY)
+            ids = tl.where(row < count, offset + row, row_capacity)
             tl.store(sorted_ptr + offset + row, ids)
             tl.store(expert_ptr + offset // BLOCK_M + block, expert)
 
@@ -236,7 +236,7 @@ def pack_recv_rows(
         expert_ids,
         RECV_M=recv_m,
         HIDDEN=hidden,
-        ROW_CAPACITY=rows,
+        row_capacity=rows,
         BLOCK_M=block_m,
         BLOCK_H=256,
     )

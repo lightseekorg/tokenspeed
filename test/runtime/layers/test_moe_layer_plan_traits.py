@@ -44,7 +44,7 @@ def _plan_kwargs(monkeypatch, **layer_kwargs) -> dict:
         plans.append(kwargs)
         return {"solution": "fake", "apply_kernel_name": "fake"}
 
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_plan)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_plan)
     monkeypatch.setattr(expert_module, "create_layer_weights", lambda *a, **k: None)
     monkeypatch.setitem(global_server_args_dict, "moe_mxfp4_fp8_activation", False)
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)

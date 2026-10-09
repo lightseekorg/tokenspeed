@@ -160,6 +160,27 @@ jobs:
             --reuse-runner-state \
             --result-json .ci-artifacts/result.json
 
+      - name: Checkout source reporter
+        if: always()
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: ${{ env.WORK_DIR }}-source
+          sparse-checkout: .github/scripts/ci_result_source.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Record checked-out source
+        if: always()
+        env:
+          EXPECTED_SOURCE: ${{ inputs.checkout_ref || github.sha }}
+          CONFIG: ${{ matrix.config }}
+          RUNNER: ${{ matrix.runner }}
+        run: >-
+          python3 "${{ env.WORK_DIR }}-source/.github/scripts/ci_result_source.py"
+          --work-dir "$WORK_DIR" --expected "$EXPECTED_SOURCE"
+          --config "$CONFIG" --runner "$RUNNER"
+
       - name: Upload task result
         if: always()
         uses: actions/upload-artifact@v4
@@ -167,6 +188,7 @@ jobs:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.WORK_DIR }}/.ci-artifacts/result.json
+            ${{ env.WORK_DIR }}/.ci-artifacts/source.json
             ${{ env.WORK_DIR }}/.ci-artifacts/published/
           include-hidden-files: true
 
@@ -188,3 +210,4 @@ jobs:
             gb200*) python3 "${{ env.WORK_DIR }}/test/ci_system/process_group_manager.py" cleanup-stale || true ;;
           esac
           rm -rf "${{ env.WORK_DIR }}"
+          rm -rf "${{ env.WORK_DIR }}-source"

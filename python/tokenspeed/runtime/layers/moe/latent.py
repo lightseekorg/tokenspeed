@@ -26,8 +26,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection as kernel_kimi3_latent_projection,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection_add3 as kernel_kimi3_latent_projection_add3,
+)
 from tokenspeed_kernel.ops.moe import (
     latent_moe_expert_shared,
     native_latent_moe_available,
@@ -373,7 +378,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
         """
         if self.shard_group is None and self.column_group is None:
             raise ValueError("project_shard requires a column-parallel projection")
-        return tokenspeed_kernel.kimi3_latent_projection(
+        return kernel_kimi3_latent_projection(
             hidden_states,
             self.weight,
             solution=self.solution,
@@ -389,7 +394,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
 
     def _project_replicated(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project through whatever this rank stores, gathering nothing."""
-        return tokenspeed_kernel.kimi3_latent_projection(
+        return kernel_kimi3_latent_projection(
             hidden_states,
             self.weight,
             solution=self.solution,
@@ -467,7 +472,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
         enumeration over every ``shard_group is None`` left in this class.
         """
         if not self.narrowed:
-            return tokenspeed_kernel.kimi3_latent_projection_add3(
+            return kernel_kimi3_latent_projection_add3(
                 hidden_states,
                 self.weight,
                 addend_a,
@@ -477,7 +482,7 @@ class Kimi3LatentProjection(ReplicatedLinear):
             )
         rows = self.output_size_full // self.shard_size
         start = self.shard_rank * rows
-        local = tokenspeed_kernel.kimi3_latent_projection_add3(
+        local = kernel_kimi3_latent_projection_add3(
             hidden_states,
             self.weight,
             addend_a.narrow(-1, start, rows),

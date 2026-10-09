@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import fp8_linear, mm, prepare_fp8_linear
-from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8
+from tokenspeed_kernel.ops.gemm import (
+    _online_quantize_mxfp8,
+    fp8_linear,
+    fp8_linear_into,
+    fp8_linear_prepacked,
+    mm,
+    prepare_fp8_linear,
+)
 from tokenspeed_kernel.ops.gemm.flashinfer import (
+    flashinfer_fp8_blockscale_quantize_prepacked,
     gemm_fp8_nt_groupwise,
     has_flashinfer_fp8_blockscale,
     prepare_flashinfer_fp8_blockscale_weight_scales,
     use_flashinfer_fp8_blockscale_prepacked,
-)
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    flashinfer_fp8_blockscale_quantize_prepacked,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -103,9 +107,7 @@ def test_canonical_and_prepacked_gemm_match(device: str, m: int) -> None:
     # Triton one when M % 4 != 0; they can round an FP8 value differently, which
     # shifts a whole output row. Check canonical against its own quantized
     # operands instead: only the bf16 output rounding remains (|out| ~ 5e-3).
-    q_x, x_scales = _online_quantize_mxfp8(
-        x, [128, 128], "flashinfer_mm_fp8_blockscale"
-    )
+    q_x, x_scales = _online_quantize_mxfp8(x, [128, 128], "float32", enable_pdl=False)
     # TRT-LLM pads the scale rows to a multiple of four.
     activation = q_x[:m].float() * x_scales[:m].repeat_interleave(128, dim=1)
     reference = activation @ _dequantize_weight(weight, weight_scales).t()
@@ -208,6 +210,40 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
         prepacked_scales=True,
     )
     torch.testing.assert_close(planned, prepacked, atol=0, rtol=0)
+
+
+def test_projection_prepacked_input_and_destination(device: str) -> None:
+    """TP4 C128 communication output matches ordinary prepared projection."""
+    torch.manual_seed(6)
+    m, n, k = 4 * 128, 256, 512
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    weight = (torch.randn(n, k, device=device) * 0.02).to(torch.float8_e4m3fn)
+    weight_scales = (
+        torch.rand(n // 128, k // 128, device=device, dtype=torch.float32) * 0.02
+        + 0.001
+    )
+    plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
+    expected = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
+
+    values, scales = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
+    destination = torch.empty_like(expected)
+    actual = fp8_linear_prepacked(
+        plan, values, weight, scales, m, torch.bfloat16, out=destination
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    destination = torch.empty_like(expected)
+    actual = fp8_linear_into(
+        plan,
+        x,
+        weight,
+        weight_scales,
+        input_scales=None,
+        bias=None,
+        out_dtype=torch.bfloat16,
+        out=destination,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> None:

@@ -31,6 +31,8 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
+# Intermediate-size multiple the SiLU/SwiGLU kernels accept; ReLU2 keeps 128.
+TRTLLM_UNQUANT_ISPP_ALIGNMENT = 128
 
 _RELU2_TRAITS = {
     "weight_dtype": frozenset({"unquant"}),
@@ -54,6 +56,14 @@ if platform.is_nvidia:
         convert_to_block_layout,
         get_w2_permute_indices_with_cache,
     )
+    from tokenspeed_kernel.thirdparty.flashinfer import (
+        trtllm_bf16_moe as ispp64_launcher,
+    )
+
+    # Only the SM100-SM103 kernels below use the private launcher; other GPUs
+    # keep 128 without checking it or FlashInfer's JIT.
+    if ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3):
+        TRTLLM_UNQUANT_ISPP_ALIGNMENT = ispp64_launcher.gated_ispp_alignment()
 
     def _flashinfer_trtllm_unquant_moe_weights(w: torch.nn.Module, *, gated: bool):
         cache_permute_indices = {}
@@ -137,7 +147,9 @@ if platform.is_nvidia:
 
         ``routed`` selects between ``trtllm_bf16_moe`` (in-kernel routing from
         ``router_logits``) and ``trtllm_bf16_routed_moe`` (precomputed
-        ``topk_ids``/``topk_weights``); everything else is identical.
+        ``topk_ids``/``topk_weights``). Precomputed routes use FlashInfer's
+        unpacked (int32 IDs, BF16 weights) ABI, preserving the packed path's
+        weight rounding; everything else is identical.
         ``activation_type`` is SwiGLU for gated experts and Relu2 for
         non-gated ones.
         """
@@ -153,6 +165,13 @@ if platform.is_nvidia:
             )
 
         local_experts = getattr(w, "num_local_experts", w.w13_weight.shape[0])
+        intermediate_size = getattr(w, "intermediate_size") // getattr(w, "tp_size", 1)
+        # Sizes the stock launcher rejects run on the 64-aligned private one.
+        bf16_moe, bf16_routed_moe = (
+            (ispp64_launcher.trtllm_bf16_moe, ispp64_launcher.trtllm_bf16_routed_moe)
+            if intermediate_size % ispp64_launcher.STOCK_ISPP_ALIGNMENT
+            else (trtllm_bf16_moe, trtllm_bf16_routed_moe)
+        )
         # GEMM and sizing arguments shared by both kernel entry points.
         common_kwargs = dict(
             hidden_states=x,
@@ -160,8 +179,7 @@ if platform.is_nvidia:
             gemm2_weights=w.w2_weight,
             num_experts=getattr(w, "num_experts"),
             top_k=getattr(w, "top_k"),
-            intermediate_size=getattr(w, "intermediate_size")
-            // getattr(w, "tp_size", 1),
+            intermediate_size=intermediate_size,
             local_expert_offset=getattr(w, "ep_rank", 0) * local_experts,
             local_num_experts=local_experts,
             do_finalize=do_finalize,
@@ -171,17 +189,14 @@ if platform.is_nvidia:
         )
 
         if routed:
-            # PackedScoreIdx = (expert_id<<16)|bf16 bits, applied verbatim; &0xFFFF stops int16 sign-extension.
-            weight_bits = (
-                topk_weights.to(torch.bfloat16)
-                .contiguous()
-                .view(torch.int16)
-                .to(torch.int32)
-                & 0xFFFF
+            # Preserve the packed path's BF16 rounding without constructing
+            # score/index words. FlashInfer accepts these tensors directly.
+            topk = (
+                topk_ids.to(torch.int32).contiguous(),
+                topk_weights.to(torch.bfloat16).contiguous(),
             )
-            packed_topk = (topk_ids.to(torch.int32) << 16) | weight_bits
-            result = trtllm_bf16_routed_moe(
-                topk_ids=packed_topk,
+            result = bf16_routed_moe(
+                topk_ids=topk,
                 n_group=None,
                 topk_group=None,
                 routed_scaling_factor=None,
@@ -203,7 +218,7 @@ if platform.is_nvidia:
             routing_bias = routing_value("correction_bias", None)
             if routing_bias is not None:
                 routing_bias = routing_bias.to(routing_logits_dtype)
-            result = trtllm_bf16_moe(
+            result = bf16_moe(
                 routing_logits=router_logits.to(routing_logits_dtype),
                 routing_bias=routing_bias,
                 n_group=routing_value("n_group", None),
@@ -220,7 +235,7 @@ if platform.is_nvidia:
         # Deferred: [gemm2_out, expert_weights, expanded_idx_to_permuted_idx].
         gemm2_out, expert_weights, expanded_idx = result
         if routed:
-            # expert_weights echoes the caller's packed input; shared-sink callers drop it at finalize.
+            # Shared-sink callers use their original route weights at finalize.
             return (gemm2_out, expert_weights, expanded_idx)
         # In-kernel routing may hand back an fp32-typed buffer that actually
         # holds bf16 data (see trtllm_nvfp4.py); reinterpret to bf16 and keep
@@ -253,7 +268,7 @@ if platform.is_nvidia:
             "supports_deferred_finalize": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({128}),
+            "ispp_alignment": frozenset({TRTLLM_UNQUANT_ISPP_ALIGNMENT}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },
@@ -306,7 +321,7 @@ if platform.is_nvidia:
             "supports_deferred_finalize": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ispp_alignment": frozenset({128}),
+            "ispp_alignment": frozenset({TRTLLM_UNQUANT_ISPP_ALIGNMENT}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },

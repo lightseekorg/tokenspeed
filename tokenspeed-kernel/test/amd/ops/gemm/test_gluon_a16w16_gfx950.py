@@ -41,8 +41,6 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _get_splitk_counters,
     _supports_mfma_lds_smallm,
     _use_mfma_lds_largem,
-    _use_mfma_lds_mediumm,
-    _use_mfma_lds_smallm,
     _use_warp_reduce_smallm,
     gluon_mm_a16w16_gfx950,
     gluon_mm_a16w16_medium_gfx950,
@@ -191,14 +189,6 @@ def test_supports_splitk_rejects_non_target_shapes() -> None:
     assert not _supports_mfma_lds_smallm(8, 8192, 4096)
 
 
-def test_use_splitk_is_disabled_for_default_routing() -> None:
-    assert not _use_mfma_lds_smallm(1, 4096, 4096)
-    assert not _use_mfma_lds_smallm(4, 2560, 2048)
-    assert not _use_mfma_lds_smallm(1, 2560, 2048)
-    assert not _use_mfma_lds_smallm(2, 2560, 2048)
-    assert not _use_mfma_lds_smallm(4, 1280, 1024)
-
-
 def test_dispatcher_falls_back_for_splitk_shapes() -> None:
     dtype = torch.bfloat16
     a = torch.empty((1, 4096), device="cuda", dtype=dtype)
@@ -287,17 +277,6 @@ def test_choose_mfma_lds_mediumm_config_falls_back_for_slow_shapes() -> None:
     assert _choose_mfma_lds_mediumm_config(1152, 3584, 7168) is None
     assert _choose_mfma_lds_mediumm_config(320, 7168, 3584) is None
     assert _choose_mfma_lds_mediumm_config(576, 7168, 3584) is None
-
-
-def test_use_mediumm_routes_configured_shapes() -> None:
-    assert _use_mfma_lds_mediumm(8, 1280, 1024)
-    assert _use_mfma_lds_mediumm(64, 1280, 2880)
-    assert _use_mfma_lds_mediumm(128, 4096, 4096)
-    assert _use_mfma_lds_mediumm(768, 3584, 7168)
-    assert _use_mfma_lds_mediumm(512, 7168, 3584)
-    assert not _use_mfma_lds_mediumm(4, 1280, 1024)
-    assert not _use_mfma_lds_mediumm(256, 1280, 1024)
-    assert not _use_mfma_lds_mediumm(640, 3584, 7168)
 
 
 @pytest.mark.parametrize(

@@ -303,9 +303,10 @@ contiguous copy or a different kernel adapter.
 
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
-replaying the accepted prefix from the committed page. The Kimi-K3 recipe
-reserves that workspace before sizing the arena — the transient conv rows
-plus the per-layer capture payloads — so speculative state memory does not
+replaying the accepted prefix from the committed page. The Kimi-K3 and
+GLM-5.3-Flash recipes share this workspace calculation and reserve it before
+sizing the arena — the transient conv rows plus the per-layer capture payloads.
+GLM also reserves its target/draft-shared KPool tails once, so state memory does not
 disappear from the GPU budget. (Platforms without the replay kernels fall
 back to the dense `max_bs * (draft_tokens + 1)` per-position state
 workspace, reserved the same way.)
