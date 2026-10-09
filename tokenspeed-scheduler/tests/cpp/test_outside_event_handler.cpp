@@ -324,6 +324,125 @@ TEST_F(DisaggDecodePriorityTestSuite, PrefillDoneDoesNotMixWithAnotherSubmittedR
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
+// A decode worker with a sliding-window group beside the full-history one and
+// prefix reuse on. The sliding group lands only each prompt's retained tail,
+// so a later prompt can hit the full-history pages another request landed
+// while the sliding group matches nothing: the probe reports a promotion
+// boundary. A remote admission is still the whole prompt.
+class DisaggDecodeSlidingPrefixTestSuite : public DisaggDecodeAdmissionTestSuite {
+protected:
+    static constexpr std::int32_t kSharedTokens = 16;  // four prefix pages
+    static constexpr std::int32_t kPromptTokens = 24;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 0;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+        CacheGroupConfig& full = cfg.cache_groups.front();
+        full.block_granularity = cfg.prefix_granularity;
+        full.total_pages = cfg.device_allocator.total_pages;
+        CacheGroupConfig sliding = full;
+        sliding.group_id = "sliding";
+        sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
+        sliding.sliding_window_tokens = 8;
+        cfg.cache_groups.push_back(sliding);
+        return cfg;
+    }
+
+    RequestSpec PromptWithSharedPrefix(const std::string& id, std::int32_t tail_start, std::int32_t max_new_tokens) {
+        std::vector<std::int32_t> tokens = MakeTokens(kSharedTokens, /*start=*/1);
+        const std::vector<std::int32_t> tail = MakeTokens(kPromptTokens - kSharedTokens, tail_start);
+        tokens.insert(tokens.end(), tail.begin(), tail.end());
+        return RequestSpec{.request_id = id, .tokens = tokens, .max_new_tokens = max_new_tokens};
+    }
+
+    // r1 lands and decodes once, which publishes its prompt pages; r2 shares
+    // r1's first 16 tokens. Returns the plan that admits r2.
+    ExecutionPlan AdmitAfterSharedPrefix(std::int32_t max_new_tokens) {
+        Submit(PromptWithSharedPrefix("r1", /*tail_start=*/101, max_new_tokens));
+        SendBootstrapped("r1");
+        const ExecutionPlan first = PlanOnce();
+        const ForwardBatch* first_admission = FindRemoteAdmission(first);
+        EXPECT_NE(first_admission, nullptr);
+        if (first_admission != nullptr) {
+            EXPECT_EQ(first_admission->input_lengths, (std::vector<std::int32_t>{kPromptTokens}));
+        }
+        SendRemotePrefillDone("r1", /*bootstrap_token=*/42);
+        const ExecutionPlan first_decode = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(first_decode.Operations());
+        EXPECT_NE(FindRequestIndex(decode, "r1"), -1);
+        LandDecodes(decode, /*token=*/43);
+
+        Submit(PromptWithSharedPrefix("r2", /*tail_start=*/201, max_new_tokens));
+        SendBootstrapped("r2");
+        ExecutionPlan plan = PlanOnce();
+        LandDecodes(FindForwardBatch(plan.Operations()), /*token=*/44);
+        return plan;
+    }
+
+    // Lands every row of a decode batch with one token.
+    void LandDecodes(const ForwardBatch* batch, std::int32_t token) {
+        if (batch == nullptr) {
+            return;
+        }
+        for (const std::string& id : batch->request_ids) {
+            SendForwardDone(id, {token});
+        }
+    }
+};
+
+TEST_F(DisaggDecodeSlidingPrefixTestSuite, RemoteAdmissionAfterFullHistoryOnlyHitStaysWhole) {
+    const ExecutionPlan plan = AdmitAfterSharedPrefix(/*max_new_tokens=*/0);
+    const ForwardBatch* admission = FindRemoteAdmission(plan);
+    ASSERT_NE(admission, nullptr);
+    ASSERT_EQ(admission->request_ids, (std::vector<std::string>{"r2"}));
+    EXPECT_EQ(admission->extend_prefix_lens, (std::vector<std::int32_t>{0}));
+    EXPECT_EQ(admission->input_lengths, (std::vector<std::int32_t>{kPromptTokens}))
+        << "the peer prefills the whole prompt; a promotion boundary only shapes local chunks";
+    // The peer lands every full-history page of the prompt.
+    const auto& full_row = admission->block_tables.at("full").at(0);
+    const std::size_t prompt_pages = kPromptTokens / 4;
+    EXPECT_GE(full_row.size(), prompt_pages) << "the destination misses full-history prompt pages";
+    for (std::size_t slot = 0; slot < std::min(full_row.size(), prompt_pages); ++slot) {
+        EXPECT_GT(full_row[slot], 0) << "full slot " << slot;
+    }
+
+    SendRemotePrefillDone("r2", /*bootstrap_token=*/52);
+    for (std::int32_t round = 0; round < 3; ++round) {
+        ExecutionPlan decode_plan;
+        ASSERT_NO_THROW(decode_plan = PlanOnce()) << "decode round " << round;
+        const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
+        ASSERT_NE(FindRequestIndex(decode, "r2"), -1);
+        LandDecodes(decode, 60 + round);
+    }
+}
+
+TEST_F(DisaggDecodeSlidingPrefixTestSuite, DecodesAfterFullHistoryOnlyHitHaveTheirSlidingWriteSlot) {
+    const ExecutionPlan plan = AdmitAfterSharedPrefix(/*max_new_tokens=*/8);
+    ASSERT_NE(FindRemoteAdmission(plan), nullptr);
+    SendRemotePrefillDone("r2", /*bootstrap_token=*/52);
+
+    // r2's first decode writes position 24; the next page starts at 28.
+    for (std::int32_t position = kPromptTokens; position < kPromptTokens + 6; ++position) {
+        const ExecutionPlan decode_plan = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
+        const std::int32_t row = FindRequestIndex(decode, "r2");
+        ASSERT_GE(row, 0);
+        const std::size_t slot = static_cast<std::size_t>(position / 4);
+        for (const char* group : {"full", "sliding"}) {
+            const auto& table = decode->block_tables.at(group)[static_cast<std::size_t>(row)];
+            ASSERT_GT(table.size(), slot) << group << ": no slot for position " << position;
+            EXPECT_GT(table[slot], 0) << group << ": no page for position " << position;
+        }
+        LandDecodes(decode, 60 + position);
+    }
+}
+
 class DecodeRetractionL2TestSuite : public DisaggDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
