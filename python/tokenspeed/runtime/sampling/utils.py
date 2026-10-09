@@ -23,8 +23,10 @@ from __future__ import annotations
 import torch
 
 from tokenspeed.runtime.sampling.logprobs import (
-    gather_token_logprobs,
-    gather_token_logprobs_torch,
+    gather_token_logprobs as gather_token_logprobs,
+)
+from tokenspeed.runtime.sampling.logprobs import (
+    gather_token_logprobs_torch as gather_token_logprobs_torch,
 )
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
 

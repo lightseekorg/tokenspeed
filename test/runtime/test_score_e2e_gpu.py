@@ -220,8 +220,8 @@ def test_ordinary_decode_graph_after_scoring(engine_and_tokenizer):
 
 def test_score_megatron_reduction_matches_sampled_logprobs():
     from tokenspeed.runtime.configs.numerics import MEGATRON_VOCAB_BLOCK
+    from tokenspeed.runtime.sampling.logprobs import gather_token_logprobs
     from tokenspeed.runtime.sampling.score_utils import gather_score_logprobs
-    from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 
     torch.manual_seed(19)
     logits = torch.randn(
