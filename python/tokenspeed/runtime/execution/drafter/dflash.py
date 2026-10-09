@@ -534,9 +534,18 @@ class DFlash(BaseDrafter):
         # Target and draft views share the full-history group's page-id space.
         # Preserve the target's packed order: extend rows, then verify rows.
         target_backend = base_ctx.attn_backend
-        cache_locs = target_backend.decode_window_locations()
-        if base_ctx.num_extends > 0:
-            cache_locs = torch.cat((target_backend.extend_span_locations(), cache_locs))
+        if base_ctx.num_extends == base_ctx.bs:
+            # A PD prefill worker may never publish a decode window.
+            cache_locs = target_backend.extend_span_locations()
+        elif base_ctx.num_extends == 0:
+            cache_locs = target_backend.decode_window_locations()
+        else:
+            cache_locs = torch.cat(
+                (
+                    target_backend.extend_span_locations(),
+                    target_backend.decode_window_locations(),
+                )
+            )
         self._write_native_cache(
             hidden,
             positions,
@@ -619,6 +628,7 @@ class DFlash(BaseDrafter):
                 target_positions,
                 target_cache_locs,
                 self.token_to_kv_pool,
+                attn_backend=self.attn_backend,
             )
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
@@ -648,6 +658,9 @@ class DFlash(BaseDrafter):
             self._kv_aux_stream = torch.cuda.Stream(device=self.device)
             self._kv_fork_event = torch.cuda.Event()
             self._kv_join_event = torch.cuda.Event()
+        if self.draft_model_runner.mapping.attn.dcp_size > 1:
+            # The fused scatter accepts physical slots without an ownership mask.
+            return
         try:
             layers = self.draft_model_runner.model.layers
             if not layers:

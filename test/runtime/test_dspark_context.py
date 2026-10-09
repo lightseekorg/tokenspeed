@@ -62,7 +62,7 @@ def test_pipeline_projection_matches_concatenated_reference(stage_taps, with_tap
             seen.append(index)
             return F.linear(norms[index](rows), weights[index])
 
-        def write(rows, pos, loc, pool):
+        def write(rows, pos, loc, pool, *, attn_backend):
             assert pool == "last-stage-cache"
             writes.append((rows, pos, loc))
 
@@ -77,7 +77,9 @@ def test_pipeline_projection_matches_concatenated_reference(stage_taps, with_tap
             write_context_kv=write,
         )
         producer = DSparkContextProducer(
-            model, "last-stage-cache" if model.mapping.is_last_pp_rank else None
+            model,
+            "last-stage-cache" if model.mapping.is_last_pp_rank else None,
+            attn_backend=None,
         )
         accumulator = producer.begin_stage(hidden[0], accumulator)
         for index in owned:
@@ -105,11 +107,42 @@ def test_context_accumulators_do_not_alias_between_inflight_chunks():
         hidden_size=4,
         mapping=SimpleNamespace(is_first_pp_rank=True, is_last_pp_rank=True),
     )
-    producer = DSparkContextProducer(model, object())
+    producer = DSparkContextProducer(model, object(), attn_backend=None)
     first = producer.begin_stage(torch.ones(3, 6), None)
     second = producer.begin_stage(torch.ones(3, 6), None)
     first.fill_(7)
     assert torch.count_nonzero(second) == 0
+
+
+def test_prefill_context_write_does_not_require_decode_window():
+    from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+    hidden = torch.randn(5, 4)
+    positions = torch.arange(5)
+    slots = torch.arange(128, 133)
+    writes = []
+    drafter = SimpleNamespace(
+        _update_draft_prefix_lengths=lambda ctx, accepted: None,
+        input_buffers=SimpleNamespace(positions_buf=positions),
+        _write_native_cache=lambda h, p, loc, **kw: writes.append((h, p, loc, kw)),
+    )
+    # No decode accessor: pure prefill must not query a stale/unpublished view.
+    ctx = SimpleNamespace(
+        bs=1,
+        num_extends=1,
+        input_num_tokens=5,
+        dspark_context_producer=None,
+        attn_backend=SimpleNamespace(extend_span_locations=lambda: slots),
+    )
+    DFlash._update_native_cache_from_target(
+        drafter,
+        ctx,
+        SimpleNamespace(hidden_states=hidden),
+        torch.ones(1, dtype=torch.int32),
+    )
+    assert len(writes) == 1
+    torch.testing.assert_close(writes[0][2], slots)
+    assert writes[0][3] == {"decode_only": False}
 
 
 if __name__ == "__main__":

@@ -98,9 +98,6 @@ def test_noncontiguous_pages_and_partial_tail(degree, device):
     "override, message",
     [
         ({"device": "cpu"}, "requires CUDA"),
-        ({"speculative_num_steps": 1}, "does not yet support speculation"),
-        ({"speculative_num_draft_tokens": 2}, "does not yet support speculation"),
-        ({"is_draft": True}, "does not yet support speculation"),
     ],
 )
 def test_flashmla_dcp_rejects_unsupported_execution(override, message):
@@ -119,6 +116,14 @@ def test_flashmla_dcp_rejects_unsupported_execution(override, message):
         dcp_rank=0,
         dcp_group=(0, 1, 2, 3),
     )
+    for draft in (False, True):
+        replace(
+            config,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            is_draft=draft,
+            pd_disaggregation_enabled=True,
+        )
     with pytest.raises(ValueError, match=message):
         replace(config, **override)
 
@@ -172,7 +177,8 @@ def test_kimi_capacity_shards_only_mla():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("degree", [2, 4, 8])
-def test_flashmla_shards_merge_to_full_attention(degree):
+@pytest.mark.parametrize("query_width,causal", [(1, True), (6, True), (6, False)])
+def test_flashmla_shards_merge_to_full_attention(degree, query_width, causal):
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("FlashMLA dense decode requires SM90")
     from tokenspeed_kernel.ops.attention.mla.cuda import (
@@ -182,29 +188,29 @@ def test_flashmla_shards_merge_to_full_attention(degree):
 
     torch.manual_seed(17)
     device = "cuda"
-    width, heads, length = 576, 32, 273
+    width, heads, length = 576, 32, 258
     source = torch.randn(12 * 128, 1, width, device=device, dtype=torch.bfloat16) * 0.1
     table = torch.tensor([[10, 11, 4, 5, 16, 17]], dtype=torch.int32, device=device)
     lengths = torch.tensor([length], dtype=torch.int32, device=device)
-    q = torch.randn(1, 1, heads, width, device=device, dtype=torch.bfloat16)
+    q = torch.randn(1, query_width, heads, width, device=device, dtype=torch.bfloat16)
     q += 0.25
     source[5 * 128 : 6 * 128] += 0.4
     source[2 * 128 : 3 * 128] -= 0.3
     source[8 * 128 : 9 * 128] += 0.1
 
-    def attention(cache, pages, lens):
+    def attention(query, cache, pages, lens):
         return flash_mla_with_kvcache(
-            q,
+            query,
             cache.view(-1, 64, 1, width),
             pages,
             lens,
             512,
             get_mla_metadata()[0],
             softmax_scale=width**-0.5,
-            causal=True,
+            causal=causal,
         )
 
-    ref, _ = attention(source, table, lengths)
+    ref, _ = attention(q, source, table, lengths)
     outputs, lses = [], []
     loc = torch.arange(source.shape[0], device=device)
     for rank in range(degree):
@@ -227,26 +233,41 @@ def test_flashmla_shards_merge_to_full_attention(degree):
             write_mask=owned,
         )
         assert not local_cache[:128].any()
-        out, local = torch.empty_like(table), torch.empty_like(lengths)
-        compact_dcp_pages(
-            table,
-            lengths,
-            page_size=64,
-            block_granularity=128,
-            virtual_block_count=1024,
+        from tokenspeed.runtime.layers.attention.dcp.metadata import (
+            CompactDCPLayout,
+            dcp_query_lengths,
+            refresh_dcp_page_table_metadata,
+        )
+
+        metadata = refresh_dcp_page_table_metadata(
+            page_table=table,
+            virtual_block_count=12,
             degree=degree,
             rank=rank,
-            out=out,
-            local_lengths=local,
+            layout=CompactDCPLayout(lengths, 64, 128),
+            previous=None,
         )
-        partial, lse = attention(local_cache, out, local.clamp_min(1))
+        local = dcp_query_lengths(
+            metadata,
+            lengths,
+            query_width=query_width,
+            causal=causal,
+        ).reshape(-1)
+        partial, lse = attention(
+            q.reshape(query_width, 1, heads, width),
+            local_cache,
+            metadata.local_page_table.repeat_interleave(query_width, dim=0),
+            local.clamp_min(1),
+        )
         outputs.append(
             torch.where((local > 0)[:, None, None, None], partial.float(), 0)
         )
         lses.append(torch.where((local > 0)[:, None, None], lse, -torch.inf))
     lses = torch.stack(lses).transpose(-1, -2).unsqueeze(-1)
     merged = (torch.stack(outputs) * torch.softmax(lses, dim=0)).sum(0)
-    torch.testing.assert_close(merged, ref.float(), atol=0.002, rtol=0.03)
+    torch.testing.assert_close(
+        merged.reshape_as(ref), ref.float(), atol=0.002, rtol=0.03
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -335,9 +356,12 @@ def test_hybrid_forwards_runtime_geometry_to_both_children():
 def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     monkeypatch, hybrid, model_write
 ):
+    from test.runtime.cache_pool_test_utils import (
+        make_arena,
+        make_mla_memory_plan,
+        plan_group_specs,
+    )
     from types import SimpleNamespace
-
-    from cache_pool_test_utils import make_arena, make_mla_memory_plan, plan_group_specs
 
     from tokenspeed.runtime.layers.attention.backends.paged import flashmla
     from tokenspeed.runtime.layers.attention.dcp.cache import gather_mla_history
@@ -684,6 +708,17 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
         dcp_group=tuple(range(degree)),
         dcp_rank=0,
     )
+    for draft in (False, True):
+        replace(
+            config,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            is_draft=draft,
+            pd_disaggregation_enabled=True,
+        )
+    if degree > 1:
+        with pytest.raises(ValueError, match="non-causal block drafts"):
+            replace(config, is_draft=True, draft_block_decode=True)
     setup = prepare_cache_setup(
         family="dsa",
         server_args=SimpleNamespace(max_total_tokens=None),
@@ -705,7 +740,10 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
 
 
 @pytest.mark.parametrize("rank", range(4))
-def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch, rank):
+@pytest.mark.parametrize("query_width", [1, 6])
+def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
+    monkeypatch, rank, query_width
+):
     from types import SimpleNamespace
 
     from tokenspeed.runtime.layers.attention.backends.paged import dsa
@@ -734,9 +772,9 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
             num_extends=0, seq_lens_k=torch.tensor([128]), max_seq_len_k=128
         )
     )
-    query = torch.zeros(1, 2, 128, dtype=torch.bfloat16)
-    slots = torch.full((1, 512), -1, dtype=torch.int32)
-    slots[0, :4] = torch.tensor([64, 128, 192, 256])
+    query = torch.zeros(query_width, 2, 128, dtype=torch.bfloat16)
+    slots = torch.full((query_width, 512), -1, dtype=torch.int32)
+    slots[:, :4] = torch.tensor([64, 128, 192, 256])
     pool = SimpleNamespace(
         quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
     )
@@ -755,11 +793,15 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
 
     def decode(**kwargs):
         assert kwargs["return_lse"] is True
+        torch.testing.assert_close(
+            kwargs["kv_seq_lens"],
+            torch.arange(129 - query_width, 129, dtype=torch.int32),
+        )
         expected = torch.full_like(slots, -1)
-        expected[0, rank] = 64
+        expected[:, rank] = 64
         torch.testing.assert_close(kwargs["topk_slots"], expected)
-        assert kwargs["q"].shape == (1, 8, 128)
-        return torch.full((1, 8, 128), 7.0), torch.zeros(1, 8)
+        assert kwargs["q"].shape == (query_width, 8, 128)
+        return torch.full((query_width, 8, 128), 7.0), torch.zeros(query_width, 8)
 
     def combine(out, lse, *, group, rank, sink, keep_all_heads):
         assert sink is None and group == backend.dcp_group
@@ -778,7 +820,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
         topk_indices=slots,
         topk_lens=None,
     )
-    assert out.shape == (1, 256)
+    assert out.shape == (query_width, 256)
     assert (out == 7).all()
 
 
@@ -875,3 +917,49 @@ def test_dsa_indexer_16_heads_with_padded_quantization_scales():
     assert (indices[0] == -1).all()
     assert set(indices[1, :17].tolist()) == set(range(17))
     assert set(indices[2, :127].tolist()) == set(range(127))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flashmla_draft_refreshes_dcp_after_advance_and_rollback(monkeypatch):
+    from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
+        FlashMLABackend,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.metadata import (
+        CompactDCPLayout,
+        dcp_query_lengths,
+        refresh_dcp_page_table_metadata,
+    )
+
+    backend = object.__new__(FlashMLABackend)
+    backend.dcp_group = (0, 1, 2, 3)
+    backend.dcp_rank = 0
+    backend.page_table_buf = torch.tensor(
+        [[4, 5, 10, 11]], device="cuda", dtype=torch.int32
+    )
+    backend.seq_lens_buf = torch.tensor([127], device="cuda", dtype=torch.int32)
+    backend.dcp_metadata = refresh_dcp_page_table_metadata(
+        page_table=backend.page_table_buf,
+        virtual_block_count=10,
+        degree=4,
+        rank=0,
+        layout=CompactDCPLayout(backend.seq_lens_buf, 64, 128),
+        previous=None,
+    )
+    monkeypatch.setattr(
+        FlashMLABackend, "_renew_decode_tile_metadata", lambda self, *, for_graph: None
+    )
+    lens = backend.seq_lens_buf.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        backend.advance_draft_forward_metadata(lens)
+        query_lengths = dcp_query_lengths(
+            backend.dcp_metadata,
+            backend.seq_lens_buf,
+            query_width=3,
+            causal=True,
+        )
+    for length, expected in ((129, [0, 0, 1]), (132, [2, 3, 4]), (128, [0, 0, 0])):
+        lens.fill_(length)
+        graph.replay()
+        assert query_lengths.tolist() == [expected]
+        assert backend.dcp_metadata.local_seq_lens.item() == expected[-1]

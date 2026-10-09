@@ -55,6 +55,7 @@ from tokenspeed.runtime.layers.attention.dcp.comm import (
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPLayout,
     CompactDCPMetadata,
+    dcp_query_lengths,
     refresh_dcp_page_table_metadata,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
@@ -374,6 +375,7 @@ class FlashMLABackend(PagedAttentionBackend):
         """An in-graph-capable seq_lens rewrite (drafter hooks): copy the rows
         into the persistent buffer and renew the schedule they invalidate."""
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
+        self._refresh_dcp_metadata(bs)
         self._renew_decode_tile_metadata(
             for_graph=torch.cuda.is_available()
             and torch.cuda.is_current_stream_capturing()
@@ -514,6 +516,16 @@ class FlashMLABackend(PagedAttentionBackend):
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
         # Copy the router-resolved kernel page table into the persistent buffer.
         self.page_table_buf[:bs, : page_table.shape[1]].copy_(page_table[:bs])
+        self._refresh_dcp_metadata(bs)
+        metadata.num_extends = num_extends
+        # Replay leaves the schedule slot alone: the graph re-runs its recorded
+        # schedule-build against the live seq_lens and never reads the slot
+        # from Python. Eager renews for the seq_lens just written.
+        if not for_graph_replay:
+            self._renew_decode_tile_metadata(for_graph=False)
+        self.forward_decode_metadata = metadata
+
+    def _refresh_dcp_metadata(self, bs: int) -> None:
         if len(self.dcp_group) > 1:
             if self.dcp_metadata is None:
                 raise RuntimeError("FlashMLA DCP metadata has not been initialized")
@@ -530,13 +542,6 @@ class FlashMLABackend(PagedAttentionBackend):
                 ),
                 previous=placement,
             )
-        metadata.num_extends = num_extends
-        # Replay leaves the schedule slot alone: the graph re-runs its recorded
-        # schedule-build against the live seq_lens and never reads the slot
-        # from Python. Eager renews for the seq_lens just written.
-        if not for_graph_replay:
-            self._renew_decode_tile_metadata(for_graph=False)
-        self.forward_decode_metadata = metadata
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """A drafter's per-step seq_lens edit (chain step, step-0 accept
@@ -740,27 +745,33 @@ class FlashMLABackend(PagedAttentionBackend):
         )
 
         page_table = metadata.page_table[num_extends : num_extends + bs]
-        cache_seqlens = metadata.seq_lens_k.to(torch.int32)
-        # Draft block-decode: forward_decode flattened q to one kernel row per
-        # drafted block position (bs == bs_orig * draft_query_width), but the
-        # page table and seq_lens carry one entry per request. Repeat each
-        # request's row across its block positions so every block query attends
-        # the whole block (block-diffusion); the FlashMLA kernel requires
-        # cache_seqlens to be shape (num_kernel_rows).
+        cache_seqlens = metadata.seq_lens_k[num_extends : num_extends + bs].to(
+            torch.int32
+        )
         src_rows = page_table.shape[0]
-        if self.is_draft and 0 < src_rows < bs and bs % src_rows == 0:
+        if len(self.dcp_group) > 1:
+            assert self.dcp_metadata is not None
+            placement = self.dcp_metadata.slice_requests(
+                num_extends, num_extends + src_rows
+            )
+            width = q.shape[0] // src_rows
+            local_lengths = dcp_query_lengths(
+                placement,
+                cache_seqlens,
+                query_width=width,
+                causal=not self.is_draft or not self.draft_block_decode,
+            ).reshape(-1)
+            # Each query has its own local causal endpoint. A multi-query
+            # causal kernel would subtract global offsets from local lengths.
+            page_table = placement.local_page_table
+            if width > 1:
+                page_table = page_table.repeat_interleave(width, dim=0)
+            reshape_q = q.unsqueeze(1)
+            cache_seqlens = local_lengths.clamp_min(1)
+        elif self.is_draft and 0 < src_rows < bs and bs % src_rows == 0:
             width = bs // src_rows
             page_table = page_table.repeat_interleave(width, dim=0)
             cache_seqlens = cache_seqlens.repeat_interleave(width)
-
-        if len(self.dcp_group) > 1:
-            assert self.dcp_metadata is not None
-            placement = self.dcp_metadata.slice_requests(num_extends, num_extends + bs)
-            page_table = placement.local_page_table
-            # Empty shards run against the reserved zero page, then contribute
-            # exactly zero mass to the global softmax.
-            local_lengths = placement.local_seq_lens
-            cache_seqlens = local_lengths.clamp_min(1)
         output, lse = flash_mla_with_kvcache(
             q=reshape_q,
             k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),

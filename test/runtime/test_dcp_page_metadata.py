@@ -306,3 +306,39 @@ def test_query_visibility_full_refresh_reuses_storage(device, queries):
             previous=metadata,
             **(common | {"layout": replace(layout, visible_lens=None)}),
         )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("block_size", [64, 128])
+def test_verify_query_lengths_cross_ownership_boundaries(device, block_size):
+    from tokenspeed.runtime.layers.attention.dcp.metadata import dcp_query_lengths
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    blocks = torch.tensor([[2, 5, 8], [0, 0, 0]], dtype=torch.int32, device=device)
+    subpages = block_size // 64
+    pages = (
+        blocks[..., None] * subpages + torch.arange(subpages, device=device)
+    ).reshape(2, -1)
+    for length in (1, block_size - 1, block_size + 2, 2 * block_size + 1):
+        lens = torch.tensor([length, 0], dtype=torch.int32, device=device)
+        for rank in range(4):
+            metadata = refresh_dcp_page_table_metadata(
+                page_table=pages,
+                virtual_block_count=10,
+                degree=4,
+                rank=rank,
+                layout=CompactDCPLayout(lens, 64, block_size),
+                previous=None,
+            )
+            actual = dcp_query_lengths(metadata, lens, query_width=6, causal=True)
+            expected = [
+                sum(
+                    (int(blocks[0, t // block_size]) - 1) % 4 == rank
+                    for t in range(max(0, length - 5 + i))
+                )
+                for i in range(6)
+            ]
+            assert actual.tolist() == [expected, [0] * 6]
+            noncausal = dcp_query_lengths(metadata, lens, query_width=6, causal=False)
+            assert noncausal.tolist() == [[expected[-1]] * 6, [0] * 6]

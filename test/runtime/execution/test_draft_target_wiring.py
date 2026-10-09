@@ -515,6 +515,7 @@ def test_pipeline_dspark_draft_gets_a_context_producer_on_every_stage(is_last_pp
         pp_size=4,
         draft_model=_ContextDraft(is_last_pp_rank),
         draft_token_to_kv_pool=draft_pool,
+        draft_attn_backend=None,
     )
     assert isinstance(producer, DSparkContextProducer)
     assert producer.token_to_kv_pool is draft_pool
@@ -540,6 +541,7 @@ def test_pipeline_mtp_draft_produces_no_context(draft_model, draft_pool):
             pp_size=2,
             draft_model=draft_model,
             draft_token_to_kv_pool=draft_pool,
+            draft_attn_backend=None,
         )
         is None
     )
@@ -558,6 +560,7 @@ def test_pipeline_eagle3_is_refused_by_the_executor():
             pp_size=2,
             draft_model=torch.nn.Module(),
             draft_token_to_kv_pool=object(),
+            draft_attn_backend=None,
         )
 
 
@@ -572,6 +575,7 @@ def test_pipeline_block_drafter_without_context_production_is_rejected():
             pp_size=2,
             draft_model=torch.nn.Module(),
             draft_token_to_kv_pool=None,
+            draft_attn_backend=None,
         )
 
 
@@ -586,12 +590,17 @@ def test_single_stage_never_builds_a_context_producer():
             pp_size=1,
             draft_model=_ContextDraft(is_last_pp_rank=True),
             draft_token_to_kv_pool=object(),
+            draft_attn_backend=None,
         )
         is None
     )
     assert (
         select_dspark_context_producer(
-            spec_algo=None, pp_size=2, draft_model=None, draft_token_to_kv_pool=None
+            spec_algo=None,
+            pp_size=2,
+            draft_model=None,
+            draft_token_to_kv_pool=None,
+            draft_attn_backend=None,
         )
         is None
     )

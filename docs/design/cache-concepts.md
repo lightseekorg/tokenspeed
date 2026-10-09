@@ -1092,6 +1092,12 @@ window the first decode consumes. Under PD the retained tail of the SWA group
 ships to the decode node like any sliding window, draft rows included, and
 the decode node re-feeds nothing.
 
+K3 DSpark context injection uses the draft backend's cache placement to
+resolve virtual slots and mask nonowner writes before storing MLA KV. It
+therefore follows the same DCP ownership contract as attention writes; the
+architecture alone must not reject DCP. Backend capability and shared-group
+storage checks still apply.
+
 Capacity has three shapes, all on the base class. The default is the flat
 product (`parents × tightest packing × P`). A probe arena is the third and
 narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe
@@ -1167,18 +1173,10 @@ partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
 GPU DSA sparse prefill instead combines local sparse-attention partials.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
-DCP does not make unsupported kernels portable. DCP excludes speculative
-decoding for every model on the ordinary MLA/DSA recipe, whichever dense
-kernel runs it: `OrdinaryRecipe.groups()` refuses to shard a cache that holds
-a draft group, so a CuTe MLA engine that would accept the draft kernels still
-cannot combine DCP with a draft; FlashMLA and GPU DSA `AttnConfig` additionally
-reject any speculative width, draft or target, under DCP. Only the recipes
-that declare their own groups shard with a draft present: DeepSeek V4 (its
-draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
-the sharded MLA history group), each subject to its backend's `AttnConfig`
-gate. The draft's decode steps would run the same sparse/dense DCP branches as
-the target's, but that path has not been validated for the ordinary recipe, so
-its exclusion is a gate rather than a geometry limit. All DCP paths exclude the Host KVStore: the L2
+DCP does not make unsupported kernels portable. FlashMLA verify maps
+per-query causal bounds to local lengths; DSA selects causal Top-K before
+mapping cache slots. Non-causal DSA block drafts remain unsupported.
+All DCP paths exclude the Host KVStore: the L2
 copies address device pages by scheduler block ID with no ownership
 translation (`cache/l2/executor.py`), so a sharded engine must pass
 `--disable-kvstore`.

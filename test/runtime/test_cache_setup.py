@@ -1226,7 +1226,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         (None, "tokenspeed_mla", None),
         ("trtllm_mla", None, "does not support MLA DCP"),
         (None, "trtllm_mla", "DCP currently requires"),
-        (None, "flashmla", "does not yet support speculation"),
+        (None, "flashmla", None),
     ],
 )
 def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
@@ -1286,8 +1286,8 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
     def profile(**kwargs):
         config = kwargs["attn_config"]
         assert config.component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
-        assert (
-            built_draft[0].component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        assert built_draft[0].component(SoftmaxAttnConfig).backend_name == (
+            draft_backend or "tokenspeed_mla"
         )
         raise ReadyForAllocation
 
@@ -1332,8 +1332,8 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
         assert args.drafter_attention_backend == draft_backend
 
 
-@pytest.mark.parametrize("degree", [1, 2])
-def test_kimi_dspark_rejects_sharded_context_writes(degree):
+@pytest.mark.parametrize("degree", [1, 2, 8])
+def test_kimi_dspark_preserves_backend_with_dcp(degree):
     from tokenspeed.runtime.layers.attention import registry
 
     def side(architecture):
@@ -1352,12 +1352,9 @@ def test_kimi_dspark_rejects_sharded_context_writes(degree):
     )
     target = side("KimiK3ForConditionalGeneration")
     draft = side("K3DSparkModel")
-    if degree > 1:
-        with pytest.raises(ValueError, match="K3 DSpark does not support DCP"):
-            registry._apply_backend_overrides(args, target, draft)
-    else:
-        registry._apply_backend_overrides(args, target, draft)
-        assert args.drafter_attention_backend == "tokenspeed_mla"
+    registry._apply_backend_overrides(args, target, draft)
+    assert args.attention_backend == registry.HYBRID_LINEAR_ATTN_BACKEND
+    assert args.drafter_attention_backend == "tokenspeed_mla"
 
 
 class _Sized(Exception):
