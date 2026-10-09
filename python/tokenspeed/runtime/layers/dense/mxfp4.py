@@ -19,8 +19,9 @@
 
 from __future__ import annotations
 
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
@@ -103,10 +104,10 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
             self.process_weights_after_loading(layer)
         input_2d = x.reshape(-1, x.shape[-1])
         output_shape = (*x.shape[:-1], layer.output_size_per_partition)
-        input_quant, input_scale = tokenspeed_kernel.quantize_mxfp4(
+        input_quant, input_scale = kernel_quantize_mxfp4(
             input_2d, scale_layout="linear"
         )
-        output = tokenspeed_kernel.mm(
+        output = kernel_mm(
             input_quant,
             layer.weight_triton_tensor,
             A_scales=input_scale,

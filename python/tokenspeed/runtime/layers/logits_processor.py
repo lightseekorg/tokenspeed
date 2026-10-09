@@ -962,9 +962,9 @@ class LogitsProcessor(nn.Module):
             from tokenspeed.runtime.utils.env import global_server_args_dict
 
             if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-                import tokenspeed_kernel
+                from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 
-                logits = tokenspeed_kernel.mm(
+                logits = kernel_mm(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
                     override="aok",

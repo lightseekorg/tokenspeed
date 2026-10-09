@@ -79,7 +79,8 @@ def test_draft_projections_use_common_gemm_dispatch(m: int) -> None:
                 return_value=False,
             ),
             mock.patch(
-                "tokenspeed_kernel.mm", side_effect=torch.nn.functional.linear
+                "tokenspeed.runtime.layers.dense.unquant.kernel_mm",
+                side_effect=torch.nn.functional.linear,
             ) as gemm,
         ):
             layer(x)

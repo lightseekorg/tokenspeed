@@ -482,10 +482,11 @@ def test_a_rebind_hands_back_views_of_the_rebuilt_pool(monkeypatch) -> None:
     monkeypatch.setattr(
         cudagraph_memory,
         "reserve_and_rebind",
-        lambda *a, profiled_cache_bytes: seen.append(
+        lambda *a, profiled_cache_bytes, startup_resident_bytes: seen.append(
             (
                 a,
                 profiled_cache_bytes,
+                startup_resident_bytes,
                 args.attention_backend,
                 args.drafter_attention_backend,
             )
@@ -499,12 +500,18 @@ def test_a_rebind_hands_back_views_of_the_rebuilt_pool(monkeypatch) -> None:
     )
 
     attention, views = device._rebind_under_reserve(
-        "executor", "build", args, 3, probe, ("trtllm_mla", "flashinfer")
+        "executor",
+        "build",
+        args,
+        3,
+        probe,
+        ("trtllm_mla", "flashinfer"),
+        startup_resident_bytes=11,
     )
 
     assert attention is rebuilt
     # The rebuild resolves from the operator's choice, not the probe's write-back.
-    assert seen == [(("executor", "build", args, 3), 7, "trtllm_mla", "flashinfer")]
+    assert seen == [(("executor", "build", args, 3), 7, 11, "trtllm_mla", "flashinfer")]
     assert views == device.PoolViews(
         token_to_kv_pool="real",
         draft_token_to_kv_pool="draft",

@@ -41,6 +41,51 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 DEVICE = "cuda"
 
 
+def test_projection_a2a_pack_batch_shape():
+    from tokenspeed_kernel.ops.communication import triton as communication
+
+    peers, channels = 4, 16384
+    shard = channels // peers
+
+    def run(local_rows, physical_rows, row_padding, column_stride):
+        inputs = torch.empty_strided(
+            (local_rows, channels),
+            (channels * column_stride + row_padding, column_stride),
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        inputs.copy_(torch.randn_like(inputs))
+        # Poison reused scratch so unwritten owner padding also fails numerics.
+        workspace = torch.full(
+            (peers, physical_rows, shard),
+            float("nan"),
+            dtype=inputs.dtype,
+            device=DEVICE,
+        )
+        packed = communication.triton_pack_channel_shards_for_a2a(inputs, workspace)
+        expected = torch.zeros_like(workspace)
+        expected[:, :local_rows].copy_(
+            inputs.reshape(local_rows, peers, shard).transpose(0, 1)
+        )
+        torch.testing.assert_close(packed.view_as(expected), expected, rtol=0, atol=0)
+
+    # Warm the scalar alignment classes, not every token count or stride.
+    run(16, 16, 0, 1)
+    run(17, 32, 1, 2)
+    run(17, 33, 3, 3)
+    with assert_no_triton_compile(communication._pack_channel_shards_for_a2a_kernel):
+        for case in (
+            (32, 32, 0, 1),
+            (64, 64, 0, 1),
+            (128, 128, 0, 1),
+            (97, 128, 3, 2),
+            (129, 257, 5, 3),
+            (513, 529, 7, 5),
+            (0, 64, 0, 1),
+        ):
+            run(*case)
+
+
 def test_packed_qkv_complex_rotary_token_count():
     from tokenspeed_kernel.ops.attention.mha._triton import qkv_rotary
 
@@ -692,9 +737,15 @@ def test_merge_prefill_checkpoint_outputs_token_counts():
     def run(body_tokens, tail_tokens, extent):
         body = torch.randn(body_tokens, 3, 4, device=DEVICE).transpose(-1, -2)
         tail = torch.randn(tail_tokens, 3, 4, device=DEVICE).transpose(-1, -2)
-        order = torch.randperm(extent, device=DEVICE)
-        body_indices = order[:body_tokens].clone()
-        tail_indices = order[body_tokens : body_tokens + tail_tokens].clone()
+        # Index views start one element in, off 16-byte alignment, as batch slices do.
+        order = torch.cat(
+            [
+                torch.zeros(1, device=DEVICE, dtype=torch.int64),
+                torch.randperm(extent, device=DEVICE),
+            ]
+        )[1:]
+        body_indices = order[:body_tokens]
+        tail_indices = order[body_tokens : body_tokens + tail_tokens]
         body_indices[::5] = -1
         expected = torch.zeros(extent, 4, 3, device=DEVICE)
         for source, indices in ((body, body_indices), (tail, tail_indices)):
@@ -705,7 +756,7 @@ def test_merge_prefill_checkpoint_outputs_token_counts():
         )
         torch.testing.assert_close(merged, expected, rtol=0, atol=0)
 
-        sources = torch.full((extent,), -1, dtype=torch.int64, device=DEVICE)
+        sources = torch.full((extent + 1,), -1, dtype=torch.int64, device=DEVICE)[1:]
         concat = torch.cat((body_indices, tail_indices))
         live = concat >= 0
         sources[concat[live]] = torch.arange(concat.numel(), device=DEVICE)[live]
@@ -715,12 +766,14 @@ def test_merge_prefill_checkpoint_outputs_token_counts():
         torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
 
     run(16, 16, 40)
-    run(9, 7, 21)
     with assert_no_triton_compile(
         ckpt._scatter_checkpoint_output_kernel, ckpt._gather_checkpoint_output_kernel
     ):
         for body_tokens, tail_tokens, extent in (
+            (9, 7, 21),
+            (1, 1, 2),
             (11, 5, 19),
+            (32, 16, 48),
             (37, 13, 60),
             (70, 3, 90),
         ):

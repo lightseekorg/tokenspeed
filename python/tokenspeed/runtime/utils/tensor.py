@@ -18,11 +18,47 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Pack small host tensors into a single device transfer."""
+"""Tensor padding and packed host-to-device transfers."""
 
 from __future__ import annotations
 
 import torch
+
+
+def prepare_padded_rows(
+    inputs: torch.Tensor,
+    rows: int,
+    scratch: torch.Tensor,
+    *,
+    alignment_bytes: int,
+) -> torch.Tensor:
+    """Return contiguous rows, copying into caller-owned scratch when needed.
+
+    Args:
+        inputs: Two-dimensional tensor with at most ``rows`` rows.
+        rows: Output row count; any extra rows are zero-filled.
+        scratch: Contiguous storage with matching dtype/device, at least
+            ``rows * inputs.shape[1]`` elements, and an aligned base address.
+            Its shape is arbitrary. On the copy path it must not overlap inputs.
+        alignment_bytes: Required positive byte alignment; 1 adds no restriction.
+
+    Returns:
+        Inputs themselves when already contiguous, aligned and the right size;
+        otherwise a view into scratch, valid until that storage is reused.
+        No new tensor storage is allocated. Callers allocate scratch before
+        graph capture and finish consuming the result before reusing it.
+    """
+    if (
+        inputs.shape[0] == rows
+        and inputs.is_contiguous()
+        and inputs.data_ptr() % alignment_bytes == 0
+    ):
+        return inputs
+    width = inputs.shape[1]
+    padded = scratch.view(-1)[: rows * width].view(rows, width)
+    padded.zero_()
+    padded[: inputs.shape[0]].copy_(inputs)
+    return padded
 
 
 def upload_packed(

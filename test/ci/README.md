@@ -393,6 +393,8 @@ NVIDIA release image
 different build. The container needs Python and pip. If PyYAML is absent, the
 job installs `PyYAML>=6,<7` into its job-local `/tmp` before starting the
 pipeline; images that already provide PyYAML do not perform this bootstrap.
+Task commands that prepend source directories to `PYTHONPATH` must preserve its
+inherited value so these bootstrapped dependencies remain importable.
 
 The generated `sbatch` command uses `/tmp` as its working directory because the
 login-node checkout may not be mounted on compute nodes. Override it with
@@ -732,6 +734,12 @@ For workflows with one case per GitHub job, use **Re-run failed jobs**.
 
 On an open same-repository PR into `main`, a repository writer can comment
 `@lightseek-bot watch` or `@lightseek-bot fix`.
+
+Completion triggers exclude `main`; its push CI creates no assistance runs.
+`PR CI Assist Dispatch` handles planner and validation dispatches whose controller
+runs on `main`. Closed PRs and PRs without an active authorized watch/fix skip
+the control job. Other PR completions and comments can still create lightweight
+runs, but ordinary comments skip all jobs and inactive callbacks stop at resolve.
 
 - `watch` follows the current CI plan's selected tasks. Failed tasks get one
   focused reproduction: NVIDIA uses Slurm GB200, then compatible GB300 only if

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
 from tokenspeed_kernel.ops.layernorm import add_rmsnorm, grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
     _add_rmsnorm_kernel,
@@ -10,6 +9,7 @@ from tokenspeed_kernel.ops.layernorm.triton import (
     qk_rmsnorm,
     rmsnorm,
 )
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from utils import assert_no_triton_compile
 
@@ -370,7 +370,7 @@ def test_add_rmsnorm_matches_unfused_reference(
     assert torch.equal(residual, total.to(torch.bfloat16))
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
     if with_fp8:
-        expected, _ = static_quant_fp8(out, scale)
+        expected, _ = quantize_fp8(out, scale=scale)
         assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 

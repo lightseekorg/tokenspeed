@@ -384,7 +384,7 @@ if is_decode_available():
         use_qk_l2norm: bool = True,
         intermediate_states_buffer: torch.Tensor | None = None,
         output_state_indices: torch.Tensor | None = None,
-        parent_indices: torch.Tensor | None,
+        tree_ancestors: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run one multi-token (T>1) GDN MTP verify step, K-last pool+indices.
 
@@ -421,7 +421,7 @@ if is_decode_available():
 
         Returns the [B, T, HV, V] decode output (q.dtype).
         """
-        if parent_indices is not None:
+        if tree_ancestors is not None:
             raise NotImplementedError(
                 "FlashInfer GDN MTP kernels follow a chain; draft trees run the Triton kernel"
             )

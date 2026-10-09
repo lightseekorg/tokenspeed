@@ -26,6 +26,7 @@ Groups are looked up from pg_manager internally via comm_backend.
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed
@@ -45,12 +46,19 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
+from tokenspeed.runtime.distributed.comm_backend.projection import (
+    ProjectionSpec,
+    ProjectionWorkspace,
+)
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
     MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
 )
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
 def _get_process_group(group: Group):
@@ -114,6 +122,90 @@ class FusionParams:
 # ---------------------------------------------------------------------------
 # Basic primitives
 # ---------------------------------------------------------------------------
+
+
+def prepare_projection_collectives(
+    spec: ProjectionSpec,
+    backend: CommBackend | None,
+    scratch_pool: "WorkspacePool | None" = None,
+) -> ProjectionWorkspace:
+    """Collectively allocate bounded projection scratch before graph capture.
+
+    The backend owns optimized selection, padding, layout conversion and
+    fallbacks. Callers may share the result across sequential same-spec layers,
+    but never across concurrently executing streams or models. Execute with
+    the same backend used to prepare the workspace; None selects the global
+    backend, as for ordinary collectives. An optional frozen, model-private
+    scratch_pool shares generic buffers across serialized projections; borrowed
+    intermediates expire when another projection starts using that pool.
+    """
+    pg_manager.init_process_group(spec.group, backend=None)
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_projection(spec, scratch_pool)
+
+
+def projection_all_gather(
+    tensor: torch.Tensor,
+    rows: int,
+    quantize: bool,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Gather padded owner rows into borrowed activations and optional FP8 scales.
+
+    rows is the physical per-owner extent. quantize permits fused 1x128 FP8
+    quantization with MN-major scales; unsupported paths return ordinary
+    activations and None so the Linear can use its usual GEMM.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_all_gather(tensor, rows, quantize, workspace)
+
+
+def projection_all_to_all(
+    tensor: torch.Tensor,
+    rows: int,
+    inverse: bool,
+    quantize: bool,
+    out: torch.Tensor | None,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Exchange token/channel axes, optionally fusing forward FP8 quantization.
+
+    Forward maps [local_rows,K] to [TP*rows,K/TP] with zero owner padding.
+    It requires out=None and returns borrowed output, optionally quantized to
+    FP8 with 1x128 MN-major scales. Inverse maps [TP*rows,N/TP] to [rows,N],
+    requires quantize=False and writes into caller-owned out; callers may
+    retain it across later communication calls.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_all_to_all(
+        tensor, rows, inverse, quantize, out, workspace
+    )
+
+
+def acquire_projection_output(
+    rows: int, workspace: ProjectionWorkspace, backend: CommBackend | None
+) -> torch.Tensor:
+    """Borrow a [TP*rows,N] GEMM destination for the following ReduceScatter."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.acquire_projection_output(rows, workspace)
+
+
+def projection_reduce_scatter(
+    tensor: torch.Tensor,
+    rows: int,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> torch.Tensor:
+    """Sum [TP*rows,N] partials into owned [rows,N] local outputs."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_reduce_scatter(tensor, rows, workspace)
 
 
 def all_reduce(

@@ -2153,7 +2153,7 @@ def test_prologue_kernels_constrain_only_traits_the_entries_state(monkeypatch):
 
 @pytest.mark.parametrize("mrope", [None, MRope((16, 8, 8), False)])
 def test_gqa_token_count_reuses_compiled_tiles(mrope):
-    """Warm each tile size and runtime integer class before varying batch sizes."""
+    """Warm each tile size once; token counts and index offsets then reuse it."""
     from tokenspeed_kernel.ops.attention.prologue.triton import _gqa_prologue_kernel
     from utils import assert_no_triton_compile
 
@@ -2162,9 +2162,10 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
     norm = head_norm(dim, 1.0, seed=201)
     k_cache, v_cache = gqa_cache(2048, hkv, dim, BF16)
 
-    def run(count):
+    def run(count, offset):
         q, k, v = split(qkv(count, hq, hkv, dim, seed=202), hq, hkv, dim)
-        positions = torch.arange(count, device="cuda")
+        # An offset leaves the index vectors off 16-byte alignment, as slices of a batch do.
+        positions = torch.arange(-offset, count, device="cuda")
         if mrope is not None:
             positions = positions.repeat(3, 1)
         out = gqa_prologue(
@@ -2172,9 +2173,12 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
             k,
             v,
             norm=norm,
-            rotary=Rotary(table, positions, RopeStyle.NEOX, mrope),
+            rotary=Rotary(table, positions[..., offset:], RopeStyle.NEOX, mrope),
             cache=HeadKVCache(
-                k_cache, v_cache, None, torch.arange(count, device="cuda")
+                k_cache,
+                v_cache,
+                None,
+                torch.arange(-offset, count, device="cuda")[offset:],
             ),
             return_kv=True,
             solution="triton",
@@ -2183,11 +2187,12 @@ def test_gqa_token_count_reuses_compiled_tiles(mrope):
         assert bytes_equal(k_cache[:count].flatten(1), out.k)
         assert bytes_equal(v_cache[:count].flatten(1), v)
 
-    for count in (1, 32, 33, 128, 129, 512, 513):
-        run(count)
+    for count in (32, 128, 512):
+        run(count, 0)
     with assert_no_triton_compile(_gqa_prologue_kernel):
-        for count in (7, 48, 63, 97, 192, 255, 320, 777, 1024):
-            run(count)
+        for count in (1, 7, 33, 48, 63, 97, 129, 192, 255, 320, 513, 777, 1024):
+            for offset in (0, 1):
+                run(count, offset)
 
 
 def test_mla_token_count_reuses_compiled_tiles():

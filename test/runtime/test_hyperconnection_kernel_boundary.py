@@ -26,12 +26,11 @@ from unittest import mock
 
 import pytest
 import torch
-from tokenspeed_kernel import (
-    gated_residual_combine,
+from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
-    gated_residual_mix,
     grouped_gemma_rmsnorm,
 )
+from tokenspeed_kernel.ops.residual import gated_residual_combine, gated_residual_mix
 
 import tokenspeed.runtime.distributed.comm_manager as comm_manager_module
 import tokenspeed.runtime.layers.hyperconnection as hyperconnection_module
@@ -47,7 +46,7 @@ from tokenspeed.runtime.models.qwen4_exp_nextn import Qwen4ExpDraftAttentionDeco
 
 def test_runtime_uses_tokenspeed_kernel_boundary() -> None:
     source = inspect.getsource(hyperconnection_module)
-    assert "from tokenspeed_kernel import" in source
+    assert "from tokenspeed_kernel.ops.residual import" in source
     assert "import triton" not in source
     assert "@triton.jit" not in source
 

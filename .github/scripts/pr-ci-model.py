@@ -148,7 +148,9 @@ def _model_body(root: Path) -> str:
     return body.strip()
 
 
-def _check_public_output(body: str, root: Path, *, source_links: bool = False) -> None:
+def _check_public_output(
+    body: str, root: Path, *, source_links: bool = False, max_length: int = 60000
+) -> None:
     config = tomllib.loads(
         Path(os.environ["KIMI_CODE_HOME"], "config.toml").read_text()
     )
@@ -203,7 +205,7 @@ def _check_public_output(body: str, root: Path, *, source_links: bool = False) -
         raise SystemExit(
             "CI plan failed the public-output check; no plan was published."
         )
-    if len(body) > 60000:
+    if len(body) > max_length:
         raise SystemExit("CI plan exceeds the comment size limit.")
 
 
