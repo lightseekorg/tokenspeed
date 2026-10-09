@@ -6,8 +6,8 @@ numpy
 torch==2.14.0
 torchvision==0.29.0
 apache-tvm-ffi==0.1.13.post3
-tokenspeed-proton==3.9.10.post20261003
-tokenspeed-triton==3.9.10.post20261003
+tokenspeed-proton==3.9.10.post20261008
+tokenspeed-triton==3.9.10.post20261008
 nvidia-cutlass-dsl[cu13]==4.8.0
 nvidia-cutlass-dsl-libs-cu13==4.8.0
 flashinfer-python==0.7.1rc2
