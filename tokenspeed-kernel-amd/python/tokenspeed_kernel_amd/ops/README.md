@@ -759,3 +759,11 @@ probabilities by 256 before the E4M3 cast to preserve small weights, and
 divide out that factor at normalization. The projected-value API applies
 the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
+
+### gfx1250 DSV4.1 indexer key layout
+
+The CSA2 scorer loads and dequantizes packed keys with adjacent key dimensions
+assigned to each lane, then converts BF16 values to the existing WMMA layout.
+Full-history and candidate-block scans share this layout. Page checks, query
+preparation, head reductions and top-k selection are unchanged. Caller-owned
+logits must still be initialized to negative infinity for masked rows.

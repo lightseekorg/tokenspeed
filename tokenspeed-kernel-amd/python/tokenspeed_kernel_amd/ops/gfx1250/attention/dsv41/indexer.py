@@ -225,8 +225,11 @@ def gluon_dsv41_index_topk_gfx1250(
     )
     output_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
     output_columns = gl.arange(0, BLOCK_N, layout=output_layout)
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, k_dot_layout))[:, None]
-    columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, k_dot_layout))[None, :]
+    key_load_layout: gl.constexpr = gl.BlockedLayout(
+        [32, 1], [4, 8], [1, NUM_WARPS], [0, 1]
+    )
+    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, key_load_layout))[:, None]
+    columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, key_load_layout))[None, :]
 
     for tile_offset in range(0, CHUNK_N, BLOCK_N):
         tile_start = candidate_start + tile_offset
@@ -270,6 +273,7 @@ def gluon_dsv41_index_topk_gfx1250(
             (scale_u8.to(gl.int32) << 23).to(gl.float32, bitcast=True),
         )
         key = gl.where(valid, (value * scale).to(gl.bfloat16), 0.0)
+        key = gl.convert_layout(key, k_dot_layout)
         acc = gl.zeros([32, BLOCK_N], gl.float32, layout=wmma_layout)
         head_scores = gl.amd.cdna5.wmma(query, key, acc)
         head_scores = gl.maximum(head_scores, 0.0, propagate_nan=tl.PropagateNan.ALL)
