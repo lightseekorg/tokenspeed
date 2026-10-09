@@ -16,7 +16,7 @@ For a compact compatibility table, see
 | `--tokenizer` | Tokenizer path when it differs from the model path. |
 | `--tokenizer-mode` | Select tokenizer behavior. `auto` uses fast tokenizers and model-specific hooks when available. |
 | `--skip-tokenizer-init` | Skip tokenizer initialization for input-ID-only serving paths. |
-| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, `sharded_state`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
+| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
@@ -34,15 +34,18 @@ with rank-dependent weight-name filters prefetch independently. Use
 `--disable-weight-loader-prefetch-checkpoints` to disable prefetch or
 `--weight-loader-prefetch-num-threads` to set reader concurrency per rank.
 
-`--load-format sharded_state` reads only the current global rank's files,
+The programmatic `LoadConfig(load_format="sharded_state")` loader reads only
+the current global rank's files,
 named `model-rank-{rank}-part-{part}.safetensors` by default. These are
 post-processed runtime state dictionaries, not ordinary Hugging Face shards.
 Reload with the same model configuration, parallel mapping, quantization,
 and runtime weight layout. The loader constructs and post-processes the
 model before copying the saved state into it; compatibility must be checked
 for the model and quantization in use. Keep model configuration/tokenizer
-files with the checkpoint. A custom filename pattern can be supplied with
-`--model-loader-extra-config '{"pattern":"model-rank-{rank}-part-{part}.safetensors"}'`.
+files with the checkpoint. A custom filename pattern can be supplied through
+`LoadConfig.model_loader_extra_config`, for example
+`{"pattern": "model-rank-{rank}-part-{part}.safetensors"}`. The serving CLI does
+not expose this loader or its extra configuration.
 
 ## Precision And Quantization
 
