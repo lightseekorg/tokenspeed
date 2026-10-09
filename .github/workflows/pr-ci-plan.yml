@@ -5,6 +5,7 @@ on:
   # Dispatch refreshes a specific open PR for watch/fix; main pushes never plan.
   pull_request:
     types: [opened, synchronize, reopened]
+    branches: [main]
 
   workflow_dispatch:
     inputs:
