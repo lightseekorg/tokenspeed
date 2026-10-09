@@ -533,3 +533,8 @@ join admission records using their epoch and request ID.
 Capture metadata `page_event_semantics=separate_publication_v1` means page
 publication/removal has its own `stored`/`removed` events. Producer frontiers such
 as `computed` alone do not prove cache residency. Gaps still invalidate replay.
+
+The headless Rust frontend receives trace epochs through the named-field ZMQ
+ready response. Each DP replica contributes its own epoch. With pipeline
+parallelism, only one stage handshakes, so this path advertises no epoch until
+all stage identities can be supplied; Python startup IPC still collects stages.

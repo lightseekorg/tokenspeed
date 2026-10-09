@@ -375,6 +375,14 @@ def connect_msgpack_engine_for_loop(
         world_size=loop.world_size,
         data_parallel_size=loop.dp_size,
         tensor_parallel_size=loop.attn_tp_size,
+        pipeline_parallel_size=loop.pp_size,
+        # Only the I/O-owning stage handshakes. Do not advertise one stage's
+        # capture as the identity of a multi-stage cache domain.
+        cache_trace_epochs=(
+            [loop._cache_trace.epoch]
+            if loop._cache_trace is not None and loop.pp_size == 1
+            else []
+        ),
         decode_context_parallel_size=server_args.decode_context_parallel_size,
         data_parallel_rank=loop.dp_rank,
         max_num_seqs=server_args.max_num_seqs,

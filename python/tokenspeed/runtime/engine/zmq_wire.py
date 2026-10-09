@@ -91,6 +91,7 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
     kv_events_config: dict | None = None
+    cache_trace_epochs: list[str] = []
 
 
 _ENC = msgspec.msgpack.Encoder()
