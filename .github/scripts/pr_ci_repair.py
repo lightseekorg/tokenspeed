@@ -48,13 +48,16 @@ from pr_ci_assist import (
     dispatch_native_checks,
     latest_command,
     load_state,
+    main_advance_compatible,
     native_check,
     pages,
+    pr_source_matches,
     public_gate,
     publish,
     pull,
     repair_deadline,
     runs_for,
+    targeted_plan,
     task_status,
     validate_plan,
 )
@@ -158,7 +161,11 @@ def allowed_paths(request: dict) -> set[str]:
     allowed = {
         p
         for p in request["data"]["paths"]
-        if safe_path(p) and not {"test", "tests"}.intersection(Path(p).parts[:-1])
+        if safe_path(p)
+        and (
+            not {"test", "tests"}.intersection(Path(p).parts[:-1])
+            or (request["state"].get("target") and Path(p).suffix == ".py")
+        )
     }
     if any(
         c["workflow"] == "nvidia-kernel-library-tests.yml" and c["status"] == "failed"
@@ -314,6 +321,39 @@ def guard_test_assertions(source: Path, head: str, base: str, path: str):
             path=path,
             details=[snippets[key] for key in missing.elements()],
         )
+
+
+def guard_targeted_tests(source: Path, request: dict):
+    """Keep targeted test repairs from bypassing their existing execution."""
+    state = request["state"]
+    if not state.get("target"):
+        return
+
+    def controls(content: str) -> Counter:
+        return Counter(
+            ast.dump(node, include_attributes=False)
+            for node in ast.walk(ast.parse(content))
+            if isinstance(node, (ast.Return, ast.Try, ast.If, ast.IfExp))
+            or (
+                isinstance(node, (ast.Name, ast.Attribute))
+                and (node.id if isinstance(node, ast.Name) else node.attr)
+                in {"skip", "skipif", "xfail", "importorskip", "SkipTest"}
+            )
+        )
+
+    for path in allowed_paths(request):
+        if Path(path).suffix != ".py" or not {"test", "tests"}.intersection(
+            Path(path).parts[:-1]
+        ):
+            continue
+        inherited = Counter()
+        for ref in (state["head"], state["validation_base"]):
+            if command("git", "ls-tree", "--name-only", ref, "--", path, cwd=source):
+                inherited |= controls(
+                    command("git", "show", f"{ref}:{path}", cwd=source)
+                )
+        if controls(source.joinpath(path).read_text()) - inherited:
+            raise RepairRejected("test-assertions", path=path)
 
 
 def guard_retired_exports(source: Path, head: str, base: str):
@@ -598,7 +638,26 @@ def configure():
     run_ids = set(evidence["run_ids"].values()) | set(native)
     if request.get("lint_run"):
         run_ids.add(request["lint_run"])
+    target = request["state"].get("target")
+    if target and "diagnostics" not in request:
+        job = api(f"actions/jobs/{target['job']}")
+        diagnostics.append(
+            "Requested failed job (untrusted diagnostic data):\n"
+            + json.dumps({k: job[k] for k in ("id", "run_id", "name", "head_sha")})
+            + "\n"
+            # Capture colored logs as data; never print them to the terminal.
+            + command(
+                "gh",
+                "api",
+                "--allow-escape-sequences",
+                f"repos/{REPO}/actions/jobs/{target['job']}/logs",
+            )[-200000:]
+        )
     for run_id in run_ids:
+        # The completed job log is available before the whole workflow ends.
+        # Still collect its native artifacts below, including Slurm task logs.
+        if target and run_id == target["run"] and "diagnostics" not in request:
+            continue
         jobs = pages(f"actions/runs/{run_id}/jobs?filter=latest", "jobs")
         names = {t["name"] for t in validate_plan(request["plan"], request["data"])}
         if run_id in native:
@@ -822,6 +881,7 @@ def proposed_patch(source, request, allowed, conflicts, before, planner, guard_r
                 shutil.copymode(source / path, target)
             command("git", "add", "--", *sorted(selected), cwd=review)
             diff = guard(review, state["head"], allowed, validation_base=base)
+            guard_targeted_tests(review, request)
             runtime_lint(source, request)
             os.environ["KIMI_CODE_HOME"] = str(guard_root)
             try:
@@ -1028,10 +1088,13 @@ every command, test and assertion. Do not use external paths or symlinks.
 Do not copy diagnostic paths, hosts, credentials or environment identifiers into source.
 Do not perform unrelated cleanup. Stop if the cause is uncertain.
 Respect deliberate removals from main; do not restore retired interfaces.
-Allowed test files are merge-conflict resolutions only. Preserve current main
+Allowed test files are conflict resolutions or PR tests for an explicitly
+requested failed job. Repair their collection/import setup when needed. Preserve current main
 assertions and the PR's added assertions, thresholds and coverage;
-do not weaken or skip tests. Do not resurrect ancestor checks for interfaces
+do not weaken tests or skip their supported configurations. Do not resurrect ancestor checks for interfaces
 deliberately removed on main. Migrate their callers to supported operator modules.
+Do not add skip/xfail markers or change test execution controls to bypass a failure.
+For collection failures, prefer deferring imports until after existing platform checks.
 Apply the repair with Edit or Write. Describing a proposed change without editing
 the allowed source does not complete this task.
 """)
@@ -1040,6 +1103,8 @@ the allowed source does not complete this task.
         prompt += " The existing source contains the previous accepted edits. Read feedback.json first for known material issues in those edits, and correct them before proposing a patch. Complete their verification against current main and correct the remaining conflict resolutions. A retained test missing from the prior patch still has its main-side contents; migrate its imports or calls only if required by the PR's supported API. Preserve already completed edits and avoid restarting the broad investigation."
     if "diagnostics" in request:
         prompt += " The diagnostics now describe validation of the previous accepted candidate. Repair that observed failure while preserving the accepted edits; passing original-head checks do not resolve this candidate failure."
+    if state.get("target"):
+        prompt += f" The user explicitly requested repair of job {state['target']['job']} from run {state['target']['run']}. Use the supplied failure evidence in diagnostics.txt. Diagnose that failure from the evidence and source; a different backend passing does not resolve it. Fix only the supported platform's behavior and preserve test assertions and coverage."
     if FP8_API in allowed and parents.joinpath("main", FP8_REFERENCE).is_file():
         prompt += f" The PR may remove a module that exists on main. Read {parents}/main/{FP8_REFERENCE} for authoritative prepacked FP8 behavior, but check actual merged-source module availability before importing it. Preserve the PR's refactor and adapt callers to available registered/native/Triton backends. Zero-group scales, padding and backend rounding must match that reference; ad hoc tensor arithmetic is not an equivalent implementation."
     env = {k: v for k, v in os.environ.items() if k not in {"GH_TOKEN", "GITHUB_TOKEN"}}
@@ -1263,6 +1328,7 @@ def check():
         cwd=source,
     )
     diff = guard(source, state["head"], allowed, validation_base=base)
+    guard_targeted_tests(source, request)
     runtime_lint(source, request)
     WORK.joinpath("patch.diff").write_text(diff + "\n")
     command("git", "add", "--all", cwd=source)
@@ -1314,7 +1380,9 @@ def current_request(request: dict, *, check_base: bool = True) -> dict:
     if (
         check_base
         and "validation_base" in state
-        and state["validation_base"] != api("git/ref/heads/main")["object"]["sha"]
+        and not main_advance_compatible(
+            state, api("git/ref/heads/main")["object"]["sha"], source=ROOT
+        )
     ):
         raise ValueError("Main changed before validation.")
     pr = pull(state["pr"])
@@ -1346,8 +1414,7 @@ def current_request(request: dict, *, check_base: bool = True) -> dict:
         or live != state
         or state["phase"] != "repairing"
         or state["action"] != "fix"
-        or state["head"] != pr["head"]["sha"]
-        or state["base"] != pr["base"]["sha"]
+        or not pr_source_matches(state, pr, source=ROOT)
     ):
         raise ValueError("Repair authorization or source changed.")
     return pr
@@ -1414,9 +1481,8 @@ def stage():
             "state": {**request["state"], "validation_base": request["repair_base"]},
         }
         current_request(original, check_base=False)
-        if (
-            request["state"]["validation_base"]
-            != api("git/ref/heads/main")["object"]["sha"]
+        if not main_advance_compatible(
+            request["state"], api("git/ref/heads/main")["object"]["sha"], source=ROOT
         ):
             raise ValueError("Main changed after the refreshed checks.")
         publish(
@@ -1431,6 +1497,7 @@ def stage():
     os.environ.update(PR_NUMBER=str(state["pr"]), GITHUB_REPOSITORY=REPO)
     # Rebuild public context ourselves, instead of trusting the checks artifact.
     data = context(source, state["head"], state["base"])
+    request["plan"] = targeted_plan(request["plan"], data, state)
     validate_plan(request["plan"], data)
     request["data"] = data
     conflicts = merge(source, base, commit=False)
@@ -1444,6 +1511,7 @@ def stage():
     restore_patch(source, state["head"], set())
     command("git", "apply", "--index", str(WORK / "patch.diff"), cwd=source)
     guard(source, state["head"], allowed_paths(request), validation_base=base)
+    guard_targeted_tests(source, request)
     proof = json.loads(WORK.joinpath("checked.json").read_text())
     if (
         hashlib.sha256(WORK.joinpath("patch.diff").read_bytes()).hexdigest()
@@ -1558,19 +1626,17 @@ def wait_for_validation(request: dict):
         )
 
 
-def promote(state: dict):
+def promote(state: dict, *, deadline: int):
     public_gate()
-    deadline = repair_deadline(state)
     base = state.get("validation_base", state["base"])
-    if (
-        "validation_base" in state
-        and base != api("git/ref/heads/main")["object"]["sha"]
+    if "validation_base" in state and not main_advance_compatible(
+        state, api("git/ref/heads/main")["object"]["sha"], source=ROOT
     ):
         raise ValueError("Main changed before promotion.")
     if time.time() >= deadline:
-        raise ValueError("The one-hour repair and validation budget expired.")
+        raise ValueError("The authorized publication budget expired.")
     pr = pull(state["pr"])
-    if (pr["head"]["sha"], pr["base"]["sha"]) != (state["head"], state["base"]):
+    if not pr_source_matches(state, pr, source=ROOT):
         raise ValueError("PR or main moved before promotion.")
     latest = latest_command(pages(f"issues/{state['pr']}/comments", None))
     if not latest or latest["id"] != state["command"]:
@@ -1626,16 +1692,20 @@ def promote(state: dict):
         subprocess.run(["git", "merge", "--abort"], cwd=source, capture_output=True)
         command("git", "reset", "--hard", promoted, cwd=source)
     current = pull(state["pr"])
-    if (current["head"]["sha"], current["base"]["sha"]) != (
-        state["head"],
-        state["base"],
-    ):
+    if not pr_source_matches(state, current, source=source):
         raise ValueError("PR or main moved during promotion.")
-    if (
-        "validation_base" in state
-        and base != api("git/ref/heads/main")["object"]["sha"]
-    ):
-        raise ValueError("Main changed during promotion.")
+    if "validation_base" in state:
+        main = api("git/ref/heads/main")["object"]["sha"]
+        if not main_advance_compatible(state, main, source=source):
+            raise ValueError("Relevant main inputs changed during promotion.")
+        if main != base:
+            result = subprocess.run(
+                ["git", "merge-tree", "--write-tree", "HEAD", main],
+                cwd=source,
+                capture_output=True,
+            )
+            if result.returncode:
+                raise ValueError("Promoted repair conflicts with current main.")
     push(source, pr["head"]["ref"], deadline=deadline)
 
 

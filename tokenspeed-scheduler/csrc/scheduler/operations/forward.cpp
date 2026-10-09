@@ -532,9 +532,22 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request) {
     std::vector<BlockTable>& tables = request->BlockTablesRef();
-    const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     fsm::CacheProgress cache_progress = request->CacheProgress();
     const std::int32_t num_computed_tokens = request->NumComputedTokens();
+    std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
+    if (config_.decode_input_tokens > 1) {
+        const std::int32_t decode_width = std::max(config_.decode_input_tokens, reserve_tokens);
+        const std::int32_t pending_decode_tokens =
+            request->Is<fsm::Decoding>()
+                ? std::min(request->ResultsInFlight(), config_.overlap_schedule_depth) * config_.decode_input_tokens
+                : 0;
+        // All groups consume the same logical token extent, including sparse tables.
+        // Reuse reserved speculative slots after a prefill interrupts decode instead
+        // of charging another verify span on every restart.
+        const std::int32_t reserved_end =
+            tables.front().NumBlocks() * coordinator_.GroupBlockGranularity(0) - tables.front().AvailableTokens();
+        reserve_tokens = std::max(num_computed_tokens + pending_decode_tokens + decode_width - reserved_end, 0);
+    }
     const RequestProgress progress =
         advanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>());

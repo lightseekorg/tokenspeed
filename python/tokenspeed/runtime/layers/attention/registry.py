@@ -826,11 +826,11 @@ def _gdn_linear_attn_backend(
     server_args: ServerArgs, config: AttnConfig
 ) -> AttentionBackend:
     del server_args
-    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-        MambaAttnBackend,
+    from tokenspeed.runtime.layers.attention.backends.state.gdn import (
+        GdnAttnBackend,
     )
 
-    return MambaAttnBackend(config, config.component(SoftmaxAttnConfig))
+    return GdnAttnBackend(config, config.component(SoftmaxAttnConfig))
 
 
 def _mamba2_linear_attn_backend(
