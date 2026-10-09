@@ -4,7 +4,7 @@ on:
   issue_comment:
     types: [created]
   workflow_run:
-    workflows: [PR CI Plan, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
+    workflows: [PR CI Plan, Lint, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
     types: [completed]
     branches-ignore: [main]
   workflow_call:
@@ -14,6 +14,15 @@ on:
         description: "PR whose existing authorized watch/fix should be reconciled"
         required: true
         type: string
+      repair_run:
+        description: "Completed repair run whose accepted source edits should seed this retry"
+        required: false
+        type: string
+      check_only:
+        description: "Recheck an accepted patch without requesting new source edits"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -37,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
       - id: resolve
         env:
@@ -57,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - run: python3 -m pip install pyyaml
@@ -65,6 +74,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr }}
+          REPAIR_RUN: ${{ inputs.repair_run }}
+          REPAIR_CHECK_ONLY: ${{ inputs.check_only }}
           TOKENSPEED_B200_RUNNER_LABEL: b200v2
         run: python3 .github/scripts/pr_ci_assist.py control --pr "$PR_NUMBER"
       - if: steps.control.outputs.repair == 'true'
@@ -78,32 +89,49 @@ jobs:
     needs: control
     if: needs.control.outputs.repair == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: repair-request
           path: ${{ runner.temp }}/pr-ci-assist
-      - uses: actions/setup-node@v6
+      - if: inputs.repair_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: repair-patch
+          run-id: ${{ inputs.repair_run }}
+          github-token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          path: ${{ runner.temp }}/pr-ci-assist/previous-repair
+      - if: '!inputs.check_only'
+        uses: actions/setup-node@v6
         with:
           node-version: '24'
-      - run: npm install --global @moonshot-ai/kimi-code@2.1.1
-      - run: python3 -m pip install pyyaml
+      - if: '!inputs.check_only'
+        run: npm install --global @moonshot-ai/kimi-code@2.1.1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install pyyaml ruff
       - name: Prepare provider configuration
+        if: '!inputs.check_only'
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           KIMI_CODE_HOME: ${{ runner.temp }}/ci-assist-home
         run: python3 .github/scripts/pr_ci_repair.py configure
       - name: Prepare source repair
+        if: '!inputs.check_only'
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           KIMI_CODE_HOME: ${{ runner.temp }}/ci-assist-home
         run: python3 .github/scripts/pr_ci_repair.py model
+      - name: Reuse accepted source repair
+        if: inputs.check_only
+        run: python3 .github/scripts/pr_ci_repair.py reuse
       - uses: actions/upload-artifact@v4
         with:
           name: repair-patch
@@ -115,11 +143,11 @@ jobs:
   check:
     needs: repair
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
@@ -129,7 +157,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: python3 -m pip install pre-commit pyyaml
+      - run: python3 -m pip install pre-commit pyyaml ruff
       - name: Check repair without publishing credentials
         run: python3 .github/scripts/pr_ci_repair.py check
       - uses: actions/upload-artifact@v4
@@ -145,14 +173,14 @@ jobs:
     needs: [resolve, control, check]
     if: needs.check.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     concurrency:
       group: pr-ci-assist-${{ needs.resolve.outputs.pr }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
@@ -180,7 +208,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:

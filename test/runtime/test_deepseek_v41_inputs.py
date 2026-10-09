@@ -917,7 +917,7 @@ def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
         assert x.dtype == layer.input_dtype
         return x
 
-    monkeypatch.setattr(model_executor.tokenspeed_kernel, "moe_apply", fake_apply)
+    monkeypatch.setattr(model_executor, "kernel_moe_apply", fake_apply)
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = torch.device("cpu")
     executor.drafter = SimpleNamespace(

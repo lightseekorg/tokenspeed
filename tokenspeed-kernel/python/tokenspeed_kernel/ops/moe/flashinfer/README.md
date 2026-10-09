@@ -2,37 +2,22 @@
 
 ## NVFP4 routing-map padding
 
-The TRT-LLM NVFP4 entry points use a private native launcher that initializes
-`permuted_idx_to_token_idx` to `-1` before routing. Routing then writes the
-real token assignments. Expert-tile padding and the guard entry stay invalid,
-so the first GEMM does not gather activations using stale workspace values.
+The pinned FlashInfer version (0.7.1rc2) initializes unused rows inside active
+expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
+This prevents unnecessary activation loads in the first GEMM without a separate
+fill-kernel launch. Routing refreshes live mappings and tile padding on every
+invocation, including CUDA graph replay and both logits and precomputed top-k
+entry points. Allocation slack beyond the active tiles and the launcher's extra
+guard entry are not part of this initialization contract.
 
-The initialization uses the native tensor's allocated length and current CUDA
-stream. It applies to both routing from logits and precomputed top-k, including
-different token counts, expert partitions and GEMM tile sizes. It runs in eager
-execution and is recorded inside CUDA graphs, so every replay refreshes padding
-even when graphs reuse a memory pool. No host synchronization or extra routing
-buffer is needed.
-
-`thirdparty/flashinfer/trtllm_moe.py` builds a source-keyed private JIT module.
-The adapter ships as a Python package in both source distributions and wheels;
-it does not require a source checkout on `PYTHONPATH`.
-It adds a checked fill-kernel launch after the named map allocation; the kernel
-waits on and releases programmatic dependents, so the routing chain keeps PDL
-where a memset graph node would cost about 4 us per MoE layer. It retains
-FlashInfer's routing and GEMM implementations and Python API signatures. The
-small-batch tactic policy below narrows the tuner's candidates for one model.
-The installed package and stock JIT modules are unchanged. The first warmup
-requires FlashInfer's usual JIT toolchain and compiles the private module;
-subsequent processes reuse its cache. Warmup must finish before graph capture.
-An unrecognized native allocation layout raises an error rather than silently
-running without initialization. Review this adapter when updating FlashInfer.
-It can be removed once the minimum supported FlashInfer version guarantees
-the same padding initialization before every routing invocation.
+`thirdparty/flashinfer/trtllm_moe.py` uses the upstream native module while
+retaining the private runner for the small-batch tactic policy below. Warmup
+must finish before graph capture.
 
 Regression coverage includes live and padded mapping entries, local expert
 partitions, PDL on/off, changing routing within one captured shape, graph replay
-after workspace corruption, and output equality with the upstream operator.
+after workspace corruption, untouched allocation slack/guard, and output
+equality with the upstream operator.
 Expert-partition tests retain the loader's global activation input scales while
 sharding expert weights, and select SiTU through FlashInfer's activation enum.
 
@@ -46,7 +31,7 @@ blocks of 64 elements. Non-gated activations still need 128.
 
 `thirdparty/flashinfer/trtllm_bf16_moe.py` builds a private copy of the
 installed launcher in which only that check requires 64 for gated and 128 for
-non-gated activations. Like the NVFP4 adapter, it uses a source-keyed JIT
+non-gated activations. It uses a source-keyed JIT
 module, private operator names and cloned entry points, and refuses a launcher
 whose check it does not find exactly once. `trtllm_unquant.py`'s SiLU/SwiGLU
 kernels declare `ispp_alignment` 64 when the adapter applies to the installed
@@ -59,9 +44,8 @@ else `bin/nvcc` under its CUDA home). This is decided once per process at
 import, without compiling, so kernel selection and layer padding agree. Only
 sizes that are not multiples of 128 run on the private launcher; the first such
 layer JIT-compiles the whole private TRT-LLM MoE module during warmup. Other
-sizes keep FlashInfer's stock module. The NVFP4 routing-map initialization is
-not added: the routing workspace does not depend on the intermediate size, so
-these layers keep FlashInfer's BF16 routing behavior. Remove the adapter once
+sizes keep FlashInfer's stock module. These layers keep FlashInfer's BF16
+routing behavior. Remove the adapter once
 the minimum supported FlashInfer accepts these sizes.
 
 ## Qwen3.8 low-batch tactic

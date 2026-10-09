@@ -70,7 +70,7 @@ def _make_pool(page_size: int, size: int = 512):
 
 def _quantize(x: torch.Tensor):
     """[T, H, D] bf16 -> (fp8 data, [T, H, sf] e8m0 scales) via the kernel op."""
-    from tokenspeed_kernel import quantize_mxfp8
+    from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
     t, h, d = x.shape
     q, sf = quantize_mxfp8(x.reshape(t * h, d))

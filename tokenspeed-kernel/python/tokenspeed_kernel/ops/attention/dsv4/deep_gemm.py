@@ -24,6 +24,7 @@ import logging
 from math import ceil
 
 import torch
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.residual.triton import compute_mhc_num_splits
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -468,7 +469,6 @@ def _dsv4_index_candidates(
         mask_index_scores,
     )
     from tokenspeed_kernel.ops.attention.dsa.triton import combine_topk_weights
-    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
     pages, positions, lengths = compact_index_pages(
         local_page_table,
@@ -478,7 +478,7 @@ def _dsv4_index_candidates(
     )
     if index_k_format == "fp8_scaled":
         q = index_q[0].contiguous()
-        values, scales = quantize_fp8_with_scale(
+        values, scales = quantize_fp8(
             q.reshape(-1, q.shape[-1]),
             granularity="token_group",
             group_size=128,

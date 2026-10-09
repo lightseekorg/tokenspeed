@@ -23,10 +23,10 @@
 from dataclasses import astuple
 
 import pytest
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel.ops.gemm import flashinfer as fi
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.gemm.triton_gemv import (
     _rowcta_gemv_kernel,
     decode_gemv,
@@ -81,6 +81,6 @@ def test_serving_routes_new_row_counts_away_from_per_m_compiles(warp_splitk):
             rows = x[:m]
             assert not use_decode_gemv(rows, weight)
             expected = (rows.float() @ weight.float().T).to(torch.bfloat16)
-            for got in (decode_gemv(rows, weight), tokenspeed_kernel.mm(rows, weight)):
+            for got in (decode_gemv(rows, weight), kernel_mm(rows, weight)):
                 torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
     assert warp_splitk._compile.cache_info().misses == misses

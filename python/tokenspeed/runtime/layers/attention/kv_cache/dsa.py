@@ -24,7 +24,7 @@ from typing import ClassVar
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     index_k_plane_dtype,
@@ -180,7 +180,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 f"index-K plane dtype {buf.dtype} has no write path: uint8 "
                 "(fp8_scaled) or bfloat16 (bf16)"
             )
-        index_k_fp8, index_k_scale = quantize_fp8_with_scale(
+        index_k_fp8, index_k_scale = quantize_fp8(
             index_k,
             granularity="token_group",
             group_size=_INDEX_K_FP8_GROUP_SIZE,

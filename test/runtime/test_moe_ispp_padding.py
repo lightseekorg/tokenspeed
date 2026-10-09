@@ -189,8 +189,8 @@ def _planned_unquant_ispp(monkeypatch, activation: str, ispp: int) -> int:
         lambda: SimpleNamespace(value="flashinfer_trtllm"),
     )
     monkeypatch.setattr(
-        expert_mod.tokenspeed_kernel,
-        "moe_plan",
+        expert_mod,
+        "kernel_moe_plan",
         lambda weight_dtype, **kwargs: plans.append(kwargs) or {"solution": "fake"},
     )
     monkeypatch.setattr(expert_mod, "create_layer_weights", lambda *a, **k: None)

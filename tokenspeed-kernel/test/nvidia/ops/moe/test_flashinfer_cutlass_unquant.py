@@ -44,6 +44,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.platform import current_platform
 
 
@@ -176,7 +179,6 @@ def _reference(x, ids, weights, w13, w2, first_expert):
 @pytest.mark.parametrize("ep_rank", [0, 1])
 def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
     _requires_flashinfer_hopper()
-    import tokenspeed_kernel
 
     torch.manual_seed(0)
     device = "cuda"
@@ -194,7 +196,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         ids[token, :real] = torch.randperm(num_experts - 1, device=device)[:real] + 1
         weights[token, :real] = torch.rand(real, device=device)
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -219,7 +221,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         tp_size=1,
         tp_rank=0,
     )
-    tokenspeed_kernel.moe_process_weights(plan, layer)
+    kernel_moe_process_weights(plan, layer)
     expected = _reference(
         x, ids, weights, reference_w13, w2, first_expert=ep_rank * local
     )
@@ -229,7 +231,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         # the chain away from it.
         garbage = torch.full((64 << 20,), float("nan"), device=device)
         del garbage
-        out = tokenspeed_kernel.moe_apply(
+        out = kernel_moe_apply(
             plan,
             x,
             layer,

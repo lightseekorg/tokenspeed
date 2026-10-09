@@ -27,7 +27,7 @@ import re
 from collections.abc import Iterable
 
 import torch
-from tokenspeed_kernel import mhc_post
+from tokenspeed_kernel.ops.residual import mhc_post
 from torch import nn
 from transformers import PretrainedConfig
 

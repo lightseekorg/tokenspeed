@@ -431,7 +431,6 @@ def test_qwen4_exp_qsa_backend_resolution_pins_sparse_dispatch() -> None:
             is_kda=False,
             is_dsa=False,
             is_qsa=True,
-            has_cache_plan=True,
         )
         == "qsa"
     )
@@ -441,7 +440,6 @@ def test_qwen4_exp_qsa_backend_resolution_pins_sparse_dispatch() -> None:
             is_kda=False,
             is_dsa=False,
             is_qsa=True,
-            has_cache_plan=True,
         )
         == "qsa"
     )

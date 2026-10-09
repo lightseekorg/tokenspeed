@@ -24,8 +24,8 @@ import logging
 import os
 
 import pytest
+import tokenspeed_kernel.compile_monitor as compile_monitor
 import torch
-from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.compile_monitor import (
     CompileMonitor,
