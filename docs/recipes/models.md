@@ -736,13 +736,9 @@ launch command.
 QSA selects CuTe DSL sparse attention on B200 (SM100) and B300 (SM103) for
 BF16 queries with BF16 or FP8 E4M3 KV caches, 256-dimensional heads, 6/12/24
 query heads, 1/2/4 KV heads, and a selected-slot width of 2051. This applies to
-ordinary decode and MTP verification under CUDA Graph. On B200/B300, BF16 QSA
-prefill (including one-token prefill) uses FlashInfer PrimTS with logical block
-candidates from the indexer. Query groups stay within each request and reuse KV
-across overlapping candidates. FlashInfer 0.7.1rc5 is required. FP8 KV prefill,
-unsupported geometries, and calls supplying only physical slots retain FA2;
-PrimTS QSA currently requires matching Q/K/V dtypes, so TokenSpeed preserves
-BF16 queries instead of adding an FP8 query quantization step.
+ordinary decode and MTP verification under CUDA Graph. BF16 prefill on
+B200/B300, including one-token prefill, uses FlashInfer PrimTS (requires
+0.7.1rc5). FP8 KV prefill and other inputs unsupported by PrimTS use FA2.
 
 The decoder passes ordinary sublayer-output tensors and residual tuples between
 layers. At adjacent HC boundaries, it explicitly calls the consuming mixer's

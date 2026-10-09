@@ -837,16 +837,14 @@ Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
-The QSA API preserves `decode_query_lengths`: uniform decode/verification
-uses a positive width; prefill and mixed/ragged queries use `None`, including
-single-request and single-token prefill. Only decode may select CuTe. On
-SM100/SM103, supported BF16 prefill uses FlashInfer PrimTS with the indexer's
-logical block selection and existing request/page metadata. Query groups must
-stop at request boundaries. Other supported NVIDIA inputs retain FA2 over
-the equivalent physical slots. Adapting ragged rows to one-token queries must
-retain this distinction. All kernels use the same cache writer and
-sparse-attention call; the indexer still returns physical slots across graph
-breaks and keeps logical candidates in the existing per-forward share.
+QSA uses positive `decode_query_lengths` for uniform decode/verification and
+`None` for prefill or mixed/ragged queries, including one-token prefill.
+Only decode may use CuTe. Supported BF16 prefill on SM100/SM103 uses FlashInfer
+PrimTS with logical block candidates; query groups stay within each request.
+Other supported NVIDIA inputs use FA2 over equivalent physical slots.
+All kernels share the cache writer and sparse-attention call. The indexer
+returns physical slots across graph breaks and keeps logical candidates
+in the existing per-forward share.
 
 `QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
 target. Registry construction binds the cache plan and preallocates its
