@@ -71,6 +71,12 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
         supports_mxfp8_gemm_shape as _supports_mxfp8_gemm_shape,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.skinny import (
+        launch_triton_mm_mxfp8_skinny_gfx950 as _mm_mxfp8_skinny_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.skinny import (
+        supports_mxfp8_skinny_shape as _supports_mxfp8_skinny_shape,
+    )
 
     try:
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (
@@ -224,6 +230,46 @@ if current_platform().is_amd:
         if block_size is None:
             raise ValueError("gfx950 MXFP8 GEMM requires block_size")
         return _mm_mxfp8_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            alpha=alpha,
+            block_size=block_size,
+            out=out,
+        )
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="triton_mm_mxfp8_skinny_gfx950",
+        solution="triton",
+        capability=_GFX950_CAPABILITY,
+        signatures=_MXFP8_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mxfp8_skinny_shape}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical"}),
+            "out_dtype": frozenset({torch.bfloat16, torch.float16}),
+            "out_inner_stride_one": frozenset({True}),
+        },
+    )
+    def triton_mm_mxfp8_skinny_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if A_scales is None or B_scales is None or block_size is None:
+            raise ValueError("gfx950 skinny MXFP8 GEMM requires scales and block_size")
+        return _mm_mxfp8_skinny_impl(
             A,
             B,
             A_scales,
@@ -531,6 +577,11 @@ else:
     def gluon_mm_mxfp8_gfx950(**kwargs):
         raise ImportError("gluon_mm_mxfp8_gfx950 requires tokenspeed-kernel-amd")
 
+    def triton_mm_mxfp8_skinny_gfx950(**kwargs):
+        raise ImportError(
+            "triton_mm_mxfp8_skinny_gfx950 requires tokenspeed-kernel-amd"
+        )
+
     def gluon_mm_mxfp8_ue8m0_gfx1250(*args, **kwargs):
         raise ImportError("gluon_mm_mxfp8_ue8m0_gfx1250 requires AMD CDNA5")
 
@@ -551,6 +602,7 @@ else:
 __all__ = [
     "gluon_mm_a16w16_prefill_gfx950",
     "gluon_mm_mxfp8_gfx950",
+    "triton_mm_mxfp8_skinny_gfx950",
     "gluon_mm_fp8_blockscale_gfx1250",
     "gluon_mm_mxfp8_ue8m0_gfx1250",
     "gluon_linear_attnres_partials_gfx950",
