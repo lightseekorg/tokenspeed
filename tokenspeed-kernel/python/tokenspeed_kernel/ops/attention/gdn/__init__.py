@@ -118,6 +118,69 @@ class GdnChunkPrefillResult:
     h_layout: GdnCheckpointLayout = GdnCheckpointLayout.NONE
 
 
+# Chunk-prefill kernels whose launch geometry depends only on the sequence count
+# and which read the sequence bounds on device.
+_DEVICE_BOUNDS_CHUNK_PREFILL = frozenset({"flashinfer_gdn_chunk_prefill"})
+
+
+def _chunk_prefill_traits(
+    head_dim: int,
+    value_head_dim: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    output_h: bool,
+    qk_l2norm: bool,
+) -> dict[str, int | bool]:
+    return {
+        "head_dim": head_dim,
+        "value_head_dim": value_head_dim,
+        "num_v_gte_num_q": num_v_heads >= num_q_heads,
+        "output_h": output_h,
+        "qk_l2norm": qk_l2norm,
+    }
+
+
+def gdn_chunk_prefill_capturable(
+    dtype: torch.dtype,
+    *,
+    head_dim: int,
+    value_head_dim: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    qk_l2norm: bool,
+) -> bool:
+    """Whether a CUDA graph can capture ``gdn_chunk_prefill`` at a fixed sequence count.
+
+    The kernel selected for this geometry must size its launch from the number
+    of sequences alone and read ``cu_seqlens`` on device, so a graph replayed
+    with rewritten bounds of the same sequence count stays valid.
+
+    Args:
+        dtype: Q/K/V dtype.
+        head_dim: Query/key head dimension.
+        value_head_dim: Value head dimension.
+        num_q_heads: Query (and key) head count.
+        num_v_heads: Value head count.
+        qk_l2norm: Whether the scan L2-normalizes Q/K.
+
+    Returns:
+        ``True`` when the selected kernel can be captured that way.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    try:
+        kernel = select_kernel(
+            "attention",
+            "gdn_chunk_prefill",
+            _attention_format_signature(q=probe, k=probe, v=probe),
+            traits=_chunk_prefill_traits(
+                head_dim, value_head_dim, num_q_heads, num_v_heads, False, qk_l2norm
+            ),
+        )
+    except NoKernelFoundError:
+        return False
+    return kernel.name in _DEVICE_BOUNDS_CHUNK_PREFILL
+
+
 def gdn_chunk_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -164,13 +227,9 @@ def gdn_chunk_prefill(
     value_head_dim = v.shape[-1]
     num_q_heads = q.shape[-2]
     num_v_heads = v.shape[-2]
-    traits = {
-        "head_dim": head_dim,
-        "value_head_dim": value_head_dim,
-        "num_v_gte_num_q": num_v_heads >= num_q_heads,
-        "output_h": output_h,
-        "qk_l2norm": qk_l2norm,
-    }
+    traits = _chunk_prefill_traits(
+        head_dim, value_head_dim, num_q_heads, num_v_heads, output_h, qk_l2norm
+    )
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
@@ -718,6 +777,7 @@ __all__ = [
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "gdn_chunk_prefill",
+    "gdn_chunk_prefill_capturable",
     "gdn_decode_step",
     "gdn_decode_mtp",
     "gdn_replay_commit",

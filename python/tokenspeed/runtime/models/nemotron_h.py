@@ -51,7 +51,6 @@ from tokenspeed.runtime.execution.forward_step import (
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
     RMSNorm as RMSNormGated,
 )
-from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -96,10 +95,7 @@ MixerOutput = tuple[torch.Tensor, torch.Tensor | None]
 
 def _static_fp8_scale(linear: LinearBase) -> torch.Tensor | None:
     """The per-tensor input scale of a static-FP8 linear, which its producer may apply."""
-    method = linear.quant_method
-    if isinstance(method, Fp8LinearMethod) and not method.block_quant:
-        return linear.input_scale
-    return None
+    return linear.quant_method.static_fp8_input_scale(linear)
 
 
 def _fc2_reduce_group(
@@ -218,6 +214,9 @@ class NemotronHNorm(RMSNorm):
                 out=hidden_states,
                 out_fp8=normed_fp8,
                 fp8_scale=fp8_scale,
+                out_fp4=None,
+                fp4_scale=None,
+                gemma=False,
             )
             return hidden_states, normed_fp8, residual
         if extra is not None:
