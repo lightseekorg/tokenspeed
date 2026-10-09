@@ -3399,9 +3399,9 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
 
-        # Agree on raw settings before any shared-expert subgroup is created.
-        shared_value = envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
-        shared_parallel = validate_shared_expert_settings(mapping, shared_value)
+        # Agree on parsed sizes before any shared-expert subgroup is created.
+        shared_size = envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
+        shared_parallel = validate_shared_expert_settings(mapping, shared_size)
         if shared_parallel is not None:
             initialize_shared_expert_group(shared_parallel)
 

@@ -86,20 +86,17 @@ def main():
         device_id=torch.device("cuda", torch.cuda.current_device()),
     )
     # Exercise real world-wide agreement before any shared TP group exists.
-    # Disabled and malformed ranks must reject together with enabled peers.
-    for divergent_value in ("1", "invalid"):
-        rejected = False
-        try:
-            validate_shared_expert_settings(
-                mapping, divergent_value if rank == 0 else str(args.tp_size)
-            )
-        except ValueError as exc:
-            rejected = "differ across ranks" in str(exc)
-        accepted_rejection = torch.tensor(int(rejected), device="cuda")
-        dist.all_reduce(accepted_rejection, op=dist.ReduceOp.MIN)
-        assert accepted_rejection.item() == 1, "Every rank must reject disagreement"
-    assert validate_shared_expert_settings(mapping, "1") is None
-    validate_shared_expert_settings(mapping, str(args.tp_size))
+    # Disabled ranks must reject together with enabled peers.
+    rejected = False
+    try:
+        validate_shared_expert_settings(mapping, 1 if rank == 0 else args.tp_size)
+    except ValueError as exc:
+        rejected = "differ across ranks" in str(exc)
+    accepted_rejection = torch.tensor(int(rejected), device="cuda")
+    dist.all_reduce(accepted_rejection, op=dist.ReduceOp.MIN)
+    assert accepted_rejection.item() == 1, "Every rank must reject disagreement"
+    assert validate_shared_expert_settings(mapping, 1) is None
+    validate_shared_expert_settings(mapping, args.tp_size)
     index = json.loads((args.model / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -114,7 +111,7 @@ def main():
     assert all(w.dtype == torch.bfloat16 for w in weights)
     config = json.loads((args.model / "config.json").read_text())["text_config"]
     mlps = []
-    for size in ("1", str(args.tp_size)):
+    for size in (1, args.tp_size):
         parallel = shared_expert_mapping(mapping, size)
         with torch.device("cuda"):
             mlp = KimiLinearMLP(

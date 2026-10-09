@@ -42,28 +42,24 @@ if TYPE_CHECKING:
 
 
 def validate_projection_settings(
-    mapping: Mapping, qkv_value: str, output_value: str
+    mapping: Mapping, qkv_size: int, output_size: int
 ) -> tuple[DenseLayerMapping | None, DenseLayerMapping | None]:
     """Agree on target-model settings before constructing any sharded projection.
 
-    Disabled and malformed ranks also join the world agreement, so peers cannot
+    Disabled ranks also join the world agreement on parsed sizes, so peers cannot
     enter subgroup preparation with different projection graphs. Return the
     independent QKV and output mappings; None selects the ordinary projection.
     """
-    values = (qkv_value, output_value)
+    sizes = (qkv_size, output_size)
     if dist.is_initialized() and mapping.world_size > 1:
         pg_manager.init_process_group(mapping.world_group, backend="gloo")
         group = pg_manager.get_process_group("gloo", mapping.world_group)
         gathered = [None] * group.size()
-        dist.all_gather_object(gathered, values, group=group)
-        if any(value != values for value in gathered):
+        dist.all_gather_object(gathered, sizes, group=group)
+        if any(value != sizes for value in gathered):
             raise ValueError(
                 f"Kimi projection TP settings differ across ranks: {gathered}"
             )
-    try:
-        sizes = tuple(int(value) for value in values)
-    except ValueError as exc:
-        raise ValueError("Kimi projection TP sizes must be positive integers") from exc
     if any(size < 1 or mapping.world_size % size for size in sizes):
         raise ValueError(
             f"Kimi projection TP sizes {sizes} must be positive divisors of "

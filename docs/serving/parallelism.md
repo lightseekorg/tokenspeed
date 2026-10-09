@@ -266,7 +266,8 @@ block scales alongside the routing IDs and weights. Combine outputs remain BF16.
 
 Shard selected dense weights across contiguous groups of DP ranks with these
 independent settings. Set the same values on every worker before launch; unset
-or `1` keeps that component replicated.
+or `1` keeps that component replicated. Non-integer values produce a warning and
+use `1`. Workers must agree on the resulting sizes before creating TP subgroups.
 
 | Environment variable | Sharded computation |
 |---|---|

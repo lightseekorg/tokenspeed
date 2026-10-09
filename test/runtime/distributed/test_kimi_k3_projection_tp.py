@@ -42,14 +42,13 @@ register_cuda_ci(est_time=120, suite="runtime-2gpu")
 @pytest.mark.parametrize(
     ("sizes", "mapping_overrides", "message"),
     [
-        (("abc", "1"), {}, "positive integers"),
-        (("1", "3"), {}, "positive divisors"),
-        (("0", "1"), {}, "positive divisors"),
-        (("2", "1"), {"attn_tp_size": 2}, "attention TP1/DPworld"),
-        (("2", "1"), {"linear_attn_tp_size": 2}, "linear attention TP1"),
-        (("2", "1"), {"attn_head_tp_size": 2}, "attention TP1/DPworld"),
-        (("1", "2"), {"moe_ep_size": 2}, "MoE TP1/EPworld"),
-        (("2", "2"), {"pp_size": 2, "moe_ep_size": 2}, "PP1"),
+        ((1, 3), {}, "positive divisors"),
+        ((0, 1), {}, "positive divisors"),
+        ((2, 1), {"attn_tp_size": 2}, "attention TP1/DPworld"),
+        ((2, 1), {"linear_attn_tp_size": 2}, "linear attention TP1"),
+        ((2, 1), {"attn_head_tp_size": 2}, "attention TP1/DPworld"),
+        ((1, 2), {"moe_ep_size": 2}, "MoE TP1/EPworld"),
+        ((2, 2), {"pp_size": 2, "moe_ep_size": 2}, "PP1"),
     ],
 )
 def test_projection_settings_reject_invalid_configuration(
@@ -237,7 +236,7 @@ def _model_worker(rank, size, rendezvous):
         moe_tp_size=1,
         moe_ep_size=size,
     )
-    parallel, _ = validate_projection_settings(mapping, str(size), str(size))
+    parallel, _ = validate_projection_settings(mapping, size, size)
     hidden, proj, heads, head_dim = 7168, 12288, 96, 128
     config = KimiLinearConfig(
         hidden_size=hidden,
