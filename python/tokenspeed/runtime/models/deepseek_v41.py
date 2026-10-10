@@ -87,7 +87,11 @@ from torch import nn
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_all_reduce_outputs,
+    all_reduce,
+    can_acquire_all_reduce_outputs,
+)
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -949,15 +953,19 @@ class DeepseekV41Attention(nn.Module):
         grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
         weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
         out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
+        if not self.mapping.attn.has_tp:
+            return self.wo_b(out, scale=None)[0]
+        group = self.mapping.attn.tp_group
+        shapes = ((out.shape[0], self.wo_b.output_size),)
+        if can_acquire_all_reduce_outputs(shapes, out, group):
+            # wo_b writes straight into the all-reduce's memory.
+            outputs = acquire_all_reduce_outputs(shapes, out, group)
+            self.wo_b(out, scale=None, out=outputs[0])
+            return all_reduce(outputs, group=group)[0]
         out, _ = self.wo_b(out, scale=None)
-        if self.mapping.attn.has_tp:
-            out = all_reduce(
-                out,
-                group=self.mapping.attn.tp_group,
-                backend=None,
-                op=torch.distributed.ReduceOp.SUM,
-            )
-        return out
+        return all_reduce(
+            out, group=group, backend=None, op=torch.distributed.ReduceOp.SUM
+        )
 
 
 class DeepseekV41MoE(DeepseekV4MoE):
@@ -1182,8 +1190,12 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
         x = self.comm_manager.pre_mlp_comm(x, ctx)
         total, maximum = self.comm_manager.get_num_tokens(ctx)
-        x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
-        x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
+        # Produce the MoE output straight into the all-reduce's memory.
+        out = self.comm_manager.acquire_post_moe_output(tuple(x.shape), x, ctx)
+        x = self.ffn(
+            x, image_mask, total, maximum, ctx=None, comm_manager=None, out=out
+        )
+        x, _ = self.comm_manager.post_mlp_comm(x, None, ctx, acquired=out is not None)
         return x
 
 
