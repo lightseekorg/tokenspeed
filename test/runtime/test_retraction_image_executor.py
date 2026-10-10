@@ -621,6 +621,45 @@ def test_slot_state_only_image_round_trips_through_empty_ops():
     assert _acks(executor.poll_results()) == _restore_done(2)
 
 
+def test_a_failed_snapshot_leg_still_fences_the_launched_ordered_rows():
+    """The ordered L2 rows launch before the snapshot leg; if an exporter raises
+    mid-export, the rows (and whatever of the leg launched) are in flight with
+    no event recorded. The fence is issued on the write stream's tail anyway
+    before the error propagates, so the plan's zeroing cannot run over copy
+    sources still being read."""
+    layout = _layout(4, [("full", 4)])
+    executor, slot_state, lanes = _build(layout=layout, shard_counts=[1])
+    slot_state.export_slot_state = Mock(side_effect=RuntimeError("exporter broke"))
+    ordered_finish, tail = Mock(name="ordered_finish"), Mock(name="tail")
+    lanes["ordered"].start_d2h.return_value = ordered_finish
+    fence_stream = Mock(name="fence_stream")
+    order = Mock()
+    order.attach_mock(lanes["ordered"].start_d2h, "l2_ordered")
+    order.attach_mock(lanes["snapshot"].start_d2h, "pool")
+    order.attach_mock(tail.record, "record")
+    order.attach_mock(fence_stream.wait_event, "fence")
+    with (
+        patch.object(executor_module.Cache, "WriteBackOp", _WriteBackOp, create=True),
+        patch.object(executor_module.device_module, "Event", return_value=tail),
+        pytest.raises(RuntimeError, match="exporter broke"),
+    ):
+        executor.submit_write_backs(
+            [
+                _WriteBackOp([11], [[0]], [[1]], [[5]], [False]),
+                _snapshot_op(7, 1, [_transfer(0, 2, 2)], pool_index=3),
+            ],
+            prerequisite_stream="execution-stream",
+            fence_stream=fence_stream,
+        )
+    # Both legs launched, then the tail event was recorded on the write
+    # stream and fenced -- not the ordered leg's own event.
+    assert [c[0] for c in order.mock_calls] == ["l2_ordered", "pool", "record", "fence"]
+    tail.record.assert_called_once_with(executor.write_stream)
+    fence_stream.wait_event.assert_called_once_with(tail)
+    # The pinned publication never started: the plan failed before it.
+    lanes["pinned"].start_d2h.assert_not_called()
+
+
 def test_restore_reads_both_tiers_imports_the_slot_and_acks_once():
     layout = _layout(4, [("full", 4), ("state", 1)])
     executor, slot_state, lanes = _build(layout=layout, shard_counts=[1, 1])

@@ -562,21 +562,32 @@ class HostCacheExecutor:
                 snapshot_ops.append(operation)
                 self._append_snapshot_store(operation, transfers=snapshot_transfers)
         self._check_distinct(snapshot_ops)
-        fence = self._start_writing(
-            ordered_op_ids,
-            ordered_transfers,
-            ordered_pages,
-            lane=self._ordered_write_lane,
-            prerequisite_stream=prerequisite_stream,
-        )
-        if snapshot_ops:
-            # Recorded after the ordered L2 rows on the same stream, so
-            # waiting on it waits on both legs.
-            fence = self._start_snapshot_store(
-                snapshot_ops,
-                snapshot_transfers,
+        fence = None
+        try:
+            fence = self._start_writing(
+                ordered_op_ids,
+                ordered_transfers,
+                ordered_pages,
+                lane=self._ordered_write_lane,
                 prerequisite_stream=prerequisite_stream,
             )
+            if snapshot_ops:
+                # Recorded after the ordered L2 rows on the same stream, so
+                # waiting on it waits on both legs.
+                fence = self._start_snapshot_store(
+                    snapshot_ops,
+                    snapshot_transfers,
+                    prerequisite_stream=prerequisite_stream,
+                )
+        except BaseException:
+            # Whatever of the two legs launched is in flight on the write
+            # stream without its event (an exporter raised mid-export, a lane
+            # failed); fence the stream's tail anyway, or the plan's zeroing
+            # could run over copy sources still being read.
+            tail = device_module.Event()
+            tail.record(self.write_stream)
+            fence_stream.wait_event(tail)
+            raise
         if fence is not None:
             fence_stream.wait_event(fence)
         self._start_writing(
