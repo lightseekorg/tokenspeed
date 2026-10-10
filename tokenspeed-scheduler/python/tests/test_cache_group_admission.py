@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import deque
+
 import pytest
 from tokenspeed_scheduler import (
     CacheGroupConfig,
@@ -88,6 +90,78 @@ def test_overlap_decode_admission_uses_runtime_verify_width(verify_width: int):
     scheduler = _overlap_admission_scheduler(verify_width)
     assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
     assert scheduler.cache_group_available_pages("overlap.history") == verify_width
+
+
+@pytest.mark.parametrize("overlap_depth", [0, 1])
+@pytest.mark.parametrize("accepted_tokens", [1, 3, 4])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions(
+    overlap_depth: int, accepted_tokens: int, mixed: bool
+):
+    cfg = _base_config(num_device_pages=4096)
+    cfg.prefix_granularity = 64
+    cfg.decode_input_tokens = 4
+    cfg.overlap_schedule_depth = overlap_depth
+    cfg.enable_mixed_prefill_decode = mixed
+    cfg.disable_prefix_cache = True
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=64,
+            total_pages=4096,
+        ),
+        CacheGroupConfig(
+            group_id="compressor",
+            block_granularity=4,
+            total_pages=4096,
+            retention=CacheRetention.SlidingWindow,
+            family=CacheGroupFamily.History,
+            sliding_window_tokens=8,
+        ),
+        CacheGroupConfig(
+            group_id="state",
+            block_granularity=64,
+            total_pages=4096,
+            family=CacheGroupFamily.State,
+        ),
+    ]
+    scheduler = Scheduler(cfg)
+    scheduler.submit_requests([_make_spec("long", list(range(16)))])
+    pending = deque()
+    for step in range(100):
+        if step % 5 == 3:
+            scheduler.submit_requests([_make_spec(f"short-{step}", list(range(16)))])
+        for op in scheduler.next_execution_plan().forward:
+            if "long" in op.request_ids and op.num_extends() == 0:
+                row = op.request_ids.index("long")
+                table = op.block_tables["compressor"][row]
+                committed = scheduler.request_token_size("long") - 1
+                reservation_end = (
+                    committed + (overlap_depth + 1) * cfg.decode_input_tokens
+                )
+                assert len(table) <= (reservation_end + 3) // 4
+                assert table[committed // 4] > 0
+            pending.append(op)
+        while len(pending) > overlap_depth:
+            op = pending.popleft()
+            events = ExecutionEvent()
+            for index, rid in enumerate(op.request_ids):
+                result = ForwardEvent.ExtendResult()
+                result.request_id = rid
+                result.tokens = [1] * (
+                    accepted_tokens if index >= op.num_extends() else 1
+                )
+                events.add_event(result)
+                if rid != "long":
+                    finish = ForwardEvent.Finish()
+                    finish.request_id = rid
+                    events.add_event(finish)
+                elif index >= op.num_extends():
+                    reserve = ForwardEvent.UpdateReserveNumTokens()
+                    reserve.request_id = rid
+                    reserve.reserve_num_tokens_in_next_schedule_event = accepted_tokens
+                    events.add_event(reserve)
+            scheduler.advance(events)
 
 
 def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():

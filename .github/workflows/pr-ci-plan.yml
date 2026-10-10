@@ -4,7 +4,8 @@ run-name: "CI plan #${{ github.event.pull_request.number || inputs.pr }} | ${{ g
 on:
   # Dispatch refreshes a specific open PR for watch/fix; main pushes never plan.
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
+    branches: [main]
 
   workflow_dispatch:
     inputs:
@@ -25,10 +26,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: pr-ci-plan-${{ github.event.pull_request.number || inputs.pr }}
-  cancel-in-progress: true
-
 jobs:
   plan:
     name: CI Coverage Plan
@@ -36,6 +33,12 @@ jobs:
       github.repository == 'lightseekorg/tokenspeed'
       && (github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository)
       && github.actor != 'dependabot[bot]'
+      && (github.event.action != 'edited' || github.event.changes.base)
+    # Job-level so title and description edits, which skip this job, never
+    # cancel an in-progress plan.
+    concurrency:
+      group: pr-ci-plan-${{ github.event.pull_request.number || inputs.pr }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

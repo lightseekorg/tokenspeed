@@ -1,20 +1,16 @@
-"""Fp8LinearMethod MXFP8 (1,32) path: load-time scale swizzle + flashinfer pin."""
+"""Fp8LinearMethod MXFP8 (1,32) with canonical scales."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_mxfp8
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or has_flashinfer_mxfp8 is None
-    or not has_flashinfer_mxfp8(),
-    reason="requires SM100/103 CUDA and flashinfer mm_mxfp8",
+    not torch.cuda.is_available(), reason="requires a CUDA GPU"
 )
 
 
@@ -39,7 +35,7 @@ def _method() -> Fp8LinearMethod:
     )
 
 
-def test_process_weights_swizzles_and_pins_flashinfer() -> None:
+def test_process_weights_preserves_canonical_scales() -> None:
     n, k = 256, 512
     layer = _make_layer(n, k)
     ref_weight = layer.weight.data.clone()
@@ -48,8 +44,7 @@ def test_process_weights_swizzles_and_pins_flashinfer() -> None:
     method = _method()
     method.process_weights_after_loading(layer)
 
-    assert method.prepared_linear_plan(layer) is not None
-    assert layer.weight_scale_inv.dim() == 2
+    assert torch.equal(layer.weight_scale_inv, ref_scales)
     assert torch.equal(layer.weight.data, ref_weight)
 
     x = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)

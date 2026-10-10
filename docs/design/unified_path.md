@@ -797,10 +797,10 @@ model alone is not a reason to introduce a bespoke backend.
 the ordinary router, wrapped by the existing `HybridLinearAttnBackend` only
 when this view owns GDN layers. Forward dispatch and PD step recording stay
 with that child; the root broadcasts cache and metadata lifecycle calls.
-Registry construction selects the attention child first, then composes the
-Qwen4-Exp consumers once, regardless of whether this view has GDN layers.
-The factory reads the pool view to choose these consumers and leaves binding
-to the common validation and publication path after construction.
+Registry construction selects the attention child; the Qwen4-Exp composite
+selects its consumers from the pool view's local fields, regardless of whether
+this view has GDN layers. Binding stays with the common validation and
+publication path after construction.
 The root initializes the common `AttentionBackend` attributes from its own
 `AttnConfig`, including draft status, verify width, dtype and head geometry;
 these attributes do not depend on an attention child's wrapper shape.
@@ -889,9 +889,12 @@ of the persistent request caches.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
-before sizing the arena. The Qwen4-Exp root's `preallocate_verify_workspace`
-selects its GDN/PLE/QSA consumers, allocates each once and returns their total
-bytes; registry only invokes this operation and checks the recipe budget.
+before sizing the arena. `preallocate_verify_workspace` is called on the
+backend root and returns its verify buffers' bytes. The hybrid delegates to
+its recurrent child; Qwen4-Exp invokes its attention child, PLE and QSA.
+Registry retains the recipe's preparation conditions and budget check,
+without opening the recurrent child. Inkling ring accounting and QCP
+history-gather allocation and sharing remain separate from verify preparation.
 Draft roots allocate no target verify workspace. Qwen4-Exp reserves no
 verify workspace when the target width is one, even with a draft model
 attached; this includes the inherited GDN/PLE staging budget and PLE commit
@@ -1245,13 +1248,13 @@ extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
 
-## Recurrent prefill subgraphs (KDA, Mamba2)
+## Recurrent prefill subgraphs (KDA, Mamba2, GDN)
 
 ### Capturing recurrent layers in the outer graph
 
 `CapacityPrefillBackend` (`state/prefill_capacity.py`) owns this contract for
-KDA and Mamba2; each subclass only states which forwards it admits and whether
-uncaptured shapes also run the capacity layout. GDN does not capture its layers.
+KDA, Mamba2 and GDN; each subclass only states which forwards it admits and whether
+uncaptured shapes also run the capacity layout.
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture and replay. This consumer-stream seam builds or
 refreshes `CapacityPrefillMetadata` with the selected token and request capacities.
@@ -1273,6 +1276,13 @@ the preparation seam rewrites both in place, in one pinned upload, before each
 use. Mamba2 chunks align to the packed token axis, so when one-token dummy tails
 shift a later request's tail, a multi-request capture matches eager within
 rounding rather than bit for bit; a one-request capture matches exactly.
+
+GDN admits capacity prefills only when the selected chunk-prefill kernel sizes
+its launch from the sequence count and reads the bounds on device
+(`gdn_chunk_prefill_capturable`); otherwise its layers keep their breaks. Like
+Mamba2, uncaptured shapes keep the scheduler metadata. The scan chunks each
+sequence from its own start, so captures of any request count match eager bit
+for bit.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels and post-attention compute together.

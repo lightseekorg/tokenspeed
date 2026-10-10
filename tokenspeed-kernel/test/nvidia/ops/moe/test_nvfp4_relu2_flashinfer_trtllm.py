@@ -33,6 +33,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
 HIDDEN = 256
 ISPP = 256
@@ -291,9 +292,8 @@ def test_relu2_kernel_routing_matches_sigmoid_bias_top22(num_tokens):
 @requires_relu2
 @pytest.mark.parametrize("routing_mode", [None, "precomputed_topk"])
 def test_moe_plan_selects_the_relu2_kernels(routing_mode):
-    import tokenspeed_kernel
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "nvfp4",
         input_dtype=torch.bfloat16,
         activation="relu2",
@@ -321,11 +321,11 @@ def test_moe_plan_selects_the_relu2_kernels(routing_mode):
 
 @requires_relu2
 def test_moe_plan_rejects_an_intermediate_width_off_128_rows():
-    import tokenspeed_kernel
+
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     with pytest.raises(NoKernelFoundError):
-        tokenspeed_kernel.moe_plan(
+        kernel_moe_plan(
             "nvfp4",
             input_dtype=torch.bfloat16,
             activation="relu2",

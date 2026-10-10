@@ -236,8 +236,9 @@ W4A8 variant.
 
 With `none`, `agrs`, or `flashinfer` transport and attention DP greater than one,
 Kimi-K3 requires
-`attention DP == MoE EP == world size`. Shared experts and latent projections
-are replicated; only the routed experts require dispatch/combine communication.
+`attention DP == MoE EP == world size`. By default, shared experts and attention
+projections are replicated; only the routed experts require dispatch/combine
+communication.
 
 Select the transport with `--all2all-backend`:
 
@@ -261,13 +262,86 @@ dispatch, SiTU expert computation, and combine with MegaMoE. It requires
 The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
 
-Kimi-K3 can independently shard its BF16 shared-expert MLP with
-`TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE` (unset or `1` preserves existing
-behavior). The size must divide world size and be strictly smaller than it;
-DEP16 supports TP2, TP4 and TP8, with matching intermediate-channel divisibility.
-AllGather and ReduceScatter restore local token ownership around
-the sharded MLP. Attention and caches remain TP1/DP16; routed MoE remains EP16.
-See the [shared-expert TP runbook](../recipes/kimi-k3-shared-expert-tp.md).
+#### Tensor-parallel subgroups within DP
+
+Shard selected dense weights across contiguous groups of DP ranks with these
+independent settings. Set the same values on every worker before launch; unset
+or `1` keeps that component replicated. Non-integer values produce a warning and
+use `1`. Workers must agree on the resulting sizes before creating TP subgroups.
+
+| Environment variable | Sharded computation |
+|---|---|
+| `TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE` | KDA QKV/gates and MLA QKV-A/output gate |
+| `TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE` | KDA and MLA output projections |
+| `TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE` | BF16 shared-expert MLP |
+
+Each size must be a positive divisor of world size. Shared-expert TP must also
+be smaller than world size and divide the MLP intermediate width. Keep attention
+and linear attention at TP1/DPworld, routed MoE at TP1/EPworld, and pipeline
+parallelism disabled. QKV and output projection sharding also require attention
+head-TP at 1. DEP16 can use TP2, TP4, or TP8 subgroups; these settings do not
+change attention caches or token ownership.
+
+QKV and output projection sharding support BF16 and 128×128 block-FP8 weights
+with BF16 activations, including the FP8 attention weights in an NVFP4
+checkpoint. Checkpoint FP8 codes and scales are preserved. QKV TP requires
+gated MLA with Q-LoRA; gated MLA without Q-LoRA is rejected even with replicated
+projections. MLA Q-B, KV-B, KDA convolution and norms keep their existing
+mapping. Target-model projection settings do not change the draft model.
+
+Each sharded computation restores complete outputs to the original token owner:
+
+- QKV: AllGather → column-parallel projection → All-to-All.
+- Output projection: All-to-All → row-parallel projection → ReduceScatter.
+- Shared expert: AllGather → gate/up → activation → down → ReduceScatter.
+
+Empty ranks still join collectives when peers have work. Uneven batches pad to
+the subgroup's largest physical token count. Communication buffers are prepared
+before CUDA-graph capture and reused across layers; shared experts use separate
+buffers. Shared AllGather finishes before routed dispatch, shared GEMMs finish
+before routed BMM, and shared ReduceScatter runs after dispatch and before
+combine. The runtime selects optimized collectives for supported shapes and
+topologies, with generic collective fallbacks otherwise. Place each subgroup
+on a CUDA-IPC-accessible node to use the optimized paths.
+
+TP4 reduces the selected weights to approximately one quarter per GPU, not
+total model memory or latency. Communication and padding can outweigh GEMM
+savings, especially for uneven traffic or large prefill batches. Compare TTFT,
+decode latency and cache capacity separately with real weights and the full
+model. A fixed memory budget can turn weight savings into more cache rather
+than lower device usage; reduced-layer tests do not establish full-model capacity.
+
+#### DEP16 example with TP4 subgroups
+
+This example enables all three settings. Set any one to `1` to keep that
+component replicated, or set all three to `1` for the DEP16 baseline.
+
+```bash
+export TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE=4
+export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=4
+export TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4
+
+python -m tokenspeed.cli serve \
+  --model MODEL_DIR --quantization nvfp4 --dtype bfloat16 \
+  --world-size 16 --nprocs-per-node 4 \
+  --attn-tp-size 1 --data-parallel-size 16 --dense-tp-size 1 \
+  --moe-tp-size 1 --expert-parallel-size 16 \
+  --all2all-backend flashinfer --moe-backend flashinfer_trtllm \
+  --attention-backend tokenspeed_mla --kda-backend cutedsl_kda \
+  --dist-init-addr HEAD_NODE:29500 \
+  --max-num-seqs 256 --max-model-len 4096 \
+  --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
+  --prefix-granularity 128 --enable-prefix-caching --disable-kvstore \
+  --max-cudagraph-capture-size 16 --cudagraph-capture-sizes 1 2 4 8 16
+```
+
+Launch one server process per node on four nodes with four GPUs each, using the
+same checkpoint, container and environment. `HEAD_NODE` is the allocated head
+node, not localhost. On Slurm, reserve a persistent allocation with `salloc`,
+then launch through the site's `submit` wrapper or `srun`. The global sequence
+limit above allows 16 requests per rank. For higher concurrency, increase both
+the sequence budget and graph capture sizes and check cache admission. Keep
+hardware, inputs and serving settings fixed when comparing TP configurations.
 
 ### DeepEP all-to-all
 

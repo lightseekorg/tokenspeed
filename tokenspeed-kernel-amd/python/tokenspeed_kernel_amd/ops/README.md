@@ -484,6 +484,19 @@ code, and the boundary tiles mask keys only, since rows past `q_len` are
 never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
 those keys score `-inf`.
 
+## Transform
+
+### GFX950 Hadamard query transform
+
+The operation applies a length-128 Hadamard transform with an explicit output
+scale to contiguous BF16 query rows on gfx950, returning the same shape and
+dtype. Empty inputs return an empty output of the same shape.
+
+One 64-lane wave handles each row, keeping two FP32 values per lane during
+seven add/subtract butterfly stages. Their order matches the portable
+reduction tree so the BF16 results agree exactly. The output scale is fixed
+for a compiled kernel; the number of rows is supplied by the launch grid.
+
 ## Sampling
 
 ### Argmax
@@ -706,6 +719,14 @@ weights:
 The row tile is resolved from the gathered row count and expert count unless
 the caller pins it. Ragged M and N edges are masked rather than peeled, so a
 trailing partial tile loads only the rows that exist.
+
+The large-batch router counts expert assignments in groups of at most 256
+experts, using four warps in the counting stage. This reduces LDS atomic
+contention when routing across many experts. Duplicate expert IDs are counted
+separately, and invalid IDs are excluded from every group.
+The subsequent prefix scan processes eight adjacent experts per four-warp
+block, coalescing accesses to the row-major chunk-count buffer. Each expert
+retains an independent scan over chunks; partial expert groups are masked.
 
 ### Causal MLA verification on gfx950
 

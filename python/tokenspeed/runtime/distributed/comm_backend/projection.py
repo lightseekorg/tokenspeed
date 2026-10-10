@@ -365,13 +365,13 @@ class ProjectionBackend:
                 group, min(spec.max_tokens, 128), spec.output_size, spec.device
             )
         channels = spec.input_size if spec.kind == "row" else spec.output_size
-        if size == 4 and channels % 8 == 0:
+        if size in (2, 4, 8) and channels % (2 * size) == 0:
             workspace.a2a = TokenSpeedA2ALamportState(
                 group, min(spec.max_tokens, 512), channels, spec.device, min(128, sms)
             )
-            if channels % 32 == 0:
+            if channels % (8 * size) == 0:
                 workspace.a2a.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
-            if spec.kind == "row" and channels % 512 == 0:
+            if spec.kind == "row" and channels % (128 * size) == 0:
                 workspace.a2a.prepare_fp8_quantization()
 
     def all_gather(

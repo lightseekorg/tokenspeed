@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenspeed-mla"
-version = "0.2.17"
+version = "0.2.20"
 description = "Speed-of-light TokenSpeed MLA kernels."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = { file = "LICENSE" }
 dependencies = [
     "apache-tvm-ffi>=0.1.11,<0.2",
     "nvidia-cutlass-dsl>=4.8.0",
-    "tokenspeed-triton>=3.8.10.post20260920",
+    "tokenspeed-triton>=3.9.10.post20261008",
     "torch",
 ]
 

@@ -125,7 +125,6 @@ def test_trtllm_cutedsl_merged_preparation_and_dispatch(monkeypatch) -> None:
         )
     )
     method.process_weights_after_loading(module)
-    assert method.prepared_linear_plan(module) is not None
     x = torch.randn(32, HIDDEN, device="cuda", dtype=torch.bfloat16)
     output = method.apply(module, x, bias=None, block_scale=None, output_dtype=None)
     reference = x.float() @ _dequant(module.weight, module.weight_scale_inv).T
@@ -135,7 +134,9 @@ def test_trtllm_cutedsl_merged_preparation_and_dispatch(monkeypatch) -> None:
     attention = SimpleNamespace(
         local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
     )
-    parts = KimiLinearKDA._project_qkvfab(attention, x, attnres_partial_args=None)
+    parts = KimiLinearKDA._project_qkvfab(
+        attention, x, ctx=None, attnres_partial_args=None
+    )
     torch.testing.assert_close(
         torch.cat(parts, dim=-1), output[:, : module.used_rows], rtol=0, atol=0
     )
@@ -222,13 +223,6 @@ def test_fp8_merged_incomplete_load_raises() -> None:
         module.verify_fp8_load_complete()
 
 
-def test_fp8_merged_forward_fails_fast() -> None:
-    """The legacy bf16 GEMV forward must not consume FP8 codes silently."""
-    module = _build_fp8_merged(rank=0)
-    with pytest.raises(RuntimeError, match="kimi3_qkvfab_projection"):
-        module(torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device="cuda"))
-
-
 def test_bf16_mode_unchanged() -> None:
     """mxfp4/bf16 checkpoints construct exactly the pre-FP8 module."""
     from tokenspeed.runtime.models.kimi_k3 import KimiKDAMergedProj
@@ -249,11 +243,7 @@ def test_bf16_mode_unchanged() -> None:
     assert module.fp8_block_quant is False
 
 
-def test_qkvfab_fp8_w8a8_matches_dequant_reference_and_pins_flashinfer() -> None:
-    from tokenspeed_kernel.ops.gemm.flashinfer import (
-        has_flashinfer_fp8_blockscale,
-        prepare_flashinfer_fp8_blockscale_weight_scales,
-    )
+def test_qkvfab_fp8_w8a8_matches_dequant_reference() -> None:
     from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_qkvfab_projection
 
     torch.manual_seed(1)
@@ -278,26 +268,6 @@ def test_qkvfab_fp8_w8a8_matches_dequant_reference_and_pins_flashinfer() -> None
         assert rel < 5e-2, f"M={m}: {rel=:.3e}"  # w8a8 activation-quant band
         # Pad rows produce exact zeros.
         assert torch.all(out[:, module.used_rows :] == 0)
-
-    if has_flashinfer_fp8_blockscale is None or not has_flashinfer_fp8_blockscale():
-        pytest.skip("flashinfer blockscale unavailable for the pin check")
-    # The prepacked-scale path pins the flashinfer kernel via override: a
-    # successful call IS the selection assertion (the override raises if the
-    # kernel cannot serve the shape).
-    prepacked = prepare_flashinfer_fp8_blockscale_weight_scales(
-        module.weight_scale_inv.data
-    )
-    x = torch.randn(4, HIDDEN, device="cuda", dtype=torch.bfloat16) * 0.2
-    out_pinned = kimi3_qkvfab_projection(
-        x,
-        module.weight,
-        weight_scale=module.weight_scale_inv,
-        prepacked_scales=prepacked,
-    )
-    torch.cuda.synchronize()
-    ref32 = x.float() @ w_dq.t()
-    rel = ((out_pinned.float() - ref32).abs().amax() / ref32.abs().amax()).item()
-    assert rel < 5e-2, f"pinned flashinfer path: {rel=:.3e}"
 
 
 def _quantize_per_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -357,7 +327,9 @@ def test_per_channel_merged_projection_matches_dequantized_reference(rank) -> No
     attention = SimpleNamespace(
         local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
     )
-    parts = KimiLinearKDA._project_qkvfab(attention, x, attnres_partial_args=None)
+    parts = KimiLinearKDA._project_qkvfab(
+        attention, x, ctx=None, attnres_partial_args=None
+    )
     reference = x.float() @ (codes.float() * scales[:, None]).T
     output = torch.cat(parts, dim=-1).float()
     # Per-token FP8 activation rounding bounds the error.

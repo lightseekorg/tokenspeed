@@ -5,9 +5,23 @@ from __future__ import annotations
 from unittest import mock
 
 import pytest
-import tokenspeed_kernel
 import torch
 from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection as kernel_kimi3_latent_projection,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_latent_projection_add3 as kernel_kimi3_latent_projection_add3,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_mla_qkv_gate_projection as kernel_kimi3_mla_qkv_gate_projection,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_qkvfab_projection as kernel_kimi3_qkvfab_projection,
+)
+from tokenspeed_kernel.ops.gemm import (
+    kimi3_shared_down_projection as kernel_kimi3_shared_down_projection,
+)
 from utils import is_cdna5
 
 if not is_cdna5():
@@ -25,28 +39,28 @@ def test_kimi3_m16_add3_auto_matches_composed_and_captures() -> None:
     lane = torch.randn(16, 10752, device="cuda", dtype=torch.bfloat16)
     shared_output = lane[:, 3584:]
 
-    composed = tokenspeed_kernel.kimi3_latent_projection_add3(
+    composed = kernel_kimi3_latent_projection_add3(
         hidden_states,
         weight,
         prefix,
         shared_output,
         solution="composed",
     )
-    forced = tokenspeed_kernel.kimi3_latent_projection_add3(
+    forced = kernel_kimi3_latent_projection_add3(
         hidden_states,
         weight,
         prefix,
         shared_output,
         solution="gluon_wmma_add3",
     )
-    triton_control = tokenspeed_kernel.kimi3_latent_projection_add3(
+    triton_control = kernel_kimi3_latent_projection_add3(
         hidden_states,
         weight,
         prefix,
         shared_output,
         solution="triton_wmma_add3",
     )
-    automatic = tokenspeed_kernel.kimi3_latent_projection_add3(
+    automatic = kernel_kimi3_latent_projection_add3(
         hidden_states,
         weight,
         prefix,
@@ -60,7 +74,7 @@ def test_kimi3_m16_add3_auto_matches_composed_and_captures() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = tokenspeed_kernel.kimi3_latent_projection_add3(
+        captured = kernel_kimi3_latent_projection_add3(
             hidden_states,
             weight,
             prefix,
@@ -73,7 +87,7 @@ def test_kimi3_m16_add3_auto_matches_composed_and_captures() -> None:
     hidden_states.copy_(torch.randn_like(hidden_states))
     prefix.copy_(torch.randn_like(prefix))
     shared_output.copy_(torch.randn_like(shared_output))
-    mutated_expected = tokenspeed_kernel.kimi3_latent_projection_add3(
+    mutated_expected = kernel_kimi3_latent_projection_add3(
         hidden_states,
         weight,
         prefix,
@@ -91,7 +105,7 @@ def test_kimi3_m16_add3_rejects_non_target_projection() -> None:
     addend = torch.empty(16, 3584, device="cuda", dtype=torch.bfloat16)
 
     with pytest.raises(ValueError, match="3584->7168"):
-        tokenspeed_kernel.kimi3_latent_projection_add3(
+        kernel_kimi3_latent_projection_add3(
             hidden_states,
             weight,
             addend,
@@ -114,13 +128,13 @@ def test_kimi3_mla_qkv_gate_tdm_auto_matches_and_captures(
     weight = torch.randn(3648, 7168, device="cuda", dtype=torch.bfloat16)
     expected = torch.nn.functional.linear(hidden_states, weight)
 
-    forced = tokenspeed_kernel.kimi3_mla_qkv_gate_projection(
+    forced = kernel_kimi3_mla_qkv_gate_projection(
         hidden_states,
         weight,
         2112,
         solution="gluon_wmma_gfx1250",
     )
-    automatic = tokenspeed_kernel.kimi3_mla_qkv_gate_projection(
+    automatic = kernel_kimi3_mla_qkv_gate_projection(
         hidden_states,
         weight,
         2112,
@@ -133,7 +147,7 @@ def test_kimi3_mla_qkv_gate_tdm_auto_matches_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = tokenspeed_kernel.kimi3_mla_qkv_gate_projection(
+        captured = kernel_kimi3_mla_qkv_gate_projection(
             hidden_states,
             weight,
             2112,
@@ -178,7 +192,7 @@ def test_kimi3_gfx1250_large_m_latent_projection_matches_and_captures(
     expected = torch.nn.functional.linear(hidden_states, weight)
     output = torch.empty_like(expected)
 
-    actual = tokenspeed_kernel.kimi3_latent_projection(
+    actual = kernel_kimi3_latent_projection(
         hidden_states,
         weight,
         out=output,
@@ -189,7 +203,7 @@ def test_kimi3_gfx1250_large_m_latent_projection_matches_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = tokenspeed_kernel.kimi3_latent_projection(
+        captured = kernel_kimi3_latent_projection(
             hidden_states,
             weight,
         )
@@ -221,7 +235,7 @@ def test_kimi3_gfx1250_large_m_shared_down_matches(
     expected = torch.nn.functional.linear(hidden_states, weight)
     output = torch.empty_like(expected)
 
-    actual = tokenspeed_kernel.kimi3_shared_down_projection(
+    actual = kernel_kimi3_shared_down_projection(
         hidden_states,
         weight,
         out=output,
@@ -253,7 +267,7 @@ def test_kimi3_gfx1250_large_m_mla_qkv_gate_matches(
     )
     expected = torch.nn.functional.linear(hidden_states, weight)
 
-    projection = tokenspeed_kernel.kimi3_mla_qkv_gate_projection(
+    projection = kernel_kimi3_mla_qkv_gate_projection(
         hidden_states,
         weight,
         2112,
@@ -362,12 +376,12 @@ def test_kimi3_kda_qkvfab_tdm_auto_matches_and_captures(
     expected = torch.nn.functional.linear(hidden_states, weight)
     output = torch.empty_like(expected)
 
-    forced = tokenspeed_kernel.kimi3_qkvfab_projection(
+    forced = kernel_kimi3_qkvfab_projection(
         hidden_states,
         weight,
         solution="gluon_wmma_gfx1250",
     )
-    automatic = tokenspeed_kernel.kimi3_qkvfab_projection(
+    automatic = kernel_kimi3_qkvfab_projection(
         hidden_states,
         weight,
         out=output,
@@ -379,7 +393,7 @@ def test_kimi3_kda_qkvfab_tdm_auto_matches_and_captures(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = tokenspeed_kernel.kimi3_qkvfab_projection(
+        captured = kernel_kimi3_qkvfab_projection(
             hidden_states,
             weight,
         )
@@ -421,7 +435,7 @@ def test_kimi3_gfx1250_large_m_qkvfab_matches(
     )
     expected = torch.nn.functional.linear(hidden_states, weight)
 
-    actual = tokenspeed_kernel.kimi3_qkvfab_projection(
+    actual = kernel_kimi3_qkvfab_projection(
         hidden_states,
         weight,
     )
@@ -475,7 +489,7 @@ def test_kimi3_shared_down_strided_output_contract(
         "gluon_wmma_tdm_dense_gfx1250",
         wraps=dense_module.gluon_wmma_tdm_dense_gfx1250,
     ) as wmma:
-        actual = tokenspeed_kernel.kimi3_shared_down_projection(
+        actual = kernel_kimi3_shared_down_projection(
             hidden_states, weight, out=out, solution=solution
         )
         assert wmma.called == (dtype == torch.bfloat16 and solution == "auto")
@@ -483,7 +497,7 @@ def test_kimi3_shared_down_strided_output_contract(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     assert torch.all(lane[:, :32] == -7)
     with pytest.raises(ValueError, match="unknown"):
-        tokenspeed_kernel.kimi3_shared_down_projection(
+        kernel_kimi3_shared_down_projection(
             hidden_states, weight, out=out, solution="invalid"
         )
 
@@ -506,7 +520,7 @@ def test_kimi3_shared_down_strided_inputs_use_torch(noncontiguous) -> None:
     )
     torch.mm(hidden_states, weight.T, out=expected)
     with mock.patch.object(dense_module, "gluon_wmma_tdm_dense_gfx1250") as wmma:
-        actual = tokenspeed_kernel.kimi3_shared_down_projection(
+        actual = kernel_kimi3_shared_down_projection(
             hidden_states, weight, out=out, solution="auto"
         )
         wmma.assert_not_called()
