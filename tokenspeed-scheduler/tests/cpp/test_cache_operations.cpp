@@ -759,6 +759,42 @@ TEST(CacheOperationTest, APrefetchThatLandsNothingPublishesNothing) {
     EXPECT_FALSE(coordinator.AcquireDeviceCachedBlock(key)) << "nothing reaches the Device index";
 }
 
+TEST(CacheOperationTest, AMalformedPrefetchAckIsIgnoredAndTheOpStaysInFlight) {
+    BlockPool device_pool{4, {1}};
+    BlockPool host_pool{4, {1}};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true);
+    const CacheKey h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey h1{.group_id = 0, .content_hash = "h1"};
+    coordinator.RegisterStorageKeys(std::array{h0, h1});
+    auto plan =
+        coordinator.PlanPrefetch(coordinator.ProbePrefix(std::array<std::string, 2>{"h0", "h1"}), /*min_pages=*/1);
+    ASSERT_TRUE(plan);
+    TierTransferManager transfers(coordinator);
+    PrefetchOperation op = transfers.StartPrefetch("r1", std::move(*plan));
+    ASSERT_EQ(op.num_pages, 2);
+
+    // Out of range either way: nothing is published, nothing is released,
+    // and the op is still waiting for a well-formed ACK.
+    EXPECT_FALSE(transfers.CompletePrefetch(op.op_id, /*landed_pages=*/3));
+    EXPECT_FALSE(transfers.CompletePrefetch(op.op_id, /*landed_pages=*/-1));
+    EXPECT_TRUE(transfers.HasAnyInFlight());
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 2) << "the op's blocks are still pinned";
+
+    auto done = transfers.CompletePrefetch(op.op_id, /*landed_pages=*/2);
+    ASSERT_TRUE(done);
+    EXPECT_EQ(done->published.size(), 2u);
+    EXPECT_FALSE(transfers.HasAnyInFlight());
+}
+
 TEST(CacheOperationTest, ALandedPrefetchPublishesHostEntriesTheAdmissionThenLoads) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};

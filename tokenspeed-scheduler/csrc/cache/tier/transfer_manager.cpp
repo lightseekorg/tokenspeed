@@ -25,6 +25,8 @@
 #include <unordered_set>
 #include <utility>
 
+#include <spdlog/spdlog.h>
+
 #include "utils.h"
 
 namespace tokenspeed {
@@ -163,10 +165,16 @@ std::optional<TierTransferManager::PrefetchCompleted> TierTransferManager::Compl
     if (it == prefetches_.end()) {
         return std::nullopt;
     }
+    if (landed_pages < 0 || landed_pages > static_cast<std::int32_t>(it->second.page_row_ends.size())) {
+        // A malformed ACK is the runtime's bug, not a reason to publish pages
+        // that may not have landed or to drop pins a copy may still need: the
+        // op stays in flight, untouched, until a well-formed ACK arrives.
+        spdlog::error("[TierTransferManager] prefetch op {} acknowledged with landed_pages={} outside [0, {}]; ignored",
+                      op_id, landed_pages, it->second.page_row_ends.size());
+        return std::nullopt;
+    }
     InFlightPrefetch prefetch = std::move(it->second);
     prefetches_.erase(it);
-    _assert(landed_pages >= 0 && landed_pages <= static_cast<std::int32_t>(prefetch.page_row_ends.size()),
-            "a prefetch lands a prefix of the pages it was asked for");
     const std::size_t landed_rows =
         landed_pages == 0 ? 0 : prefetch.page_row_ends[static_cast<std::size_t>(landed_pages) - 1];
     PrefetchCompleted completed{.request_id = std::move(prefetch.request_id)};

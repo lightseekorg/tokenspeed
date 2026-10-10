@@ -64,8 +64,10 @@ public:
         std::vector<CacheKey> unlanded;
     };
     // Publishes the first landed_pages prefix pages' rows as Host entries and
-    // drops the op; nullopt for an unknown or duplicate op id. Publication
-    // happens whether or not the request still exists: the bytes landed.
+    // drops the op; nullopt for an unknown or duplicate op id, and for a
+    // landed_pages outside [0, pages] (logged; the op then stays in flight
+    // untouched). Publication happens whether or not the request still
+    // exists: the bytes landed.
     std::optional<PrefetchCompleted> CompletePrefetch(std::uint32_t op_id, std::int32_t landed_pages);
 
     // A retraction image and the two store ops that fill it. The L2 leg is a
