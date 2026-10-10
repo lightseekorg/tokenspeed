@@ -90,6 +90,7 @@ def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
     monkeypatch.setattr(flashinfer_module, "gather_and_expand_scalars", fake_gather)
     backend = FlashInferSamplingBackend(
         SamplingBackendConfig(
+            synthetic_acceptance_length=None,
             enable_speculative_sampling=False,
             sampling_stream="per-request",
             logprob_order="megatron",

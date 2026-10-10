@@ -146,6 +146,7 @@ def _seed_coins(backend, *, bs: int, n: int, seed: int):
 
 def _build_backend(*, max_bs: int, max_n: int, vocab: int, device, group):
     cfg = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",

@@ -52,6 +52,7 @@ MAX_BS = 4
 
 def _config(sampling_stream: str, device: str) -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream=sampling_stream,
         logprob_order="torch",
