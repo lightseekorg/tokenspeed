@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from utils import assert_no_triton_compile
 
 pytest.importorskip("tokenspeed_triton")
 pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
@@ -129,3 +130,143 @@ def test_fused_selected_attention_matches_gather_softmax(heads, with_global):
     )
     torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
     assert torch.count_nonzero(out[[1, 4]]).item() == 0
+
+
+def _arena_cache(rows, fmt, page_pad):
+    """Page-planar cache view with an arena-style padded page stride."""
+    width = {"swa": 528, "global": 288}[fmt]
+    pages = (rows.shape[0] + 63) // 64
+    stride = 64 * width + page_pad
+    raw = torch.zeros(pages * stride, dtype=torch.uint8, device=rows.device)
+    cache = raw.as_strided((pages, 64, width), (stride, width, 1))
+    dsv41.cache_scatter(
+        rows, cache, torch.arange(rows.shape[0], device=rows.device), fmt
+    )
+    return cache
+
+
+def _gather_softmax(q, sink, segments):
+    parts, masks = [], []
+    for cache, slots, lens, fmt in segments:
+        parts.append(dsv41.cache_gather(cache, slots, fmt, None).float())
+        masks.append(
+            (torch.arange(slots.shape[1], device=q.device) < lens[:, None])
+            & (slots >= 0)
+            & (slots < cache.shape[0] * 64)
+        )
+    kv, valid = torch.cat(parts, dim=1), torch.cat(masks, dim=1)
+    logits = torch.bmm(q.float(), kv.transpose(1, 2)) * 512**-0.5
+    logits.masked_fill_(~valid[:, None], -torch.inf)
+    sinks = sink[None, :, None].expand(q.shape[0], -1, 1)
+    probs = torch.cat((logits, sinks), dim=-1).softmax(dim=-1)[..., :-1]
+    return torch.bmm(probs, kv)
+
+
+def _decode_inputs(tokens, device, seed):
+    """Decode-shaped selections: 128 SWA and 512 global slots per query row."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    swa = _arena_cache(
+        torch.randn((256, 512), generator=generator).bfloat16().to(device),
+        "swa",
+        512,
+    )
+    glob = _arena_cache(
+        torch.randn((1024, 512), generator=generator).bfloat16().to(device),
+        "global",
+        256,
+    )
+    swa_slots = torch.randint(-2, 256, (tokens, 128), generator=generator)
+    global_slots = torch.randint(-1, 1100, (tokens, 512), generator=generator)
+    swa_lens = torch.randint(0, 129, (tokens,), generator=generator)
+    global_lens = torch.randint(0, 513, (tokens,), generator=generator)
+    swa_lens[:2] = 128
+    global_lens[:2] = 512
+    return [
+        (swa, swa_slots.to(device), swa_lens.int().to(device), "swa"),
+        (glob, global_slots.to(device), global_lens.int().to(device), "global"),
+    ]
+
+
+def _padded_query(tokens, real_heads, heads, device, seed):
+    """rope_pad_query-style queries: zero padded heads with -inf sinks."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    q = torch.zeros((tokens, heads, 512), dtype=torch.bfloat16)
+    q[:, :real_heads] = torch.randn((tokens, real_heads, 512), generator=generator)
+    sink = torch.full((heads,), -torch.inf)
+    sink[:real_heads] = torch.linspace(-3, 3, real_heads)
+    return q.to(device), sink.to(device)
+
+
+@pytest.mark.parametrize("tokens", [6, 192])
+@pytest.mark.parametrize("real_heads", [16, 64])
+def test_fused_selected_attention_decode_shapes(tokens, real_heads):
+    """Split (6 rows) and single-workgroup (192 rows) paths at decode widths.
+
+    Padded zero-query heads take the row-sum shortcut and must still match the
+    softmax over their (all-zero) scores.
+    """
+    platform = current_platform()
+    if not (platform.is_cdna4 or platform.is_cdna5):
+        pytest.skip("AMD fused selected attention")
+    device = torch.device("cuda:0")
+    segments = _decode_inputs(tokens, device, 7)
+    q, sink = _padded_query(tokens, real_heads, 64, device, 11)
+    expected = _gather_softmax(q, sink, segments).bfloat16()
+    (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
+    out = dsv41.selected_attention(
+        q,
+        swa,
+        swa_slots,
+        swa_lens,
+        glob,
+        global_slots,
+        global_lens,
+        sink,
+        512**-0.5,
+        None,
+        256,
+        None,
+        None,
+        None,
+    )
+    torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
+
+
+def test_fused_selected_attention_gfx950_no_recompile_across_rows():
+    """Row count changes the grid and split count, never a compile key."""
+    if not current_platform().is_cdna4:
+        pytest.skip("gfx950 kernel")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+
+    device = torch.device("cuda:0")
+    segments = _decode_inputs(192, device, 3)
+    (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
+    q, sink = _padded_query(192, 16, 64, device, 5)
+
+    def run(tokens):
+        selected.launch_gluon_dsv41_selected_attention_gfx950(
+            q[:tokens],
+            swa,
+            swa_slots[:tokens],
+            swa_lens[:tokens],
+            glob,
+            global_slots[:tokens],
+            global_lens[:tokens],
+            sink,
+            512**-0.5,
+            None,
+            256,
+            None,
+            None,
+            None,
+        )
+
+    for tokens in (1, 192):
+        run(tokens)
+    with assert_no_triton_compile(
+        selected.gluon_dsv41_selected_attention_gfx950,
+        selected.gluon_dsv41_selected_attention_reduce_gfx950,
+    ):
+        for tokens in (2, 5, 33, 96, 150, 191):
+            run(tokens)
+    torch.cuda.synchronize()

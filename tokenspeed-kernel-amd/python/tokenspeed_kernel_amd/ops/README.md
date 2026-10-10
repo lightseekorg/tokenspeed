@@ -317,6 +317,46 @@ storage before scoring. Missing or out-of-range cache pages never contribute
 rows or blocks, including the newest visible block. A valid newest block
 remains eligible regardless of its score.
 
+### gfx950 DeepSeek V4.1 selected attention
+
+`gluon_dsv41_selected_attention_gfx950` reads the page-planar SWA
+(E4M3 values, E8M0 per 32) and global (E2M1 values, E4M3 per 16) caches
+directly and runs one online softmax over both segments with a single sink.
+Dense-workspace prefill calls are forwarded to `dsv4_prefill`.
+
+#### Contract
+
+- BF16 queries `(tokens, heads, 512)`, any head count; FP32 sinks. Caches are
+  uint8 `[pages, 64, 528]` / `[pages, 64, 288]` views with contiguous page
+  bytes and 16-byte aligned page strides (arena padding allowed).
+- Slots and lengths follow `dsv41.selected_attention`: holes, out-of-range
+  slots and positions past the length are skipped; empty selections write 0.
+- Grid, split count and workspace depend only on tensor shapes; nothing reads
+  device lengths on the host, and the token count is never a compile key.
+
+#### Algorithm
+
+A four-wave workgroup owns one query row, up to 64 heads and a contiguous share
+of the row's 64-row tiles (SWA tiles, then global tiles). Each wave loads 16
+contiguous bytes of a row per lane, dequantizes with the CDNA4 scaled
+conversions (`v_cvt_scalef32_pk_bf16_fp8`; E2M1 via
+`v_cvt_scalef32_pk_f32_fp4` times the exact FP32 E4M3 scale) into BF16 pairs
+in LDS, and the waves split the tile's rows for QK and the head dims for PV
+(16x16x32 BF16 MFMA). Slots are prefetched two tiles ahead and rows one tile
+ahead.
+
+The decode layout pads queries to 64/128 heads with zero rows. A 16-head
+group whose query is all zero scores exactly zero, so its output is
+`row_sum(V) * e^-m / (count * e^-m + e^(sink - m))` with `m = max(sink, 0)`:
+such groups skip the score and PV passes, and one all-ones MFMA per tile
+accumulates the V row sum for all of them.
+
+The main kernel runs one workgroup per CU (VGPR-bound). While
+`tokens * head_blocks` is below 256, rows are split over up to eight
+workgroups that store FP32 `(max, sum, P @ V)` partials (zero-query groups store
+the row sum and count). `gluon_dsv41_selected_attention_reduce_gfx950` merges
+them in a fixed order and adds the sink once.
+
 ### gfx1250 MLA decode
 
 `gluon_mla_decode_gfx1250` computes absorbed MLA decode over a paged cache,
