@@ -244,6 +244,7 @@ def gluon_dsv41_index_topk_gfx950(
     BLOCK_N: gl.constexpr,
     CHUNK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    LISTED: gl.constexpr,
 ):
     token = gl.program_id(0)
     split = gl.program_id(1)
@@ -258,6 +259,18 @@ def gluon_dsv41_index_topk_gfx950(
     candidate_start = split * SCORE_CHUNK
     candidate_end = gl.minimum(width, candidate_start + SCORE_CHUNK)
     candidate_end = gl.minimum(candidate_end, max_candidates)
+    if CANDIDATES >= 0:
+        # Padded candidate lists are mostly -1 at short contexts: a split
+        # with no listed block scores nothing.
+        list_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+        slots = candidate_start // 8 + gl.arange(0, LISTED, layout=list_layout)
+        listed = gl.load(
+            candidates + token * cand_stride + slots,
+            mask=slots < candidate_end // 8,
+            other=-1,
+        )
+        if gl.max(listed, axis=0) < 0:
+            candidate_end = candidate_start
     # Every logits element of this split's chunk is written: scores where
     # live, -inf elsewhere, so callers need not pre-fill the logits.
     chunk_end = gl.minimum(candidate_start + SCORE_CHUNK, max_candidates)
@@ -445,6 +458,7 @@ def dsv41_index_logits_gfx950(
         BLOCK_N=32,
         CHUNK_N=chunk_n,
         NUM_WARPS=2,
+        LISTED=triton.next_power_of_2(score_chunk_size // 8),
         num_warps=2,
         waves_per_eu=2,
     )
