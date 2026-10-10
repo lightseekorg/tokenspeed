@@ -179,7 +179,8 @@ work directory. Lazy compilation during a request can then write its cache even
 when the runner's shared `/cache/triton` volume is full. The directory survives
 the task's server restarts, and the same job cleanup removes it. Compiler
 options and test workloads are unchanged. Performance jobs retain the runner's
-Triton cache policy so cold compilation stays out of measured requests.
+Triton cache policy so cold compilation is not newly introduced into measured
+requests.
 
 The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
 tokenizer under

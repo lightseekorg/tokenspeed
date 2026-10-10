@@ -100,9 +100,9 @@ Tuning:
   raises an error.
 - InstantTensor supports only `*.safetensors` checkpoints (same shard selection
   as `--load-format safetensors`).
-- InstantTensor rejects checkpoints declaring a sub-byte safetensors dtype
-  (`F4`, `F6_E2M3`, `F6_E3M2`) up front, because it reads them at twice their
-  true length without raising. This does not affect NVFP4 or MXFP4 checkpoints,
+- TokenSpeed rejects checkpoints declaring a sub-byte safetensors dtype
+  (`F4`, `F6_E2M3`, `F6_E3M2`) up front, because InstantTensor reads them at
+  twice their true length without raising. This does not affect NVFP4 or MXFP4 checkpoints,
   which store their packed 4-bit values as byte-aligned `U8`.
 
 For benchmarks and implementation details, see the

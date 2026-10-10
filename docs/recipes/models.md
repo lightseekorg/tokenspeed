@@ -546,7 +546,7 @@ and 4 and was validated with a 16,384-token KV pool. Increase
 together when scaling the deployment. `--disable-autotune` shortens bring-up.
 Remove it after validation when you want startup tuning.
 
-TokenSpeed validates the current Ascend sampling path with greedy decoding.
+The current Ascend sampling path is validated with greedy decoding.
 Because `--sampling-backend greedy` always performs argmax, send
 `temperature=0` and do not expect request-level `top_p` or `top_k` to take
 effect.

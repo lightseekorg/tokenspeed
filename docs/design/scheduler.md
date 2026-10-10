@@ -11,8 +11,9 @@ prefix granularity, cache groups, LCM blocks).
 
 ## 1. Admission is per chunk
 
-The scheduler prefills a prompt in chunks bounded by `max_scheduled_tokens`
-(`--chunked-prefill-size`). It admits capacity **for the chunk being
+The scheduler schedules a prompt's prefill in chunks bounded by
+`max_scheduled_tokens` (`--chunked-prefill-size`). It admits capacity **for
+the chunk being
 scheduled, never for the whole prompt**: `schedulePrefill` /
 `schedulePrefillFirstChunk` build one `GroupDemand` per cache group sized by
 this chunk's tokens, and the coordinator either grants the pages or the

@@ -121,8 +121,9 @@ A suite declares:
 - per-case relative regression, absolute regression, and noise limits.
 
 A case may set `measurement_blocks` when its noise profile requires more samples
-than the suite default. The suite's single benchmark harness receives the
-effective value for each case and records it with that case's result.
+than the suite default. The suite runner records the effective value with that
+case's result; the suite's single benchmark harness receives that value for
+each case.
 
 The optional `case_files` list composes model-and-operation case files into the
 hardware suite. Case IDs remain unique across the composed suite.

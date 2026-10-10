@@ -184,7 +184,8 @@ mode. The encode loop marks it after its ready message. From then on the
 monitor logs every Triton compilation with its duration and cause and reports
 by name any compile-time kernel parameter that keeps taking new values from
 one call site -- a per-batch value passed as `tl.constexpr`; the per-round
-metrics call exports them as `tokenspeed:jit_serving_compiles` /
+metrics call exports the compilation counts and durations as
+`tokenspeed:jit_serving_compiles` /
 `tokenspeed:jit_serving_compile_seconds`. `TOKENSPEED_JIT_COMPILE_CHECK=error`
 raises there instead, and CI serving jobs run with it.
 The same mark closes the kernel package's compile switch

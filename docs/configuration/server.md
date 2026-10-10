@@ -189,7 +189,7 @@ into one response is the router's job -- an SGLang `mini_lb`-style router or
 the Dynamo compatibility frontend joins the prefill node's prompt logprobs
 with the decode node's output, just as it does for SGLang. The direct msgpack
 scheduler drive (SMG) carries sampled-token logprobs only: it refuses a
-`logprob_start_len` that produces prompt logprobs rather than compute
+`logprob_start_len` that would produce prompt logprobs rather than compute
 and drop them.
 
 `top_logprobs_num > 0` and `token_ids_logprob` are not supported yet.

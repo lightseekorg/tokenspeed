@@ -13,14 +13,14 @@ The future of AI should be transparent, collaborative, and inclusive. LightSeek 
 
 ## External contributions
 
-Especially welcome:
+These contributions are especially welcome:
 
 - obvious bug fixes
 - small and verifiable production-needed features
 - performance optimizations that fit the existing codebase style and do not introduce unnecessary complexity
 - documentation, tooling, and benchmarking improvements
 
-For larger features or architectural changes, start with an RFC or design discussion before implementation.
+For larger features or architectural changes, consider starting with an RFC or design discussion before implementation.
 
 ## Engineering principles
 
