@@ -77,6 +77,35 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_glm53_flash import (  #
     HybridGlm53FlashTokenToKVPool,
     _KPoolTailWorkspace,
 )
+from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
+    SamplingBackend,
+    SamplingBackendConfig,
+)
+from tokenspeed.runtime.sampling.backends.flashinfer import (  # noqa: E402
+    FlashInferSamplingBackend,
+)
+from tokenspeed.runtime.sampling.backends.flashinfer_full import (  # noqa: E402
+    FlashInferFullSamplingBackend,
+)
+from tokenspeed.runtime.sampling.backends.greedy import (  # noqa: E402
+    GreedySamplingBackend,
+)
+from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
+    TritonSamplingBackend,
+)
+from tokenspeed.runtime.sampling.backends.triton_full import (  # noqa: E402
+    TritonFullSamplingBackend,
+)
+from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
+from tokenspeed.runtime.sampling.utils import coin_eps  # noqa: E402
+
+SAMPLING_BACKENDS = (
+    GreedySamplingBackend,
+    FlashInferSamplingBackend,
+    FlashInferFullSamplingBackend,
+    TritonSamplingBackend,
+    TritonFullSamplingBackend,
+)
 
 # One request-pool geometry for every owner: max_bs decode rows, one sink row
 # (max_req_pool_size = max_bs + 1) and the graph-padding row past it.
@@ -229,6 +258,43 @@ def _dsa(pool, *, is_draft: bool) -> DSABackend:
     return backend
 
 
+def _sampling_backend(cls) -> SamplingBackend:
+    """A sampling backend over the test pool geometry, on the CPU."""
+    config = SamplingBackendConfig(
+        enable_speculative_sampling=cls is not GreedySamplingBackend,
+        sampling_stream="batch",
+        logprob_order="torch",
+        max_bs=MAX_BS,
+        max_draft_tokens_per_req=SPEC_TOKENS,
+        max_req_pool_size=MAX_REQ_POOL_SIZE,
+        vocab_size=VOCAB,
+        device="cpu",
+    )
+    # The Triton backends size a scratch buffer by the SM count.
+    with patch.object(
+        torch.cuda,
+        "get_device_properties",
+        return_value=SimpleNamespace(multi_processor_count=4),
+    ):
+        return cls(config)
+
+
+def _sampling_params(rid: str, **overrides) -> SamplingParams:
+    params = SamplingParams(
+        temperature=0.7,
+        top_k=5,
+        top_p=0.9,
+        min_p=0.1,
+        frequency_penalty=0.5,
+        presence_penalty=0.25,
+        repetition_penalty=1.5,
+        **overrides,
+    )
+    params.resolve_seed(rid)
+    params.normalize(None)
+    return params
+
+
 def _randomize(rows: list[torch.Tensor]) -> None:
     for row in rows:
         if row.dtype == torch.bool:
@@ -350,6 +416,75 @@ def test_dsa_kpool_tail_round_trip_once_per_arena():
     _round_trip(target, src_slot=2, dst_slot=5)
 
 
+@pytest.mark.parametrize("cls", SAMPLING_BACKENDS, ids=lambda cls: cls.__name__)
+def test_sampling_backend_round_trip_continues_where_the_victim_stopped(cls):
+    """A restored request samples as the unretracted run would: its scalars,
+    penalty history, bias and coin generator land in the new slot, and the
+    next prepare_step sees no rid flip there -- so nothing is re-initialised."""
+    backend = _sampling_backend(cls)
+    victim, params = "req-victim", _sampling_params("req-victim")
+    params.logit_bias = {"3": 2.0, "7": -1.5}
+    src_slot, dst_slot = 4, 8
+    # The victim's steps so far: scattered scalars (and a generator) on its
+    # first step, then some accumulated history.
+    backend.prepare_step([victim], [src_slot], [params], num_tokens_per_req=2)
+    rows = backend.slot_state_rows(src_slot)
+    for row in rows:
+        if row.ndim == 1 and row.dtype == torch.int32:  # the penalty counts
+            row[::3] = 2
+    expected = [row.clone() for row in rows]
+    # The victim's own generator stays where its last step left it: it is
+    # the oracle for what an unretracted next step would have drawn.
+    generator = (
+        backend._cpu_generator_per_slot[src_slot]
+        if isinstance(backend, FlashInferSamplingBackend)
+        else None
+    )
+
+    assert backend.slot_state_bytes() % SLOT_STATE_ALIGNMENT == 0
+    image = torch.full((backend.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
+    backend.export_slot_state(src_slot, image, None)
+    for row in rows:
+        row.zero_()
+    backend.import_slot_state(dst_slot, image, None, request_id=victim)
+    assert all(
+        torch.equal(a, b) for a, b in zip(backend.slot_state_rows(dst_slot), expected)
+    )
+
+    # The restored slot is the victim's: the next step must not reset it.
+    with patch.object(
+        type(backend), "_reset_slot", side_effect=AssertionError("slot was reset")
+    ):
+        backend.prepare_step([victim], [dst_slot], [params], num_tokens_per_req=2)
+    if cls is GreedySamplingBackend:
+        assert backend.slot_state_bytes() == 0
+        return
+    assert backend._last_rid_per_slot[dst_slot] == victim
+    assert all(
+        torch.equal(a, b) for a, b in zip(backend.slot_state_rows(dst_slot), expected)
+    )
+    if generator is not None:
+        # The coin stream continues from the victim's last step: the step
+        # above refilled the restored slot's coins (n = 2, plus the final
+        # coin) from the restored generator, and they are exactly what the
+        # unretracted generator draws next.
+        assert backend._cpu_generator_per_slot[dst_slot] is not generator
+        lo = coin_eps(torch.float32)
+        unretracted_coins = torch.empty((1, 2), dtype=torch.float32)
+        unretracted_coins[0, :2].uniform_(lo, 1.0, generator=generator)
+        unretracted_final = torch.empty((1,), dtype=torch.float32)
+        unretracted_final[0].uniform_(lo, 1.0, generator=generator)
+        assert torch.equal(backend._coins_buf[0, :2], unretracted_coins[0])
+        assert torch.equal(backend._final_coins_buf[0], unretracted_final[0])
+
+
+def test_sampling_backend_refuses_to_image_a_slot_never_prepared():
+    backend = _sampling_backend(FlashInferSamplingBackend)
+    image = torch.zeros(backend.slot_state_bytes(), dtype=torch.uint8)
+    with pytest.raises(RuntimeError, match="no per-request coin generator"):
+        backend.export_slot_state(5, image, None)
+
+
 def test_a_leaf_without_slot_state_images_nothing():
     leaf = _Leaf()
     assert leaf.slot_state_bytes() == 0
@@ -366,6 +501,7 @@ def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
     executor.attn_backend = _inkling()
     leaf = executor.attn_backend.child_backends()[0]
     executor.drafter = _mtp(states)
+    executor.sampling_backend = _sampling_backend(FlashInferFullSamplingBackend)
     # A shared draft tree is listed once; a distinct one adds its own nodes.
     executor.draft_attn_backend = executor.attn_backend
     assert executor.slot_state_exporters() == (
@@ -373,6 +509,7 @@ def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
         executor.attn_backend,
         leaf,
         executor.drafter,
+        executor.sampling_backend,
     )
     executor.draft_attn_backend = _inkling()
     exporters = executor.slot_state_exporters()
@@ -383,7 +520,10 @@ def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
         executor.draft_attn_backend,
         executor.draft_attn_backend.child_backends()[0],
         executor.drafter,
+        executor.sampling_backend,
     )
+    # Slot 2 of the sampling backend must have been prepared to be imaged.
+    executor.sampling_backend.prepare_step(["r2"], [2], [_sampling_params("r2")])
 
     # The layout measures every owner once at construction and only slices
     # afterwards: no owner is asked its size again on export or import.
@@ -449,17 +589,19 @@ def _storage_ids(rows) -> set[int]:
 
 def _assert_slot_state_complete(owner, *, exporter, slot_domains: set[int]) -> None:
     exported = _storage_ids(exporter.slot_state_rows(0))
-    token_derived = set(getattr(type(owner), "token_derived_slot_state", ()))
+    declared = set(getattr(type(owner), "token_derived_slot_state", ())) | set(
+        getattr(type(owner), "constant_slot_state", ())
+    )
     uncovered = sorted(
         name
         for name, tensor in _per_slot_tensors(owner, slot_domains).items()
-        if tensor.untyped_storage().data_ptr() not in exported
-        and name not in token_derived
+        if tensor.untyped_storage().data_ptr() not in exported and name not in declared
     )
     assert not uncovered, (
         f"{type(owner).__name__} keeps per-slot state with no exporter: {uncovered}. "
-        "List it in slot_state_rows (restored byte for byte) or in "
-        "token_derived_slot_state (reseeded from the request's tokens)."
+        "List it in slot_state_rows (restored byte for byte), in "
+        "token_derived_slot_state (reseeded from the request's tokens) or in "
+        "constant_slot_state (identical for every slot)."
     )
 
 
@@ -492,8 +634,36 @@ def test_backend_slot_state_is_complete():
     _assert_slot_state_complete(pool, exporter=target, slot_domains={POOL_ROWS})
 
 
+@pytest.mark.parametrize("cls", SAMPLING_BACKENDS, ids=lambda cls: cls.__name__)
+def test_sampling_backend_slot_state_is_complete(cls):
+    backend = _sampling_backend(cls)
+    _assert_slot_state_complete(backend, exporter=backend, slot_domains={POOL_ROWS})
+    # The declared constant pools exist, are per-slot, and really are constant.
+    per_slot = _per_slot_tensors(backend, {POOL_ROWS})
+    for name in SamplingBackend.constant_slot_state:
+        assert name in per_slot
+        assert per_slot[name].abs().sum() == 0
+    # Every per-slot thing the rid-flip reset writes is in the image.
+    if cls is not GreedySamplingBackend:
+        exported = _storage_ids(backend.slot_state_rows(0))
+        written = []
+        for name, tensor in per_slot.items():
+            if name in SamplingBackend.constant_slot_state:
+                continue
+            tensor.fill_(0)
+            backend._reset_slot(2, _sampling_params("r2"))
+            if tensor[2].abs().sum() != 0:
+                written.append(name)
+            assert tensor.untyped_storage().data_ptr() in exported, name
+        assert "_temperature_pool" in written and "_seed_pool" in written
+
+
 def test_completeness_check_catches_an_unexported_buffer():
     states = _runtime_states(draft_probs=False, trees=False, history=False)
     states.rogue_per_slot = torch.zeros(POOL_ROWS, dtype=torch.int32)
     with pytest.raises(AssertionError, match="rogue_per_slot"):
         _assert_slot_state_complete(states, exporter=states, slot_domains={POOL_ROWS})
+    backend = _sampling_backend(TritonFullSamplingBackend)
+    backend._rogue_pool = torch.zeros(POOL_ROWS, VOCAB, dtype=torch.int32)
+    with pytest.raises(AssertionError, match="_rogue_pool"):
+        _assert_slot_state_complete(backend, exporter=backend, slot_domains={POOL_ROWS})

@@ -473,12 +473,17 @@ cache group must travel with the pages or the continuation is not exact: the
 next step's inputs and the verifier's recorded draft distributions
 (`RuntimeStates`), the MTP stash, DSpark's context windows, Eagle's draft
 history frontier, the Inkling conv ring and its pending-hydration bit, the
-DSA KPool tail. Each owner implements `SlotStateExporter`
-(`execution/slot_state.py`) by listing its per-slot rows once
-(`slot_state_rows`); the export, the import and the size derive from that
-list. Every node of an attention tree is its own exporter
+DSA KPool tail, and the sampling backend's per-request state (the sampling
+scalars, the penalty token counts and logit bias of the `*_full` backends,
+the FlashInfer backends' per-slot coin generator) — everything its rid-flip
+reset would otherwise re-initialise, so the import claims the new slot for
+the request and penalties and seeded sampling continue exactly. Each owner
+implements `SlotStateExporter` (`execution/slot_state.py`) by listing its
+per-slot rows once (`slot_state_rows`); the export, the import and the size
+derive from that list. Every node of an attention tree is its own exporter
 (`slot_state_exporters` flattens the tree), and `ModelExecutor` lists
-`RuntimeStates`, the attention nodes and the drafter in blob order. The Host
+`RuntimeStates`, the attention nodes, the drafter and the sampling backend
+in blob order. The Host
 cache executor measures them **once**, at construction (`SlotStateLayout`:
 sizes are fixed for its lifetime), so a store or restore only slices the
 arena row at the recorded offsets and never re-measures an owner on the

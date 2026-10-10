@@ -296,6 +296,16 @@ class TritonSamplingBackend(SamplingBackend):
         self._top_p_pool[pool_idx].fill_(float(sp.top_p))
         self._seed_pool[pool_idx].fill_(int(sp.seed))
 
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # The Gumbel-max streams are keyed by (seed, cache length) on the
+        # Device, so the scalars are the whole per-slot state here.
+        return [
+            self._temperature_pool[slot],
+            self._top_k_pool[slot],
+            self._top_p_pool[slot],
+            self._seed_pool[slot],
+        ]
+
     def prepare_step(
         self,
         request_ids: list[str],

@@ -1807,8 +1807,10 @@ class ModelExecutor:
 
         The runtime states, every node of the target attention tree, the
         nodes of the draft tree not already listed (a draft Inkling wrapper
-        owns its own ring; a shared node is listed once) and the drafter.
-        The Host cache executor lays these out once (``SlotStateLayout``):
+        owns its own ring; a shared node is listed once), the drafter and the
+        sampling backend (its per-request scalars, penalty history and coin
+        generator). The Host cache executor lays these out once
+        (``SlotStateLayout``):
         each contributes a fixed-size segment, exported on a retraction
         store from the exporters' tensors on ``execution_stream`` (the caller
         orders the transfer stream behind it) and imported on a restore
@@ -1826,6 +1828,7 @@ class ModelExecutor:
             )
         if self.drafter is not None:
             exporters.append(self.drafter)
+        exporters.append(self.sampling_backend)
         return tuple(exporters)
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):

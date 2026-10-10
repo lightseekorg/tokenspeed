@@ -223,6 +223,19 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
     def reset_capture_state(self) -> None:
         self._counts[0].fill_(0)
 
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # The penalty history and bias beside the parent's scalars: a restored
+        # request's penalties continue from the tokens it had produced.
+        return [
+            *super().slot_state_rows(slot),
+            self._counts[slot],
+            self._logit_bias[slot],
+            self._min_p_pool[slot],
+            self._freq_pen_pool[slot],
+            self._pres_pen_pool[slot],
+            self._rep_pen_pool[slot],
+        ]
+
     @nvtx_range("sampling:penalties", color="yellow")
     def _apply_penalties_and_bias(
         self,
