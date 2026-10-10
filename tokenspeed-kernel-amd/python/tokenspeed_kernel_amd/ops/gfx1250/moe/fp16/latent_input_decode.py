@@ -125,11 +125,12 @@ def gluon_latent_input_decode_gfx1250(
     dot_layout_b: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=wmma_layout, k_width=8
     )
+    # Pad each 128-element K row to avoid two-way bank conflicts in WMMA loads.
     shared_layout_a: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [M, BLOCK_K], [1, 0]
+        [[128, 8]], [M, BLOCK_K], [1, 0]
     )
     shared_layout_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [BLOCK_N, BLOCK_K], [1, 0]
+        [[128, 8]], [BLOCK_N, BLOCK_K], [1, 0]
     )
 
     a_smem = gl.allocate_shared_memory(
@@ -190,14 +191,35 @@ def gluon_latent_input_decode_gfx1250(
             acc = gl.amd.cdna5.wmma(a, b, acc)
     gl.amd.cdna5.tdm.async_wait(0)
 
-    offs_m = gl.arange(0, M, gl.SliceLayout(1, wmma_layout))
-    offs_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, wmma_layout))
-    column = pid_n * BLOCK_N + offs_n
-    row = row_base + offs_m
-    offsets = (pid_split * split_stride + row[:, None] * TOTAL_N + column[None, :]).to(
-        gl.int32
-    )
-    gl.amd.cdna5.buffer_store(acc, partial_ptr, offsets, mask=row[:, None] < actual_m)
+    # Sparse row masks already coalesce; redistribute fuller tiles for stores.
+    if actual_m < 8:
+        offs_m = gl.arange(0, M, gl.SliceLayout(1, wmma_layout))
+        offs_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, wmma_layout))
+        column = pid_n * BLOCK_N + offs_n
+        row = row_base + offs_m
+        offsets = (
+            pid_split * split_stride + row[:, None] * TOTAL_N + column[None, :]
+        ).to(gl.int32)
+        gl.amd.cdna5.buffer_store(
+            acc, partial_ptr, offsets, mask=row[:, None] < actual_m
+        )
+    else:
+        store_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 4], [2, 16], [gl.num_warps(), 1], [1, 0]
+        )
+        stored_acc = gl.convert_layout(acc, store_layout)
+        store_m = gl.arange(0, M, gl.SliceLayout(1, store_layout))
+        store_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, store_layout))
+        store_column = pid_n * BLOCK_N + store_n
+        store_row = row_base + store_m
+        store_offsets = (
+            pid_split * split_stride
+            + store_row[:, None] * TOTAL_N
+            + store_column[None, :]
+        ).to(gl.int32)
+        gl.amd.cdna5.buffer_store(
+            stored_acc, partial_ptr, store_offsets, mask=store_row[:, None] < actual_m
+        )
 
 
 @gluon.jit(launch_metadata=_epilogue_launch_metadata)

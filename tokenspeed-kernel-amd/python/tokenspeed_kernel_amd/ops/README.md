@@ -626,6 +626,12 @@ that a companion kernel reduces and fans out to the three consumers. The
 split is what bounds the kernel: its partial traffic scales with the token
 count while the weight traffic does not.
 
+The decode pipeline pads each 128-element K row in shared memory, avoiding
+two-way bank conflicts when loading the WMMA operands. At eight or more rows,
+FP32 partials are redistributed for contiguous stores; smaller row masks retain
+the original store layout. The row threshold is runtime control and does not
+add per-token JIT specializations.
+
 Prefill instead runs the wide large-M WMMA schedule from
 `gfx1250/gemm/fp16/mm.py`, a `256 x 256` tile on eight warps in 128-wide K
 steps through a double-buffered TDM pipeline, with no split at all. The kernel
