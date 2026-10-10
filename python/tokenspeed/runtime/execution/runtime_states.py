@@ -153,8 +153,10 @@ class RuntimeStates:
 
         ``context_len`` is zero without Engram, three for V4.1. This executor
         state follows valid_cache_lengths, not sampled output or model KV. It
-        is reseeded from host snapshots on admission/recovery, never transferred
-        or prefix-matched as a backend cache. Returns None.
+        is reseeded from the control plane's token list on admission and on a
+        slot handoff (it is token-derived, so a retraction image leaves it
+        out), never transferred or prefix-matched as a backend cache. Returns
+        None.
         """
         if context_len == 0:
             return

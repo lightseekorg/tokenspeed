@@ -138,8 +138,8 @@ def input_logprob_plan_for_forward(
     probe is capped there). The request wants position ``p`` when
     ``logprob_start_len <= p < input_length - 1``: the last prompt position
     predicts the first generated token, which is the output logprob's job.
-    Positions past the prompt (a retracted request's rebased generation) and
-    requests that already finalized their prompt logprobs contribute nothing.
+    Positions past the prompt and requests that already finalized their
+    prompt logprobs contribute nothing.
     The plan is one triple per extend slot; the targets (each row's next
     prompt token) are read on the device from the scheduler's shifted input
     ids, which cover the chunk boundary, so nothing per row crosses here.

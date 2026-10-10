@@ -542,7 +542,7 @@ requests sample at temperature. Greedy requests behave identically under both
 rules. `top_k`, `top_p`, `min_p`, penalties and `logit_bias` stay on the
 verifier's side; `q` only follows the temperature.
 
-A request admitted (or re-admitted after a recompute retract) has no
+A request admitted has no
 recorded `q` for its first chain: its rows hold a sentinel above
 `--spec-reject-draft-prob-threshold`, which rejects at the first draft and
 samples the first token from the full target. A request a capacity

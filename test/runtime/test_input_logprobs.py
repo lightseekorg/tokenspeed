@@ -303,11 +303,10 @@ def test_plan_with_a_prefix_hit_at_the_start_and_a_start_inside_a_chunk():
     assert _triples(plan) == ((2, 3, 6),)
 
 
-def test_plan_clips_a_rebased_window_and_skips_finalized_requests():
+def test_plan_clips_positions_past_the_prompt_and_skips_finalized_requests():
     ids = list(range(100, 110))
     state = _state(ids, start=5)
-    # After retraction the prefill window carries 3 generated tokens past the
-    # prompt; only prompt positions are gathered.
+    # A window reaching past the prompt gathers prompt positions only.
     op = _Op(["a"], [13], [0], 1)
     plan = _plan(op, {"a": state})
     assert _triples(plan) == ((5, 4, 5),)

@@ -165,11 +165,10 @@ configuration, pass `--low-latency-max-num-tokens-per-gpu 32`. Size for the full
 admissible batch, not just the CUDA graph ladder: larger eager batches remain
 possible. The selected value must also satisfy DeepEP's alignment requirements.
 
-If `low_latency` is pinned, include the configured prefill/recovery chunk beside
-the decode batch before TP slicing, because no normal buffers exist. For the
-D example and an 8192-token chunk, this requires at least 1056 source rows per
-rank. The default 256 or a decode-only setting of 32 would be insufficient for
-that workload. Prefer `auto` to route extends through normal dispatch.
+The decode node runs no extend-shaped work -- a retracted request is restored
+from its image, never re-prefilled -- so a pinned `low_latency` needs only the
+decode batch's rows per rank. Prefer `auto` all the same: it keeps the
+default dispatch for anything that is not a graph-shaped decode step.
 
 DeepEP's own receive buffers still reserve expert capacity. The Marlin
 bridge uses device counts to construct aligned work and bound intermediate
