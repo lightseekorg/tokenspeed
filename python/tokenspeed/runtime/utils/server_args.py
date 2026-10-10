@@ -445,10 +445,10 @@ class ServerArgs:
     # instead. Sized like the KVStore: an explicit size in gigabytes wins
     # (0 = not set), else a ratio of this rank's Device KV capacity (an
     # explicit 0 disables the pool: every capacity block then aborts its
-    # victim), else derived at device build -- the whole Device KV once
-    # without L2, the tails of ``retraction_snapshot_max_requests`` images
-    # with L2. The request cap derives from --max-num-seqs per attention-DP
-    # rank when 0 (resolve_retraction_snapshot_options).
+    # victim), else derived at device build -- 0.1 of the Device KV without
+    # L2, the tails of ``retraction_snapshot_max_requests`` images with L2
+    # (cache/l2/sizing.py). The request cap derives from --max-num-seqs per
+    # attention-DP rank when 0 (resolve_retraction_snapshot_options).
     retraction_snapshot_host_gb: float = 0.0
     retraction_snapshot_ratio: float | None = None
     retraction_snapshot_max_requests: int = 0
@@ -2417,11 +2417,12 @@ class ServerArgs:
             "Device KV capacity (the base --kvstore-ratio uses). An explicit 0 "
             "disables the pool: no image can be taken and every capacity block "
             "aborts its victim -- the only way to get abort-only behaviour. "
-            "Unset (the default) derives the size: the whole Device KV once "
-            "(ratio 1.0) without the KVStore, else the tails of "
-            "--retraction-snapshot-max-requests images (one page per group that "
-            "publishes to Host L2, a request's worst case for a group that never "
-            "does), the slot-state arena coming on top.",
+            "Unset (the default) derives the size: 0.1 of the Device KV without "
+            "the KVStore (whole images; an on-by-default pool must stay cheap to "
+            "pin -- pass 1 to make every resident suspendable), else the tails "
+            "of --retraction-snapshot-max-requests images (one page per group "
+            "that publishes to Host L2, a request's worst case for a group that "
+            "never does), the slot-state arena coming on top.",
         )
         parser.add_argument(
             "--retraction-snapshot-max-requests",

@@ -455,7 +455,8 @@ slot; `scheduler.md` §2 and §4 describe the FSM side):
   evicted, never prefix-indexed, allocated by the scheduler like the Host L2
   pool and addressed by scheduler (virtual) block id. Without the L2 tier
   (`--disable-kvstore`) the whole image goes there, and the derived default
-  is the Device KV once.
+  is a tenth of the Device KV -- an on-by-default pool stays cheap to pin;
+  `--retraction-snapshot-ratio 1` makes every resident suspendable.
 
 The runtime side is **one** `HostCacheExecutor` (`cache/l2/executor.py`)
 owning two `HostCacheStorage` buffers over the same field geometry, each with

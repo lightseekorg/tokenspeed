@@ -32,6 +32,7 @@ import pytest
 ts = pytest.importorskip("tokenspeed_scheduler")
 
 from tokenspeed.runtime.cache.l2.sizing import (  # noqa: E402
+    DEFAULT_DEVICE_RATIO,
     NO_POOL,
     RetractionPoolRequest,
     RetractionPoolSizing,
@@ -248,10 +249,15 @@ def test_resolution_order_size_then_ratio_then_derived(l2_tier):
     sizing = _resolve(_request(ratio=0.25), l2_tier=l2_tier)
     assert sizing.lcm_blocks == 10
     assert "--retraction-snapshot-ratio" in sizing.source
-    # Neither: the Device KV once without L2, the image tails with it.
+    # Neither: a tenth of the Device KV without L2 (whole images, kept cheap
+    # to pin), the image tails with it.
     sizing = _resolve(_request(), l2_tier=l2_tier)
-    assert sizing.lcm_blocks == (8 * 3 if l2_tier else DEVICE)
+    assert DEFAULT_DEVICE_RATIO == 0.1
+    assert sizing.lcm_blocks == (8 * 3 if l2_tier else int(DEVICE * 0.1))
     assert sizing.source.startswith("derived")
+    if not l2_tier:
+        # Explicit ratio 1 is how a deployment makes every resident suspendable.
+        assert _resolve(_request(ratio=1.0), l2_tier=False).lcm_blocks == DEVICE
 
 
 def test_ratio_zero_resolves_to_no_pool_and_too_small_sizes_are_refused():
@@ -399,7 +405,7 @@ def test_device_build_counts_the_tail_only_for_the_derived_pool_beside_l2():
     assert request.tail_lcm_blocks_per_request == tail_lcm_blocks_per_request(
         model, specs, 4096
     )
-    # Settled by a knob, or sized as the Device KV once: no model is built.
+    # Settled by a knob, or sized off the Device KV alone: no model is built.
     for overrides in (
         dict(retraction_snapshot_host_gb=2.0),
         dict(retraction_snapshot_ratio=0.5),

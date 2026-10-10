@@ -26,9 +26,13 @@ explicit size in gigabytes wins (``--kvstore-size``,
 capacity (``--kvstore-ratio``, ``--retraction-snapshot-ratio``). The snapshot
 pool adds two rules of its own. An explicit ratio ``0`` disables it, so every
 capacity block aborts its victim. And when neither knob is given, the pool is
-derived from what it has to hold: whole images when there is no Host L2 tier
-to take the hash-complete pages (the Device KV once), or just the tails of
-``max_retracted_requests`` images when there is one. The tail of an image,
+derived: without a Host L2 tier to take the hash-complete pages, whole images
+would need the Device KV once, which an on-by-default pool cannot pin (a
+small model on a large GPU pins hundreds of gigabytes of Host memory), so the
+default is ``DEFAULT_DEVICE_RATIO`` (0.1) of the Device KV -- enough to
+suspend a few residents, every image that does not fit aborting its victim --
+and with an L2 tier just the tails of ``max_retracted_requests`` images,
+which are cheap. The tail of an image,
 per cache group, is one page for a group that publishes to L2 (its unaligned
 last page; a state group's live block) and a request's worst-case pages for a
 group that never publishes (a replayable sliding group) -- page counts the
@@ -42,6 +46,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+
+#: The derived pool without a Host L2 tier, as a ratio of this rank's Device
+#: KV: whole images at a price an on-by-default pool can pin. A deployment
+#: that wants every resident suspendable passes ``--retraction-snapshot-ratio
+#: 1`` (or enables the KVStore, whose tails are cheap).
+DEFAULT_DEVICE_RATIO = 0.1
 
 
 def gigabytes_to_lcm_blocks(gigabytes: float, *, host_lcm_block_bytes: int) -> int:
@@ -176,8 +186,11 @@ def resolve_retraction_pool(
             "Device LCM blocks"
         )
     elif not l2_tier:
-        blocks = device_lcm_blocks
-        source = "derived: the Device KV once, no Host L2 tier"
+        blocks = int(device_lcm_blocks * DEFAULT_DEVICE_RATIO)
+        source = (
+            f"derived: {DEFAULT_DEVICE_RATIO} of {device_lcm_blocks} Device LCM "
+            "blocks, no Host L2 tier"
+        )
     else:
         blocks = request.max_retracted_requests * request.tail_lcm_blocks_per_request
         source = (
