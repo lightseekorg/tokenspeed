@@ -126,9 +126,10 @@ D arguments:
 `auto` keeps ordinary decode on low latency and CUDA graph. If cache
 pressure retracts a request, the scheduler images it to Host and restores it
 by a copy, never by a prefill, so the decode node runs no extend-shaped work
-(`--retraction-snapshot-host-gb` sizes the image pool; without one nothing
-can be imaged, and a capacity-blocked round aborts the newest resident with
-finish `err_type` 524 instead).
+(the image pool is sized by default from `--max-num-seqs`; see
+`--retraction-snapshot-ratio` in [Server configuration](../configuration/server.md),
+whose explicit `0` removes the pool so a capacity-blocked round aborts the
+newest resident with finish `err_type` 524 instead).
 
 `max-num-seqs` is global across DP: this example allows 32 requests per D
 replica and captures through that local batch size. Keep graph padding

@@ -449,10 +449,13 @@ slot; `scheduler.md` §2 and §4 describe the FSM side):
   L2 never holds (a drafter-private group, a state group's live block, a
   replayable group's private pages) and the request's slot-state blob — goes
   to the **retraction snapshot pool**: a small, request-private, pinned pool
-  sized by `--retraction-snapshot-host-gb`, never evicted, never
-  prefix-indexed, allocated by the scheduler like the Host L2 pool and
-  addressed by scheduler (virtual) block id. Without the L2 tier
-  (`--disable-kvstore`) the whole image goes there.
+  sized like the Host L2 tier (an explicit `--retraction-snapshot-host-gb`,
+  else `--retraction-snapshot-ratio` of the Device KV, else derived: by
+  default one tail per retractable request, `cache/l2/sizing.py`), never
+  evicted, never prefix-indexed, allocated by the scheduler like the Host L2
+  pool and addressed by scheduler (virtual) block id. Without the L2 tier
+  (`--disable-kvstore`) the whole image goes there, and the derived default
+  is the Device KV once.
 
 The runtime side is **one** `HostCacheExecutor` (`cache/l2/executor.py`)
 owning two `HostCacheStorage` buffers over the same field geometry, each with
@@ -1237,10 +1240,13 @@ request is the escalating admission headroom each retraction adds to the
 victim's next admission. The protocol — victim choice, the image's two legs,
 readmission order, why the release is safe before the image copies — is
 `scheduler.md` §2 and §4. The snapshot pool's size is a configuration input
-like the Host cache's (`num_snapshot_pages`, `max_retracted_requests`): it
-bounds how many pages of suspended requests may be held at once; when a
-victim's image does not fit, the victim is aborted instead of imaged
-(`scheduler.md` §2), so a capacity block never waits on the Host.
+like the Host cache's (`num_snapshot_pages`, `max_retracted_requests`),
+resolved by the runtime at device build (`cache/l2/sizing.py`; the
+derivation table is in `docs/configuration/server.md`): it bounds how many
+pages of suspended requests may be held at once; when a victim's image does
+not fit, the victim is aborted instead of imaged (`scheduler.md` §2), so a
+capacity block never waits on the Host. `--retraction-snapshot-ratio 0`
+is the pool-less engine, where every capacity block aborts.
 
 ## Virtual block placement within a shared physical plan
 

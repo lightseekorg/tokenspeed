@@ -50,10 +50,8 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import tokenspeed.runtime.cache.l2.executor as executor_module  # noqa: E402
 import tokenspeed.runtime.cache.transfer.lanes as lanes_module  # noqa: E402
-from tokenspeed.runtime.cache.l2.executor import (  # noqa: E402
-    HostCacheExecutor,
-    num_snapshot_lcm_blocks,
-)
+from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor  # noqa: E402
+from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest  # noqa: E402
 from tokenspeed.runtime.cache.transfer.lanes import (  # noqa: E402
     CompletionQueue,
     HostTransferLane,
@@ -228,6 +226,19 @@ def _restore_op(op_id, slot, rows, *, pool_index=1):
     )
 
 
+def _pool(host_gb, max_retracted, *, ratio=None, tail=0):
+    """Pool knobs as ServerArgs resolves them: 0/None unset, ratio 0 = no pool."""
+    return RetractionPoolRequest(
+        host_gb=host_gb,
+        ratio=ratio,
+        max_retracted_requests=max_retracted,
+        tail_lcm_blocks_per_request=tail,
+    )
+
+
+NO_POOL = _pool(0.0, 0, ratio=0.0)
+
+
 def _build(
     *,
     layout,
@@ -241,6 +252,7 @@ def _build(
     """A two-tier executor over fakes: mocked storage, geometry, streams, lanes.
 
     Returns ``(executor, slot_state, lanes)`` with ``lanes`` keyed by role.
+    ``snapshot_host_gb`` 0 builds no pool.
     """
     if slot_state is None and snapshot_host_gb > 0:
         slot_state = _SlotState()
@@ -298,8 +310,11 @@ def _build(
             l2_tier=l2_tier,
             host_ratio=1.5,  # 3 L2 LCM blocks over a 2-block device layout
             host_size_gb=0,
-            snapshot_host_gb=snapshot_host_gb,
-            max_retracted_requests=max_retracted if snapshot_host_gb > 0 else 0,
+            snapshot_pool=(
+                _pool(snapshot_host_gb, max_retracted)
+                if snapshot_host_gb > 0
+                else NO_POOL
+            ),
             slot_state_exporters=(slot_state,) if slot_state is not None else None,
             io_backend="direct",
             attn_tp_rank=0,
@@ -337,34 +352,39 @@ def test_op_dataclasses_carry_the_wire_fields():
         assert _acks([cache_event_from_payload(payload)]) == [(kind, op_id)]
 
 
-def test_num_snapshot_lcm_blocks_is_explicit_about_zero():
-    assert num_snapshot_lcm_blocks(host_gb=0.0035, host_lcm_block_bytes=1_000_000) == 3
-    with pytest.raises(ValueError, match="positive"):
-        num_snapshot_lcm_blocks(host_gb=0, host_lcm_block_bytes=1)
-    with pytest.raises(ValueError, match="no whole LCM block"):
-        num_snapshot_lcm_blocks(host_gb=0.0005, host_lcm_block_bytes=1_000_000)
-
-
-def test_constructor_requires_a_tier_and_matching_pool_knobs():
+def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
     layout = _layout(2, [("full", 2)])
     with pytest.raises(ValueError, match="L2 tier, a snapshot pool or both"):
         _build(layout=layout, shard_counts=[1], l2_tier=False, snapshot_host_gb=0)
-    with pytest.raises(ValueError, match="go together"):
-        with patch.object(
-            executor_module, "compute_host_lcm_block_bytes", return_value=1
-        ):
+    with patch.object(executor_module, "compute_host_lcm_block_bytes", return_value=1):
+        # A pool with no slot-state rows, or no exporters to fill them, is refused.
+        with pytest.raises(ValueError, match="slot-state exporters"):
             HostCacheExecutor(
                 _Pool(layout, [1]),
                 l2_tier=True,
                 host_ratio=1.0,
                 host_size_gb=0,
-                snapshot_host_gb=0.0,
-                max_retracted_requests=3,
+                snapshot_pool=_pool(1e-9, 3),
                 slot_state_exporters=None,
                 io_backend="direct",
                 attn_tp_rank=0,
                 dcp_rank=0,
             )
+        with pytest.raises(ValueError, match="slot-state rows"):
+            HostCacheExecutor(
+                _Pool(layout, [1]),
+                l2_tier=True,
+                host_ratio=1.0,
+                host_size_gb=0,
+                snapshot_pool=_pool(1e-9, 0),
+                slot_state_exporters=(_SlotState(),),
+                io_backend="direct",
+                attn_tp_rank=0,
+                dcp_rank=0,
+            )
+    # Too small a size holds no whole block and is refused, not rounded to none.
+    with pytest.raises(ValueError, match="no whole LCM block"):
+        _build(layout=layout, shard_counts=[1], snapshot_host_gb=0.0005)
     executor, _, _ = _build(layout=layout, shard_counts=[1], snapshot_host_gb=0)
     assert (executor.num_host_pages, executor.num_snapshot_pages) == (4, 1)
     assert executor.max_retracted_requests == 0 and executor.blob_arena is None
@@ -1032,8 +1052,7 @@ def _round_trip_two_ranks(io_backend, executors):
                 l2_tier=True,
                 host_ratio=1.5,  # 3 L2 LCM blocks
                 host_size_gb=0,
-                snapshot_host_gb=3 * 16 / 1e9,  # 3 pool LCM blocks of 2 x 8 B
-                max_retracted_requests=2,
+                snapshot_pool=_pool(3 * 16 / 1e9, 2),  # 3 pool LCM blocks of 2 x 8 B
                 slot_state_exporters=(slot_states[rank],),
                 io_backend=io_backend,
                 attn_tp_rank=0,

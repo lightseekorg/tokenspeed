@@ -18,6 +18,13 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
+# Pure Python, no runtime dependencies: the knobs of an L2-only executor.
+from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest  # noqa: E402
+
+NO_POOL = RetractionPoolRequest(
+    host_gb=0.0, ratio=0.0, max_retracted_requests=0, tail_lcm_blocks_per_request=0
+)
+
 
 class _LoadEvents(SimpleNamespace):
     def set_completion(self, event):
@@ -1206,8 +1213,7 @@ class GroupAwareWireTest(unittest.TestCase):
                 l2_tier=True,
                 host_ratio=1.0,
                 host_size_gb=0,
-                snapshot_host_gb=0,
-                max_retracted_requests=0,
+                snapshot_pool=NO_POOL,
                 slot_state_exporters=None,
                 io_backend="kernel",
                 attn_tp_rank=0,
@@ -1305,8 +1311,7 @@ class GroupAwareWireTest(unittest.TestCase):
                         l2_tier=True,
                         host_ratio=1.0,
                         host_size_gb=0,
-                        snapshot_host_gb=0,
-                        max_retracted_requests=0,
+                        snapshot_pool=NO_POOL,
                         slot_state_exporters=None,
                         io_backend=io_backend,
                         attn_tp_rank=0,
@@ -1853,8 +1858,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 l2_tier=True,
                 host_ratio=1.0,
                 host_size_gb=0,
-                snapshot_host_gb=0,
-                max_retracted_requests=0,
+                snapshot_pool=NO_POOL,
                 slot_state_exporters=None,
                 io_backend=io_backend,
                 attn_tp_rank=0,

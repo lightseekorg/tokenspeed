@@ -47,6 +47,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             import torch
 
             import tokenspeed.runtime.cache.l2.executor as executor_module
+            from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
             from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
             from tokenspeed.runtime.cache.transfer.layout import (
                 CacheField,
@@ -59,6 +60,12 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             self.skipTest("needs a CUDA device")
         self.torch = torch
         self.executor_module = executor_module
+        self.no_pool = RetractionPoolRequest(
+            host_gb=0.0,
+            ratio=0.0,
+            max_retracted_requests=0,
+            tail_lcm_blocks_per_request=0,
+        )
         self.MemoryKvStore = MemoryKvStore
         self.CacheField = CacheField
         self.CacheGroupLayout = CacheGroupLayout
@@ -118,8 +125,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 l2_tier=True,
                 host_ratio=1.0,
                 host_size_gb=0,
-                snapshot_host_gb=0,
-                max_retracted_requests=0,
+                snapshot_pool=self.no_pool,
                 slot_state_exporters=None,
                 io_backend="direct",
                 attn_tp_rank=0,

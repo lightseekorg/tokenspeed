@@ -442,9 +442,15 @@ class ServerArgs:
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
-    # instead. 0 is the explicit "no pool": nothing can be imaged, so a
-    # capacity-blocked round aborts the newest resident.
+    # instead. Sized like the KVStore: an explicit size in gigabytes wins
+    # (0 = not set), else a ratio of this rank's Device KV capacity (an
+    # explicit 0 disables the pool: every capacity block then aborts its
+    # victim), else derived at device build -- the whole Device KV once
+    # without L2, the tails of ``retraction_snapshot_max_requests`` images
+    # with L2. The request cap derives from --max-num-seqs per attention-DP
+    # rank when 0 (resolve_retraction_snapshot_options).
     retraction_snapshot_host_gb: float = 0.0
+    retraction_snapshot_ratio: float | None = None
     retraction_snapshot_max_requests: int = 0
     # Test knob: every |N| plans the scheduler retracts the oldest quiescent
     # Decoding (N > 0) or Prefilling (N < 0) request without capacity
@@ -1139,42 +1145,73 @@ class ServerArgs:
         self._handle_kvstore()
         self.validate_l3_prefetch_options()
         self.validate_cache_options()
-        self.validate_retraction_snapshot_options()
+        self.resolve_retraction_snapshot_options()
 
-    def validate_retraction_snapshot_options(self):
-        """The retraction snapshot pool: both knobs or neither, retracting roles only.
+    @property
+    def retracting_role(self) -> bool:
+        """Whether this engine can retract at all: the fused and decode roles."""
+        return self.disaggregation_mode not in ("prefill", "encode")
 
-        A positive ``--retraction-snapshot-host-gb`` builds the pinned pool
-        and needs ``--retraction-snapshot-max-requests`` for the slot-state
-        arena it comes with; 0 is the explicit "no pool" and must not come
-        with arena slots. Prefill and encode roles never retract, so a pool
-        there is a configuration error rather than idle memory. The pool is
-        not sized against the Device pool or the running requests: a victim
-        whose image does not fit is aborted by the scheduler rather than
-        imaged (``docs/configuration/server.md``, "Retraction snapshot pool").
+    @property
+    def retraction_snapshot_pool_disabled(self) -> bool:
+        """Whether no image can ever be taken, so a capacity block aborts.
+
+        The one way to ask for that on a retracting role is
+        ``--retraction-snapshot-ratio 0`` without a size override; the roles
+        that never retract are resolved to the same knobs.
+        """
+        return (
+            self.retraction_snapshot_host_gb == 0
+            and self.retraction_snapshot_ratio == 0
+        )
+
+    def resolve_retraction_snapshot_options(self):
+        """Resolve the retraction snapshot pool's knobs the way the KVStore's are.
+
+        ``--retraction-snapshot-host-gb`` is the explicit size and wins when
+        set (0 = not set); ``--retraction-snapshot-ratio`` sizes the pool as
+        a fraction of this rank's Device KV capacity, an explicit 0 disabling
+        it; neither given means the device builder derives the size
+        (``cache/l2/sizing.py``). ``--retraction-snapshot-max-requests`` 0
+        derives to the rank's running requests (``--max-num-seqs`` over the
+        attention-DP ranks), the most that can ever need an image at once.
+        The prefill and encode roles never retract: their knobs are resolved
+        to no pool here with a log, as the KVStore's are off on the encode
+        role.
         """
         host_gb = self.retraction_snapshot_host_gb
+        ratio = self.retraction_snapshot_ratio
         max_requests = self.retraction_snapshot_max_requests
-        if host_gb < 0 or max_requests < 0:
+        if host_gb < 0 or max_requests < 0 or (ratio is not None and ratio < 0):
             raise ValueError(
-                "--retraction-snapshot-host-gb and "
+                "--retraction-snapshot-host-gb, --retraction-snapshot-ratio and "
                 "--retraction-snapshot-max-requests must be non-negative"
             )
-        if (host_gb > 0) != (max_requests > 0):
-            raise ValueError(
-                "--retraction-snapshot-host-gb and --retraction-snapshot-max-requests "
-                "go together: a pool needs slot-state rows and rows need a pool "
-                f"(got {host_gb} GB, {max_requests} requests)"
-            )
-        if host_gb > 0 and self.disaggregation_mode in ("prefill", "encode"):
-            raise ValueError(
-                f"the {self.disaggregation_mode} role never retracts; drop "
-                "--retraction-snapshot-host-gb"
-            )
-        if self.debug_force_retraction_interval != 0 and host_gb <= 0:
-            raise ValueError(
-                "--debug-force-retraction-interval forces retractions, which need "
-                "a retraction snapshot pool (--retraction-snapshot-host-gb)"
+        if not self.retracting_role:
+            if host_gb > 0 or ratio is not None or max_requests > 0:
+                logger.info(
+                    f"{self.disaggregation_mode!s} instance never retracts; ignoring "
+                    "the retraction snapshot pool arguments"
+                )
+            self.retraction_snapshot_host_gb = 0.0
+            self.retraction_snapshot_ratio = 0.0
+            self.retraction_snapshot_max_requests = 0
+            return
+        if self.retraction_snapshot_pool_disabled:
+            if max_requests > 0:
+                raise ValueError(
+                    "--retraction-snapshot-ratio 0 disables the retraction snapshot "
+                    "pool; --retraction-snapshot-max-requests has no rows to size"
+                )
+            if self.debug_force_retraction_interval != 0:
+                raise ValueError(
+                    "--debug-force-retraction-interval forces retractions, which the "
+                    "pool --retraction-snapshot-ratio 0 disabled"
+                )
+            return
+        if max_requests == 0:
+            self.retraction_snapshot_max_requests = self.max_num_seqs // max(
+                self.mapping.attn.dp_size, 1
             )
 
     def resolve_speculative_decoding(self):
@@ -2344,19 +2381,34 @@ class ServerArgs:
             "is copied back; nothing is recomputed. A victim whose image does not "
             "fit the Host (L2 pins, the pool or its rows) is aborted instead of "
             "imaged and the client told why, so the pool bounds how much can be "
-            "suspended at once, never how long an admission waits. 0 (the "
-            "default) means no pool: nothing can be imaged, and a capacity-blocked "
-            "round aborts the newest resident. Fused and decode roles only.",
+            "suspended at once, never how long an admission waits. The explicit "
+            "size, overriding --retraction-snapshot-ratio when set; 0 (the "
+            "default) means not set. The prefill and encode roles never retract "
+            "and ignore it.",
+        )
+        parser.add_argument(
+            "--retraction-snapshot-ratio",
+            type=float,
+            default=ServerArgs.retraction_snapshot_ratio,
+            help="Size of the retraction snapshot pool as a fraction of this rank's "
+            "Device KV capacity (the base --kvstore-ratio uses). An explicit 0 "
+            "disables the pool: no image can be taken and every capacity block "
+            "aborts its victim -- the only way to get abort-only behaviour. "
+            "Unset (the default) derives the size: the whole Device KV once "
+            "(ratio 1.0) without the KVStore, else the tails of "
+            "--retraction-snapshot-max-requests images (one page per group that "
+            "publishes to Host L2, a request's worst case for a group that never "
+            "does), the slot-state arena coming on top.",
         )
         parser.add_argument(
             "--retraction-snapshot-max-requests",
             type=int,
             default=ServerArgs.retraction_snapshot_max_requests,
             help="Slot-state image rows of the retraction snapshot pool, i.e. the "
-            "most requests suspended at once. Required with a non-zero pool; a "
-            "victim that finds no free row is aborted rather than imaged, so size "
-            "it for the concurrency expected under pressure (--max-num-seqs / "
-            "attention-DP size covers every resident).",
+            "most requests suspended at once. 0 (the default) derives to this "
+            "rank's running requests, --max-num-seqs / attention-DP size, which "
+            "covers every resident; a victim that finds no free row is aborted "
+            "rather than imaged. Refused with --retraction-snapshot-ratio 0.",
         )
         parser.add_argument(
             "--debug-force-retraction-interval",
@@ -2365,8 +2417,9 @@ class ServerArgs:
             help="TEST ONLY. Every |N| scheduler plans retract the oldest quiescent "
             "decoding request (N > 0) or the one prefilling request between its "
             "chunks (N < 0) without capacity pressure, so the suspend/restore "
-            "path runs on every request of a test run. Needs a retraction "
-            "snapshot pool. 0 (the default) is off; never set it in serving.",
+            "path runs on every request of a test run. Refused with "
+            "--retraction-snapshot-ratio 0. 0 (the default) is off; never set it "
+            "in serving.",
         )
         # Mamba Cache
         parser.add_argument(

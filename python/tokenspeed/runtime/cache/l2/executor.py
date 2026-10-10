@@ -25,8 +25,9 @@ One executor, two pinned Host buffers over the same field geometry:
 * the **L2 prefix tier** (``--enable-kvstore``): hash-complete prefix pages the
   scheduler publishes, stored by ``WriteBackOp``, loaded by ``LoadBackOp``
   with layerwise consumer fences, optionally backed by L3;
-* the **retraction snapshot pool** (``--retraction-snapshot-host-gb``): the
-  request-private tail of a retracted request's image -- its unaligned tail
+* the **retraction snapshot pool** (on by default where the engine retracts;
+  sized by ``tokenspeed.runtime.cache.l2.sizing``): the request-private tail
+  of a retracted request's image -- its unaligned tail
   pages, every block of a group L2 never holds, and its slot-state blob --
   stored by ``SnapshotOp`` and read back, together with the request's pinned
   L2 entries, by one ``RestoreOp`` whose rows name their source tier.
@@ -68,6 +69,11 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
 from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
+from tokenspeed.runtime.cache.l2.sizing import (
+    RetractionPoolRequest,
+    gigabytes_to_lcm_blocks,
+    resolve_retraction_pool,
+)
 from tokenspeed.runtime.cache.l2.storage import (
     HostCacheStorage,
     compute_host_lcm_block_bytes,
@@ -143,30 +149,13 @@ def _num_host_lcm_blocks(
     host_size_gb: float,
 ) -> int:
     if host_size_gb > 0:
-        count = int(host_size_gb * 1e9 // host_lcm_block_bytes)
+        count = gigabytes_to_lcm_blocks(
+            host_size_gb, host_lcm_block_bytes=host_lcm_block_bytes
+        )
     else:
         count = int(device_lcm_blocks * host_ratio)
     if count <= 0:
         raise ValueError("Host L2 resolved to zero LCM blocks")
-    return count
-
-
-def num_snapshot_lcm_blocks(*, host_gb: float, host_lcm_block_bytes: int) -> int:
-    """LCM blocks of a snapshot pool of ``host_gb`` gigabytes (decimal, like L2).
-
-    Raises:
-        ValueError: ``host_gb`` is not positive or holds no whole block.
-    """
-    if host_gb <= 0:
-        raise ValueError(
-            "--retraction-snapshot-host-gb must be positive to build a pool"
-        )
-    count = int(host_gb * 1e9 // host_lcm_block_bytes)
-    if count <= 0:
-        raise ValueError(
-            f"--retraction-snapshot-host-gb {host_gb} holds no whole LCM block "
-            f"({host_lcm_block_bytes} bytes each)"
-        )
     return count
 
 
@@ -186,8 +175,7 @@ class HostCacheExecutor:
         l2_tier: bool,
         host_ratio: float,
         host_size_gb: float,
-        snapshot_host_gb: float,
-        max_retracted_requests: int,
+        snapshot_pool: RetractionPoolRequest,
         slot_state_exporters: Sequence[SlotStateExporter] | None,
         io_backend: str,
         attn_tp_rank: int,
@@ -206,10 +194,11 @@ class HostCacheExecutor:
                 ``host_size_gb`` is 0.
             host_size_gb: L2 size in decimal gigabytes; overrides the ratio
                 when positive.
-            snapshot_host_gb: Snapshot pool size in decimal gigabytes; 0 is
-                no pool (``SnapshotOp`` / ``RestoreOp`` are then refused).
-            max_retracted_requests: Slot-state arena rows; positive with a
-                pool, 0 without one.
+            snapshot_pool: The retraction snapshot pool's knobs as
+                ``ServerArgs`` resolved them, sized here against this
+                rank's layout (``resolve_retraction_pool``); a disabled
+                request builds no pool (``SnapshotOp`` / ``RestoreOp`` are
+                then refused).
             slot_state_exporters: The owners of per-slot state outside the
                 cache groups, in blob order (``ModelExecutor.
                 slot_state_exporters``); laid out once here into the arena
@@ -223,16 +212,11 @@ class HostCacheExecutor:
         """
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
-        if not l2_tier and snapshot_host_gb <= 0:
+        if not l2_tier and snapshot_pool.disabled:
             raise ValueError(
                 "a Host cache executor needs the L2 tier, a snapshot pool or both"
             )
-        if (snapshot_host_gb > 0) != (max_retracted_requests > 0):
-            raise ValueError(
-                "a snapshot pool and its slot-state rows go together: got "
-                f"{snapshot_host_gb} GB and {max_retracted_requests} requests"
-            )
-        if snapshot_host_gb > 0 and slot_state_exporters is None:
+        if not snapshot_pool.disabled and slot_state_exporters is None:
             raise ValueError("a snapshot pool needs the slot-state exporters")
         self.attn_tp_rank = attn_tp_rank
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
@@ -260,18 +244,21 @@ class HostCacheExecutor:
             )
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # --- retraction snapshot pool -----------------------------------------
-        snapshot_lcm_blocks = 0
+        self.snapshot_sizing = resolve_retraction_pool(
+            snapshot_pool,
+            l2_tier=l2_tier,
+            device_lcm_blocks=self.layout.num_lcm_blocks,
+            host_lcm_block_bytes=host_lcm_block_bytes,
+        )
+        snapshot_lcm_blocks = self.snapshot_sizing.lcm_blocks
         self.blob_bytes = 0
         # The blob layout is measured once here; every store and restore
         # slices the arena row at its recorded offsets.
         self._slot_state: SlotStateLayout | None = None
-        if snapshot_host_gb > 0:
-            snapshot_lcm_blocks = num_snapshot_lcm_blocks(
-                host_gb=snapshot_host_gb, host_lcm_block_bytes=host_lcm_block_bytes
-            )
+        if snapshot_lcm_blocks:
             self._slot_state = SlotStateLayout(slot_state_exporters)
             self.blob_bytes = self._slot_state.nbytes
-        self.max_retracted_requests = int(max_retracted_requests)
+        self.max_retracted_requests = self.snapshot_sizing.max_retracted_requests
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
         arena_bytes = self.max_retracted_requests * self.blob_bytes
         # Both tiers count against the one headroom check.
@@ -333,17 +320,13 @@ class HostCacheExecutor:
                 f"Allocated {l2_bytes / 1000000000.0:.2f} GB compact Host L2 ("
                 f"{host_lcm_blocks!s} LCM blocks, {host_lcm_block_bytes!s} bytes/block)",
             )
-        if snapshot_lcm_blocks:
-            tokens_per_lcm_block = max(
-                1, int(contract.token_capacity) // int(contract.num_lcm_blocks)
-            )
+        if attn_tp_rank == 0:
             logger.info(
-                f"Allocated {snapshot_bytes / 1e9:.2f} GB pinned retraction snapshot "
-                f"pool ({snapshot_lcm_blocks} LCM blocks, {host_lcm_block_bytes} "
-                f"bytes/block, about {snapshot_lcm_blocks * tokens_per_lcm_block} "
-                f"tokens) and a {arena_bytes / 1e6:.2f} MB slot-state arena "
-                f"({self.max_retracted_requests} x {self.blob_bytes} bytes); "
-                f"images are {'tails, with the bulk in L2' if l2_tier else 'whole (no L2 tier)'}"
+                self.snapshot_sizing.describe(
+                    host_lcm_block_bytes=host_lcm_block_bytes,
+                    blob_bytes=self.blob_bytes,
+                    l2_tier=l2_tier,
+                )
             )
 
         # Layerwise load fences exist for L2 prefix loads only: a restore's
@@ -907,7 +890,7 @@ class HostCacheExecutor:
         if self.snapshot_block_owners is None:
             raise RuntimeError(
                 "cache op names snapshot-pool blocks but this engine has no "
-                "retraction snapshot pool (--retraction-snapshot-host-gb)"
+                "retraction snapshot pool (--retraction-snapshot-ratio 0)"
             )
         return self.snapshot_block_owners
 
@@ -993,8 +976,8 @@ class HostCacheExecutor:
     def _check_snapshot_op(self, op: SnapshotOp | RestoreOp) -> None:
         if self.snapshot_storage is None:
             raise RuntimeError(
-                f"{type(op).__name__} {op.op_id} needs the retraction snapshot pool "
-                "(--retraction-snapshot-host-gb)"
+                f"{type(op).__name__} {op.op_id} needs the retraction snapshot pool, "
+                "which --retraction-snapshot-ratio 0 removed"
             )
         if not 0 <= int(op.snapshot_slot) < self.max_retracted_requests:
             raise IndexError(

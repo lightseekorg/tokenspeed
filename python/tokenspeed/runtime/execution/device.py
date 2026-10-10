@@ -84,6 +84,11 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.cache.l2.sizing import (
+    NO_POOL,
+    RetractionPoolRequest,
+    tail_lcm_blocks_per_request,
+)
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.types import (
@@ -174,10 +179,10 @@ class DeviceSpecs:
             sized here because it depends on the pools' transfer layout; 0
             without ``--enable-kvstore``. The scheduler is configured from it.
         num_snapshot_pages: The retraction snapshot pool's page count (incl.
-            the null page), sized like the L2 tier's from
-            ``--retraction-snapshot-host-gb``; 1 (the null page alone)
-            without a pool, when nothing can be imaged and a capacity-blocked
-            round aborts a resident instead.
+            the null page), resolved like the L2 tier's size
+            (``cache/l2/sizing.py``); 1 (the null page alone) without a
+            pool, when nothing can be imaged and a capacity-blocked round
+            aborts a resident instead.
         max_retracted_requests: Slot-state image rows of the snapshot pool,
             i.e. how many requests may be retracted at once; 0 without a
             pool.
@@ -1114,6 +1119,60 @@ def probe_arena_floor(
     )
 
 
+def _retraction_pool_request(
+    server_args,
+    contract,
+    *,
+    max_batch_size: int,
+    max_context_len: int,
+    decode_input_tokens: int,
+    overlap_schedule_depth: int,
+) -> RetractionPoolRequest:
+    """The snapshot pool's knobs plus the tail unit a derived size counts in.
+
+    The tail unit comes from the scheduler's own ``CapacityModel`` over the
+    bound contract's groups, under the same limits the pool was sized for, so
+    an image's tail is counted the way the scheduler will later claim it.
+    Skipped (0) when the knobs settle the size without it.
+    """
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+        SchedulerLimits,
+        capacity_model,
+        scheduler_role,
+    )
+
+    tail_lcm_blocks = 0
+    needs_tail = (
+        server_args.enable_kvstore
+        and server_args.retraction_snapshot_host_gb == 0
+        and server_args.retraction_snapshot_ratio is None
+    )
+    if needs_tail:
+        model = capacity_model(
+            contract.group_specs,
+            prefix_granularity=contract.prefix_granularity,
+            virtual_packing=contract.virtual_packing,
+            limits=SchedulerLimits(
+                role=scheduler_role(server_args.disaggregation_mode),
+                max_live_requests=max_batch_size,
+                max_scheduled_tokens=int(server_args.chunked_prefill_size),
+                max_context_len=max_context_len,
+                decode_input_tokens=decode_input_tokens,
+                overlap_schedule_depth=overlap_schedule_depth,
+                disable_prefix_cache=not server_args.enable_prefix_caching,
+            ),
+        )
+        tail_lcm_blocks = tail_lcm_blocks_per_request(
+            model, contract.group_specs, max_context_len
+        )
+    return RetractionPoolRequest(
+        host_gb=server_args.retraction_snapshot_host_gb,
+        ratio=server_args.retraction_snapshot_ratio,
+        max_retracted_requests=server_args.retraction_snapshot_max_requests,
+        tail_lcm_blocks_per_request=tail_lcm_blocks,
+    )
+
+
 def build_device_side(
     *,
     server_args,
@@ -1355,12 +1414,20 @@ def build_device_side(
         )
 
     # The compact Host cache: the L2 prefix tier (--enable-kvstore), the
-    # retraction snapshot pool (--retraction-snapshot-host-gb), or both in one
-    # executor over the same field geometry. The executor is the model
-    # executor's peer: it lays out the slot-state exporters the model
+    # retraction snapshot pool (on by default on the roles that retract), or
+    # both in one executor over the same field geometry. The executor is the
+    # model executor's peer: it lays out the slot-state exporters the model
     # executor lists, so it is built after it.
     host_cache_executor = None
-    if server_args.enable_kvstore or server_args.retraction_snapshot_host_gb > 0:
+    snapshot_pool = _retraction_pool_request(
+        server_args,
+        views.token_to_kv_pool.arena.runtime_contract,
+        max_batch_size=max_batch_size,
+        max_context_len=model_config.context_len + server_args.spec_context_pad,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
+    )
+    if server_args.enable_kvstore or not snapshot_pool.disabled:
         from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
 
         host_cache_executor = HostCacheExecutor(
@@ -1369,12 +1436,16 @@ def build_device_side(
             l2_tier=server_args.enable_kvstore,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
-            snapshot_host_gb=server_args.retraction_snapshot_host_gb,
-            max_retracted_requests=server_args.retraction_snapshot_max_requests,
+            snapshot_pool=snapshot_pool,
             slot_state_exporters=executor.slot_state_exporters(),
             io_backend=server_args.kvstore_io_backend,
             attn_tp_rank=attn_tp_rank,
             dcp_rank=server_args.mapping.attn.dcp_rank,
+        )
+    elif attn_tp_rank == 0:
+        # With an executor the line comes from its resolved sizing.
+        logger.info(
+            NO_POOL.describe(host_lcm_block_bytes=0, blob_bytes=0, l2_tier=False)
         )
     if server_args.enable_kvstore and server_args.kvstore_storage_backend is not None:
         # L3 under the L2 tier.

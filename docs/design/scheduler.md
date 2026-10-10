@@ -460,7 +460,8 @@ pages and slot in that very round, the blocked grant proceeds exactly as after
 a retraction, and the plan records it (`ExecutionPlan::aborts`, a
 `SchedulerAbort{request_id, AbortReason::kImageDoesNotFit, detail}`) so the
 runtime fails the request toward its client with the shortfall and the knob
-to raise (`--retraction-snapshot-host-gb`, `--retraction-snapshot-max-requests`).
+to raise (`--retraction-snapshot-host-gb` / `--retraction-snapshot-ratio`,
+`--retraction-snapshot-max-requests`).
 The same site handles a victim that passed the probe but whose L2 leg fell
 back to a pool that then could not take it. Waiting instead would deadlock
 once every resident needs a page; charging worst-case host room at admission
@@ -886,10 +887,15 @@ pool, and L3 storage is refused with a page-cyclic sharded group
 (`cache-concepts.md`). `debug_force_retraction_interval` (§2) is the only
 knob that chooses victims outside capacity pressure, and it is refused
 without a pool. Every diagnostic names the binding field and the server arg
-behind it (`num_snapshot_pages` from `--retraction-snapshot-host-gb`,
-`max_retracted_requests` from `--retraction-snapshot-max-requests`,
+behind it (`num_snapshot_pages` from the pool the runtime resolved --
+`--retraction-snapshot-host-gb`, `--retraction-snapshot-ratio`, or the
+derived default of `docs/configuration/server.md`, "Retraction snapshot
+pool" -- `max_retracted_requests` from `--retraction-snapshot-max-requests`,
 `--debug-force-retraction-interval`), because the runtime surfaces the message
-verbatim at startup.
+verbatim at startup. The scheduler takes page counts; how the runtime arrives
+at them (the Host KVStore-style size-over-ratio rule, the tail-per-request
+default beside L2 that this model's `SingleRequestGroupPages` and
+`LcmBlocksNeededFor` count) is `python/tokenspeed/runtime/cache/l2/sizing.py`.
 
 **Release note — the runtime lands with the pin.** This scheduler is not a
 drop-in for the runtime on `main`: `SchedulerConfig.num_snapshot_pages` is
