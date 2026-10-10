@@ -51,6 +51,81 @@ def _load_keys(row, start, n, latest, BLOCKS: tl.constexpr, BLOCK: tl.constexpr)
 
 
 @triton.jit
+def _select_in_registers(
+    row,
+    n,
+    k,
+    latest,
+    out,
+    lens,
+    block_lens,
+    query,
+    candidates,
+    stride_candidates,
+    row_cap,
+    block_cap,
+    candidate_topk,
+    BLOCKS,
+    HAS_CANDIDATES: tl.constexpr,
+    SORT_ROWS: tl.constexpr,
+    NMAX: tl.constexpr,
+):
+    # The whole row fits one register tile: load its keys once, then run the
+    # same four radix passes and index-order emit as the looped path.
+    if BLOCKS:
+        idx, key, valid = _load_keys(row, 0, n, latest, True, NMAX)
+    else:
+        idx, key, valid = _load_keys(row, 0, n, latest, False, NMAX)
+    bins = tl.arange(0, 256)
+    prefix = tl.full([], 0, tl.uint32)
+    high = tl.full([], 0, tl.uint32)
+    remaining = k
+    total = 0
+    for p in tl.static_range(4):
+        match = valid & ((key & high) == prefix)
+        bucket = ((key >> (24 - 8 * p)) & 255).to(tl.int32)
+        hist = tl.histogram(bucket, 256, mask=match)
+        if p == 0:
+            total = tl.sum(hist)
+        at_least = tl.sum(hist) - tl.cumsum(hist, 0) + hist
+        digit = tl.max(tl.where(at_least >= remaining, bins, 0))
+        above = tl.sum(tl.where(bins == digit, at_least - hist, 0))
+        remaining -= above
+        prefix |= digit.to(tl.uint32) << (24 - 8 * p)
+        high |= tl.full([], 255, tl.uint32) << (24 - 8 * p)
+    take_all = total <= k
+    equal = (valid & (key == prefix)).to(tl.int32)
+    tie_rank = tl.cumsum(equal, 0) - equal
+    take = valid & ((key > prefix) | ((equal != 0) & (tie_rank < remaining)))
+    take = take | (take_all & valid)
+    chosen = take.to(tl.int32)
+    position = tl.cumsum(chosen, 0) - chosen
+    logical = idx
+    if HAS_CANDIDATES:
+        block = tl.load(
+            candidates + query.to(tl.int64) * stride_candidates + idx // 8,
+            mask=take,
+            other=-1,
+        )
+        logical = block * 8 + idx % 8
+    tl.store(out + position, logical, mask=take)
+    selected = tl.sum(chosen)
+    tl.store(lens, selected)
+    cap = tl.where(BLOCKS, block_cap, row_cap)
+    for start in range(0, cap, NMAX):
+        pad = start + tl.arange(0, NMAX)
+        tl.store(out + pad, -1, mask=(pad >= selected) & (pad < cap))
+    if candidate_topk == 0:
+        tl.store(block_lens + query, 0)
+    if SORT_ROWS:
+        tl.debug_barrier()
+        slots = tl.arange(0, 512)
+        ids = tl.load(out + slots, mask=slots < selected, other=2147483647)
+        ids = tl.sort(ids)
+        tl.store(out + slots, tl.where(slots < selected, ids, -1), mask=slots < k)
+
+
+@triton.jit
 def dsv41_index_select_gfx950(
     logits,
     visible,
@@ -103,6 +178,110 @@ def dsv41_index_select_gfx950(
             out = block_out + query.to(tl.int64) * stride_block_out
             lens = block_lens + query
 
+    # Rows up to 16384 keys stay in registers; the tile size follows the row
+    # so short rows do not pay for the largest tile.
+    if n <= 16384:
+        if n <= 1024:
+            _select_in_registers(
+                row,
+                n,
+                k,
+                latest,
+                out,
+                lens,
+                block_lens,
+                query,
+                candidates,
+                stride_candidates,
+                row_cap,
+                block_cap,
+                candidate_topk,
+                BLOCKS,
+                HAS_CANDIDATES,
+                SORT_ROWS,
+                1024,
+            )
+        elif n <= 2048:
+            _select_in_registers(
+                row,
+                n,
+                k,
+                latest,
+                out,
+                lens,
+                block_lens,
+                query,
+                candidates,
+                stride_candidates,
+                row_cap,
+                block_cap,
+                candidate_topk,
+                BLOCKS,
+                HAS_CANDIDATES,
+                SORT_ROWS,
+                2048,
+            )
+        elif n <= 4096:
+            _select_in_registers(
+                row,
+                n,
+                k,
+                latest,
+                out,
+                lens,
+                block_lens,
+                query,
+                candidates,
+                stride_candidates,
+                row_cap,
+                block_cap,
+                candidate_topk,
+                BLOCKS,
+                HAS_CANDIDATES,
+                SORT_ROWS,
+                4096,
+            )
+        elif n <= 8192:
+            _select_in_registers(
+                row,
+                n,
+                k,
+                latest,
+                out,
+                lens,
+                block_lens,
+                query,
+                candidates,
+                stride_candidates,
+                row_cap,
+                block_cap,
+                candidate_topk,
+                BLOCKS,
+                HAS_CANDIDATES,
+                SORT_ROWS,
+                8192,
+            )
+        else:
+            _select_in_registers(
+                row,
+                n,
+                k,
+                latest,
+                out,
+                lens,
+                block_lens,
+                query,
+                candidates,
+                stride_candidates,
+                row_cap,
+                block_cap,
+                candidate_topk,
+                BLOCKS,
+                HAS_CANDIDATES,
+                SORT_ROWS,
+                16384,
+            )
+        return
     # MSB-first radix select of the k-th largest key, 8 bits per pass.
     bins = tl.arange(0, 256)
     prefix = tl.full([], 0, tl.uint32)
