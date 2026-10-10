@@ -148,6 +148,60 @@ def maybe_warm_cupti_for_graph_capture() -> None:
     _init_for_cuda_graphs()
 
 
+def scheduler_config_from_args(
+    server_args,
+    specs,
+    *,
+    max_scheduled_tokens: int,
+    max_batch_size: int,
+    decode_input_tokens: int,
+    overlap_schedule_depth: int,
+    enable_kv_cache_events: bool,
+    prefix_replay_tokens: int,
+):
+    """The C++ scheduler's config from the server arguments and the device build.
+
+    One place turns the two into ``make_config``'s arguments, so the knobs an
+    engine does not have -- the L3 prefetch threshold without an L3 store --
+    are translated here, not left as None for the binding.
+
+    Args:
+        server_args: The resolved server arguments.
+        specs: The ``DeviceSpecs`` of the built device side: the cache
+            geometry, the cache groups and the Host tiers' page counts.
+        max_scheduled_tokens: Per-step prefill token budget.
+        max_batch_size: Rank-local batch slots.
+        decode_input_tokens: Verify width per decode step.
+        overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
+        enable_kv_cache_events: Whether KV cache events are published.
+        prefix_replay_tokens: DSpark prefix replay tokens, 0 without.
+    """
+    geometry = specs.cache_geometry
+    has_l3 = server_args.kvstore_storage_backend is not None
+    return make_config(
+        num_device_pages=geometry.num_device_pages,
+        max_scheduled_tokens=max_scheduled_tokens,
+        max_batch_size=max_batch_size,
+        prefix_granularity=geometry.prefix_granularity,
+        num_host_pages=specs.num_host_pages,
+        disable_l2_cache=not server_args.enable_kvstore,
+        enable_l3_storage=has_l3,
+        role=server_args.disaggregation_mode,
+        num_snapshot_pages=specs.num_snapshot_pages,
+        max_retracted_requests=specs.max_retracted_requests,
+        # The threshold is unset (None) without a store; the binding takes 0.
+        l3_prefetch_min_pages=server_args.kvstore_prefetch_min_pages if has_l3 else 0,
+        debug_force_retraction_interval=server_args.debug_force_retraction_interval,
+        enable_kv_cache_events=enable_kv_cache_events,
+        decode_input_tokens=decode_input_tokens,
+        overlap_schedule_depth=overlap_schedule_depth,
+        disable_prefix_cache=not server_args.enable_prefix_caching,
+        prefix_replay_tokens=prefix_replay_tokens,
+        cache_groups=specs.cache_groups,
+        enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+    )
+
+
 class EventLoop:
     def __init__(
         self,
@@ -281,7 +335,6 @@ class EventLoop:
             )
             self._dp_local_info = torch.zeros(1, 3, dtype=torch.int32)
             self._dp_global_info = torch.zeros(mapping.world_size, 3, dtype=torch.int32)
-        num_host_pages = specs.num_host_pages
         # The cache hooks gather over the TP CPU group, so the gather is sized
         # by that group, which --emulate-rank-zero backs with this process alone.
         cache_replica_tp_size = self.attn_tp_cpu_group.size()
@@ -352,30 +405,15 @@ class EventLoop:
         # Backend/pool compatibility is validated inside ModelExecutor
         # (validate_scheduler_config), before CUDA-graph capture.
         self._cache_groups = cache_groups
-        scheduler_cfg = make_config(
-            num_device_pages=geometry.num_device_pages,
+        scheduler_cfg = scheduler_config_from_args(
+            server_args,
+            specs,
             max_scheduled_tokens=max_scheduled_tokens,
             max_batch_size=per_rank_max_batch,
-            prefix_granularity=geometry.prefix_granularity,
-            num_host_pages=num_host_pages,
-            disable_l2_cache=not server_args.enable_kvstore,
-            enable_l3_storage=server_args.kvstore_storage_backend is not None,
-            role=server_args.disaggregation_mode,
-            num_snapshot_pages=specs.num_snapshot_pages,
-            max_retracted_requests=specs.max_retracted_requests,
-            l3_prefetch_min_pages=(
-                server_args.kvstore_prefetch_min_pages
-                if server_args.kvstore_storage_backend is not None
-                else 0
-            ),
-            debug_force_retraction_interval=server_args.debug_force_retraction_interval,
-            enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=self.overlap_schedule_depth,
-            disable_prefix_cache=not server_args.enable_prefix_caching,
+            enable_kv_cache_events=self._kv_events_enabled,
             prefix_replay_tokens=prefix_replay_tokens,
-            cache_groups=cache_groups,
-            enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
         logger.info(
             f"Scheduler config: prefix_granularity={scheduler_cfg.prefix_granularity!s}"
