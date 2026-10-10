@@ -150,8 +150,8 @@ case identity, advance it. For example, adding a consumer fusion without
 renaming the operation starts a new comparison epoch. For ordinary kernel
 implementation changes or benchmark harness and CI changes, do not advance it.
 Those kernel implementation changes are what the benchmark is intended to
-compare, while CI represents and checks timing-infrastructure compatibility
-separately.
+compare, while the comparison tooling represents and checks
+timing-infrastructure compatibility separately.
 
 Compatible cases must have the same ID, comparison epoch, definition, warmup
 settings, cache mode, and recorded hardware. Their measurement-block counts may
