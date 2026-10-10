@@ -1702,8 +1702,10 @@ def _rope_pad_query(
 
 @_register_rope("dsv41_rope_pad_query")
 def rope_pad_query(values, positions, cache):
+    from tokenspeed_kernel.ops.attention.dsv41 import query_heads
+
     n, h, _ = values.shape
-    hp = 64 if h <= 64 else 128
+    hp = query_heads(h)
     output = torch.empty((n, hp, 512), dtype=values.dtype, device=values.device)
     return _launch_query(values, positions, cache, output, hp)
 
