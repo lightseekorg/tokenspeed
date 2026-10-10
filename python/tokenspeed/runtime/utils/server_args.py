@@ -1210,6 +1210,15 @@ class ServerArgs:
                 )
             return
         if max_requests == 0:
+            # The cap is max_num_seqs per attention-DP rank: __post_init__
+            # resolves both before the cache.
+            if self.mapping is None or self.max_num_seqs is None:
+                raise ValueError(
+                    "resolve_parallelism() and resolve_memory_and_scheduling() must "
+                    "run before resolve_cache(): the derived "
+                    "--retraction-snapshot-max-requests is max_num_seqs per "
+                    "attention-DP rank"
+                )
             self.retraction_snapshot_max_requests = self.max_num_seqs // max(
                 self.mapping.attn.dp_size, 1
             )

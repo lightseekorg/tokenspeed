@@ -363,7 +363,11 @@ class EventLoop:
             role=server_args.disaggregation_mode,
             num_snapshot_pages=specs.num_snapshot_pages,
             max_retracted_requests=specs.max_retracted_requests,
-            l3_prefetch_min_pages=server_args.kvstore_prefetch_min_pages,
+            l3_prefetch_min_pages=(
+                server_args.kvstore_prefetch_min_pages
+                if server_args.kvstore_storage_backend is not None
+                else 0
+            ),
             debug_force_retraction_interval=server_args.debug_force_retraction_interval,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
