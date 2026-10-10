@@ -130,9 +130,15 @@ private:
     std::uint32_t nextOpId() { return next_op_id_++; }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
-    // The Host block an unacknowledged store already carries for key, with
-    // that store's op id; empty when none does.
-    std::pair<CacheBlockRef, std::uint32_t> inFlightHostBlock(const CacheKey& key) const;
+    // The Host block an unacknowledged store already carries for each key,
+    // with that store's op id. Built once per retraction from write_backs_
+    // (rather than mirrored in a second container) and looked up per slot.
+    struct InFlightHostBlock {
+        CacheBlockRef block;
+        std::uint32_t op_id{0};
+    };
+    using InFlightHostBlocks = std::unordered_map<CacheKey, InFlightHostBlock, CacheKeyHash>;
+    InFlightHostBlocks inFlightHostBlocks() const;
 
     CacheCoordinator& coordinator_;
     std::unordered_map<std::uint32_t, InFlightWriteBack> write_backs_;

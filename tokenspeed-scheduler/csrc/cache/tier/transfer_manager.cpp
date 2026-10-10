@@ -175,15 +175,16 @@ void TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {
     load_backs_.erase(it);
 }
 
-std::pair<CacheBlockRef, std::uint32_t> TierTransferManager::inFlightHostBlock(const CacheKey& key) const {
+TierTransferManager::InFlightHostBlocks TierTransferManager::inFlightHostBlocks() const {
+    InFlightHostBlocks by_key;
     for (const auto& [op_id, write_back] : write_backs_) {
         for (const StoreTicket& ticket : write_back.tickets) {
-            if (ticket.key == key) {
-                return {ticket.host_block_ref, op_id};
-            }
+            // StartPendingStores dedupes against in-flight keys, so each key
+            // travels on at most one ticket.
+            by_key.emplace(ticket.key, InFlightHostBlock{.block = ticket.host_block_ref, .op_id = op_id});
         }
     }
-    return {CacheBlockRef{}, 0};
+    return by_key;
 }
 
 std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartRetractionStores(
@@ -212,6 +213,7 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
     std::vector<std::uint32_t> allocate_groups;
     std::vector<std::int32_t> allocate_buckets;
     if (coordinator_.HasHostPool()) {
+        const InFlightHostBlocks in_flight = inFlightHostBlocks();
         for (std::int32_t g = 0; g < num_groups; ++g) {
             const GroupAllocator& allocator = coordinator_.Allocator(g);
             for (ImageSlot& slot : published[static_cast<std::size_t>(g)]) {
@@ -220,9 +222,9 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
                     host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
                     continue;
                 }
-                if (auto [in_flight, op_id] = inFlightHostBlock(slot.key); in_flight) {
-                    wait_for(op_id);
-                    slot.block = std::move(in_flight);
+                if (const auto it = in_flight.find(slot.key); it != in_flight.end()) {
+                    wait_for(it->second.op_id);
+                    slot.block = it->second.block;
                     host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
                     continue;
                 }
