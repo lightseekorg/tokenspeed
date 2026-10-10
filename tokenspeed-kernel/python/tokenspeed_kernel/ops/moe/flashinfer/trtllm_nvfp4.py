@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -34,6 +35,8 @@ platform = current_platform()
 TRTLLM_NVFP4_ISPP_ALIGNMENT = 64
 # Non-gated GEMM1 tiles its rows by 128.
 TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT = 128
+# The fused kernels miscompute a hidden size off this multiple, so it is zero-padded to one.
+TRTLLM_NVFP4_HIDDEN_ALIGNMENT = 256
 
 
 if platform.is_nvidia:
@@ -72,6 +75,8 @@ if platform.is_nvidia:
         # intermediate_size_per_partition: gated w13 stacks gate + up.
         intermediate_size = w13_rows // 2 if gated else w13_rows
         hidden_size = w.w13_weight.shape[2] * 2
+        hidden_pad = -hidden_size % TRTLLM_NVFP4_HIDDEN_ALIGNMENT
+        padded_hidden = hidden_size + hidden_pad
 
         if gated:
             # Fix 1: Swap [W1(Gate), W3(Up)] -> [W3(Up), W1(Gate)].
@@ -110,6 +115,16 @@ if platform.is_nvidia:
         w2_scales = w.w2_weight_scale.data.view(torch.float8_e4m3fn).reshape(
             num_experts, hidden_size, intermediate_size // _group_size
         )
+        if hidden_pad:
+            # Zero FP4 codes and zero block scales: the padded columns and rows contribute nothing.
+            w13_fp4, w13_scales = (
+                F.pad(t.view(torch.uint8), (0, hidden_pad // per_byte)).view(t.dtype)
+                for t, per_byte in ((w13_fp4, 2), (w13_scales, _group_size))
+            )
+            w2_fp4, w2_scales = (
+                F.pad(t.view(torch.uint8), (0, 0, 0, hidden_pad)).view(t.dtype)
+                for t in (w2_fp4, w2_scales)
+            )
 
         w13_weights_shuffled = []
         w13_scales_shuffled = []
@@ -171,7 +186,7 @@ if platform.is_nvidia:
         w.gemm1_scales_fp4_shuffled = torch.nn.Parameter(
             torch.stack(w13_scales_shuffled)
             .view(torch.float8_e4m3fn)
-            .reshape(num_experts, w13_rows, hidden_size // _group_size),
+            .reshape(num_experts, w13_rows, padded_hidden // _group_size),
             requires_grad=False,
         )
         w.gemm2_weights_fp4_shuffled = torch.nn.Parameter(
@@ -180,7 +195,7 @@ if platform.is_nvidia:
         w.gemm2_scales_fp4_shuffled = torch.nn.Parameter(
             torch.stack(w2_scales_shuffled)
             .view(torch.float8_e4m3fn)
-            .reshape(num_experts, hidden_size, intermediate_size // _group_size),
+            .reshape(num_experts, padded_hidden, intermediate_size // _group_size),
             requires_grad=False,
         )
 
@@ -290,6 +305,7 @@ if platform.is_nvidia:
 
         # Store intermediate_size_per_partition for the executor
         w.intermediate_size_per_partition = intermediate_size
+        w.trtllm_hidden_pad = hidden_pad
 
         # Free per-shard scales that are no longer needed
         del w.w13_weight_scale_2
@@ -354,11 +370,15 @@ if platform.is_nvidia:
                 data.new_empty((0,), dtype=torch.int32),
             )
 
+        hidden_pad = w.trtllm_hidden_pad
         if prequantized:
             hs_fp4, hs_scale = x
+            if hidden_pad:
+                hs_fp4 = F.pad(hs_fp4, (0, hidden_pad // 2))
+                hs_scale = F.pad(hs_scale.view(torch.uint8), (0, hidden_pad // 16))
         else:
             hs_fp4, hs_scale = fp4_quantize(
-                x,
+                F.pad(x, (0, hidden_pad)) if hidden_pad else x,
                 w.w13_input_scale_quant,
                 is_sf_swizzled_layout=False,
                 enable_pdl=enable_pdl,
@@ -396,7 +416,7 @@ if platform.is_nvidia:
 
         if activation_type is not None:
             common_kwargs["activation_type"] = activation_type
-        if output is not None:
+        if output is not None and not hidden_pad:
             # Caller-owned destination (e.g. a fused all-reduce lane slice);
             # the kernel writes the finalized rows in place.
             common_kwargs["output"] = output
@@ -428,9 +448,14 @@ if platform.is_nvidia:
                 **common_kwargs,
             )
         if do_finalize:
-            return result[0]
+            if not hidden_pad:
+                return result[0]
+            finalized = result[0][:, : result[0].shape[1] - hidden_pad]
+            return finalized.contiguous() if output is None else output.copy_(finalized)
         # Deferred: [gemm2_out, expert_weights, expanded_idx_to_permuted_idx]
         gemm2_out, expert_weights, expanded_idx = result
+        if hidden_pad:
+            gemm2_out = gemm2_out[:, : gemm2_out.shape[1] - hidden_pad].contiguous()
         if routed:
             # expert_weights just echoes the caller's input; shared-sink callers drop it and pass their own.
             return (gemm2_out, expert_weights, expanded_idx)

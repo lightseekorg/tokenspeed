@@ -37,6 +37,8 @@ from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
 HIDDEN = 256
 ISPP = 256
+# Nemotron-3 Nano's width, off the fused kernels' 256-column multiple.
+UNALIGNED_HIDDEN = 2688
 
 _FP8_E4M3_MAX = 448.0
 _FP4_E2M1_MAX = 6.0
@@ -147,18 +149,21 @@ class _MoEWeights(torch.nn.Module):
 
 
 def _make_weights(
-    generator: torch.Generator, num_experts: int, input_scales: tuple[float, float]
+    generator: torch.Generator,
+    num_experts: int,
+    input_scales: tuple[float, float],
+    hidden: int,
 ) -> dict[str, torch.Tensor]:
     """Non-gated NVFP4 experts in the loader layout: w13 ``[E, I, H]``, w2 ``[E, H, I]``."""
     w13, w13_scale, w13_s2 = [], [], []
     w2, w2_scale, w2_s2 = [], [], []
     for _ in range(num_experts):
         packed, sf, s2 = _nvfp4_quantize(
-            torch.randn(ISPP, HIDDEN, generator=generator) * 0.5
+            torch.randn(ISPP, hidden, generator=generator) * 0.5
         )
         w13.append(packed), w13_scale.append(sf), w13_s2.append(s2)
         packed, sf, s2 = _nvfp4_quantize(
-            torch.randn(HIDDEN, ISPP, generator=generator) * 0.5
+            torch.randn(hidden, ISPP, generator=generator) * 0.5
         )
         w2.append(packed), w2_scale.append(sf), w2_s2.append(s2)
     return {
@@ -217,9 +222,10 @@ def _random_topk(generator, num_tokens, num_experts, top_k):
 
 
 @requires_relu2
+@pytest.mark.parametrize("hidden", [HIDDEN, UNALIGNED_HIDDEN])
 @pytest.mark.parametrize("input_scales", [(1.0, 1.0), (0.05, 2.0)])
 @pytest.mark.parametrize("num_tokens", [1, 37])
-def test_relu2_routed_moe_matches_dequant_reference(input_scales, num_tokens):
+def test_relu2_routed_moe_matches_dequant_reference(input_scales, num_tokens, hidden):
     from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
         flashinfer_trtllm_nvfp4_relu2_moe_weights,
         flashinfer_trtllm_nvfp4_relu2_routed_moe_apply,
@@ -227,9 +233,9 @@ def test_relu2_routed_moe_matches_dequant_reference(input_scales, num_tokens):
 
     num_experts, top_k = 16, 6
     generator = torch.Generator().manual_seed(20260930)
-    raw = _make_weights(generator, num_experts, input_scales)
+    raw = _make_weights(generator, num_experts, input_scales, hidden)
     hidden_states = (
-        (torch.randn(num_tokens, HIDDEN, generator=generator) * 0.2).bfloat16().cuda()
+        (torch.randn(num_tokens, hidden, generator=generator) * 0.2).bfloat16().cuda()
     )
     topk_ids, topk_weights = _random_topk(generator, num_tokens, num_experts, top_k)
 
@@ -262,7 +268,7 @@ def test_relu2_kernel_routing_matches_sigmoid_bias_top22(num_tokens):
 
     num_experts, top_k, scale = 512, 22, 5.0
     generator = torch.Generator().manual_seed(88)
-    raw = _make_weights(generator, num_experts, (1.0, 1.0))
+    raw = _make_weights(generator, num_experts, (1.0, 1.0), HIDDEN)
     hidden_states = (
         (torch.randn(num_tokens, HIDDEN, generator=generator) * 0.2).bfloat16().cuda()
     )
