@@ -551,7 +551,10 @@ For orientation, one iteration of `event_loop`:
   `Cache.PrefetchOp`, and holds the request in a pre-admission state
   (`Prefetching`: no Device page, no request-pool row, admission skips past
   it) while the executor's lane fills the pages in prefix order, stopping at
-  the first missing object or at the deadline. Each round the hooks
+  the first missing object or at the deadline -- which bounds when the next
+  batch may start, not a batch in flight: the store's `batch_get_into` has
+  no timeout, so a hung get holds the single-thread lane and every later
+  prefetch, the namespace delete and shutdown behind it. Each round the hooks
   MIN-reduce every in-flight op's landed prefix across the replica; the
   converged op is acknowledged once as `PrefetchDoneEvent(op_id,
   landed_pages)`, the scheduler publishes the landed prefix in the Host

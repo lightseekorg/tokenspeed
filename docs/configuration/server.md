@@ -967,7 +967,11 @@ admitted past it. The Host cache executor's prefetch lane (a CPU thread)
 fills the pages in prefix order, `--kvstore-prefetch-batch-pages` per
 `batch_get_into`, and stops at the first missing page or at the deadline
 `--kvstore-prefetch-timeout-base-s + --kvstore-prefetch-timeout-per-page-s
-x pages`; the replica agrees (a MIN across TP, CP and PP) on the pages
+x pages`, counted from when the op starts on the lane and checked between
+batches only (a `batch_get_into` already issued runs to completion -- the
+store API has no timeout -- so one batch may overrun the deadline, and a
+hung store holds the lane and every later prefetch behind it); the replica
+agrees (a MIN across TP, CP and PP) on the pages
 landed, the scheduler publishes exactly that prefix in Host L2 and forgets
 the rest of the keys, and the request's admission is then an ordinary Host
 hit whose Host-to-Device load overlaps its first chunk layer by layer.
@@ -982,7 +986,7 @@ knobs are required with `--kvstore-storage-backend` and refused without it:
 | Argument | Description |
 | --- | --- |
 | `--kvstore-prefetch-min-pages` | The shortest L3-only prefix, in prefix pages, worth a prefetch; a shorter hit is computed. The reference engine's `prefetch_threshold`. |
-| `--kvstore-prefetch-timeout-base-s` | The prefetch deadline's base term in seconds (positive). |
+| `--kvstore-prefetch-timeout-base-s` | The prefetch deadline's base term in seconds (positive). The deadline says when the lane stops starting batches; it does not interrupt a batch in flight. |
 | `--kvstore-prefetch-timeout-per-page-s` | The deadline's per-page term in seconds (0 for a fixed deadline). |
 | `--kvstore-prefetch-batch-pages` | Prefix pages per `batch_get_into` of a prefetch; the fetch stops at the first batch with a missing page (the reference engine uses 128). |
 

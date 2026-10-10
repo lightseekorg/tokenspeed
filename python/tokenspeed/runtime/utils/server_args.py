@@ -2348,9 +2348,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.kvstore_prefetch_timeout_base_s,
             help="L3 prefetch deadline, base term in seconds: a prefetch stops "
-            "starting batches base + per-page * pages seconds after it began and "
-            "lands the prefix it has. Positive; required with "
-            "--kvstore-storage-backend.",
+            "starting batches base + per-page * pages seconds after it began on "
+            "the prefetch lane and lands the prefix it has. The deadline is "
+            "checked between batches only -- a batch_get_into already issued "
+            "runs to completion (the store API has no timeout), so one batch may "
+            "overrun it and a hung store holds the lane and every later "
+            "prefetch. Positive; required with --kvstore-storage-backend.",
         )
         parser.add_argument(
             "--kvstore-prefetch-timeout-per-page-s",

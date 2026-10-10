@@ -437,9 +437,13 @@ class HostCacheExecutor:
             rank: This rank's position in the L3 key.
             prefix_for_weight_version: Builds the namespace of a weight version.
             prefetch_timeout_base_s: A prefetch op's deadline is
-                ``base + per_page * pages`` seconds after it starts
-                (``--kvstore-prefetch-timeout-base-s``); batches past the
-                deadline are not fetched and the op lands what it has.
+                ``base + per_page * pages`` seconds after it starts on the
+                lane (``--kvstore-prefetch-timeout-base-s``); a batch is not
+                started past the deadline and the op lands what it has. The
+                deadline bounds nothing else: ``batch_get_into`` has no
+                timeout, so a batch already issued runs to completion and a
+                hung store holds the single-thread lane -- later prefetches,
+                the namespace delete and shutdown wait behind it.
             prefetch_timeout_per_page_s: The per-page term of that deadline
                 (``--kvstore-prefetch-timeout-per-page-s``).
             prefetch_batch_pages: Prefix pages per ``batch_get_into``
@@ -746,11 +750,13 @@ class HostCacheExecutor:
         """The lane's job: fetch ``pages`` in prefix order; return the pages landed.
 
         One ``batch_get_into`` per ``prefetch_batch_pages`` prefix pages. A
-        batch is not started past the deadline; the first page whose get
-        fails (any of its groups) ends the fetch, and the pages before it
-        are the result -- a page with no rows (nothing of it to fetch here)
-        lands trivially. A backend fault counts as a miss at that batch, so
-        the replica still converges on a prefix.
+        batch is not started past the deadline (checked between batches
+        only: the store call has no timeout, so an issued batch runs to
+        completion); the first page whose get fails (any of its groups) ends
+        the fetch, and the pages before it are the result -- a page with no
+        rows (nothing of it to fetch here) lands trivially. A backend fault
+        counts as a miss at that batch, so the replica still converges on a
+        prefix.
         """
         l3_store = self.l3_store
         if l3_store is None:
