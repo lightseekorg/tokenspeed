@@ -331,7 +331,7 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                     )
                     table[0, 0] = 1
 
-    def test_write_slots_translate_and_mask_for_every_dcp_size(self):
+    def test_write_slots_translate_and_mask_for_every_kvp_size(self):
         table = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
         slots = torch.tensor(
             [0, 63, 64, 128, 200, 256, 511, 576, -1], dtype=torch.int64
@@ -434,7 +434,7 @@ class RecipeDeclarationTest(unittest.TestCase):
                     )
                     self.assertEqual(spec.shard_count, expected, spec.group_id)
 
-    def test_group_set_does_not_depend_on_the_dcp_size(self):
+    def test_group_set_does_not_depend_on_the_kvp_size(self):
         ids = {
             kvp_size: [
                 spec.group_id
@@ -469,7 +469,7 @@ class RecipeDeclarationTest(unittest.TestCase):
                     recipe.parents_needed(layout, capacity + 256), parents
                 )
 
-    def test_dcp_raises_capacity_without_growing_the_arena(self):
+    def test_kvp_raises_capacity_without_growing_the_arena(self):
         base = _recipe(kvp_size=1, fp4=True, draft=True).setup().spec
         sharded = _recipe(kvp_size=4, fp4=True, draft=True).setup().spec
         self.assertGreater(sharded.token_capacity, base.token_capacity)
@@ -550,7 +550,7 @@ class PrefillExchangePlanTest(unittest.TestCase):
 
 
 class MappingTest(unittest.TestCase):
-    def test_dcp_subgroups_are_consecutive_within_attention_tp(self):
+    def test_kvp_subgroups_are_consecutive_within_attention_tp(self):
         for rank in range(8):
             mapping = AttentionLayerMapping(
                 rank=rank, world_size=8, tp_size=8, dp_size=1, kvp_size=4
@@ -567,7 +567,7 @@ class MappingTest(unittest.TestCase):
         self.assertFalse(plain.has_kvp)
         self.assertEqual(plain.kvp_group, (3,))
 
-    def test_dcp_must_divide_attention_tp(self):
+    def test_kvp_must_divide_attention_tp(self):
         with self.assertRaisesRegex(ValueError, "divisible"):
             AttentionLayerMapping(
                 rank=0, world_size=8, tp_size=8, dp_size=1, kvp_size=3
@@ -607,7 +607,7 @@ class ConfigurationTest(unittest.TestCase):
         fields.update(overrides)
         return AttnConfig(**fields)
 
-    def test_dcp_requires_the_deepseek_v4_backend(self):
+    def test_kvp_requires_a_dcp_capable_backend(self):
         with self.assertRaisesRegex(ValueError, "DeepSeek V4"):
             self._config(components=(self._component("mha"),))
 
@@ -629,7 +629,7 @@ class ConfigurationTest(unittest.TestCase):
         ):
             self._config(kvp_size=1, kvp_group=(0,))
 
-    def test_dcp_keeps_the_host_kvstore_but_refuses_l3(self):
+    def test_kvp_keeps_the_host_kvstore_but_refuses_l3(self):
         # Host blocks are allocated in their Device block's residue class, so
         # the KVStore (and the retraction snapshot pool) serve a sharded
         # engine; an L3 key has no owner-stable form under sharding.
@@ -647,7 +647,7 @@ class ConfigurationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "L3"):
             args.validate_cache_options()
 
-    def test_dcp_allows_aggregated_and_prefill_roles_only(self):
+    def test_kvp_allows_aggregated_and_prefill_roles_only(self):
         for mode in ("null", "prefill"):
             validate_kvp_disaggregation_role(has_kvp=True, disaggregation_mode=mode)
         for mode in ("null", "prefill", "decode", "encode"):

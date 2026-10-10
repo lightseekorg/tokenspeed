@@ -84,7 +84,7 @@ def test_refusals(argv, match):
         prepare_server_args(BASE + argv)
 
 
-def test_refuses_dcp_narrower_than_the_shard_group():
+def test_refuses_kvp_narrower_than_the_shard_group():
     argv = [flag if flag != "2" else "4" for flag in BASE]
     with pytest.raises(ValueError, match="--kv-parallel-size must be 1"):
         prepare_server_args(argv + ["--kv-parallel-size", "2"])

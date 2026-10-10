@@ -6982,7 +6982,7 @@ def _unbound_deepseek_v4_backend():
 
 
 class DeepseekV4RebindTest(unittest.TestCase):
-    def test_indexer_cache_uses_dcp_topology_but_state_remains_replicated(self):
+    def test_indexer_cache_uses_kvp_topology_but_state_remains_replicated(self):
         for degree in (1, 4):
             with self.subTest(degree=degree):
                 backend = _unbound_deepseek_v4_backend()
@@ -7004,7 +7004,7 @@ class DeepseekV4RebindTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "topologies disagree"):
                         backend.set_cache_pool(pool)
 
-    def test_dcp_rebind_and_runtime_configuration_retain_virtual_page_bounds(self):
+    def test_kvp_rebind_and_runtime_configuration_retain_virtual_page_bounds(self):
         for degree in (1, 4):
             with self.subTest(degree=degree):
                 backend = _unbound_deepseek_v4_backend()

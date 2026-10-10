@@ -81,7 +81,7 @@ def _recipe(degree, fp4):
 
 
 class Dsv4CacheArenaBenefitTest(unittest.TestCase):
-    def test_dcp_increases_capacity_with_the_same_cache_budget(self):
+    def test_kvp_increases_capacity_with_the_same_cache_budget(self):
         for fp4 in (False, True):
             with self.subTest(fp4=fp4):
                 tp_recipe = _recipe(degree=1, fp4=fp4)

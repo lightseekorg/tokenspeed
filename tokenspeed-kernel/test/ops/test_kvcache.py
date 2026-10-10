@@ -45,7 +45,7 @@ from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
 
-def test_dcp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> None:
+def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> None:
     def run(batch, cols, queries, padding):
         owned = torch.arange(cols) % 3 == 0
         prefix = torch.zeros((batch, cols + 1 + padding), dtype=torch.int32)

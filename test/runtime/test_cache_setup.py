@@ -1229,7 +1229,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         (None, "flashmla", "does not yet support speculation"),
     ],
 )
-def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
+def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
     monkeypatch, target_backend, draft_backend, error
 ):
     from test.runtime.conftest import kimi_recipe

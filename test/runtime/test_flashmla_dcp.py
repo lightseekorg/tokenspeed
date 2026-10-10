@@ -617,7 +617,7 @@ def test_gather_owned_rows_masks_nan_and_preserves_order(monkeypatch, shape, gro
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("token_limit", [None, 64, 128, 576])
-def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
+def test_ordinary_mla_kvp_capacity_and_token_limit(degree, token_limit):
     from test.runtime.test_cache_setup import _mla_config
     from types import SimpleNamespace
 
@@ -656,7 +656,7 @@ def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
 
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
-def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
+def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
     from dataclasses import asdict
     from test.runtime.test_cache_setup import _mla_config
     from types import SimpleNamespace
