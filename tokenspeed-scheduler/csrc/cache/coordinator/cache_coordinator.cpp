@@ -402,18 +402,19 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
     if (extension_pages < min_pages) {
         return std::nullopt;
     }
-    PrefetchPlan plan{.first_page = floor_tokens / prefix_granularity_};
-    for (std::int32_t page = 0; page < extension_pages; ++page) {
-        // Every group's rows of the page are acquired in one batch (one Host
-        // allocation pass per page, not per row); a shortfall leaves a row
-        // empty, and the page -- its other blocks returning -- is not planned.
-        std::vector<std::uint32_t> page_groups;
-        std::vector<CacheKey> page_keys;
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            const std::int32_t block_granularity = geometry_[i].BlockGranularity();
-            const std::int32_t blocks_per_page = prefix_granularity_ / block_granularity;
-            const std::int32_t floor_blocks = floor_tokens / block_granularity;
-            const GroupPrefixProbe& hits = probe.storage.per_group[i];
+    // The rows each page needs: a storage-tier hit the matcher asked for
+    // whose object is not already on Host.
+    struct PageRows {
+        std::vector<std::uint32_t> groups;
+        std::vector<CacheKey> keys;
+    };
+    std::vector<PageRows> pages(static_cast<std::size_t>(extension_pages));
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const std::int32_t block_granularity = geometry_[i].BlockGranularity();
+        const std::int32_t blocks_per_page = prefix_granularity_ / block_granularity;
+        const std::int32_t floor_blocks = floor_tokens / block_granularity;
+        const GroupPrefixProbe& hits = probe.storage.per_group[i];
+        for (std::int32_t page = 0; page < extension_pages; ++page) {
             for (std::int32_t b = page * blocks_per_page; b < (page + 1) * blocks_per_page; ++b) {
                 const auto hit_index = static_cast<std::size_t>(b);
                 if (hit_index >= hits.hits.size() || hits.hits[hit_index] == 0) {
@@ -424,21 +425,53 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
                     continue;  // landed meanwhile: an ordinary Host hit at admission
                 }
                 _assert(storage_keys_.contains(key), "storage probe hit without a Host or L3 entry");
-                page_groups.push_back(groups_[i].Id());
-                page_keys.push_back(key);
+                pages[static_cast<std::size_t>(page)].groups.push_back(groups_[i].Id());
+                pages[static_cast<std::size_t>(page)].keys.push_back(key);
             }
         }
+    }
+    // The threshold is decided before anything is acquired: a fill that would
+    // stop short of min_pages must evict nothing for the attempt. Counted per
+    // group against its free slots, its unpinned entries and the pool's empty
+    // parents (conservative: another group's evictable parents are not
+    // counted, so a plan this refuses might have fit by evicting them -- the
+    // request then computes the pages, which never blocks it).
+    {
+        std::vector<std::int64_t> rows_by_group(groups_.size(), 0);
+        for (std::int32_t page = 0; page < min_pages; ++page) {
+            for (const std::uint32_t group_id : pages[static_cast<std::size_t>(page)].groups) {
+                ++rows_by_group[group_id];
+            }
+        }
+        std::int64_t parents_needed = 0;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            const std::int64_t evictable = groups_[i].Index().EvictableCandidates(*host_pool_).size();
+            const std::vector<std::int64_t> need{std::max<std::int64_t>(0, rows_by_group[i] - evictable)};
+            parents_needed +=
+                ParentsNeededForBuckets(need, host_pool_->FreeSlotsByBucket(groups_[i].Id()),
+                                        /*dense_need=*/0, groups_[i].Allocator().CacheBlocksPerLcmBlock());
+        }
+        if (parents_needed > host_pool_->NumEmptyLcmBlocks()) {
+            return std::nullopt;
+        }
+    }
+    PrefetchPlan plan{.first_page = floor_tokens / prefix_granularity_};
+    for (std::int32_t page = 0; page < extension_pages; ++page) {
+        // Every group's rows of the page are acquired in one batch (one Host
+        // allocation pass per page, not per row); a shortfall leaves a row
+        // empty, and the page -- its other blocks returning -- is not planned.
         // L3 is accepted only for replicated groups (one bucket), see
         // Validate; a prefetch destination has no Device counterpart whose
         // bucket it would have to follow.
-        const std::vector<std::int32_t> buckets(page_groups.size(), 0);
-        HostAllocationBatch host_blocks = AcquireHostBlocks(page_groups, buckets);
+        PageRows& rows = pages[static_cast<std::size_t>(page)];
+        const std::vector<std::int32_t> buckets(rows.groups.size(), 0);
+        HostAllocationBatch host_blocks = AcquireHostBlocks(rows.groups, buckets);
         if (host_blocks.stats.unallocated != 0) {
             break;  // the Host pool is pinned full: the fill stops before this page
         }
-        for (std::size_t r = 0; r < page_keys.size(); ++r) {
-            plan.rows.push_back(PrefetchRow{.group_id = page_groups[r],
-                                            .key = page_keys[r],
+        for (std::size_t r = 0; r < rows.keys.size(); ++r) {
+            plan.rows.push_back(PrefetchRow{.group_id = rows.groups[r],
+                                            .key = std::move(rows.keys[r]),
                                             .host_block = std::move(host_blocks.blocks[r]),
                                             .page_index = plan.first_page + page});
         }

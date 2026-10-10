@@ -593,7 +593,6 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     // eviction like prefix hits; every other slot is a bucket-constrained
     // fresh block.
     std::vector<PlannedShape> shapes(groups_.size());
-    std::vector<std::vector<CacheBlockLocation>> claimable(groups_.size());
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> protected_locations;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         _assert(demands[i].table != nullptr && demands[i].table->NumBlocks() == 0,

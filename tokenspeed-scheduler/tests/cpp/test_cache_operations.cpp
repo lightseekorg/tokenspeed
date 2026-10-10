@@ -795,6 +795,53 @@ TEST(CacheOperationTest, AMalformedPrefetchAckIsIgnoredAndTheOpStaysInFlight) {
     EXPECT_FALSE(transfers.HasAnyInFlight());
 }
 
+TEST(CacheOperationTest, APrefetchBelowTheThresholdEvictsNothing) {
+    BlockPool device_pool{8, {1}};
+    BlockPool host_pool{4, {1}};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true);
+    // Two Host blocks hold another prompt's unpinned entries, two are pinned:
+    // at most two rows can ever be placed, both by eviction.
+    const CacheKey other0{.group_id = 0, .content_hash = "other0"};
+    const CacheKey other1{.group_id = 0, .content_hash = "other1"};
+    for (const CacheKey& key : {other0, other1}) {
+        CacheBlockRef block = coordinator.AcquireHostBlock(/*group_id=*/0, /*bucket=*/0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, key);
+    }
+    const std::vector<CacheBlockRef> pinned = host_pool.AcquireBlocks(/*group_id=*/0, 2);
+    ASSERT_EQ(pinned.size(), 2u);
+    ASSERT_EQ(coordinator.NumHostCachedBlocks(), 2);
+
+    const CacheKey h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey h1{.group_id = 0, .content_hash = "h1"};
+    const CacheKey h2{.group_id = 0, .content_hash = "h2"};
+    coordinator.RegisterStorageKeys(std::array{h0, h1, h2});
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"});
+    ASSERT_EQ(probe.storage.num_common_tokens, 6);
+
+    // Three pages are wanted but two can be placed: below a three-page
+    // threshold the plan is refused before any block is acquired, so the
+    // other prompt's entries are untouched.
+    EXPECT_FALSE(coordinator.PlanPrefetch(probe, /*min_pages=*/3));
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 2) << "a refused plan evicts nothing";
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(other0));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(other1));
+
+    // At a two-page threshold the fill is worth its evictions.
+    auto plan = coordinator.PlanPrefetch(probe, /*min_pages=*/2);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->page_row_ends, (std::vector<std::size_t>{1, 2}));
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0) << "both entries gave way to the fill";
+}
+
 TEST(CacheOperationTest, ALandedPrefetchPublishesHostEntriesTheAdmissionThenLoads) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
