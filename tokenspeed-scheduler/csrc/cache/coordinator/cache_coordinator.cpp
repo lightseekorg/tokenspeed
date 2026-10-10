@@ -404,8 +404,12 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
     }
     PrefetchPlan plan{.first_page = floor_tokens / prefix_granularity_};
     for (std::int32_t page = 0; page < extension_pages; ++page) {
-        bool short_of_blocks = false;
-        for (std::size_t i = 0; i < groups_.size() && !short_of_blocks; ++i) {
+        // Every group's rows of the page are acquired in one batch (one Host
+        // allocation pass per page, not per row); a shortfall leaves a row
+        // empty, and the page -- its other blocks returning -- is not planned.
+        std::vector<std::uint32_t> page_groups;
+        std::vector<CacheKey> page_keys;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::int32_t block_granularity = geometry_[i].BlockGranularity();
             const std::int32_t blocks_per_page = prefix_granularity_ / block_granularity;
             const std::int32_t floor_blocks = floor_tokens / block_granularity;
@@ -420,23 +424,23 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
                     continue;  // landed meanwhile: an ordinary Host hit at admission
                 }
                 _assert(storage_keys_.contains(key), "storage probe hit without a Host or L3 entry");
-                // L3 is accepted only for replicated groups (one bucket), see
-                // Validate; a prefetch destination has no Device counterpart
-                // whose bucket it would have to follow.
-                CacheBlockRef host_block = AcquireHostBlock(groups_[i].Id(), /*bucket=*/0);
-                if (!host_block) {
-                    short_of_blocks = true;  // the Host pool is pinned full: the fill stops before this page
-                    break;
-                }
-                plan.rows.push_back(PrefetchRow{.group_id = groups_[i].Id(),
-                                                .key = key,
-                                                .host_block = host_block,
-                                                .page_index = plan.first_page + page});
+                page_groups.push_back(groups_[i].Id());
+                page_keys.push_back(key);
             }
         }
-        if (short_of_blocks) {
-            plan.rows.resize(plan.page_row_ends.empty() ? 0 : plan.page_row_ends.back());
-            break;
+        // L3 is accepted only for replicated groups (one bucket), see
+        // Validate; a prefetch destination has no Device counterpart whose
+        // bucket it would have to follow.
+        const std::vector<std::int32_t> buckets(page_groups.size(), 0);
+        HostAllocationBatch host_blocks = AcquireHostBlocks(page_groups, buckets);
+        if (host_blocks.stats.unallocated != 0) {
+            break;  // the Host pool is pinned full: the fill stops before this page
+        }
+        for (std::size_t r = 0; r < page_keys.size(); ++r) {
+            plan.rows.push_back(PrefetchRow{.group_id = page_groups[r],
+                                            .key = page_keys[r],
+                                            .host_block = std::move(host_blocks.blocks[r]),
+                                            .page_index = plan.first_page + page});
         }
         plan.page_row_ends.push_back(plan.rows.size());
     }
