@@ -359,8 +359,12 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
 
         const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
-        tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
-                                               promotion_boundary_tokens);
+        // A remote landing completes the prompt in one transfer. Local chunk
+        // promotion must not truncate its window or drop the first decode reserve.
+        tokens_this_round = source == fsm::PrefillSource::kRemote
+                                ? unscheduled
+                                : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled,
+                                                     remaining, promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return std::nullopt;
         }
