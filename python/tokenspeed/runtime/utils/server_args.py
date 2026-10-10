@@ -1188,14 +1188,18 @@ class ServerArgs:
                 "--retraction-snapshot-max-requests must be non-negative"
             )
         if not self.retracting_role:
-            if host_gb > 0 or ratio is not None or max_requests > 0:
+            forced = self.debug_force_retraction_interval != 0
+            if host_gb > 0 or ratio is not None or max_requests > 0 or forced:
                 logger.info(
                     f"{self.disaggregation_mode!s} instance never retracts; ignoring "
                     "the retraction snapshot pool arguments"
+                    + (" and --debug-force-retraction-interval" if forced else "")
                 )
             self.retraction_snapshot_host_gb = 0.0
             self.retraction_snapshot_ratio = 0.0
             self.retraction_snapshot_max_requests = 0
+            # The scheduler refuses the knob on a pool-less engine.
+            self.debug_force_retraction_interval = 0
             return
         if self.retraction_snapshot_pool_disabled:
             if max_requests > 0:
@@ -1219,9 +1223,16 @@ class ServerArgs:
                     "--retraction-snapshot-max-requests is max_num_seqs per "
                     "attention-DP rank"
                 )
-            self.retraction_snapshot_max_requests = self.max_num_seqs // max(
-                self.mapping.attn.dp_size, 1
-            )
+            dp_size = max(self.mapping.attn.dp_size, 1)
+            self.retraction_snapshot_max_requests = self.max_num_seqs // dp_size
+            if self.retraction_snapshot_max_requests == 0:
+                raise ValueError(
+                    "the retraction snapshot pool derives its request cap from "
+                    f"--max-num-seqs ({self.max_num_seqs}) per attention-DP rank "
+                    f"({dp_size}), which is 0 here; raise --max-num-seqs to at "
+                    "least the attention-DP size or pass "
+                    "--retraction-snapshot-max-requests"
+                )
 
     def resolve_speculative_decoding(self):
         # Keep drafter backend consistent with the main model unless explicitly set.

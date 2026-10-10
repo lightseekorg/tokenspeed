@@ -73,6 +73,12 @@ def test_default_is_a_derived_pool_with_the_request_cap_from_max_num_seqs():
     # An explicit cap is kept as is.
     args = ServerArgs(model="x", max_num_seqs=64, retraction_snapshot_max_requests=3)
     assert args.retraction_snapshot_max_requests == 3
+    # Fewer requests than attention-DP ranks derive to no rows: refused by
+    # name (resolve_cache runs before the general max_num_seqs check).
+    with pytest.raises(
+        ValueError, match=r"--max-num-seqs \(1\).*--retraction-snapshot-max-requests"
+    ):
+        ServerArgs(model="x", world_size=2, data_parallel_size=2, max_num_seqs=1)
 
 
 def test_explicit_size_and_ratio_pass_through_and_each_is_enough_alone():
@@ -124,6 +130,19 @@ def test_non_retracting_roles_resolve_to_no_pool_with_a_log(role, caplog):
     )
     assert args.retraction_snapshot_max_requests == 0
     assert any("never retracts" in record.message for record in caplog.records)
+    # The forced-retraction test knob is dropped too (the scheduler refuses
+    # it on a pool-less engine), and the log says so.
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        args = ServerArgs(
+            model="x", disaggregation_mode=role, debug_force_retraction_interval=3
+        )
+    assert args.debug_force_retraction_interval == 0
+    assert any(
+        "never retracts" in record.message
+        and "--debug-force-retraction-interval" in record.message
+        for record in caplog.records
+    )
     # Nothing to say when nothing was asked for.
     caplog.clear()
     with caplog.at_level(logging.INFO):
