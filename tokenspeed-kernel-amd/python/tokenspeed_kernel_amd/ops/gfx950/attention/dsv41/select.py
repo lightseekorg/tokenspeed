@@ -66,6 +66,8 @@ def dsv41_index_select_gfx950(
     stride_block_out,
     topk,
     candidate_topk,
+    row_cap,
+    block_cap,
     HAS_CANDIDATES: tl.constexpr,
     SORT_ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -145,6 +147,13 @@ def dsv41_index_select_gfx950(
         selected += tl.sum(chosen)
         ties += tl.sum(equal)
     tl.store(lens, selected)
+    # Pad the rest of the destination row, so callers need not pre-fill it.
+    cap = tl.where(BLOCKS, block_cap, row_cap)
+    for start in range(0, cap, BLOCK):
+        pad = start + tl.arange(0, BLOCK)
+        tl.store(out + pad, -1, mask=(pad >= selected) & (pad < cap))
+    if candidate_topk == 0:
+        tl.store(block_lens + query, 0)
 
     if SORT_ROWS:
         # Candidate blocks need not be ordered: sort the selected logical rows.
@@ -185,6 +194,8 @@ def launch_dsv41_index_select_gfx950(
         block_out.stride(0) if block_out.ndim == 2 and block_out.shape[1] else 0,
         min(int(topk), width),
         min(int(candidate_topk), width // 8),
+        row_out.shape[1],
+        block_out.shape[1] if block_out.ndim == 2 else 0,
         HAS_CANDIDATES=has_candidates,
         SORT_ROWS=has_candidates,
         BLOCK=2048,

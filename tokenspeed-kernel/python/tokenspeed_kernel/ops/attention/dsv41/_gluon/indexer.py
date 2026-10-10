@@ -152,11 +152,14 @@ def run_dsv41_csa2_index_topk(
 
     tokens = index_q.shape[0]
     row_out, row_lens, block_out, block_lens = out
-    row_out.fill_(-1)
-    row_lens.zero_()
-    block_out.fill_(-1)
-    block_lens.zero_()
-    if not tokens or not page_table.shape[1] or need < 1:
+    empty = not tokens or not page_table.shape[1] or need < 1
+    if launch_select is None or empty:
+        # A select kernel writes its rows' padding; other paths start filled.
+        row_out.fill_(-1)
+        row_lens.zero_()
+        block_out.fill_(-1)
+        block_lens.zero_()
+    if empty:
         return out
 
     # Arena pages have gaps between them but contiguous bytes within each page.
