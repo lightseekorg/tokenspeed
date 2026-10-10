@@ -1177,17 +1177,32 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         table = table[:, : max(0, index_cache.shape[0] - 1)]
         candidate_capacity = min(self.spec.candidate_topk, table.shape[1] * 8)
         n = positions.numel()
-        rows = torch.full(
-            (n, self.spec.index_topk), -1, dtype=torch.int32, device=self.device
-        )
-        lens = torch.zeros(n, dtype=torch.int32, device=self.device)
-        blocks = torch.full(
-            (n, candidate_capacity if produce_candidates else 0),
-            -1,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        block_lens = torch.zeros(n, dtype=torch.int32, device=self.device)
+        # index_topk writes every element of its outputs, padding included, so
+        # decode (whose query tiles cover all rows) skips the initial fills.
+        # Prefill windows only cover rows inside request spans.
+        if window is None:
+            rows = torch.empty(
+                (n, self.spec.index_topk), dtype=torch.int32, device=self.device
+            )
+            lens = torch.empty(n, dtype=torch.int32, device=self.device)
+            blocks = torch.empty(
+                (n, candidate_capacity if produce_candidates else 0),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            block_lens = torch.empty(n, dtype=torch.int32, device=self.device)
+        else:
+            rows = torch.full(
+                (n, self.spec.index_topk), -1, dtype=torch.int32, device=self.device
+            )
+            lens = torch.zeros(n, dtype=torch.int32, device=self.device)
+            blocks = torch.full(
+                (n, candidate_capacity if produce_candidates else 0),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            block_lens = torch.zeros(n, dtype=torch.int32, device=self.device)
         # Query tiling bounds both score scratch and replicated table rows. Do
         # not index_select the table for the entire prefill (T * context pages).
         canonical_prefill = window is not None
