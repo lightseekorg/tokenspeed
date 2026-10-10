@@ -1,4 +1,4 @@
-# Scheduler: admission, retraction and recovery
+# Scheduler: admission, retraction and restore
 
 The C++ scheduler (`tokenspeed-scheduler/`) decides, once per round, what each
 engine does next. This document covers one axis of that: **at what granularity
@@ -54,19 +54,12 @@ cached position has none, so the runtime admits it with the bound set to `s`
 and the positions `>= s` are recomputed as ordinary prefill input whatever the
 cache holds. The bound limits the probe itself, not a later trim, so excluded
 hit pages are never claimed and the recomputed suffix lands on private pages.
-A readmission after retraction relaxes the bound to
-`max(max_cached_prefix_tokens, landed_tokens)`, where `fsm::Retracted` records
-the positions whose forward results had landed before the retraction (the
-victim's computed chunks; for a decoding victim its whole rebased prompt).
-Those positions produced their logits and the runtime keeps those logprobs, so
-matching them back -- the victim's own snapshot or anyone's equal pages --
-loses nothing and recomputing them would only redo work. The probe does not
-reach further: it matches the global prefix cache, not the victim's snapshot,
-and a deeper hit on another request's pages (or on a chunk whose forward was
-skipped after a failed cache load) would stand in for logits that were never
-produced. The decode role of a disaggregated deployment never computes prompt
-rows (the prefill node returns the logprobs), so the runtime leaves its bound
-at the default.
+Only a `Submitted` prompt is probed: a retracted request is never re-probed,
+it comes back by restoring its image (§4), so no position whose logits were
+produced is ever matched against another request's pages or recomputed. The
+decode role of a disaggregated deployment never computes prompt rows (the
+prefill node returns the logprobs), so the runtime leaves its bound at the
+default.
 
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in
@@ -197,8 +190,8 @@ only supplies the full extent and block tables, not a body/tail execution plan.
 
 An incomplete prefill holds the head of line; a completing prefill releases
 it within the same plan build. The same rule applies with prefix caching
-disabled and during local recovery on a decode node. Remote decode-role
-admission keeps its endpoint-only landing layout.
+disabled. Remote decode-role admission keeps its endpoint-only landing layout;
+a decode node never prefills locally (§3.2).
 
 The capacity guarantees are retention-specific:
 
@@ -220,10 +213,13 @@ The capacity guarantees are retention-specific:
   sparse re-shaping requires `AvailableTokens() == 0`).
 
 Finish can publish a pending prefill checkpoint, then queues existing prefill
-cache for L2 without upgrading its kind. With L2, prefill retraction may publish
-a materialized recovery Endpoint at the completed window boundary; `Prefilling`
-and `PrefillDone` both use their actual prefill window. Decode retraction adds
-no state checkpoint. Missing cache is recomputed through ordinary prefill.
+cache for L2 without upgrading its kind. Retraction publishes the same way
+before it images the request (§2): a mid-prefill victim may publish a
+materialized Endpoint at its completed window boundary (`Prefilling` and
+`PrefillDone` both use their actual prefill window), a decoding victim adds no
+state checkpoint. The image then carries every block the tables hold — the
+working state included — so a resumed request needs no checkpoint it did not
+already own (§4).
 
 ### 1.3 Bounded replay
 
@@ -289,11 +285,11 @@ boundary aligns it — the first chunk spends the hit window before sizing its
 new tokens (and waits for a fresher budget when none is left), and in fused
 mixed mode the decode batch leaves that same amount for a pending local
 prefill (`MinPrefillChunkTokens`, the same reserve the mamba checkpoint page
-uses). Replay is re-derived at every
-admission, so a retracted request carries nothing: its readmission re-probes
-and replays from the new `P`. Replayable groups cannot be combined with
-snapshot-state groups, whose chunk alignment would fight the final-window
-rule.
+uses). Replay is derived at admission only: a retracted request's replayable
+pages are imaged with every other group's, and the chunk it resumes has
+`replay = 0` by construction, so nothing is re-derived at restore (§4).
+Replayable groups cannot be combined with snapshot-state groups, whose chunk
+alignment would fight the final-window rule.
 
 PD: a replayable group travels like any sliding-window group. The prefill
 role replays on its own local hits exactly as the fused role does and, at
@@ -312,8 +308,8 @@ regeneration anywhere.
 `CapacityModel::SingleRequestGroupPages` (`csrc/scheduler/capacity_model.h`):
 the largest prompt whose worst-case working set — aligned checkpoint + final
 continuation state, decode reserve, overlap-depth protection, the state growth
-block, and for chunked sparse local recovery the retained input checkpoint
-(and, with the prefix cache on, a first chunk's cached one) — fits the pool.
+block, and for a chunked sparse prefill the retained input checkpoint (and,
+with the prefix cache on, a first chunk's cached one) — fits the pool.
 It is not a live check against currently free capacity; a prompt within the
 bound can still fail admission right now and simply waits.
 
@@ -356,8 +352,10 @@ both the tail and the ordinary growth reserve: the output working set is
 capacity bound share `SnapshotStateReserveTokens` for the growth reservation.
 The retained input is additional. With ordinary decode and equal prefix/state
 grains, an unaligned finishing chunk can therefore need four state blocks,
-not three. This also applies to local recovery on a decode node, and to
-single-forward execution with prefix caching disabled. Narrower state blocks
+not three. This also applies to single-forward execution with prefix caching
+disabled. The decode role charges no prefill peak: a snapshot-state group
+there holds its landed endpoint plus the banked growth block, and a restore
+rebuilds exactly that shape (§3.2). Narrower state blocks
 must count the entire materialized suffix, not assume that two outputs always
 occupy two adjacent slots. Tests cover small pools that must reject an oversized
 request instead of accepting a request that can never produce a forward.
@@ -368,7 +366,17 @@ request instead of accepting a request that can never produce a forward.
 (`PlanBuild::NoPrefillProgress()`: nothing was admitted and no resident prefill
 advanced a chunk) and an admission failed for capacity. Decode steps do not
 count as progress — they release no capacity, so a round of pure decode leaves
-a stalled prefill exactly as stuck as an empty one.
+a stalled prefill exactly as stuck as an empty one. Retraction exists only
+where a snapshot pool does (`SchedulerConfig::HasSnapshotPool()`, §4): with
+the null page alone configured, `chooseVictim` finds nobody, residents run to
+completion and the blocked admission waits.
+
+**A retracted request loses no work.** It is *suspended*: its block tables are
+imaged to Host byte-for-byte, its Device pages are released, and the restore
+(§4) copies the image back into fresh pages and resumes the request in the
+state it left — mid-prefill at its next chunk, or at its next decode step. The
+cost of a retraction is the image's bytes (proportional to the pages held)
+plus the client-visible pause; nothing is recomputed.
 
 **Retract-and-grant, in one round.** The retraction serves a specific request —
 the first candidate whose admission failed for capacity
@@ -380,25 +388,60 @@ page waiting for whoever asks first next round, which is what previously
 required a cross-round capacity barrier. Two edges of the loop:
 
 - **The victim may BE the blocker** (a resident request blocked on its own
-  next page is the preferred victim). It comes back through the readmission
-  phase; the grant is redirected to the first waiting prompt instead —
-  granting the pages straight back to the victim's own readmission is the
-  loop the grant exists to break.
-- **A grant that cannot legally join its round's batch** (a D-role recovery
-  chunk beside an already-built decode batch; a fused prefill beside decodes
-  outside mixed mode) still retracts one victim, and the next round's phase
-  order (§3) tries the blocker before any other claim.
+  next page is the preferred victim). It comes back through the restore
+  phase, so the grant is redirected: to the next request whose admission
+  failed for capacity this round (`AdmissionFeedback::capacity_blocked`, in
+  phase order), else to the first waiting prompt — granting the pages straight
+  back to the victim's own readmission is the loop the grant exists to break.
+  With nobody to redirect to, the victim is **not** retracted: the retraction
+  would cost its image's copies and its restore and serve no one, so it waits
+  for a completion instead.
+- **A grant that cannot legally join its round's batch** (a fused prefill
+  beside decodes outside mixed mode) still retracts one victim, and the next
+  round's phase order (§3) tries the blocker before any other claim.
 
-**The victim's pages are released — and grantable — immediately**, even though
-its L2 snapshot has not been copied yet. The snapshot store is issued with
-`StoreSourceGuard::kStreamOrdered`: its ticket pins only the Host destination,
-and the runtime fences the **forward thread's stream** on the D2H copy's
-completion ahead of everything else the plan does to those pages — that
-stream carries the zeroing, fences the forwards, and gates a granted remote
-prefill's RDMA trigger (see `DeviceHandle.execute` and `event-loop.md`) — so
-the copy reads the old bytes whatever the scheduler does with the pages. This
-is the one store that pays for its ordering on the forward's critical path,
-and it has to: the pages are gone in the same round.
+**The image has two legs, both stream-ordered.** `retractVictim` first
+publishes the victim's computed prefix pages into the Device index exactly as
+a finish does (`advanceRequestProgress` + `CacheCompletedBlocks`; §1.2 says
+what a state group publishes), then `TierTransferManager::StartRetractionStores`
+classifies every data slot of every table:
+
+- *The L2 leg.* A slot whose Device block is a published prefix entry becomes
+  an ordinary Host L2 entry, acquired — like every Host copy — in the Device
+  block's bucket (`cache-concepts.md`, placement). Keys already Host-cached, or
+  carried by a store still in flight, are pinned rather than copied again; the
+  rest ride one `WriteBackOperation` issued with
+  `StoreSourceGuard::kStreamOrdered`. The image holds a pinned `CacheBlockRef`
+  on each Host entry until the restore lands, so the planner cannot evict it
+  and `ClearCache` refuses, but the entries are published prefix cache like any
+  other and later prompts may hit them.
+- *The tail leg.* Every other slot — the unaligned tail, groups that never
+  publish (snapshot-state working blocks, replayable groups), and with no Host
+  cache the whole image — gets a block of the request-private
+  **snapshot pool** (`snapshot_allocator`; never prefix-indexed, never
+  evicted), again in the Device block's bucket. These rows, plus the
+  **slot-state blob** of the request's runtime row (sampling state, speculative
+  readiness — exported by the runtime into `snapshot_slot`), ride one
+  `SnapshotStoreOperation`; the op may carry zero page rows, the blob always.
+  A published slot whose Host L2 block cannot be acquired after evicting
+  unpinned entries falls back to the pool.
+
+The retraction is **refused** — the victim keeps running, the publication it
+did is written back as its progress — only when the pool cannot hold tail plus
+fallback, or when no blob slot is free (`SnapshotSlotAllocator`,
+`max_retracted_requests` slots). Nothing is kept on refusal, though the
+unpinned Host entries evicted for the attempt stay evicted.
+
+**The victim's pages are released — and grantable — immediately**, before
+either copy has run. Both legs are stream-ordered: their tickets pin only the
+Host destinations, and the runtime fences the **forward thread's stream** on
+the D2H copies' completion ahead of everything else the plan does to those
+pages — that stream carries the zeroing, fences the forwards, and gates a
+granted remote prefill's RDMA trigger (see `DeviceHandle.execute` and
+`event-loop.md`) — so the copies read the old bytes whatever the scheduler
+does with the pages. These are the only stores that pay for their ordering on
+the forward's critical path, and they have to: the pages are gone in the same
+round.
 
 **Every other store pins its Device sources until the ack.** Boundary
 publications of a live request and the finish-time flush are issued with
@@ -409,21 +452,24 @@ not count it — until `CompleteWriteBack` publishes the Host entry and drops th
 pin. Nothing else needs to know the copy is in flight, so the runtime copies
 on its own stream and no forward waits. A cached block is never written again
 by its owner (prefix reuse already depends on that), so the pin alone makes
-the copy race-free. Both guards are one path — `StartPendingStores(guard)` —
-and the op carries `source_pinned` to the runtime, which branches on the guard
-and never on the reason.
+the copy race-free. Both guards share one ticket (`StartPendingStores(guard)`
+drains the publication queue; `StartRetractionStores` builds the image's L2
+leg from the victim's tables), and the op carries `source_pinned` to the
+runtime, which branches on the guard and never on the reason.
 
 **Per-victim quiescence, not global.** A request whose own forward is still
-out must not be retracted — its result would land on pages it no longer owns —
-and one whose pages a PD transfer still pins must not be either. Both are
-checked on the chosen victim; if it is not quiescent, retraction waits for it
-rather than sacrificing a worse-ranked request. Two global gates remain. An
-in-flight load-back: it is writing pages its readmission owns, and the victim
-policy cannot see that write. And an in-flight *pinned* store: it holds Device
-capacity the ack returns by itself, so retracting anyone for that capacity
-would be the thrash of §4 — the blocked admission retries against the
-released pins next round instead. Stream-ordered stores hold nothing and gate
-nothing.
+out must not be retracted — its result would land on pages it no longer owns,
+and the image must know the landed tokens — and one whose pages a PD transfer
+still pins must not be either. Both are checked on the chosen victim; if it is
+not quiescent, retraction waits for it rather than sacrificing a worse-ranked
+request. Two global gates remain. An in-flight load-back: it is writing pages
+its admission owns, and the victim policy cannot see that write. And an
+in-flight *pinned* store: it holds Device capacity the ack returns by itself,
+so retracting anyone for that capacity would be the thrash of §4 — the
+blocked admission retries against the released pins next round instead.
+Stream-ordered stores — both legs of an image — hold nothing and gate
+nothing, and an in-flight restore gates nothing: its request is `Restoring`,
+invisible to `chooseVictim`.
 
 The forward-out check is a count in `fsm::ForwardResources`, incremented when
 a forward is scheduled and cleared when its result lands. It lives in the
@@ -451,14 +497,28 @@ is the point, not the payload. Work this
 engine does not perform — the peer's decode on a P node, the peer's prefill on
 a D node — is not counted here; those are fenced by the PD transfer ack.
 
-**Victim choice** (`chooseVictim`, shared by D and fused): an incomplete
-prefill first — it has produced no output a client is reading, and L2 writeback
-may preserve a computed checkpoint for the retry — largest first, freeing the
-most at once; then decode work by most newly releasable LCM blocks and fewest
-tokens — the most capacity for the least lost work. Exempt in both tiers: a
-request whose reserve already covers its whole generation
-(`Request::ReserveCoversGeneration`) — retracting it frees exactly what its
-readmission must take back, pure thrash.
+**Victim choice** (`chooseVictim`, shared by D and fused). Neither tier loses
+work, so the key is who frees the most for the least interruption: an
+incomplete prefill first — no client is streaming it yet, and the mid-prompt
+prefill is usually the request that blocked on its own next page, so
+retracting it and granting its pages to a prompt that can finish is the
+shortest path out of head-of-line — largest first, freeing the most at once;
+then decode work by most newly releasable LCM blocks and fewest **generated**
+tokens — the needed pages with the fewest victims disturb the fewest clients,
+and among equal frees the client that has streamed least is interrupted.
+Exempt in both tiers: a request whose reserve already covers its whole
+generation (`Request::ReserveCoversGeneration`) — retracting it frees exactly
+what its restore must take back, pure thrash. Excluded by state: `Retracted`,
+`Restoring`, `RemotePrefilling`.
+
+**Forced retraction** (`debug_force_retraction_interval`, a debug knob; `0`
+off) exercises the path without pressure: every `|interval|` plans the oldest
+`Decoding` (`> 0`) or `Prefilling` (`< 0`) request is *armed* — kept out of
+that round's batch so its outstanding forward lands — and retracted at the
+first plan where it is quiescent, bypassing the victim policy's exemption but
+not the image-fit refusal. It runs at the start of the D and fused grammars,
+before the restore phase, so the freed pages are granted by the ordinary
+phases.
 
 The P role never retracts: `buildPrefillWorkerPlan` simply does not call
 `maybeRetractForCapacity` (the only two call sites are the D and fused
@@ -483,8 +543,9 @@ is held by the role grammars alone, and every operation enters the batch
 through one gate, `pushOperation`, where budget and flag accounting live. The
 per-request admission layer (`admit`, `schedulePrefill*`, `scheduleDecode`)
 sees none of that: it receives only the output plan (to record fresh pages to
-zero) and an `AdmissionFeedback` (`admission_failed`, `capacity_blocker`), so
-it can report outcomes but never compose the batch.
+zero) and an `AdmissionFeedback` (`admission_failed`, `capacity_blocker`, the
+`capacity_blocked` list the grant may be redirected to), so it can report
+outcomes but never compose the batch.
 
 ### 3.1 P — prefill worker
 
@@ -517,14 +578,18 @@ the PD ACK finishes or aborts the request. On the D role the pin is exactly
 transfers. Because the pin is the state, no event handler can forget to clear
 it, and `Abort`/`Finish`/`RemotePrefillDone` release it by transitioning.
 
-**Recovery: n/a.** The readmission path is unreachable on this role.
+**Restore: n/a.** Nothing on this role is ever `Retracted`, so the restore
+phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
 
 ### 3.2 D — decode worker
 
 **Phases:**
 
-1. Local recovery, alone in its batch — a resident recovery chunk if one is
-   mid-prompt, else the one readmission this round may start (§4).
+0. Forced retraction, if the debug knob is set (§2).
+1. The one restore this round may start (§4) — a `Retracted` request whose
+   image has landed, resuming a streaming client, so it takes capacity ahead
+   of fresh work. It rides **beside** the batch as a cache op: no token
+   budget, no batch slot, no forward.
 2. The decode batch (`scheduleDecodeBatch`) — every PrefillDone first decode
    and Decoding step; decodes consume no token budget on this role.
 3. At most **one** remote admission — the whole prompt at once (the peer
@@ -532,97 +597,149 @@ it, and `Abort`/`Finish`/`RemotePrefillDone` release it by transitioning.
    consumes no token budget and no batch slot, so there is nothing to defer
    for. Capped at one per round because each reserves an entire prompt's
    pages; a queue's worth in one round would drain the pool before any KV
-   arrives. Head-of-line (1.1) does not apply — there is no mid-way.
+   arrives. Head-of-line (1.1) does not apply — there is no mid-way. A restore
+   that failed for capacity in phase 1 **seals** this phase: a newcomer taking
+   the pages it waits for would starve it.
 4. `maybeRetractForCapacity` (§2), whose grant also rides beside the batch
    (a remote admission) or joins it (a blocked decode).
 
-The old "one of exactly three shapes per round" grammar is gone: a decode
-batch and a remote admission coexist routinely, and only a local recovery
-chunk still claims a round to itself (its load-back's layerwise streaming and
-the recovery prefill are batch-global machinery).
+A decode batch, a restore and a remote admission coexist routinely. Nothing on
+this role is ever `Prefilling`: a prompt is the peer's work, and a retracted
+request comes back by restore, never by a local prefill — so no round is ever
+claimed by an extend forward, and the capacity model charges no prefill peak
+(§1.4).
 
-**Retraction and recovery:** victims are chosen by the shared rule in §2 —
-normally decode work (resident requests are decoding prompts the peer
-prefilled), with a mid-prompt local recovery chunk as the one possible
-prefill-tier victim. The victim's KV is written back to L2 (best-effort) and
-it enters `fsm::Retracted`; recovery re-prefills locally, loading the
-snapshot back (`LoadBackBatch`). A D-role victim recovers through this
-ordered path even when there is no host cache to snapshot into (from
-scratch), because the role has no other way back.
-
-This recovery prefill is the one extend forward a D node runs. A decode
-engine whose attention layout cannot run one (head TP,
-`--attn-head-tp-size`; see `docs/serving/parallelism.md`) relies on the
-§4 exemption instead of a scheduler switch: it admits only requests whose
-`max_new_tokens` fits one safe-step window, so every resident request has its
-generation prepaid and `chooseVictim` finds nobody — the readmission path
-stays unreachable by construction, and the runtime refuses larger budgets at
-admission (`RequestHandler`, mirroring `kRetractionSafeSteps`).
+**Retraction and restore:** victims are chosen by the shared rule in §2 —
+everything resident is decode work (prompts the peer prefilled, in
+`PrefillDone` or `Decoding`); `RemotePrefilling` is pinned by the peer's
+in-flight prefill and never a victim. The image is taken from this node's own
+pages and nothing crosses the PD wire: the receiver and admission record were
+already released at `RemotePrefillDone`, and the bootstrap token lives in the
+request's token container, so a `PrefillDone` victim restored to `PrefillDone`
+still gets its first decode exactly as before. A restore runs no forward, so a
+decode engine whose attention layout cannot run an extend (head TP,
+`--attn-head-tp-size`; see `docs/serving/parallelism.md`) retracts and
+restores like any other.
 
 ### 3.3 Fused — one engine, everything local
 
-**Phases, mixed mode** (`enable_mixed_prefill_decode`): decodes first — a
+**Phases, mixed mode** (`enable_mixed_prefill_decode`): forced retraction
+(§2) and the one restore this round may start (§4) first on every mode — the
+restore resumes a streaming client and takes no budget — then decodes: a
 client is streaming them, and a long prefill chunk must not starve them of
-token budget — then the shared local-prefill phases (readmission first, since
-it holds an L2 snapshot other admissions could evict; then resident chunks;
-then new prompts) spend what remains, then `maybeRetractForCapacity`. The
-decode batch leaves `state_prefill_reserve` (one state-checkpoint page of
-budget) untouched when a mamba prefill is pending, since that prefill cannot
-advance in sub-page chunks.
+token budget; then the shared local-prefill phases (resident chunks, then new
+prompts) spend what remains, then `maybeRetractForCapacity`. The decode batch
+leaves `state_prefill_reserve` (one state-checkpoint page of budget) untouched
+when a mamba prefill is pending, since that prefill cannot advance in sub-page
+chunks. A restore that failed for capacity seals new-prompt admission for the
+round (`new_prompts_sealed`), as on the D role.
 
-**Phases, non-mixed:** the prefill phases run first and alone; decodes get
-the round only when no prefill scheduled. No state reserve is needed —
-scheduling order is the capacity priority.
+**Phases, non-mixed:** after the restore, the prefill phases run first and
+alone; decodes get the round only when no prefill scheduled. No state reserve
+is needed — scheduling order is the capacity priority.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
-decode work. Whether the victim's KV is stored depends on the host cache:
-with one, the retraction becomes an L2 snapshot the readmission loads back;
-without one the request re-prefills from scratch
-(`has_recoverable_snapshot = false`) and competes for admission like a
-newcomer rather than queueing behind other readmissions.
+decode work. The Host cache decides the image's split, not whether there is
+one: with L2 the published prefix travels as pinned L2 entries and only the
+tail goes to the snapshot pool; without L2 the whole image goes to the pool.
+Either way the request resumes where it stopped, and never competes for
+admission as a newcomer.
 
-## 4. The recovery protocol
+## 4. Suspend and resume
 
-What remains of cross-request recovery bookkeeping is **one integer** on the
-scheduler (`next_retraction_epoch_`); everything else is derived from the
-`fsm::Retracted` states themselves. The former `RetractionRecovery` class —
-barrier, recovering-pin, priority overrides — is gone; §2's same-round grant
-and the rules below absorb each of its jobs.
+What the scheduler keeps across requests for retraction is **one integer**
+(`next_retraction_epoch_`) and **one slot allocator** (`snapshot_slots_`, a
+`SnapshotSlotAllocator` handing out blob slots `1..max_retracted_requests`);
+everything else lives on the two FSM states a suspended request moves through
+and is dropped with them. There is no queue to keep in step with the FSM: a
+request that finishes or aborts while suspended simply stops qualifying, and
+its `CacheBlockRef`s release what it held.
 
-**Readmission order** (`nextReadmission`) is derived, not stored. Each
-retraction stamps a monotonic `retraction_epoch` and a `resumes_generation`
-flag onto the `fsm::Retracted` state; among this round's candidates holding a
-recoverable snapshot, victims with generated output first (they resume a
-generation a client is already reading), then oldest epoch. The flag is
-`Request::HasGeneratedOutput()` — token count above the submitted prompt
-size — rather than "was the victim decoding": a victim taken mid-RECOVERY is
-Prefilling again, but its generated tokens still exist (an earlier
-retraction rebased them into its prefill window), and its standing survives.
-A store-less fused retraction is not in this ordering at all — it has no L2
-pages to load back, so it re-prefills through the ordinary admission path
-(`admitsLikeNewPrompt`). The runtime can also emit `forward::Retract` without
-a Host snapshot: an L3 prefetch that missed after Admit. Dest pages were
-not filled, so publishing would cache empty KV; the request re-prefills
-the same way. Mixed partners in that forward retract together so ranks
-stay aligned, and a D-role `plan.remote_prefill` admission retracts with
-them — the peer pull is withheld so suffix-only KV cannot land on empty
-prefix pages. The client is not failed. There is no queue to keep in
-step with the FSM: a request that finishes or aborts while retracted
-simply stops qualifying, with no bookkeeping to prune.
-Nor is bounded replay (§1.3) carried across a
-retraction: the readmission re-probes and derives its replay window from the
-new hit, and the L2 snapshot never holds a replayable group's pages.
+**`fsm::Retracted` holds no Device pages.** It carries the request's token
+container and cache progress, the `RetractionImage` — per group an
+`ImageTable` (`num_blocks`, `reclaimed_prefix_blocks`, `available_tokens`,
+and per data slot its `slot_index`, a pinned ref on the Host block that holds
+the bytes — an L2 entry with its `CacheKey`, or a snapshot-pool block with
+none) — the blob slot, the `ResumeShape` that names the state it resumes
+(`ResumePrefilling{window, reserve}`, `ResumePrefillDone{window, reserve}` or
+`ResumeDecoding{reserve}`), its `retraction_epoch` and `resumes_generation`
+stamp, and `pending_store_ops`: every op the image waits for — both legs' own
+ops and any earlier in-flight store carrying one of its keys. The image is
+**landed** (`ImageLanded()`) when all of them have been acknowledged
+(`cache::WriteBackDone`, `cache::SnapshotDone`); until then the request is
+not a readmission candidate, because a restore started earlier would copy
+bytes that have not arrived.
 
-**A readmission that does not fit, waits.** Its failed admission never
+**Readmission order** (`nextReadmission`) is derived, not stored: among this
+round's candidates whose image landed, victims with generated output first
+(they resume a generation a client is already reading), then oldest epoch. The
+flag is `Request::HasGeneratedOutput()` — token count above the submitted
+prompt size — rather than "was the victim decoding": a victim taken
+mid-prefill may still own generated tokens (an earlier retraction rebased them
+into its prefill window), and its standing survives.
+
+**The restore** (`scheduleRestore`, one per round, phase 1 of both grammars)
+rebuilds the request on fresh Device pages:
+
+- `CacheCoordinator::Restore` gives every group a table of identical shape —
+  same `num_blocks`, same null holes (a state group's absolute slots, a
+  sliding group's reclaimed prefix) — with one fresh block per imaged slot **in
+  the imaged bucket**, then runs the ordinary `Admit` demand on the rebuilt
+  tables inside the same planner pass: `DenseGrowth{0}` plus the reserve
+  `ReservePrefillDemands` derives from the resume shape exactly as for a
+  first chunk — the decode slot (and the snapshot-state growth block) when the
+  request resumes decoding or its completed prompt; the rest of the prompt plus
+  the escalated admission headroom when it resumes mid-prefill. Cache-only
+  blocks are evicted for it as for any admission, and a failed restore leaves
+  nothing allocated.
+- An L2 slot whose key still has a Device-cached canonical block is
+  **claimed** instead of copied (the same bytes by construction — the victim's
+  own block, cache-only since it was freed — and protected from the planner's
+  eviction like a prefix hit). Every other slot becomes one row of a single
+  `SnapshotRestoreOperation`, tagged with its source tier (`HostTier::kL2`
+  rows carry their key, `kSnapshotPool` rows none), and its destination page
+  is listed in `plan.pages_to_zero` so the plan sanitizes it before the copy.
+  The op also names the blob slot and the request's **new** request-pool
+  index: the runtime imports the slot-state blob into that row.
+- The request moves to **`fsm::Restoring`**: it holds the rebuilt tables (a
+  `ForwardResources` bundle, so it occupies capacity like any resident), the
+  image and the op id, is never scheduled, never a victim and never a
+  readmission candidate. Both ends of every row stay pinned by the transfer
+  manager until the ACK, so an abort while restoring cannot re-grant a page
+  the copy is still writing. A restore takes no token budget and no batch
+  slot; it is a cache op beside the batch, like a remote admission.
+- `cache::RestoreDone` republishes the L2-tier destinations into the Device
+  prefix index (as a prefix load-back does), drops the image — the L2 pins go,
+  the entries stay published and evictable; the pool blocks return — and
+  `RestoreDoneEvent` moves the request to the state its shape names: a
+  `Decoding` request decodes next round with no prefill, a `PrefillDone` one
+  takes its first decode, a `Prefilling` one schedules its next chunk with
+  `replay = 0`.
+
+Why a `Restoring` state at all: the copy is asynchronous and the request must
+hold its pages while it runs, yet nothing may be scheduled against pages whose
+bytes are still arriving. `Retracted` holds no pages by definition, and the
+schedulable states must stay free of a "but not yet" flag every phase would
+have to test; a state the phases do not know is the one way to hold pages and
+be invisible at once.
+
+**Finish or abort while suspended** drops the state: from `Retracted`, the
+pinned Host entries become ordinary evictable entries at once and the pool
+blocks return when the copies still writing them land (the tickets hold the
+refs); from `Restoring`, the rebuilt tables are freed and the restore's ACK
+only drops its pins (`CompleteSnapshotRestore` still republishes the L2 rows
+— the bytes are whole). A late ACK for a dropped image is harmless.
+
+**A readmission that does not fit, waits.** Its failed restore never
 triggers retraction (it is never recorded as the capacity blocker): when the
-readmission needs a victim, the two simply do not fit together, and swapping
-them — a writeback, a load-back and a re-prefill per swap — is pure thrash.
-The resident request keeps running and its completion frees the space. This
-replaces the old `recovering_` head-of-line pin, and unlike escalation-bounded
-ping-pong it makes the evict-each-other cycle structurally impossible. Nor
-does a waiting readmission stall anyone else: decodes run regardless, and
-only new-prompt admission is sealed behind it (a newcomer taking the pages it
-waits for would starve it).
+restore needs a victim, the two simply do not fit together, and swapping
+them — two images and two restores per swap — is pure thrash. The resident
+request keeps running and its completion frees the space. Unlike
+escalation-bounded ping-pong this makes the evict-each-other cycle
+structurally impossible. Nor does a waiting readmission stall anyone else:
+decodes run regardless, and only new-prompt admission is sealed behind it
+(a newcomer taking the pages it waits for would starve it) — the remote
+admission on the D role, the new-prompt tier on the fused role.
 
 **Escalating headroom** is what keeps a request from being retracted forever.
 Being retracted means the previous admission was still too optimistic, so
@@ -641,18 +758,45 @@ could ever use, so after a couple of retractions it holds enough room to run
 to completion — at which point `ReserveCoversGeneration` exempts it from the
 victim policy and it **cannot be retracted again**. This is a per-request
 adaptive backoff: it penalises only the request whose admission proved
-over-optimistic, and never makes anyone else wait.
+over-optimistic, and never makes anyone else wait. Now that a retraction costs
+a copy rather than a recompute, the constant is a thrash bound only.
 
 The exemption compares the windows the admission secured against the budget
-that was open **at that admission** (`Request::RemainingNewTokensAtAdmission`
-— recoverable from the prefill window, because every retraction rebases and
-nothing else moves it), never against the current remaining budget. Decode
-spends the prepaid headroom exactly as fast as it shrinks that budget, so
-judging the window against today's remainder would count spent headroom as
-still held: a request that outgrew a partial reserve would look covered the
-moment its remainder dipped under the window — exactly when it needs a new
-page — and once every resident request looked covered, retraction would have
-no victim and nothing could free that page.
+that was open **at that admission** (`Request::RemainingNewTokensAtAdmission`,
+stamped by the first chunk's and the restore's scheduling events), never
+against the current remaining budget. Decode spends the prepaid headroom
+exactly as fast as it shrinks that budget, so judging the window against
+today's remainder would count spent headroom as still held: a request that
+outgrew a partial reserve would look covered the moment its remainder dipped
+under the window — exactly when it needs a new page — and once every resident
+request looked covered, retraction would have no victim and nothing could
+free that page.
+
+**`forward::RecomputeRetract` is a different case.** The runtime emits it for
+a batch whose L3 prefetch missed after `Admit`: the destination pages were
+never filled, so there is nothing to image and publishing would cache empty
+KV. `RecomputeRetractEvent` frees the pages, rebases the prefill and drops the
+request to `Submitted`; it re-prefills through ordinary admission like a
+newcomer — no image, no blob slot, no readmission order. Mixed partners in
+the skipped forward retract together so ranks stay aligned, and a D-role
+`plan.remote_prefill` admission retracts with them — the peer pull is withheld
+so suffix-only KV cannot land on empty prefix pages. The client is not failed.
+
+**Weight updates and flushes.** `Scheduler::RetractedSize()` counts the
+requests suspended with an image (`Retracted` + `Restoring`); a cache flush is
+refused while any image copy is in flight (`HasAnyInFlight` includes the
+snapshot ops) and `ClearCache` refuses pinned Host entries, so an image is
+never invalidated under a suspended request. `SnapshotPoolFreeBlocks()` and
+`HostPoolPinnedBlocks()` are the leak checks: with no request suspended both
+must read empty and zero.
+
+**Configuration** is explicit on every role: `snapshot_allocator.total_pages`
+(`1` = the null page alone = never retract) and `max_retracted_requests`
+(`0` with no pool, `> 0` with one; the runtime's slot-state arena has that
+many rows plus the null row) are validated together, the P role refuses a
+pool, and L3 storage is refused with a page-cyclic sharded group
+(`cache-concepts.md`). `debug_force_retraction_interval` (§2) is the only
+knob that chooses victims outside capacity pressure.
 
 ## 5. Invariants a change must preserve
 
@@ -661,11 +805,14 @@ no victim and nothing could free that page.
   growth block banked by the admission that finishes shaping a state group
   (1.2), and the admission headroom (4) — which only full-history groups hold.
   A replayable group's private suffix starts at the replay window, which is
-  inside the forward's input, not beyond it (1.3).
+  inside the forward's input, not beyond it (1.3). A restore grants exactly
+  the imaged shape plus the same reserve a first chunk of its resume shape
+  would (4).
 - A replayable group is never matched, published or streamed (1.3); its
   re-fed rows are forward input that debits the token budget but never
   advances `num_computed_tokens`; only a hit's first chunk re-feeds, and no
   final chunk is shorter than the replay window (`ChunkKeepingFinalWindow`).
+  Its request-private pages are imaged and restored like any other group's.
 - A prefill demand's reserve is decided once per group, by kind, in
   `ReservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
   helper asserts it found none set.
@@ -673,30 +820,41 @@ no victim and nothing could free that page.
   to it: they consume no fresh capacity within their reserve, so they keep
   running beside a stalled prefill.
 - Retraction fires only when no prefill progressed and an admission failed
-  (2). The chosen victim must be quiescent — no forward of its own in flight,
-  no PD transfer against its pages (§3.1) — and an in-flight load-back or an in-flight pinned
-  store defers all retraction; stream-ordered stores defer nothing.
+  (2), and only with a snapshot pool configured. The chosen victim must be
+  quiescent — no forward of its own in flight, no PD transfer against its
+  pages (§3.1) — and an in-flight load-back or an in-flight pinned store
+  defers all retraction; stream-ordered stores and in-flight restores defer
+  nothing. A victim that would serve nobody is not retracted.
 - Freed capacity is granted to the request it was freed for in the same plan
-  build whenever the round's grammar admits the grant (2); the write-back →
+  build whenever the round's grammar admits the grant (2); the image copies →
   zero → load → forward order on the forward thread's stream is what makes
   the immediate release safe, and changing `DeviceHandle.execute`'s ordering
   breaks it.
 - A store either pins its Device sources until the ack or is stream-ordered;
-  never neither (2). Only `retractVictim` issues a stream-ordered store — its
-  sources are granted away in the same round — and only such an op may be
-  fenced ahead of the plan's page reuse by the runtime. A new store site
-  chooses its guard explicitly (`StartPendingStores` has no default).
+  never neither (2). Only the two legs of a retraction image are
+  stream-ordered — their sources are granted away in the same round — and
+  only such ops may be fenced ahead of the plan's page reuse by the runtime. A
+  new store site chooses its guard explicitly (`StartPendingStores` has no
+  default).
+- Every tier transfer pairs blocks of equal residue (bucket): L2 store, L2
+  prefix load, both image legs and the restore; the transfer manager asserts
+  it when it builds a batch, so under page-cyclic sharding the rank that owns
+  one end owns the other (`cache-concepts.md`).
 - Only computed tokens are published as a prefix, and exactly those.
   `Request::NumComputedTokens()` is the one frontier for prefix hashing and
-  retention on admission and retraction: the scheduled window end while
-  prefilling (an incomplete prefill's whole token count would publish pages
-  never computed), and every token but the last while decoding — feedback
-  ends with the sampled token the next forward computes. It does not subtract
-  the verify width: a decode result lands its accepted tokens, not a fixed
-  number, so any margin is an estimate that lags the real endpoint and
-  delays publication and reclaim behind it.
-- At most one readmission is in progress per role, by phase construction; a
-  readmission that fails admission waits and never triggers retraction (4).
+  retention on admission and retraction, and the extent an image covers: the
+  scheduled window end while prefilling (an incomplete prefill's whole token
+  count would publish pages never computed), and every token but the last
+  while decoding — feedback ends with the sampled token the next forward
+  computes. It does not subtract the verify width: a decode result lands its
+  accepted tokens, not a fixed number, so any margin is an estimate that lags
+  the real endpoint and delays publication and reclaim behind it.
+- A `Retracted` request holds no Device pages; its image is held by that state
+  alone (Host pins and pool refs) and dropped with it. It becomes a
+  readmission candidate only once every store it waits for has landed, at
+  most one restore starts per round, and a `Restoring` request is never
+  scheduled, never a victim and never re-probed (4). A readmission that fails
+  admission waits and never triggers retraction (4).
 - A request whose admission prepaid the generation budget open at that
   admission is never a victim (2); with the fresh-admission prepay this bounds
   retraction to requests whose `max_new_tokens` exceeds one safe-step window

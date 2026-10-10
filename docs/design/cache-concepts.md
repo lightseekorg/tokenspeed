@@ -87,17 +87,19 @@ A fourth quantity lives outside the logical world entirely:
   (as a state slot). The view is defined by the consumer, not by the block.
 
 `BlockPool` owns the physical placement indexes: the FIFO of empty LCM blocks,
-the free child-slot count for each cache group, and per-bucket ordered sets of
-partially filled LCM blocks. C++ group ids are dense scheduler indices, so
-the scheduler supplies the complete packing vector when it constructs each
-pool. The per-group placement records form a vector indexed by group id, and
-each `GroupAvailability` stores immutable slots-per-parent geometry. The
-coordinator registers each group's shard count before allocation; an ordinary
-standalone pool fixes a single bucket on first use. Registration cannot change
-the geometry after it is fixed, including after all blocks are freed. The pool
-updates its free-slot count and bucket indexes together on every occupancy
-transition. A parent with zero occupants is unbound, so its capacity
-belongs to the global empty-parent FIFO rather than any group.
+the free child-slot count **per bucket** for each cache group, and per-bucket
+ordered sets of partially filled LCM blocks. C++ group ids are dense scheduler
+indices, so the scheduler supplies the complete packing vector when it
+constructs each pool. The per-group placement records form a vector indexed by
+group id, and each `GroupAvailability` stores immutable slots-per-parent
+geometry. The coordinator registers each group's shard count in every pool it
+owns — Device, Host L2 and the snapshot pool alike — before allocation, so a
+block's bucket means the same owner on every tier; an ordinary standalone pool
+fixes a single bucket on first use. Registration cannot change the geometry
+after it is fixed, including after all blocks are freed. The pool updates its
+per-bucket free-slot counts and bucket indexes together on every occupancy
+transition. A parent with zero occupants is unbound, so its capacity belongs
+to the global empty-parent FIFO rather than any group.
 
 The pool knows which child slots are occupied, never who holds them. Whether a
 child is pinned by a request table, published by a prefix-cache entry, or held
@@ -236,8 +238,11 @@ Host restores still use `CacheFullBlocks` and may register `kChunk` entries.
 All cached checkpoints remain subject to ordinary capacity eviction; Endpoint
 does not pin storage. Allocation, reservations and transfer fences are unchanged.
 Finish queues existing prefill checkpoints for L2 without upgrading their kind.
-With L2, prefill retraction may publish a computed recovery Endpoint; decode
-retraction uses available prefill cache and recomputes the suffix.
+Retraction publishes like finish (a mid-prefill victim may publish a computed
+Endpoint at its completed window) and then images every block its tables
+hold, working state included; the restore copies the image back and claims
+the L2 keys still cached on the Device, so nothing is recomputed
+([Scheduler §2, §4](scheduler.md#2-retraction-when-admission-fails)).
 
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at
@@ -637,14 +642,26 @@ Its responsibilities:
   writeback. The first decode admission from `PrefillDone` applies the same
   policy to the final prompt boundary. Ordinary decode publishes history-cache
   Device entries but no state entries; full-attention pages do not stream to
-  Host during decode. At finish or retraction, eligible non-state Device pages
-  and the newest existing prefill checkpoint per state group are queued
-  before request ownership is released. Ordinary sliding-window entries
-  always stream when published. The queue is drained by
-  `TierTransferManager::StartPendingStores(guard)`: every store but a
-  retraction's snapshot pins its Device sources until the ACK; the snapshot
-  store is stream-ordered instead, because its sources are re-granted in the
-  same round (`scheduler.md` §2).
+  Host during decode. At finish, eligible non-state Device pages and the
+  newest existing prefill checkpoint per state group are queued before
+  request ownership is released. Ordinary sliding-window entries always
+  stream when published. The queue is drained by
+  `TierTransferManager::StartPendingStores(guard)`, and every store it
+  issues pins its Device sources until the ACK. A retraction does not use the
+  queue: `StartRetractionStores` publishes the victim's computed prefix the
+  same way and then builds its image from the tables themselves — the
+  published slots not yet on Host become one stream-ordered write-back whose
+  Host entries the image pins (keys already Host-cached, or carried by a store
+  in flight, are pinned instead of copied), every other slot goes to the
+  request-private **snapshot pool** on the same stream-ordered footing — because
+  the victim's sources are re-granted in the same round (`scheduler.md` §2).
+  The snapshot pool is a third `BlockPool` the coordinator owns beside Device
+  and Host L2: never prefix-indexed, never evicted, its blocks held only by
+  the `Retracted`/`Restoring` state that imaged them, and `Validate` requires
+  it to be stated on every role (the null page alone means "never retract").
+  The way back is one `SnapshotRestoreOperation` whose rows name their Host
+  tier; its L2-tier destinations are republished at the ACK
+  (`CompleteSnapshotRestore`) exactly as a prefix load-back's are.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
   beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
@@ -812,8 +829,9 @@ Its responsibilities:
   across the replica, and a miss unregisters the keys, skips H2D /
   skips publishing empty Host pages (`LoadBackDone.success=false`),
   skips Device prefix publication for those prefetch destinations,
-  skips the model forward, and retracts the batch snapshot-less so the
-  next admit recomputes those tokens. D-role admit rides
+  skips the model forward, and drops the batch back to `Submitted` with
+  `forward::RecomputeRetract` (no image: the pages were never filled) so
+  the next admit recomputes those tokens. D-role admit rides
   `plan.remote_prefill` with no local forward: those request ids retract
   on the same path, and the loop withholds that stream from execute so
   the peer does not land suffix-only KV on empty prefix pages. A backend exception or malformed
@@ -1129,11 +1147,16 @@ sequence slot.
 
 When admission fails for capacity and no prefill can progress, the scheduler
 retracts a resident victim and grants the freed pages to the blocked request
-within the same plan build; what stops an overcommitted workload from
-repeatedly rebuilding, briefly decoding and re-retracting the same prompt is
-the escalating admission headroom each retraction adds to the victim's next
-admission. The protocol — victim choice, readmission order, why the release
-is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
+within the same plan build; the victim is suspended with an image of its
+tables and restored into fresh pages later, losing no work. What stops an
+overcommitted workload from repeatedly suspending and restoring the same
+request is the escalating admission headroom each retraction adds to the
+victim's next admission. The protocol — victim choice, the image's two legs,
+readmission order, why the release is safe before the image copies — is
+`scheduler.md` §2 and §4. The snapshot pool's size is a configuration input
+like the Host cache's (`num_snapshot_pages`, `max_retracted_requests`): it
+bounds how many pages of suspended requests may be held at once, and a
+retraction whose image does not fit is refused, not forced.
 
 ## Virtual block placement within a shared physical plan
 
@@ -1178,10 +1201,27 @@ draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
 the sharded MLA history group), each subject to its backend's `AttnConfig`
 gate. The draft's decode steps would run the same sparse/dense DCP branches as
 the target's, but that path has not been validated for the ordinary recipe, so
-its exclusion is a gate rather than a geometry limit. All DCP paths exclude the Host KVStore: the L2
-copies address device pages by scheduler block ID with no ownership
-translation (`cache/l2/executor.py`), so a sharded engine must pass
-`--disable-kvstore`.
+its exclusion is a gate rather than a geometry limit.
+
+**Tier transfers under sharding pair blocks of equal residue.** The Host L2
+pool and the snapshot pool are registered with the same `shard_count` as the
+Device pool, and every transfer the scheduler emits — L2 store, L2 prefix
+load, both legs of a retraction image, the restore — acquires its destination
+in its source's bucket (`AcquireHostBlocks(group_ids, buckets)`,
+`AcquireBlocksInBuckets`, `TakeImage`, `Restore`), so `(src - 1) % D ==
+(dst - 1) % D` for every row; `TierTransferManager` asserts it when it builds
+a batch. A Host block's residue is therefore its owner exactly as a Device
+block's is, and one `owned_local_pages` translation serves both ends of every
+row: a rank keeps the rows it owns and translates both ids to local pages, a
+replicated group (`D = 1`) owns every row. L3 storage stays refused with a
+sharded group (`SchedulerConfig::Validate`): an L3 key names content, group,
+offset and `tp_rank`, but which rank owns a block is decided at allocation,
+so a rank probing `batch_exists` can only answer for the blocks it owned when
+the object was written. A residue-constrained acquisition can fail while
+other buckets have room; a restore then waits like any readmission, and the
+balanced allocator keeps ordinary admissions within one block per bucket, so
+the imbalance a restore sees is bounded by what its own victim table
+contributed.
 
 PD transfer supports a sharded **prefill** role against an unsharded decode
 role. Manifests carry scheduler (virtual) IDs on both sides and are bounded
@@ -1292,8 +1332,21 @@ are exhausted may it open the next FIFO empty parent. Bucket balance cannot
 reserve an extra parent or cause admission failure while another bucket is
 available. A failed acquire leaves both placement and request tables unchanged.
 
-`BlockPool` maintains the free-slot count of each group and an ordered parent
-index per bucket. Each parent records only its lowest free slot per bucket;
+Beside that balanced path, `BlockPool::AcquireBlocksInBuckets(group, buckets)`
+acquires blocks in **given** buckets — one per requested block — for the
+transfers above and for `GroupAllocator::AcquireShape`, which rebuilds a
+retracted request's table from its recorded shape (claimed blocks in place,
+fresh ones in the imaged buckets). Its exact check is per bucket with one
+shared empty-parent budget: an opened parent gives every bucket
+`packing / shard_count` slots at once, so the parents needed are
+`max_b ceil((need_b - holes_b)+ / (packing / shard_count))`
+(`ParentsNeededForBuckets`, the formula the pool, the coordinator's image
+probe and the admission planner's shadow occupancy share). `D = 1` passes
+bucket 0 everywhere and is the same path. No mutation on a failed check, and
+the choice is deterministic on every mirrored rank.
+
+`BlockPool` maintains the free-slot count of each group per bucket and an
+ordered parent index per bucket. Each parent records only its lowest free slot per bucket;
 it does not materialize a list of every hole. Physical `occupy` and `Release`
 update these indices, including full-to-partial transitions and final-child
 release. Shared request/prefix references therefore keep both the parent

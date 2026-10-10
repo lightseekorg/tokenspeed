@@ -42,10 +42,10 @@ public:
 
     // Drains the coordinator's pending store candidates into one write-back
     // op. `guard` says how the Device sources are protected while the copy is
-    // in flight (see StoreSourceGuard): every candidate drained by this call
-    // gets the same guard, so a retraction's kStreamOrdered drain also covers
-    // ordinary candidates queued earlier in the round -- a superset that is
-    // always safe, only slower.
+    // in flight (see StoreSourceGuard); every candidate drained by this call
+    // gets the same guard. Boundary publication and finish drain with
+    // kPinnedUntilAck; a retraction's stream-ordered L2 leg does not use the
+    // queue -- StartRetractionStores builds it from the victim's tables.
     std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard);
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
