@@ -1002,7 +1002,14 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlots(std::sp
         for (std::int32_t slot = 0; slot < span.blocks; ++slot) {
             const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)];
             if (std::optional<CacheKey> key = groups_[i].Index().KeyOf(pool_, block)) {
-                published[i].push_back(ImageSlot{.slot_index = slot, .block = block, .key = std::move(*key)});
+                const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
+                    groups_[i].Index().MetadataFor(pool_, block->Location());
+                _assert(metadata.has_value(), "a published slot has an index entry");
+                published[i].push_back(ImageSlot{.slot_index = slot,
+                                                 .block = block,
+                                                 .key = std::move(*key),
+                                                 .logical_block_index = metadata->logical_block_index,
+                                                 .boundary_kind = metadata->boundary_kind});
             }
         }
     }
@@ -1153,12 +1160,13 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
     rememberStorageKey(key);
 }
 
-void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key) {
+void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
+                                        CacheBoundaryKind boundary_kind) {
     _assert(static_cast<bool>(block_ref), "CacheDeviceBlock requires a destination block");
     _assert(key.group_id < groups_.size(), "CacheDeviceBlock group id out of range");
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
-    groups_[key.group_id].Index().Register(pool_, block_ref, key, ++next_access_epoch_, /*logical_block_index=*/-1,
-                                           CacheBoundaryKind::kChunk, &newly_cached);
+    groups_[key.group_id].Index().Register(pool_, block_ref, key, ++next_access_epoch_, logical_block_index,
+                                           boundary_kind, &newly_cached);
     if (!cache_mutation_sink_) {
         return;
     }

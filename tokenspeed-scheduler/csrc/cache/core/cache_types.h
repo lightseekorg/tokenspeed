@@ -184,12 +184,17 @@ struct GroupPrefixProbe {
     std::vector<std::uint8_t> hits{};
 };
 
-// Pinned source/destination blocks for one asynchronous cache transfer.
+// Pinned source/destination blocks for one asynchronous cache transfer. A
+// keyed transfer (a restore's Host L2 row) republishes its destination at the
+// ACK under `key`, with the logical block index and boundary kind the entry
+// had before the retraction; an unkeyed one publishes nothing.
 struct BlockTransfer {
     std::uint32_t group_id{0};
     CacheBlockRef source;
     CacheBlockRef destination;
     CacheKey key{};
+    std::int32_t logical_block_index{-1};
+    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
 };
 
 // A Host L2 entry a store's ACK published: the key and the block that is now
@@ -214,6 +219,11 @@ struct ImageSlot {
     std::int32_t slot_index{0};
     CacheBlockRef block;
     CacheKey key{};
+    // How the Device entry was published before the retraction (a published
+    // slot only): the restore republishes its destination the same way, so
+    // eviction ranks it as it did the original.
+    std::int32_t logical_block_index{-1};
+    CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
 
     bool InHostCache() const noexcept { return !key.content_hash.empty(); }
 };

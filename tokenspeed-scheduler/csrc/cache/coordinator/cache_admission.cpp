@@ -658,6 +658,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
                 .source = slot.block,
                 .destination = destination,
                 .key = slot.key,
+                .logical_block_index = slot.logical_block_index,
+                .boundary_kind = slot.boundary_kind,
             };
             // A published slot comes back from Host L2 (and is re-published at
             // the ACK); a private slot from the snapshot pool. Neither is
