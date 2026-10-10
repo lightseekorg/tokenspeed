@@ -115,6 +115,31 @@ def test_prefill_matches_reference(tokens: int) -> None:
         torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
 
 
+def test_prefill_partial_tile_replays_with_changed_inputs() -> None:
+    # Exercise the first partial tile after the automatic prefill threshold,
+    # including tiles that cross the router/routed/shared column boundaries.
+    torch.manual_seed(12501537)
+    _packed, views = _weights()
+    hidden = torch.randn(1537, HIDDEN, dtype=torch.bfloat16, device="cuda")
+
+    def run():
+        return _project(hidden, views, "gluon_latent_input_largem_gfx1250")
+
+    previous = tuple(output.clone() for output in run())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    hidden.copy_(torch.randn_like(hidden))
+    graph.replay()
+    eager = run()
+    for output, direct, reference, old in zip(
+        captured, eager, _reference(hidden, views), previous, strict=True
+    ):
+        assert not torch.equal(output, old)
+        torch.testing.assert_close(output, direct, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize(
     ("tokens", "expected"),
     [
