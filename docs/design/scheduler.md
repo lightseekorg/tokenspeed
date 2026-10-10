@@ -11,9 +11,9 @@ prefix granularity, cache groups, LCM blocks).
 
 ## 1. Admission is per chunk
 
-A prompt is prefilled in chunks bounded by `max_scheduled_tokens`
-(`--chunked-prefill-size`). Capacity is admitted **for the chunk being
-scheduled, never for the whole prompt**: `schedulePrefill` /
+A **local prefill**, including D-role recovery, runs in chunks bounded by
+`max_scheduled_tokens` (`--chunked-prefill-size`). Capacity is admitted **for
+the local chunk being scheduled, not the whole prompt**: `schedulePrefill` /
 `schedulePrefillFirstChunk` build one `GroupDemand` per cache group sized by
 this chunk's tokens, and the coordinator either grants the pages or the
 request stays put. Alongside the demands, one `RequestProgress` per request
@@ -23,6 +23,17 @@ and reclaims inside the same `Admit` (`advanceRequestProgress` in
 `scheduler/operations/forward.cpp` is the one place that hashes those pages
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
+
+**Remote admission is the exception.** A newly submitted D-role request is
+admitted for the **whole suffix after the common cache hit**, matching the
+remote transfer's extent rather than any one local forward. In
+`schedulePrefillFirstChunk`, a remote source sets `tokens_this_round = unscheduled`;
+only a local source calls `PrefillChunkTokens`. A deeper full-history hit can
+set a promotion boundary beyond the common hit when sliding-window lookback
+is missing. That boundary
+must still split local recovery forwards, but must not clip the remote input
+span or suppress its completing-prefill decode reserve. See the
+[remote-admission regression](../../tokenspeed-scheduler/tests/pd-sliding-regression.md#remote-admission-must-cover-the-whole-suffix).
 
 When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
 `host_prefix_tokens` and rounds that length down to `prefix_granularity`
@@ -68,10 +79,10 @@ produced. The decode role of a disaggregated deployment never computes prompt
 rows (the prefill node returns the logprobs), so the runtime leaves its bound
 at the default.
 
-Two adjustments ride on top of the raw chunk size. Both are pure token
+Two adjustments ride on top of the local chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in
 `scheduler/operations/prefill_chunk.h` (`PrefillChunkTokens` is the one
-entry both prefill paths call), what each group demands for it in
+entry both local prefill paths call), what each group demands for it in
 `scheduler/operations/group_demands.h`.
 
 **Alignment.** `AlignPrefillChunk` shortens a chunk so it ends on a prefix-page
@@ -339,10 +350,24 @@ Per group, `ConcurrentGroupPages` charges: a snapshot-state group its
 single-request peak once per live request (the working set does not grow
 with history); a prefix-closed history group `ceil(T / g)` dense pages plus,
 per request, `ceil((g - 1 + protected) / g)` for the unaligned tail and the
-protected tokens that may spill past it; a sliding group, per request,
-`ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
-pages, plus one in-flight prefill chunk behind its lookback (or, on the
-decode role, the landing bound `min(dense, lookback + window)` per request).
+protected tokens that may spill past it; a sliding group on P or fused, per
+request, `ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)`
+resident pages, plus one in-flight prefill chunk behind its lookback.
+
+On D, the sliding single-request bound is
+`min(dense, max(lookback + window, local_prefill_peak))`: capacity must cover
+**both remote landing and local recovery**, even with L2 disabled. A recovery
+chunk can be larger than the remote sliding window. The bound must cover every
+recovery chunk after released prefix pages have been evicted: fitting the first
+chunk does not guarantee that a later chunk plus its retained lookback fits.
+For `N` live requests, concurrent sizing is
+`min(dense, N * landing + recovery_extra)`, where
+`landing = lookback + window` and `recovery_extra = max(single - landing, 0)`
+for `N > 0` (zero otherwise). Only one request recovers locally at a time,
+so charge the excess once, not once per request. All terms count group pages;
+`dense` is the corresponding single-request or concurrent dense bound, and
+`single` is that group's `SingleRequestGroupPages(ctx)`. See the
+[sliding-capacity regression](../../tokenspeed-scheduler/tests/pd-sliding-regression.md#sliding-capacity-must-cover-local-recovery).
 
 Speculative decode admission grows from the committed token frontier plus the verify
 spans still in flight and the span being scheduled. Already reserved slots
@@ -527,10 +552,10 @@ it, and `Abort`/`Finish`/`RemotePrefillDone` release it by transitioning.
    mid-prompt, else the one readmission this round may start (§4).
 2. The decode batch (`scheduleDecodeBatch`) — every PrefillDone first decode
    and Decoding step; decodes consume no token budget on this role.
-3. At most **one** remote admission — the whole prompt at once (the peer
-   prefills it), riding `plan.remote_prefill` **beside** the decode batch: it
-   consumes no token budget and no batch slot, so there is nothing to defer
-   for. Capped at one per round because each reserves an entire prompt's
+3. At most **one** remote admission — the whole unmatched suffix at once (the
+   peer prefills it), riding `plan.remote_prefill` **beside** the decode batch:
+   it consumes no token budget and no batch slot, so there is nothing to defer
+   for. Capped at one per round because each reserves its destination
    pages; a queue's worth in one round would drain the pool before any KV
    arrives. Head-of-line (1.1) does not apply — there is no mid-way.
 4. `maybeRetractForCapacity` (§2), whose grant also rides beside the batch
@@ -656,12 +681,13 @@ no victim and nothing could free that page.
 
 ## 5. Invariants a change must preserve
 
-- Admission never grants pages for tokens beyond the chunk being scheduled,
-  except the decode reserve on the completing chunk (1), the snapshot-state
+- Local admission never grants pages for tokens beyond the chunk being
+  scheduled, except the decode reserve on the completing chunk (1), the snapshot-state
   growth block banked by the admission that finishes shaping a state group
   (1.2), and the admission headroom (4) — which only full-history groups hold.
   A replayable group's private suffix starts at the replay window, which is
-  inside the forward's input, not beyond it (1.3).
+  inside the forward's input, not beyond it (1.3). Remote admission covers the
+  whole unmatched suffix and is not clipped at a local promotion boundary (1).
 - A replayable group is never matched, published or streamed (1.3); its
   re-fed rows are forward input that debits the token budget but never
   advances `num_computed_tokens`; only a hit's first chunk re-feeds, and no

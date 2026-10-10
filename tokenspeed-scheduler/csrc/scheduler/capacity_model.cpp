@@ -151,8 +151,9 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
                                                           block_granularity);
                 // A sliding prefix probe can retain one older lookback island
                 // across null holes while the remote prompt tail is restored at
-                // absolute slots. Bound both intervals, capped by a dense table.
-                child_pages = std::min<std::int64_t>(dense_pages, lookback + window_pages);
+                // absolute slots. A retracted request instead needs its lookback
+                // and one local recovery chunk. Bound both, capped by a dense table.
+                child_pages = std::min(dense_pages, std::max(lookback + window_pages, local_prefill_peak()));
             } else {
                 // Decode-only restores its destination in one admission, so a
                 // non-sparse group cannot slide old prompt pages first.
@@ -208,8 +209,12 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
             const std::int64_t window_pages =
                 ceilDiv(resident_tokens + decode_width + protected_tokens + block_granularity - 1, block_granularity);
             if (config_.role == Role::kD) {
-                // The single-request landing bound, once per live request.
-                group_pages[i] = std::min(dense_pages, live_requests * (lookback + window_pages));
+                // Every request may hold a remote landing, but only one can
+                // recover locally at a time. Add just its excess working set.
+                const std::int64_t landing_pages = lookback + window_pages;
+                const std::int64_t recovery_extra =
+                    live_requests > 0 ? std::max<std::int64_t>(single_request_pages[i] - landing_pages, 0) : 0;
+                group_pages[i] = std::min(dense_pages, live_requests * landing_pages + recovery_extra);
             } else {
                 // Every live request's resident window, plus one in-flight
                 // prefill chunk behind its lookback before those rows slide.

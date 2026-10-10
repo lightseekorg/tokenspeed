@@ -359,8 +359,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
 
         const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
-        tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
-                                               promotion_boundary_tokens);
+        // Remote admission covers the whole suffix; promotion only shapes local forwards.
+        tokens_this_round = source == fsm::PrefillSource::kRemote
+                                ? unscheduled
+                                : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled,
+                                                     remaining, promotion_boundary_tokens);
         if (tokens_this_round == 0) {
             return std::nullopt;
         }
