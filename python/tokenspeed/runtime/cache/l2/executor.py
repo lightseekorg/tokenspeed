@@ -27,10 +27,8 @@ from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import NamedTuple
 
-import psutil
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
-    build_host_transfer_geometry,
     transfer_cache_blocks,
     wait_layer_ready,
 )
@@ -47,6 +45,13 @@ from tokenspeed.runtime.cache.l3.backend import (
     l3_unread_key_capacity,
 )
 from tokenspeed.runtime.cache.l3.executor import L3HostStore, StoragePage
+from tokenspeed.runtime.cache.transfer.lanes import (
+    HostTransferLane,
+    build_transfer_geometry,
+    check_host_memory,
+    load_stream_priority,
+    new_cache_stream,
+)
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
@@ -55,26 +60,6 @@ logger = get_colorful_logger(__name__)
 device_module = get_device_module()
 
 _HOST_MEM_HEADROOM_BYTES = 10 * (1024**3)
-
-
-def _load_stream_priority() -> int | None:
-    priority_range = getattr(device_module.Stream, "priority_range", None)
-    if priority_range is None:
-        return None
-    try:
-        _, load_priority = priority_range()
-    except (RuntimeError, TypeError):
-        return None
-    return load_priority
-
-
-def _new_cache_stream(priority: int | None = None):
-    if priority is None:
-        return device_module.Stream()
-    try:
-        return device_module.Stream(priority=priority)
-    except (RuntimeError, TypeError):
-        return device_module.Stream()
 
 
 def _ordered_unique(values: Iterable[int]) -> list[int]:
@@ -92,21 +77,6 @@ class _Ack(NamedTuple):
     op_ids: list[int]
     backup_pages: list[StoragePage]
     success: bool
-
-
-class _WriteLane:
-    """Staging for one kind of write-back submission.
-
-    Each lane owns its transfer workspace and the event guarding that
-    workspace's pinned metadata staging, so the two lanes a round may submit
-    (stream-ordered, then pinned) never wait on each other's staging.
-    """
-
-    __slots__ = ("metadata_done", "workspace")
-
-    def __init__(self) -> None:
-        self.workspace = HostTransferWorkspace()
-        self.metadata_done = None
 
 
 def _num_host_lcm_blocks(
@@ -162,15 +132,11 @@ class L2CacheExecutor:
             host_size_gb=host_size_gb,
         )
         requested_host_bytes = host_lcm_blocks * host_lcm_block_bytes
-        available_host_bytes = (
-            psutil.virtual_memory().available - _HOST_MEM_HEADROOM_BYTES
+        check_host_memory(
+            requested_host_bytes,
+            headroom_bytes=_HOST_MEM_HEADROOM_BYTES,
+            purpose="L2",
         )
-        if requested_host_bytes > available_host_bytes:
-            raise ValueError(
-                "Not enough Host memory for L2: requesting "
-                f"{requested_host_bytes / 1e9:.2f} GB, available "
-                f"{available_host_bytes / 1e9:.2f} GB"
-            )
         self.host_storage = HostCacheStorage(
             self.layout,
             num_host_lcm_blocks=host_lcm_blocks,
@@ -216,77 +182,17 @@ class L2CacheExecutor:
         # publication, whose sources the scheduler holds until the ACK) fences
         # nothing and never holds up the round. A load's consumers are fenced
         # per layer by the tracker events.
-        self.write_stream = _new_cache_stream(None)
-        self.load_stream = _new_cache_stream(_load_stream_priority())
-        device = self.layout.buffers[0].device
-        fields_by_id = {}
-        for group_index, group in enumerate(self.layout.groups):
-            for field_index, field in enumerate(group.fields):
-                if field.field_id in fields_by_id:
-                    raise ValueError(
-                        f"cache transfer field {field.field_id!r} appears twice"
-                    )
-                fields_by_id[field.field_id] = (
-                    group_index,
-                    field_index,
-                    group,
-                    field,
-                )
-
-        rows = []
-        layer_slices = []
-        consumed_fields = set()
-        for consumer in self.layout.consumers:
-            layer_offset = len(rows)
-            for field_id in consumer:
-                if field_id in consumed_fields:
-                    raise ValueError(
-                        f"cache transfer field {field_id!r} has two consumers"
-                    )
-                try:
-                    group_index, field_index, group, field = fields_by_id[field_id]
-                except KeyError as exc:
-                    raise ValueError(
-                        f"cache consumer references unknown field {field_id!r}"
-                    ) from exc
-                consumed_fields.add(field_id)
-                rows.append(
-                    (
-                        group_index,
-                        field.device_buffer_index,
-                        field.device_block_zero_offset_bytes,
-                        field.block_stride_bytes,
-                        self.host_storage.host_cache_block_bytes[group_index],
-                        self.host_storage.host_field_offsets[group_index][field_index],
-                        group.cache_blocks_per_lcm_block,
-                        field.payload_bytes,
-                    )
-                )
-            layer_slices.append((layer_offset, len(rows) - layer_offset))
-        missing_fields = set(fields_by_id) - consumed_fields
-        if missing_fields:
-            raise ValueError(
-                f"cache transfer fields have no consumer {sorted(missing_fields)}"
-            )
-
-        geometry = build_host_transfer_geometry(
-            rows=tuple(rows),
-            layer_slices=tuple(layer_slices),
-            group_packing=tuple(
-                group.cache_blocks_per_lcm_block for group in self.layout.groups
-            ),
-            host_lcm_block_bytes=self.host_storage.host_lcm_block_bytes,
-            num_host_lcm_blocks=self.host_storage.num_host_lcm_blocks,
-            num_device_lcm_blocks=self.layout.num_lcm_blocks,
-            num_device_buffers=len(self.layout.buffers),
+        self.write_stream = new_cache_stream(None)
+        self.load_stream = new_cache_stream(load_stream_priority())
+        # Both the write stream (D2H) and load stream (H2D) consume this
+        # immutable table; the kernel backend publishes it to the Device once.
+        self._transfer_geometry = build_transfer_geometry(
+            self.layout, self.host_storage, io_backend=io_backend
         )
-        if io_backend == "kernel" and device.type != "npu":
-            # Both the write stream (D2H) and load stream (H2D) consume this
-            # immutable table, so publish it synchronously once at init.
-            geometry = geometry.bind(device, non_blocking=False)
-        self._transfer_geometry = geometry
-        self._ordered_write_lane = _WriteLane()
-        self._pinned_write_lane = _WriteLane()
+        # Two lanes, so the two kinds a round may submit (stream-ordered, then
+        # pinned) never wait on each other's metadata staging.
+        self._ordered_write_lane = HostTransferLane()
+        self._pinned_write_lane = HostTransferLane()
         # A tracker waits for an event set's previous final-layer event before
         # reusing its index. Aligning workspaces to those indices keeps each
         # load's pinned and Device block-ID tables immutable until all
@@ -720,7 +626,7 @@ class L2CacheExecutor:
         transfers: Sequence[tuple[int, int, int]],
         backup_pages: Sequence[StoragePage],
         *,
-        lane: _WriteLane,
+        lane: HostTransferLane,
         prerequisite_stream,
     ):
         """Launch one D2H batch on the write stream; return its completion event.
@@ -736,54 +642,15 @@ class L2CacheExecutor:
                 f"[L2] writeback started: operations={len(op_ids):d} blocks="
                 f"{len(transfers):d} pinned={lane is self._pinned_write_lane!s}",
             )
-        # Behind the forwards that wrote the source pages: that is what lets
-        # the copy read their final bytes.
-        self.write_stream.wait_stream(prerequisite_stream)
-        # CPU writes are not ordered by stream FIFO. Retire the previous
-        # metadata upload before refilling its pinned source, not at submit.
-        if lane.metadata_done is not None and not lane.metadata_done.query():
-            lane.metadata_done.synchronize()
-        num_blocks, _ = lane.workspace.load_block_transfers(
-            transfers, geometry=self._transfer_geometry
-        )
-        # Address-table allocation and the metadata H2D must be enqueued on
-        # the write stream itself: the payload kernel below reads those tables
-        # from that stream, and a copy issued on the caller's stream would sit
-        # behind the wait recorded above with nothing ordering it first.
-        with device_module.stream(self.write_stream):
-            mode = lane.workspace.prepare_backend(
-                self.layout.buffers,
-                self.host_storage.host_buffer,
-                backend=self.transfer_backend,
-            )
-            if mode.uses_device_tables:
-                if lane.metadata_done is None:
-                    lane.metadata_done = device_module.Event()
-                try:
-                    lane.workspace.commit_block_transfers(
-                        num_blocks, self.layout.buffers[0].device, non_blocking=True
-                    )
-                finally:
-                    # Also protect a partially submitted upload if staging
-                    # fails. This event excludes the payload transfer; Device
-                    # table reuse remains ordered by the write stream's FIFO.
-                    lane.metadata_done.record(self.write_stream)
-        transfer_cache_blocks(
-            "d2h",
-            self.layout.buffers,
-            self.host_storage.host_buffer,
-            self._transfer_geometry,
-            lane.workspace,
-            self.write_stream,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=self._transfer_geometry.num_field_rows,
+        finish = lane.start_d2h(
+            transfers,
+            device_buffers=self.layout.buffers,
+            host_buffer=self.host_storage.host_buffer,
+            geometry=self._transfer_geometry,
+            stream=self.write_stream,
+            prerequisite_stream=prerequisite_stream,
             backend=self.transfer_backend,
-            grid_cap=None,
-            layer_ready_flags=None,
         )
-        finish = device_module.Event()
-        finish.record(self.write_stream)
         with self._ack_lock:
             self._write_acks.append(
                 _Ack(

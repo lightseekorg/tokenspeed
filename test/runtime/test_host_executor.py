@@ -58,6 +58,12 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     host_transfer.build_host_transfer_geometry = Mock()
     host_transfer.transfer_cache_blocks = Mock()
     host_transfer.wait_layer_ready = Mock()
+    lanes = ModuleType("tokenspeed.runtime.cache.transfer.lanes")
+    lanes.HostTransferLane = Mock
+    lanes.build_transfer_geometry = Mock()
+    lanes.check_host_memory = Mock()
+    lanes.load_stream_priority = Mock(return_value=None)
+    lanes.new_cache_stream = Mock()
     scheduler = ModuleType("tokenspeed_scheduler")
 
     class Cache:
@@ -95,6 +101,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
         "tokenspeed_scheduler": scheduler,
         "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
         "tokenspeed.runtime.cache.l2.storage": storage,
+        "tokenspeed.runtime.cache.transfer.lanes": lanes,
         "tokenspeed.runtime.cache.transfer.layout": layout,
         "tokenspeed.runtime.execution.forward_step": forward_step,
         "tokenspeed.runtime.utils": runtime_utils,
@@ -169,6 +176,11 @@ class CacheEventPayloadTest(unittest.TestCase):
         self.assertEqual(
             self.pop_common([[load_payload], [dict(load_payload)]]), [load_payload]
         )
+
+
+def _lanes_module():
+    """The shared Host-transfer lane module the L2 write path delegates to."""
+    return import_module("tokenspeed.runtime.cache.transfer.lanes")
 
 
 class GroupAwareWireTest(unittest.TestCase):
@@ -404,6 +416,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def _make_write_executor(self, executor_module):
         L2CacheExecutor = executor_module.L2CacheExecutor
+        lanes_module = _lanes_module()
         executor = L2CacheExecutor.__new__(L2CacheExecutor)
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
@@ -413,8 +426,11 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.transfer_backend = "auto"
         executor._write_acks = []
         executor.write_stream = Mock(name="write_stream")
+        # Real lanes over mocked workspaces: the staging discipline under test
+        # is the lane's, the executor only picks which lane an op rides.
         for lane_name in ("_ordered_write_lane", "_pinned_write_lane"):
-            lane = SimpleNamespace(workspace=Mock(), metadata_done=None)
+            with patch.object(lanes_module, "HostTransferWorkspace", Mock):
+                lane = lanes_module.HostTransferLane()
             lane.workspace.load_block_transfers.return_value = (1, (0, 1))
             lane.workspace.prepare_backend.return_value = SimpleNamespace(
                 uses_device_tables=True,
@@ -429,6 +445,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_writeback_rides_the_write_stream_ordered_after_the_caller(self):
         executor_module = self._executor_module()
+        lanes_module = _lanes_module()
         executor, device = self._make_write_executor(executor_module)
         lane = executor._pinned_write_lane
         prerequisite_stream = object()
@@ -437,20 +454,20 @@ class GroupAwareWireTest(unittest.TestCase):
         # Every stream the executor touches is one the caller named; the
         # thread's current stream is never consulted.
         no_current_stream = patch.object(
-            executor_module.device_module,
+            lanes_module.device_module,
             "current_stream",
             side_effect=AssertionError("current stream must not be consulted"),
         )
 
         with (
             no_current_stream,
-            patch.object(executor_module.device_module, "stream") as stream_ctx,
+            patch.object(lanes_module.device_module, "stream") as stream_ctx,
             patch.object(
-                executor_module.device_module,
+                lanes_module.device_module,
                 "Event",
                 side_effect=[metadata_done, finish],
             ),
-            patch.object(executor_module, "transfer_cache_blocks") as transfer,
+            patch.object(lanes_module, "transfer_cache_blocks") as transfer,
         ):
             fence = executor._start_writing(
                 [7],
@@ -510,11 +527,11 @@ class GroupAwareWireTest(unittest.TestCase):
                 order.attach_mock(metadata_done.record, "record")
                 with (
                     no_current_stream,
-                    patch.object(executor_module.device_module, "stream") as stream_ctx,
+                    patch.object(lanes_module.device_module, "stream") as stream_ctx,
                     patch.object(
-                        executor_module.device_module, "Event", return_value=finish
+                        lanes_module.device_module, "Event", return_value=finish
                     ),
-                    patch.object(executor_module, "transfer_cache_blocks") as transfer,
+                    patch.object(lanes_module, "transfer_cache_blocks") as transfer,
                 ):
                     order.attach_mock(stream_ctx, "stream")
                     order.attach_mock(transfer, "payload")
@@ -543,6 +560,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_submit_write_backs_fences_only_stream_ordered_ops(self):
         executor_module = self._executor_module()
+        lanes_module = _lanes_module()
         executor, _ = self._make_write_executor(executor_module)
         fence_stream = Mock(name="fence_stream")
         prerequisite = object()
@@ -572,14 +590,14 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
             ),
             patch.object(
-                executor_module.device_module, "stream", return_value=nullcontext()
+                lanes_module.device_module, "stream", return_value=nullcontext()
             ),
             patch.object(
-                executor_module.device_module,
+                lanes_module.device_module,
                 "Event",
                 side_effect=lambda: next(events),
             ),
-            patch.object(executor_module, "transfer_cache_blocks") as transfer,
+            patch.object(lanes_module, "transfer_cache_blocks") as transfer,
         ):
             executor.submit_write_backs(
                 SimpleNamespace(cache=[WriteBackOp()]),
@@ -620,6 +638,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_mixed_write_lanes_ack_only_their_completed_l3_put(self):
         executor_module = self._executor_module()
+        lanes_module = _lanes_module()
         executor, _ = self._make_write_executor(executor_module)
         executor._load_acks = []
         executor._ready_load_acks = []
@@ -671,18 +690,18 @@ class GroupAwareWireTest(unittest.TestCase):
         try:
             with (
                 patch.object(executor_module.Cache, "WriteBackOp", WriteBackOp),
-                patch.object(executor_module.device_module, "current_stream"),
+                patch.object(lanes_module.device_module, "current_stream"),
                 patch.object(
-                    executor_module.device_module,
+                    lanes_module.device_module,
                     "stream",
                     return_value=nullcontext(),
                 ),
                 patch.object(
-                    executor_module.device_module,
+                    lanes_module.device_module,
                     "Event",
                     side_effect=lambda: next(events),
                 ),
-                patch.object(executor_module, "transfer_cache_blocks"),
+                patch.object(lanes_module, "transfer_cache_blocks"),
             ):
                 executor.submit_write_backs(
                     SimpleNamespace(cache=[WriteBackOp()]),
@@ -722,6 +741,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_submit_write_backs_without_stream_ordered_ops_fences_nothing(self):
         executor_module = self._executor_module()
+        lanes_module = _lanes_module()
         executor, _ = self._make_write_executor(executor_module)
         fence_stream = Mock(name="fence_stream")
         prerequisite = object()
@@ -739,10 +759,10 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
             ),
             patch.object(
-                executor_module.device_module, "stream", return_value=nullcontext()
+                lanes_module.device_module, "stream", return_value=nullcontext()
             ),
-            patch.object(executor_module.device_module, "Event", side_effect=Mock),
-            patch.object(executor_module, "transfer_cache_blocks"),
+            patch.object(lanes_module.device_module, "Event", side_effect=Mock),
+            patch.object(lanes_module, "transfer_cache_blocks"),
         ):
             executor.submit_write_backs(
                 SimpleNamespace(cache=[WriteBackOp()]),
@@ -882,6 +902,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_kernel_init_builds_consumer_ordered_static_geometry_once(self):
         executor_module = self._executor_module()
+        lanes_module = _lanes_module()
         L2CacheExecutor = executor_module.L2CacheExecutor
 
         device = SimpleNamespace(type="cuda")
@@ -970,17 +991,18 @@ class GroupAwareWireTest(unittest.TestCase):
             ),
             patch.object(executor_module, "HostCacheStorage", return_value=storage),
             patch.object(
-                executor_module.psutil,
+                lanes_module.psutil,
                 "virtual_memory",
                 return_value=SimpleNamespace(available=10**12),
             ),
             patch.object(
                 executor_module, "LayerwiseLoadTracker", side_effect=make_tracker
             ),
-            patch.object(executor_module, "_new_cache_stream", return_value="load"),
+            patch.object(executor_module, "new_cache_stream", return_value="load"),
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(
-                executor_module,
+                lanes_module,
                 "build_host_transfer_geometry",
                 return_value=unbound_geometry,
             ) as build_geometry,
@@ -1013,6 +1035,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
     def test_direct_and_npu_init_keep_geometry_on_the_host(self):
         executor_module = self._executor_module()
+        lanes_module = _lanes_module()
         L2CacheExecutor = executor_module.L2CacheExecutor
 
         pool = Mock()
@@ -1035,15 +1058,16 @@ class GroupAwareWireTest(unittest.TestCase):
             ),
             patch.object(executor_module, "HostCacheStorage", return_value=storage),
             patch.object(
-                executor_module.psutil,
+                lanes_module.psutil,
                 "virtual_memory",
                 return_value=SimpleNamespace(available=10**12),
             ),
             patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
-            patch.object(executor_module, "_new_cache_stream", return_value="load"),
+            patch.object(executor_module, "new_cache_stream", return_value="load"),
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(
-                executor_module,
+                lanes_module,
                 "build_host_transfer_geometry",
                 side_effect=lambda **_kwargs: SimpleNamespace(
                     device_rows=None,
@@ -1092,6 +1116,7 @@ class GroupAwareWireTest(unittest.TestCase):
             "tokenspeed_scheduler",
             "tokenspeed.runtime.cache.l2.layerwise_load",
             "tokenspeed.runtime.cache.l2.storage",
+            "tokenspeed.runtime.cache.transfer.lanes",
             "tokenspeed.runtime.cache.transfer.layout",
             "tokenspeed.runtime.execution.forward_step",
             "tokenspeed.runtime.utils",
@@ -1107,14 +1132,18 @@ class GroupAwareWireTest(unittest.TestCase):
                 self.assertIs(sys.modules[name], sentinel)
 
     def test_two_isolated_loads_preserve_imported_real_modules(self):
+        # psutil is a real dependency of the shared lane module; the isolated
+        # loader imports it ahead of its sys.modules snapshot so the snapshot's
+        # restore cannot drop it again.
         first = _load_executor_module_without_triton(force_isolated=True)
-        first_psutil = first.psutil
+        first_psutil = sys.modules["psutil"]
+        self.assertIs(_lanes_module().psutil, first_psutil)
 
-        self.assertIs(sys.modules["psutil"], first_psutil)
         second = _load_executor_module_without_triton(force_isolated=True)
 
-        self.assertIs(second.psutil, first_psutil)
+        self.assertIsNot(first, second)
         self.assertIs(sys.modules["psutil"], first_psutil)
+        self.assertIs(_lanes_module().psutil, first_psutil)
 
     def test_loadback_commits_block_ids_once_and_launches_one_flagged_kernel(self):
         executor_module, executor, device, geometry, workspace = (
