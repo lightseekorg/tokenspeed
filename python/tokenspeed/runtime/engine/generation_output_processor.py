@@ -1138,6 +1138,46 @@ class OutputProcesser:
             state.grammar.accept_token(bootstrap_token)
         state.check_finished()
 
+    def finish_scheduler_aborted_requests(self, aborts) -> None:
+        """Finish the requests the scheduler aborted while building a plan.
+
+        The last resort of a capacity retraction whose victim could not be
+        imaged (``ExecutionPlan.aborts``, ``docs/configuration/server.md``,
+        "Retraction snapshot pool"): the scheduler released the request's
+        pages and slot in that very round and emits nothing further for it,
+        so this is the request's whole finish -- the client gets an
+        ``ABORT_CODE.CapacityAbort`` finish carrying the scheduler's detail
+        (the shortfall and the knobs to raise), which a caller that can
+        resubmit retries on. Returns no scheduler event: the request is
+        already ``Finished`` there. A victim is quiescent when chosen, so no
+        in-flight forward names it; an id already gone (a client abort that
+        crossed the same round) is skipped.
+
+        Args:
+            aborts: The plan's ``SchedulerAbort`` entries (``request_id``,
+                ``reason``, ``detail``).
+        """
+        for abort in aborts:
+            rid = str(abort.request_id)
+            state = self.rid_to_state.get(rid)
+            if state is None:
+                continue
+            detail = str(abort.detail)
+            if not state.finished:
+                state.finished_reason = FINISH_ABORT(
+                    message=f"Request aborted by the scheduler: {detail}",
+                    err_type=ABORT_CODE.CapacityAbort,
+                )
+            self.metrics.record_capacity_abort()
+            if self.attn_tp_rank == 0:
+                logger.warning(
+                    f"Req {rid!s} aborted by the scheduler ({abort.reason!s}): {detail}"
+                )
+            self._log_request_stats(rid, state, time.time())
+            self.stream_output([rid], [state])
+            self._release_multimodal_features(state)
+            self.rid_to_state.pop(rid)
+
     def finish_remote_prefill_only_request(self, req_id: str) -> list:
         """Finish after remote prefill when no decode step is needed.
 

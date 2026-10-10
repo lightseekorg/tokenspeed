@@ -381,7 +381,8 @@ def make_config(
     Args:
         num_device_pages: Device LCM blocks including the null page.
         max_scheduled_tokens: Per-step prefill token budget.
-        max_batch_size: Per-rank batch slots.
+        max_batch_size: Per-rank batch slots -- the most requests this rank
+            runs at once (``--max-num-seqs`` over the attention-DP ranks).
         prefix_granularity: Prefix-hash page size in tokens.
         num_host_pages: Host L2 LCM blocks including the null page; 0 without
             the L2 tier.
@@ -390,11 +391,15 @@ def make_config(
         role: ``server_args.disaggregation_mode``.
         num_snapshot_pages: The retraction snapshot pool's LCM blocks
             including the null page (``DeviceSpecs.num_snapshot_pages``).
-            Required on every role: 1 -- the null page alone -- means the
-            engine never retracts; more enables retraction on the fused and
-            decode roles (the prefill role refuses a pool).
+            Required on every role: 1 -- the null page alone -- means no
+            image can be taken, so a capacity-blocked round aborts the newest
+            resident instead of suspending anyone; more enables suspend and
+            restore on the fused and decode roles (the prefill role refuses a
+            pool).
         max_retracted_requests: Slot-state arena rows, hence the most
-            requests retracted at once; positive exactly when a pool exists.
+            requests suspended at once; positive exactly when a pool exists.
+            A victim whose image does not fit the Host (L2 pins, pool, rows)
+            is aborted by the scheduler instead of imaged.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -414,7 +419,7 @@ def make_config(
         )
     if num_snapshot_pages < 1:
         raise ValueError(
-            "num_snapshot_pages must include the null page (1 = never retract); "
+            "num_snapshot_pages must include the null page (1 = no pool); "
             f"got {num_snapshot_pages}."
         )
     if (num_snapshot_pages > 1) != (max_retracted_requests > 0):

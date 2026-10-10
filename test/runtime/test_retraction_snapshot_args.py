@@ -24,6 +24,8 @@ import pytest
 
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
+POOL = dict(retraction_snapshot_host_gb=1.0, retraction_snapshot_max_requests=16)
+
 
 def test_default_is_no_pool():
     args = ServerArgs(model="x")
@@ -32,10 +34,8 @@ def test_default_is_no_pool():
 
 
 def test_a_pool_needs_its_slot_rows_and_vice_versa():
-    args = ServerArgs(
-        model="x", retraction_snapshot_host_gb=4.0, retraction_snapshot_max_requests=16
-    )
-    assert args.retraction_snapshot_host_gb == 4.0
+    args = ServerArgs(model="x", **POOL)
+    assert args.retraction_snapshot_host_gb == 1.0
     with pytest.raises(ValueError, match="go together"):
         ServerArgs(model="x", retraction_snapshot_host_gb=4.0)
     with pytest.raises(ValueError, match="go together"):
@@ -47,21 +47,11 @@ def test_a_pool_needs_its_slot_rows_and_vice_versa():
 @pytest.mark.parametrize("role", ["prefill", "encode"])
 def test_non_retracting_roles_refuse_a_pool(role):
     with pytest.raises(ValueError, match="never retracts"):
-        ServerArgs(
-            model="x",
-            disaggregation_mode=role,
-            retraction_snapshot_host_gb=1.0,
-            retraction_snapshot_max_requests=2,
-        )
+        ServerArgs(model="x", disaggregation_mode=role, **POOL)
 
 
 def test_the_pool_is_independent_of_the_kvstore():
-    args = ServerArgs(
-        model="x",
-        disable_kvstore=True,
-        retraction_snapshot_host_gb=1.0,
-        retraction_snapshot_max_requests=2,
-    )
+    args = ServerArgs(model="x", disable_kvstore=True, **POOL)
     assert args.enable_kvstore is False
     assert args.retraction_snapshot_host_gb == 1.0
 
@@ -71,13 +61,7 @@ def test_dcp_takes_both_host_tiers_but_not_l3():
     # class and the executor translates ownership on both ends of every row,
     # so a KV-page-sharded engine may run the Host KVStore and the snapshot
     # pool. L3 keys have no owner-stable form under sharding and stay refused.
-    args = ServerArgs(
-        model="x",
-        world_size=2,
-        decode_context_parallel_size=2,
-        retraction_snapshot_host_gb=1.0,
-        retraction_snapshot_max_requests=2,
-    )
+    args = ServerArgs(model="x", world_size=2, decode_context_parallel_size=2, **POOL)
     assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
     with pytest.raises(ValueError, match="L3.*decode-context-parallel-size"):
         ServerArgs(
@@ -93,10 +77,5 @@ def test_forced_retraction_is_a_test_knob_that_needs_a_pool():
     with pytest.raises(ValueError, match="debug-force-retraction-interval.*pool"):
         ServerArgs(model="x", debug_force_retraction_interval=3)
     for interval in (3, -2):
-        args = ServerArgs(
-            model="x",
-            retraction_snapshot_host_gb=1.0,
-            retraction_snapshot_max_requests=2,
-            debug_force_retraction_interval=interval,
-        )
+        args = ServerArgs(model="x", **POOL, debug_force_retraction_interval=interval)
         assert args.debug_force_retraction_interval == interval

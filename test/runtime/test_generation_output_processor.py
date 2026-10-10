@@ -56,9 +56,13 @@ class _Metrics:
 
     def __init__(self):
         self.nan_aborts = 0
+        self.capacity_aborts = 0
 
     def record_nan_abort(self):
         self.nan_aborts += 1
+
+    def record_capacity_abort(self):
+        self.capacity_aborts += 1
 
 
 class _ForwardOp:
@@ -826,3 +830,43 @@ def test_non_pd_cached_tokens_reach_output():
     state.finished_reason = FINISH_LENGTH(length=1)
     processor.stream_output(["local"], [state])
     assert sender.items[0].cached_tokens == [1280]
+
+
+def test_scheduler_aborts_finish_toward_the_client_with_a_capacity_code():
+    """A capacity retraction whose victim could not be imaged aborted that
+    request inside the plan build: the processor finishes it to the client
+    with ``ABORT_CODE.CapacityAbort`` and the scheduler's detail, counts it,
+    returns no event (the scheduler already dropped it) and leaves the other
+    requests alone; an id the client aborted in the same round is skipped."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.engine.request_types import ABORT_CODE
+
+    sender = _Sender()
+    metrics = _Metrics()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=metrics)
+    victim = _state([1, 2, 3], computed_length=3)
+    victim.output_ids = [41, 42]
+    processor.rid_to_state["victim"] = victim
+    processor.rid_to_state["other"] = _state([4, 5, 6], computed_length=3)
+    aborts = [
+        SimpleNamespace(
+            request_id="victim",
+            reason="ImageDoesNotFit",
+            detail="no blob slot free (max_retracted_requests=2); raise "
+            "--retraction-snapshot-max-requests",
+        ),
+        SimpleNamespace(request_id="gone", reason="ImageDoesNotFit", detail="x"),
+    ]
+
+    assert processor.finish_scheduler_aborted_requests(aborts) is None
+
+    assert set(processor.rid_to_state) == {"other"}
+    assert victim.finished and victim.finished_reason.is_error
+    reason = victim.finished_reason.to_json()
+    assert reason["type"] == "abort"
+    assert reason["err_type"] == ABORT_CODE.CapacityAbort.value == 524
+    assert "max_retracted_requests=2" in reason["message"]
+    assert metrics.capacity_aborts == 1
+    (out,) = sender.items
+    assert out.rids == ["victim"] and out.finished_reasons[0] == reason

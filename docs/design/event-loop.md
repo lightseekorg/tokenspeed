@@ -413,9 +413,15 @@ For orientation, one iteration of `event_loop`:
    round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
    step. Otherwise: revalidate queued L3 hits, plan (`next_execution_plan`),
-   derive the forward op, record metrics, DP-sync, and gather per-batch state
-   (draining the in-flight queue first if the dispatch depends on a pending
-   commit, Principle 4).
+   count its cache ops, finish the requests the plan aborted
+   (`plan.aborts`: a capacity retraction whose victim could not be imaged
+   aborted the newest resident inside the plan build; the scheduler
+   released its pages in that round and emits nothing further for it, so
+   the output processor finishes it toward the client with
+   `ABORT_CODE.CapacityAbort` and no event flows back -- the one request
+   finish that is not a forward result), derive the forward op, record
+   metrics, DP-sync, and gather per-batch state (draining the in-flight
+   queue first if the dispatch depends on a pending commit, Principle 4).
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse. The
    handle adapts the plan's cache ops once (`cache_ops_from_plan`, on the

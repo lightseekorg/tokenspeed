@@ -363,8 +363,8 @@ are not advertised as control URLs; use a concrete address for gateway discovery
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
-| `--retraction-snapshot-host-gb` | Per-rank pinned Host pool, in gigabytes, for the retraction image's tail: a retracted request's unaligned tail pages, its blocks of groups Host L2 never holds, and its slot state (the hash-complete blocks go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool must hold whole images, about `--max-model-len` x bytes-per-token each). A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. `0` (the default) means no pool: the scheduler never retracts, and an admission that does not fit waits for completions. Fused and decode roles only; refused on prefill/encode. Allowed under `--decode-context-parallel-size > 1`. Startup logs the pool in LCM blocks and tokens. |
-| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, i.e. the most requests retracted at once. Required with a non-zero pool and refused without one; a rule of thumb is `2 x --max-num-seqs / dp_size`. |
+| `--retraction-snapshot-host-gb` | Per-rank pinned Host pool, in gigabytes, for the retraction image's tail: a retracted request's unaligned tail pages, its blocks of groups Host L2 never holds, and its slot state (the hash-complete blocks go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool must hold whole images, about `--max-model-len` x bytes-per-token each). A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. `0` (the default) means no pool: nothing can be imaged, and a capacity-blocked round aborts the newest resident. Fused and decode roles only; refused on prefill/encode. Allowed under `--decode-context-parallel-size > 1`. Startup logs the pool in LCM blocks and tokens. |
+| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, i.e. the most requests suspended at once. Required with a non-zero pool and refused without one. When no row is free the scheduler aborts a resident rather than waiting, so size it for the concurrency expected under pressure; `--max-num-seqs / attention-DP size` covers every resident request. |
 | `--debug-force-retraction-interval` | **Test only.** Every `N` scheduler plans retract the oldest quiescent decoding request (`N > 0`), or with `-N` the one prefilling request between its chunks, without capacity pressure, so a test run exercises the suspend/restore path on every request (the bitwise continuation oracle of [Numerics](../design/numerics.md)). Needs a retraction snapshot pool. `0` (the default) is off; never set it in serving. |
 
 For pure prefill, token capacities count newly computed tokens, not cached
@@ -764,11 +764,33 @@ and the slot-state blob go to the request-private pool
 (`docs/design/cache-concepts.md`, "Retraction image"). The two buffers are
 separate allocations of one Host cache executor and both count against its
 Host-memory headroom check. The pool is independent of the KVStore: with
-`--disable-kvstore` there is no L2 leg and the pool holds whole images, so it
-must be sized for the victims the operator wants to hold at once; with L2 it
-holds about one page per group per retracted request plus the slot-state
-blob. `0` is the explicit "no pool": the scheduler then never retracts, and
-an admission that does not fit waits for completions.
+`--disable-kvstore` there is no L2 leg and the pool holds whole images; with
+L2 it holds the tails -- about one page per group per retracted request --
+plus the slot-state blob. `0` is the explicit "no pool": nothing can be
+imaged, so a capacity-blocked round aborts the newest resident (below).
+
+**When the image does not fit.** Host accounting stays optimistic -- no
+admission gate charges a request's worst-case image -- and retraction never
+waits on Host capacity or falls back to recomputation. The capacity policy
+ranks only victims whose image fits (a free slot-state row and pool room for
+the tail; hash-complete pages ride Host L2, whose shortfall falls back to
+the pool). When no resident fits, the scheduler **aborts the newest
+retractable resident** in the same round and grants its pages to the
+blocked request. The client sees the finish `{"type": "abort", "err_type":
+524, "message": "Request aborted by the scheduler: <detail>"}`
+(`ABORT_CODE.CapacityAbort`; the detail names the shortfall -- "snapshot
+pool cannot hold the image" or "no blob slot free
+(max_retracted_requests=N)" -- and the arg to raise), distinguishable from
+a NaN abort (523) or a transfer failure (521), so a caller that can retry --
+an RL rollout, a batch job -- resubmits; the engine counts them in
+`tokenspeed:num_capacity_aborted_requests`. The two args therefore size how
+much work may be suspended at once, and exceeding them costs an abort of
+one request, never latency for everyone else. With no pool
+(`--retraction-snapshot-host-gb 0`) nothing can be imaged, so a
+capacity-blocked round aborts the newest resident instead of imaging
+anyone. `--debug-force-retraction-interval` never aborts: a forced
+retraction whose image does not fit is refused and logged. The scheduler's
+victim choice is in `docs/design/scheduler.md` section 2.
 
 The ops ride the round's `DeviceHandle.execute` with the L2 write-backs and
 load-backs (`docs/design/event-loop.md`), their ACKs the same cache poll, and

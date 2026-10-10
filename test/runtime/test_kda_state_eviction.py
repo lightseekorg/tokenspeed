@@ -166,7 +166,7 @@ class _ScheduledKDA:
         config.prefix_granularity = _P
         config.num_device_pages = _USABLE_BLOCKS + 1
         config.num_host_pages = 0
-        config.num_snapshot_pages = 1  # the null page alone: never retract
+        config.num_snapshot_pages = 1  # the null page alone: no pool
         config.max_retracted_requests = 0
         config.max_scheduled_tokens = _P
         config.max_batch_size = 1

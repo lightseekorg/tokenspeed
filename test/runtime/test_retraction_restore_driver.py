@@ -45,6 +45,11 @@ from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     SnapshotOp,
 )
 from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks  # noqa: E402
+from tokenspeed.runtime.engine.generation_output_processor import (  # noqa: E402
+    OutputProcesser,
+    RequestState,
+)
+from tokenspeed.runtime.engine.request_types import ABORT_CODE  # noqa: E402
 from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
     advance_scheduler,
     cache_ops_from_plan,
@@ -52,6 +57,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
     make_config,
     make_extend_result_event,
 )
+from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
 PAGE = 16
 PROMPT = list(range(40))  # 2 hash-complete pages and a 8-token tail
@@ -246,11 +252,10 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
     driver.complete([restore])
 
     # RestoreDone: Decoding again, same token count, nothing left in the pool
-    # or pinned in L2, and the next decode runs in the restored slot. Its
-    # input is the request's last token either way the scheduler states it:
-    # explicitly (no forward of the request is in flight to capture it from)
-    # or as -1, deferring to the restored row, whose column 0 is that token;
-    # the runtime takes both (RuntimeStates.import_slot_state).
+    # or pinned in L2, and the next decode runs in the restored slot with
+    # the request's last token stated explicitly (no forward of the request
+    # is in flight to capture it from; RuntimeStates.import_slot_state keeps
+    # the imaged candidates beside it).
     rnd = driver.round()
     assert scheduler.retracted_size() == 0 and scheduler.decoding_size() == 1
     assert scheduler.request_token_size("a") == tokens_before
@@ -259,7 +264,7 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
     (decode,) = rnd.forwards
     assert list(decode.request_ids) == ["a"] and decode.num_extends() == 0
     assert list(decode.request_pool_indices) == [restore.request_pool_index]
-    assert list(decode.decode_input_ids) in ([driver.last_token], [-1])
+    assert list(decode.decode_input_ids) == [driver.last_token]
     driver.complete(rnd.ops)
     driver.land(decode)
     assert scheduler.request_token_size("a") == tokens_before + 1
@@ -287,7 +292,8 @@ def test_an_aborted_victims_store_is_still_acknowledged_and_frees_its_image() ->
     assert driver.hooks._num_inflight == 0
 
 
-def test_the_knob_is_off_by_default_and_a_null_pool_never_retracts() -> None:
+def test_the_knob_is_off_by_default() -> None:
+    # Without the knob and without capacity pressure nothing is retracted.
     scheduler = _scheduler(l2=False, force_interval=0)
     driver = _Driver(scheduler)
     _prefill_and_decode_once(driver)
@@ -296,3 +302,118 @@ def test_the_knob_is_off_by_default_and_a_null_pool_never_retracts() -> None:
         assert rnd.ops == [] and len(rnd.forwards) == 1
         driver.land(rnd.forwards[0])
     assert scheduler.retracted_size() == 0
+
+
+class _Sender:
+    def __init__(self) -> None:
+        self.items: list = []
+
+    def send_pyobj(self, obj) -> None:
+        self.items.append(obj)
+
+
+class _Tokenizer:
+    eos_token_id = None
+    additional_stop_token_ids = None
+
+    def decode(self, ids):
+        return "".join(str(i) for i in ids)
+
+
+class _Metrics:
+    enabled = False
+
+    def __init__(self) -> None:
+        self.capacity_aborts = 0
+
+    def record_nan_abort(self) -> None:
+        raise AssertionError("not a NaN abort")
+
+    def record_capacity_abort(self) -> None:
+        self.capacity_aborts += 1
+
+
+def test_a_capacity_blocked_round_with_no_fitting_image_aborts_the_newest_resident():
+    """No pool: nothing can be imaged, so when the residents outgrow the
+    Device pool the scheduler aborts the newest one inside the plan build
+    and lists it in ``plan.aborts``; the output processor finishes it toward
+    the client with ``ABORT_CODE.CapacityAbort`` and the scheduler's detail,
+    and the other residents keep decoding on the freed pages."""
+    page = 64
+    groups = [
+        ts.CacheGroupConfig(
+            group_id="history",
+            block_granularity=page,
+            total_pages=256 + 1,
+            retention=ts.CacheRetention.FullHistory,
+            family=ts.CacheGroupFamily.History,
+        )
+    ]
+    scheduler = ts.Scheduler(
+        make_config(
+            num_device_pages=256 + 1,
+            max_scheduled_tokens=4096,
+            max_batch_size=8,
+            prefix_granularity=page,
+            num_host_pages=0,
+            disable_l2_cache=True,
+            enable_l3_storage=False,
+            role="fused",
+            num_snapshot_pages=1,
+            max_retracted_requests=0,
+            cache_groups=groups,
+        )
+    )
+    sender = _Sender()
+    metrics = _Metrics()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=metrics)
+    for rid in ("a", "b", "c"):
+        spec = ts.RequestSpec()
+        spec.request_id = rid
+        spec.tokens = list(range(page))
+        # Past the retraction safe-step window: the admission reserve does
+        # not cover the generation, so the residents are retractable and
+        # outgrow the 256 pages together.
+        spec.max_new_tokens = 9000
+        scheduler.submit_requests([spec])
+        processor.rid_to_state[rid] = RequestState(
+            prompt_input_ids=list(range(page)),
+            sampling_params=SamplingParams(max_new_tokens=9000, ignore_eos=True),
+            stream=False,
+            tokenizer=_Tokenizer(),
+            computes_prompt_logprobs=True,
+        )
+
+    token = 1000
+    aborted = None
+    for _ in range(10_000):
+        plan = scheduler.next_execution_plan()
+        processor.finish_scheduler_aborted_requests(plan.aborts)
+        if plan.aborts:
+            aborted = list(plan.aborts)
+            break
+        for op in plan.forward:
+            for rid in op.request_ids:
+                advance_scheduler(scheduler, [make_extend_result_event(rid, [token])])
+                token += 1
+    assert aborted is not None, "the residents never outgrew the Device pool"
+    (abort,) = aborted
+    assert abort.request_id == "c"  # the newest resident, the least work lost
+    assert int(abort.reason) == 0  # AbortReason.ImageDoesNotFit
+    assert "--retraction-snapshot-max-requests" in abort.detail
+    # Finished toward the client, with the capacity code and the detail.
+    assert set(processor.rid_to_state) == {"a", "b"}
+    (out,) = sender.items
+    assert out.rids == ["c"]
+    reason = out.finished_reasons[0]
+    assert (
+        reason["type"] == "abort"
+        and reason["err_type"] == ABORT_CODE.CapacityAbort.value
+    )
+    assert abort.detail in reason["message"]
+    assert metrics.capacity_aborts == 1
+    # The scheduler dropped it on its own; the others go on decoding.
+    assert scheduler.decoding_size() == 2 and scheduler.waiting_size() == 0
+    plan = scheduler.next_execution_plan()
+    assert plan.aborts == []
+    assert sorted(rid for op in plan.forward for rid in op.request_ids) == ["a", "b"]

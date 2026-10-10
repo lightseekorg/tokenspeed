@@ -176,7 +176,8 @@ class DeviceSpecs:
         num_snapshot_pages: The retraction snapshot pool's page count (incl.
             the null page), sized like the L2 tier's from
             ``--retraction-snapshot-host-gb``; 1 (the null page alone)
-            without a pool, which tells the scheduler never to retract.
+            without a pool, when nothing can be imaged and a capacity-blocked
+            round aborts a resident instead.
         max_retracted_requests: Slot-state image rows of the snapshot pool,
             i.e. how many requests may be retracted at once; 0 without a
             pool.

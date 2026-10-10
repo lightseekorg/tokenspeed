@@ -73,6 +73,10 @@ class ABORT_CODE(Enum):
     TransferFailed = 521
     UnknownError = 522
     NumericalError = 523
+    # The scheduler aborted the request because a capacity retraction could
+    # not image its victim (no snapshot-pool room or no image row): the
+    # request itself is fine and can be resubmitted.
+    CapacityAbort = 524
 
 
 class FINISH_ABORT(BaseFinishReason):

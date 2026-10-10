@@ -1120,6 +1120,13 @@ class EventLoop:
                     self._l3_hooks.revalidate_queued_hits()
                     execution_plan = self.scheduler.next_execution_plan()
                     self._cache_hooks.count_plan_ops(execution_plan)
+                    # A capacity retraction whose victim could not be imaged
+                    # aborted that request inside the plan build; it is gone
+                    # from the scheduler, so finish it toward the client here
+                    # (no event flows back).
+                    self.output_processor.finish_scheduler_aborted_requests(
+                        execution_plan.aborts
+                    )
 
                     forward_op = self._get_forward_op(execution_plan)
                     forward_op, l3_prefetch_retracts = self._l3_hooks.prepare_forward(

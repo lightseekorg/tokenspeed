@@ -433,8 +433,9 @@ class ServerArgs:
 
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
-    # resumed by restore. 0 is the explicit "no pool": the scheduler then
-    # never retracts and a blocked admission waits for completions.
+    # resumed by restore; a victim whose image does not fit is aborted
+    # instead. 0 is the explicit "no pool": nothing can be imaged, so a
+    # capacity-blocked round aborts the newest resident.
     retraction_snapshot_host_gb: float = 0.0
     retraction_snapshot_max_requests: int = 0
     # Test knob: every |N| plans the scheduler retracts the oldest quiescent
@@ -1138,7 +1139,10 @@ class ServerArgs:
         and needs ``--retraction-snapshot-max-requests`` for the slot-state
         arena it comes with; 0 is the explicit "no pool" and must not come
         with arena slots. Prefill and encode roles never retract, so a pool
-        there is a configuration error rather than idle memory.
+        there is a configuration error rather than idle memory. The pool is
+        not sized against the Device pool or the running requests: a victim
+        whose image does not fit is aborted by the scheduler rather than
+        imaged (``docs/configuration/server.md``, "Retraction snapshot pool").
         """
         host_gb = self.retraction_snapshot_host_gb
         max_requests = self.retraction_snapshot_max_requests
@@ -2254,17 +2258,22 @@ class ServerArgs:
             "pinned there until the request is restored; with --disable-kvstore "
             "the pool must hold whole images). A retracted request is suspended "
             "with its image and resumes exactly where it stopped once the image "
-            "is copied back; nothing is recomputed. 0 (the default) means no "
-            "pool: the scheduler never retracts and a blocked admission waits "
-            "for completions. Fused and decode roles only.",
+            "is copied back; nothing is recomputed. A victim whose image does not "
+            "fit the Host (L2 pins, the pool or its rows) is aborted instead of "
+            "imaged and the client told why, so the pool bounds how much can be "
+            "suspended at once, never how long an admission waits. 0 (the "
+            "default) means no pool: nothing can be imaged, and a capacity-blocked "
+            "round aborts the newest resident. Fused and decode roles only.",
         )
         parser.add_argument(
             "--retraction-snapshot-max-requests",
             type=int,
             default=ServerArgs.retraction_snapshot_max_requests,
             help="Slot-state image rows of the retraction snapshot pool, i.e. the "
-            "most requests retracted at once. Required with a non-zero pool; "
-            "a rule of thumb is 2 x --max-num-seqs / dp_size.",
+            "most requests suspended at once. Required with a non-zero pool; a "
+            "victim that finds no free row is aborted rather than imaged, so size "
+            "it for the concurrency expected under pressure (--max-num-seqs / "
+            "attention-DP size covers every resident).",
         )
         parser.add_argument(
             "--debug-force-retraction-interval",

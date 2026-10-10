@@ -689,10 +689,13 @@ def test_l3_recovery_preserves_round_order(
     failed_forward = SimpleNamespace(
         request_ids=["running", "new"], input_lengths=[1, 4]
     )
-    first_plan = SimpleNamespace(forward=[first_forward], remote_prefill=None)
+    first_plan = SimpleNamespace(
+        forward=[first_forward], remote_prefill=None, aborts=[]
+    )
     failed_plan = SimpleNamespace(
         forward=[] if remote_only else [failed_forward],
         remote_prefill=SimpleNamespace(request_ids=["remote"]),
+        aborts=[],
     )
     plans = iter([first_plan, failed_plan])
 
@@ -777,7 +780,12 @@ def test_l3_recovery_preserves_round_order(
         ),
         _gather_sampling_params=Mock(return_value=[]),
         _gather_grammar_state=Mock(return_value=None),
-        output_processor=SimpleNamespace(rid_to_state={}),
+        output_processor=SimpleNamespace(
+            rid_to_state={},
+            finish_scheduler_aborted_requests=lambda aborts: trace.append(
+                ("aborts", list(aborts))
+            ),
+        ),
         _ngram_context_len=0,
         _request_history_rows=None,
         _dispatch_depends_on_pending_commit=Mock(return_value=False),
@@ -812,6 +820,11 @@ def test_l3_recovery_preserves_round_order(
     device.invalidate_l3_prefetch.assert_called_once_with()
     scheduler.unregister_storage_keys.assert_called_once_with([0], ["h4"], [0])
     loop._cache_hooks.count_plan_ops.assert_any_call(failed_plan)
+    # Every plan's scheduler aborts are finished toward the client right
+    # after it is built, before the round's device work.
+    for plan in (first_plan, failed_plan):
+        plan_index = trace.index(("plan", plan))
+        assert trace[plan_index + 1] == ("aborts", [])
 
 
 if __name__ == "__main__":
