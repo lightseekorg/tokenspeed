@@ -135,6 +135,10 @@ Finished AbortEvent::operator()(Submitted&&) {
     return Finished{};
 }
 
+Finished AbortEvent::operator()(Prefetching&&) {
+    return Finished{};
+}
+
 template <typename State>
 Finished AbortEvent::abortForward(State&& state) {
     _assert(coordinator_ != nullptr, "AbortEvent requires a cache coordinator");
@@ -212,37 +216,6 @@ Retracted SnapshotRetractEvent::operator()(Decoding&& state) {
     const ResumeDecoding shape{.reserve_num_tokens_in_next_schedule_event =
                                    state.ReserveNumTokensInNextScheduleEvent()};
     return retract(std::move(state), shape);
-}
-
-template <typename State>
-Submitted RecomputeRetractEvent::recompute(State&& state) {
-    _assert(coordinator_ != nullptr, "RecomputeRetractEvent requires a cache coordinator");
-    ForwardResources& resources = state.resources;
-    // Prompt + generated become one fresh prefill: the skipped forward wrote
-    // nothing, so there is no checkpoint to continue from.
-    resources.token_container->RebasePrefill();
-    FreeRequest(*coordinator_, resources.block_tables);
-    return Submitted{resources.token_container, resources.prefix_granularity};
-}
-
-Submitted RecomputeRetractEvent::operator()(Prefilling&& state) {
-    return recompute(std::move(state));
-}
-
-Submitted RecomputeRetractEvent::operator()(PrefillDone&& state) {
-    return recompute(std::move(state));
-}
-
-Submitted RecomputeRetractEvent::operator()(PrefillAwaitingResult&& state) {
-    return recompute(std::move(state));
-}
-
-Submitted RecomputeRetractEvent::operator()(RemotePrefilling&& state) {
-    return recompute(std::move(state));
-}
-
-Submitted RecomputeRetractEvent::operator()(Decoding&& state) {
-    return recompute(std::move(state));
 }
 
 Restoring ScheduleRestoreEvent::operator()(Retracted&& state) {

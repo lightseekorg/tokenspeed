@@ -71,15 +71,6 @@ bool holdsHeadOfLine(const Request& request) {
     return request.Is<fsm::Prefilling>();
 }
 
-bool prefixHashPrefetchesFromStorage(std::span<const BlockTransfer> load_pairs, const std::string& content_hash) {
-    for (const BlockTransfer& transfer : load_pairs) {
-        if (transfer.prefetch_from_storage && transfer.key.content_hash == content_hash) {
-            return true;
-        }
-    }
-    return false;
-}
-
 template <typename Operation>
 void fillBlockTables(Operation& operation, Request& request, const CacheCoordinator& coordinator,
                      std::span<const std::string> group_ids) {
@@ -288,146 +279,114 @@ bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback&
         .has_value();
 }
 
-std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFirstChunk(
-    ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t remaining,
-    std::int32_t decode_input_tokens) {
+Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                                  Request* request, std::int32_t remaining,
+                                                                  std::int32_t decode_input_tokens,
+                                                                  std::vector<PrefetchOperation>& prefetches) {
+    AdmissionMatch match = matchPrefixAtAdmission(request);
+    // L3 objects beyond the Host hit are fetched into Host BEFORE admission:
+    // the request waits (holding only the Host blocks being filled, no Device
+    // pages, no slot) and is admitted as an ordinary Host hit once they
+    // landed, so nothing an admission loads can miss. Below the threshold
+    // the pages are simply computed. The D role probes the Device alone and
+    // never gets here with a storage tier.
+    if (config_.enable_l3_storage && config_.role != Role::kD) {
+        if (std::optional<CacheCoordinator::PrefetchPlan> prefetch =
+                coordinator_.PlanPrefetch(match.probe, config_.l3_prefetch_min_pages)) {
+            std::vector<CacheBlockRef> host_blocks;
+            host_blocks.reserve(prefetch->rows.size());
+            for (const CacheCoordinator::PrefetchRow& row : prefetch->rows) {
+                host_blocks.push_back(row.host_block);
+            }
+            PrefetchOperation op = tier_transfers_.StartPrefetch(request->Id(), std::move(*prefetch));
+            spdlog::info("[Scheduler] prefetch: request {} waits for {} L3 page(s) beyond its Host hit", request->Id(),
+                         op.num_pages);
+            request->Apply(fsm::SchedulePrefetchEvent{std::move(host_blocks), op.op_id});
+            prefetches.push_back(std::move(op));
+            return FirstChunkOutcome{.prefetching = true};
+        }
+    }
     if (req_pool_allocator_.AvailableSlots() == 0) {
-        return std::nullopt;
+        return FirstChunkOutcome{};
     }
 
-    AdmissionMatch match = matchPrefixAtAdmission(request);
     // The D role's prompts are the peer's work; every other first chunk is local.
     const fsm::PrefillSource source =
         config_.role == Role::kD ? fsm::PrefillSource::kRemote : fsm::PrefillSource::kLocal;
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
-    std::int32_t host_prefix_cap = match.probe.host.num_common_tokens;
     registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
 
-    std::optional<CacheCoordinator::AdmissionResult> admission;
-    std::vector<BlockTable> tables;
-    std::int32_t hit_tokens = 0;
-    std::int32_t tokens_this_round = 0;
-    std::int32_t decode_reserve = 0;
-    std::int32_t promotion_boundary_tokens = 0;
+    _assert(match.probe.host.num_common_tokens % prefix_granularity == 0, "a Host hit ends on a prefix boundary");
+    const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+    const std::int32_t promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
+    _assert(promotion_boundary_tokens == 0 ||
+                (promotion_boundary_tokens % prefix_granularity == 0 && promotion_boundary_tokens > hit_tokens &&
+                 promotion_boundary_tokens < request->PrefillSize()),
+            "promotion boundary must be page-aligned and inside the unmatched prompt");
 
-    // L3 Host prefetch can allocate fewer pages than ProbePrefix reported.
-    // Retry admission from that shortened boundary so the first-chunk window
-    // and table coverage stay aligned. Clamping num_common_tokens is
-    // required so acquireHostWithKeys re-matches window/Mamba groups at the
-    // shortened bound: a full re-probe would see the same L3 keys again,
-    // and truncating a non-closed hits mask can leave required lookback
-    // pages as holes. Bound retries by the probed Host span, not a fixed
-    // cap: a sliding-window or Mamba hit can shrink by one prefix page per
-    // attempt while the Host pool stays pinned.
-    const std::int32_t initial_host_prefix = host_prefix_cap;
-    const int max_attempts =
-        1 + std::max(0, initial_host_prefix - match.probe.device.num_common_tokens) / prefix_granularity;
-    for (int attempt = 0;; ++attempt) {
-        _assert(attempt < max_attempts, "L3 host prefix clamp did not converge");
-        if (match.probe.host.num_common_tokens > host_prefix_cap) {
-            match.probe.host.num_common_tokens = host_prefix_cap;
-        }
-        match.probe.host.num_common_tokens -= match.probe.host.num_common_tokens % prefix_granularity;
-        hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-        promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
-        _assert(promotion_boundary_tokens == 0 ||
-                    (promotion_boundary_tokens % prefix_granularity == 0 && promotion_boundary_tokens > hit_tokens &&
-                     promotion_boundary_tokens < request->PrefillSize()),
-                "promotion boundary must be page-aligned and inside the unmatched prompt");
-
-        const std::int32_t hit_prefix_pages = hit_tokens / prefix_granularity;
-        match.prefix_hashes.assign(
-            match.candidate_prefix_hashes.begin(),
-            match.candidate_prefix_hashes.begin() +
-                std::min(match.candidate_prefix_hashes.size(), static_cast<std::size_t>(hit_prefix_pages)));
-        const std::int32_t extension_pages =
-            std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / prefix_granularity;
-        const auto extension_begin =
-            match.candidate_prefix_hashes.begin() + match.probe.device.num_common_tokens / prefix_granularity;
-        match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
-
-        const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
-        tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
-                                               promotion_boundary_tokens);
-        if (tokens_this_round == 0) {
-            return std::nullopt;
-        }
-        const std::int32_t after_tokens = hit_tokens + tokens_this_round;
-        const bool completes_prefill = tokens_this_round == unscheduled;
-        decode_reserve = completes_prefill ? decode_input_tokens : 0;
-        // Every admission on a decoding role (D, Fused) secures real headroom
-        // before the prefill starts: the rest of the prompt plus decode room
-        // that starts at one safe-step window and grows with each retraction
-        // (Request::AdmissionHeadroom). Pages only -- the request still computes
-        // one chunk per round, because the chunk size is a forward-pass limit
-        // rather than a capacity one. The P role is exempt: it never decodes
-        // locally and never retracts, so there is no decode room to prepay.
-        const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
-        const PrefillReserve reserve{
-            .decode_input_tokens = decode_input_tokens,
-            .completes_prefill = completes_prefill,
-            .prompt_headroom_tokens = headroom > 0 ? unscheduled - tokens_this_round + headroom : 0,
-            // A remote landing always finishes shaping; the P role needs no local decode growth.
-            .reserve_snapshot_state_growth =
-                config_.role != Role::kP && (source == fsm::PrefillSource::kRemote || completes_prefill),
-        };
-        tables = std::vector<BlockTable>(static_cast<std::size_t>(coordinator_.NumGroups()));
-        std::vector<GroupDemand> demands =
-            MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{tokens_this_round}});
-        ReservePrefillDemands(demands, config_.cache_groups, reserve);
-        if (source == fsm::PrefillSource::kLocal) {
-            MakeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens, after_tokens);
-        }
-
-        if (source == fsm::PrefillSource::kRemote) {
-            for (std::size_t i = 0; i < demands.size(); ++i) {
-                const CacheGroupConfig& group = config_.cache_groups[i];
-                const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
-                if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
-                    // The peer lands only the endpoint snapshot, in slot (PrefillSize-1)/g.
-                    demands[i].extent = SparseSuffix{
-                        .extent_tokens = request->PrefillSize(),
-                        .first_block = (request->PrefillSize() - 1) / block_granularity,
-                    };
-                } else if (group.Kind() == AttnKind::kSlidingWindow) {
-                    const std::int32_t retained_begin =
-                        std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
-                    demands[i].extent = SparseSuffix{
-                        .extent_tokens = request->PrefillSize(),
-                        .first_block = std::max(hit_tokens / block_granularity, retained_begin / block_granularity),
-                    };
-                }
-            }
-        }
-        // Admit here, not through Scheduler::admit: a shortened Host prefix
-        // retries after Free(tables), and that helper would leave discarded
-        // new_page_ids in plan.pages_to_zero.
-        CacheCoordinator::PrefixProbe probe_for_admit = match.probe;
-        // First admission has computed nothing to publish or reclaim.
-        admission = coordinator_.Admit(std::move(probe_for_admit), demands, RequestProgress{},
-                                       /*request_access_epoch=*/std::nullopt);
-        if (!admission) {
-            feedback.admission_failed = true;
-            return std::nullopt;
-        }
-        _assert(admission->host_prefix_tokens % prefix_granularity == 0,
-                "admitted host prefix must land on a prefix boundary");
-        const std::int32_t admitted_hit_tokens =
-            std::max(admission->device_prefix_tokens, admission->host_prefix_tokens);
-        if (admitted_hit_tokens >= hit_tokens) {
-            break;
-        }
-        // load_pairs own Host sources and extra Device dest refs; Free(tables)
-        // does not drop those pins. Save the shortened boundary and release
-        // the discarded admission before the next Admit.
-        const std::int32_t shortened_host_prefix = admission->host_prefix_tokens;
-        admission.reset();
-        coordinator_.Free(tables);
-        host_prefix_cap = shortened_host_prefix;
-        host_prefix_cap -= host_prefix_cap % prefix_granularity;
+    const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
+    const std::int32_t tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
+                                                              unscheduled, remaining, promotion_boundary_tokens);
+    if (tokens_this_round == 0) {
+        return FirstChunkOutcome{};
+    }
+    const std::int32_t after_tokens = hit_tokens + tokens_this_round;
+    const bool completes_prefill = tokens_this_round == unscheduled;
+    const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;
+    // Every admission on a decoding role (D, Fused) secures real headroom
+    // before the prefill starts: the rest of the prompt plus decode room
+    // that starts at one safe-step window and grows with each retraction
+    // (Request::AdmissionHeadroom). Pages only -- the request still computes
+    // one chunk per round, because the chunk size is a forward-pass limit
+    // rather than a capacity one. The P role is exempt: it never decodes
+    // locally and never retracts, so there is no decode room to prepay.
+    const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
+    const PrefillReserve reserve{
+        .decode_input_tokens = decode_input_tokens,
+        .completes_prefill = completes_prefill,
+        .prompt_headroom_tokens = headroom > 0 ? unscheduled - tokens_this_round + headroom : 0,
+        // A remote landing always finishes shaping; the P role needs no local decode growth.
+        .reserve_snapshot_state_growth =
+            config_.role != Role::kP && (source == fsm::PrefillSource::kRemote || completes_prefill),
+    };
+    std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
+    std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{tokens_this_round}});
+    ReservePrefillDemands(demands, config_.cache_groups, reserve);
+    if (source == fsm::PrefillSource::kLocal) {
+        MakeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens, after_tokens);
     }
 
-    _assert(admission.has_value(), "first-chunk admission must produce a result");
+    if (source == fsm::PrefillSource::kRemote) {
+        for (std::size_t i = 0; i < demands.size(); ++i) {
+            const CacheGroupConfig& group = config_.cache_groups[i];
+            const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
+            if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
+                // The peer lands only the endpoint snapshot, in slot (PrefillSize-1)/g.
+                demands[i].extent = SparseSuffix{
+                    .extent_tokens = request->PrefillSize(),
+                    .first_block = (request->PrefillSize() - 1) / block_granularity,
+                };
+            } else if (group.Kind() == AttnKind::kSlidingWindow) {
+                const std::int32_t retained_begin =
+                    std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
+                demands[i].extent = SparseSuffix{
+                    .extent_tokens = request->PrefillSize(),
+                    .first_block = std::max(hit_tokens / block_granularity, retained_begin / block_granularity),
+                };
+            }
+        }
+    }
+    // First admission has computed nothing to publish or reclaim.
+    std::optional<CacheCoordinator::AdmissionResult> admission =
+        coordinator_.Admit(std::move(match.probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
+    if (!admission) {
+        feedback.admission_failed = true;
+        return FirstChunkOutcome{};
+    }
+    // Every Host hit is an entry the admission acquired in the same step, so
+    // the admitted prefix is the probed one.
+    _assert(std::max(admission->device_prefix_tokens, admission->host_prefix_tokens) == hit_tokens,
+            "an admission claims exactly the prefix it probed");
     _assert(admission->promotion_boundary_tokens == promotion_boundary_tokens,
             "promotion boundary changed between probe and admission");
     _assert(admission->new_page_ids.size() == cache_group_ids_.size(),
@@ -439,16 +398,11 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
 
     if (!match.extension_hashes.empty()) {
-        // Host-warm H2D destinations are already filled on Host. L3 prefetch
-        // destinations are empty until LoadBackDone.success, so publishing
-        // them here would leave Device prefix hits after a vanished object.
-        // A mixed hash (one group Host-warm, another L3) skips this call;
-        // CompleteLoadBack publishes every filled destination per group.
+        // The Host-warm H2D destinations are filled on Host already; publish
+        // them on the Device now (the layer-wise load makes the bytes
+        // available before any forward reads them).
         const std::int32_t first_extension_slot = admission->device_prefix_tokens / prefix_granularity;
         for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
-            if (prefixHashPrefetchesFromStorage(admission->load_pairs, match.extension_hashes[i])) {
-                continue;
-            }
             coordinator_.CacheFullBlocks(tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1),
                                          admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i),
                                          CacheBoundaryKind::kChunk);
@@ -460,20 +414,20 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         .promotion_boundary_tokens = admission->promotion_boundary_tokens,
     };
     recordPrefillStateCheckpoint(cache_progress, source, hit_tokens + tokens_this_round, prefix_granularity);
-    return fsm::SchedulePrefillFirstChunkEvent{
-        tokens_this_round,
-        decode_reserve,
-        &req_pool_allocator_,
-        source,
-        &coordinator_,
-        std::move(tables),
-        hit_tokens,
-        std::move(cache_progress),
-        std::move(admission->load_pairs),
-        // The P role holds a completed prompt until its result lands: the
-        // remote decode that hands it off carries the bootstrap token.
-        config_.role == Role::kP,
-    };
+    return FirstChunkOutcome{.event = fsm::SchedulePrefillFirstChunkEvent{
+                                 tokens_this_round,
+                                 decode_reserve,
+                                 &req_pool_allocator_,
+                                 source,
+                                 &coordinator_,
+                                 std::move(tables),
+                                 hit_tokens,
+                                 std::move(cache_progress),
+                                 std::move(admission->load_pairs),
+                                 // The P role holds a completed prompt until its result lands: the
+                                 // remote decode that hands it off carries the bootstrap token.
+                                 config_.role == Role::kP,
+                             }};
 }
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
@@ -597,18 +551,24 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
     return operation;
 }
 
-std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
-                                                                    Request* request, std::int32_t token_budget,
-                                                                    std::int32_t decode_reserve,
-                                                                    std::vector<LoadBackOperation>& load_backs) {
+std::optional<Scheduler::PrefillAdmission> Scheduler::schedulePrefillCandidate(
+    ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t token_budget,
+    std::int32_t decode_reserve, std::vector<LoadBackOperation>& load_backs,
+    std::vector<PrefetchOperation>& prefetches) {
     if (request->Is<fsm::Prefilling>()) {
         if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve)) {
-            return applyEventAndBuildOperation(request, std::move(*event));
+            return PrefillAdmission{.operation = applyEventAndBuildOperation(request, std::move(*event))};
         }
         return std::nullopt;
     }
-    if (auto event = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve)) {
-        return applyEventAndBuildOperation(request, std::move(*event), load_backs);
+    FirstChunkOutcome outcome =
+        schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve, prefetches);
+    if (outcome.prefetching) {
+        return PrefillAdmission{};
+    }
+    if (outcome.event) {
+        return PrefillAdmission{.operation =
+                                    applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs)};
     }
     return std::nullopt;
 }
@@ -900,15 +860,20 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // plan.remote_prefill beside whatever batch this round built.
             // Everything else is local prefill work joining the model batch.
             const std::int32_t budget = remote_grant ? blocker->PrefillSize() : build.token_budget;
-            if (auto operation = schedulePrefillCandidate(build.plan, feedback, blocker, budget,
-                                                          config_.decode_input_tokens, build.load_backs)) {
-                if (remote_grant) {
+            if (auto admitted =
+                    schedulePrefillCandidate(build.plan, feedback, blocker, budget, config_.decode_input_tokens,
+                                             build.load_backs, build.prefetches)) {
+                if (!admitted->operation) {
+                    // The blocker went to prefetch its L3 prefix first; it is
+                    // admitted on the freed pages once that landed.
+                    build.scheduled.insert(blocker);
+                } else if (remote_grant) {
                     // The blocker is now RemotePrefilling: the peer's prefill
                     // is out against its pages (pdTransferInFlight).
                     build.scheduled.insert(blocker);
-                    build.remote_prefill.emplace_back(std::move(*operation));
+                    build.remote_prefill.emplace_back(std::move(*admitted->operation));
                 } else {
-                    pushOperation(build, *blocker, std::move(*operation));
+                    pushOperation(build, *blocker, std::move(*admitted->operation));
                     blocker->TrackScheduledForward();
                 }
                 return;
@@ -1095,9 +1060,15 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 continue;
             }
             feedback.admission_failed = false;
-            if (auto operation = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
-                                                          decode_reserve, build.load_backs)) {
-                pushOperation(build, *request, std::move(*operation));
+            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
+                                                         decode_reserve, build.load_backs, build.prefetches)) {
+                if (!admitted->operation) {
+                    // Gone to prefetch its L3 prefix (Prefetching): it holds
+                    // no head of line, so the prompts behind it go on.
+                    build.scheduled.insert(request);
+                    continue;
+                }
+                pushOperation(build, *request, std::move(*admitted->operation));
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
                     return;
@@ -1204,10 +1175,14 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
                 continue;
             }
             feedback.admission_failed = false;
-            if (auto operation = schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
-                                                          config_.decode_input_tokens, build.load_backs)) {
+            if (auto admitted =
+                    schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
+                                             config_.decode_input_tokens, build.load_backs, build.prefetches)) {
+                // The D role probes the Device alone, so no admission here
+                // ever goes to prefetch.
+                _assert(admitted->operation.has_value(), "a D-role admission never prefetches from L3");
                 build.scheduled.insert(request);
-                build.remote_prefill.emplace_back(std::move(*operation));
+                build.remote_prefill.emplace_back(std::move(*admitted->operation));
                 break;
             }
             if (feedback.admission_failed) {
@@ -1277,6 +1252,7 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
     return BuiltOperations{
         .forward = std::move(build.operations),
         .load_backs = std::move(build.load_backs),
+        .prefetches = std::move(build.prefetches),
         .snapshot_stores = std::move(build.snapshot_stores),
         .snapshot_restores = std::move(build.snapshot_restores),
     };

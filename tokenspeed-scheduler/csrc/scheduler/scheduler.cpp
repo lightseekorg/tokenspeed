@@ -328,7 +328,7 @@ std::size_t Scheduler::BootstrappingSize() const {
 
 std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Submitted, fsm::Retracted, fsm::Restoring>();
+        return request->IsAnyOf<fsm::Submitted, fsm::Prefetching, fsm::Retracted, fsm::Restoring>();
     }));
 }
 
@@ -391,46 +391,6 @@ std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std:
     return ComputePrefixHashes(prefix_pages, "");
 }
 
-std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
-    bool hol_blocks_new_prompts = false;
-    for (const auto& request : requests_) {
-        if (request->Is<fsm::Prefilling>()) {
-            hol_blocks_new_prompts = true;
-            break;
-        }
-    }
-    // A restore takes a request slot too, so a suspended request counts as
-    // occupying one.
-    const std::int32_t occupied = static_cast<std::int32_t>(PrefillSize() + DecodingSize() + RetractedSize());
-    const std::int32_t free_slots = config_.max_batch_size - occupied;
-    if (free_slots <= 0 || hol_blocks_new_prompts || AvailableLcmBlocks() <= 0) {
-        return {};
-    }
-
-    std::vector<std::string> hashes;
-    std::unordered_set<std::string> seen;
-    std::int32_t remaining = free_slots;
-    for (const auto& request : requests_) {
-        if (remaining <= 0) {
-            break;
-        }
-        if (!request->Is<fsm::Submitted>()) {
-            continue;
-        }
-        std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(/*except_last=*/false);
-        const std::int32_t candidate_prefix_pages =
-            std::max((request->PrefillSize() - 1) / config_.prefix_granularity, 0);
-        prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-        for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
-            if (seen.insert(content_hash).second) {
-                hashes.push_back(std::move(content_hash));
-            }
-        }
-        --remaining;
-    }
-    return hashes;
-}
-
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
     const auto it = requests_by_id_.find(id);
     return it == requests_by_id_.end() ? -1 : it->second->TokenSize();
@@ -471,12 +431,17 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
 
     // Store legs first (the runtime fences the forward thread's stream on the
-    // stream-ordered ones before the plan's page reuse), then the loads.
+    // stream-ordered ones before the plan's page reuse), then the L3
+    // prefetches (no stream dependency: nothing in the round reads them),
+    // then the loads.
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
     if (!built.snapshot_stores.empty()) {
         plan.With(CacheOperation{SnapshotStoreBatch{built.snapshot_stores}});
+    }
+    if (!built.prefetches.empty()) {
+        plan.With(CacheOperation{PrefetchBatch{built.prefetches}});
     }
     if (!built.load_backs.empty()) {
         plan.With(CacheOperation{LoadBackBatch{built.load_backs}});

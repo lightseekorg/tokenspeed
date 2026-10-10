@@ -141,6 +141,9 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
 
     Finished operator()(Bootstrapping&&);
     Finished operator()(Submitted&&);
+    // The op in flight keeps the Host blocks until its ACK; only the
+    // request's own pins drop here.
+    Finished operator()(Prefetching&&);
     Finished operator()(Prefilling&& state);
     Finished operator()(RemotePrefilling&& state);
     Finished operator()(PrefillDone&& state);
@@ -200,28 +203,37 @@ private:
     std::vector<std::uint32_t> pending_store_ops_;
 };
 
-// The runtime skipped a forward whose L3 prefetch missed after admission: the
-// destination pages were never filled, so there is nothing to image. Every
-// request-owned page is released, the generated tokens are folded into the
-// prefill window (RebasePrefill), and the request re-prefills like a newcomer
-// through the ordinary admission path: it lands in Submitted. Not a snapshot
-// retraction -- no image, no blob slot, no readmission order.
-struct RecomputeRetractEvent : InvalidTransitionHandler<RecomputeRetractEvent> {
-    using InvalidTransitionHandler<RecomputeRetractEvent>::operator();
+// A Submitted request's L3 prefetch was issued: it waits for the fill before
+// it can be admitted as a Host hit, pinning the blocks being filled.
+struct SchedulePrefetchEvent : InvalidTransitionHandler<SchedulePrefetchEvent> {
+    using InvalidTransitionHandler<SchedulePrefetchEvent>::operator();
 
-    explicit RecomputeRetractEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
+    SchedulePrefetchEvent(std::vector<CacheBlockRef> host_blocks, std::uint32_t prefetch_op)
+        : host_blocks_{std::move(host_blocks)}, prefetch_op_{prefetch_op} {}
 
-    Submitted operator()(Prefilling&& state);
-    Submitted operator()(PrefillDone&& state);
-    Submitted operator()(PrefillAwaitingResult&& state);
-    Submitted operator()(RemotePrefilling&& state);
-    Submitted operator()(Decoding&& state);
+    Prefetching operator()(Submitted&& state) {
+        return Prefetching{state.TokenContainerPtr(), state.PrefixGranularity(), std::move(host_blocks_), prefetch_op_};
+    }
 
 private:
-    template <typename State>
-    Submitted recompute(State&& state);
+    std::vector<CacheBlockRef> host_blocks_;
+    std::uint32_t prefetch_op_{0};
+};
 
-    CacheCoordinator* coordinator_{};
+// The prefetch finished: the request is Submitted again, at its original
+// queue position, holding the Host entries that landed (published by the
+// scheduler before this event) until its admission claims them.
+struct PrefetchDoneEvent : InvalidTransitionHandler<PrefetchDoneEvent> {
+    using InvalidTransitionHandler<PrefetchDoneEvent>::operator();
+
+    explicit PrefetchDoneEvent(std::vector<CacheBlockRef> published) : published_{std::move(published)} {}
+
+    Submitted operator()(Prefetching&& state) {
+        return Submitted{state.token_container, state.prefix_granularity, std::move(published_)};
+    }
+
+private:
+    std::vector<CacheBlockRef> published_;
 };
 
 // One of the image's store ops was acknowledged (WriteBackDone for the L2

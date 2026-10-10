@@ -132,6 +132,7 @@ TEST(CapacityModelTest, L3SizingDoesNotRequireHostPagesBeforeAllocation) {
     SchedulerConfig sizing = SizingConfig(Role::kFused, 4, 8, 1, 0, false, {Full("full", 4, 1)});
     sizing.disable_l2_cache = false;
     sizing.enable_l3_storage = true;
+    sizing.l3_prefetch_min_pages = 1;
     const CapacityModel model{sizing};
     SchedulerConfig sized = SizedConfig(sizing, 8);
     EXPECT_THROW(sized.Validate(), std::invalid_argument);

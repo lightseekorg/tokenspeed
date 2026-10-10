@@ -142,7 +142,7 @@ protected:
         EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{expected_prefix});
         for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
             for (std::uint32_t op_id : std::get<LoadBackBatch>(operation).op_ids) {
-                SendLoadBackDone(op_id, /*success=*/true);
+                SendLoadBackDone(op_id);
             }
         }
         AckWriteBacks(plan);

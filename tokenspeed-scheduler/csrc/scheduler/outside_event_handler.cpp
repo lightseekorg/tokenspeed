@@ -26,6 +26,8 @@
 #include <utility>
 #include <vector>
 
+#include <spdlog/spdlog.h>
+
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
@@ -159,19 +161,6 @@ void Scheduler::handleEvent(const forward::Abort& event) {
     }
 }
 
-void Scheduler::handleEvent(const forward::RecomputeRetract& event) {
-    Request* request = findRequest(event.request_id);
-    // Only a request with a forward out against its pages can have had that
-    // forward skipped; a suspended or finished one has nothing to recompute.
-    if (request == nullptr || !request->HoldsPages() || request->Is<fsm::Restoring>()) {
-        return;
-    }
-    // The skipped forward's destination pages were never filled: publishing
-    // would cache empty KV, so the request re-prefills through ordinary
-    // admission like a newcomer.
-    request->Apply(fsm::RecomputeRetractEvent{&coordinator_});
-}
-
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
     const std::vector<HostPublication> published = tier_transfers_.CompleteWriteBack(event.op_id);
     // A retraction image's L2 leg: every suspended request waiting for this
@@ -188,7 +177,26 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-    tier_transfers_.CompleteLoadBack(event.op_id, event.success);
+    tier_transfers_.CompleteLoadBack(event.op_id);
+}
+
+void Scheduler::handleEvent(const cache::PrefetchDone& event) {
+    std::optional<TierTransferManager::PrefetchCompleted> done =
+        tier_transfers_.CompletePrefetch(event.op_id, event.landed_pages);
+    if (!done) {
+        return;  // unknown or duplicate ACK
+    }
+    // The objects that did not land are forgotten; a later probe may find
+    // them again and register them afresh.
+    coordinator_.UnregisterStorageKeys(done->unlanded);
+    Request* request = findRequest(done->request_id);
+    const auto* prefetching = request == nullptr ? nullptr : request->GetIf<fsm::Prefetching>();
+    if (prefetching == nullptr || prefetching->prefetch_op != event.op_id) {
+        return;  // aborted while prefetching: the landed entries stay published, now evictable
+    }
+    spdlog::info("[Scheduler] prefetch: request {} landed {} of its L3 page(s); admissible again", request->Id(),
+                 event.landed_pages);
+    request->Apply(fsm::PrefetchDoneEvent{std::move(done->published)});
 }
 
 void Scheduler::handleEvent(const cache::SnapshotDone& event) {

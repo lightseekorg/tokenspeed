@@ -65,6 +65,14 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
+    if (enable_l3_storage && l3_prefetch_min_pages < 1) {
+        throw std::invalid_argument(
+            "Scheduler: L3 storage requires l3_prefetch_min_pages >= 1 (the L3 prefetch threshold, in prefix pages)");
+    }
+    if (!enable_l3_storage && l3_prefetch_min_pages != 0) {
+        throw std::invalid_argument(
+            "Scheduler: l3_prefetch_min_pages is an L3 setting; it must be 0 without L3 storage");
+    }
     if (enable_l3_storage) {
         // A Host copy keeps its Device block's residue, but an L3 prefetch
         // allocates its Host page before any Device destination exists.

@@ -87,9 +87,7 @@ public:
     }
 
     // Tokens generated so far / still permitted. Both compare against the
-    // SUBMITTED prompt, which neither a restore nor a recompute's
-    // RebasePrefill (which folds generated tokens into the prefill window)
-    // can change.
+    // SUBMITTED prompt, which no retraction or restore changes.
     std::int32_t GeneratedTokens() const { return std::max(0, TokenSize() - submitted_prompt_size_); }
     std::int32_t RemainingNewTokens() const { return std::max(0, max_new_tokens_ - GeneratedTokens()); }
     bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
@@ -137,8 +135,8 @@ public:
     }
 
     // True in every state that carries ForwardResources; Bootstrapping,
-    // Submitted, Retracted and Finished hold no pages (Restoring does: its
-    // fresh pages are being filled).
+    // Submitted, Prefetching, Retracted and Finished hold no pages (Restoring
+    // does: its fresh pages are being filled).
     bool HoldsPages() const {
         return std::visit(Overloaded{
                               [](const fsm::HoldsForwardResources auto&) { return true; },
@@ -247,6 +245,7 @@ public:
         return std::visit(Overloaded{
                               [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
                               [](const fsm::Submitted&) -> std::string { return "Submitted"; },
+                              [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
                               [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
                               [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },

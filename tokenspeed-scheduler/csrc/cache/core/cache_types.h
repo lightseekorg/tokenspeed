@@ -190,9 +190,6 @@ struct BlockTransfer {
     CacheBlockRef source;
     CacheBlockRef destination;
     CacheKey key{};
-    // True when source is a freshly allocated Host block that L3 must fill
-    // before the Host→Device copy.
-    bool prefetch_from_storage{false};
 };
 
 // A Host L2 entry a store's ACK published: the key and the block that is now

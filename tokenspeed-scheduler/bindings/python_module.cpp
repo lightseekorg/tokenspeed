@@ -44,9 +44,9 @@
 Writable types:
 1. SchedulerConfig
 2. RequestSpec
-3. ForwardEvent (ExtendResult, Finish, Abort, RecomputeRetract, UpdateReserveNumTokens)
+3. ForwardEvent (ExtendResult, Finish, Abort, UpdateReserveNumTokens)
 4. PD::*Event
-5. cache::*DoneEvent (WriteBack, LoadBack, Snapshot, Restore)
+5. cache::* ACKs (WriteBackDone, LoadBackDone, PrefetchDone, SnapshotDone, RestoreDone)
 
 All other types are produced by the scheduler and consumed by Python, so they do
 not need writable properties.
@@ -163,6 +163,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
+        // L3 only: the fewest whole prefix pages an L3 hit must add beyond the
+        // Host hit before the request waits for a pre-admission prefetch of
+        // them; required (>= 1) with L3, 0 without.
+        .def_rw("l3_prefetch_min_pages", &tokenspeed::SchedulerConfig::l3_prefetch_min_pages)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
@@ -209,10 +213,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::Abort::request_id);
 
-    nb::class_<tokenspeed::forward::RecomputeRetract>(forward_event, "RecomputeRetract")
-        .def(nb::init<>())
-        .def_rw("request_id", &tokenspeed::forward::RecomputeRetract::request_id);
-
     nb::class_<tokenspeed::forward::UpdateReserveNumTokens>(forward_event, "UpdateReserveNumTokens")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::UpdateReserveNumTokens::request_id)
@@ -228,10 +228,21 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id);
 
+    // A prefix load landed. Every source is a Host-warm entry, so there is no
+    // failed load-back: an L3 object that is gone is discovered by the
+    // pre-admission prefetch (PrefetchDoneEvent), never by a load.
     nb::class_<tokenspeed::cache::LoadBackDone>(cache, "LoadBackDoneEvent")
-        .def(nb::init<std::uint32_t, bool>(), nb::arg("op_id"), nb::arg("success"))
-        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id)
-        .def_rw("success", &tokenspeed::cache::LoadBackDone::success);
+        .def(nb::init<>())
+        .def(nb::init<std::uint32_t>(), nb::arg("op_id"))
+        .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id);
+
+    // A pre-admission L3 prefetch (PrefetchOp) finished with its first
+    // landed_pages prefix pages fetched into their Host blocks
+    // (replica-converged); the rest did not land.
+    nb::class_<tokenspeed::cache::PrefetchDone>(cache, "PrefetchDoneEvent")
+        .def(nb::init<std::uint32_t, std::int32_t>(), nb::arg("op_id"), nb::arg("landed_pages"))
+        .def_rw("op_id", &tokenspeed::cache::PrefetchDone::op_id)
+        .def_rw("landed_pages", &tokenspeed::cache::PrefetchDone::landed_pages);
 
     nb::class_<tokenspeed::cache::SnapshotDone>(cache, "SnapshotDoneEvent")
         .def(nb::init<>())
@@ -316,8 +327,25 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("src_pages", &tokenspeed::LoadBackBatch::src_pages)
         .def_ro("dst_pages", &tokenspeed::LoadBackBatch::dst_pages)
         .def_ro("content_hashes", &tokenspeed::LoadBackBatch::content_hashes)
-        .def_ro("page_offsets", &tokenspeed::LoadBackBatch::page_offsets)
-        .def_ro("prefetch_from_storage", &tokenspeed::LoadBackBatch::prefetch_from_storage);
+        .def_ro("page_offsets", &tokenspeed::LoadBackBatch::page_offsets);
+
+    // A Submitted request's pre-admission L3 fill: one op per request, rows
+    // in prefix-page order (page_indices non-decreasing), each naming the
+    // object (content_hash, page_offset, group) and the Host page to fill.
+    // The runtime fetches in order, stops at the first page that fails or at
+    // its timeout, and acknowledges once with PrefetchDoneEvent(op_id,
+    // landed_pages): the largest n <= num_pages such that every row with
+    // page_index < first_page + n landed. No stream dependency.
+    nb::class_<tokenspeed::PrefetchBatch>(cache, "PrefetchOp")
+        .def_ro("op_ids", &tokenspeed::PrefetchBatch::op_ids)
+        .def_ro("request_ids", &tokenspeed::PrefetchBatch::request_ids)
+        .def_ro("first_pages", &tokenspeed::PrefetchBatch::first_pages)
+        .def_ro("num_pages", &tokenspeed::PrefetchBatch::num_pages)
+        .def_ro("group_ids", &tokenspeed::PrefetchBatch::group_ids)
+        .def_ro("host_pages", &tokenspeed::PrefetchBatch::host_pages)
+        .def_ro("content_hashes", &tokenspeed::PrefetchBatch::content_hashes)
+        .def_ro("page_offsets", &tokenspeed::PrefetchBatch::page_offsets)
+        .def_ro("page_indices", &tokenspeed::PrefetchBatch::page_indices);
 
     nb::class_<tokenspeed::WriteBackBatch>(cache, "WriteBackOp")
         .def_ro("op_ids", &tokenspeed::WriteBackBatch::op_ids)
@@ -442,7 +470,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("bootstrapping_size", &tokenspeed::Scheduler::BootstrappingSize,
              "Count requests waiting for their PD bootstrap handshake.")
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize,
-             "Count Submitted, Retracted and Restoring requests awaiting admission or their restore.")
+             "Count Submitted, Prefetching, Retracted and Restoring requests awaiting admission or their restore.")
         .def("retracted_size", &tokenspeed::Scheduler::RetractedSize,
              "Count requests suspended with an image (Retracted or Restoring); a weight update must not flush "
              "while this is non-zero.")
@@ -470,7 +498,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("cache_group_total_pages", &tokenspeed::Scheduler::CacheGroupTotalPages, nb::arg("group_id"))
         .def("cache_group_available_pages", &tokenspeed::Scheduler::CacheGroupAvailablePages, nb::arg("group_id"))
         .def("prefix_hashes_for_tokens", &tokenspeed::Scheduler::PrefixHashesForTokens, nb::arg("tokens"))
-        .def("waiting_prefix_hashes", &tokenspeed::Scheduler::WaitingPrefixHashes)
         .def(
             "expand_prefix_keys",
             [](const tokenspeed::Scheduler& scheduler, const std::vector<std::string>& content_hashes) {

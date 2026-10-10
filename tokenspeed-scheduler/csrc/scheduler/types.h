@@ -73,6 +73,11 @@ struct SchedulerConfig {
     std::int32_t overlap_schedule_depth{0};
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
+    // L3 only: the fewest whole prefix pages an L3 hit must extend the Host
+    // hit by before the request waits for a pre-admission prefetch of them
+    // (fsm::Prefetching); a shorter extension is computed instead. Required
+    // (>= 1) with L3, and 0 without: no silent default.
+    std::int32_t l3_prefetch_min_pages{0};
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
 

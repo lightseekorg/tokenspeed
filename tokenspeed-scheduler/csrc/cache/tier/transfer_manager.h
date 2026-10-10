@@ -49,6 +49,23 @@ public:
     std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard);
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
+    // The pre-admission L3 fill of one Submitted request: one op over the
+    // plan's rows, whose Host blocks the op pins until its ACK (the request
+    // pins them too, and may be aborted meanwhile).
+    PrefetchOperation StartPrefetch(const std::string& request_id, CacheCoordinator::PrefetchPlan plan);
+    // What a prefetch's ACK leaves behind: the Host entries now published
+    // (pinned for the request to hold until its admission acquires them) and
+    // the keys whose objects did not land (to forget from the storage shadow).
+    struct PrefetchCompleted {
+        std::string request_id;
+        std::vector<CacheBlockRef> published;
+        std::vector<CacheKey> unlanded;
+    };
+    // Publishes the first landed_pages prefix pages' rows as Host entries and
+    // drops the op; nullopt for an unknown or duplicate op id. Publication
+    // happens whether or not the request still exists: the bytes landed.
+    std::optional<PrefetchCompleted> CompletePrefetch(std::uint32_t op_id, std::int32_t landed_pages);
+
     // A retraction image and the two store ops that fill it. The L2 leg is a
     // stream-ordered write-back of the published pages not yet on Host (keys
     // already Host-cached or carried by an in-flight store are pinned, not
@@ -85,7 +102,9 @@ public:
     // index possibly redirected the publication to an existing entry -- so a
     // retraction image pinned on a ticket's block can follow the redirect.
     std::vector<HostPublication> CompleteWriteBack(std::uint32_t op_id);
-    void CompleteLoadBack(std::uint32_t op_id, bool success);
+    // A prefix load landed: drops the op's pins. Its destinations were
+    // published at admission (every source is a Host-warm entry).
+    void CompleteLoadBack(std::uint32_t op_id);
     // Returns the request the op belonged to (nullopt for an unknown or
     // duplicate ACK) so the scheduler can advance its FSM.
     std::optional<std::string> CompleteSnapshotStore(std::uint32_t op_id);
@@ -107,7 +126,7 @@ public:
     // sacrificing a request for capacity that is about to free.
     bool HasPinnedStoresInFlight() const;
     bool HasAnyInFlight() const {
-        return !write_backs_.empty() || !load_backs_.empty() || !snapshot_stores_.empty() ||
+        return !write_backs_.empty() || !load_backs_.empty() || !prefetches_.empty() || !snapshot_stores_.empty() ||
                !snapshot_restores_.empty();
     }
 
@@ -138,6 +157,14 @@ private:
         std::string request_id;
         std::vector<BlockTransfer> transfers;
     };
+    // A prefetch pins its Host destinations until the ACK, which publishes
+    // the landed prefix (page_row_ends maps a landed page count to a row
+    // prefix) and lets the rest go.
+    struct InFlightPrefetch {
+        std::string request_id;
+        std::vector<CacheCoordinator::PrefetchRow> rows;
+        std::vector<std::size_t> page_row_ends;
+    };
 
     std::uint32_t nextOpId() { return next_op_id_++; }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
@@ -158,6 +185,7 @@ private:
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;
     std::unordered_map<std::uint32_t, InFlightSnapshotStore> snapshot_stores_;
     std::unordered_map<std::uint32_t, InFlightSnapshotRestore> snapshot_restores_;
+    std::unordered_map<std::uint32_t, InFlightPrefetch> prefetches_;
     std::uint32_t next_op_id_{0};
 };
 

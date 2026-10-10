@@ -137,7 +137,15 @@ public:
 
         std::vector<std::vector<CacheKey>> group_keys;
         Tier device;
+        // Entries the Host tier holds beyond the Device hit. Admission loads
+        // these; nothing an admission touches can miss.
         Tier host;
+        // L3 only: the prefix the storage shadow (keys known to exist in the
+        // remote store) extends beyond the Host hit, matched by the same
+        // matchers over "Host-cached or registered". Never admitted directly:
+        // PlanPrefetch turns it into a pre-admission Host fill, after which
+        // it is an ordinary Host hit. Empty without L3.
+        Tier storage;
     };
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
@@ -145,7 +153,8 @@ public:
         // Longer prefix-closed coverage worth materializing for non-closed groups.
         std::int32_t promotion_boundary_tokens{0};
         std::uint64_t access_epoch{0};
-        // Host L2 -> Device copies: an admission's Host prefix hits, or a
+        // Host L2 -> Device copies: an admission's Host prefix hits (unkeyed;
+        // their Device destinations are published at admission), or a
         // restore's published slots (keyed, re-published at the ACK).
         std::vector<BlockTransfer> load_pairs;
         // Restore only: snapshot pool -> Device copies of the private slots.
@@ -164,6 +173,33 @@ public:
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
+
+    // One L3 object to fetch into a Host block, in prefix order. page_index
+    // is the prompt's prefix page the row belongs to, so the runtime can turn
+    // the rows that landed into a landed prefix-page count.
+    struct PrefetchRow {
+        std::uint32_t group_id{0};
+        CacheKey key{};
+        CacheBlockRef host_block;
+        std::int32_t page_index{0};
+    };
+    // The Host fill an L3-extended probe calls for: rows in prefix-page order
+    // (every group's rows of a page before the next page's), so a landed
+    // prefix length maps to a row prefix; page_row_ends[i] is the row count
+    // covering the first i + 1 prefetched pages.
+    struct PrefetchPlan {
+        std::vector<PrefetchRow> rows;
+        std::vector<std::size_t> page_row_ends;
+        std::int32_t first_page{0};  // prefix page index the fill starts at (the Host hit's end)
+    };
+    // Acquires a Host block for every storage-tier hit of `probe` beyond its
+    // Host hit, page by page, stopping at the first page a block cannot be
+    // had for (the pages before it stay); nullopt -- holding nothing -- when
+    // fewer than min_pages whole pages could be planned, so the request
+    // admits normally and computes them. Keys already Host-cached need no
+    // row. Mutates nothing but the Host allocation (which may evict unpinned
+    // entries).
+    std::optional<PrefetchPlan> PlanPrefetch(const PrefixProbe& probe, std::int32_t min_pages);
     // Decode-side PD reuses local history pages, while final-state groups are
     // restored from the remote endpoint snapshot. Their aligned null holes do
     // not count as cache hits.
@@ -377,14 +413,14 @@ private:
     BlockPool& tierPool();
     template <CacheTier Tier>
     const BlockPool& tierPool() const;
+    // with_storage_keys treats the L3 shadow's keys as hits beside the tier's
+    // entries (the Host tier only): the storage probe of ProbePrefix.
     template <CacheTier Tier>
     PrefixProbe::Tier probeTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
-                                        std::int32_t floor_tokens) const;
+                                        std::int32_t floor_tokens, bool with_storage_keys) const;
     template <CacheTier Tier>
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
-                                         PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
-    CoordinatorMatch acquireHostWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     template <CacheTier Tier>

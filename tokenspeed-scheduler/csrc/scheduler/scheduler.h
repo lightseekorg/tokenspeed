@@ -72,7 +72,8 @@ public:
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
-    // Requests waiting for an admission: Submitted, plus the suspended ones --
+    // Requests waiting for an admission: Submitted, Prefetching (their L3
+    // prefix is being fetched into Host first), plus the suspended ones --
     // Retracted (waiting to be restored) and Restoring (their copy back is in
     // flight) -- which hold no schedulable work until they resume.
     std::size_t WaitingSize() const;
@@ -115,18 +116,13 @@ public:
     // refuses to flush while this is non-zero.
     std::size_t RetractedSize() const;
 
-    // L3 storage (Mooncake Store, etc.) sits below Host. Python queries the
-    // backend for existing objects, then registers the matching CacheKeys so
-    // ProbePrefix can treat them as Host hits that require prefetch.
+    // L3 storage (Mooncake Store, etc.) sits below Host. At submit the
+    // runtime asks the backend which of a prompt's objects exist and
+    // registers the matching CacheKeys; an admission that finds registered
+    // keys beyond its Host hit issues a pre-admission prefetch of them
+    // (PrefetchOperation, fsm::Prefetching) and admits them as a Host hit
+    // once they landed. Admission itself never fetches from L3.
     std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
-    // Prefix hashes of Submitted requests the scheduler can admit this round
-    // (a restore copies the request's own image back and probes nothing). The
-    // event loop revalidates these against L3 immediately before
-    // NextExecutionPlan so a queued hit cannot survive deletion. Requests
-    // that cannot take a batch slot (full decode batch, HOL incomplete
-    // prefill) or cannot obtain Device pages (pool exhausted) are skipped so
-    // a long waiter is not rehashed and remotely probed on every decode step.
-    std::vector<std::string> WaitingPrefixHashes() const;
     std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
         return coordinator_.ExpandPrefixKeys(content_hashes);
     }
@@ -179,16 +175,23 @@ private:
     struct BuiltOperations {
         std::vector<ForwardOperation> forward;
         std::vector<LoadBackOperation> load_backs;
+        std::vector<PrefetchOperation> prefetches;
         std::vector<SnapshotStoreOperation> snapshot_stores;
         std::vector<SnapshotRestoreOperation> snapshot_restores;
     };
     BuiltOperations buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
                                            std::vector<WriteBackOperation>& write_back_operations);
-    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(ExecutionPlan& plan,
-                                                                                 AdmissionFeedback& feedback,
-                                                                                 Request* request,
-                                                                                 std::int32_t remaining,
-                                                                                 std::int32_t decode_input_tokens);
+    // What considering a Submitted request for admission produced: the
+    // first-chunk event (admitted), or a prefetch issued instead (the request
+    // is Prefetching; it is considered again once the fill landed), or
+    // neither (feedback says whether capacity was the reason).
+    struct FirstChunkOutcome {
+        std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
+        bool prefetching{false};
+    };
+    FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
+                                                std::int32_t remaining, std::int32_t decode_input_tokens,
+                                                std::vector<PrefetchOperation>& prefetches);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event);
@@ -226,6 +229,7 @@ private:
 
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
+    void handleEvent(const cache::PrefetchDone& event);
     void handleEvent(const cache::SnapshotDone& event);
     void handleEvent(const cache::RestoreDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
@@ -234,7 +238,6 @@ private:
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
     void handleEvent(const forward::ExtendResult& event);
     void handleEvent(const forward::Abort& event);
-    void handleEvent(const forward::RecomputeRetract& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
@@ -252,6 +255,8 @@ private:
         std::vector<ForwardOperation> remote_decode;
         std::vector<ForwardOperation> remote_prefill;
         std::vector<LoadBackOperation> load_backs;
+        // Pre-admission L3 fills issued this round (fsm::Prefetching).
+        std::vector<PrefetchOperation> prefetches;
         // A retraction's tail-leg store (its L2 leg joins the write-backs) and
         // a readmission's restore: cache ops riding beside the batch.
         std::vector<SnapshotStoreOperation> snapshot_stores;
@@ -300,14 +305,22 @@ private:
         build.operations.push_back(std::move(operation));
     }
 
+    // What scheduling one prefill-work candidate produced: the chunk to run
+    // this round, or none when a Submitted request was sent to prefetch its
+    // L3 prefix instead (fsm::Prefetching; the round carries only its
+    // PrefetchOperation and the request is considered again once it landed).
+    struct PrefillAdmission {
+        std::optional<PrefillOperation> operation;
+    };
     // Admission for one prefill-work candidate: a resumed chunk for a
-    // Prefilling request, the first chunk otherwise. Returns the built
-    // operation, or nullopt when admission fails (feedback.admission_failed
-    // says whether capacity was the reason).
-    std::optional<PrefillOperation> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
+    // Prefilling request, the first chunk (or a prefetch) otherwise. nullopt
+    // when admission fails (feedback.admission_failed says whether capacity
+    // was the reason).
+    std::optional<PrefillAdmission> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t token_budget,
                                                              std::int32_t decode_reserve,
-                                                             std::vector<LoadBackOperation>& load_backs);
+                                                             std::vector<LoadBackOperation>& load_backs,
+                                                             std::vector<PrefetchOperation>& prefetches);
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated

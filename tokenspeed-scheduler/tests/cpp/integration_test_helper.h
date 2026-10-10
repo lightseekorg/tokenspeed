@@ -139,10 +139,29 @@ protected:
         }
     }
 
-    void SendLoadBackDone(std::uint32_t op_id, bool success) {
+    void SendLoadBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
-        event.With(cache::LoadBackDone(op_id, success));
+        event.With(cache::LoadBackDone{.op_id = op_id});
         scheduler_->Advance(std::move(event));
+    }
+
+    // A pre-admission L3 prefetch finished with its first landed_pages prefix
+    // pages fetched.
+    void SendPrefetchDone(std::uint32_t op_id, std::int32_t landed_pages) {
+        ExecutionEvent event;
+        event.With(cache::PrefetchDone(op_id, landed_pages));
+        scheduler_->Advance(std::move(event));
+    }
+
+    static const PrefetchBatch* FindPrefetch(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (const auto* prefetch = std::get_if<PrefetchBatch>(cache_op)) {
+                    return prefetch;
+                }
+            }
+        }
+        return nullptr;
     }
 
     // Send ExtendResult to the scheduler: the forward landed. `tokens` are
@@ -170,14 +189,6 @@ protected:
     void SendAbortEvent(const std::string& request_id) {
         ExecutionEvent event;
         event.With(forward::Abort{.request_id = request_id});
-        scheduler_->Advance(std::move(event));
-    }
-
-    // The runtime skipped this request's forward after a failed L3 prefetch:
-    // it re-prefills like a newcomer.
-    void SendRecomputeRetractEvent(const std::string& request_id) {
-        ExecutionEvent event;
-        event.With(forward::RecomputeRetract{.request_id = request_id});
         scheduler_->Advance(std::move(event));
     }
 

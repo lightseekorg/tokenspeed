@@ -29,15 +29,22 @@ struct WriteBackDone {
     std::uint32_t op_id{};
 };
 
+// A prefix load-back landed: every row was copied. Its destinations were
+// published at admission (Host-warm hits); the ACK drops the op's pins.
 struct LoadBackDone {
-    std::uint32_t op_id;
-    // False when L3 prefetch did not fill the Host sources. CompleteLoadBack
-    // must not CacheHostBlock empty pages. Both fields are constructor
-    // arguments so a caller cannot ACK an op_id and silently publish.
-    bool success;
+    std::uint32_t op_id{};
+};
 
-    LoadBackDone() = delete;
-    LoadBackDone(std::uint32_t op_id, bool success) : op_id(op_id), success(success) {}
+// A pre-admission L3 prefetch (PrefetchOperation) finished: the first
+// landed_pages prefix pages of its rows were fetched into their Host blocks
+// (replica-converged), the rest were not. Both fields are constructor
+// arguments so a caller cannot ACK an op without saying how much landed.
+struct PrefetchDone {
+    std::uint32_t op_id;
+    std::int32_t landed_pages;
+
+    PrefetchDone() = delete;
+    PrefetchDone(std::uint32_t op_id, std::int32_t landed_pages) : op_id(op_id), landed_pages(landed_pages) {}
 };
 
 // A retraction image's tail leg (SnapshotStoreOperation) completed its D2H
@@ -54,5 +61,6 @@ struct RestoreDone {
 
 };  // namespace cache
 
-using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::SnapshotDone, cache::RestoreDone>;
+using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::PrefetchDone, cache::SnapshotDone,
+                                cache::RestoreDone>;
 }  // namespace tokenspeed

@@ -24,23 +24,32 @@ and reclaims inside the same `Admit` (`advanceRequestProgress` in
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
 
-When L3 Host prefetch cannot allocate every probed page, `Admit` shortens
-`host_prefix_tokens` and rounds that length down to `prefix_granularity`
-(the identity boundary every group's `block_granularity` divides).
-`acquireHostWithKeys` re-runs the non-prefix-closed matcher at that bound
-and reconverges the groups: truncating a sliding-window or Mamba hits
-mask (for example `[0, 1, 1]` to `[0, 1]`, with a five-token window and
-two-token blocks requiring two lookback pages) can leave the first live
-lookback page as a hole, and a full re-probe would see the same L3 keys
-as a complete hit again. Retry count is the probed Host span in prefix
-pages, not a fixed cap, so a long window/Mamba hit can shrink to the
-Device floor instead of asserting. `schedulePrefillFirstChunk` then frees that
-attempt — including the discarded `AdmissionResult`, whose `load_pairs`
-pin Host sources and Device destinations independently of the tables —
-and retries from the shortened probe so `hit_tokens` / `tokens_this_round`
-match the tables. Each retry recomputes the reserve from the cache group's
-declared `block_granularity`, using the same reservation interface as later
-prefill chunks.
+**L3 is fetched before admission, never by it.** An admission loads only
+Host entries that exist (`PrefixProbe::host`), so nothing it loads can miss and
+the Host-to-Device leg keeps its layer-wise overlap with the first chunk. The
+objects the L3 shadow knows beyond the Host hit (`PrefixProbe::storage`, the
+same matchers run over "Host-cached or registered") are handled by
+`CacheCoordinator::PlanPrefetch` first: it acquires a Host block for every
+storage-tier row, prefix page by prefix page, stops at the first page the Host
+pool cannot take whole (the pages before it stay), and gives up — holding
+nothing — below `SchedulerConfig::l3_prefetch_min_pages` (the explicit
+threshold; required with L3), in which case the request admits normally and
+computes those pages. With a plan, `schedulePrefillFirstChunk` emits one
+`PrefetchOperation` (`Cache.PrefetchOp`: rows in prefix-page order with their
+`page_indices`, one op per request) and the request moves to
+**`fsm::Prefetching`**: it pins only the Host blocks being filled — no Device
+pages, no request-pool row — is skipped by admission without holding the head
+of line (later `Submitted` prompts are admitted past it), is never a victim,
+and can be aborted (the op's own pins keep the blocks until its ACK). The
+runtime fetches in order, stops at the first failure or its timeout, and
+acknowledges once with `cache::PrefetchDone{op_id, landed_pages}`
+(replica-converged); the scheduler publishes the first `landed_pages` pages as
+Host entries, frees the rest, forgets the unlanded keys from the storage
+shadow, and returns the request to `Submitted` at its original queue position,
+holding the published entries pinned until its admission acquires them. The
+next admission is an ordinary Host hit. The cost: an L3 hit waits one fetch
+before it is admitted, holding no Device page meanwhile. The D role probes the
+Device alone (`ProbeDecodeDevicePrefix`) and never prefetches.
 
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages. The probe is bounded
@@ -830,15 +839,10 @@ under the window — exactly when it needs a new page — and once every residen
 request looked covered, retraction would have no victim and nothing could
 free that page.
 
-**`forward::RecomputeRetract` is a different case.** The runtime emits it for
-a batch whose L3 prefetch missed after `Admit`: the destination pages were
-never filled, so there is nothing to image and publishing would cache empty
-KV. `RecomputeRetractEvent` frees the pages, rebases the prefill and drops the
-request to `Submitted`; it re-prefills through ordinary admission like a
-newcomer — no image, no blob slot, no readmission order. Mixed partners in
-the skipped forward retract together so ranks stay aligned, and a D-role
-`plan.remote_prefill` admission retracts with them — the peer pull is withheld
-so suffix-only KV cannot land on empty prefix pages. The client is not failed.
+**There is no retraction without an image.** The one case that used to
+recompute — an L3 prefetch that missed after admission — no longer exists:
+L3 objects are fetched into Host before admission (§1), so an admission's
+load-back cannot miss and no forward is ever skipped or retracted for L3.
 
 **Weight updates and flushes.** `Scheduler::RetractedSize()` counts the
 requests suspended with an image (`Retracted` + `Restoring`), and every flush
@@ -873,14 +877,18 @@ verbatim at startup.
 drop-in for the runtime on `main`: `SchedulerConfig.num_snapshot_pages` is
 required (there is no default; `make_config` in
 `python/tokenspeed/runtime/engine/scheduler_utils.py` must pass it, `1` on
-engines that never retract), `ForwardEvent.Retract` is renamed
-`ForwardEvent.RecomputeRetract` (`make_retract_event` in `scheduler_utils.py`
-and its caller in `engine/l3_cache_hooks.py` follow), and the plan carries two
-new cache op kinds (`Cache.SnapshotOp`, `Cache.RestoreOp`) with two new ACKs
-(`Cache.SnapshotDoneEvent`, `Cache.RestoreDoneEvent`) that `DeviceHandle` and
-the cache hooks must execute and count, and `ExecutionPlan.aborts` lists the
-requests a capacity retraction aborted (§2) for the runtime to fail toward
-their clients. Following AGENTS.md's release
+engines that never retract), `ForwardEvent.Retract` is gone with nothing in
+its place (`make_retract_event` in `scheduler_utils.py` and the forward-skip
+in `engine/l3_cache_hooks.py` go), `Cache.LoadBackDoneEvent` loses its
+`success` argument and `Cache.LoadBackOp` its `prefetch_from_storage` rows,
+`waiting_prefix_hashes` is gone (the prefetch op is the probe), L3 engines
+pass `SchedulerConfig.l3_prefetch_min_pages`, and the plan carries three new
+cache op kinds (`Cache.PrefetchOp`, `Cache.SnapshotOp`, `Cache.RestoreOp`)
+with three new ACKs (`Cache.PrefetchDoneEvent`, `Cache.SnapshotDoneEvent`,
+`Cache.RestoreDoneEvent`) that `DeviceHandle` and the cache hooks must
+execute and count, and `ExecutionPlan.aborts` lists the requests a capacity
+retraction aborted (§2) for the runtime to fail toward their clients.
+Following AGENTS.md's release
 sequence, the `tokenspeed-scheduler` version bump is published first and the
 runtime PR that pins it (`feat/retraction-snapshot-consume`: server args,
 `make_config`, the event rename, the op dispatch and the slot-state exporters)
@@ -929,6 +937,9 @@ lands in the same change as the pin, never a release apart.
   prefix load, both image legs and the restore; the transfer manager asserts
   it when it builds a batch, so under page-cyclic sharding the rank that owns
   one end owns the other (`cache-concepts.md`).
+- An admission loads Host entries only; L3 objects reach Host through a
+  `PrefetchOperation` issued before admission (1), and a `Prefetching`
+  request holds no Device page, no request-pool row and no head of line.
 - Only computed tokens are published as a prefix, and exactly those.
   `Request::NumComputedTokens()` is the one frontier for prefix hashing and
   retention on admission and retraction, and the extent an image covers: the

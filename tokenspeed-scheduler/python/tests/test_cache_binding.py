@@ -36,8 +36,8 @@ def test_removed_storage_cache_api_is_not_exported():
     assert not hasattr(request, "rolling_hashes")
     assert not hasattr(request, "storage_hit_pages")
 
-    assert not hasattr(Cache, "PrefetchDoneEvent")
-    assert not hasattr(Cache, "PrefetchOp")
+    # Cache.PrefetchOp / Cache.PrefetchDoneEvent exist again, as the
+    # pre-admission L3 fill (not the old adjunct API).
     assert not hasattr(Cache, "BackUpOp")
     assert not hasattr(Cache, "CacheKind")
     assert not hasattr(Cache.WriteBackOp, "is_retract")
@@ -45,9 +45,10 @@ def test_removed_storage_cache_api_is_not_exported():
     assert not hasattr(Cache.LoadBackOp, "src_pages_by_kind")
     assert not hasattr(ts.Forward.Batch, "hist_token_lens")
     assert not hasattr(ts.Scheduler, "get_request_paged_cache_page_ids")
-    # Retraction suspends with an image; the recompute-from-scratch event
-    # survives only for a vanished L3 prefetch.
+    # Retraction suspends with an image; there is no recompute-from-scratch
+    # event of any kind (an L3 object that is gone is found by the prefetch).
     assert not hasattr(ts.ForwardEvent, "Retract")
+    assert not hasattr(ts.ForwardEvent, "RecomputeRetract")
     assert not hasattr(ts.Scheduler, "has_recoverable_snapshot")
 
 
@@ -70,13 +71,19 @@ def test_cache_event_fields_are_bound():
     restore.op_id = 11
     assert restore.op_id == 11
 
-    load_back = Cache.LoadBackDoneEvent(8, False)
+    load_back = Cache.LoadBackDoneEvent(8)
     assert load_back.op_id == 8
-    assert load_back.success is False
+    assert not hasattr(
+        load_back, "success"
+    ), "a load cannot miss: an L3 miss is a PrefetchDoneEvent"
+
+    prefetch = Cache.PrefetchDoneEvent(12, 3)
+    assert prefetch.op_id == 12
+    assert prefetch.landed_pages == 3
     with pytest.raises(TypeError):
-        Cache.LoadBackDoneEvent()
+        Cache.PrefetchDoneEvent()
     with pytest.raises(TypeError):
-        Cache.LoadBackDoneEvent(9)
+        Cache.PrefetchDoneEvent(13)
 
 
 def test_execution_event_accepts_cache_events():
@@ -85,9 +92,10 @@ def test_execution_event_accepts_cache_events():
     write_back = Cache.WriteBackDoneEvent()
     assert execution_event.add_event(write_back) is execution_event
 
-    load_back = Cache.LoadBackDoneEvent(8, True)
+    load_back = Cache.LoadBackDoneEvent(8)
     assert execution_event.add_event(load_back) is execution_event
 
+    assert execution_event.add_event(Cache.PrefetchDoneEvent(9, 0)) is execution_event
     assert execution_event.add_event(Cache.SnapshotDoneEvent()) is execution_event
     assert execution_event.add_event(Cache.RestoreDoneEvent()) is execution_event
 
@@ -113,12 +121,32 @@ def test_snapshot_ops_carry_the_blob_slot_and_source_tier():
     assert int(Cache.HostTier.SnapshotPool) == 1
 
 
-def test_forward_recompute_retract_event_is_bound():
-    retract = ts.ForwardEvent.RecomputeRetract()
-    retract.request_id = "r0"
-    assert retract.request_id == "r0"
-    execution_event = ExecutionEvent()
-    assert execution_event.add_event(retract) is execution_event
+def test_recompute_retract_is_gone_and_prefetch_op_is_bound():
+    # There is no retraction without an image: the L3-miss case is handled
+    # before admission by the prefetch op, never by a forward-event retract.
+    assert not hasattr(ts.ForwardEvent, "RecomputeRetract")
+    assert not hasattr(ts.ForwardEvent, "Retract")
+    for field in (
+        "op_ids",
+        "request_ids",
+        "first_pages",
+        "num_pages",
+        "group_ids",
+        "host_pages",
+        "content_hashes",
+        "page_offsets",
+        "page_indices",
+    ):
+        assert hasattr(Cache.PrefetchOp, field), field
+    assert not hasattr(Cache.LoadBackOp, "prefetch_from_storage")
+    assert not hasattr(ts.Scheduler, "waiting_prefix_hashes")
+
+
+def test_scheduler_aborts_are_bound():
+    assert int(ts.AbortReason.ImageDoesNotFit) == 0
+    for field in ("request_id", "reason", "detail"):
+        assert hasattr(ts.SchedulerAbort, field), field
+    assert hasattr(ts.ExecutionPlan, "aborts")
 
 
 def test_snapshot_pool_is_stated_explicitly():

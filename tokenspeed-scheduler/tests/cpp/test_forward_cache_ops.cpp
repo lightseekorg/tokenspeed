@@ -741,6 +741,7 @@ TEST(SchedulerConfigValidateTest, L3StorageRequiresReplicatedGroups) {
     SchedulerConfig config = MakeValidConfig();
     config.host_allocator.total_pages = 32;
     config.enable_l3_storage = true;
+    config.l3_prefetch_min_pages = 1;
     config.cache_groups[0].cache_blocks_per_lcm_block = 2;
     config.cache_groups[0].shard_count = 2;
     EXPECT_THROW(config.Validate(), std::invalid_argument)

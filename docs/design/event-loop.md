@@ -332,7 +332,7 @@ Current inventory:
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
 | `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries) | `count_plan_ops`, `poll_ready_events` |
-| `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `revalidate_queued_hits`, `prepare_forward` |
+| `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests` (the `batch_exists` probe that registers L3 keys), per-round MIN convergence of in-flight `PrefetchOp`s into `PrefetchDoneEvent`s |
 | `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
 
 `_pause_hooks` and `_pd_hooks` are also handed the `DeviceHandle`: both have
@@ -397,10 +397,12 @@ For orientation, one iteration of `event_loop`:
 2. Poll completed L2 cache ops; **advance the scheduler (head call site)** so
    this round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
-   step. Otherwise: revalidate queued L3 hits, plan (`next_execution_plan`),
-   derive the forward op, record metrics, DP-sync, and gather per-batch state
-   (draining the in-flight queue first if the dispatch depends on a pending
-   commit, Principle 4).
+   step. Otherwise: plan (`next_execution_plan`), derive the forward op,
+   record metrics, DP-sync, and gather per-batch state (draining the
+   in-flight queue first if the dispatch depends on a pending commit,
+   Principle 4). Nothing re-probes L3 here: an L3 hit is fetched into Host by
+   a `PrefetchOp` before the request is admitted, so no planned forward can
+   be skipped for a vanished object.
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse:
    host-cache write-backs first (a retraction's snapshot copy must read the
@@ -408,7 +410,9 @@ For orientation, one iteration of `event_loop`:
    forward thread's stream on its completion here; an ordinary store's
    sources are pinned by the scheduler until the ACK, so its copy rides the
    write stream and fences nothing), then page zeroing (the new owner's
-   sanitization), then load-backs (they target zeroed pages), then the
+   sanitization), then L3 prefetches (Host-lane submissions with no stream
+   dependency: nothing in the round reads their pages), then load-backs
+   (they target zeroed pages), then restores, then the
    plan's remote streams to the transfer peer (a D-node remote prefill
    waits on the zeroing fence inside its submission, which the FIFO orders
    after the write-back fence), then the plan's batch to the model. `planned` is

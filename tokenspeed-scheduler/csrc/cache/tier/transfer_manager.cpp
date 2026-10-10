@@ -120,10 +120,69 @@ bool TierTransferManager::HasPinnedStoresInFlight() const {
 LoadBackOperation TierTransferManager::StartPrefixLoad(std::vector<BlockTransfer> block_transfers) {
     _assert(!block_transfers.empty(), "prefix load requires at least one block transfer");
     for (const BlockTransfer& pair : block_transfers) {
-        _assert(pair.prefetch_from_storage || coordinator_.IsHostCachedBlock(pair.source->Location()),
+        _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
                 "pinned Host block lost its cache entry before load emission");
     }
     return startLoadBack(std::move(block_transfers));
+}
+
+PrefetchOperation TierTransferManager::StartPrefetch(const std::string& request_id,
+                                                     CacheCoordinator::PrefetchPlan plan) {
+    _assert(!plan.rows.empty() && !plan.page_row_ends.empty(), "a prefetch op carries at least one page");
+    PrefetchOperation op{
+        .op_id = nextOpId(),
+        .request_id = request_id,
+        .first_page = plan.first_page,
+        .num_pages = static_cast<std::int32_t>(plan.page_row_ends.size()),
+    };
+    op.transfers.reserve(plan.rows.size());
+    op.page_indices.reserve(plan.rows.size());
+    for (const CacheCoordinator::PrefetchRow& row : plan.rows) {
+        const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(row.group_id));
+        op.transfers.push_back(CacheTransfer{
+            .group_id = row.group_id,
+            .source_page = -1,
+            .destination_page = manager.ResolveCacheBlockId(row.host_block->Location()),
+            .content_hash = row.key.content_hash,
+            .page_offset = row.key.page_offset,
+        });
+        op.page_indices.push_back(row.page_index);
+    }
+    const bool inserted = prefetches_
+                              .emplace(op.op_id, InFlightPrefetch{.request_id = request_id,
+                                                                  .rows = std::move(plan.rows),
+                                                                  .page_row_ends = std::move(plan.page_row_ends)})
+                              .second;
+    _assert(inserted, "duplicate prefetch op id");
+    return op;
+}
+
+std::optional<TierTransferManager::PrefetchCompleted> TierTransferManager::CompletePrefetch(std::uint32_t op_id,
+                                                                                            std::int32_t landed_pages) {
+    auto it = prefetches_.find(op_id);
+    if (it == prefetches_.end()) {
+        return std::nullopt;
+    }
+    InFlightPrefetch prefetch = std::move(it->second);
+    prefetches_.erase(it);
+    _assert(landed_pages >= 0 && landed_pages <= static_cast<std::int32_t>(prefetch.page_row_ends.size()),
+            "a prefetch lands a prefix of the pages it was asked for");
+    const std::size_t landed_rows =
+        landed_pages == 0 ? 0 : prefetch.page_row_ends[static_cast<std::size_t>(landed_pages) - 1];
+    PrefetchCompleted completed{.request_id = std::move(prefetch.request_id)};
+    for (std::size_t i = 0; i < prefetch.rows.size(); ++i) {
+        CacheCoordinator::PrefetchRow& row = prefetch.rows[i];
+        if (i < landed_rows) {
+            // The object landed in this block: a Host entry like any store's.
+            // Register may redirect to an entry that appeared meanwhile; the
+            // pin follows the publication.
+            coordinator_.CacheHostBlock(row.host_block, row.key);
+            completed.published.push_back(std::move(row.host_block));
+        } else {
+            completed.unlanded.push_back(std::move(row.key));  // the block returns with the row
+        }
+    }
+    return completed;
 }
 
 LoadBackOperation TierTransferManager::startLoadBack(std::vector<BlockTransfer> block_transfers) {
@@ -158,29 +217,10 @@ std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_
     return published;
 }
 
-void TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {
-    auto it = load_backs_.find(op_id);
-    if (it == load_backs_.end()) {
-        return;
-    }
-    // A missed batch_get_into must not publish empty Host or Device pages.
-    // Host-warm destinations of a mixed L3 hash were not CacheFullBlocks'd at
-    // admit (the hash had an L3 prefetch sibling). Publish every keyed filled
-    // destination. Host-only L2 load-backs leave key empty; those pages were
-    // already published at admit. CacheHostBlock remains prefetch-only
-    // because Host-warm sources are already in the Host index.
-    for (BlockTransfer& transfer : it->second) {
-        if (!success) {
-            continue;
-        }
-        if (transfer.prefetch_from_storage && transfer.source) {
-            coordinator_.CacheHostBlock(transfer.source, transfer.key);
-        }
-        if (transfer.destination && !transfer.key.content_hash.empty()) {
-            coordinator_.CacheDeviceBlock(transfer.destination, transfer.key);
-        }
-    }
-    load_backs_.erase(it);
+void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
+    // Both ends were pinned for the copy; the destinations were published
+    // when the admission claimed the Host hit, so the ACK only lets go.
+    load_backs_.erase(op_id);
 }
 
 TierTransferManager::InFlightHostBlocks TierTransferManager::inFlightHostBlocks() const {
@@ -401,7 +441,6 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
             .destination_page = manager.ResolveCacheBlockId(block_transfer.destination->Location()),
             .content_hash = block_transfer.key.content_hash,
             .page_offset = block_transfer.key.page_offset,
-            .prefetch_from_storage = block_transfer.prefetch_from_storage,
         });
     }
     return transfers;
