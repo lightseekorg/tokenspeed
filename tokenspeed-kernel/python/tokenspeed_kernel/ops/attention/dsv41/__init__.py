@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -73,6 +74,7 @@ __all__ = [
     "compressor_metadata",
     "swa_rope_scatter",
     "rope_inplace",
+    "query_heads",
     "rope_pad_query",
     "dspark_rows",
     "dspark_anchors",
@@ -580,13 +582,25 @@ def rope_inplace(
     return kernel(values, positions, cos_sin_cache)
 
 
+def query_heads(heads: int) -> int:
+    """Head count of the queries this platform's decode selected attention reads.
+
+    FlashMLA reads 64 or 128 heads, so ``rope_pad_query`` zero-pads up to that
+    and the attention sink pads with -inf. The AMD Gluon kernel reads any head
+    count, where padding would only add work.
+    """
+    if current_platform().is_amd:
+        return heads
+    return 64 if heads <= 64 else 128
+
+
 def rope_pad_query(
     values: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     solution: str | None,
 ) -> torch.Tensor:
-    """Rotate compact queries while fully writing the FlashMLA 64/128-head input.
+    """Rotate compact queries while fully writing the decode attention input.
 
     Args:
         values: BF16/FP16 [tokens,real_heads,512], 1..128 heads, strided rows/heads.
@@ -595,7 +609,8 @@ def rope_pad_query(
         solution: Optional registered implementation restriction.
 
     Returns:
-        Fresh contiguous [tokens,64 or128,512] queries. Every padded head is zero;
+        Fresh contiguous [tokens,query_heads(real_heads),512] queries (64 or 128
+        heads for FlashMLA). Every padded head is zero;
         input storage is unchanged. This is forward/graph-owned scratch, never
         persistent KV or a request-indexed state buffer.
     """
