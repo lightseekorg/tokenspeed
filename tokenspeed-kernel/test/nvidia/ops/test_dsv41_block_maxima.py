@@ -33,6 +33,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# The downstream selector is registered and imported only on Hopper.
+requires_hopper_selector = pytest.mark.skipif(
+    not impl.platform.is_hopper,
+    reason="requires the Hopper DeepSelect path",
+)
+
+
 def reference(logits, visible):
     rows, width = logits.shape
     if width % 8:
@@ -120,6 +127,7 @@ def canonical(ids):
     "visible_values",
     [[0, 1, 1001, 1330], [7, 8, 9, 16384], [16385, 20000, 65535, 65536]],
 )
+@requires_hopper_selector
 def test_candidate_sets_and_downstream(visible_values):
     torch.manual_seed(37)
     width = 1048640
@@ -146,6 +154,7 @@ def test_candidate_sets_and_downstream(visible_values):
         torch.testing.assert_close(x, y, atol=0, rtol=0)
 
 
+@requires_hopper_selector
 def test_bounded_selection_graph_refresh():
     width = 1048640
     torch.manual_seed(73)
@@ -220,6 +229,7 @@ def native_selection(scores, visible, block_stats):
     return out
 
 
+@requires_hopper_selector
 def test_clean_block_selection_graph_refresh():
     width = 65536
     torch.manual_seed(73)
