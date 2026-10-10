@@ -894,20 +894,21 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     return true;
 }
 
-template <CacheTier Tier>
-void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table,
-                                                    const CompletedPages& completed, std::uint64_t access_epoch) {
+std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRanges(
+    std::size_t group_index, const CompletedPages& completed) const {
+    std::vector<PublishedRange> ranges;
     if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
-        return;
+        return ranges;
     }
     const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
+    const std::int32_t hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
     if (groups_[group_index].Matcher().IsPrefixClosed()) {
-        std::vector<CacheKey> keys =
-            keysForGroup(completed.prefix_hashes.subspan(static_cast<std::size_t>(completed.first_new_prefix_page)),
-                         groups_[group_index].Id());
-        cacheFullBlocksForGroup<Tier>(group_index, table, keys, completed.first_new_prefix_page * pages_per_prefix_hash,
-                                      access_epoch, completed.boundary_kind, completed.stream_completed_to_host);
-        return;
+        ranges.push_back(PublishedRange{
+            .first_cache_block = completed.first_new_prefix_page * pages_per_prefix_hash,
+            .num_blocks = (hashed_prefix_pages - completed.first_new_prefix_page) * pages_per_prefix_hash,
+            .boundary_kind = completed.boundary_kind,
+        });
+        return ranges;
     }
     // Ordinary state chunks remain request-owned. Retained state boundaries
     // publish only proven prefill checkpoints in the newly hashed range;
@@ -916,11 +917,10 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
     const CacheBoundaryKind boundary_kind =
         is_state ? completed.state_boundary_kind.value_or(completed.boundary_kind) : completed.boundary_kind;
     if (is_state && boundary_kind == CacheBoundaryKind::kChunk) {
-        return;
+        return ranges;
     }
     // Sliding windows resume from the newest hashed boundary. State groups
     // may have several materialized boundaries awaiting publication.
-    const std::int32_t hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
     std::vector<std::int32_t> boundaries_in_prefix_pages;
     if (!is_state) {
         boundaries_in_prefix_pages.push_back(hashed_prefix_pages);
@@ -935,10 +935,6 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
             }
         }
     }
-    if (boundaries_in_prefix_pages.empty()) {
-        return;
-    }
-    const std::vector<CacheKey> keys = keysForGroup(completed.prefix_hashes, groups_[group_index].Id());
     for (const std::int32_t boundary_prefix_pages : boundaries_in_prefix_pages) {
         const std::int32_t boundary_cache_block = boundary_prefix_pages * pages_per_prefix_hash;
         const std::int32_t lookback =
@@ -946,12 +942,29 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
         if (lookback == 0) {
             continue;
         }
-        const std::int32_t first_cache_block = boundary_cache_block - lookback;
+        ranges.push_back(PublishedRange{
+            .first_cache_block = boundary_cache_block - lookback,
+            .num_blocks = lookback,
+            .boundary_kind = boundary_kind,
+        });
+    }
+    return ranges;
+}
+
+template <CacheTier Tier>
+void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table,
+                                                    const CompletedPages& completed, std::uint64_t access_epoch) {
+    const std::vector<PublishedRange> ranges = completedBlockRanges(group_index, completed);
+    if (ranges.empty()) {
+        return;
+    }
+    const std::vector<CacheKey> keys = keysForGroup(completed.prefix_hashes, groups_[group_index].Id());
+    for (const PublishedRange& range : ranges) {
         cacheFullBlocksForGroup<Tier>(
             group_index, table,
-            std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(first_cache_block),
-                                                    static_cast<std::size_t>(lookback)),
-            first_cache_block, access_epoch, boundary_kind, completed.stream_completed_to_host);
+            std::span<const CacheKey>{keys}.subspan(static_cast<std::size_t>(range.first_cache_block),
+                                                    static_cast<std::size_t>(range.num_blocks)),
+            range.first_cache_block, access_epoch, range.boundary_kind, completed.stream_completed_to_host);
     }
 }
 
@@ -1072,6 +1085,47 @@ std::optional<CacheCoordinator::SnapshotPoolPlan> CacheCoordinator::planSnapshot
 bool CacheCoordinator::SnapshotPoolHolds(std::span<const BlockTable> tables, std::int32_t num_tokens,
                                          std::span<const std::vector<ImageSlot>> host_served_slots) const {
     return planSnapshotPool(tables, num_tokens, host_served_slots).has_value();
+}
+
+std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlotsAfter(std::span<const BlockTable> tables,
+                                                                              std::int32_t num_tokens,
+                                                                              const RequestProgress& progress) const {
+    std::vector<std::vector<ImageSlot>> published = PublishedDataSlots(tables, num_tokens);
+    if (!progress.completed_pages) {
+        return published;
+    }
+    const CompletedPages& completed = *progress.completed_pages;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const std::vector<PublishedRange> ranges = completedBlockRanges(i, completed);
+        if (ranges.empty()) {
+            continue;
+        }
+        const DataSpan span = dataSpan(tables[i], geometry_[i].BlockGranularity(), num_tokens);
+        const std::span<const CacheBlockRef> blocks = tables[i].Blocks();
+        const std::vector<CacheKey> keys = keysForGroup(completed.prefix_hashes, groups_[i].Id());
+        std::vector<ImageSlot>& slots = published[i];
+        for (const PublishedRange& range : ranges) {
+            for (std::int32_t slot = range.first_cache_block; slot < range.first_cache_block + range.num_blocks;
+                 ++slot) {
+                const auto index = static_cast<std::size_t>(slot);
+                // A slot beyond the data span, a null hole, or one already
+                // published is not added: the publication would register
+                // nothing new there.
+                if (slot >= span.blocks || !blocks[index] ||
+                    std::ranges::any_of(slots, [slot](const ImageSlot& s) { return s.slot_index == slot; })) {
+                    continue;
+                }
+                _assert(index < keys.size(), "a published range lies inside the hashed prefix");
+                slots.push_back(ImageSlot{.slot_index = slot,
+                                          .block = blocks[index],
+                                          .key = keys[index],
+                                          .logical_block_index = slot,
+                                          .boundary_kind = range.boundary_kind});
+            }
+        }
+        std::ranges::sort(slots, {}, &ImageSlot::slot_index);
+    }
+    return published;
 }
 
 std::optional<CacheCoordinator::ImageTaken> CacheCoordinator::TakeImage(

@@ -357,10 +357,15 @@ private:
         bool image_fits{false};
     };
     VictimChoice chooseVictim(std::span<Request* const> candidates) const;
+    // The first half of a retraction: publishes the pages the victim completed
+    // since its last admission (see forward.cpp).
+    void publishCompletedPrefix(Request& victim);
     // Whether the host budgets hold the request's image right now: a blob
-    // slot is free and the snapshot pool holds the tail, the published pages
-    // being assumed to ride Host L2 (an L2 shortfall falls back to the pool
-    // at retraction time, where it can still turn out not to fit).
+    // slot is free and the snapshot pool holds everything the L2 leg would
+    // not carry once the retraction has published the request's completed
+    // pages (projected, nothing mutated). An L2 allocation shortfall can still
+    // send published slots to the pool at retraction time, where the image can
+    // then turn out not to fit.
     bool imageFits(const Request& request) const;
     // Why a victim could not be imaged: no snapshot pool at all (the null
     // page alone is configured, so nothing is ever imaged), no blob slot

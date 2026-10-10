@@ -3117,6 +3117,57 @@ TEST_F(NoImageFitsSuite, WhenNoImageFitsTheNewestResidentIsAbortedAndTheGrantPro
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "the pool balances after the abort";
 }
 
+// With Host L2 the published pages leave the pool to the tail alone. A
+// decode victim that completed a prefix page since its last admission has
+// not hashed it yet; the retraction publishes it first and sends it to L2, so
+// the fit probe must not count it against the pool.
+class L2TailOnlyPoolSuite : public ImageDoesNotFitSuite {
+protected:
+    std::int32_t SnapshotPoolBlocks() const override { return 1; }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = ImageDoesNotFitSuite::MakeConfig();
+        cfg.disable_l2_cache = false;
+        return cfg;
+    }
+};
+
+TEST_F(L2TailOnlyPoolSuite, AnUnhashedCompletedPageRidesL2AndTheVictimIsRetractedNotAborted) {
+    // The prefill publication streams the prompt pages to Host (pinned
+    // stores); acknowledge them as they appear so the blocked round may
+    // retract.
+    Submit(MakeRequestSpec("a", /*num_pages=*/3));
+    Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("a", {42});
+    SendForwardDone("b", {142});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("a", {43});
+    SendForwardDone("b", {143});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("a", {44});
+    SendForwardDone("b", {144});
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+
+    // a = [1..6 42 43 44]: 8 computed tokens, four whole pages; page 3
+    // ([43 44]) completed since a's last admission and is unhashed. All four
+    // ride L2 once published, so the one-block pool holds a's (empty) tail:
+    // a is imaged, not aborted.
+    const ExecutionPlan round = PlanOnce();
+    EXPECT_TRUE(round.aborts.empty()) << "nothing is aborted while an image fits";
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_EQ(scheduler_->RequestTokenSize("a"), 9) << "a, the ranked victim, is the one suspended";
+    const SnapshotStoreBatch* store = FindSnapshotStore(round);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{"a"});
+    EXPECT_TRUE(store->src_pages.at(0).empty()) << "no tail: the pool holds only the blob";
+    const auto write_backs = ExtractCacheOpsOfKind<WriteBackBatch>(round);
+    ASSERT_FALSE(write_backs.empty()) << "the unhashed page goes to Host with the L2 leg";
+    const ForwardBatch* granted = FindForwardBatch(round);
+    ASSERT_NE(granted, nullptr);
+    EXPECT_EQ(granted->request_ids, std::vector<std::string>{"b"}) << "the blocked decode runs on a's pages";
+}
+
 // The null page alone: the engine never images, and says so.
 class NoPoolSuite : public ImageDoesNotFitSuite {
 protected:

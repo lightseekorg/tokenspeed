@@ -142,7 +142,7 @@ void recordPrefillStateCheckpoint(fsm::CacheProgress& cache_progress, fsm::Prefi
 // Hashes the prefix pages that num_computed_tokens has filled since the
 // previous admission and states the request's progress for the coordinator.
 // The returned spans view cache_progress, which must outlive their use.
-RequestProgress advanceRequestProgress(Request& request, fsm::CacheProgress& cache_progress,
+RequestProgress advanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
                                        bool stream_completed_to_host) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
@@ -606,77 +606,45 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
                !request.ReserveCoversGeneration(kRetractionSafeSteps);
     };
-    Request* victim = nullptr;
-    for (Request* request : candidates) {
-        if (request->Is<fsm::Prefilling>() && retractable(*request) &&
-            (victim == nullptr || request->TokenSize() > victim->TokenSize()) && imageFits(*request)) {
-            victim = request;
-        }
-    }
-    if (victim != nullptr) {
-        return VictimChoice{.victim = victim, .image_fits = true};
-    }
-
-    std::optional<std::tuple<std::int32_t, std::int32_t, std::string>> victim_rank;
+    // Rank first, then probe the host fit in rank order, so the probe (which
+    // hashes the candidate's completed pages) runs for as few candidates as
+    // possible -- normally one.
+    std::vector<Request*> ranked;
+    std::vector<Request*> decodes;
     Request* newest = nullptr;
     for (Request* request : candidates) {
         if (!retractable(*request)) {
             continue;
         }
         newest = request;  // candidates arrive in submission order
-        if (!request->IsAnyOf<fsm::Decoding, fsm::PrefillDone>()) {
-            continue;
-        }
-        auto rank = std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),
-                               request->GeneratedTokens(), request->Id()};
-        if ((!victim_rank || rank < *victim_rank) && imageFits(*request)) {
-            victim = request;
-            victim_rank = std::move(rank);
-        }
+        (request->Is<fsm::Prefilling>() ? ranked : decodes).push_back(request);
     }
-    if (victim != nullptr) {
-        return VictimChoice{.victim = victim, .image_fits = true};
+    std::ranges::stable_sort(ranked,
+                             [](const Request* a, const Request* b) { return a->TokenSize() > b->TokenSize(); });
+    const auto decode_rank = [this](const Request* request) {
+        return std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),
+                          request->GeneratedTokens(), request->Id()};
+    };
+    std::ranges::stable_sort(
+        decodes, [&decode_rank](const Request* a, const Request* b) { return decode_rank(a) < decode_rank(b); });
+    ranked.insert(ranked.end(), decodes.begin(), decodes.end());
+    for (Request* request : ranked) {
+        if (imageFits(*request)) {
+            return VictimChoice{.victim = request, .image_fits = true};
+        }
     }
     return VictimChoice{.victim = newest, .image_fits = false};
 }
 
-bool Scheduler::imageFits(const Request& request) const {
-    if (snapshot_slots_.AvailableSlots() == 0) {
-        return false;
-    }
-    const std::int32_t num_computed_tokens = request.NumComputedTokens();
-    // The published slots ride Host L2 (StartRetractionStores pins or copies
-    // them there); only the rest must fit the pool. Pages the request has
-    // completed but not yet hashed are published at retraction and join the
-    // L2 leg too, so the probe is conservative only by those pages.
-    const std::vector<std::vector<ImageSlot>> published =
-        coordinator_.PublishedDataSlots(request.BlockTablesRef(), num_computed_tokens);
-    return coordinator_.SnapshotPoolHolds(
-        request.BlockTablesRef(), num_computed_tokens,
-        coordinator_.HasHostPool() ? published : std::vector<std::vector<ImageSlot>>(published.size()));
-}
-
-// Suspends a quiescent victim with its image. First the completed prefix
-// pages are published into the Device index (a finish-like publication other
-// requests may hit; it costs only the hashes of pages not yet hashed, and the
-// image's L2 leg is built from exactly those entries). Then the transfer
-// manager takes the image -- published slots as pinned Host L2 entries,
-// everything else in the snapshot pool, each in its Device block's bucket --
-// and issues both store legs; the victim's Device pages are released by the
-// retract event and may be granted away in this very round, because the
-// runtime orders both copies on the forward thread's stream ahead of the
-// plan's page reuse. A victim whose image cannot be held, or with no blob
-// slot free, is not retracted: the shortfall is returned, and the publication
-// it did is written back as the victim's progress so it is not redone.
-std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
-    Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations) {
-    if (snapshot_slots_.AvailableSlots() == 0) {
-        return ImageShortfall::kBlobSlot;
-    }
+// The first half of a retraction: hashes the prefix pages the victim
+// completed since its last admission and publishes them into the Device index
+// -- exactly what its next admission would have published -- then writes the
+// progress back. Only what has actually been computed is published (an
+// incomplete prefill has only the chunks it has been through; TokenSize()
+// would publish pages that were never computed). Device-only: the pages reach
+// Host through the image's L2 leg.
+void Scheduler::publishCompletedPrefix(Request& victim) {
     fsm::CacheProgress cache_progress = victim.CacheProgress();
-    // Only what has actually been computed may be published as a prefix: an
-    // incomplete prefill has only the chunks it has been through -- taking
-    // TokenSize() there would publish pages that were never computed.
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
     RequestProgress progress =
         advanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
@@ -692,6 +660,56 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
         coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
     }
     cache_progress.DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());
+    victim.CacheProgressRef() = std::move(cache_progress);
+}
+
+bool Scheduler::imageFits(const Request& request) const {
+    if (snapshot_slots_.AvailableSlots() == 0) {
+        return false;
+    }
+    // The retraction publishes the candidate's completed pages before it
+    // images it, and those pages ride the L2 leg. The probe projects that
+    // publication on a copy of the progress (hashing the same pages
+    // publishCompletedPrefix will) and reads the L2/pool split off
+    // PublishedDataSlotsAfter -- the publication's own slot rule -- so it
+    // counts against the pool exactly what StartRetractionStores will put
+    // there. Nothing is mutated: a candidate that does not fit is left as it
+    // was. Without a Host pool everything is the pool's.
+    fsm::CacheProgress cache_progress = request.CacheProgress();
+    const std::int32_t num_computed_tokens = request.NumComputedTokens();
+    RequestProgress progress =
+        advanceRequestProgress(request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+                               /*stream_completed_to_host=*/false);
+    if (progress.completed_pages) {
+        classifyCompletedStateBoundaries(*progress.completed_pages, num_computed_tokens,
+                                         coordinator_.PrefixGranularity());
+    }
+    const std::vector<std::vector<ImageSlot>> published =
+        coordinator_.PublishedDataSlotsAfter(request.BlockTablesRef(), num_computed_tokens, progress);
+    return coordinator_.SnapshotPoolHolds(
+        request.BlockTablesRef(), num_computed_tokens,
+        coordinator_.HasHostPool() ? published : std::vector<std::vector<ImageSlot>>(published.size()));
+}
+
+// Suspends a quiescent victim with its image. First the completed prefix
+// pages are published into the Device index (publishCompletedPrefix: a
+// finish-like publication other requests may hit; it costs only the hashes
+// of pages not yet hashed, and the image's L2 leg is built from exactly
+// those entries). Then the transfer manager takes the image -- published
+// slots as pinned Host L2 entries, everything else in the snapshot pool, each
+// in its Device block's bucket -- and issues both store legs; the victim's
+// Device pages are released by the retract event and may be granted away in
+// this very round, because the runtime orders both copies on the forward
+// thread's stream ahead of the plan's page reuse. A victim whose image cannot
+// be held, or with no blob slot free, is not retracted: the shortfall is
+// returned, and the publication it did stands as its progress.
+std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
+    Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations) {
+    if (snapshot_slots_.AvailableSlots() == 0) {
+        return ImageShortfall::kBlobSlot;
+    }
+    publishCompletedPrefix(victim);
+    const std::int32_t num_computed_tokens = victim.NumComputedTokens();
 
     // The blob slot is shared with the store that exports into it (and later
     // the restore that imports from it): an abort before either ACK leaves
@@ -700,12 +718,9 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
     std::optional<TierTransferManager::RetractionStores> stores = tier_transfers_.StartRetractionStores(
         victim.Id(), victim.RequestPoolIndex(), blob_slot, victim.BlockTablesRef(), num_computed_tokens);
     if (!stores) {
-        // The publication stands; the victim keeps running with it recorded.
-        victim.CacheProgressRef() = std::move(cache_progress);
-        return ImageShortfall::kSnapshotPool;
+        return ImageShortfall::kSnapshotPool;  // the publication stands; the victim keeps running
     }
     victim.NoteRetracted();
-    victim.CacheProgressRef() = std::move(cache_progress);
     if (stores->host_store) {
         write_back_operations.push_back(std::move(*stores->host_store));
     }

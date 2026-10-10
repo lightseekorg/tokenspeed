@@ -225,6 +225,15 @@ public:
     // swaps in the Host block). Everything else goes to the snapshot pool.
     std::vector<std::vector<ImageSlot>> PublishedDataSlots(std::span<const BlockTable> tables,
                                                            std::int32_t num_tokens) const;
+    // The same slots once `progress` has been published as well: the entries
+    // that exist now plus the slots CacheCompletedBlocks(progress) would
+    // register (the single publication rule, completedBlockRanges). The
+    // victim probe reads the image's L2/pool split off this before the
+    // retraction publishes, so it sees exactly what StartRetractionStores
+    // will see afterwards. Without completed pages it is PublishedDataSlots.
+    std::vector<std::vector<ImageSlot>> PublishedDataSlotsAfter(std::span<const BlockTable> tables,
+                                                                std::int32_t num_tokens,
+                                                                const RequestProgress& progress) const;
 
     // A retracted request's KV image plus the Device -> snapshot-pool copies
     // that fill its snapshot-pool slots. The pairs pin the Device sources
@@ -428,6 +437,19 @@ private:
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+    // One run of cache blocks a publication registers in a group, and the
+    // boundary kind it registers them under.
+    struct PublishedRange {
+        std::int32_t first_cache_block{0};
+        std::int32_t num_blocks{0};
+        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+    };
+    // What publishing `completed` covers in one group -- every newly hashed
+    // page of a prefix-closed group, the lookback behind the newest boundary
+    // of a sliding group, the lookback behind each materialized checkpoint
+    // of a state group, nothing for a replayable one. The one source for
+    // cacheCompletedBlocksForGroup and for PublishedDataSlotsAfter.
+    std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                       std::uint64_t access_epoch);
