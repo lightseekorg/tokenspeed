@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import unittest
+from concurrent.futures import Future
 from contextlib import nullcontext
 from importlib import import_module, util
 from types import ModuleType, SimpleNamespace
@@ -478,17 +479,15 @@ class GroupAwareWireTest(unittest.TestCase):
             executor.complete_l3_prefetch(5, 1)
 
     def test_prefetch_lane_stops_at_the_deadline_and_on_a_backend_fault(self):
-        module, executor = self._prefetch_executor(batch_pages=1, timeout_base_s=0.0001)
-        slow = threading.Event()
-
-        def prefetch(pages):
-            slow.wait(0.05)
-            return [True] * len(pages)
-
-        executor.l3_store.prefetch.side_effect = prefetch
-        executor.submit_prefetches([self._prefetch_op(module, 1, 3)])
-        # The first batch starts before the deadline; later ones do not.
-        self.assertEqual(self._settle(executor, 1), 1)
+        module, executor = self._prefetch_executor(batch_pages=1, timeout_base_s=1.0)
+        # The lane reads the clock once for the deadline and once before each
+        # batch: the first batch is on time, the second past the deadline.
+        clock = iter([0.0, 0.0] + [10.0] * 100)
+        executor.l3_store.prefetch.side_effect = lambda pages: [True] * len(pages)
+        with patch.object(module.time, "monotonic", side_effect=lambda: next(clock)):
+            executor.submit_prefetches([self._prefetch_op(module, 1, 3)])
+            self.assertEqual(self._settle(executor, 1), 1)
+        self.assertEqual(executor.l3_store.prefetch.call_count, 1)
 
         executor.l3_store.prefetch.side_effect = [[True], RuntimeError("rpc")]
         executor.submit_prefetches([self._prefetch_op(module, 2, 3)])
@@ -528,6 +527,46 @@ class GroupAwareWireTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no storage backend"):
             executor.submit_prefetches([self._prefetch_op(module, 4, 1)])
         self.assertEqual(executor._prefetch_jobs, {})
+
+    def test_a_prefetch_that_raised_lands_nothing_and_is_logged_once(self):
+        """The hooks poll progress every round until the replica converges;
+        a failed lane job is an error once, not a traceback per round."""
+        module, executor = self._prefetch_executor(batch_pages=1)
+        executor._l3_prefetch_batch_pages = 0  # range(..., 0): the job raises
+        module.logger.error.reset_mock()  # the isolated module's logger is a Mock
+        executor.submit_prefetches([self._prefetch_op(module, 9, 2)])
+        self.assertEqual(self._settle(executor, 9), 0)
+        for _ in range(3):
+            self.assertEqual(executor.l3_prefetch_progress(), {9: (True, 0)})
+        module.logger.error.assert_called_once()
+        self.assertIn("prefetch 9 (r9) raised", module.logger.error.call_args.args[0])
+        # Draining never re-raises a failed job: it has left the lane.
+        executor._wait_l3_prefetches()
+        executor.complete_l3_prefetch(9, 0)
+
+    def test_the_weight_version_swap_drains_in_flight_prefetches(self):
+        """A prefetch gets under the key prefix, so the prefix is not swapped
+        while one is on the lane -- the backups were already drained; the
+        prefetches are too, a failed one included."""
+        module, executor = self._prefetch_executor()
+        executor._l3_prefix_for_weight_version = lambda version: f"prefix/{version}"
+        pending, failed = Future(), Future()
+        executor._prefetch_jobs = {
+            1: module._PrefetchJob(request_id="r1", num_pages=2, future=pending),
+            2: module._PrefetchJob(request_id="r2", num_pages=2, future=failed),
+        }
+        failed.set_exception(RuntimeError("rpc"))
+        swapped = threading.Event()
+        executor.l3_store.set_key_prefix.side_effect = lambda prefix: swapped.set()
+        worker = threading.Thread(
+            target=executor.set_l3_weight_version, args=("v2",), daemon=True
+        )
+        worker.start()
+        self.assertFalse(swapped.wait(0.05), "swapped while a prefetch was in flight")
+        pending.set_result(2)
+        self.assertTrue(swapped.wait(5.0))
+        worker.join(5.0)
+        executor.l3_store.set_key_prefix.assert_called_once_with("prefix/v2")
 
     def _owner_executor(self, *, num_groups=2):
         """An executor with replicated (identity) owner translations only."""

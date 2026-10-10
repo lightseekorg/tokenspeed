@@ -132,13 +132,19 @@ class _Ack(NamedTuple):
     backup_pages: list[StoragePage]
 
 
-class _PrefetchJob(NamedTuple):
+class _PrefetchJob:
     """One in-flight L3 prefetch on the lane: the op, its pages by prefix page,
-    and the future that resolves to the pages landed (a prefix length)."""
+    and the future that resolves to the pages landed (a prefix length). A
+    failed future is reported once (``failure_logged``), not on every poll
+    until the replica converges."""
 
-    request_id: str
-    num_pages: int
-    future: Future
+    __slots__ = ("request_id", "num_pages", "future", "failure_logged")
+
+    def __init__(self, request_id: str, num_pages: int, future: Future) -> None:
+        self.request_id = request_id
+        self.num_pages = num_pages
+        self.future = future
+        self.failure_logged = False
 
 
 def _num_host_lcm_blocks(
@@ -487,7 +493,10 @@ class HostCacheExecutor:
         factory = self._l3_prefix_for_weight_version
         if factory is None:
             raise RuntimeError("L3 prefix cannot be rebuilt without a factory")
+        # Both lanes read the prefix: a backup puts under it, a prefetch
+        # gets under it, so neither may straddle the swap.
         self._wait_l3_backups()
+        self._wait_l3_prefetches()
         l3_store.set_key_prefix(factory(str(weight_version)))
 
     def _wait_l3_backups(self) -> None:
@@ -497,10 +506,15 @@ class HostCacheExecutor:
             future.result()
 
     def _wait_l3_prefetches(self) -> None:
+        """Block until every in-flight prefetch has left the lane.
+
+        A prefetch that raised is done too (``l3_prefetch_progress`` reports
+        it as landing nothing); waiting does not re-raise it.
+        """
         with self._ack_lock:
             jobs = list(self._prefetch_jobs.values())
         for job in jobs:
-            job.future.result()
+            job.future.exception()
 
     # ------------------------------------------------------------------
     # Submission (forward thread)
@@ -837,10 +851,14 @@ class HostCacheExecutor:
                 continue
             failed = job.future.exception()
             if failed is not None:
-                logger.error(
-                    f"[L3] prefetch {op_id} ({job.request_id}) raised; landing nothing",
-                    exc_info=failed,
-                )
+                if not job.failure_logged:
+                    # Polled every round until the replica converges: say it once.
+                    job.failure_logged = True
+                    logger.error(
+                        f"[L3] prefetch {op_id} ({job.request_id}) raised; landing "
+                        "nothing",
+                        exc_info=failed,
+                    )
                 progress[op_id] = (True, 0)
             else:
                 progress[op_id] = (True, int(job.future.result()))
@@ -1098,6 +1116,10 @@ class HostCacheExecutor:
                 prerequisite_stream=None,
                 backend=self.transfer_backend,
             )
+        # Reading the victim's slot here is safe although the scheduler freed
+        # it in this plan: the victim is quiescent (chooseVictim takes no
+        # request with a forward in flight) and the FIFO submits every forward
+        # of this plan behind the fence recorded below.
         for op in ops:
             self._slot_state.export(
                 int(op.request_pool_index),
