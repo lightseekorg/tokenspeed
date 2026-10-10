@@ -216,6 +216,11 @@ class MoELayer(torch.nn.Module):
         fp8_scale_block_shape = None
         internal_activation_dtype = "input"
         if self._quant_kind == "fp8":
+            if self.quant_config.weight_block_size is None:
+                raise ValueError(
+                    f"{self.prefix}: FP8 experts without a weight block size "
+                    "(per-tensor scales) have no MoE kernel"
+                )
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
             self._apply_trtllm_ispp_padding(
                 fp8_scale_block_shape[0], "FP8 block scales tile it"
