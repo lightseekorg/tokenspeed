@@ -1397,8 +1397,8 @@ def build_device_side(
     # The compact Host cache: the L2 prefix tier (--enable-kvstore), the
     # retraction snapshot pool (--retraction-snapshot-host-gb), or both in one
     # executor over the same field geometry. The executor is the model
-    # executor's peer: it needs the slot-state exporter the model executor
-    # aggregates, so it is built after it.
+    # executor's peer: it lays out the slot-state exporters the model
+    # executor lists, so it is built after it.
     host_cache_executor = None
     if server_args.enable_kvstore or server_args.retraction_snapshot_host_gb > 0:
         from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
@@ -1411,7 +1411,7 @@ def build_device_side(
             host_size_gb=server_args.kvstore_size,
             snapshot_host_gb=server_args.retraction_snapshot_host_gb,
             max_retracted_requests=server_args.retraction_snapshot_max_requests,
-            slot_state=executor,
+            slot_state_exporters=executor.slot_state_exporters(),
             io_backend=server_args.kvstore_io_backend,
             attn_tp_rank=attn_tp_rank,
             dcp_rank=server_args.mapping.attn.dcp_rank,

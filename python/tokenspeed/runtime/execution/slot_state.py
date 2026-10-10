@@ -39,6 +39,11 @@ export a row it does not import. The architecture test in
 ``test/runtime/test_slot_state.py`` enumerates every per-slot tensor of the
 implementing classes and requires each to be either exported here or named
 token-derived.
+
+The blob's layout -- which owner's segment sits where -- is fixed for the
+executor's lifetime, so :class:`SlotStateLayout` computes it once when the
+Host cache executor is built; a victim's export and a restore's import only
+slice at the recorded offsets.
 """
 
 from __future__ import annotations
@@ -100,21 +105,29 @@ def _stream_scope(stream):
 
 
 def _image_views(rows: Sequence[torch.Tensor], image: torch.Tensor):
-    """Pair each row with its typed view into ``image``; raise on overflow."""
+    """Pair each row with its typed view into ``image``; raise on overflow.
+
+    One pass over the rows: the offsets fall out of forming the views.
+    """
     if image.dtype != torch.uint8 or image.ndim != 1:
         raise ValueError("a slot-state image is a 1-D uint8 tensor")
-    needed = slot_state_image_bytes(rows)
-    if needed > image.numel():
-        raise ValueError(
-            f"slot-state image of {image.numel()} bytes cannot hold {needed} bytes"
-        )
+    capacity = image.numel()
     offset = 0
     views = []
     for row in rows:
         nbytes = row.numel() * row.element_size()
+        if offset + nbytes > capacity:
+            break
         view = image[offset : offset + nbytes].view(row.dtype).view(row.shape)
         views.append((row, view))
         offset += aligned_slot_state_bytes(nbytes)
+    # The image must hold the padded rows too: a segment is always a whole
+    # number of alignment units.
+    if len(views) < len(rows) or offset > capacity:
+        raise ValueError(
+            f"slot-state image of {capacity} bytes cannot hold "
+            f"{slot_state_image_bytes(rows)} bytes"
+        )
     return views
 
 
@@ -144,41 +157,56 @@ def unpack_slot_rows(rows: Sequence[torch.Tensor], image: torch.Tensor, stream) 
             row.copy_(view, non_blocking=True)
 
 
-def _segments(
-    exporters: Sequence[SlotStateExporter], image: torch.Tensor
-) -> list[tuple[SlotStateExporter, torch.Tensor]]:
-    """Slice ``image`` into one segment per exporter, in order; raise on overflow."""
-    sizes = [exporter.slot_state_bytes() for exporter in exporters]
-    if any(size % SLOT_STATE_ALIGNMENT for size in sizes):
-        raise ValueError("every slot-state segment must be alignment-padded")
-    if sum(sizes) > image.numel():
-        raise ValueError(
-            f"slot-state exporters need {sum(sizes)} bytes, image has {image.numel()}"
-        )
-    segments = []
-    offset = 0
-    for exporter, size in zip(exporters, sizes):
-        segments.append((exporter, image[offset : offset + size]))
-        offset += size
-    return segments
+class SlotStateLayout:
+    """The fixed byte layout of one slot's image: one segment per exporter.
 
+    Built once, when the Host cache executor is constructed: every exporter's
+    size is fixed for the executor's lifetime, so the per-victim export and
+    the per-restore import slice ``out`` / ``src`` at the recorded offsets and
+    hand each exporter its segment -- no size queries on the forward thread.
+    """
 
-def export_slot_state_sequence(
-    exporters: Sequence[SlotStateExporter], slot: int, out: torch.Tensor, stream
-) -> None:
-    """Export ``slot`` through ``exporters`` into consecutive segments of ``out``."""
-    for exporter, segment in _segments(exporters, out):
-        exporter.export_slot_state(slot, segment, stream)
+    __slots__ = ("nbytes", "segments")
 
+    def __init__(self, exporters: Sequence[SlotStateExporter]) -> None:
+        """
+        Args:
+            exporters: The owners in blob order; each contributes
+                ``slot_state_bytes()`` bytes, which must be alignment-padded.
+        """
+        segments: list[tuple[SlotStateExporter, int, int]] = []
+        offset = 0
+        for exporter in exporters:
+            size = int(exporter.slot_state_bytes())
+            if size % SLOT_STATE_ALIGNMENT:
+                raise ValueError(
+                    f"{type(exporter).__name__} slot-state segment of {size} bytes "
+                    f"is not padded to {SLOT_STATE_ALIGNMENT}"
+                )
+            segments.append((exporter, offset, offset + size))
+            offset += size
+        #: ``(exporter, begin, end)`` byte ranges, in blob order.
+        self.segments = tuple(segments)
+        #: The blob width: the snapshot arena's row size.
+        self.nbytes = offset
 
-def import_slot_state_sequence(
-    exporters: Sequence[SlotStateExporter],
-    slot: int,
-    src: torch.Tensor,
-    stream,
-    *,
-    request_id: str,
-) -> None:
-    """Import consecutive segments of ``src`` into ``slot`` through ``exporters``."""
-    for exporter, segment in _segments(exporters, src):
-        exporter.import_slot_state(slot, segment, stream, request_id=request_id)
+    def _check(self, image: torch.Tensor) -> None:
+        if image.numel() < self.nbytes:
+            raise ValueError(
+                f"slot-state exporters need {self.nbytes} bytes, image has "
+                f"{image.numel()}"
+            )
+
+    def export(self, slot: int, out: torch.Tensor, stream) -> None:
+        """Image ``slot`` into ``out`` on ``stream``, one segment per exporter."""
+        self._check(out)
+        for exporter, begin, end in self.segments:
+            exporter.export_slot_state(slot, out[begin:end], stream)
+
+    def import_(self, slot: int, src: torch.Tensor, stream, *, request_id: str) -> None:
+        """Restore ``src`` into ``slot``, now ``request_id``'s, on ``stream``."""
+        self._check(src)
+        for exporter, begin, end in self.segments:
+            exporter.import_slot_state(
+                slot, src[begin:end], stream, request_id=request_id
+            )

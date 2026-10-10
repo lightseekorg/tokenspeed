@@ -476,9 +476,13 @@ history frontier, the Inkling conv ring and its pending-hydration bit, the
 DSA KPool tail. Each owner implements `SlotStateExporter`
 (`execution/slot_state.py`) by listing its per-slot rows once
 (`slot_state_rows`); the export, the import and the size derive from that
-list, composites (`child_backends`) concatenate their children, and
-`ModelExecutor` concatenates `RuntimeStates`, the attention trees and the
-drafter into one blob per slot. The executor keeps a pinned arena of
+list. Every node of an attention tree is its own exporter
+(`slot_state_exporters` flattens the tree), and `ModelExecutor` lists
+`RuntimeStates`, the attention nodes and the drafter in blob order. The Host
+cache executor measures them **once**, at construction (`SlotStateLayout`:
+sizes are fixed for its lifetime), so a store or restore only slices the
+arena row at the recorded offsets and never re-measures an owner on the
+forward thread. The executor keeps a pinned arena of
 `--retraction-snapshot-max-requests` × `blob_bytes`, indexed by the op's
 `snapshot_slot`; the store exports the victim's slot on the write stream
 (the slot is reused only behind the fence), the restore imports into the

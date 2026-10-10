@@ -73,11 +73,7 @@ from tokenspeed.runtime.execution.prefill_graph import (
 )
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
-from tokenspeed.runtime.execution.slot_state import (
-    SlotStateExporter,
-    export_slot_state_sequence,
-    import_slot_state_sequence,
-)
+from tokenspeed.runtime.execution.slot_state import SlotStateExporter
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -1809,46 +1805,28 @@ class ModelExecutor:
     def slot_state_exporters(self) -> tuple[SlotStateExporter, ...]:
         """The owners of per-slot state outside the cache groups, in blob order.
 
-        The runtime states, the target attention tree, the draft tree when it
-        is a distinct object (a draft Inkling wrapper owns its own ring; a
-        shared tree is listed once) and the drafter. Each contributes a
-        fixed-size segment; the order is the blob layout.
+        The runtime states, every node of the target attention tree, the
+        nodes of the draft tree not already listed (a draft Inkling wrapper
+        owns its own ring; a shared node is listed once) and the drafter.
+        The Host cache executor lays these out once (``SlotStateLayout``):
+        each contributes a fixed-size segment, exported on a retraction
+        store from the exporters' tensors on ``execution_stream`` (the caller
+        orders the transfer stream behind it) and imported on a restore
+        after the plan's zeroing, before the request's first forward.
         """
-        exporters: list[SlotStateExporter] = [self.runtime_states, self.attn_backend]
+        exporters: list[SlotStateExporter] = [self.runtime_states]
+        exporters.extend(self.attn_backend.slot_state_exporters())
         draft_backend = self.draft_attn_backend
-        if draft_backend is not None and draft_backend is not self.attn_backend:
-            exporters.append(draft_backend)
+        if draft_backend is not None:
+            listed = {id(exporter) for exporter in exporters}
+            exporters.extend(
+                exporter
+                for exporter in draft_backend.slot_state_exporters()
+                if id(exporter) not in listed
+            )
         if self.drafter is not None:
             exporters.append(self.drafter)
         return tuple(exporters)
-
-    def slot_state_bytes(self) -> int:
-        """Bytes of one request slot's image; the snapshot arena's row width."""
-        return sum(
-            exporter.slot_state_bytes() for exporter in self.slot_state_exporters()
-        )
-
-    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
-        """Image ``slot`` into ``out`` on ``stream`` (a retraction store).
-
-        The exporters' tensors are written on ``execution_stream``; the caller
-        orders ``stream`` behind it before this call and records the
-        completion event after it.
-        """
-        export_slot_state_sequence(self.slot_state_exporters(), slot, out, stream)
-
-    def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
-    ) -> None:
-        """Restore an image into ``slot``, now ``request_id``'s, on ``stream``.
-
-        Runs after the plan's zeroing and before the request's first forward;
-        the restored request is not schedulable until the copy's ACK, so no
-        forward reads the slot meanwhile.
-        """
-        import_slot_state_sequence(
-            self.slot_state_exporters(), slot, src, stream, request_id=request_id
-        )
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.

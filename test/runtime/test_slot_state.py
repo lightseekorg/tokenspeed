@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -57,6 +58,7 @@ from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E
 from tokenspeed.runtime.execution.slot_state import (  # noqa: E402
     SLOT_STATE_ALIGNMENT,
     SlotStateExporter,
+    SlotStateLayout,
     pack_slot_rows,
     slot_state_image_bytes,
     unpack_slot_rows,
@@ -336,6 +338,8 @@ def test_dspark_windows_round_trip_and_claim_the_slot():
 def test_inkling_ring_round_trip_through_the_wrapper():
     backend = _inkling()
     _round_trip(backend, src_slot=3, dst_slot=9)
+    # The wrapper images its own ring; its leaf is a separate (empty) node.
+    assert backend.slot_state_exporters() == (backend, backend.child_backends()[0])
 
 
 def test_dsa_kpool_tail_round_trip_once_per_arena():
@@ -353,42 +357,64 @@ def test_a_leaf_without_slot_state_images_nothing():
     leaf.import_slot_state(0, torch.zeros(0, dtype=torch.uint8), None, request_id="r")
 
 
-def test_model_executor_concatenates_its_owners_once_each():
+def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
     states = _runtime_states(draft_probs=True, trees=False, history=False)
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.runtime_states = states
+    # A composite tree is flattened: the wrapper and its leaf are separate
+    # segments, each imaging its own rows.
     executor.attn_backend = _inkling()
+    leaf = executor.attn_backend.child_backends()[0]
     executor.drafter = _mtp(states)
-    # A shared draft tree is listed once; a distinct one adds its own segment.
+    # A shared draft tree is listed once; a distinct one adds its own nodes.
     executor.draft_attn_backend = executor.attn_backend
-    shared = executor.slot_state_bytes()
-    assert shared == (
-        states.slot_state_bytes()
-        + executor.attn_backend.slot_state_bytes()
-        + executor.drafter.slot_state_bytes()
+    assert executor.slot_state_exporters() == (
+        states,
+        executor.attn_backend,
+        leaf,
+        executor.drafter,
     )
     executor.draft_attn_backend = _inkling()
-    assert (
-        executor.slot_state_bytes()
-        == shared + executor.draft_attn_backend.slot_state_bytes()
+    exporters = executor.slot_state_exporters()
+    assert exporters == (
+        states,
+        executor.attn_backend,
+        leaf,
+        executor.draft_attn_backend,
+        executor.draft_attn_backend.child_backends()[0],
+        executor.drafter,
     )
 
+    # The layout measures every owner once at construction and only slices
+    # afterwards: no owner is asked its size again on export or import.
+    layout = SlotStateLayout(exporters)
+    assert layout.nbytes == sum(owner.slot_state_bytes() for owner in exporters)
+    assert [owner for owner, _, _ in layout.segments] == list(exporters)
+    assert leaf.slot_state_bytes() == 0
     rows = lambda slot: [  # noqa: E731
-        row
-        for owner in executor.slot_state_exporters()
-        for row in owner.slot_state_rows(slot)
+        row for owner in exporters for row in owner.slot_state_rows(slot)
     ]
     torch.manual_seed(1)
     _randomize(rows(2))
     expected = [row.clone() for row in rows(2)]
-    image = torch.zeros(executor.slot_state_bytes(), dtype=torch.uint8)
-    executor.export_slot_state(2, image, None)
-    for row in rows(2):
-        row.zero_()
-    executor.import_slot_state(6, image, None, request_id="r6")
+    image = torch.zeros(layout.nbytes, dtype=torch.uint8)
+    with patch.object(
+        RuntimeStates, "slot_state_bytes", side_effect=AssertionError("re-measured")
+    ):
+        layout.export(2, image, None)
+        for row in rows(2):
+            row.zero_()
+        layout.import_(6, image, None, request_id="r6")
     assert all(torch.equal(a, b) for a, b in zip(rows(6), expected))
     with pytest.raises(ValueError, match="need"):
-        executor.export_slot_state(2, image[:-SLOT_STATE_ALIGNMENT], None)
+        layout.export(2, image[:-SLOT_STATE_ALIGNMENT], None)
+
+    class _Unpadded:
+        def slot_state_bytes(self):
+            return 3
+
+    with pytest.raises(ValueError, match="not padded"):
+        SlotStateLayout([_Unpadded()])
 
 
 # ----------------------------------------------------------------------

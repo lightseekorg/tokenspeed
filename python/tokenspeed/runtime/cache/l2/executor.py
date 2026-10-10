@@ -86,7 +86,7 @@ from tokenspeed.runtime.cache.transfer.ops import (
 )
 from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
-from tokenspeed.runtime.execution.slot_state import SlotStateExporter
+from tokenspeed.runtime.execution.slot_state import SlotStateExporter, SlotStateLayout
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
@@ -177,7 +177,7 @@ class HostCacheExecutor:
         host_size_gb: float,
         snapshot_host_gb: float,
         max_retracted_requests: int,
-        slot_state: SlotStateExporter | None,
+        slot_state_exporters: Sequence[SlotStateExporter] | None,
         io_backend: str,
         attn_tp_rank: int,
         dcp_rank: int,
@@ -199,9 +199,10 @@ class HostCacheExecutor:
                 no pool (``SnapshotOp`` / ``RestoreOp`` are then refused).
             max_retracted_requests: Slot-state arena rows; positive with a
                 pool, 0 without one.
-            slot_state: The model executor, as the aggregate of every
-                per-slot state owner; sizes and fills the arena rows. May be
-                None only without a pool.
+            slot_state_exporters: The owners of per-slot state outside the
+                cache groups, in blob order (``ModelExecutor.
+                slot_state_exporters``); laid out once here into the arena
+                row. May be None only without a pool.
             io_backend: ``"direct"`` (DMA ranges) or ``"kernel"`` (mapped-Host
                 Triton copies).
             attn_tp_rank: Attention-TP rank; rank 0 logs.
@@ -220,8 +221,8 @@ class HostCacheExecutor:
                 "a snapshot pool and its slot-state rows go together: got "
                 f"{snapshot_host_gb} GB and {max_retracted_requests} requests"
             )
-        if snapshot_host_gb > 0 and slot_state is None:
-            raise ValueError("a snapshot pool needs the slot-state exporter")
+        if snapshot_host_gb > 0 and slot_state_exporters is None:
+            raise ValueError("a snapshot pool needs the slot-state exporters")
         self.attn_tp_rank = attn_tp_rank
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         target_layout = device_pool.cache_transfer_layout()
@@ -250,11 +251,15 @@ class HostCacheExecutor:
         # --- retraction snapshot pool -----------------------------------------
         snapshot_lcm_blocks = 0
         self.blob_bytes = 0
+        # The blob layout is measured once here; every store and restore
+        # slices the arena row at its recorded offsets.
+        self._slot_state: SlotStateLayout | None = None
         if snapshot_host_gb > 0:
             snapshot_lcm_blocks = num_snapshot_lcm_blocks(
                 host_gb=snapshot_host_gb, host_lcm_block_bytes=host_lcm_block_bytes
             )
-            self.blob_bytes = int(slot_state.slot_state_bytes())
+            self._slot_state = SlotStateLayout(slot_state_exporters)
+            self.blob_bytes = self._slot_state.nbytes
         self.max_retracted_requests = int(max_retracted_requests)
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
         arena_bytes = self.max_retracted_requests * self.blob_bytes
@@ -302,7 +307,6 @@ class HostCacheExecutor:
         self.snapshot_storage: HostCacheStorage | None = None
         self.snapshot_block_owners: BlockOwnerTranslation | None = None
         self._snapshot_geometry = None
-        self._slot_state = slot_state
         self.blob_arena: torch.Tensor | None = None
         if snapshot_lcm_blocks:
             self.snapshot_storage = HostCacheStorage(
@@ -852,7 +856,7 @@ class HostCacheExecutor:
                 backend=self.transfer_backend,
             )
         for op in ops:
-            self._slot_state.export_slot_state(
+            self._slot_state.export(
                 int(op.request_pool_index),
                 self.blob_arena[int(op.snapshot_slot)],
                 self.write_stream,
@@ -916,7 +920,7 @@ class HostCacheExecutor:
                 backend=self.transfer_backend,
             )
         for op in ops:
-            self._slot_state.import_slot_state(
+            self._slot_state.import_(
                 int(op.request_pool_index),
                 self.blob_arena[int(op.snapshot_slot)],
                 self.load_stream,
