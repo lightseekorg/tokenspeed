@@ -35,15 +35,18 @@ _PAGE_SIZE = 64
 # Match the native paged scorer's transient score budget. Heads are gathered
 # once per API chunk; only score/selection work is split at wider histories.
 _LOGITS_BUDGET_BYTES = 32 << 20
+# A fused select reads only the visible prefix of each logits row, and its
+# scorer writes only that prefix, so a capacity-wide tile costs memory but no
+# work: one tile keeps a decode batch to one scorer and one select launch.
+_SELECT_LOGITS_BUDGET_BYTES = 512 << 20
 _FP32_BYTES = 4
 
 
-def _score_query_tile(queries: int, width: int) -> int:
+def _score_query_tile(
+    queries: int, width: int, budget: int = _LOGITS_BUDGET_BYTES
+) -> int:
     """Fit as many queries as possible in one bounded FP32 logits tile."""
-    return min(
-        queries,
-        max(1, _LOGITS_BUDGET_BYTES // (width * _FP32_BYTES)),
-    )
+    return min(queries, max(1, budget // (width * _FP32_BYTES)))
 
 
 def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
@@ -130,8 +133,8 @@ def run_dsv41_csa2_index_topk(
 ):
     """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch.
 
-    ``logits_written``: ``launch_logits`` writes every logits element (scores or
-    -inf), so the logits scratch needs no -inf fill.
+    ``logits_written``: ``launch_logits`` writes every logits element the
+    select reads (scores or -inf), so the logits scratch needs no -inf fill.
     """
     out = _index_topk_outputs(
         index_q,
@@ -196,7 +199,15 @@ def run_dsv41_csa2_index_topk(
             candidates = candidates.contiguous()
         queries = end - start
         width = need
-        score_query_tile = _score_query_tile(queries, width)
+        score_query_tile = _score_query_tile(
+            queries,
+            width,
+            (
+                _LOGITS_BUDGET_BYTES
+                if launch_select is None
+                else _SELECT_LOGITS_BUDGET_BYTES
+            ),
+        )
         for query_begin in range(0, queries, score_query_tile):
             query_end = min(query_begin + score_query_tile, queries)
             output_begin = start + query_begin
