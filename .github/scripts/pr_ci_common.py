@@ -51,7 +51,7 @@ def upsert_comment(
         url = command("gh", "pr", "comment", number, "--repo", repo, "--body", body)
         comment_id = int(url.rsplit("issuecomment-", 1)[-1])
     else:
-        token = command("gh", "auth", "token", "--hostname", "github.com")
+        token = command("gh", "auth", "token", "--hostname", "github.com").strip()
         request = Request(
             f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}",
             data=json.dumps({"body": body}).encode(),

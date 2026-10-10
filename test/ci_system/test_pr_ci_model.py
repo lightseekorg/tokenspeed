@@ -214,7 +214,7 @@ def test_plan_publish_updates_the_existing_plan_comment(tmp_path, monkeypatch):
             comments.append(comment)
             return f"https://github.com/{repo}/pull/123#issuecomment-{comment['id']}"
         if args == ("gh", "auth", "token", "--hostname", "github.com"):
-            return "test-token"
+            return "test-token\n"
         if args[:2] == ("gh", "api") and "/issues/comments/" in args[-1]:
             comment_id = int(args[-1].rsplit("/", 1)[-1])
             return json.dumps(next(c for c in comments if c["id"] == comment_id))
@@ -222,6 +222,7 @@ def test_plan_publish_updates_the_existing_plan_comment(tmp_path, monkeypatch):
 
     def patch(request, *, timeout):
         assert request.method == "PATCH" and timeout == 30
+        assert request.get_header("Authorization") == "Bearer test-token"
         patched.append(request.full_url)
         comment_id = int(request.full_url.rsplit("/", 1)[-1])
         next(c for c in comments if c["id"] == comment_id)["body"] = json.loads(
