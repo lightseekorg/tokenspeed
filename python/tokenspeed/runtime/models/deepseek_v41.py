@@ -76,6 +76,7 @@ from weakref import WeakValueDictionary
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.dsv41 import (
+    query_heads,
     rope_inplace,
     rope_pad_query,
 )
@@ -808,7 +809,7 @@ class DeepseekV41Attention(nn.Module):
             self._padded_attn_sink[: self.n_local_heads].copy_(param)
 
     def _kernel_attn_sink(self):
-        padded = 64 if self.n_local_heads <= 64 else 128
+        padded = query_heads(self.n_local_heads)
         if not self.attn_sink.is_cuda or padded == self.n_local_heads:
             return self.attn_sink
         if self._padded_attn_sink is None:
