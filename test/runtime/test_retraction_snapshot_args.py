@@ -25,6 +25,12 @@ import pytest
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 POOL = dict(retraction_snapshot_host_gb=1.0, retraction_snapshot_max_requests=16)
+PREFETCH = dict(
+    kvstore_prefetch_min_pages=2,
+    kvstore_prefetch_timeout_base_s=1.0,
+    kvstore_prefetch_timeout_per_page_s=0.0,
+    kvstore_prefetch_batch_pages=128,
+)
 
 
 def test_default_is_no_pool():
@@ -69,6 +75,7 @@ def test_dcp_takes_both_host_tiers_but_not_l3():
             world_size=2,
             decode_context_parallel_size=2,
             kvstore_storage_backend="mooncake",
+            **PREFETCH,
         )
 
 
@@ -79,3 +86,26 @@ def test_forced_retraction_is_a_test_knob_that_needs_a_pool():
     for interval in (3, -2):
         args = ServerArgs(model="x", **POOL, debug_force_retraction_interval=interval)
         assert args.debug_force_retraction_interval == interval
+
+
+def test_the_l3_prefetch_knobs_are_explicit_with_a_store_and_absent_without():
+    # No silent default: the threshold, the deadline and the batch all come
+    # with the store; without one they have nothing to size.
+    with pytest.raises(
+        ValueError, match="needs the L3 prefetch knobs: --kvstore-prefetch-min-pages"
+    ):
+        ServerArgs(model="x", kvstore_storage_backend="memory")
+    with pytest.raises(ValueError, match="need --kvstore-storage-backend"):
+        ServerArgs(model="x", kvstore_prefetch_min_pages=2)
+    args = ServerArgs(model="x", kvstore_storage_backend="memory", **PREFETCH)
+    assert args.kvstore_prefetch_min_pages == 2
+    for bad in (
+        dict(kvstore_prefetch_min_pages=0),
+        dict(kvstore_prefetch_timeout_base_s=0.0),
+        dict(kvstore_prefetch_timeout_per_page_s=-1.0),
+        dict(kvstore_prefetch_batch_pages=0),
+    ):
+        with pytest.raises(ValueError, match=next(iter(bad)).replace("_", "-")):
+            ServerArgs(
+                model="x", kvstore_storage_backend="memory", **{**PREFETCH, **bad}
+            )

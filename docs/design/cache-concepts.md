@@ -419,9 +419,10 @@ freshly acquired pages. The scheduler asserts both when batching a plan's ops
 and the runtime refuses an op with nothing to copy; neither side dedups or
 invents an acknowledgement, because an op that never completes a copy would
 hold its tickets forever.
-An L3 prefetch failure is an explicit unsuccessful completion: it skips H2D
-and releases the failed load through `LoadBackDone(success=False)` so the
-request can recompute. It never acknowledges or publishes a successful copy.
+A load-back cannot miss: an L3 hit is fetched into Host pages before the
+request is admitted (`PrefetchOp`, below), and a prefetch that lands short
+acknowledges the prefix it landed (`PrefetchDone(op_id, landed_pages)`) so the
+scheduler publishes exactly that much and admits against it.
 
 ### Retraction image: two Host tiers, one executor, one ownership translation
 
@@ -708,14 +709,9 @@ Its responsibilities:
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, Mamba) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
-  Host-warm first-chunk extensions call `CacheFullBlocks` at admit.
-  L3 prefetch destinations wait for `LoadBackDone.success` and
-  `CacheDeviceBlock`; publishing them earlier would cache empty KV.
-  When one prefix hash is mixed (Host-warm in one group, L3 in another),
-  admit skips `CacheFullBlocks` for that hash and `CompleteLoadBack`
-  publishes every keyed filled Device destination. Host-only L2 load-backs
-  leave `BlockTransfer.key` empty and stay on the admit-time
-  `CacheFullBlocks` path.
+  Host-warm first-chunk extensions call `CacheFullBlocks` at admit; an L3
+  prefetch's landed pages were published in the Host tier at its
+  `PrefetchDone`, so by admission they are Host-warm like any other.
   For Mamba-state groups, `CacheCompletedBlocks` publishes only explicitly
   listed materialized boundaries inside the newly hashed range; an empty list
   publishes no state snapshots (see
@@ -758,8 +754,11 @@ Its responsibilities:
   completion gather so every rank raises together. Every rank
   stays in every replica-group gather even when an earlier intersection
   is empty, so a peer that is ready on PP is not left unmatched. A later Host
-  miss that is known to exist in L3 allocates
-  a Host page, `batch_get_into`s it, then runs the ordinary H2D load.
+  miss that is known to exist in L3 is prefetched before the request is
+  admitted: the scheduler allocates its Host pages and emits one
+  `PrefetchOp`, the executor's prefetch lane `batch_get_into`s them in
+  prefix order, and the admission that follows the ACK runs the ordinary
+  H2D load from the landed prefix.
   Object keys are `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`;
   the trailing `c0` is the retired context-parallel shard id, kept literal
   (as is the `cp_size: 1` entry of the hashed namespace) so objects written
@@ -883,63 +882,60 @@ Its responsibilities:
   objects under that stable prefix rather than minting a process-local
   generation, so a restarted rank still probes the same keys. Independent
   TokenSpeed jobs that share a tenant are not in the TP/PP/DP MIN: a
-  fleet-wide wipe is an operator flush of every instance. A later
-  `batch_exists` miss is not a lease; vanished-L3 prefetch recovers if
-  another client republishes or this delete races a peer PUT.
+  fleet-wide wipe is an operator flush of every instance. A
+  `batch_exists` hit is not a lease: the prefetch that follows lands what
+  is still there.
   Cross-instance reuse probes `batch_exists` before `submit_requests`, then
   MIN-reduces existence across every cache-owning rank in the DP replica
   (attention TP, then CP, then PP; not across DP) and
-  `register_storage_keys` / `unregister_storage_keys`. Immediately before
-  `next_execution_plan`, the event loop re-probes prefix hashes of waiting
-  requests that can take a batch slot and Device pages this round so a
-  queued hit cannot survive deletion, eviction, or a lost object. Waiting
-  work that cannot be admitted (full decode batch, head-of-line incomplete
-  prefill, exhausted Device pages) is not rehashed or remotely probed. The
+  `register_storage_keys` the hits. The
   scheduler's L3 key shadow is bounded to Host page capacity. A single
   registration keeps the earliest contiguous prefix keys so prefix-closed
   matchers still hit, even when sequential write-backs already filled the
   shadow with this prompt's suffix; later unrelated keys LRU-evict older
   prompts. Unregister removes keys from both the live set and the LRU
-  order deque so vanished-object recovery cannot accumulate tombstones
-  while the live set stays below capacity. Admit-time registration
-  restores keys that were dropped from the shadow.
-  That probe is not a lease: after Admit
-  allocates Host pages, `batch_get_into` can still miss. A positive but
-  short Mooncake byte count is a miss, not a success: the unread suffix
-  would keep stale Host bytes. Prefetch runs
-  on the control plane (CPU, same as `batch_exists`), is MIN-reduced
-  across the replica, and a miss unregisters the keys, skips H2D /
-  skips publishing empty Host pages (`LoadBackDone.success=false`),
-  skips Device prefix publication for those prefetch destinations,
-  skips the model forward, and retracts the batch snapshot-less so the
-  next admit recomputes those tokens. D-role admit rides
-  `plan.remote_prefill` with no local forward: those request ids retract
-  on the same path, and the loop withholds that stream from execute so
-  the peer does not land suffix-only KV on empty prefix pages. A backend exception or malformed
-  result is converted to a local miss before that MIN-reduce so a
-  faulted rank cannot skip the collective and hang healthy peers. Only
-  pages whose replica-converged `batch_get_into` missed stay
-  unread: a later `batch_exists` hit must not re-register them and retry
-  the same prefetch. Successfully restored pages in a mixed prefetch
-  stay readable. Replica admission MIN-reduces local readability
-  (exists and not unread) so one rank cannot re-register a key while a
-  peer still blacklists it. A later Host backup forgets an unread entry
-  only when the object was absent and this put created it; a create-only
-  skip of an unreadable object keeps the blacklist. That pre-PUT existence
-  probe covers only a snapshot of unread keys in the backup batch; ordinary
-  backups use the backend's create-only PUT without a duplicate existence
-  RPC. Keys marked unread after the snapshot remain unread conservatively.
-  The unread set is
-  also bounded to Host CacheBlock capacity (LCM parents times each
-  group's `cache_blocks_per_lcm_block`). Clients are not failed; mixed
-  prefill/decode partners in the same forward retract together so ranks
-  stay aligned. Existence and prefetch are skipped when L3 is unset:
-  Host-only and
+  order deque so a vanished object cannot accumulate tombstones while the
+  live set stays below capacity. Admit-time registration restores keys
+  that were dropped from the shadow.
+  **The prefetch is pre-admission and asynchronous** (the reference
+  engine's model). When a `Submitted` request's probe finds registered L3
+  keys past its Device/Host hit and at least `--kvstore-prefetch-min-pages`
+  of them, the scheduler allocates Host blocks for those pages, emits one
+  `Cache.PrefetchOp` and holds the request in `Prefetching`: it owns the
+  Host blocks and nothing else -- no Device page, no request-pool row --
+  and admission skips past it, so a later `Submitted` request may be
+  admitted first. Fewer Host blocks than the hit truncate the prefetch;
+  below the minimum there is none and the request simply computes those
+  pages: admission never waits on Host availability. The executor's
+  prefetch lane (a CPU thread, not the control plane) `batch_get_into`s
+  the op's pages in prefix order, `--kvstore-prefetch-batch-pages` per
+  get, and stops at the first missing page -- a positive but short byte
+  count is a miss, not a success -- or at the deadline
+  `--kvstore-prefetch-timeout-base-s + --kvstore-prefetch-timeout-per-page-s
+  x pages`; its result is the pages landed, a prefix length. Each round
+  `L3CacheHooks` MIN-reduces every in-flight op's done flag and landed
+  count across the replica (attention TP, then CP, then PP; the op-id set
+  is mirrored, so every rank enters the same collectives), and a converged
+  op is acknowledged once as `PrefetchDoneEvent(op_id, landed_pages)`. The
+  scheduler then publishes the landed prefix in the Host tier (pinned by the
+  request until its admission takes them, then ordinary L2 lifetime), frees
+  the tail, forgets the unlanded keys (no blacklist: a later `batch_exists`
+  hit may register them again) and returns the request to `Submitted` in its
+  original queue position; its admission is an ordinary Host hit with
+  L2-only load rows, overlapping its first chunk layer by layer. Nothing is
+  skipped or retracted: only the L3-to-Host leg can miss, and it never
+  overlapped a forward. The cost is one plan of latency per L3 hit (the
+  Host-to-Device leg no longer overlaps the first chunk's start) while the
+  request holds no Device page. The D role never prefetches: its admission
+  probes Device only. A backend exception or malformed existence result is
+  a local miss, a lane fault a landing of nothing, so a faulted rank cannot
+  skip the collective and hang healthy peers. Clients are not failed.
+  Existence and prefetch are skipped when L3 is unset: Host-only and
   `--disable-kvstore` admission must not hash prefixes or copy
   `group_keys` for a storage index that does not exist. CI covers this path
-  with the in-process `memory` backend (scheduler tests register keys /
-  evict Host then assert `prefetch_from_storage`, and the CUDA runtime suite
-  round-trips packed Host bytes through `batch_put_from` / Host wipe /
+  with the in-process `memory` backend (scheduler tests register keys and
+  assert the `PrefetchOp` and the `Prefetching` hold, and the CUDA runtime
+  suite round-trips packed Host bytes through `batch_put_from` / Host wipe /
   `batch_get_into`) plus a live `mooncake_master` job that drives
   `MooncakeKvStore` over TCP / `P2PHANDSHAKE`, matching SGLang HiCache /
   vLLM `MooncakeStoreConnector` on packed CacheBlocks rather than split

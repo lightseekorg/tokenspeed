@@ -80,6 +80,21 @@ class _FakeRestoreBatch(_FakeSnapshotBatch):
         self.source_tiers = [[1]] * len(op_ids)
 
 
+class _FakePrefetchBatch:
+    """The wire face of ``Cache.PrefetchOp``: one row per waiting request."""
+
+    def __init__(self, op_ids) -> None:
+        self.op_ids = list(op_ids)
+        self.request_ids = [f"r{op_id}" for op_id in op_ids]
+        self.first_pages = [0] * len(op_ids)
+        self.num_pages = [1] * len(op_ids)
+        self.group_ids = [[0]] * len(op_ids)
+        self.host_pages = [[1]] * len(op_ids)
+        self.content_hashes = [["h"]] * len(op_ids)
+        self.page_offsets = [[0]] * len(op_ids)
+        self.page_indices = [[0]] * len(op_ids)
+
+
 class _Device:
     """The DeviceHandle surface the hooks use. Submission rides
     ``DeviceHandle.execute`` with the rest of the round's plan-derived device
@@ -186,6 +201,7 @@ def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
             LoadBackOp=(),
             SnapshotOp=_FakeSnapshotBatch,
             RestoreOp=_FakeRestoreBatch,
+            PrefetchOp=_FakePrefetchBatch,
         ),
     )
 
@@ -232,21 +248,24 @@ def test_snapshot_and_restore_batches_count_one_ticket_per_request(
             _FakeWriteBackOp(op_ids=[1]),
             _FakeSnapshotBatch(op_ids=[2, 3]),
             _FakeRestoreBatch(op_ids=[4]),
+            _FakePrefetchBatch(op_ids=[5, 6]),
         ]
     )
 
     hooks.count_plan_ops(plan)
 
-    assert hooks._num_inflight == 4
+    assert hooks._num_inflight == 6
     for event in (
         _cache_event("SnapshotDoneEvent", 2),
         _cache_event("RestoreDoneEvent", 4),
+        Cache.PrefetchDoneEvent(5, 3),
     ):
         device.results = [event]
         (ready,) = hooks.poll_ready_events()
         assert type(ready).__name__ == type(event).__name__
         assert ready.op_id == event.op_id
-    assert hooks._num_inflight == 2
+    assert ready.landed_pages == 3
+    assert hooks._num_inflight == 3
 
 
 def test_poll_returns_completed_events_and_settles_inflight(fake_cache_ops) -> None:

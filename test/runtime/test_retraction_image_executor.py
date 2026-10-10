@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from contextlib import nullcontext
 from dataclasses import fields
 from types import SimpleNamespace
@@ -65,6 +66,8 @@ from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
 from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     CacheTransfer,
     HostTier,
+    PrefetchOp,
+    PrefetchRow,
     RestoreOp,
     SnapshotOp,
 )
@@ -180,6 +183,9 @@ class _WriteBackOp:
         self.src_pages = src_pages
         self.dst_pages = dst_pages
         self.source_pinned = source_pinned
+        # Unkeyed rows unless a test sets the keys: nothing for L3 to back up.
+        self.content_hashes = [[""] * len(groups) for groups in group_ids]
+        self.page_offsets = [[0] * len(groups) for groups in group_ids]
 
 
 class _LoadBackOp:
@@ -582,7 +588,6 @@ def test_slot_state_only_image_round_trips_through_empty_ops():
         executor.submit_load_backs(
             [_restore_op(2, 0, [], pool_index=5)],
             prerequisite_stream="default-stream",
-            l3_prefetch_ok={},
         )
     lanes["restore_l2"].start_h2d.assert_not_called()
     lanes["restore_pool"].start_h2d.assert_not_called()
@@ -622,7 +627,6 @@ def test_restore_reads_both_tiers_imports_the_slot_and_acks_once():
         executor.submit_load_backs(
             [op],
             prerequisite_stream="default-stream",
-            l3_prefetch_ok={},
         )
 
     assert [c[0] for c in order.mock_calls] == ["wait", "l2", "pool", "record"]
@@ -668,7 +672,6 @@ def test_restore_rows_need_their_tier_and_run_outside_capture():
             executor.submit_load_backs(
                 [l2_row],
                 prerequisite_stream="s",
-                l3_prefetch_ok={},
             )
     pool_row = _restore_op(2, 0, [(HostTier.SNAPSHOT_POOL, _transfer(0, 1, 2))])
     with patch.object(executor_module, "get_is_capture_mode", return_value=True):
@@ -676,7 +679,6 @@ def test_restore_rows_need_their_tier_and_run_outside_capture():
             executor.submit_load_backs(
                 [pool_row],
                 prerequisite_stream="s",
-                l3_prefetch_ok={},
             )
     # Without a pool, snapshot ops are refused outright.
     executor, _, _ = _build(layout=layout, shard_counts=[1], snapshot_host_gb=0)
@@ -734,7 +736,6 @@ def test_plan_level_checks_refuse_duplicates_bad_slots_and_ragged_tiers():
             executor.submit_load_backs(
                 [_LoadBackOp([21], [[0]], [[5]], [[1]]), ragged],
                 prerequisite_stream="s",
-                l3_prefetch_ok={},
             )
         with pytest.raises(ValueError, match="duplicate snapshot slot"):
             executor.submit_load_backs(
@@ -744,7 +745,6 @@ def test_plan_level_checks_refuse_duplicates_bad_slots_and_ragged_tiers():
                     _restore_op(7, 1, []),
                 ],
                 prerequisite_stream="s",
-                l3_prefetch_ok={},
             )
     # Nothing was launched, exported, imported or queued for an ACK.
     executor.write_stream.wait_stream.assert_not_called()
@@ -812,9 +812,9 @@ def test_kvp_ranks_store_their_owned_subsets_on_both_legs():
 
 
 def test_kvp_rank_backs_up_and_prefetches_only_the_host_pages_it_owns():
-    """L3 sees the rows this rank copied, by local Host id: the L2 write's
-    backup list and the load's prefetch keys both pass the owner filter, so
-    a peer's page is neither put nor fetched from here."""
+    """L3 sees the rows this rank owns, by local Host id: the L2 write's
+    backup list and a prefetch op's pages both pass the owner filter, so a
+    peer's page is neither put nor fetched from here."""
     layout = _layout(2, [("full", 2)])
     # Device 1 -> Host 3 is rank 0's (local Host 2); Device 2 -> Host 6 is
     # rank 1's (local Host 3).
@@ -837,16 +837,35 @@ def test_kvp_rank_backs_up_and_prefetches_only_the_host_pages_it_owns():
         ((pending_finish, ack),) = executor._completions.pending()
         assert pending_finish is finish
         assert (ack.op_ids, ack.backup_pages) == ([11], [owned_page])
-        load = _LoadBackOp([12], [[0, 0]], [[3, 6]], [[1, 2]])
-        load.content_hashes = [["h3", "h6"]]
-        load.page_offsets = [[0, 1]]
-        load.prefetch_from_storage = [[1, 1]]
-        with patch.object(
-            executor_module.Cache, "LoadBackOp", _LoadBackOp, create=True
-        ):
-            assert executor._plan_prefetch_pages(SimpleNamespace(cache=[load])) == [
-                owned_page
+        # The prefetch of the same two pages fetches only this rank's one; the
+        # peer's page counts as landed here so the replica MIN is the owners'.
+        executor.l3_store = Mock()
+        executor.l3_store.prefetch.return_value = [True]
+        executor._l3_prefetch_timeout_base_s = 10.0
+        executor._l3_prefetch_timeout_per_page_s = 0.0
+        executor._l3_prefetch_batch_pages = 4
+        executor.submit_prefetches(
+            [
+                PrefetchOp(
+                    op_id=12,
+                    request_id="r12",
+                    first_page=0,
+                    num_pages=2,
+                    rows=(
+                        PrefetchRow(0, 3, "h3", 0, 0),
+                        PrefetchRow(0, 6, "h6", 1, 1),
+                    ),
+                )
             ]
+        )
+        for _ in range(200):
+            progress = executor.l3_prefetch_progress()
+            if progress[12][0]:
+                break
+            time.sleep(0.01)
+        assert progress[12] == (True, 2)
+        executor.l3_store.prefetch.assert_called_once_with([owned_page])
+        executor._l3_prefetch_lane.shutdown(wait=True)
 
 
 @pytest.mark.parametrize("backend", ["dma", "auto"])
@@ -1073,7 +1092,6 @@ def _round_trip_two_ranks(io_backend, executors):
         executor.submit_load_backs(
             [restore, empty_restore],
             prerequisite_stream=stream,
-            l3_prefetch_ok={},
         )
     torch.cuda.synchronize()
     assert [_acks(executor.poll_results()) for executor in executors.values()] == [

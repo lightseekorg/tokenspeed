@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The retraction image's wire operations and ACKs, runtime side.
+"""The Host cache's per-request wire operations, runtime side.
 
 A retraction image is split by publishability. Its bulk -- every block under
 a hash-complete prefix page -- goes to Host L2 as today's stream-ordered
@@ -29,13 +29,18 @@ slot-state blob -- goes to the small request-private snapshot pool through a
 source tier, so both Host buffers land in the request's fresh Device pages
 under one completion event and the scheduler sees one ``RestoreDone``.
 
-The C++ scheduler emits ``SnapshotStoreOperation`` /
-``SnapshotRestoreOperation`` batched per plan (bound as ``Cache.SnapshotOp`` /
-``Cache.RestoreOp``, lists-of-lists like the L2 batches);
-``engine/scheduler_utils.cache_ops_from_plan`` maps every row of a batch onto
-one of these per-request dataclasses, which is the Host cache executor's unit
-of work: one slot exported or imported, one ACK. The ACKs are the binding's
-``Cache.SnapshotDoneEvent`` / ``Cache.RestoreDoneEvent``; they join
+An L3 prefetch (``PrefetchOp``) fills a waiting request's freshly allocated
+Host pages from the L3 store before its admission, in prefix order, so the
+admission that follows sees a plain Host hit; its ACK carries the pages that
+landed (a prefix length, MIN-reduced across the replica).
+
+The C++ scheduler emits these batched per plan (bound as ``Cache.SnapshotOp``
+/ ``Cache.RestoreOp`` / ``Cache.PrefetchOp``, lists-of-lists like the L2
+batches); ``engine/scheduler_utils.cache_ops_from_plan`` maps every row of a
+batch onto one of these per-request dataclasses, which is the Host cache
+executor's unit of work: one slot exported or imported, one prefetch job, one
+ACK. The ACKs are the binding's ``Cache.SnapshotDoneEvent`` /
+``Cache.RestoreDoneEvent`` / ``Cache.PrefetchDoneEvent``; they join
 ``WriteBackDoneEvent`` / ``LoadBackDoneEvent`` on the cache-result poll and are
 replica-intersected by the same hooks.
 """
@@ -120,3 +125,48 @@ class RestoreOp:
     snapshot_slot: int
     transfers: tuple[CacheTransfer, ...]
     source_tier: tuple[HostTier, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PrefetchRow:
+    """One Host page of a prefetch op: a prefix page's block of one group.
+
+    Attributes:
+        group_id: Cache group index, in the scheduler's group order.
+        host_page: Scheduler (virtual) block id of the Host L2 block the
+            scheduler allocated for the page.
+        content_hash: The prefix page's key; the L3 object name derives from
+            it.
+        page_offset: The key's page offset within the prefix.
+        page_index: The prefix page the row belongs to; rows come in
+            non-decreasing page order.
+    """
+
+    group_id: int
+    host_page: int
+    content_hash: str
+    page_offset: int
+    page_index: int
+
+
+@dataclass(frozen=True, slots=True)
+class PrefetchOp:
+    """Fill a waiting request's Host pages from L3 before its admission.
+
+    Attributes:
+        op_id: The scheduler's ticket; the ACK carries it back with the
+            pages landed.
+        request_id: The request waiting in ``Prefetching``.
+        first_page: The prefix page the fill starts at (the Host hit's end).
+        num_pages: The prefix pages the rows cover; ``landed_pages`` of the
+            ACK is the largest ``n <= num_pages`` whose rows all landed.
+        rows: The pages to fetch in prefix-page order (every group's rows of
+            a page before the next page's); a page may have no rows at all
+            (a sliding group's older pages), which lands trivially.
+    """
+
+    op_id: int
+    request_id: str
+    first_page: int
+    num_pages: int
+    rows: tuple[PrefetchRow, ...]

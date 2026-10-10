@@ -874,22 +874,12 @@ split flush would leave mirrored
 schedulers with different prefix indexes. The weight-update RPC then
 fails so the caller retries instead of serving new weights against the
 previous checkpoint or entering NCCL weight broadcasts alone. A
-`batch_exists` hit is not a lease: if
-`batch_get_into` misses after Admit, the runtime unregisters the key,
-skips publishing empty Host pages, and retracts the batch for recompute
-(`RecomputeRetract`: the pages were never filled, so there is nothing to
-image) so the next admit recomputes those tokens. A short Mooncake read (fewer
-bytes than the requested page) is a miss, not a success. Failed `batch_get_into` pages
-stay unread so a later `batch_exists` hit cannot re-register them and
-retry the same prefetch; only replica-converged misses are blacklisted.
-Replica admission MIN-reduces local readability (exists and not unread).
-A later Host backup forgets an unread entry only when it created a
-missing object; a create-only skip of an unreadable object keeps the
-blacklist. The unread set is bounded to Host CacheBlock capacity (LCM
-parents times each group's `cache_blocks_per_lcm_block`).
-A backend exception or malformed result is a
-local miss so every replica rank still enters the MIN-reduce. Clients
-are not failed.
+`batch_exists` hit is not a lease: the L3 pages are fetched into Host
+before the request is admitted (below), and whatever is no longer there
+simply lands short. A short Mooncake read (fewer bytes than the requested
+page) is a miss, not a success. A backend exception or malformed result is a
+local miss so every replica rank still enters the MIN-reduce. Clients are
+not failed.
 L2 write-back ACKs use the same replica groups: `WriteBackDone` is
 emitted only after every cache-owning rank holds the completion, so a
 worker cannot publish Host while a replica peer's Mooncake put is still in
@@ -929,10 +919,36 @@ in `--kvstore-storage-backend-extra-config`, for example:
 
 Constructing `MooncakeKvStore` requires `extra_config`; pass `None` to
 use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other env defaults.
-Queued requests that can take a batch slot and Device pages this round
-re-probe L3 immediately before admission so a hit that waited for capacity
-cannot keep a deleted or evicted object as a Host hit. A full decode batch
-or exhausted Device pool does not rehash the rest of the wait queue.
+
+**Prefetch before admission.** An L3 hit is never loaded under a running
+forward. When a waiting request's registered L3 keys past its Device/Host
+hit span at least `--kvstore-prefetch-min-pages` prefix pages, the
+scheduler allocates Host blocks for them, emits a prefetch op and holds the
+request in a pre-admission state that owns those Host blocks and nothing
+else -- no Device page, no batch slot -- while later requests may be
+admitted past it. The Host cache executor's prefetch lane (a CPU thread)
+fills the pages in prefix order, `--kvstore-prefetch-batch-pages` per
+`batch_get_into`, and stops at the first missing page or at the deadline
+`--kvstore-prefetch-timeout-base-s + --kvstore-prefetch-timeout-per-page-s
+x pages`; the replica agrees (a MIN across TP, CP and PP) on the pages
+landed, the scheduler publishes exactly that prefix in Host L2 and forgets
+the rest of the keys, and the request's admission is then an ordinary Host
+hit whose Host-to-Device load overlaps its first chunk layer by layer.
+Fewer free Host blocks than the hit truncate the prefetch; below the minimum
+there is none and the pages are computed -- admission never waits on Host
+room. The cost: an L3 hit waits for its prefetch before it is admitted (one
+plan of latency at least), holding no Device pages meanwhile; the gain: no
+forward is ever skipped or recomputed because of L3. The decode role of a PD
+deployment never prefetches (its admission probes Device only). The four
+knobs are required with `--kvstore-storage-backend` and refused without it:
+
+| Argument | Description |
+| --- | --- |
+| `--kvstore-prefetch-min-pages` | The shortest L3-only prefix, in prefix pages, worth a prefetch; a shorter hit is computed. The reference engine's `prefetch_threshold`. |
+| `--kvstore-prefetch-timeout-base-s` | The prefetch deadline's base term in seconds (positive). |
+| `--kvstore-prefetch-timeout-per-page-s` | The deadline's per-page term in seconds (0 for a fixed deadline). |
+| `--kvstore-prefetch-batch-pages` | Prefix pages per `batch_get_into` of a prefetch; the fetch stops at the first batch with a missing page (the reference engine uses 128). |
+
 `--kvstore-storage-backend memory` is an in-process dict for tests only.
 CI exercises that Mooncake-compatible contract end-to-end (scheduler
 prefetch after `register_storage_keys` / Host eviction, and a CUDA

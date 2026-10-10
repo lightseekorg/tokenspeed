@@ -30,8 +30,6 @@ import hashlib
 import json
 import os
 import re
-import threading
-from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -1037,125 +1035,6 @@ def copy_host_bytes(host_buffer: Any, offset: int, size: int) -> bytes:
     if callable(numpy):
         return bytes(numpy())
     return bytes(view)
-
-
-def l3_unread_key_capacity(
-    *, num_host_pages: int, cache_blocks_per_lcm_block: Sequence[int]
-) -> int:
-    """Return the unread-set bound in per-group CacheBlocks, not LCM parents.
-
-    Each Host LCM parent packs ``cache_blocks_per_lcm_block`` CacheBlocks
-    per group. Unread keys are those CacheBlocks, so a single multi-group
-    prefetch can insert more entries than ``num_host_pages``. Matching the
-    scheduler L3 shadow, capacity is ``num_host_pages`` times the sum of
-    each group's packing.
-    """
-
-    packed = 0
-    for count in cache_blocks_per_lcm_block:
-        if int(count) <= 0:
-            raise ValueError("cache_blocks_per_lcm_block must be positive")
-        packed += int(count)
-    if packed <= 0:
-        return max(int(num_host_pages), 1)
-    return max(int(num_host_pages) * packed, 1)
-
-
-def l3_pages_newly_published(
-    pages: Sequence[tuple], existed: Sequence[bool]
-) -> list[tuple]:
-    """Return pages that were absent before backup and may leave the unread set.
-
-    Mooncake puts are create-only. An object that ``batch_exists`` already
-    reports cannot be overwritten, so a failed ``batch_get_into`` of that
-    object must stay unread. Length mismatch returns no pages so a
-    truncated existence probe cannot clear the blacklist.
-    """
-
-    if len(existed) != len(pages):
-        return []
-    return [page for page, present in zip(pages, existed) if not present]
-
-
-class L3UnreadKeySet:
-    """Failed L3 gets that must not be re-admitted from ``batch_exists``.
-
-    A vanished or unreadable object can stay visible to ``batch_exists``.
-    Those keys stay unread until a Host backup creates a replacement
-    object (not a create-only skip of the existing one), a namespace
-    delete succeeds, or the set exceeds Host CacheBlock
-    capacity (oldest first) so a long-lived process cannot accumulate
-    every historical failure. Replica admission MIN-reduces local
-    readability so one rank cannot forget earlier than its peers.
-    """
-
-    def __init__(self, *, capacity: int) -> None:
-        if int(capacity) <= 0:
-            raise ValueError("L3 unread capacity must be positive")
-        self._capacity = int(capacity)
-        self._keys: OrderedDict[tuple[int, str, int], None] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def mark(
-        self,
-        groups: Sequence[int],
-        hashes: Sequence[str],
-        offsets: Sequence[int],
-    ) -> None:
-        with self._lock:
-            for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
-                key = (int(group_id), str(content_hash), int(page_offset))
-                self._keys.pop(key, None)
-                self._keys[key] = None
-            while len(self._keys) > self._capacity:
-                self._keys.popitem(last=False)
-
-    def contains(self, group_id: int, content_hash: str, page_offset: int) -> bool:
-        with self._lock:
-            return (
-                int(group_id),
-                str(content_hash),
-                int(page_offset),
-            ) in self._keys
-
-    def forget(
-        self,
-        groups: Sequence[int],
-        hashes: Sequence[str],
-        offsets: Sequence[int],
-    ) -> None:
-        with self._lock:
-            for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
-                self._keys.pop(
-                    (int(group_id), str(content_hash), int(page_offset)),
-                    None,
-                )
-
-    def unread_pages(self, pages: Sequence[tuple]) -> list[tuple]:
-        """Snapshot only backed-up pages whose failed GET needs revalidation."""
-
-        with self._lock:
-            if not self._keys:
-                return []
-            return [
-                page
-                for page in pages
-                if (int(page[0]), str(page[2]), int(page[3])) in self._keys
-            ]
-
-    def forget_pages(self, pages: Sequence[tuple]) -> None:
-        groups = []
-        hashes = []
-        offsets = []
-        for group_id, _host_block, content_hash, page_offset in pages:
-            groups.append(int(group_id))
-            hashes.append(str(content_hash))
-            offsets.append(int(page_offset))
-        self.forget(groups=groups, hashes=hashes, offsets=offsets)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._keys.clear()
 
 
 def write_host_bytes(host_buffer: Any, offset: int, payload: bytes) -> None:

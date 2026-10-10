@@ -331,8 +331,6 @@ class DeviceHandle:
         self,
         execution_plan,
         planned: "PlannedForward | None",
-        *,
-        submit_remote_prefill: bool,
     ) -> PendingExecution | None:
         """Execute one scheduler plan; never blocks on the per-round path.
 
@@ -347,13 +345,14 @@ class DeviceHandle:
         enqueued; a pinned write-back -- an ordinary publication, whose
         sources the scheduler holds until the ACK -- rides the write stream
         and fences nothing), then page zeroing (the new owner's
-        sanitization), then the Device-bound copies (``LoadBackOp`` and
+        sanitization), then the L3 prefetches (``PrefetchOp``: a waiting
+        request's Host pages filled from L3 on a CPU lane -- no stream, no
+        Device page, acknowledged after the replica converges on the landed
+        prefix), then the Device-bound copies (``LoadBackOp`` and
         ``RestoreOp``, ordered behind the zeroing: a load-back lands on
         zeroed pages, a restore overwrites its destinations whole), the
         transfer peer's remote streams, and finally the ``ForwardBatch``. The
-        loop hands the round over and does not branch on it, except
-        withholding ``plan.remote_prefill`` after vanished-L3 recovery -- the
-        same recompute retract that skips the model forward.
+        loop hands the round over and does not branch on it.
 
         A store's ``request_pool_index`` names the victim's slot, which the
         scheduler frees in the same plan build: the slot's next owner first
@@ -375,11 +374,6 @@ class DeviceHandle:
                 collective. Either way the plan's page zeroing and cache
                 transfers — retraction writebacks, load-back destinations —
                 still run; they do not depend on a forward.
-            submit_remote_prefill: Whether to submit ``plan.remote_prefill``.
-                False after vanished-L3 recovery: those requests retract for
-                recompute, and pulling suffix-only KV onto empty prefix
-                pages would land invalid cache on the decode node. Cache
-                ops still run so LoadBackDone can unpin without publishing.
 
         Returns:
             The submitted forward's ``PendingExecution``, or None on rounds
@@ -418,17 +412,16 @@ class DeviceHandle:
             else None
         )
         if l2 is not None:
+            # The L3 prefetches: CPU work on the executor's own lane, started
+            # here on the control plane -- they touch no stream and no Device
+            # page, so they neither wait on the zeroing nor hold up the FIFO.
+            l2.submit_prefetches(cache_ops)
             # Behind the zeroing: the loads' destinations were zeroed on the
             # default stream, so that is the prerequisite they order after.
-            # Capture on the control plane, before the next round can prefetch
-            # or invalidate its own L3 pages while this submission is queued.
-            l3_prefetch_ok = l2.take_l3_prefetch_results()
             self._l2_submissions.append(
                 self._thread.submit(
                     lambda: l2.submit_load_backs(
-                        cache_ops,
-                        prerequisite_stream=executor.default_stream,
-                        l3_prefetch_ok=l3_prefetch_ok,
+                        cache_ops, prerequisite_stream=executor.default_stream
                     )
                 )
             )
@@ -449,7 +442,7 @@ class DeviceHandle:
                 self._thread.submit(lambda: peer.execute(remote_decode))
             )
         remote_prefill = execution_plan.remote_prefill
-        if remote_prefill is not None and submit_remote_prefill:
+        if remote_prefill is not None:
             # D role: the prompt prefills on the peer; pull its KV into the
             # pages this plan admitted (and may be zeroing).
             self._transfer_submissions.append(
@@ -523,8 +516,9 @@ class DeviceHandle:
     def poll_cache_results(self) -> list:
         """Collect completed Host cache ops (both tiers); never blocks.
 
-        Yields the scheduler's four ACK kinds -- ``WriteBackDoneEvent``,
-        ``LoadBackDoneEvent``, ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
+        Yields the scheduler's ACK kinds -- ``WriteBackDoneEvent``,
+        ``LoadBackDoneEvent``, ``PrefetchDoneEvent`` (once the hooks
+        converged the op), ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
         for ``CacheOpHooks`` to replica-intersect and the loop to advance.
 
         Stays on the control plane deliberately: completion is CUDA event
@@ -580,92 +574,36 @@ class DeviceHandle:
             return None
         return l2.l3_exists(pages)
 
-    def plan_has_l3_prefetch(self, execution_plan) -> bool:
-        """True when this plan's load-backs need ``batch_get_into``."""
+    def l3_prefetch_progress(self) -> dict[int, tuple[bool, int]]:
+        """This rank's in-flight L3 prefetches: op id to ``(done, landed_pages)``.
 
-        l2 = self._l2
-        if l2 is None:
-            return False
-        return l2.plan_has_l3_prefetch(execution_plan)
-
-    def prefetch_l3_load_backs(self, execution_plan) -> list[bool]:
-        """Fill Host pages from L3 on the control plane. CPU-only.
-
-        Returns per-page ``batch_get_into`` success, aligned with
-        ``l3_prefetch_storage_keys``. Existence is not a lease; the event
-        loop MIN-reduces this vector across the replica before H2D.
+        Read on the control plane each round by ``L3CacheHooks``, which
+        MIN-reduces the vector across the replica; the op-id set is mirrored.
         """
 
         l2 = self._l2
         if l2 is None:
-            return []
-        return l2.prefetch_l3_load_backs(execution_plan)
+            return {}
+        return l2.l3_prefetch_progress()
 
-    def invalidate_l3_prefetch(self) -> None:
-        """Skip H2D for this plan's L3 sources after a replica-wide miss."""
+    def complete_l3_prefetch(self, op_id: int, landed_pages: int) -> None:
+        """Record a prefetch op's replica-converged landed prefix.
 
-        if self._l2 is not None:
-            self._l2.invalidate_l3_prefetch()
-
-    def l3_prefetch_storage_keys(
-        self, execution_plan
-    ) -> tuple[list[int], list[str], list[int]]:
-        """Content hashes this plan would restore from L3, for unregister."""
-
-        l2 = self._l2
-        if l2 is None:
-            return [], [], []
-        return l2.l3_prefetch_storage_keys(execution_plan)
-
-    def mark_l3_keys_unread(
-        self, groups: list[int], hashes: list[str], offsets: list[int]
-    ) -> None:
-        """Remember keys whose ``batch_get_into`` failed after Admit.
-
-        ``batch_exists`` can still report these present. The next admit
-        MIN-reduces local readability (exists and not unread) so every
-        replica rank admits the same prefix. A later Host backup forgets
-        the entry only when the object was absent and this put created it;
-        a create-only skip of an unreadable object keeps the blacklist.
+        The next ``poll_cache_results`` yields its one ``PrefetchDoneEvent``.
         """
 
         l2 = self._l2
         if l2 is None:
-            return
-        l2.mark_l3_keys_unread(groups=groups, hashes=hashes, offsets=offsets)
-
-    def l3_key_is_unread(
-        self, group_id: int, content_hash: str, page_offset: int
-    ) -> bool:
-        """True when this key already failed ``batch_get_into``."""
-
-        l2 = self._l2
-        if l2 is None:
-            return False
-        return l2.l3_key_is_unread(
-            group_id=int(group_id),
-            content_hash=str(content_hash),
-            page_offset=int(page_offset),
-        )
-
-    def forget_l3_unread_keys(
-        self, groups: list[int], hashes: list[str], offsets: list[int]
-    ) -> None:
-        """Allow a key to hit L3 again after this put created a missing object."""
-
-        l2 = self._l2
-        if l2 is None:
-            return
-        l2.forget_l3_unread_keys(groups=groups, hashes=hashes, offsets=offsets)
+            raise RuntimeError("L3 prefetch completed without a Host cache executor")
+        l2.complete_l3_prefetch(op_id, landed_pages)
 
     def delete_l3_namespace(self) -> bool:
         """Delete L3 objects under the current prefix. Device/Host stay intact.
 
         Returns True when L2/L3 is unset or the store reports the prefix
         is gone. Call this before ``ClearCache``; a False must leave
-        every rank's Device/Host indexes untouched. A successful delete
-        also forgets unread prefetch keys so a new namespace can restore
-        the same content hashes.
+        every rank's Device/Host indexes untouched. In-flight prefetches
+        are drained first: the lane may still be writing their Host pages.
         """
 
         if self._l2 is None:
@@ -1555,6 +1493,9 @@ def build_device_side(
             key_prefix=prefix_for_weight_version(server_args.weight_version),
             rank=attn_tp_rank,
             prefix_for_weight_version=prefix_for_weight_version,
+            prefetch_timeout_base_s=server_args.kvstore_prefetch_timeout_base_s,
+            prefetch_timeout_per_page_s=server_args.kvstore_prefetch_timeout_per_page_s,
+            prefetch_batch_pages=server_args.kvstore_prefetch_batch_pages,
         )
 
     kv_transfer = _build_kv_transfer(

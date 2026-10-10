@@ -463,9 +463,9 @@ least once (several times for the longest), and assert `output_ids` and
 prompt-logprob request, an MTP configuration with
 `--enable-speculative-sampling` at temperature 1 (so the stash and the `q`
 path are exercised), a `Prefilling` victim through a negative interval, and
-on PD the decode node forced. The recompute retract of an L3 miss after
-admission (`RecomputeRetract`) is outside this oracle: it re-prefills, and
-the re-prefill is itself bitwise under batch invariance.
+on PD the decode node forced. An L3 prefetch that lands short is outside
+this oracle and needs none: it happens before the request is admitted, and
+the pages it did not land are computed by the ordinary prefill.
 
 ## Expert placement and online rebalancing
 

@@ -85,6 +85,7 @@ def _scheduler(*, l2: bool, force_interval: int) -> ts.Scheduler:
         role="fused",
         num_snapshot_pages=POOL_LCM_BLOCKS + 1,
         max_retracted_requests=2,
+        l3_prefetch_min_pages=0,
         debug_force_retraction_interval=force_interval,
         cache_groups=groups,
     )
@@ -361,6 +362,7 @@ def test_a_capacity_blocked_round_with_no_fitting_image_aborts_the_newest_reside
             role="fused",
             num_snapshot_pages=1,
             max_retracted_requests=0,
+            l3_prefetch_min_pages=0,
             cache_groups=groups,
         )
     )

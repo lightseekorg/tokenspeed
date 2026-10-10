@@ -19,9 +19,8 @@
 # SOFTWARE.
 
 """The scheduler wire adapter in ``engine/scheduler_utils``: the plan's cache
-ops onto the runtime's per-request ops, the four cache ACK kinds across the
-rank-sync payload, the recompute-retract event and the retraction fields of
-``make_config``."""
+ops onto the runtime's per-request ops, the five cache ACK kinds across the
+rank-sync payload, and the retraction and prefetch fields of ``make_config``."""
 
 from __future__ import annotations
 
@@ -34,6 +33,8 @@ ts = pytest.importorskip("tokenspeed_scheduler")
 from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     CacheTransfer,
     HostTier,
+    PrefetchOp,
+    PrefetchRow,
     RestoreOp,
     SnapshotOp,
 )
@@ -44,7 +45,6 @@ from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
     cache_event_to_payload,
     cache_ops_from_plan,
     make_config,
-    make_recompute_retract_event,
     pop_common_cache_event_payloads,
 )
 
@@ -65,6 +65,10 @@ class _RestoreBatch(SimpleNamespace):
     pass
 
 
+class _PrefetchBatch(SimpleNamespace):
+    pass
+
+
 @pytest.fixture()
 def wire(monkeypatch):
     # The op bindings have no Python constructor; dispatch on these fakes.
@@ -76,6 +80,7 @@ def wire(monkeypatch):
             LoadBackOp=_LoadBackOp,
             SnapshotOp=_SnapshotBatch,
             RestoreOp=_RestoreBatch,
+            PrefetchOp=_PrefetchBatch,
         ),
     )
 
@@ -111,15 +116,49 @@ def _restore_batch(**overrides):
     return _RestoreBatch(**fields)
 
 
+def _prefetch_batch(**overrides):
+    fields = dict(
+        op_ids=[8],
+        request_ids=["w"],
+        first_pages=[2],
+        num_pages=[3],
+        group_ids=[[0, 1, 0, 1]],
+        host_pages=[[5, 6, 7, 8]],
+        content_hashes=[["p2", "p2", "p4", "p4"]],
+        page_offsets=[[2, 2, 4, 4]],
+        page_indices=[[2, 2, 4, 4]],  # page 3 has no rows (a sliding group)
+    )
+    fields.update(overrides)
+    return _PrefetchBatch(**fields)
+
+
 def test_plan_adapter_passes_l2_batches_and_expands_snapshot_batches(wire):
     write_back, load_back = _WriteBackOp(op_ids=[1]), _LoadBackOp(op_ids=[2, 3])
     plan = SimpleNamespace(
-        cache=[write_back, _snapshot_batch(), load_back, _restore_batch()]
+        cache=[
+            write_back,
+            _snapshot_batch(),
+            load_back,
+            _restore_batch(),
+            _prefetch_batch(),
+        ]
     )
 
     ops = cache_ops_from_plan(plan)
 
     assert ops[0] is write_back and ops[3] is load_back
+    assert ops[5] == PrefetchOp(
+        op_id=8,
+        request_id="w",
+        first_page=2,
+        num_pages=3,
+        rows=(
+            PrefetchRow(0, 5, "p2", 2, 2),
+            PrefetchRow(1, 6, "p2", 2, 2),
+            PrefetchRow(0, 7, "p4", 4, 4),
+            PrefetchRow(1, 8, "p4", 4, 4),
+        ),
+    )
     assert ops[1] == SnapshotOp(
         op_id=4,
         request_id="a",
@@ -166,6 +205,8 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
         cache_ops_from_plan(
             SimpleNamespace(cache=[_restore_batch(source_tiers=[[0, 1, 7]])])
         )
+    with pytest.raises(ValueError, match="ragged cache operation 8"):
+        cache_ops_from_plan(SimpleNamespace(cache=[_prefetch_batch(host_pages=[[5]])]))
     with pytest.raises(TypeError, match="unsupported cache op kind: str"):
         cache_ops_from_plan(SimpleNamespace(cache=["op"]))
 
@@ -185,11 +226,16 @@ def test_cache_acks_round_trip_the_rank_sync_payload(kind):
     ts.ExecutionEvent().add_event(rebuilt)
 
 
-def test_load_back_ack_carries_its_outcome():
-    payload = cache_event_to_payload(ts.Cache.LoadBackDoneEvent(7, False))
-    assert payload == {"kind": "LoadBackDoneEvent", "op_id": 7, "success": False}
+def test_load_back_and_prefetch_acks_round_trip():
+    # A load-back lands or does not happen: no outcome on the ACK.
+    payload = cache_event_to_payload(ts.Cache.LoadBackDoneEvent(7))
+    assert payload == {"kind": "LoadBackDoneEvent", "op_id": 7}
+    assert cache_event_from_payload(payload).op_id == 7
+    # A prefetch's ACK carries the replica-converged landed prefix.
+    payload = cache_event_to_payload(ts.Cache.PrefetchDoneEvent(9, 4))
+    assert payload == {"kind": "PrefetchDoneEvent", "op_id": 9, "landed_pages": 4}
     rebuilt = cache_event_from_payload(payload)
-    assert (rebuilt.op_id, rebuilt.success) == (7, False)
+    assert (rebuilt.op_id, rebuilt.landed_pages) == (9, 4)
     with pytest.raises(ValueError, match="Unsupported cache event type"):
         cache_event_from_payload({"kind": "RetractDoneEvent", "op_id": 1})
 
@@ -203,11 +249,13 @@ def test_replica_intersection_is_per_kind_and_op_id():
     ]
 
 
-def test_recompute_retract_event_is_the_l3_miss_path():
-    event = make_recompute_retract_event("r1")
-    assert isinstance(event, ts.ForwardEvent.RecomputeRetract)
-    assert event.request_id == "r1"
+def test_no_retract_event_survives():
+    # A capacity retraction is the scheduler's suspend-with-image path and an
+    # L3 miss lands a shorter Host hit before admission: the runtime builds no
+    # retract event of any kind.
     assert not hasattr(ts.ForwardEvent, "Retract")
+    assert not hasattr(scheduler_utils, "make_retract_event")
+    assert not hasattr(scheduler_utils, "make_recompute_retract_event")
 
 
 def _config(**overrides):
@@ -222,6 +270,7 @@ def _config(**overrides):
         role="fused",
         num_snapshot_pages=1,
         max_retracted_requests=0,
+        l3_prefetch_min_pages=0,
     )
     fields.update(overrides)
     return make_config(**fields)
@@ -248,3 +297,17 @@ def test_make_config_states_the_snapshot_pool_on_every_role():
     with pytest.raises(TypeError):
         # The retraction fields are keyword-only and required.
         make_config(32, 64, 8, 2, 0, True, False, "fused")
+
+
+def test_make_config_ties_the_prefetch_threshold_to_l3():
+    with pytest.raises(ValueError, match="l3_prefetch_min_pages"):
+        _config(l3_prefetch_min_pages=2)
+    with pytest.raises(ValueError, match="l3_prefetch_min_pages"):
+        _config(num_host_pages=8, disable_l2_cache=False, enable_l3_storage=True)
+    config = _config(
+        num_host_pages=8,
+        disable_l2_cache=False,
+        enable_l3_storage=True,
+        l3_prefetch_min_pages=2,
+    )
+    assert config.l3_prefetch_min_pages == 2
