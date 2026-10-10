@@ -234,6 +234,16 @@ prefill and decode warmups compile both before serving. Direct kernel callers
 must warm both token ranges; disabling startup warmups can defer compilation
 until the first call in an unwarmed range.
 
+### gfx1250 dense BF16 prefill projection
+
+The large-M Kimi projection uses TDM loads and FP32 WMMA accumulation. Before
+storing, it rounds the accumulator to BF16 and redistributes it so adjacent
+lanes write contiguous vectors. The store layout follows the existing compute
+tile and warp count, with a row-oriented warp layout for narrow projections.
+Redistributing BF16 values limits shared-memory traffic
+during the conversion. Output masks cover partial row and column tiles for
+both four- and eight-warp schedules.
+
 ## Attention
 
 ### DeepSeek V4 attention

@@ -212,6 +212,37 @@ def test_kimi3_gfx1250_large_m_latent_projection_matches_and_captures(
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.parametrize(
+    "m,n,k",
+    [(513, 1536, 7168), (513, 6288, 7168), (4097, 3584, 7168), (12289, 2304, 1536)],
+)
+def test_dense_prefill_partial_tiles_refresh_graph_outputs(m, n, k):
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+        gluon_mm_a16w16_largem_gfx1250,
+    )
+
+    torch.manual_seed(1250)
+    hidden = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    storage = torch.full((m * n + 256,), -17, device="cuda", dtype=torch.bfloat16)
+    output = storage[128:-128].view(m, n)
+    gluon_mm_a16w16_largem_gfx1250(hidden, weight, out=output)
+    initial = output.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gluon_mm_a16w16_largem_gfx1250(hidden, weight, out=output)
+
+    hidden.mul_(-0.75)
+    graph.replay()
+    torch.testing.assert_close(output, hidden @ weight.T, atol=2e-2, rtol=2e-2)
+    assert not torch.equal(output, initial)
+    assert torch.all(storage[:128] == -17)
+    assert torch.all(storage[-128:] == -17)
+    replayed = output.clone()
+    gluon_mm_a16w16_largem_gfx1250(hidden, weight, out=output)
+    torch.testing.assert_close(output, replayed, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("num_tokens", [512, 4095, 4097, 8192, 12289])
 def test_kimi3_gfx1250_large_m_shared_down_matches(
     num_tokens: int,

@@ -924,6 +924,7 @@ def _wmma_tdm_dense_largem_kernel(
     GROUP_M: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     WARP_BASES: gl.constexpr,
+    NARROW_OUTPUT: gl.constexpr,
 ):
     """Dense BF16 CDNA5 TDM/WMMA GEMM for large K3 projections.
 
@@ -1016,13 +1017,24 @@ def _wmma_tdm_dense_largem_kernel(
     b = b_smem.index(last_idx % NUM_BUFFERS).permute([1, 0]).load(layout=dot_layout_b)
     acc = gl.amd.cdna5.wmma(a, b, acc)
 
-    offs_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, wmma_layout))
-    offs_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, wmma_layout))
+    # Match contiguous output vectors to the existing compute tile. Round
+    # first so redistribution moves BF16 values through shared memory.
+    if NARROW_OUTPUT and BLOCK_M == 128:
+        store_layout: gl.constexpr = gl.BlockedLayout([1, 4], [1, 32], [4, 1], [1, 0])
+    elif gl.num_warps() == 8:
+        store_layout: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [8, 1], [1, 0])
+    elif BLOCK_M == 256:
+        store_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [1, 4], [1, 0])
+    else:
+        store_layout: gl.constexpr = gl.BlockedLayout([1, 4], [2, 16], [2, 2], [1, 0])
+    out = gl.convert_layout(acc.to(gl.bfloat16), store_layout)
+    offs_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, store_layout))
+    offs_n = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, store_layout))
     output_offsets = (offs_m[:, None] * stride_om + offs_n[None, :] * stride_on).to(
         gl.int32
     )
     gl.amd.cdna5.buffer_store(
-        acc.to(gl.bfloat16),
+        out,
         out_ptr,
         output_offsets,
         mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
@@ -1117,6 +1129,7 @@ def gluon_mm_a16w16_largem_gfx1250(
         GROUP_M=group_m,
         NUM_BUFFERS=2,
         WARP_BASES=warp_bases,
+        NARROW_OUTPUT=n <= 1536,
         num_warps=num_warps,
         num_stages=1,
     )
