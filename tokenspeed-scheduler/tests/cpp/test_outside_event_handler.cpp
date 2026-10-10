@@ -58,6 +58,7 @@ protected:
         cfg.device_allocator.total_pages = 8;
         cfg.host_allocator.total_pages = 8;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -131,6 +132,7 @@ protected:
             state.family = CacheGroupFamily::State;
             cfg.cache_groups.push_back(std::move(state));
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -248,6 +250,7 @@ protected:
         full.family = CacheGroupFamily::History;
         full.transfer_policy = CacheTransferPolicy::FullSuffix;
         cfg.cache_groups = {full};
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -295,6 +298,7 @@ protected:
         cfg.device_allocator.total_pages = 5;
         cfg.max_batch_size = 2;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -332,6 +336,7 @@ protected:
         cfg.disable_prefix_cache = false;
         cfg.device_allocator.total_pages = 5;  // null parent + one four-page recovery working set
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -344,6 +349,7 @@ protected:
         cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
         cfg.max_batch_size = 3;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -355,6 +361,7 @@ protected:
         cfg.device_allocator.total_pages = 6;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         cfg.max_batch_size = 2;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -365,6 +372,7 @@ protected:
         SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
         cfg.disable_l2_cache = true;
         cfg.host_allocator.total_pages = 0;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -374,6 +382,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
         cfg.disable_prefix_cache = true;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -771,6 +780,7 @@ protected:
         state.family = CacheGroupFamily::State;
         state.transfer_policy = CacheTransferPolicy::LatestSnapshot;
         cfg.cache_groups = {full, state};
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -783,6 +793,7 @@ protected:
         cfg.cache_groups[0].total_pages = 15;
         cfg.cache_groups[1].total_pages = 8;
         cfg.disable_prefix_cache = true;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -795,6 +806,7 @@ protected:
         state.block_granularity = 1;
         state.total_pages = 13;
         state.cache_blocks_per_lcm_block = 2;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -807,6 +819,7 @@ protected:
         cfg.max_scheduled_tokens = 8;
         cfg.cache_groups[0].total_pages = 17;
         cfg.cache_groups[1].total_pages = 9;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -830,6 +843,7 @@ protected:
         sliding.family = CacheGroupFamily::History;
         sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
         cfg.cache_groups = {sliding};
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };

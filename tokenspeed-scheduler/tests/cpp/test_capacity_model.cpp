@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "integration_test_helper.h"
 #include "scheduler/capacity_model.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
@@ -96,6 +97,7 @@ SchedulerConfig SizedConfig(SchedulerConfig cfg, std::int32_t usable_lcm_blocks)
     for (CacheGroupConfig& group : cfg.cache_groups) {
         group.total_pages = 1 + usable_lcm_blocks * group.cache_blocks_per_lcm_block;
     }
+    SetTestSnapshotPool(cfg);
     return cfg;
 }
 

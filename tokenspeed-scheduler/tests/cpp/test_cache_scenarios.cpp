@@ -134,6 +134,7 @@ protected:
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -211,6 +212,7 @@ protected:
             MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -235,6 +237,7 @@ protected:
         SchedulerConfig cfg = MambaChunkAlignmentSuite::MakeConfig();
         cfg.max_scheduled_tokens = 64;
         cfg.disable_prefix_cache = false;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -278,6 +281,7 @@ TEST(MambaStateCheckpointTest, KeepsAlignedDecodeEndpointWorkingOnlyUnderWideVer
             cfg.cache_groups = {
                 MakeGroup("full", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
                 MakeGroup("state", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0)};
+            SetTestSnapshotPool(cfg);
             Scheduler scheduler{cfg};
             const std::int32_t initially_empty = scheduler.EmptyLcmBlocks();
             std::vector<std::int32_t> tokens(124, 1);
@@ -347,6 +351,7 @@ TEST(MambaStateCheckpointTest, ReclaimsWorkingStateAtExactAcceptedFrontier) {
                 cfg.cache_groups = {
                     MakeGroup("full", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
                     MakeGroup("state", 4, 128, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0)};
+                SetTestSnapshotPool(cfg);
                 Scheduler scheduler{cfg};
                 std::vector<std::int32_t> tokens(3, 1);
                 scheduler.SubmitRequests(
@@ -426,6 +431,7 @@ TEST(MambaStateCheckpointTest, BackToBackResultsPublishExactHistoryButNoDecodeSt
                     cfg.cache_groups.push_back(MakeGroup("state", 4, 128, CacheGroupConfig::Retention::FullHistory,
                                                          CacheGroupFamily::State, 0));
                 }
+                SetTestSnapshotPool(cfg);
                 Scheduler scheduler{cfg};
                 std::vector<std::int32_t> tokens(3, 1);
                 scheduler.SubmitRequests(
@@ -488,6 +494,7 @@ TEST(MambaStateCheckpointCapacityTest, CountsInternalCheckpointEvenWithoutPrefix
                   CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
     };
 
+    SetTestSnapshotPool(cfg);
     Scheduler scheduler{std::move(cfg)};
 
     // Four prompt tokens plus decode fit in two blocks (endpoint + growth).
@@ -514,6 +521,7 @@ TEST(MambaStateCheckpointCapacityTest, CountsRetainedInputForChunkedSingleForwar
             MakeGroup("state", 4, cfg.device_allocator.total_pages, CacheGroupConfig::Retention::FullHistory,
                       CacheGroupFamily::State, 0),
         };
+        SetTestSnapshotPool(cfg);
         Scheduler scheduler{cfg};
         RequestSpec spec{.request_id = "chunked", .tokens = std::vector<std::int32_t>(14, 1), .max_new_tokens = 1};
         if (usable_blocks == 3) {
@@ -547,6 +555,7 @@ TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkSuffixAndSubPageGrowth) {
                   CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
     };
 
+    SetTestSnapshotPool(cfg);
     Scheduler scheduler{std::move(cfg)};
 
     // A five-token prompt can retain a cached input beside its aligned
@@ -565,6 +574,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaStateCheckpointSuite::MakeConfig();
         cfg.disable_prefix_cache = true;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -589,6 +599,7 @@ protected:
             group.transfer_policy = group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot
                                                                           : CacheTransferPolicy::FullSuffix;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -731,6 +742,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaStateCheckpointPrefillRoleSuite::MakeConfig();
         cfg.role = Role::kD;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -755,6 +767,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaChunkAlignmentSuite::MakeConfig();
         cfg.max_scheduled_tokens = 12;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -803,6 +816,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaSparsePrefillSuite::MakeConfig();
         cfg.overlap_schedule_depth = 1;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -841,6 +855,7 @@ protected:
         SchedulerConfig cfg = MambaChunkAlignmentSuite::MakeConfig();
         cfg.max_scheduled_tokens = cfg.prefix_granularity;
         cfg.enable_mixed_prefill_decode = true;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -864,6 +879,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = MambaMixedBudgetSuite::MakeConfig();
         cfg.max_scheduled_tokens = cfg.prefix_granularity + cfg.decode_input_tokens;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -902,6 +918,7 @@ TEST(MambaChunkAlignmentConfigTest, RejectsBudgetSmallerThanStatePage) {
                   CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
     };
 
+    SetTestSnapshotPool(cfg);
     EXPECT_THROW((void)Scheduler(std::move(cfg)), std::invalid_argument);
 }
 
@@ -932,6 +949,7 @@ protected:
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/8),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -993,6 +1011,7 @@ protected:
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/5),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1070,6 +1089,7 @@ protected:
             MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1125,6 +1145,7 @@ protected:
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1306,6 +1327,7 @@ protected:
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1420,6 +1442,7 @@ protected:
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/2),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1492,6 +1515,7 @@ protected:
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1558,6 +1582,7 @@ protected:
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1678,6 +1703,7 @@ protected:
         SchedulerConfig cfg = PrefillSlideAdmissionSuite::MakeConfig();
         cfg.device_allocator.total_pages = 17;
         cfg.host_allocator.total_pages = 17;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1740,6 +1766,7 @@ protected:
             MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1751,6 +1778,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = CapacityBlockSuite::MakeConfig();
         cfg.disable_prefix_cache = false;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1892,6 +1920,7 @@ protected:
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1959,6 +1988,7 @@ protected:
         for (auto& group : cfg.cache_groups) {
             group.total_pages = cfg.device_allocator.total_pages;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -1993,6 +2023,7 @@ protected:
         SchedulerConfig cfg = CapacityBlockSuite::MakeConfig();
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = false;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -2141,6 +2172,7 @@ protected:
             MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -2246,6 +2278,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.max_scheduled_tokens = 4;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -2383,6 +2416,7 @@ protected:
         for (auto& group : cfg.cache_groups) {
             group.total_pages = cfg.device_allocator.total_pages;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -2694,6 +2728,7 @@ protected:
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -2814,6 +2849,7 @@ protected:
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -2827,6 +2863,7 @@ TEST_F(RetractExactFitSuite, ReportsSingleRequestTokenCapacity) {
 TEST_F(RetractExactFitSuite, ReportsCapacityUsingEachGroupsBlockGranularity) {
     SchedulerConfig config = MakeConfig();
     config.cache_groups[1].block_granularity = 1;
+    SetTestSnapshotPool(config);
     Scheduler scheduler{std::move(config)};
 
     // Eight parents fit ceil(tokens / 2) pages for the first group and one
@@ -2837,6 +2874,7 @@ TEST_F(RetractExactFitSuite, ReportsCapacityUsingEachGroupsBlockGranularity) {
 TEST_F(RetractExactFitSuite, IncludesOverlapDecodeReserveInTokenCapacity) {
     SchedulerConfig config = MakeConfig();
     config.overlap_schedule_depth = 1;
+    SetTestSnapshotPool(config);
     Scheduler scheduler{std::move(config)};
     // The extra decode token shares the fourth page with token seven. Counting
     // it as a separately rounded page would incorrectly report only six.
@@ -2865,6 +2903,7 @@ TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
     sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
     cfg.cache_groups = {sliding};
 
+    SetTestSnapshotPool(cfg);
     Scheduler scheduler{std::move(cfg)};
 
     // W=4, q=2 and a one-token decode reserve can require two cached
@@ -2922,6 +2961,7 @@ protected:
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -3017,6 +3057,7 @@ protected:
             MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -3181,6 +3222,7 @@ protected:
             MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -3561,6 +3603,7 @@ protected:
             MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -3661,6 +3704,7 @@ protected:
             MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History, SlidingWindowTokens()),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -3858,6 +3902,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = PrefixHitSuite::MakeConfig();
         cfg.prefix_replay_tokens = PrefixReplayTokens();
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -3988,6 +4033,7 @@ protected:
                                            /*sliding_window_tokens=*/32);
         state.cache_blocks_per_lcm_block = 4;
         cfg.cache_groups = {history, state};
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -4107,6 +4153,7 @@ protected:
             MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -4212,6 +4259,7 @@ TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
         MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
                   CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
     };
+    SetTestSnapshotPool(cfg);
     EXPECT_THROW((void)Scheduler(std::move(cfg)), std::invalid_argument);
 }
 
@@ -4727,6 +4775,7 @@ protected:
                       CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
                       /*sliding_window_tokens=*/4),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -4932,6 +4981,7 @@ protected:
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -5212,6 +5262,7 @@ protected:
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -5314,6 +5365,7 @@ protected:
         cfg.enable_l3_storage = true;
         // 6 usable Host pages: r1 fills the pool; the churn request replaces r1.
         cfg.host_allocator.total_pages = 7;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -5372,6 +5424,7 @@ protected:
         for (auto& group : cfg.cache_groups) {
             group.total_pages = cfg.device_allocator.total_pages;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -5418,6 +5471,7 @@ protected:
             MakeGroup("full_coarse", /*block_granularity=*/4, cfg.device_allocator.total_pages,
                       CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -5497,6 +5551,7 @@ protected:
         cfg.enable_l3_storage = true;
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = false;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -5577,6 +5632,7 @@ protected:
             swa,
             tail,
         };
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -5842,6 +5898,7 @@ protected:
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 

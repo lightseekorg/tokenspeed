@@ -31,6 +31,7 @@
 #include "cache/core/cache_types.h"
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache_test_access.h"
+#include "integration_test_helper.h"
 #include "scheduler/operations/cache.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "scheduler/types.h"
@@ -489,6 +490,7 @@ SchedulerConfig MakeValidConfig() {
     group.block_granularity = 128;
     group.total_pages = config.device_allocator.total_pages;
     config.cache_groups = {group};
+    SetTestSnapshotPool(config);
     return config;
 }
 
@@ -660,8 +662,49 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowAndNoSnapshotStateO
         for (CacheGroupConfig& group : pd.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
+        SetTestSnapshotPool(pd);
         EXPECT_NO_THROW(pd.Validate());
     }
+}
+
+TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {
+    // The pool is explicit on every role: 0 pages says nothing, the null page
+    // alone says "never retract" (and takes no blob slots), anything above it
+    // needs blob slots -- and the P role, which never retracts, takes neither.
+    SchedulerConfig config = MakeValidConfig();
+    config.snapshot_allocator.total_pages = 0;
+    config.max_retracted_requests = 0;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.snapshot_allocator.total_pages = 1;
+    EXPECT_NO_THROW(config.Validate());
+    config.max_retracted_requests = 4;
+    EXPECT_THROW(config.Validate(), std::invalid_argument) << "slots without a pool";
+    config.snapshot_allocator.total_pages = 16;
+    EXPECT_NO_THROW(config.Validate());
+    config.max_retracted_requests = 0;
+    EXPECT_THROW(config.Validate(), std::invalid_argument) << "a pool without slots";
+    config.max_retracted_requests = -1;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+
+    config.max_retracted_requests = 4;
+    config.role = Role::kP;
+    config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
+    EXPECT_THROW(config.Validate(), std::invalid_argument) << "the P role never retracts";
+    config.snapshot_allocator.total_pages = 1;
+    config.max_retracted_requests = 0;
+    EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(SchedulerConfigValidateTest, L3StorageRequiresReplicatedGroups) {
+    SchedulerConfig config = MakeValidConfig();
+    config.host_allocator.total_pages = 32;
+    config.enable_l3_storage = true;
+    config.cache_groups[0].cache_blocks_per_lcm_block = 2;
+    config.cache_groups[0].shard_count = 2;
+    EXPECT_THROW(config.Validate(), std::invalid_argument)
+        << "an L3 prefetch allocates its Host page before any Device destination exists";
+    config.cache_groups[0].shard_count = 1;
+    EXPECT_NO_THROW(config.Validate());
 }
 
 TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {

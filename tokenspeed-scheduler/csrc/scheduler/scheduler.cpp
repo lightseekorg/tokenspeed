@@ -51,6 +51,10 @@ std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
 }
 
+std::int32_t snapshotPoolBlocks(const SchedulerConfig& config) {
+    return config.HasSnapshotPool() ? config.snapshot_allocator.NumUsableBlocks() : 0;
+}
+
 std::vector<std::int32_t> slotsPerParentByGroup(const SchedulerConfig& config) {
     std::vector<std::int32_t> slots_per_group;
     slots_per_group.reserve(config.cache_groups.size());
@@ -82,11 +86,14 @@ CacheKey eventKey(const CacheKey& key) {
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
       req_pool_allocator_{config_.max_batch_size},
+      snapshot_slots_{config_.max_retracted_requests},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
       host_pool_{hostPoolBlocks(config_), slotsPerParentByGroup(config_)},
+      snapshot_pool_{snapshotPoolBlocks(config_), slotsPerParentByGroup(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
                                    config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
-                                   /*snapshot_pool=*/nullptr, config_.StreamsDeviceCacheToHost())},
+                                   snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
+                                   config_.StreamsDeviceCacheToHost())},
       tier_transfers_{coordinator_} {
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
@@ -317,6 +324,11 @@ std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
         return request->IsAnyOf<fsm::Submitted, fsm::Retracted>();
     }));
+}
+
+std::size_t Scheduler::RetractedSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Retracted>(); }));
 }
 
 std::size_t Scheduler::DecodingSize() const {

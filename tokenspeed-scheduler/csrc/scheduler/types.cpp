@@ -65,6 +65,34 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
+    if (enable_l3_storage) {
+        // A Host copy keeps its Device block's residue, but an L3 prefetch
+        // allocates its Host page before any Device destination exists.
+        for (const CacheGroupConfig& group : cache_groups) {
+            if (group.shard_count > 1) {
+                throw std::invalid_argument(
+                    "Scheduler: L3 storage is not supported for page-cyclic sharded cache "
+                    "groups (group '" +
+                    group.group_id + "')");
+            }
+        }
+    }
+    // The snapshot pool is stated explicitly on every role: the null page
+    // alone (and no slots) says "never retract", anything more needs slots.
+    if (snapshot_allocator.total_pages < 1) {
+        throw std::invalid_argument("Scheduler: snapshot_allocator.total_pages must include the null page");
+    }
+    if (max_retracted_requests < 0) {
+        throw std::invalid_argument("Scheduler: max_retracted_requests must be >= 0");
+    }
+    if (HasSnapshotPool() != (max_retracted_requests > 0)) {
+        throw std::invalid_argument(
+            "Scheduler: a snapshot pool above the null page requires max_retracted_requests > 0, and "
+            "max_retracted_requests > 0 requires a snapshot pool");
+    }
+    if (role == Role::kP && HasSnapshotPool()) {
+        throw std::invalid_argument("Scheduler: the P role never retracts and takes no snapshot pool");
+    }
 }
 
 void SchedulerConfig::ValidateCapacityInputs() const {

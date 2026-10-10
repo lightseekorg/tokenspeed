@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,21 @@
 #include "unit_test_helper.h"
 
 namespace tokenspeed::test {
+
+// Retraction capacity for a test config that does not exercise image-fit
+// refusals: a snapshot pool as large as the Device pool and one blob slot per
+// request slot on the retracting roles, so any resident request can be
+// imaged; none on the P role, which never retracts. Suites that test a
+// refusal size the pool themselves instead of calling this.
+inline void SetTestSnapshotPool(SchedulerConfig& cfg) {
+    if (cfg.role == Role::kP) {
+        cfg.snapshot_allocator.total_pages = 1;
+        cfg.max_retracted_requests = 0;
+        return;
+    }
+    cfg.snapshot_allocator.total_pages = cfg.device_allocator.total_pages;
+    cfg.max_retracted_requests = std::max(cfg.max_batch_size, 1);
+}
 
 class SchedulerTestSuite : public ::testing::Test {
 protected:
@@ -56,6 +72,7 @@ protected:
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
         });
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -235,6 +252,7 @@ protected:
             group.family = i == 0 ? CacheGroupFamily::History : CacheGroupFamily::State;
             cfg.cache_groups.push_back(std::move(group));
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 

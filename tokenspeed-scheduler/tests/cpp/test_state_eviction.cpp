@@ -48,6 +48,7 @@ protected:
                 .family = id == "full" ? CacheGroupFamily::History : CacheGroupFamily::State,
             });
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 

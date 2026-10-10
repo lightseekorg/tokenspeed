@@ -13,6 +13,7 @@
 #include "cache/tier/transfer.h"
 #include "cache/tier/transfer_manager.h"
 #include "cache_test_access.h"
+#include "integration_test_helper.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
 
@@ -142,15 +143,18 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
             .family = CacheGroupFamily::History,
             .transfer_policy = CacheTransferPolicy::FullSuffix,
         });
+        SetTestSnapshotPool(config);
         return config;
     };
 
     SchedulerConfig disabled = make_config();
     disabled.disable_l2_cache = true;
+    SetTestSnapshotPool(disabled);
     EXPECT_NO_THROW(Scheduler{std::move(disabled)});
 
     SchedulerConfig empty = make_config();
     empty.host_allocator.total_pages = 1;
+    SetTestSnapshotPool(empty);
     EXPECT_NO_THROW(Scheduler{std::move(empty)});
 }
 
@@ -171,6 +175,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
             .family = CacheGroupFamily::History,
             .transfer_policy = CacheTransferPolicy::FullSuffix,
         });
+        SetTestSnapshotPool(config);
         return config;
     };
 
@@ -436,6 +441,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
         .family = CacheGroupFamily::History,
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
+    SetTestSnapshotPool(config);
     Scheduler scheduler{std::move(config)};
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
     RequestSpec spec{
@@ -463,6 +469,7 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
         .family = CacheGroupFamily::History,
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
+    SetTestSnapshotPool(config);
     Scheduler scheduler{std::move(config)};
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
     RequestSpec spec{
@@ -554,6 +561,7 @@ TEST(CacheOperationTest, L3StorageRequiresHostCache) {
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
     });
+    SetTestSnapshotPool(config);
     EXPECT_THROW(Scheduler{std::move(config)}, std::invalid_argument);
 }
 
@@ -572,6 +580,7 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
     });
+    SetTestSnapshotPool(config);
     EXPECT_NO_THROW(Scheduler{std::move(config)});
 }
 

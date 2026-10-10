@@ -99,6 +99,15 @@ public:
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
+    // Empty parents of the request-private snapshot pool: every block of it
+    // belongs to some retracted request's image, so a request that finished
+    // or aborted while retracted must have returned its share (leak check).
+    std::int32_t SnapshotPoolFreeBlocks() const { return coordinator_.NumFreeSnapshotLcmBlocks(); }
+    // Requests suspended with an image: Retracted (waiting to be restored)
+    // and Restoring (their copy back is in flight). A weight update must not
+    // restore an image of old-weight KV under new weights, so the runtime
+    // refuses to flush while this is non-zero.
+    std::size_t RetractedSize() const;
 
     // L3 storage (Mooncake Store, etc.) sits below Host. Python queries the
     // backend for existing objects, then registers the matching CacheKeys so
@@ -307,10 +316,14 @@ private:
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
+    // One slot per retracted request: the index of its slot-state blob in
+    // the runtime's arena, released by the FSM transition that drops the image.
+    SnapshotSlotAllocator snapshot_slots_;
 
     // Pools outlive every CacheBlockRef stored below.
     BlockPool block_pool_;
     BlockPool host_pool_;
+    BlockPool snapshot_pool_;
     CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
     std::vector<WriteBackOperation> pending_write_back_operations_;
