@@ -94,3 +94,25 @@ class UnquantizedLinearMethod(LinearMethodBase):
             layer.weight,
             bias=bias,
         )
+
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
+        """Write the plain GEMM into ``out`` (e.g. all-reduce memory) directly."""
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        if (
+            block_scale is not None
+            or bias is not None
+            or output_dtype != x.dtype
+            or global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+            or resolve_kernel_override("gemm", "mm", None) is not None
+        ):
+            return super().apply_into(layer, x, bias, block_scale, output_dtype, out)
+        if use_decode_gemv(x, layer.weight):
+            return decode_gemv(x, layer.weight, out=out)
+        from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250
+
+        largem = _try_gluon_largem_gfx1250(x, layer.weight)
+        if largem is not None:
+            out.copy_(largem)
+            return out
+        return kernel_mm(x, layer.weight, out=out)

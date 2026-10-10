@@ -1950,6 +1950,7 @@ class DeepseekV4MoE(nn.Module):
         input_ids: torch.Tensor,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0 and not self.use_gluon_petit:
             return hidden_states
@@ -1970,7 +1971,11 @@ class DeepseekV4MoE(nn.Module):
                 )
             with fork.branch():
                 shared = self._forward_shared_experts(hidden_states)
-        return routed + shared if shared is not None else routed
+        if out is None:
+            return routed + shared if shared is not None else routed
+        if shared is None:
+            return out.copy_(routed)
+        return torch.add(routed, shared, out=out)
 
     def forward(
         self,
@@ -1980,7 +1985,9 @@ class DeepseekV4MoE(nn.Module):
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext | None = None,
         comm_manager: CommManager | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``out``: optional destination of the output (non-MegaMoE path)."""
         if self.use_mega_moe:
             return self.forward_mega_moe(
                 hidden_states,
@@ -1991,7 +1998,7 @@ class DeepseekV4MoE(nn.Module):
                 comm_manager,
             )
         return self.forward_normal(
-            hidden_states, input_ids, num_global_tokens, max_num_tokens_per_gpu
+            hidden_states, input_ids, num_global_tokens, max_num_tokens_per_gpu, out
         )
 
 

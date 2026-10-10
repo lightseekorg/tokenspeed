@@ -23,8 +23,10 @@ from collections.abc import Sequence
 import torch
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_all_reduce_outputs,
     all_reduce,
     all_to_all_transpose,
+    can_acquire_all_reduce_outputs,
     token_all_gather,
     token_all_gather_rows,
     token_reduce_scatter,
@@ -581,11 +583,39 @@ class CommManager:
             scattered_num_tokens=self.moe_tp_ep_group_scattered_num_tokens(ctx),
         )
 
+    def acquire_post_moe_output(
+        self, shape: tuple[int, ...], like: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor | None:
+        """Storage the MoE output can be produced into for ``post_moe_comm``.
+
+        Returns collective memory when ``post_moe_comm`` will all-reduce the
+        output in place, so it skips staging a copy; ``None`` otherwise. Every
+        rank of the MoE group must call it with the same arguments.
+        """
+        if (
+            not self.is_moe
+            or not self.mapping.moe.has_tp_ep
+            or self.moe_combine_order == "slot"
+            or self._shard(ctx) is not None
+            or not self.use_all_reduce(is_moe=True)
+        ):
+            return None
+        group = self.mapping.moe.tp_ep_group
+        shapes = (tuple(shape),)
+        if not can_acquire_all_reduce_outputs(shapes, like, group):
+            return None
+        return acquire_all_reduce_outputs(shapes, like, group)[0]
+
     def post_mlp_comm(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+        acquired: bool = False,
     ):
+        """``acquired``: ``hidden_states`` came from ``acquire_post_moe_output``."""
         if self.is_moe:
-            return self.post_moe_comm(hidden_states, residual, ctx)
+            return self.post_moe_comm(hidden_states, residual, ctx, acquired)
         else:
             return self.post_dense_comm(hidden_states, residual, ctx)
 
@@ -616,7 +646,11 @@ class CommManager:
         return hidden_states, residual
 
     def post_moe_comm(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+        acquired: bool = False,
     ):
         """Bring the routed-expert output back to this rank's layout.
 
@@ -644,7 +678,11 @@ class CommManager:
             return hidden_states[offset : offset + own], residual
 
         if replicated:
-            hidden_states = all_reduce(hidden_states, self.mapping.moe.tp_ep_group)
+            group = self.mapping.moe.tp_ep_group
+            if acquired:
+                (hidden_states,) = all_reduce((hidden_states,), group)
+            else:
+                hidden_states = all_reduce(hidden_states, group)
             return hidden_states, residual
         hidden_states = token_reduce_scatter(
             hidden_states,
