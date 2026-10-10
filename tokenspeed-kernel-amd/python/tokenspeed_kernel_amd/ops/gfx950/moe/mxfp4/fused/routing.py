@@ -28,7 +28,7 @@ top-k-only route kernels."""
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe._common import (
     RaggedTensorMetadata,
     make_ragged_tensor_metadata,
@@ -298,6 +298,9 @@ def default_grouped_route(
 # ``RaggedTensorMetadata`` + gather_indx/scatter_indx/gate_scal of length
 # ``G``. Metadata shapes are queried from ``RaggedTensorMetadata`` so they match
 # ``make_ragged_tensor_metadata`` on HIP and non-HIP alike.
+#
+# Routes from precomputed top-k (any M) instead use the chunked counting sort
+# ``_precomputed_topk_route``; see ``_route_from_topk``.
 # ===========================================================================
 
 # Number of block-size rows in RaggedTensorMetadata for the active platform
@@ -1023,7 +1026,7 @@ def gluon_precomputed_topk_flat_m1_route(
     return ragged, gather_indx, scatter_indx, gate_scal
 
 
-def _route_from_topk(
+def _route_from_topk_torch(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     num_experts: int,
@@ -1034,10 +1037,16 @@ def _route_from_topk(
     torch.Tensor,
     torch.Tensor,
 ]:
+    """Torch route for flat gate counts above ``PRECOMPUTED_ROUTE_MAX_G``.
+
+    Same contract as ``_precomputed_topk_route``: rows are stably sorted by
+    expert id; invalid ids (outside ``[0, num_experts)``) sort after every
+    expert with a zero gate and are not counted in any slice.
+    """
     flat_ids = topk_ids.reshape(-1).to(torch.long)
-    valid = flat_ids >= 0
-    safe_ids = torch.where(valid, flat_ids, flat_ids.new_zeros(()))
-    sort_order = torch.argsort(safe_ids, stable=True)
+    valid = (flat_ids >= 0) & (flat_ids < num_experts)
+    sort_key = torch.where(valid, flat_ids, flat_ids.new_full((), num_experts))
+    sort_order = torch.argsort(sort_key, stable=True)
 
     top_k = topk_ids.shape[1]
     # sort_order defines the expert-sorted ragged row order. GEMM1 gathers
@@ -1049,15 +1058,37 @@ def _route_from_topk(
     if dtype is not None and gate_scal.dtype != dtype:
         gate_scal = gate_scal.to(dtype)
 
-    col_sum = torch.zeros((num_experts,), dtype=torch.int32, device=safe_ids.device)
-    col_sum.scatter_add_(0, safe_ids, valid.to(torch.int32))
+    col_sum = torch.zeros((num_experts,), dtype=torch.int32, device=flat_ids.device)
+    col_sum.scatter_add_(0, torch.where(valid, flat_ids, 0), valid.to(torch.int32))
     ragged_metadata = make_ragged_tensor_metadata(col_sum, int(sort_order.numel()))
     return ragged_metadata, gather_indx, scatter_indx, gate_scal
 
 
-@gluon.jit
-def _fused_precomputed_topk_route_small_m(
-    TopkWeights,  # [M, TOPK] dtype
+# Rows of the flat [G] route handled by one program of _precomputed_topk_route.
+_PRECOMPUTED_ROUTE_CHUNK = 64
+_PRECOMPUTED_ROUTE_WARPS = 8
+# Every program re-reads all G ids to build the expert histogram, so the
+# total work grows as G^2 / chunk: 56 us at G=49152 vs 170 us for the torch
+# route, about even near G=10^5. Larger routes use _route_from_topk_torch.
+PRECOMPUTED_ROUTE_MAX_G = 65536
+
+
+def _precomputed_topk_route_launch_metadata(grid, kernel, args):
+    """Report route traffic to Proton: every program reads all G ids."""
+    g = args["G"]
+    n_prog = grid[0]
+    return {
+        "name": kernel.name,
+        "bytes": n_prog * g * 4 + g * (4 + 4 + 4 + args["GateScal"].element_size()),
+    }
+
+
+@gluon.jit(
+    launch_metadata=_precomputed_topk_route_launch_metadata,
+    do_not_specialize=("stride_wm", "stride_im", "G", "MAXBLK", "bs_stride"),
+)
+def _precomputed_topk_route(
+    TopkWeights,  # [M, TOPK]
     TopkIds,  # [M, TOPK] int32
     SliceSizes,  # [E] int32
     SliceOffs,  # [E+1] int32
@@ -1065,85 +1096,221 @@ def _fused_precomputed_topk_route_small_m(
     BlockSched,  # [NB, MAXBLK] int32
     GatherIndx,  # [G] int32
     ScatterIndx,  # [G] int32
-    GateScal,  # [G] dtype
+    GateScal,  # [G]
     stride_wm,
     stride_im,
-    # The token count and the block counts derived from it follow the batch;
-    # runtime so every batch shape shares one binary.
-    M,
+    # G = M*TOPK and the block-schedule width follow the batch: runtime so
+    # every batch shape shares one binary.
+    G,
+    MAXBLK,
+    bs_stride,
     E: gl.constexpr,
     TOPK: gl.constexpr,
-    GP: gl.constexpr,
-    EP: gl.constexpr,
-    MAXBLK,
-    MAXBLKP: gl.constexpr,
+    EP: gl.constexpr,  # next_pow2(E + 1): bin E collects invalid ids
+    CH: gl.constexpr,
     NB_C: gl.constexpr,
+    FIRST_BLOCK_LOG2: gl.constexpr,
     bo_stride: gl.constexpr,
-    bs_stride,
+    NUM_WARPS: gl.constexpr,
 ):
-    G: gl.constexpr = M * TOPK
-    LE: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
-    LG: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
-    LB: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
-    LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, 1], [1, 0])
+    """Stable counting sort of the flat top-k ids by expert.
 
-    g = gl.arange(0, GP, layout=LG)
-    gmask = g < G
-    tok = (g // TOPK).to(gl.int32)
-    slot = (g % TOPK).to(gl.int32)
-    idx = gl.load(TopkIds + tok * stride_im + slot, mask=gmask, other=0).to(gl.int32)
-    valid = gmask & (idx >= 0) & (idx < E)
-    safe_idx = gl.where(valid, idx, 0)
-    vals = gl.load(TopkWeights + tok * stride_wm + slot, mask=gmask, other=0.0)
-    vals = gl.where(valid, vals, 0.0)
+    Program p < cdiv(G, CH) places rows [p*CH, (p+1)*CH): destination =
+    (rows of lower experts) + (same-expert rows in earlier chunks) + (same-expert
+    rows earlier in this chunk). The trailing NB programs write the ragged
+    metadata, one block size each.
+    """
+    L1: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    # [CH, CH] rank tile: a row per lane, the columns in registers, so the
+    # row reduction is mostly in-thread.
+    RW: gl.constexpr = CH // 64  # warps along rows
+    LT: gl.constexpr = gl.BlockedLayout(
+        [1, CH // (NUM_WARPS // RW)], [64, 1], [RW, NUM_WARPS // RW], [1, 0]
+    )
+    pid = gl.program_id(0)
+    start = pid * CH
 
-    e = gl.arange(0, EP, layout=LE)
+    # Expert histogram of all rows and of the rows before this chunk, by LDS
+    # atomics (gl.histogram's per-bin ballots cost ~1 us per 128 rows here).
+    LH: gl.constexpr = gl.BlockedLayout([4], [64], [NUM_WARPS], [0])
+    HT: gl.constexpr = 4 * 64 * NUM_WARPS
+    SL: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
+    zeros = gl.zeros([EP], gl.int32, layout=L1)
+    hist_smem = gl.allocate_shared_memory(gl.int32, [EP], SL, zeros)
+    hist_pre_smem = gl.allocate_shared_memory(gl.int32, [EP], SL, zeros)
+    ones = gl.full([HT], 1, gl.int32, layout=LH)
+    for c0 in range(0, G, HT):
+        g = c0 + gl.arange(0, HT, layout=LH)
+        gmask = g < G
+        idx = gl.load(TopkIds + (g // TOPK) * stride_im + g % TOPK, mask=gmask)
+        key = gl.where((idx >= 0) & (idx < E), idx, E)
+        hist_smem.atomic_scatter_add(ones, key, axis=0, mask=gmask)
+        hist_pre_smem.atomic_scatter_add(ones, key, axis=0, mask=g < start)
+    hist = hist_smem.load(L1)
+    hist_pre = hist_pre_smem.load(L1)
+
+    e = gl.arange(0, EP, layout=L1)
     emask = e < E
-    hist = gl.histogram(safe_idx, EP, mask=valid, layout=LE)
-    gl.store(SliceSizes + e, hist, mask=emask)
-
     incl = gl.cumsum(hist, 0)
     col_offs = incl - hist
-    last = e == (E - 1)
-    gl.store(SliceOffs + e, col_offs, mask=emask)
-    gl.store(SliceOffs + e + 1, incl, mask=emask & last)
 
-    n_blk = (hist > 0).to(gl.int32)
-    blk_incl = gl.cumsum(n_blk, 0)
-    blk_excl = blk_incl - n_blk
-    n_total = gl.sum(n_blk, 0)
-    jb = gl.arange(0, MAXBLKP, layout=LB)
-    jbmask = jb < MAXBLK
-    neg_fill = gl.full([MAXBLKP], -1, gl.int32, layout=LB)
-    for k in gl.static_range(NB_C):
-        gl.store(BlockOffs + k * bo_stride + e, blk_excl, mask=emask)
-        gl.store(BlockOffs + k * bo_stride + e + 1, blk_incl, mask=emask & last)
-        gl.store(
-            BlockSched + k * bs_stride + jb,
-            neg_fill,
-            mask=jbmask & (jb >= n_total),
-        )
-        gl.store(
-            BlockSched + k * bs_stride + blk_excl,
-            e,
-            mask=(hist > 0) & emask,
-        )
+    n_chunks = gl.cdiv(G, CH)
+    if pid < n_chunks:
+        base = col_offs + hist_pre
+        LR: gl.constexpr = gl.SliceLayout(1, LT)
+        LC: gl.constexpr = gl.SliceLayout(0, LT)
+        g_r = start + gl.arange(0, CH, layout=LR)
+        g_c = start + gl.arange(0, CH, layout=LC)
+        id_r = gl.load(TopkIds + (g_r // TOPK) * stride_im + g_r % TOPK, mask=g_r < G)
+        id_c = gl.load(TopkIds + (g_c // TOPK) * stride_im + g_c % TOPK, mask=g_c < G)
+        key_r = gl.where((id_r >= 0) & (id_r < E), id_r, E)
+        key_c = gl.where((id_c >= 0) & (id_c < E), id_c, E)
+        # Rows past G are never stored and sort after every real row, so they
+        # do not need masking in the rank.
+        before = gl.expand_dims(g_c, 0) < gl.expand_dims(g_r, 1)
+        same = gl.expand_dims(key_c, 0) == gl.expand_dims(key_r, 1)
+        rank = gl.convert_layout(gl.sum((same & before).to(gl.int32), axis=1), L1)
 
-    idx_row = gl.expand_dims(gl.convert_layout(safe_idx, gl.SliceLayout(1, LT)), 1)
-    idx_col = gl.expand_dims(gl.convert_layout(safe_idx, gl.SliceLayout(0, LT)), 0)
-    valid_row = gl.expand_dims(gl.convert_layout(valid, gl.SliceLayout(1, LT)), 1)
-    valid_col = gl.expand_dims(gl.convert_layout(valid, gl.SliceLayout(0, LT)), 0)
-    g_row = gl.expand_dims(gl.arange(0, GP, layout=gl.SliceLayout(1, LT)), 1)
-    g_col = gl.expand_dims(gl.arange(0, GP, layout=gl.SliceLayout(0, LT)), 0)
-    match = ((idx_row == idx_col) & valid_row & valid_col & (g_col < g_row)).to(
-        gl.int32
+        g = start + gl.arange(0, CH, layout=L1)
+        gmask = g < G
+        tok = g // TOPK
+        idx = gl.load(TopkIds + tok * stride_im + g % TOPK, mask=gmask, other=E)
+        valid = (idx >= 0) & (idx < E)
+        key = gl.where(valid, idx, E)
+        pos = gl.gather(base, key, axis=0) + rank
+        w = gl.load(TopkWeights + tok * stride_wm + g % TOPK, mask=gmask, other=0.0)
+        w = gl.where(valid, w, 0.0)
+        gl.store(GatherIndx + pos, tok, mask=gmask)
+        gl.store(ScatterIndx + pos, g, mask=gmask)
+        gl.store(GateScal + pos, w.to(GateScal.dtype.element_ty), mask=gmask)
+    else:
+        # Programs n_chunks .. n_chunks + NB_C - 1 each own one block size.
+        k = pid - n_chunks
+        if k == 0:
+            gl.store(SliceSizes + e, hist, mask=emask)
+            # Bin E is the invalid-id bin, so col_offs[E] is the valid row
+            # total.
+            gl.store(SliceOffs + e, col_offs, mask=e <= E)
+        LB: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+        log2_bs = FIRST_BLOCK_LOG2 + k
+        n_blk = gl.where(emask, (hist + ((1 << log2_bs) - 1)) >> log2_bs, 0)
+        blk_incl = gl.cumsum(n_blk, 0)
+        blk_excl = blk_incl - n_blk
+        n_total = gl.sum(n_blk, 0)
+        gl.store(BlockOffs + k * bo_stride + e, blk_excl, mask=e <= E)
+        for j0 in range(0, MAXBLK, 64 * NUM_WARPS):
+            j = j0 + gl.arange(0, 64 * NUM_WARPS, layout=LB)
+            gl.store(
+                BlockSched + k * bs_stride + j,
+                gl.full([64 * NUM_WARPS], -1, gl.int32, layout=LB),
+                mask=(j < MAXBLK) & (j >= n_total),
+            )
+        # Schedule entry (block << 16) | expert for each expert block.
+        for b in range(0, gl.max(n_blk, 0)):
+            gl.store(
+                BlockSched + k * bs_stride + blk_excl + b,
+                (b << 16) | e,
+                mask=b < n_blk,
+            )
+
+
+def _route_from_topk(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    dtype: torch.dtype | None = None,
+) -> tuple[
+    RaggedTensorMetadata,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Ragged route (stable expert sort) from precomputed top-k.
+
+    Returns RaggedTensorMetadata plus gather_indx (source token per sorted
+    row), scatter_indx (flat token*topk+slot per sorted row) and gate_scal
+    (weight per sorted row, cast to ``dtype``). Invalid ids sort last with a
+    zero gate and belong to no slice.
+    """
+    if dtype is None:
+        dtype = topk_weights.dtype
+    M, topk = topk_ids.shape
+    G = M * topk
+    if (
+        G > PRECOMPUTED_ROUTE_MAX_G
+        or num_experts > GLUON_ROUTE_MAX_E
+        or dtype not in GLUON_ROUTE_DTYPES
+        or topk_weights.dtype not in GLUON_ROUTE_DTYPES
+    ):
+        return _route_from_topk_torch(topk_weights, topk_ids, num_experts, dtype)
+
+    return _launch_precomputed_topk_route(topk_weights, topk_ids, num_experts, dtype)
+
+
+def _launch_precomputed_topk_route(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    dtype: torch.dtype,
+) -> tuple[
+    RaggedTensorMetadata,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    M, topk = topk_ids.shape
+    G = M * topk
+    device = topk_ids.device
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+    if topk_ids.stride(1) != 1:
+        topk_ids = topk_ids.contiguous()
+    if topk_weights.stride(1) != 1:
+        topk_weights = topk_weights.contiguous()
+
+    slice_sizes = torch.empty(num_experts, dtype=torch.int32, device=device)
+    slice_offs = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+    block_offs_data = torch.empty(
+        _ROUTE_NB, num_experts + 1, dtype=torch.int32, device=device
     )
-    rank = gl.convert_layout(gl.sum(match, axis=1), LG)
+    maxblk = RaggedTensorMetadata.max_n_blocks(num_experts, G)
+    block_schedule_data = torch.empty(
+        _ROUTE_NB, maxblk, dtype=torch.int32, device=device
+    )
+    gather_indx = torch.empty(G, dtype=torch.int32, device=device)
+    scatter_indx = torch.empty(G, dtype=torch.int32, device=device)
+    gate_scal = torch.empty(G, dtype=dtype, device=device)
 
-    pos = gl.gather(col_offs, safe_idx, axis=0) + rank
-    gl.store(GatherIndx + pos, tok, mask=valid)
-    gl.store(ScatterIndx + pos, g.to(gl.int32), mask=valid)
-    gl.store(GateScal + pos, vals, mask=valid)
+    chunk = _PRECOMPUTED_ROUTE_CHUNK
+    _precomputed_topk_route[(triton.cdiv(G, chunk) + _ROUTE_NB,)](
+        topk_weights,
+        topk_ids,
+        slice_sizes,
+        slice_offs,
+        block_offs_data,
+        block_schedule_data,
+        gather_indx,
+        scatter_indx,
+        gate_scal,
+        topk_weights.stride(0),
+        topk_ids.stride(0),
+        G,
+        maxblk,
+        block_schedule_data.stride(0),
+        E=num_experts,
+        TOPK=topk,
+        EP=_route_next_pow2(num_experts + 1),
+        CH=chunk,
+        NB_C=_ROUTE_NB,
+        FIRST_BLOCK_LOG2=RaggedTensorMetadata.block_sizes_log2()[0],
+        bo_stride=block_offs_data.stride(0),
+        NUM_WARPS=_PRECOMPUTED_ROUTE_WARPS,
+        num_warps=_PRECOMPUTED_ROUTE_WARPS,
+    )
+    ragged = RaggedTensorMetadata(
+        slice_sizes, slice_offs, block_offs_data, block_schedule_data
+    )
+    return ragged, gather_indx, scatter_indx, gate_scal
 
 
 def gluon_precomputed_topk_fused_route(
@@ -1171,10 +1338,8 @@ def gluon_precomputed_topk_fused_route(
         )
 
     M, topk = topk_ids.shape
-    if M < 1 or M > SMALLM_MAX_M:
-        raise ValueError(
-            f"precomputed fused route requires 1 <= M <= {SMALLM_MAX_M}, got {M}"
-        )
+    if M < 1:
+        raise ValueError(f"precomputed fused route requires M >= 1, got {M}")
     if topk < 1 or topk > num_experts:
         raise ValueError(f"invalid topk={topk} for num_experts={num_experts}")
     if num_experts < 1 or num_experts > GLUON_ROUTE_MAX_E:
@@ -1182,57 +1347,12 @@ def gluon_precomputed_topk_fused_route(
             f"precomputed fused route supports 1 <= num_experts <= {GLUON_ROUTE_MAX_E}, "
             f"got {num_experts}"
         )
-    if M * topk > GLUON_ROUTE_MAX_G:
+    if M * topk > PRECOMPUTED_ROUTE_MAX_G:
         raise ValueError(
-            f"precomputed fused route requires M*topk <= {GLUON_ROUTE_MAX_G}, "
+            f"precomputed fused route requires M*topk <= {PRECOMPUTED_ROUTE_MAX_G}, "
             f"got {M * topk}"
         )
-    G = M * topk
-    device = topk_ids.device
-    topk_weights = topk_weights.contiguous()
-    topk_ids = topk_ids.contiguous()
-
-    slice_sizes = torch.empty(num_experts, dtype=torch.int32, device=device)
-    slice_offs = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
-    block_offs_data = torch.empty(
-        _ROUTE_NB, num_experts + 1, dtype=torch.int32, device=device
-    )
-    maxblk = RaggedTensorMetadata.max_n_blocks(num_experts, G)
-    block_schedule_data = torch.empty(
-        _ROUTE_NB, maxblk, dtype=torch.int32, device=device
-    )
-    gather_indx = torch.empty(G, dtype=torch.int32, device=device)
-    scatter_indx = torch.empty(G, dtype=torch.int32, device=device)
-    gate_scal = torch.empty(G, dtype=dtype, device=device)
-
-    _fused_precomputed_topk_route_small_m[(1,)](
-        topk_weights,
-        topk_ids,
-        slice_sizes,
-        slice_offs,
-        block_offs_data,
-        block_schedule_data,
-        gather_indx,
-        scatter_indx,
-        gate_scal,
-        topk_weights.stride(0),
-        topk_ids.stride(0),
-        M=M,
-        E=num_experts,
-        TOPK=topk,
-        GP=_route_next_pow2(G),
-        EP=_route_next_pow2(num_experts),
-        MAXBLK=maxblk,
-        MAXBLKP=_route_next_pow2(maxblk),
-        NB_C=_ROUTE_NB,
-        bo_stride=block_offs_data.stride(0),
-        bs_stride=block_schedule_data.stride(0),
-        num_warps=1,
-    )
-    ragged = RaggedTensorMetadata(
-        slice_sizes, slice_offs, block_offs_data, block_schedule_data
-    )
-    return ragged, gather_indx, scatter_indx, gate_scal
+    return _launch_precomputed_topk_route(topk_weights, topk_ids, num_experts, dtype)
 
 
 def _biased_grouped_topk_reference(
