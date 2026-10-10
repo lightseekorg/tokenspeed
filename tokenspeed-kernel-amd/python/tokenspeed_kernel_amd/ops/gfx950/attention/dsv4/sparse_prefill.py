@@ -66,6 +66,7 @@ def gluon_dsv4_prefill_sparse_k64_gfx950(
     num_queries,
     num_kv_rows,
     num_iters,
+    num_heads,
     scale,
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,
@@ -166,10 +167,12 @@ def gluon_dsv4_prefill_sparse_k64_gfx950(
     q_smem = gl.allocate_shared_memory(
         q.dtype.element_ty, [BLOCK_H, BLOCK_D], q_smem_layout
     )
+    # Heads past ``num_heads`` (fewer than BLOCK_H) read zero queries.
     cdna4_async.buffer_load_to_shared(
         q_smem,
         q + query_idx * stride_qm,
         q_off,
+        mask=(head_off[:, None] < num_heads) & (dim_off[None, :] < BLOCK_D),
         cache_modifier=".cg",
     )
     cdna4_async.commit_group()
@@ -180,6 +183,8 @@ def gluon_dsv4_prefill_sparse_k64_gfx950(
     running_max = (
         gl.load(
             attn_sink + sink_head,
+            mask=sink_head < num_heads,
+            other=-float("inf"),
         ).to(gl.float32)
         * LOG2E
     )
@@ -423,6 +428,7 @@ def gluon_dsv4_prefill_sparse_k64_gfx950(
     gl.store(
         o + query_idx * stride_om + out_off,
         output_lo,
+        mask=(out_head[:, None] < num_heads) & (out_dim[None, :] < BLOCK_D),
     )
     output_hi = gl.convert_layout(output_hi, store_layout)
     out_off = (
@@ -431,6 +437,7 @@ def gluon_dsv4_prefill_sparse_k64_gfx950(
     gl.store(
         o + query_idx * stride_om + out_off,
         output_hi,
+        mask=(out_head[:, None] < num_heads) & (out_dim[None, :] < BLOCK_D),
     )
 
 
@@ -456,6 +463,7 @@ def gluon_dsv4_prefill_sparse_k32_gfx950(
     num_queries,
     num_kv_rows,
     num_iters,
+    num_heads,  # unused: K32 runs full 64-head blocks only
     scale,
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,
@@ -828,7 +836,7 @@ def gluon_dsv4_sparse_prefill_gfx950(
 
     s, h, d = q.shape
     assert d == 512
-    assert h in (64, 128)
+    assert h <= 64 or h == 128
     assert indices.shape[0] == s
     assert indices.stride(1) == 1
     assert indices.size(1) >= 128
@@ -848,6 +856,9 @@ def gluon_dsv4_sparse_prefill_gfx950(
         softmax_scale = d**-0.5
     if block_k is None:
         block_k = _select_block_k(s, h)
+    if h < 64:
+        # Only the K64 kernel masks the missing heads of a 64-head block.
+        block_k = 64
     assert block_k in (32, 64)
     assert topk3.size(2) % block_k == 0
 
@@ -879,6 +890,7 @@ def gluon_dsv4_sparse_prefill_gfx950(
         s,
         kv3.shape[1],
         topk3.size(2) // block_k,
+        h,
         float(softmax_scale),
         BLOCK_H=64,
         BLOCK_D=512,
