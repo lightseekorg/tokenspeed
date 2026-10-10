@@ -177,6 +177,15 @@ _ROUTE_OWNED_MIN_M = 1
 
 
 _DIRECT_STAGE2_BLOCK_N = 16
+# Direct decode programs are single waves that stream a few KB per K tile, so
+# memory latency, not bandwidth, bounds small batches. Stage 2 loads all K
+# tiles of a slot before its MFMAs (up to this many tiles); stage 1 keeps a
+# chunk of K tiles in flight for the smallest batches. Identical results; V4.1
+# TP4 with serving top-k ids, whole MoE under CUDA graphs: M=1 40.0 -> 22.8 us,
+# M=6 48.7 -> 39.9 us, M=12 71.2 -> 64.9 us.
+_DIRECT_STAGE2_LOAD_MAX_KT = 8
+_DIRECT_STAGE1_LOAD_CHUNK = 8
+_DIRECT_STAGE1_CHUNK_MAX_M = 3
 
 
 _SITU_INTERMEDIATE_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
@@ -942,10 +951,16 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         topk_ids,
         inter,
         top_k,
-        BLOCK_N=16 if n_tokens <= 2 else 32,
+        BLOCK_N=16 if n_tokens <= _DIRECT_STAGE1_CHUNK_MAX_M else 32,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
+        LOAD_CHUNK=(
+            _DIRECT_STAGE1_LOAD_CHUNK
+            if n_tokens <= _DIRECT_STAGE1_CHUNK_MAX_M
+            and triton.cdiv(int(q_hidden.shape[1]), 64) % _DIRECT_STAGE1_LOAD_CHUNK == 0
+            else 0
+        ),
     )
     q_inter, q_inter_scale = _quantize_mxfp4_activation(inter)
     if out is None:
@@ -962,6 +977,11 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         out,
         top_k,
         BLOCK_N=_DIRECT_STAGE2_BLOCK_N,
+        LOAD_SLOTS=(
+            1
+            if triton.cdiv(int(q_inter.shape[1]), 64) <= _DIRECT_STAGE2_LOAD_MAX_KT
+            else 0
+        ),
     )
     return out
 

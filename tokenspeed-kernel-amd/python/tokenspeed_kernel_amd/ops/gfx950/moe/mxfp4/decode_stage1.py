@@ -75,6 +75,76 @@ def _direct_swiglu_reduce(
 
 
 @gluon.jit
+def _direct_mxfp4_load_chunk(
+    first_kt,
+    LOAD_CHUNK: gl.constexpr,
+    ak,
+    bk,
+    ask,
+    bsk,
+    am,
+    asm,
+    x_ptr,
+    x_scale_ptr,
+    w_ptr,
+    w_scale_ptr,
+    x_row_off,
+    w_expert_off,
+    s_expert_off,
+    n_cols,
+    n_cols_s,
+    x_scale_row,
+    stride_xk,
+    stride_xslin,
+    stride_xsnb,
+    stride_slin,
+    stride_snb,
+    N_PHYS,
+    K_DIM,
+    N_DIM,
+    K_PACKED: gl.constexpr,
+    BLOCK_K_PACKED: gl.constexpr,
+    BLOCK_K_SCALE: gl.constexpr,
+):
+    """Issue the loads of LOAD_CHUNK consecutive K tiles."""
+    tiles = ()
+    for j in gl.static_range(0, LOAD_CHUNK):
+        tiles += (
+            _direct_mxfp4_load_tile(
+                first_kt + j,
+                ak,
+                bk,
+                ask,
+                bsk,
+                am,
+                asm,
+                x_ptr,
+                x_scale_ptr,
+                w_ptr,
+                w_scale_ptr,
+                x_row_off,
+                w_expert_off,
+                s_expert_off,
+                n_cols,
+                n_cols_s,
+                x_scale_row,
+                stride_xk,
+                stride_xslin,
+                stride_xsnb,
+                stride_slin,
+                stride_snb,
+                N_PHYS,
+                K_DIM,
+                N_DIM,
+                K_PACKED,
+                BLOCK_K_PACKED,
+                BLOCK_K_SCALE,
+            ),
+        )
+    return tiles
+
+
+@gluon.jit
 def _stage1_mxfp4_direct_mfma_gluon(
     hidden_ptr,  # (M, D/2) uint8 e2m1 packed, token order
     hidden_scale_ptr,  # (Kscale_pad*32, ceil(M/32)) uint8 CDNA4 swizzled
@@ -106,6 +176,7 @@ def _stage1_mxfp4_direct_mfma_gluon(
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
     SWIGLU_BETA: gl.constexpr,
+    LOAD_CHUNK: gl.constexpr,
 ):
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
@@ -155,7 +226,82 @@ def _stage1_mxfp4_direct_mfma_gluon(
     TOTAL_KT: gl.constexpr = gl.cdiv(K_PACKED, BLOCK_K_PACKED)
     acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
 
-    if token < M:
+    if token < M and LOAD_CHUNK > 0:
+        gl.static_assert(TOTAL_KT % LOAD_CHUNK == 0, "LOAD_CHUNK must divide K tiles")
+        NUM_CHUNKS: gl.constexpr = TOTAL_KT // LOAD_CHUNK
+        # Keep LOAD_CHUNK K tiles in flight: load the next chunk while the
+        # current one runs its MFMAs (same accumulation order as below).
+        tiles = _direct_mxfp4_load_chunk(
+            0,
+            LOAD_CHUNK,
+            ak,
+            bk,
+            ask,
+            bsk,
+            am,
+            asm,
+            hidden_ptr,
+            hidden_scale_ptr,
+            w1_ptr,
+            w1s_ptr,
+            x_row_off,
+            w_expert_off,
+            s_expert_off,
+            n_cols,
+            n_cols_s,
+            token,
+            stride_xk,
+            stride_xslin,
+            stride_xsnb,
+            stride_slin,
+            stride_snb,
+            N_PHYS,
+            D,
+            TWO_I,
+            K_PACKED,
+            BLOCK_K_PACKED,
+            BLOCK_K_SCALE,
+        )
+        for chunk in range(1, NUM_CHUNKS):
+            next_tiles = _direct_mxfp4_load_chunk(
+                chunk * LOAD_CHUNK,
+                LOAD_CHUNK,
+                ak,
+                bk,
+                ask,
+                bsk,
+                am,
+                asm,
+                hidden_ptr,
+                hidden_scale_ptr,
+                w1_ptr,
+                w1s_ptr,
+                x_row_off,
+                w_expert_off,
+                s_expert_off,
+                n_cols,
+                n_cols_s,
+                token,
+                stride_xk,
+                stride_xslin,
+                stride_xsnb,
+                stride_slin,
+                stride_snb,
+                N_PHYS,
+                D,
+                TWO_I,
+                K_PACKED,
+                BLOCK_K_PACKED,
+                BLOCK_K_SCALE,
+            )
+            for j in gl.static_range(0, LOAD_CHUNK):
+                a, b, a_scale, b_scale = tiles[j]
+                acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
+            tiles = next_tiles
+        for j in gl.static_range(0, LOAD_CHUNK):
+            a, b, a_scale, b_scale = tiles[j]
+            acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
+    elif token < M:
         for kt in range(0, TOTAL_KT):
             a, b, a_scale, b_scale = _direct_mxfp4_load_tile(
                 kt,
@@ -225,6 +371,7 @@ def invoke_stage1_mxfp4_mfma_decode_gluon(
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
+    LOAD_CHUNK: int = 0,
 ):
     assert hidden_states_mxfp4.dtype == torch.uint8
     assert hidden_scale.dtype == torch.uint8
@@ -277,6 +424,7 @@ def invoke_stage1_mxfp4_mfma_decode_gluon(
         SWIGLU_ALPHA=float(swiglu_alpha),
         SWIGLU_LIMIT=float(swiglu_limit),
         SWIGLU_BETA=float(swiglu_beta),
+        LOAD_CHUNK=LOAD_CHUNK,
         num_warps=1,
     )
     return out
