@@ -199,6 +199,8 @@ def find_matched_target(
     Third, we try to map the layer_name to a list of fused module names.
         *All* component module names must match in order for a match to be
         successful. A successful match returns the first component target
+    Last, a target naming a class of the module (compressed-tensors' class
+        match: any class in its MRO, ``Linear`` for every ``LinearBase``)
 
     :param layer_name: layer name
     :param module: torch.nn.Module
@@ -215,6 +217,7 @@ def find_matched_target(
         _find_first_match(layer_name, targets)
         or _find_first_match(module.__class__.__name__, targets, True)
         or _match_fused_layer(layer_name, targets, fused_mapping)
+        or next((t for t in targets if matches_module_class(module, t)), None)
     )
 
     if matched_target is None:
@@ -224,6 +227,16 @@ def find_matched_target(
         )
 
     return matched_target
+
+
+def matches_module_class(module: Module, target: str) -> bool:
+    """Whether ``target`` names a class of ``module`` as compressed-tensors
+    matches ``targets`` and ``ignore`` entries: a class in the module's MRO,
+    with ``Linear`` naming every ``LinearBase``."""
+    return any(
+        cls.__name__ == target or (cls.__name__ == "LinearBase" and target == "Linear")
+        for cls in type(module).__mro__
+    )
 
 
 def _find_first_match(
