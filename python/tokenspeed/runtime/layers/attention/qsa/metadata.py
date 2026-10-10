@@ -65,6 +65,15 @@ def decode_query_lengths(
 
 
 @dataclass(frozen=True)
+class QSASelection:
+    """One indexer layer's equivalent logical-block and physical-slot selections."""
+
+    selected_slots: torch.Tensor
+    selected_blocks: torch.Tensor
+    block_size: int
+
+
+@dataclass(frozen=True)
 class QSALayout:
     """Layer-invariant cache geometry for one QSA model forward."""
 
