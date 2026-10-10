@@ -301,7 +301,10 @@ The `kernel-benchmark-amd-gfx950` performance task compares exact kernel
 registrations between two revisions. The `AMD Kernel Benchmark` workflow
 discovers it as a dedicated `kernel-benchmark` stage and runs it without
 waiting for `AMD Tests`, so the benchmark starts alongside unit tests. A
-benchmark failure fails `AMD Kernel Benchmark`, not `AMD Tests`.
+benchmark failure fails `AMD Kernel Benchmark`, not `AMD Tests`. Like the other
+PR test workflows, its `finish` job reports the `finish` check that the default
+branch requires. A failed benchmark, or a failed scan that keeps the benchmark
+from running, therefore blocks merging.
 
 Pull request runs compare the pull request's merge base with its head commit.
 Main-branch pushes compare the previous and new commits. A manual

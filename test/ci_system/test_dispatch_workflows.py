@@ -325,8 +325,40 @@ def test_amd_kernel_benchmarks_run_in_their_own_workflow():
         "github.event.pull_request.head.sha"
         in benchmark["with"]["comparison_candidate_ref"]
     )
-    assert jobs["finish"]["needs"] == ["kernel-benchmark"]
     assert "always()" in jobs["finish"]["if"]
+
+
+@pytest.mark.parametrize(
+    ("scan", "benchmark", "passes"),
+    [
+        ("success", "success", True),
+        ("success", "skipped", True),
+        ("success", "failure", False),
+        ("success", "cancelled", False),
+        # A failed scan skips the benchmark and must not pass the gate.
+        ("failure", "skipped", False),
+        ("cancelled", "skipped", False),
+    ],
+)
+def test_amd_kernel_benchmark_gate_blocks_on_failure(scan, benchmark, passes):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-kernel-benchmark.yml")
+    # The default-branch ruleset requires a check named `finish`; a renamed
+    # gate job would stop blocking merges.
+    finish = workflow["jobs"]["finish"]
+    assert "name" not in finish
+    assert finish["needs"] == ["scan", "kernel-benchmark"]
+    (step,) = finish["steps"]
+    completed = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            **os.environ,
+            "SCAN_RESULT": scan,
+            "KERNEL_BENCHMARK_RESULT": benchmark,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert (completed.returncode == 0) == passes
 
 
 def test_kernel_benchmark_task_uses_shared_ci_contract():

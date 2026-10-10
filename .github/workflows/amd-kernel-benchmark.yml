@@ -127,6 +127,9 @@ jobs:
       comparison_candidate_ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'push' && github.event.after || github.sha }}
     secrets: inherit
 
+  # The default-branch ruleset requires a check named `finish`, which matches
+  # this job as well as the other PR test workflows' gates. Keep the name so a
+  # benchmark failure blocks merging.
   finish:
     if: |
       always() &&
@@ -135,13 +138,19 @@ jobs:
         github.repository == 'lightseekorg/tokenspeed' ||
         github.repository == vars.TOKENSPEED_CI_REPOSITORY
       )
-    needs: [kernel-benchmark]
+    needs: [scan, kernel-benchmark]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
         env:
+          SCAN_RESULT: ${{ needs.scan.result }}
           KERNEL_BENCHMARK_RESULT: ${{ needs.kernel-benchmark.result }}
         run: |
+          # A failed scan skips the benchmark; do not let that pass the gate.
+          if [[ "$SCAN_RESULT" != "success" ]]; then
+            echo "Kernel benchmark scan did not succeed: result=$SCAN_RESULT"
+            exit 1
+          fi
           if [[ "$KERNEL_BENCHMARK_RESULT" != "success" && "$KERNEL_BENCHMARK_RESULT" != "skipped" ]]; then
             echo "Kernel benchmark did not finish successfully: result=$KERNEL_BENCHMARK_RESULT"
             exit 1
