@@ -190,6 +190,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
@@ -224,6 +225,7 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
@@ -265,6 +267,7 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
     const auto cache_device = [&](const CacheKey& key) {
@@ -310,6 +313,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
@@ -345,6 +349,7 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
@@ -399,6 +404,7 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false);
 
     std::vector<BlockTable> tables(1);
@@ -474,7 +480,8 @@ TEST(CacheOperationTest, ComputedStateChunkDoesNotQueueAStoreButEndpointUsesNorm
         BlockPool pool(2, {1});
         BlockPool host_pool(2, {1});
         const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
-        auto coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, true);
+        auto coordinator =
+            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr, true);
         TierTransferManager transfers(coordinator);
         const std::vector<std::string> hashes{"state2"};
         const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
@@ -504,11 +511,12 @@ TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorki
     BlockPool pool(1, {1});
     BlockPool host_pool(1, {1});
     const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
-    auto coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, false);
+    auto coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr, false);
     TierTransferManager transfers(coordinator);
     const std::vector<std::string> hashes{"restored-state"};
     const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
-    CacheBlockRef source = coordinator.AcquireHostBlock(0);
+    CacheBlockRef source = coordinator.AcquireHostBlock(0, /*bucket=*/0);
     ASSERT_TRUE(source);
     coordinator.CacheHostBlock(source, key);
     std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
@@ -577,6 +585,7 @@ TEST(CacheOperationTest, L3StorageHitsAllocateHostPrefetch) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     ASSERT_TRUE(coordinator.EnablesL3Storage());
 
@@ -607,6 +616,7 @@ TEST(CacheOperationTest, FailedLoadBackDoesNotPublishPrefetchedHost) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
     coordinator.RegisterStorageKeys(std::array{key});
@@ -638,6 +648,7 @@ TEST(CacheOperationTest, SuccessfulLoadBackPublishesPrefetchedHost) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
     coordinator.RegisterStorageKeys(std::array{key});
@@ -675,6 +686,7 @@ TEST(CacheOperationTest, MixedHostAndL3LoadBackPublishesEveryDeviceDestination) 
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     CacheBlockRef host_block = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(host_block);
@@ -720,6 +732,7 @@ TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false);
     ASSERT_FALSE(coordinator.EnablesL3Storage());
 
@@ -756,6 +769,7 @@ TEST(CacheOperationTest, L3StorageMissCanBeUnregistered) {
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/true);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
     coordinator.RegisterStorageKeys(std::array{key});
@@ -777,6 +791,7 @@ TEST(CacheOperationTest, L3UnregisterPrunesStorageKeyOrder) {
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/true);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
     for (int cycle = 0; cycle < 8; ++cycle) {
@@ -809,6 +824,7 @@ TEST(CacheOperationTest, MultiGroupL3AllocationFailureTrimsEarlierPins) {
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/true);
     const std::array keys{
         CacheKey{.group_id = 0, .content_hash = "h0"},
@@ -835,6 +851,7 @@ TEST(CacheOperationTest, ExpandPrefixKeysCoversGroupsAndOffsets) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const std::vector<CacheKey> keys = coordinator.ExpandPrefixKeys(std::array<std::string, 1>{"h0"});
     ASSERT_EQ(keys.size(), 2u);
@@ -870,6 +887,7 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
 
     const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
@@ -885,7 +903,7 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
     ASSERT_TRUE(coordinator.ContainsHostCachedBlock(key_h0));
     ASSERT_TRUE(coordinator.ContainsStorageKey(key_h0));
 
-    CacheBlockRef replacement = coordinator.AcquireHostBlock(/*group_id=*/0);
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(/*group_id=*/0, /*bucket=*/0);
     ASSERT_TRUE(replacement);
     replacement.reset();
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key_h0)) << "Host eviction must drop the L2 index entry";
@@ -919,6 +937,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowIsBoundedToHostCapacity) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
     const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
@@ -955,6 +974,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowEvictsProtectedSuffixToKeepPrefix) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
     const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
@@ -992,6 +1012,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowKeepsSharedPrefixAcrossGroups) {
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const std::array hashes{std::string{"h0"}, std::string{"h1"}, std::string{"h2"}};
     coordinator.RegisterStorageKeys(coordinator.ExpandPrefixKeys(hashes));
@@ -1017,6 +1038,7 @@ TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
@@ -1054,6 +1076,7 @@ TEST(CacheOperationTest, SlidingWindowL3ShortageRematchesLookback) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
@@ -1085,6 +1108,7 @@ TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
     const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
@@ -1116,6 +1140,7 @@ TEST(CacheOperationTest, L3HostShortageRoundsDownToPrefixGranularity) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
@@ -1157,6 +1182,7 @@ TEST(CacheOperationTest, L3HostShortageDoesNotSkipACoarserGroup) {
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);

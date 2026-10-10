@@ -32,6 +32,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
     std::vector<CacheKey> keys;
     std::vector<CacheBlockRef> device_block_refs;
     std::vector<std::uint32_t> group_ids;
+    std::vector<std::int32_t> buckets;
     // Keys already travelling: every ticket of every in-flight write-back.
     // Derived from write_backs_ on demand rather than mirrored in a second
     // container that would have to be kept in step with it. Candidates join
@@ -53,6 +54,9 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         }
 
         group_ids.push_back(candidate.key.group_id);
+        // The Host copy lives in its Device source's bucket (same owner).
+        buckets.push_back(coordinator_.Allocator(static_cast<std::int32_t>(candidate.key.group_id))
+                              .BucketOf(device_block_ref->Location()));
         keys.push_back(std::move(candidate.key));
         device_block_refs.push_back(std::move(device_block_ref));
     }
@@ -61,7 +65,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         return std::nullopt;
     }
 
-    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids);
+    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids, buckets);
     _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
 
     const bool pin_source = guard == StoreSourceGuard::kPinnedUntilAck;

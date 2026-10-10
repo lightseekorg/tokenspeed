@@ -196,31 +196,39 @@ struct BlockTransfer {
 };
 
 // One imaged block of a retracted request's table: the logical slot it sat
-// in and the snapshot-pool block that holds its bytes. The snapshot block is
-// in the same bucket (slot % shard_count) as the Device block it images, so
+// in and the Host block that holds its bytes. A slot whose Device block was
+// a published prefix entry rides Host L2 as that entry (key set; the image
+// pins the entry until the restore lands); every other slot -- the unaligned
+// tail page, unpublished pages, groups that never publish -- rides the
+// request-private snapshot pool (key empty). Either way the Host block is in
+// the same bucket (slot % shard_count) as the Device block it images, so
 // under page-cyclic sharding the rank that owns the Device page owns the
-// snapshot page too; a restore reads the bucket back off this reference.
-struct SnapshotSlot {
+// Host page too; a restore reads the bucket back off this reference.
+struct ImageSlot {
     std::int32_t slot_index{0};
-    CacheBlockRef host_block;
+    CacheBlockRef block;
+    CacheKey key{};
+
+    bool InHostCache() const noexcept { return !key.content_hash.empty(); }
 };
 
 // One cache group's table as it stood at retraction, truncated to the slots
 // that hold computed data: the restore rebuilds exactly this shape (block
 // count, null holes, unconsumed tail capacity, reclaimed prefix) with fresh
 // Device blocks and re-reserves whatever lay beyond.
-struct SnapshotTable {
+struct ImageTable {
     std::int32_t num_blocks{0};
     std::int32_t reclaimed_prefix_blocks{0};
     std::int32_t available_tokens{0};
-    std::vector<SnapshotSlot> slots;
+    std::vector<ImageSlot> slots;  // ascending slot_index
 };
 
-// A retracted request's KV, imaged into the request-private snapshot pool:
-// one SnapshotTable per cache group. The references are the only owners of
-// the snapshot blocks; dropping the image returns them to the pool.
-struct RetractionSnapshot {
-    std::vector<SnapshotTable> tables;
+// A retracted request's KV image: one ImageTable per cache group. The
+// references are what keeps the Host blocks for the request -- a snapshot
+// block's only owner, a Host L2 entry's pin -- and dropping the image
+// releases both.
+struct RetractionImage {
+    std::vector<ImageTable> tables;
 };
 
 }  // namespace tokenspeed

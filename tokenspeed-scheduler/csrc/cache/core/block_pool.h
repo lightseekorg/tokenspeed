@@ -203,39 +203,6 @@ public:
                         : std::vector<CacheBlockRef>{};
     }
 
-    std::vector<CacheBlockRef> AcquireAvailableBlocksInOrder(std::span<const std::uint32_t> group_ids) {
-        for (std::uint32_t group_id : group_ids) {
-            (void)placement(group_id);
-        }
-        std::vector<CacheBlockRef> out(group_ids.size());
-        for (std::size_t i = 0; i < group_ids.size(); ++i) {
-            out[i] = AcquireBlock(group_ids[i]);
-        }
-        return out;
-    }
-
-    std::vector<CacheBlockRef> AcquireUpToBlocksFromEmptyParent(std::uint32_t group_id, std::int32_t lcm_block_id,
-                                                                std::int32_t max_num) {
-        const auto cache_blocks_per_lcm_block = placement(group_id).packing;
-        if (max_num <= 0) {
-            return {};
-        }
-        const LcmBlock& parent = lcmBlock(lcm_block_id);
-        _assert(parent.occupied_count == 0 && !parent.bound_group, "directed Host parent must be empty");
-        _assert(!free_parent_ids_.empty() && free_parent_ids_.front() == lcm_block_id,
-                "directed Host parent must be the next free parent");
-
-        const std::int32_t take = std::min(max_num, cache_blocks_per_lcm_block);
-        (void)prepareAvailability(group_id, cache_blocks_per_lcm_block);
-        std::vector<CacheBlockRef> out;
-        out.reserve(static_cast<std::size_t>(take));
-        for (std::int32_t slot = 0; slot < take; ++slot) {
-            out.push_back(createBlockRef(group_id, cache_blocks_per_lcm_block,
-                                         CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = slot}));
-        }
-        return out;
-    }
-
     std::optional<std::uint32_t> BoundGroup(std::int32_t lcm_block_id) const {
         return lcmBlock(lcm_block_id).bound_group;
     }
