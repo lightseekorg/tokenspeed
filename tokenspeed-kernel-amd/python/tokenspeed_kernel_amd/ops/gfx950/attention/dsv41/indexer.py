@@ -718,9 +718,20 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
     if (
         logits.stride(1) != 1
         or row_out.stride(1) != 1
+        or row_lens.stride(0) != 1
         or (candidates is not None and candidates.stride(1) != 1)
     ):
         raise ValueError("select requires unit inner strides")
+    # The kernel writes row_out[q, :topk] and row_lens[q], and reads
+    # candidates[q, col // 8] for every logits column.
+    if row_out.shape[0] != queries or row_out.shape[1] < topk:
+        raise ValueError(f"row_out must be [{queries}, >= {topk}]")
+    if row_lens.shape != (queries,):
+        raise ValueError(f"row_lens must be [{queries}]")
+    if candidates is not None and (
+        candidates.shape[0] != queries or candidates.shape[1] * 8 < width
+    ):
+        raise ValueError(f"candidates must be [{queries}, >= {-(-width // 8)}]")
     cand = logits if candidates is None else candidates
     gluon_dsv41_index_topk_select_gfx950[(queries,)](
         logits,

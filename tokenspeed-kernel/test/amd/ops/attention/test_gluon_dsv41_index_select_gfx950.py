@@ -123,3 +123,31 @@ def test_select_batch_shapes_share_one_binary():
     with assert_no_triton_compile(indexer.gluon_dsv41_index_topk_select_gfx950):
         for queries, width in ((2, 64), (32, 2048), (192, 4608), (7, 16384)):
             _select(select, _logits(queries, width, generator), None, 512)
+
+
+def test_select_rejects_layouts_the_kernel_would_misaddress():
+    generator = torch.Generator(device=DEVICE).manual_seed(4)
+    queries, width, topk = 4, 64, 16
+    logits = _logits(queries, width, generator)
+    candidates = _candidates(queries, 2 * width, True, generator)
+    rows = torch.empty(queries, topk, dtype=torch.int32, device=DEVICE)
+    lens = torch.empty(queries, dtype=torch.int32, device=DEVICE)
+    launch = indexer.launch_gluon_dsv41_index_topk_select_gfx950
+    for bad in (
+        # Strided candidates would map picks to the wrong block ids.
+        dict(candidates=candidates[:, ::2]),
+        # Too few candidate blocks for the logits width reads past each row.
+        dict(candidates=candidates[:, : width // 8 - 1]),
+        dict(row_out=rows[:, : topk - 1]),
+        dict(row_lens=torch.empty(2 * queries, dtype=torch.int32, device=DEVICE)[::2]),
+    ):
+        args = dict(
+            logits=logits,
+            candidates=candidates[:, : width // 8],
+            topk=topk,
+            row_out=rows,
+            row_lens=lens,
+        )
+        args.update(bad)
+        with pytest.raises(ValueError):
+            launch(**args)
