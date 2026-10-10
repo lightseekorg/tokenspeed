@@ -136,7 +136,8 @@ def test_mxfp8_gemm_row_count():
     run(2048)
     run(768)
     with assert_no_triton_compile(mm.gluon_mm_mxfp8_gfx950):
-        for rows in (256, 1280, 1792):
+        # Ragged counts shift their last tile instead of specializing on M.
+        for rows in (256, 300, 1280, 1531, 1792, 2559):
             # Rows are independent: a shorter batch is a prefix.
             torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
 

@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip(
@@ -36,6 +36,9 @@ from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.profiling import ShapeCapture  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (  # noqa: E402
     _mxfp8_launch_metadata,
+    _mxfp8_num_splits,
+    gluon_mm_mxfp8_gfx950,
+    gluon_mm_mxfp8_reduce_gfx950,
     launch_gluon_mm_mxfp8_gfx950,
     supports_mxfp8_gemm_shape,
 )
@@ -89,8 +92,68 @@ def test_mxfp8_gemm_matches_dequantized_reference(k: int) -> None:
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
-def test_mxfp8_gemm_accepts_row_padded_operands_and_strided_scales() -> None:
-    m, n, k = 256, 256, 512
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        # Ragged M tile, N not a multiple of 256, split-K partials.
+        (641, 1152, 5120),
+        # Ragged M and N tiles, unsplit.
+        (1531, 1296, 1280),
+        # K tail (18 scale groups): shifted K walk, preloaded scale rows.
+        (8175, 5120, 576),
+        # Fewer rows and columns than one tile, K tail of 800.
+        (37, 208, 800),
+    ],
+)
+def test_mxfp8_gemm_ragged_shapes_match_dequantized_reference(
+    m: int, n: int, k: int
+) -> None:
+    a, b, a_scales, b_scales = _inputs(m, n, k)
+
+    actual = launch_gluon_mm_mxfp8_gfx950(
+        a,
+        b,
+        a_scales,
+        b_scales,
+        torch.bfloat16,
+        alpha=None,
+        block_size=[1, 32],
+        out=None,
+    )
+    expected = (_dequantize(a, a_scales) @ _dequantize(b, b_scales).T).to(actual.dtype)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("k", [5120, 576])
+def test_mxfp8_gemm_row_counts_reuse_compiled_kernels(k: int) -> None:
+    n = 1152
+    a, b, a_scales, b_scales = _inputs(8192, n, k)
+
+    def run(rows: int) -> None:
+        launch_gluon_mm_mxfp8_gfx950(
+            a[:rows],
+            b,
+            a_scales[:rows],
+            b_scales,
+            torch.bfloat16,
+            alpha=None,
+            block_size=[1, 32],
+            out=None,
+        )
+
+    # Warm the split-K and the direct-output launches.
+    run(641)
+    run(8192)
+    with assert_no_triton_compile(gluon_mm_mxfp8_gfx950, gluon_mm_mxfp8_reduce_gfx950):
+        for rows in (300, 1531, 2049, 6622, 8175):
+            run(rows)
+
+
+@pytest.mark.parametrize("k", [512, 1056])
+def test_mxfp8_gemm_accepts_row_padded_operands_and_strided_scales(k: int) -> None:
+    # K=1056 also takes the K-tail path with direct scale loads.
+    m, n = 300, 256
     a_backing = (
         torch.randn((m, k + 16), device="cuda", dtype=torch.bfloat16) * 0.05
     ).to(torch.float8_e4m3fn)
@@ -154,15 +217,17 @@ def test_mxfp8_gemm_async_scales_accept_row_padding() -> None:
 
 
 @pytest.mark.parametrize(
-    "m,n,k,expected",
+    "m,n,k,selected",
     [
-        (1024, 1792, 5120, "gluon_mm_mxfp8_gfx950"),
-        (256, 4096, 1280, "triton_mm_fp8_blockscale"),
-        (1024, 256, 512, "triton_mm_fp8_blockscale"),
+        (1024, 1792, 5120, True),
+        (8175, 1152, 5120, True),
+        (641, 5120, 576, True),
+        (257, 256, 512, True),
+        (256, 4096, 1280, False),
     ],
 )
-def test_mxfp8_gemm_public_api_selects_measured_prefill_shapes(
-    m: int, n: int, k: int, expected: str
+def test_mxfp8_gemm_public_api_selects_prefill_rows(
+    m: int, n: int, k: int, selected: bool
 ) -> None:
     a, b, a_scales, b_scales = _inputs(m, n, k)
     ShapeCapture.reset()
@@ -181,7 +246,8 @@ def test_mxfp8_gemm_public_api_selects_measured_prefill_shapes(
     finally:
         capture.enabled = False
 
-    assert capture._records[-1].kernel_name == expected
+    kernel_name = capture._records[-1].kernel_name
+    assert (kernel_name == "gluon_mm_mxfp8_gfx950") == selected
 
 
 def test_mxfp8_gemm_rejects_non_mxfp8_scale_contract() -> None:
@@ -201,26 +267,39 @@ def test_mxfp8_gemm_rejects_non_mxfp8_scale_contract() -> None:
 
 
 def test_mxfp8_shape_contract() -> None:
-    assert supports_mxfp8_gemm_shape(256, 1536, 4096)
-    assert supports_mxfp8_gemm_shape(256, 16384, 1024)
-    assert supports_mxfp8_gemm_shape(256, 4096, 1280)
-    assert supports_mxfp8_gemm_shape(1024, 1792, 5120)
-    assert not supports_mxfp8_gemm_shape(128, 4096, 1280)
-    assert not supports_mxfp8_gemm_shape(256, 3968, 1280)
-    assert not supports_mxfp8_gemm_shape(256, 4096, 384)
+    assert supports_mxfp8_gemm_shape(8175, 1152, 5120)
+    assert supports_mxfp8_gemm_shape(641, 5120, 576)
+    assert supports_mxfp8_gemm_shape(1, 16, 288)
+    assert not supports_mxfp8_gemm_shape(256, 4100, 1280)
+    assert not supports_mxfp8_gemm_shape(256, 4096, 256)
+    assert not supports_mxfp8_gemm_shape(256, 4096, 400)
 
 
-def test_mxfp8_launch_metadata_reports_flops_and_tensor_bytes() -> None:
+def test_mxfp8_split_k_only_for_underfilled_long_k_launches() -> None:
+    assert _mxfp8_num_splits(641, 1152, 5120) > 1
+    assert _mxfp8_num_splits(8192, 1152, 5120) == 1
+    assert _mxfp8_num_splits(641, 8192, 1280) == 1
+
+
+@pytest.mark.parametrize(
+    ("splits", "out_dtype"), [(1, torch.bfloat16), (4, torch.float32)]
+)
+def test_mxfp8_launch_metadata_reports_flops_and_tensor_bytes(
+    splits: int, out_dtype: torch.dtype
+) -> None:
     m, n, k = 1024, 4096, 1280
-    output = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    # Split-K writes into an FP32 [splits, M, N] partial buffer.
+    output = torch.empty((splits, m, n), device="cuda", dtype=out_dtype)
 
     metadata = _mxfp8_launch_metadata(
         None,
         SimpleNamespace(name="mxfp8"),
-        {"M": m, "N": n, "K": k, "c_ptr": output},
+        {"M": m, "N": n, "K": k, "SPLITS": splits, "c_ptr": output},
     )
 
-    expected_bytes = m * k + n * k + (m + n) * (k // 32) + m * n * 2
+    expected_bytes = (
+        m * k + n * k + (m + n) * (k // 32) + m * n * splits * output.element_size()
+    )
     assert metadata == {
         "name": "mxfp8",
         "flops8": 2 * m * n * k,

@@ -105,7 +105,8 @@ share a weight tile on one XCD's L2.
 ### gfx950 MXFP8 projection
 
 The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1
-dense projections, with portable Triton fallback outside the tuned domain.
+dense projections. Automatic selection uses it above 256 rows; smaller row
+counts belong to weight-bandwidth-bound decode kernels.
 
 #### Contract
 
@@ -115,9 +116,8 @@ dense projections, with portable Triton fallback outside the tuned domain.
   with an explicit `[1, 32]` scale block.
 - Output is BF16 or FP16. A caller-owned output may have a padded row stride,
   but its inner stride must be one.
-- The kernel requires `M` and `N` divisible by 256 and `K >= 512` divisible by
-  256. Automatic selection further requires `M >= 1024`, `N >= 1536`, and
-  `K >= 1024`.
+- `M` is arbitrary and a runtime argument. `N` must be divisible by 16, and
+  `K > 256` divisible by 32.
 
 #### Algorithm
 
@@ -131,8 +131,26 @@ E4M3 values use vectorized asynchronous global-to-LDS copies into separate,
 padded double buffers for A and B. Canonical row-major A scales use dword
 asynchronous copies. Each B-scale copy combines both N quadrants and two K
 steps in one LDS tile, then splits the four MFMA fragments in registers. Two
-waves per EU avoid spills from the longer-lived fragments. Strided scales fall
-back to direct fragment loads, and output uses vectorized buffer stores.
+waves per EU avoid spills from the longer-lived fragments. Output uses
+vectorized buffer stores.
+
+Ragged shapes keep the hot loop free of masks:
+
+- The last M or N tile is shifted back to end at the last row or column. It
+  overlaps its neighbor, and both write identical values. Only `M` or `N`
+  below one tile (a two-valued compile-time class) clamps load rows and
+  masks the store.
+- A K that is not a multiple of 256 starts the K walk below zero, so only the
+  two prologue tiles are masked; their values zero-fill. Scale rows of such a
+  K are not dword aligned. When the rounded walk is at most eight K tiles, the
+  kernel stages all of its scales in LDS once (2^0 outside K). Longer walks and
+  other unaligned scale strides load scale fragments directly.
+
+Launches that leave most CUs idle with a long K walk (medium `M` with small
+`N`) split K across workgroups. Each split writes FP32 partials, and
+`gluon_mm_mxfp8_reduce_gfx950` sums them in split order. A measured cost model
+picks the count and splits only within one wave of workgroups. The count is a
+runtime argument.
 
 ### gfx1250 MXFP8 decode projection
 

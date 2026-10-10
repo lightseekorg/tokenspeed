@@ -183,12 +183,8 @@ if current_platform().is_amd:
     )
 
     def _is_mxfp8_prefill_problem(m: int, n: int, k: int) -> bool:
-        return (
-            _supports_mxfp8_gemm_shape(m, n, k)
-            and m >= 1024
-            and n >= 1536
-            and k >= 1024
-        )
+        # Up to 256 rows, weight-bandwidth-bound decode kernels take over.
+        return _supports_mxfp8_gemm_shape(m, n, k) and m > 256
 
     @register_kernel(
         "gemm",
