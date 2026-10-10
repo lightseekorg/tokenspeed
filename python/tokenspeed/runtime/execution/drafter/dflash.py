@@ -892,10 +892,10 @@ class DFlash(BaseDrafter):
             return
         if self._kv_aux_stream is None:
             return
-        if getattr(self.draft_model_runner.model, "fc_norm", None) is not None:
+        if not self.draft_model_runner.model.supports_incremental_target_projection:
             logger.info(
-                "DFLASH incremental projection disabled: this draft normalizes "
-                "each target tap (fc_norm) before projecting."
+                "DFLASH incremental projection disabled: this draft transforms "
+                "target taps before its context projection."
             )
             return
         try:

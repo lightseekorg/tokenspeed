@@ -147,6 +147,42 @@ Notes:
   0.9704 without speculative decoding (paired disagreement 10 vs 8, McNemar
   p ~ 0.81 -- within run-to-run noise), so the draft does not move accuracy.
 
+## Qwen4-Exp DSpark
+
+Qwen4-Exp uses an external DSpark draft checkpoint. Its embedded NextN head is
+an MTP draft and cannot be selected with `--speculative-algorithm DSPARK`.
+
+```bash
+tokenspeed serve /path/to/qwen4-exp-target \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path /path/to/dspark-draft \
+    --speculative-eagle-topk 1 \
+    --drafter-attention-backend mha
+```
+
+Keep the target's hardware and attention options from its ordinary launch.
+The draft checkpoint's `block_size` determines the draft and verify widths.
+For example, `block_size: 7` requires `--speculative-num-steps 7` and
+`--speculative-num-draft-tokens 8` if the widths are supplied explicitly.
+Omit both width flags to derive them from the checkpoint.
+
+The checkpoint architecture selects the context projector:
+
+- `DSparkDraftModel`, `Qwen3DSparkModel` or `Qwen3DSparkForCausalLM` consumes
+  the raw HC branch mean at each selected target layer.
+- `HyperDSparkDraftModel`, `Qwen3HyperDSparkModel` or
+  `Qwen3HyperDSparkForCausalLM` consumes all HC branches and loads one trained
+  `hc_reducers` module per selected layer. The checkpoint must declare
+  `hc_count` and `hc_lowrank`, either at the top level or in `dflash_config`.
+
+`dflash_config.target_layer_ids` names zero-based completed decoder outputs in
+strictly increasing order; the final layer is supported. Hidden size, vocabulary
+and the HyperDSpark HC count must match the target. Full-vocabulary drafts may
+ship their own embedding and LM head; each omitted tensor is shared from the
+target. Reduced-vocabulary drafts requiring a draft-to-target ID map are not
+supported. Proposal uses the existing fixed-block vanilla Markov head.
+These GQA drafts do not support pipeline-parallel context production.
+
 ## Kimi K2.5 / K2.6
 
 Kimi-style MoE launches usually need remote code, long context, reasoning and

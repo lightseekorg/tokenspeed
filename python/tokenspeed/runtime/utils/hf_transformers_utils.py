@@ -71,6 +71,13 @@ from tokenspeed.runtime.utils import lru_cache_frozenset
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 logger = logging.getLogger(__name__)
 
+_DSPARK_DRAFT_ARCHITECTURE_ALIASES = {
+    "Qwen3DSparkModel": "DSparkDraftModel",
+    "Qwen3DSparkForCausalLM": "DSparkDraftModel",
+    "Qwen3HyperDSparkModel": "HyperDSparkDraftModel",
+    "Qwen3HyperDSparkForCausalLM": "HyperDSparkDraftModel",
+}
+
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
@@ -442,9 +449,31 @@ def get_config(
     if (
         is_draft_worker
         and config.architectures
-        and config.architectures[0].startswith("Qwen3DSparkModel")
+        and config.architectures[0] in _DSPARK_DRAFT_ARCHITECTURE_ALIASES
     ):
-        config.architectures[0] = "DSparkDraftModel"
+        config.architectures[0] = _DSPARK_DRAFT_ARCHITECTURE_ALIASES[
+            config.architectures[0]
+        ]
+
+    if (
+        is_draft_worker
+        and speculative_algorithm == "DSPARK"
+        and config.architectures
+        and config.architectures[0]
+        in (
+            "Qwen4ExpForConditionalGeneration",
+            "Qwen4ExpForCausalLM",
+            "Qwen4ExpForCausalLMNextN",
+        )
+    ):
+        # The target's embedded NextN head was trained for MTP, not DSpark.
+        raise ValueError(
+            "Qwen4-Exp DSpark requires an external DSpark draft checkpoint. "
+            "Set --speculative-draft-model-path to a Qwen3DSpark or "
+            "Qwen3HyperDSpark checkpoint instead of the Qwen4-Exp target "
+            "checkpoint; use --speculative-algorithm MTP for its embedded "
+            "NextN head."
+        )
 
     if (
         is_draft_worker

@@ -313,6 +313,11 @@ class DFlashDecoderLayer(nn.Module):
 class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     decoder_layer_cls = DFlashDecoderLayer
 
+    @property
+    def supports_incremental_target_projection(self) -> bool:
+        """Whether raw taps can be multiplied by slices of ``fc`` directly."""
+        return True
+
     def _checkpoint_capture_field(self, name: str):
         """A capture field from ``dflash_config``, else the top-level config."""
         nested = getattr(self.config, "dflash_config", {}) or {}

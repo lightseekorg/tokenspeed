@@ -1051,7 +1051,8 @@ DFlash, DFlash2 and generic DSpark use their model's ordinary capture setup;
 K3 owns its trained stream/projection contract; DeepSeek V4/V4.1 DSpark owns
 its checkpoint tap selection. `models/target_capture.py` contains only the
 shared interface. DFlash checkpoint parsing and target configuration live in
-`DFlashDraftModel.configure_target`, inherited by DFlash2 and generic DSpark.
+`DFlashDraftModel.configure_target`, inherited by DFlash2. Generic DSpark uses
+that setup for ordinary targets and owns the Qwen4-Exp HC capture adapter.
 Setup calls only the parent interface
 `configure_target`; each concrete draft directly adapts to its target family.
 There is no generic DSpark helper probing for a DeepSeek-specific setter, and
@@ -1089,6 +1090,31 @@ belongs to the output mixer. Capture execution and projection-weight placement
 use this same owner on both PP and non-PP. There is no boundary deferral or
 recovery operation. Capture's mixed stream must not be replaced by the fused
 attention input, which already includes input-layer normalization.
+
+Qwen4-Exp DSpark taps are completed-layer outputs, including the final decoder
+layer when the checkpoint selects it. Capture resolves the deferred HC residual
+injection without changing the target's normal execution, gathers token rows
+when the layer's communication layout requires it, and retains an independent
+snapshot. Ordinary DSpark consumes the unweighted HC branch mean. HyperDSpark
+consumes every HC branch and applies a checkpoint-trained reducer per tap before
+concatenation and the context FC. Its raw context width is therefore
+`num_taps * hc_count * hidden_size`, even though the FC input width remains
+`num_taps * hidden_size`. The target's MTP capture remains the final complete HC
+stream when no DSpark taps are configured.
+
+External DSpark checkpoints may supply their own full-vocabulary embedding and
+LM head. These tables are loaded as the weight stream reaches them, with no
+allocation for omitted tables. Resource binding selects each supplied table
+independently and borrows the target's corresponding table otherwise; an owned
+head uses a logits processor for its own vocabulary-sharding group. Reduced
+draft vocabularies requiring ID remapping remain unsupported and are rejected.
+
+The incremental target projection is available only to draft models declaring
+`supports_incremental_target_projection`. A nonlinear per-tap reducer cannot be
+replaced by slices of the FC weight. HyperDSpark uses its full context projector
+before the existing native KV writer; the fused KV writer remains usable after
+that projection. Proposal, verification, cache ownership and state commit keep
+the ordinary block-drafter path.
 
 `execution/dspark_context.py` contains `DSparkContextProducer` and the model
 interface it consumes. K3 tap ownership and projection arithmetic live in
