@@ -6,13 +6,20 @@ On an open, same-repository PR, a repository writer can comment:
 @lightseek-bot watch
 @lightseek-bot fix
 @lightseek-bot fix <GitHub Actions job URL>
+@lightseek-bot rerun <GitHub Actions job URL>
 ```
 
-For a targeted repair, copy the failed job's URL from that PR's Actions run.
-The optional `?pr=NUMBER` suffix is accepted. The job must belong to the PR's
-current commit and latest run attempt, and must have failed or timed out.
-The rest of its workflow may still be running. Links to other repositories,
-PRs, or older commits cannot authorize a repair.
+For a targeted repair or rerun, copy the failed job's URL from that PR's
+Actions run. The optional `?pr=NUMBER` suffix is accepted. The job must belong
+to the PR's current commit and latest run attempt, and must have failed or
+timed out. The rest of its workflow may still be running. Links to other
+repositories, PRs, or older commits cannot authorize a repair or rerun.
+
+A rerun re-dispatches the failed job's validation task through Slurm or K8s
+dispatch and reports the outcome: a pass closes the request; a failure starts
+the repair flow as if `fix` had been requested for that job. Reruns of native
+checks, which have no independent dispatch channel, start the repair flow
+directly.
 
 The repair agent receives the requested job's metadata and log alongside the
 source and existing CI plan. It diagnoses the failure and proposes the source

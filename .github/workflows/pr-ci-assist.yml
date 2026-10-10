@@ -26,7 +26,8 @@ jobs:
        (github.event.issue.pull_request &&
         contains(github.event.comment.body, '@lightseek-bot') &&
         (contains(github.event.comment.body, 'watch') ||
-         contains(github.event.comment.body, 'fix')))) &&
+         contains(github.event.comment.body, 'fix') ||
+         contains(github.event.comment.body, 'rerun')))) &&
       (github.event_name != 'workflow_run' ||
        ((github.event.workflow_run.event == 'pull_request' ||
          github.event.workflow_run.event == 'workflow_dispatch') &&

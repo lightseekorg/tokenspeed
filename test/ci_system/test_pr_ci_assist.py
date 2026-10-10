@@ -2373,3 +2373,136 @@ def test_promotion_accepts_only_owned_validation_branch(
     state["candidate"]["branch"] = "bot/pr-ci-assist-123-42-199"
     with pytest.raises(ValueError, match="Invalid candidate record"):
         repair.promote(state, deadline=1893459600)
+
+
+def test_rerun_command_requires_a_job_url(monkeypatch, selected):
+    _, state = selected
+    monkeypatch.setattr(assist, "api", lambda path: {"permission": "write"})
+    url = f"https://github.com/{REPO}/actions/runs/101/job/201"
+    author = {"user": {"login": "someone"}}
+    assert (
+        assist.permitted({**author, "body": f"@lightseek-bot rerun {url}"}) == "rerun"
+    )
+    assert assist.permitted({**author, "body": "@lightseek-bot rerun"}) is None
+    assert assist.permitted({**author, "body": f"@lightseek-bot watch {url}"}) is None
+    # The rerun action and its target round-trip through the state record.
+    state.update(action="rerun", target={"run": 101, "job": 201})
+    comment = {"user": {"login": BOT, "id": BOT_ID}, "body": marker("assist", state)}
+    assert record(comment, "assist") == state
+
+
+def test_rerun_redispatches_and_failure_escalates_to_repair(
+    monkeypatch, tmp_path, selected
+):
+    task, state = selected
+    plan = {k: state[k] for k in ("version", "repository", "pr", "head", "base")}
+    plan.update(run=55, tests=[], tasks=state["tasks"])
+    comments = [{"user": {"login": BOT, "id": BOT_ID}, "body": marker("plan", plan)}]
+    command_comment = {
+        "id": 43,
+        "body": (
+            f"@lightseek-bot rerun "
+            f"https://github.com/{REPO}/actions/runs/101/job/201"
+        ),
+    }
+    pr = {
+        "number": state["pr"],
+        "head": {"sha": state["head"]},
+        "base": {"sha": state["base"]},
+        "mergeable": True,
+    }
+    live = [None]
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "issue_comment")
+    monkeypatch.setenv("GITHUB_RUN_ID", "200")
+    monkeypatch.setattr(assist, "WORK", tmp_path)
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pull", lambda n: pr)
+    monkeypatch.setattr(assist, "pages", lambda *args: comments)
+    monkeypatch.setattr(assist, "load_state", lambda *args: copy.deepcopy(live[0]))
+    monkeypatch.setattr(assist, "latest_command", lambda *args: command_comment)
+    monkeypatch.setattr(assist, "permitted", lambda *args: "rerun")
+    monkeypatch.setattr(assist, "checkout", lambda *args: tmp_path)
+    monkeypatch.setattr(assist, "context", lambda *args: {})
+    monkeypatch.setattr(assist, "targeted_plan", lambda plan, *args: plan)
+    monkeypatch.setattr(assist, "validate_plan", lambda *args: [task])
+    monkeypatch.setattr(assist, "main_merge_clean", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        assist,
+        "api",
+        lambda path: (
+            {
+                "path": ".github/workflows/pr-ci-plan.yml",
+                "conclusion": "success",
+                "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+                "run_started_at": "2030-01-01T00:00:00Z",
+            }
+            if path == "actions/runs/55"
+            else (
+                {"run_started_at": "2030-01-01T00:00:00Z"}
+                if "actions/runs" in path
+                else {"object": {"sha": "c" * 40}}
+            )
+        ),
+    )
+    published = []
+
+    def publish(s, message):
+        live[0] = copy.deepcopy(s)
+        published.append(s["phase"])
+
+    monkeypatch.setattr(assist, "publish", publish)
+    emitted = []
+    monkeypatch.setattr(assist, "output", lambda *args: emitted.append(args))
+    dispatched = []
+    monkeypatch.setattr(assist, "dispatch", lambda *args: dispatched.append(args))
+    title = assist.run_title(task, state["head"], "gb200")
+    bot_run = {
+        "id": 999,
+        "event": "workflow_dispatch",
+        "head_branch": "main",
+        "actor": {"login": BOT},
+        "display_title": title,
+    }
+    runs = [[]]
+    monkeypatch.setattr(assist, "runs_for", lambda *args: runs[0])
+    report = ["waiting"]
+    monkeypatch.setattr(assist, "report", lambda *args: report[0])
+
+    # The rerun command re-dispatches the target's validation task; the
+    # inherited submission from an earlier watch must not suppress it.
+    live[0] = {**state, "submitted": [title]}
+    assist.control(state["pr"])
+    assert dispatched == [(task, state["head"], "gb200")]
+    assert live[0]["phase"] == "watching"
+    assert live[0]["action"] == "rerun" and live[0]["since"] == 43
+    assert live[0]["target"] == {"run": 101, "job": 201}
+    assert published == ["watching", "watching"] and not emitted
+
+    # A passed rerun closes the request without touching the repair flow.
+    runs[0] = [bot_run]
+    report[0] = "passed"
+    published.clear()
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "done"
+    assert published == ["done"] and not emitted
+
+    # A failed rerun escalates into the repair flow with the target diagnostics.
+    report[0] = "failed"
+    published.clear()
+    live[0].update(phase="watching")
+    monkeypatch.setenv("GITHUB_RUN_ID", "202")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "repairing" and live[0]["repair_run"] == 202
+    assert emitted == [("repair", "true")]
+    request = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert request["state"]["action"] == "rerun"
+    assert request["state"]["target"] == {"run": 101, "job": 201}
+    assert set(request) == {
+        "state",
+        "plan",
+        "data",
+        "conflicts",
+        "deadline",
+        "lint_run",
+    }
