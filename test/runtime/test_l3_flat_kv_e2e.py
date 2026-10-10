@@ -120,7 +120,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 host_size_gb=0,
                 snapshot_host_gb=0,
                 max_retracted_requests=0,
-                slot_state=None,
+                slot_state_exporters=None,
                 io_backend="direct",
                 attn_tp_rank=0,
                 dcp_rank=0,
