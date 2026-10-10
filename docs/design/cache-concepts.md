@@ -649,13 +649,17 @@ Its responsibilities:
   stream when published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`, and every store it
   issues pins its Device sources until the ACK. A retraction does not use the
-  queue: `StartRetractionStores` publishes the victim's computed prefix the
-  same way and then builds its image from the tables themselves — the
-  published slots not yet on Host become one stream-ordered write-back whose
-  Host entries the image pins (keys already Host-cached, or carried by a store
-  in flight, are pinned instead of copied), every other slot goes to the
-  request-private **snapshot pool** on the same stream-ordered footing — because
-  the victim's sources are re-granted in the same round (`scheduler.md` §2).
+  queue: the scheduler publishes the victim's computed prefix the same way,
+  `CacheCoordinator::PublishedDataSlots` names the data slots that are
+  published entries (with the key, logical index and boundary kind each was
+  published under), `TierTransferManager::StartRetractionStores` gives those
+  their Host blocks — keys already Host-cached, or carried by a store in
+  flight, are pinned; the rest become one stream-ordered write-back whose
+  Host entries the image pins — and `CacheCoordinator::TakeImage` places only
+  the remainder (unpublished slots, and published ones L2 could not take) in
+  the request-private **snapshot pool** on the same stream-ordered footing —
+  because the victim's sources are re-granted in the same round
+  (`scheduler.md` §2).
   The snapshot pool is a third `BlockPool` the coordinator owns beside Device
   and Host L2: never prefix-indexed, never evicted, its blocks held only by
   the `Retracted`/`Restoring` state that imaged them, and `Validate` requires
@@ -1139,8 +1143,9 @@ victim's next admission. The protocol — victim choice, the image's two legs,
 readmission order, why the release is safe before the image copies — is
 `scheduler.md` §2 and §4. The snapshot pool's size is a configuration input
 like the Host cache's (`num_snapshot_pages`, `max_retracted_requests`): it
-bounds how many pages of suspended requests may be held at once, and a
-retraction whose image does not fit is refused, not forced.
+bounds how many pages of suspended requests may be held at once, and when no
+candidate's image fits the scheduler aborts the newest resident rather than
+imaging anyone or waiting (`scheduler.md` §2).
 
 ## Virtual block placement within a shared physical plan
 

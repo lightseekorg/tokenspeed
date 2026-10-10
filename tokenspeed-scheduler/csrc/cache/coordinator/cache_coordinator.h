@@ -362,14 +362,14 @@ public:
                           CacheBoundaryKind boundary_kind);
 
     // L3 storage sits below Host: a bounded shadow of keys known to exist in
-    // the remote store, with no local Host block. Probe treats them as Host
-    // hits that require prefetch. Capacity tracks Host pages so the set
-    // cannot grow with every historical writeback. A single registration
-    // keeps the earliest contiguous prefix keys so prefix-closed matchers
-    // still hit, even when sequential write-backs already filled the
-    // shadow with this prompt's suffix. Later unrelated keys LRU-evict
-    // older prompts. Admit-time revalidation re-inserts keys that were
-    // dropped from the shadow.
+    // the remote store, with no local Host block. ProbePrefix reports them as
+    // the storage tier beyond the Host hit, which PlanPrefetch turns into a
+    // pre-admission Host fill. Capacity tracks Host pages so the set cannot
+    // grow with every historical writeback. A single registration keeps the
+    // earliest contiguous prefix keys so prefix-closed matchers still hit,
+    // even when sequential write-backs already filled the shadow with this
+    // prompt's suffix. Later unrelated keys LRU-evict older prompts;
+    // submit-time registration re-inserts keys that were dropped.
     bool EnablesL3Storage() const { return enable_l3_storage_; }
     void RegisterStorageKeys(std::span<const CacheKey> keys);
     void UnregisterStorageKeys(std::span<const CacheKey> keys);

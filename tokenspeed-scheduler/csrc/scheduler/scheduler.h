@@ -417,7 +417,7 @@ private:
     std::int32_t max_single_request_tokens_{0};
 
     // Stamped onto each retraction; the readmission order lives on the
-    // Retracted states themselves (nextReadmission).
+    // Retracted states themselves (rankedReadmissions).
     std::int64_t next_retraction_epoch_{1};
     // The forced-retraction knob's clock and the request it has armed (empty
     // when none): kept out of every batch until it is quiescent, then

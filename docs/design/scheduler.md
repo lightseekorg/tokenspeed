@@ -741,10 +741,12 @@ pages:
   tables inside the same planner pass: `DenseGrowth{0}` plus the reserve
   `ReservePrefillDemands` derives from the resume shape exactly as for a
   first chunk — the decode slot (and the snapshot-state growth block) when the
-  request resumes decoding or its completed prompt; the rest of the prompt plus
-  the escalated admission headroom when it resumes mid-prefill. Cache-only
-  blocks are evicted for it as for any admission, and a failed restore leaves
-  nothing allocated.
+  request resumes decoding or its completed prompt, the rest of the prompt
+  too when it resumes mid-prefill — and, on every resume shape, the escalated
+  admission headroom (`Request::AdmissionHeadroom`, below): the restore is the
+  admission that re-secures the room the retraction proved too optimistic,
+  whichever state the victim was in. Cache-only blocks are evicted for it as
+  for any admission, and a failed restore leaves nothing allocated.
 - An L2 slot whose key still has a Device-cached canonical block is
   **claimed** instead of copied (the same bytes by construction — the victim's
   own block, cache-only since it was freed — and protected from the planner's
