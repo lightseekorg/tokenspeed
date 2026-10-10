@@ -1277,6 +1277,9 @@ def test_active_native_work_and_queued_slurm_or_amd_are_reused(monkeypatch, sele
     run["name"] = "AMD Tests"
     queued["name"] = "unit-test / runtime (amd-1gpu)"
     assert assist.task_status(task, state, [run], submit=True) == "waiting"
+    run["name"] = "AMD Kernel Benchmark"
+    queued["name"] = "kernel-benchmark / runtime (amd-1gpu)"
+    assert assist.task_status(task, state, [run], submit=True) == "waiting"
 
 
 def test_incomplete_old_plan_refreshes_once_and_failed_refresh_requests_help(
