@@ -464,11 +464,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     module, param, loaded_shard_id
                 )
 
-                if len(loaded_weight.shape) == 0:
-                    # A per-tensor scalar (FP8 weight_scale / input_scale) from
-                    # a checkpoint module fused across one or more runtime
-                    # shards (e.g. in_proj_qkv -> qkvz shards (0, 1, 2)). Every
-                    # shard slot receives the same single checkpoint scale.
+                if loaded_weight.numel() == 1:
+                    # A per-tensor scale (FP8 / NVFP4 weight_scale, input_scale)
+                    # from a checkpoint module fused across one or more runtime
+                    # shards (e.g. in_proj_qkv -> qkvz shards (0, 1, 2)). Stored
+                    # as a 0-d scalar or a shape-[1] tensor depending on the
+                    # quantizer; every shard slot receives the same scale.
                     if any(size != 1 for size in split_sizes):
                         raise ValueError(
                             f"Unexpected scalar for tuple shard load: "
