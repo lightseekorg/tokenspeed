@@ -812,7 +812,7 @@ class GroupAwareWireTest(unittest.TestCase):
             [ordered_lane.workspace, pinned_lane.workspace],
         )
         fence_stream.wait_event.assert_called_once_with(ordered_finish)
-        pending = executor._completions.pending()
+        pending = executor._completions._pending
         self.assertEqual(
             [(finish, ack.kind, ack.op_ids) for finish, ack in pending],
             [
@@ -1422,7 +1422,7 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertEqual(load_events.layer_done_events, [finish, finish, finish])
         self.assertIs(load_events.layer_ready_flags, flags)
         self.assertIs(load_events.wait_layer_ready, executor_module.wait_layer_ready)
-        ((pending_finish, ack),) = executor._completions.pending()
+        ((pending_finish, ack),) = executor._completions._pending
         self.assertIs(pending_finish, finish)
         self.assertEqual(
             (ack.kind, ack.op_ids), (executor_module._AckKind.LOAD_BACK, [9])
@@ -1483,7 +1483,7 @@ class GroupAwareWireTest(unittest.TestCase):
         )
         self.assertEqual(draft_events.layer_done_events, [retirement])
         executor.load_stream.synchronize.assert_not_called()
-        self.assertEqual(len(executor._completions), 0)
+        self.assertEqual(executor._completions._pending, [])
 
     def test_failed_retirement_sync_poisons_executor_and_preserves_original_error(self):
         executor_module, executor, _, _, _ = self._make_load_executor(
@@ -1537,9 +1537,6 @@ class GroupAwareWireTest(unittest.TestCase):
             self.assertTrue(any("retirement sync failed" in note for note in notes))
 
             executor.load_stream.synchronize.side_effect = None
-            executor.shutdown = Mock()
-            executor.reset()
-            self.assertTrue(executor._load_poisoned)
             with self.assertRaisesRegex(RuntimeError, "poisoned"):
                 executor._start_loading([10], [(0, 3, 2)], prerequisite_stream=object())
 
@@ -1820,7 +1817,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         default_stream.synchronize.assert_called_once_with()
         executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
         executor.l3_store.close.assert_called_once_with()
-        self.assertEqual(len(executor._completions), 0)
+        self.assertEqual(executor._completions._pending, [])
 
 
 class CompactLayoutRoundTripTest(unittest.TestCase):

@@ -266,4 +266,4 @@ def test_a_pair_of_different_owners_is_refused():
         layout, _contract(layout), num_host_lcm_blocks=POOL_LCM_BLOCKS, rank=0
     )
     with pytest.raises(ValueError, match="residue class"):
-        owners.owned_rows([(0, 1, 2)])
+        owners.owned_positions([(0, 1, 2)])

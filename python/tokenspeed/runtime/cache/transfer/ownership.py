@@ -224,12 +224,3 @@ class BlockOwnerTranslation:
             )
         owned.sort(key=lambda item: item[0])
         return owned
-
-    def owned_rows(
-        self, rows: Sequence[tuple[int, int, int]]
-    ) -> list[tuple[int, int, int]]:
-        """Keep this rank's rows of ``(group_index, device_block, host_block)``, in local ids.
-
-        :meth:`owned_positions` without the positions.
-        """
-        return [row for _, row in self.owned_positions(rows)]

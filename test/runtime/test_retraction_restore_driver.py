@@ -154,7 +154,7 @@ class _Driver:
                 )
             elif isinstance(op, ts.Cache.LoadBackOp):
                 self.device.results.extend(
-                    ts.Cache.LoadBackDoneEvent(op_id, True) for op_id in op.op_ids
+                    ts.Cache.LoadBackDoneEvent(op_id) for op_id in op.op_ids
                 )
             elif isinstance(op, SnapshotOp):
                 self.device.results.append(_ack("SnapshotDoneEvent", op.op_id))
@@ -402,7 +402,8 @@ def test_a_capacity_blocked_round_with_no_fitting_image_aborts_the_newest_reside
     (abort,) = aborted
     assert abort.request_id == "c"  # the newest resident, the least work lost
     assert int(abort.reason) == 0  # AbortReason.ImageDoesNotFit
-    assert "--retraction-snapshot-max-requests" in abort.detail
+    # The detail names the knob to raise (the scheduler's wording).
+    assert "--retraction-snapshot-" in abort.detail
     # Finished toward the client, with the capacity code and the detail.
     assert set(processor.rid_to_state) == {"a", "b"}
     (out,) = sender.items

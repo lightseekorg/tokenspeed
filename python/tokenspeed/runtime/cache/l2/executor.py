@@ -1205,7 +1205,7 @@ class HostCacheExecutor:
         return pages
 
     def l3_exists(self, pages: Sequence[StoragePage]) -> list[bool] | None:
-        l3_store = getattr(self, "l3_store", None)
+        l3_store = self.l3_store
         if l3_store is None:
             return None
         return l3_store.exists(pages)
@@ -1219,7 +1219,7 @@ class HostCacheExecutor:
         first: the lane may still be writing their Host pages.
         """
 
-        l3_store = getattr(self, "l3_store", None)
+        l3_store = self.l3_store
         if l3_store is None:
             return True
         try:
@@ -1478,12 +1478,12 @@ class HostCacheExecutor:
         hangs peers waiting in ``all_reduce`` / ``all_gather_object``.
         """
 
-        failed = bool(getattr(self, "_backup_poll_failed", False))
+        failed = self._backup_poll_failed
         self._backup_poll_failed = False
         return failed
 
     def _complete_or_queue_write(self, ack: _Ack, results: list) -> None:
-        if not ack.backup_pages or getattr(self, "l3_store", None) is None:
+        if not ack.backup_pages or self.l3_store is None:
             results.extend(self._write_done(op_id) for op_id in ack.op_ids)
             return
         workers = self._l3_workers
@@ -1498,7 +1498,7 @@ class HostCacheExecutor:
 
     def _collect_finished_backups(self, results: list) -> None:
         with self._ack_lock:
-            inflight = list(getattr(self, "_backup_futures", ()))
+            inflight = list(self._backup_futures)
             self._backup_futures = []
         still: list[tuple[Future, list[int], list[StoragePage]]] = []
         for future, op_ids, pages in inflight:
@@ -1513,7 +1513,7 @@ class HostCacheExecutor:
                     exc_info=failed,
                 )
                 self._backup_poll_failed = True
-                workers = getattr(self, "_l3_workers", None)
+                workers = self._l3_workers
                 if workers is not None:
                     still.append(
                         (workers.submit(self._backup_to_storage, pages), op_ids, pages)
@@ -1527,7 +1527,7 @@ class HostCacheExecutor:
             self._backup_futures.extend(still)
 
     def _backup_to_storage(self, pages: Sequence[StoragePage]) -> None:
-        l3_store = getattr(self, "l3_store", None)
+        l3_store = self.l3_store
         if not pages or l3_store is None:
             return
         # The backend handles create-only PUTs itself.
@@ -1570,7 +1570,7 @@ class HostCacheExecutor:
         device_module.synchronize()
         pending = self._completions.drop_all()
         with self._ack_lock:
-            inflight = list(getattr(self, "_backup_futures", ()))
+            inflight = list(self._backup_futures)
             self._backup_futures = []
         # Synchronization above makes every D2H snapshot complete. Persist the
         # final batch before closing L3; otherwise a clean process shutdown can
@@ -1580,11 +1580,11 @@ class HostCacheExecutor:
                 self._backup_to_storage(ack.backup_pages)
         for future, _op_ids, _pages in inflight:
             future.result()
-        workers = getattr(self, "_l3_workers", None)
+        workers = self._l3_workers
         if workers is not None:
             workers.shutdown(wait=True)
             self._l3_workers = None
-        lane = getattr(self, "_l3_prefetch_lane", None)
+        lane = self._l3_prefetch_lane
         if lane is not None:
             # In-flight prefetches finish (or time out) before the store closes
             # under them; their outcomes are dropped with the queue.
@@ -1593,13 +1593,5 @@ class HostCacheExecutor:
         with self._ack_lock:
             self._prefetch_jobs.clear()
             self._prefetch_acks.clear()
-        if getattr(self, "l3_store", None) is not None:
+        if self.l3_store is not None:
             self.l3_store.close()
-
-    def reset(self) -> None:
-        # ``shutdown`` drained the completion queue.
-        self.shutdown()
-        with self._ack_lock:
-            self._ready_load_acks.clear()
-        for tracker, _ in self._load_trackers:
-            tracker.reset()

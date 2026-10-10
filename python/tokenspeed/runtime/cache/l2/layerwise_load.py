@@ -92,10 +92,3 @@ class LayerwiseLoadTracker:
             return
         for consumer_index in self.consumer_indices:
             self.event_sets[consumer_index].wait_for_layer(layer_index)
-
-    def reset(self) -> None:
-        self.current_load_index = -1
-        self.consumer_indices = ()
-        for events in self.event_sets:
-            events.layer_ready_flags = None
-            events.wait_layer_ready = None

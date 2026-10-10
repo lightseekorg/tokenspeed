@@ -454,16 +454,21 @@ def test_replicated_groups_translate_to_the_identity_and_reject_null():
         rank=0,
     )
     rows = [(1, 4, 2), (0, 8, 16), (0, 1, 1)]
-    # Grouped by group index, input order kept within a group.
-    assert owners.owned_rows(rows) == [(0, 8, 16), (0, 1, 1), (1, 4, 2)]
+    # Every row is owned and keeps its position; grouped by group index,
+    # input order kept within a group.
+    assert owners.owned_positions(rows) == [
+        (1, (0, 8, 16)),
+        (2, (0, 1, 1)),
+        (0, (1, 4, 2)),
+    ]
     with pytest.raises(ValueError, match="null block"):
-        owners.owned_rows([(0, 0, 1)])
+        owners.owned_positions([(0, 0, 1)])
     with pytest.raises(IndexError, match="unknown group"):
-        owners.owned_rows([(2, 1, 1)])
+        owners.owned_positions([(2, 1, 1)])
     with pytest.raises(IndexError):
-        owners.owned_rows([(0, 9, 1)])
+        owners.owned_positions([(0, 9, 1)])
     with pytest.raises(IndexError):
-        owners.owned_rows([(1, 1, 3)])
+        owners.owned_positions([(1, 1, 3)])
 
 
 def test_sharded_group_keeps_each_ranks_rows_on_both_ends():
@@ -478,13 +483,10 @@ def test_sharded_group_keeps_each_ranks_rows_on_both_ends():
         for rank in (0, 1)
     }
     rows = [(0, 1, 3), (0, 2, 6), (0, 5, 11), (0, 8, 12)]
-    assert owners[0].owned_rows(rows) == [(0, 1, 2), (0, 3, 6)]
-    assert owners[1].owned_rows(rows) == [(0, 1, 3), (0, 4, 6)]
-    assert len(owners[0].owned_rows(rows)) + len(owners[1].owned_rows(rows)) == len(
-        rows
-    )
+    assert owners[0].owned_positions(rows) == [(0, (0, 1, 2)), (2, (0, 3, 6))]
+    assert owners[1].owned_positions(rows) == [(1, (0, 1, 3)), (3, (0, 4, 6))]
     with pytest.raises(ValueError, match="residue class"):
-        owners[0].owned_rows([(0, 1, 2)])
+        owners[0].owned_positions([(0, 1, 2)])
 
 
 # ----------------------------------------------------------------------
@@ -803,7 +805,7 @@ def test_plan_level_checks_refuse_duplicates_bad_slots_and_ragged_tiers():
         lane.start_h2d.assert_not_called()
     fence.wait_event.assert_not_called()
     assert slot_state.exports == [] and slot_state.imports == []
-    assert len(executor._completions) == 0
+    assert executor._completions._pending == []
     executor._load_trackers[0][0].begin_load.assert_not_called()
 
 
@@ -883,7 +885,7 @@ def test_kvp_rank_backs_up_and_prefetches_only_the_host_pages_it_owns():
                 prerequisite_stream="s",
                 fence_stream=Mock(),
             )
-        ((pending_finish, ack),) = executor._completions.pending()
+        ((pending_finish, ack),) = executor._completions._pending
         assert pending_finish is finish
         assert (ack.op_ids, ack.backup_pages) == ([11], [owned_page])
         # The prefetch of the same two pages fetches only this rank's one; the
@@ -987,13 +989,13 @@ def test_completion_queue_releases_in_order_and_drops_on_reset():
     second.query.return_value = True
     queue.push(first, "first")
     queue.push(second, "second")
-    assert len(queue) == 2
     assert queue.pop_ready() == ["second"]
     first.query.return_value = True
     assert queue.pop_ready() == ["first"]
+    assert queue.pop_ready() == []
     queue.push(Mock(), "stale")
     assert queue.drop_all() == ["stale"]
-    assert len(queue) == 0
+    assert queue.pop_ready() == []
 
 
 # ----------------------------------------------------------------------
