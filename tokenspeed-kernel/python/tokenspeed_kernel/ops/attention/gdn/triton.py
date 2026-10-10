@@ -1056,7 +1056,8 @@ def triton_gdn_replay_commit(
         raise ValueError(f"unsupported GDN replay state dtype: {state_dtype}")
 
     BK = triton.next_power_of_2(head_k_dim)
-    BV = min(triton.next_power_of_2(head_v_dim), 32)
+    # The replay is latency-bound; narrow V tiles keep more programs in flight.
+    BV = min(triton.next_power_of_2(head_v_dim), 16)
     NK, NV = triton.cdiv(head_k_dim, BK), triton.cdiv(head_v_dim, BV)
     if NK != 1:
         raise ValueError("GDN replay does not support head dimensions above one tile")
