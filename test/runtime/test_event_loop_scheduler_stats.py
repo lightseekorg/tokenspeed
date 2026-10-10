@@ -43,6 +43,8 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
     config.prefix_granularity = 2
     config.num_device_pages = 17  # Null parent 0 plus 16 usable LCM parents.
     config.num_host_pages = 0
+    config.num_snapshot_pages = 1  # the null page alone: never retract
+    config.max_retracted_requests = 0
     config.max_scheduled_tokens = 16
     config.max_batch_size = 8
     config.decode_input_tokens = 1

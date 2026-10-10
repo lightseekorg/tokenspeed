@@ -29,13 +29,15 @@ slot-state blob -- goes to the small request-private snapshot pool through a
 source tier, so both Host buffers land in the request's fresh Device pages
 under one completion event and the scheduler sees one ``RestoreDone``.
 
-The C++ scheduler will emit ``SnapshotStoreOperation`` /
-``SnapshotRestoreOperation`` (bound as ``Cache.SnapshotOp`` /
-``Cache.RestoreOp``) with these fields; until the binding exists the runtime
-consumes these dataclasses, and the binding adapter maps one wire operation
-onto one of them field for field. The ACKs join ``WriteBackDoneEvent`` /
-``LoadBackDoneEvent`` on the cache-result poll and are replica-intersected by
-the same hooks.
+The C++ scheduler emits ``SnapshotStoreOperation`` /
+``SnapshotRestoreOperation`` batched per plan (bound as ``Cache.SnapshotOp`` /
+``Cache.RestoreOp``, lists-of-lists like the L2 batches);
+``engine/scheduler_utils.cache_ops_from_plan`` maps every row of a batch onto
+one of these per-request dataclasses, which is the Host cache executor's unit
+of work: one slot exported or imported, one ACK. The ACKs are the binding's
+``Cache.SnapshotDoneEvent`` / ``Cache.RestoreDoneEvent``; they join
+``WriteBackDoneEvent`` / ``LoadBackDoneEvent`` on the cache-result poll and are
+replica-intersected by the same hooks.
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ from enum import IntEnum
 
 
 class HostTier(IntEnum):
-    """Which pinned Host buffer a restore row reads (``HostTier`` on the wire)."""
+    """Which pinned Host buffer a restore row reads (``Cache.HostTier`` on the wire)."""
 
     L2 = 0
     SNAPSHOT_POOL = 1
@@ -118,17 +120,3 @@ class RestoreOp:
     snapshot_slot: int
     transfers: tuple[CacheTransfer, ...]
     source_tier: tuple[HostTier, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class SnapshotDoneEvent:
-    """A ``SnapshotOp`` landed on the Host: with the L2 leg's ``WriteBackDone``, the image may be restored."""
-
-    op_id: int
-
-
-@dataclass(frozen=True, slots=True)
-class RestoreDoneEvent:
-    """A ``RestoreOp`` landed on the Device: its request may be scheduled."""
-
-    op_id: int

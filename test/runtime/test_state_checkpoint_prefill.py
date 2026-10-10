@@ -69,6 +69,8 @@ def test_final_extent_and_decode_through_runtime_config(
         disable_l2_cache=True,
         enable_l3_storage=False,
         role="fused",
+        num_snapshot_pages=1,
+        max_retracted_requests=0,
         enable_kv_cache_events=False,
         decode_input_tokens=1,
         overlap_schedule_depth=0,

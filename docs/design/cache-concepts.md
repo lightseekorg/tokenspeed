@@ -236,8 +236,9 @@ Host restores still use `CacheFullBlocks` and may register `kChunk` entries.
 All cached checkpoints remain subject to ordinary capacity eviction; Endpoint
 does not pin storage. Allocation, reservations and transfer fences are unchanged.
 Finish queues existing prefill checkpoints for L2 without upgrading their kind.
-With L2, prefill retraction may publish a computed recovery Endpoint; decode
-retraction uses available prefill cache and recomputes the suffix.
+A retraction publishes the victim's completed prefix pages like a finish and
+images the rest ("Retraction image" below); the request resumes from the
+image and recomputes nothing.
 
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at
@@ -512,9 +513,11 @@ Host tier holds one translation (same Device bound, its own Host bound,
 `1 + host_lcm_blocks × packing × shard_count`). An op whose every row belongs
 to other ranks is still acknowledged by this rank from an empty copy; the
 hooks' replica intersection completes the op only once every owner has. The
-scheduler side (residue-class allocation, the Host L2 pool's sharded virtual
-count) is what makes the translation exact; until it lands every group is
-replicated and the filter is the identity.
+scheduler side (residue-class allocation for every tier transfer, the Host
+pools registered with each group's `shard_count`) is what makes the
+translation exact, so both Host tiers serve a KV-page-sharded engine; L3
+storage does not (`scheduler.md`), because an L3 key names content and
+position while ownership is decided at allocation.
 
 ## block vs. page
 
@@ -737,9 +740,10 @@ Its responsibilities:
   before request ownership is released. Ordinary sliding-window entries
   always stream when published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`: every store but a
-  retraction's snapshot pins its Device sources until the ACK; the snapshot
-  store is stream-ordered instead, because its sources are re-granted in the
-  same round (`scheduler.md` §2).
+  retraction image's two legs pins its Device sources until the ACK; the
+  image's L2 write-back and its snapshot store are stream-ordered instead,
+  because their sources are re-granted in the same round (`scheduler.md`
+  §2), and the suspended request pins the Host entries until it is restored.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
   beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
@@ -1223,12 +1227,13 @@ overcommitted, admission can fail even though the batch still has a free
 sequence slot.
 
 When admission fails for capacity and no prefill can progress, the scheduler
-retracts a resident victim and grants the freed pages to the blocked request
-within the same plan build; what stops an overcommitted workload from
-repeatedly rebuilding, briefly decoding and re-retracting the same prompt is
-the escalating admission headroom each retraction adds to the victim's next
-admission. The protocol — victim choice, readmission order, why the release
-is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
+retracts a resident victim -- suspending it with its image -- and grants the
+freed pages to the blocked request within the same plan build; what stops an
+overcommitted workload from repeatedly imaging, briefly decoding and
+re-retracting the same request is the escalating admission headroom each
+retraction adds to the victim's next restore. The protocol — victim choice,
+restore order, why the release is safe before the image copies — is
+`scheduler.md` §2 and §4.
 
 ## Virtual block placement within a shared physical plan
 
@@ -1273,14 +1278,17 @@ draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
 the sharded MLA history group), each subject to its backend's `AttnConfig`
 gate. The draft's decode steps would run the same sparse/dense DCP branches as
 the target's, but that path has not been validated for the ordinary recipe, so
-its exclusion is a gate rather than a geometry limit. All DCP paths still
-exclude both Host tiers today -- the KVStore and the retraction snapshot
-pool, under one shared refusal: the Host copies pass the ownership
-translation of the retraction-image design ("Retraction image" above, the
-identity while every group is replicated), but the scheduler does not yet
-allocate Host blocks by residue class, so a sharded engine must pass
-`--disable-kvstore` and leave `--retraction-snapshot-host-gb` at 0 until the
-runtime-consumption phase lifts both together.
+its exclusion is a gate rather than a geometry limit. Both Host tiers -- the
+KVStore and the retraction snapshot pool -- serve a DCP engine: the scheduler
+allocates every Host block in its Device block's residue class and the Host
+copies pass the ownership translation on both ends ("Retraction image" above),
+so each rank copies the blocks it owns and the L2 prefix tier is legal on the
+sharded prefill role and on fused DCP engines. L3 storage
+(`--kvstore-storage-backend`) stays refused under DCP: an L3 key names
+content, group, page offset and `tp_rank`, but which rank owns a block is
+decided at allocation, so a rank can answer an existence probe only for the
+blocks it owned when the object was written, and the owner of a page in a
+new admission is not known at probe time.
 
 PD transfer supports a sharded **prefill** role against an unsharded decode
 role. Manifests carry scheduler (virtual) IDs on both sides and are bounded

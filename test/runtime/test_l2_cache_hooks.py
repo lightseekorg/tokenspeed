@@ -45,6 +45,9 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from tokenspeed_scheduler import Cache  # noqa: E402
 
 from tokenspeed.runtime.engine import cache_hooks as cache_hooks_module  # noqa: E402
+from tokenspeed.runtime.engine import (  # noqa: E402
+    scheduler_utils as scheduler_utils_module,
+)
 from tokenspeed.runtime.engine.cache_hooks import (  # noqa: E402
     CacheOpHooks,
     cache_hooks_armed,
@@ -54,6 +57,27 @@ from tokenspeed.runtime.engine.cache_hooks import (  # noqa: E402
 class _FakeWriteBackOp:
     def __init__(self, op_ids) -> None:
         self.op_ids = op_ids
+
+
+class _FakeSnapshotBatch:
+    """The wire face of ``Cache.SnapshotOp``: one row per retracted request."""
+
+    def __init__(self, op_ids) -> None:
+        self.op_ids = list(op_ids)
+        self.request_ids = [f"r{op_id}" for op_id in op_ids]
+        self.request_pool_indices = [1] * len(op_ids)
+        self.snapshot_slots = list(range(len(op_ids)))
+        self.group_ids = [[0]] * len(op_ids)
+        self.src_pages = [[1]] * len(op_ids)
+        self.dst_pages = [[1]] * len(op_ids)
+
+
+class _FakeRestoreBatch(_FakeSnapshotBatch):
+    def __init__(self, op_ids) -> None:
+        super().__init__(op_ids)
+        self.content_hashes = [[""]] * len(op_ids)
+        self.page_offsets = [[0]] * len(op_ids)
+        self.source_tiers = [[1]] * len(op_ids)
 
 
 class _Device:
@@ -107,7 +131,11 @@ def _single_rank_hooks(device) -> CacheOpHooks:
 
 
 def _writeback_done_event(op_id: int):
-    event = Cache.WriteBackDoneEvent()
+    return _cache_event("WriteBackDoneEvent", op_id)
+
+
+def _cache_event(kind: str, op_id: int):
+    event = getattr(Cache, kind)()
     event.op_id = op_id
     return event
 
@@ -147,12 +175,18 @@ def test_collective_doubles_require_op_and_group() -> None:
 
 @pytest.fixture()
 def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
-    # The C++ op bindings (Cache.WriteBackOp) expose no Python constructor, so
-    # substitute the type the isinstance check dispatches on.
+    # The C++ op bindings (Cache.WriteBackOp, Cache.SnapshotOp, ...) expose no
+    # Python constructor, so substitute the types the plan adapter
+    # (scheduler_utils.cache_ops_from_plan) dispatches on.
     monkeypatch.setattr(
-        cache_hooks_module,
+        scheduler_utils_module,
         "Cache",
-        SimpleNamespace(WriteBackOp=_FakeWriteBackOp, LoadBackOp=()),
+        SimpleNamespace(
+            WriteBackOp=_FakeWriteBackOp,
+            LoadBackOp=(),
+            SnapshotOp=_FakeSnapshotBatch,
+            RestoreOp=_FakeRestoreBatch,
+        ),
     )
 
 
@@ -162,17 +196,11 @@ def test_disabled_kvstore_is_a_no_op() -> None:
     assert hooks.poll_ready_events() == []
 
 
-def test_hooks_arm_for_l2_and_for_the_pool_only_behind_the_phase_switch(
-    monkeypatch,
-) -> None:
-    # Armed hooks all-reduce every round, so a pool nothing can emit ops for
-    # must not arm them until the scheduler does (the one phase-4 switch).
+def test_hooks_arm_for_l2_and_for_the_retraction_snapshot_pool() -> None:
+    # Armed hooks all-reduce every round, so only an engine that can emit
+    # cache ops arms them: the L2 tier, or a pool the scheduler retracts into.
     assert cache_hooks_armed(enable_kvstore=True, max_retracted_requests=0)
     assert cache_hooks_armed(enable_kvstore=True, max_retracted_requests=4)
-    assert not cache_hooks_armed(enable_kvstore=False, max_retracted_requests=0)
-    assert cache_hooks_module.SNAPSHOT_POOL_EMITS_CACHE_OPS is False
-    assert not cache_hooks_armed(enable_kvstore=False, max_retracted_requests=4)
-    monkeypatch.setattr(cache_hooks_module, "SNAPSHOT_POOL_EMITS_CACHE_OPS", True)
     assert cache_hooks_armed(enable_kvstore=False, max_retracted_requests=4)
     assert not cache_hooks_armed(enable_kvstore=False, max_retracted_requests=0)
 
@@ -188,6 +216,37 @@ def test_submit_counts_in_flight_and_rejects_unknown_ops(fake_cache_ops) -> None
 
     with pytest.raises(TypeError, match="unsupported cache op kind"):
         hooks.count_plan_ops(SimpleNamespace(cache=[object()]))
+
+
+def test_snapshot_and_restore_batches_count_one_ticket_per_request(
+    fake_cache_ops,
+) -> None:
+    # A snapshot store or restore batch carries one op id per retracted
+    # request and each is acknowledged on its own, so each counts once --
+    # unlike an L2 batch, whose tickets are its op_ids, these are expanded
+    # to per-request ops by the plan adapter first.
+    device = _Device()
+    hooks = _single_rank_hooks(device)
+    plan = SimpleNamespace(
+        cache=[
+            _FakeWriteBackOp(op_ids=[1]),
+            _FakeSnapshotBatch(op_ids=[2, 3]),
+            _FakeRestoreBatch(op_ids=[4]),
+        ]
+    )
+
+    hooks.count_plan_ops(plan)
+
+    assert hooks._num_inflight == 4
+    for event in (
+        _cache_event("SnapshotDoneEvent", 2),
+        _cache_event("RestoreDoneEvent", 4),
+    ):
+        device.results = [event]
+        (ready,) = hooks.poll_ready_events()
+        assert type(ready).__name__ == type(event).__name__
+        assert ready.op_id == event.op_id
+    assert hooks._num_inflight == 2
 
 
 def test_poll_returns_completed_events_and_settles_inflight(fake_cache_ops) -> None:

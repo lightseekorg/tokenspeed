@@ -66,22 +66,37 @@ def test_the_pool_is_independent_of_the_kvstore():
     assert args.retraction_snapshot_host_gb == 1.0
 
 
-def test_dcp_refuses_both_host_tiers_with_one_guard():
-    # The scheduler does not yet allocate Host blocks by residue class, so a
-    # sharded engine gets neither Host tier; the refusal names both and is
-    # lifted for both at once.
-    with pytest.raises(ValueError, match="Host cache tiers.*residue class"):
-        ServerArgs(model="x", world_size=2, decode_context_parallel_size=2)
-    with pytest.raises(ValueError, match="Host cache tiers.*residue class"):
+def test_dcp_takes_both_host_tiers_but_not_l3():
+    # The scheduler allocates every Host block in its Device block's residue
+    # class and the executor translates ownership on both ends of every row,
+    # so a KV-page-sharded engine may run the Host KVStore and the snapshot
+    # pool. L3 keys have no owner-stable form under sharding and stay refused.
+    args = ServerArgs(
+        model="x",
+        world_size=2,
+        decode_context_parallel_size=2,
+        retraction_snapshot_host_gb=1.0,
+        retraction_snapshot_max_requests=2,
+    )
+    assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
+    with pytest.raises(ValueError, match="L3.*decode-context-parallel-size"):
         ServerArgs(
             model="x",
             world_size=2,
             decode_context_parallel_size=2,
-            disable_kvstore=True,
+            kvstore_storage_backend="mooncake",
+        )
+
+
+def test_forced_retraction_is_a_test_knob_that_needs_a_pool():
+    assert ServerArgs(model="x").debug_force_retraction_interval == 0
+    with pytest.raises(ValueError, match="debug-force-retraction-interval.*pool"):
+        ServerArgs(model="x", debug_force_retraction_interval=3)
+    for interval in (3, -2):
+        args = ServerArgs(
+            model="x",
             retraction_snapshot_host_gb=1.0,
             retraction_snapshot_max_requests=2,
+            debug_force_retraction_interval=interval,
         )
-    args = ServerArgs(
-        model="x", world_size=2, decode_context_parallel_size=2, disable_kvstore=True
-    )
-    assert args.enable_kvstore is False and args.retraction_snapshot_host_gb == 0.0
+        assert args.debug_force_retraction_interval == interval

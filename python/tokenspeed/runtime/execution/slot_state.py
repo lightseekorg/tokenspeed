@@ -100,7 +100,8 @@ def slot_state_image_bytes(rows: Iterable[torch.Tensor]) -> int:
     )
 
 
-def _stream_scope(stream):
+def stream_scope(stream):
+    """Enqueue on ``stream`` (a transfer stream), or inline for a CPU-only owner."""
     return nullcontext() if stream is None else device_module.stream(stream)
 
 
@@ -141,7 +142,7 @@ def pack_slot_rows(rows: Sequence[torch.Tensor], image: torch.Tensor, stream) ->
         stream: The transfer stream, or None for a CPU-only owner.
     """
     views = _image_views(rows, image)
-    with _stream_scope(stream):
+    with stream_scope(stream):
         for row, view in views:
             view.copy_(row, non_blocking=True)
 
@@ -152,7 +153,7 @@ def unpack_slot_rows(rows: Sequence[torch.Tensor], image: torch.Tensor, stream) 
     Arguments as for :func:`pack_slot_rows`.
     """
     views = _image_views(rows, image)
-    with _stream_scope(stream):
+    with stream_scope(stream):
         for row, view in views:
             row.copy_(view, non_blocking=True)
 

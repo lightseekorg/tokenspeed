@@ -48,7 +48,9 @@ import pytest
 import torch
 from tokenspeed_scheduler import PD
 
+from tokenspeed.runtime.cache.transfer.ops import HostTier, RestoreOp, SnapshotOp
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.engine import scheduler_utils as scheduler_utils_module
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
@@ -161,6 +163,71 @@ def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None
     )
 
 
+class _WriteBackOp:
+    """The wire face of ``Cache.WriteBackOp`` (no Python constructor), passed
+    through to the executor as one batch."""
+
+    def __init__(self, label) -> None:
+        self.label = label
+        self.op_ids = [1]
+
+    def __repr__(self) -> str:
+        return f"WriteBackOp({self.label!r})"
+
+
+class _LoadBackOp(_WriteBackOp):
+    def __repr__(self) -> str:
+        return f"LoadBackOp({self.label!r})"
+
+
+class _SnapshotBatch:
+    """The wire face of ``Cache.SnapshotOp``: ``rows`` is
+    ``[(op_id, request_pool_index, snapshot_slot)]``, one per victim, each with
+    one tail row of group 0."""
+
+    def __init__(self, rows) -> None:
+        self.op_ids = [op_id for op_id, _, _ in rows]
+        self.request_ids = [f"r{op_id}" for op_id, _, _ in rows]
+        self.request_pool_indices = [slot for _, slot, _ in rows]
+        self.snapshot_slots = [blob for _, _, blob in rows]
+        self.group_ids = [[0] for _ in rows]
+        self.src_pages = [[2] for _ in rows]
+        self.dst_pages = [[3] for _ in rows]
+
+
+class _RestoreBatch:
+    """The wire face of ``Cache.RestoreOp``; not a ``_SnapshotBatch`` subclass,
+    as the adapter dispatches on the type."""
+
+    def __init__(self, rows) -> None:
+        store = _SnapshotBatch(rows)
+        self.op_ids = store.op_ids
+        self.request_ids = store.request_ids
+        self.request_pool_indices = store.request_pool_indices
+        self.snapshot_slots = store.snapshot_slots
+        self.group_ids = store.group_ids
+        self.src_pages = store.src_pages
+        self.dst_pages = store.dst_pages
+        self.content_hashes = [[""] for _ in rows]
+        self.page_offsets = [[0] for _ in rows]
+        self.source_tiers = [[int(HostTier.SNAPSHOT_POOL)] for _ in rows]
+
+
+@pytest.fixture()
+def wire_ops(monkeypatch):
+    """Dispatch the plan adapter on the fakes above instead of the bindings."""
+    monkeypatch.setattr(
+        scheduler_utils_module,
+        "Cache",
+        SimpleNamespace(
+            WriteBackOp=_WriteBackOp,
+            LoadBackOp=_LoadBackOp,
+            SnapshotOp=_SnapshotBatch,
+            RestoreOp=_RestoreBatch,
+        ),
+    )
+
+
 def _planned(*, num_extends, label=None):
     """A round whose op carries only what routing reads."""
     return PlannedForward(
@@ -253,26 +320,26 @@ def test_an_aborted_request_still_lands_its_candidates_but_is_not_armed():
 # ----------------------------------------------------------------------
 
 
-def test_one_plan_orders_write_backs_zeroing_then_load_backs():
+def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
     """The FIFO carries the correctness order for same-round page reuse: the
     write-backs are submitted ahead of the new owner's zeroing (a
     stream-ordered snapshot copy lands its fence on the default stream the
     zeroing runs on), and the load-backs target zeroed pages. Every stream is
     named: the copies are told which stream wrote the pages and which one
     the fence lands on; the loads are told which stream zeroed their
-    destinations."""
+    destinations. The executor sees the plan's cache ops once, adapted, and
+    the same list on both submissions."""
     trace: list = []
-    plan = _plan(pages_to_zero=[3, 4], cache=["op"])
+    store, load = _WriteBackOp("store"), _LoadBackOp("load")
+    plan = _plan(pages_to_zero=[3, 4], cache=[store, load])
     handle = _handle(
         trace,
         host_cache_executor=SimpleNamespace(
-            submit_write_backs=lambda p, *, prerequisite_stream, fence_stream: (
-                trace.append(
-                    ("write_backs", p.cache, prerequisite_stream, fence_stream)
-                )
+            submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+                trace.append(("write_backs", ops, prerequisite_stream, fence_stream))
             ),
-            submit_load_backs=lambda p, *, prerequisite_stream, l3_prefetch_ok: trace.append(
-                ("load_backs", p.cache, prerequisite_stream)
+            submit_load_backs=lambda ops, *, prerequisite_stream, l3_prefetch_ok: trace.append(
+                ("load_backs", ops, prerequisite_stream)
             ),
             take_l3_prefetch_results=lambda: {},
             poll_results=lambda: ["done"],
@@ -286,15 +353,115 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
 
     assert trace == [
         "submit",
-        ("write_backs", ["op"], "execution-stream", "default-stream"),
+        ("write_backs", [store, load], "execution-stream", "default-stream"),
         "submit",
         ("zero", (3, 4)),
         "submit",
-        ("load_backs", ["op"], "default-stream"),
+        ("load_backs", [store, load], "default-stream"),
     ]
     # Polling never touches the FIFO — the round head must not wait on it.
     assert handle.poll_cache_results() == ["done"]
     assert trace[-1] != "submit"
+
+
+def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
+    """A retraction's image rides ``execute`` with no operation of its own:
+    the snapshot store goes to ``submit_write_backs`` (whose stream-ordered
+    lane fences the default stream the zeroing runs on) ahead of the
+    zeroing, the restore to ``submit_load_backs`` behind it. The binding's
+    batches arrive at the executor as one per-request op each -- the unit it
+    exports/imports a slot for -- carrying the victim's slot on the store and
+    the new slot on the restore."""
+    trace: list = []
+    plan = _plan(
+        pages_to_zero=[9],
+        cache=[
+            _WriteBackOp("l2-leg"),
+            _SnapshotBatch([(7, 3, 0), (8, 5, 1)]),
+            _RestoreBatch([(9, 4, 2)]),
+        ],
+    )
+
+    def submit_write_backs(ops, *, prerequisite_stream, fence_stream):
+        trace.append(("write_backs", ops, fence_stream))
+
+    def submit_load_backs(ops, *, prerequisite_stream, l3_prefetch_ok):
+        trace.append(("load_backs", ops, prerequisite_stream))
+
+    handle = _handle(
+        trace,
+        host_cache_executor=SimpleNamespace(
+            submit_write_backs=submit_write_backs,
+            submit_load_backs=submit_load_backs,
+            take_l3_prefetch_results=lambda: {},
+        ),
+    )
+    handle._executor.zero_cache_pages = lambda pages: trace.append(
+        ("zero", tuple(pages))
+    )
+
+    handle.execute(plan, None, submit_remote_prefill=True)
+
+    kinds = [entry[0] if isinstance(entry, tuple) else entry for entry in trace]
+    assert kinds == ["submit", "write_backs", "submit", "zero", "submit", "load_backs"]
+    # Stores precede the zeroing on the FIFO, and the fence they record lands
+    # on the stream the zeroing runs on.
+    stores = trace[1][1]
+    assert trace[1][2] == "default-stream"
+    assert [type(op).__name__ for op in stores] == [
+        "_WriteBackOp",
+        "SnapshotOp",
+        "SnapshotOp",
+        "RestoreOp",
+    ]
+    victims = [op for op in stores if isinstance(op, SnapshotOp)]
+    assert [(op.op_id, op.request_pool_index, op.snapshot_slot) for op in victims] == [
+        (7, 3, 0),
+        (8, 5, 1),
+    ]
+    # The restore is behind the zeroing and names the resumed request's new
+    # slot; it orders after the default stream, where the zeroing ran.
+    restores = [op for op in trace[-1][1] if isinstance(op, RestoreOp)]
+    assert [(op.op_id, op.request_pool_index, op.snapshot_slot) for op in restores] == [
+        (9, 4, 2)
+    ]
+    assert trace[-1][2] == "default-stream"
+    assert kinds.index("zero") < kinds.index("load_backs")
+
+
+def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
+    wire_ops,
+):
+    """The store's ``request_pool_index`` is the victim's slot, which the
+    scheduler frees in the same plan build; its next owner writes it in a
+    forward. The handle enqueues every forward behind the store submission,
+    whose fence the forward's prologue inherits, so the export reads the
+    victim's bytes even when this very plan's batch reuses the slot."""
+    trace: list = []
+    plan = _plan(pages_to_zero=[2], cache=[_SnapshotBatch([(1, 6, 0)])])
+    handle = _handle(
+        trace,
+        host_cache_executor=SimpleNamespace(
+            submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+                trace.append(("store", [op.request_pool_index for op in ops]))
+            ),
+            submit_load_backs=lambda ops, *, prerequisite_stream, l3_prefetch_ok: (
+                trace.append("load_backs")
+            ),
+            take_l3_prefetch_results=lambda: {},
+        ),
+    )
+    handle._executor.zero_cache_pages = lambda pages: trace.append("zero")
+    handle._executor.execute_forward_op = lambda op, *a, **k: trace.append(
+        ("forward", list(op.request_pool_indices))
+    )
+    planned = _planned(num_extends=1)
+    planned.forward_op.request_pool_indices = [6]  # the slot just freed
+
+    handle.execute(plan, planned, submit_remote_prefill=True)
+
+    order = [entry for entry in trace if entry != "submit"]
+    assert order == [("store", [6]), "zero", "load_backs", ("forward", [6])]
 
 
 def test_page_zeroing_without_l2_submits_only_zeroing():
@@ -318,26 +485,26 @@ def test_a_plan_with_no_device_work_submits_nothing():
     assert trace == []
 
 
-def test_a_failed_cache_submission_surfaces_at_the_next_poll():
+def test_a_failed_cache_submission_surfaces_at_the_next_poll(wire_ops):
     """A submission that raised produces no completion acks; swallowing it
     would leave its ops counted in flight forever."""
     trace: list = []
 
-    def exploding(plan, *, prerequisite_stream, fence_stream):
+    def exploding(ops, *, prerequisite_stream, fence_stream):
         raise ValueError("bad cache op")
 
     handle = _handle(
         trace,
         host_cache_executor=SimpleNamespace(
             submit_write_backs=exploding,
-            submit_load_backs=lambda p, *, prerequisite_stream, l3_prefetch_ok: None,
+            submit_load_backs=lambda ops, *, prerequisite_stream, l3_prefetch_ok: None,
             take_l3_prefetch_results=lambda: {},
             poll_results=lambda: [],
         ),
     )
 
     # Submission itself never raises (fire-and-forget)...
-    handle.execute(_plan(cache=["op"]), None, submit_remote_prefill=True)
+    handle.execute(_plan(cache=[_WriteBackOp("op")]), None, submit_remote_prefill=True)
     # ...the failure re-raises at the round head, data-plane cause chained.
     with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
         handle.poll_cache_results()
@@ -345,7 +512,7 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
 
 
 @pytest.mark.parametrize("second_ok", [True, False])
-def test_queued_load_backs_capture_each_plans_l3_results(second_ok):
+def test_queued_load_backs_capture_each_plans_l3_results(second_ok, wire_ops):
     """Two control-plane rounds run before either queued H2D submission."""
     from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
 
@@ -353,9 +520,9 @@ def test_queued_load_backs_capture_each_plans_l3_results(second_ok):
     observed = []
     l2 = HostCacheExecutor.__new__(HostCacheExecutor)
     l2._l3_prefetch_ok = {(0, 1, "first", 0): True}
-    l2.submit_write_backs = lambda p, *, prerequisite_stream, fence_stream: None
-    l2.submit_load_backs = lambda p, *, prerequisite_stream, l3_prefetch_ok: (
-        observed.append((p, l3_prefetch_ok))
+    l2.submit_write_backs = lambda ops, *, prerequisite_stream, fence_stream: None
+    l2.submit_load_backs = lambda ops, *, prerequisite_stream, l3_prefetch_ok: (
+        observed.append((ops, l3_prefetch_ok))
     )
     handle = _handle([], host_cache_executor=l2)
 
@@ -365,8 +532,9 @@ def test_queued_load_backs_capture_each_plans_l3_results(second_ok):
         return future
 
     handle._thread = SimpleNamespace(submit=enqueue)
-    first = _plan(cache=["first"])
-    second = _plan(cache=["second"])
+    first_op, second_op = _LoadBackOp("first"), _LoadBackOp("second")
+    first = _plan(cache=[first_op])
+    second = _plan(cache=[second_op])
     handle.execute(first, None, submit_remote_prefill=True)
     assert l2._l3_prefetch_ok == {}
     l2._l3_prefetch_ok = {(0, 2, "second", 0): True}
@@ -377,8 +545,8 @@ def test_queued_load_backs_capture_each_plans_l3_results(second_ok):
     for fn, future in queued:
         future.set_result(fn())
     assert observed == [
-        (first, {(0, 1, "first", 0): True}),
-        (second, {(0, 2, "second", 0): second_ok}),
+        ([first_op], {(0, 1, "first", 0): True}),
+        ([second_op], {(0, 2, "second", 0): second_ok}),
     ]
 
 

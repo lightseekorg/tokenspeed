@@ -34,7 +34,7 @@ import logging
 import torch
 import torch.distributed as dist
 
-from tokenspeed.runtime.engine.scheduler_utils import make_retract_event
+from tokenspeed.runtime.engine.scheduler_utils import make_recompute_retract_event
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +181,11 @@ class L3CacheHooks:
         ``batch_exists`` is not a lease. After Admit, ``batch_get_into`` can
         still miss. Prefetch on this control-plane turn, MIN-reduce across
         the replica, then skip H2D / skip publishing empty Host pages and
-        retract (snapshot-less) so the next admit recomputes those tokens.
+        retract for recompute (``RecomputeRetract``: the destination pages
+        were never filled, so there is nothing to image; the request drops
+        to Submitted and the next admit recomputes those tokens -- a
+        different path from the scheduler's capacity retraction, which
+        suspends a request with its image and restores it).
         A backend exception or malformed result is a local miss so every
         rank still enters the MIN-reduce; raising would hang healthy peers.
         Failed keys stay unread: a later ``batch_exists`` hit must not
@@ -237,7 +241,7 @@ class L3CacheHooks:
                 if rid in seen:
                     continue
                 seen.add(rid)
-                retracted.append(make_retract_event(rid))
+                retracted.append(make_recompute_retract_event(rid))
 
         if forward_op is not None:
             _retract(forward_op.request_ids)

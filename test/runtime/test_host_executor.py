@@ -368,9 +368,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._load_poisoned = False
         executor.block_owners = _identity_owners()
 
-        executor.submit_load_backs(
-            SimpleNamespace(cache=[]), prerequisite_stream=object(), l3_prefetch_ok={}
-        )
+        executor.submit_load_backs([], prerequisite_stream=object(), l3_prefetch_ok={})
 
         tracker.set_consumers.assert_called_once_with(-1)
 
@@ -418,7 +416,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
                 stream = object()
                 executor.submit_load_backs(
-                    first, prerequisite_stream=stream, l3_prefetch_ok=captured
+                    first.cache, prerequisite_stream=stream, l3_prefetch_ok=captured
                 )
                 executor._start_loading.assert_called_once_with(
                     [1], [(0, 11, 1)], success=True, prerequisite_stream=stream
@@ -426,7 +424,7 @@ class GroupAwareWireTest(unittest.TestCase):
                 if second_outcome != "empty":
                     executor._start_loading.reset_mock()
                     executor.submit_load_backs(
-                        second,
+                        second.cache,
                         prerequisite_stream=stream,
                         l3_prefetch_ok=second_captured,
                     )
@@ -700,7 +698,7 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(lanes_module, "transfer_cache_blocks") as transfer,
         ):
             executor.submit_write_backs(
-                SimpleNamespace(cache=[WriteBackOp()]),
+                [WriteBackOp()],
                 prerequisite_stream=prerequisite,
                 fence_stream=fence_stream,
             )
@@ -807,7 +805,7 @@ class GroupAwareWireTest(unittest.TestCase):
                 patch.object(lanes_module, "transfer_cache_blocks"),
             ):
                 executor.submit_write_backs(
-                    SimpleNamespace(cache=[WriteBackOp()]),
+                    [WriteBackOp()],
                     prerequisite_stream=object(),
                     fence_stream=Mock(),
                 )
@@ -868,7 +866,7 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(lanes_module, "transfer_cache_blocks"),
         ):
             executor.submit_write_backs(
-                SimpleNamespace(cache=[WriteBackOp()]),
+                [WriteBackOp()],
                 prerequisite_stream=prerequisite,
                 fence_stream=fence_stream,
             )
@@ -894,7 +892,7 @@ class GroupAwareWireTest(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 executor.submit_write_backs(
-                    SimpleNamespace(cache=[WriteBackOp()]),
+                    [WriteBackOp()],
                     prerequisite_stream=prerequisite,
                     fence_stream=object(),
                 )

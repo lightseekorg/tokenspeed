@@ -77,13 +77,7 @@ from tokenspeed.runtime.cache.transfer.lanes import (
     new_cache_stream,
 )
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
-from tokenspeed.runtime.cache.transfer.ops import (
-    HostTier,
-    RestoreDoneEvent,
-    RestoreOp,
-    SnapshotDoneEvent,
-    SnapshotOp,
-)
+from tokenspeed.runtime.cache.transfer.ops import HostTier, RestoreOp, SnapshotOp
 from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.execution.slot_state import SlotStateExporter, SlotStateLayout
@@ -286,9 +280,8 @@ class HostCacheExecutor:
                 rank=dcp_rank,
             )
         # The scheduler wire includes logical null LCMBlock 0 in its counts;
-        # 0 L2 pages means no L2 tier, 1 snapshot page means no pool. The
-        # pool count is reserved for the scheduler's snapshot ops (a later
-        # phase); it does not change today's retraction behaviour.
+        # 0 L2 pages means no L2 tier, 1 snapshot page means no pool (the
+        # scheduler then never retracts).
         self.num_host_pages = host_lcm_blocks + 1 if l2_tier else 0
         self.num_snapshot_pages = snapshot_lcm_blocks + 1
         self.l3_store = None
@@ -474,7 +467,9 @@ class HostCacheExecutor:
     # Submission (forward thread)
     # ------------------------------------------------------------------
 
-    def submit_write_backs(self, plan, *, prerequisite_stream, fence_stream) -> None:
+    def submit_write_backs(
+        self, cache_ops: Sequence, *, prerequisite_stream, fence_stream
+    ) -> None:
         """Enqueue the plan's D2H copies on the write stream.
 
         Must run BEFORE the plan's page zeroing. Every copy is ordered behind
@@ -492,8 +487,10 @@ class HostCacheExecutor:
         both legs.
 
         Args:
-            plan: The round's ExecutionPlan; its ``Cache.WriteBackOp`` and
-                ``SnapshotOp`` entries are read here.
+            cache_ops: The round's cache ops as ``scheduler_utils.
+                cache_ops_from_plan`` adapts them; the ``Cache.WriteBackOp``
+                batches and the per-request ``SnapshotOp`` entries are read
+                here, the rest belongs to ``submit_load_backs``.
             prerequisite_stream: The stream whose completed work every copy
                 must observe -- the model executor's execution stream, where
                 the forwards wrote the source pages and the slot state.
@@ -511,7 +508,7 @@ class HostCacheExecutor:
         # The whole plan is validated and translated before the first launch:
         # a bad op must not leave the ordered rows in flight without the
         # fence that follows them.
-        for operation in plan.cache:
+        for operation in cache_ops:
             if isinstance(operation, Cache.WriteBackOp):
                 self._append_write_backs(
                     operation,
@@ -552,7 +549,11 @@ class HostCacheExecutor:
         )
 
     def submit_load_backs(
-        self, plan, *, prerequisite_stream, l3_prefetch_ok: dict[StoragePage, bool]
+        self,
+        cache_ops: Sequence,
+        *,
+        prerequisite_stream,
+        l3_prefetch_ok: dict[StoragePage, bool],
     ) -> None:
         """Launch the plan's H2D loads; runs after the plan's page zeroing.
 
@@ -561,14 +562,18 @@ class HostCacheExecutor:
         A ``RestoreOp`` rides the same load stream with its rows split by
         source tier (the request's pinned L2 entries, the pool's tail pages),
         then its slot-state import; it arms no layerwise tracker, because the
-        request is not schedulable until the ACK.
+        request is not schedulable until the ACK, and its destinations are
+        overwritten whole rather than zeroed first.
 
         Args:
-            plan: The round's ExecutionPlan; its ``Cache.LoadBackOp`` and
-                ``RestoreOp`` entries are read here.
+            cache_ops: The round's cache ops as ``scheduler_utils.
+                cache_ops_from_plan`` adapts them; the ``Cache.LoadBackOp``
+                batches and the per-request ``RestoreOp`` entries are read
+                here.
             prerequisite_stream: The stream whose completed work every copy
-                must observe -- the one the plan's page zeroing ran on, so the
-                loads land on zeroed destination pages.
+                must observe -- the one the plan's page zeroing ran on (behind
+                the store fence), so the loads land on zeroed destination
+                pages and nothing reads a restored page before its image.
             l3_prefetch_ok: This submission's captured prefetch results. Later
                 control-plane rounds must not change the queued H2D decision.
         """
@@ -580,7 +585,7 @@ class HostCacheExecutor:
             HostTier.L2: [],
             HostTier.SNAPSHOT_POOL: [],
         }
-        for operation in plan.cache:
+        for operation in cache_ops:
             if isinstance(operation, Cache.LoadBackOp):
                 kept_rows = self._append_transfers(
                     operation.op_ids,
@@ -887,8 +892,12 @@ class HostCacheExecutor:
 
         One event after the L2-tier rows, the pool-tier rows and the imports,
         so the scheduler sees one ``RestoreDone`` per op; the layerwise
-        tracker is not armed. The ops were validated at collection; an op
-        with no rows restores its slot state alone.
+        tracker is not armed. A row overwrites its whole destination block,
+        so the scheduler lists no restore destination for zeroing; the copies
+        still order behind the stream the caller names, which carries the
+        plan's store fence and its zeroing of other pages. The ops were
+        validated at collection; an op with no rows restores its slot state
+        alone.
         """
         if get_is_capture_mode():
             raise RuntimeError("a snapshot restore must run outside graph capture")
@@ -899,7 +908,7 @@ class HostCacheExecutor:
                 f"[snapshot] restore started: operations={len(ops):d} "
                 f"l2_blocks={len(l2_rows):d} pool_blocks={len(pool_rows):d}",
             )
-        # Behind the zeroing of the destinations on the stream the caller named.
+        # Behind the plan's zeroing and store fence on the stream the caller named.
         self.load_stream.wait_stream(prerequisite_stream)
         if l2_rows:
             self._restore_l2_lane.start_h2d(
@@ -1377,9 +1386,9 @@ class HostCacheExecutor:
                     self._load_done(op_id, ack.success) for op_id in ack.op_ids
                 )
             elif ack.kind is _AckKind.SNAPSHOT:
-                results.extend(SnapshotDoneEvent(op_id=op_id) for op_id in ack.op_ids)
+                results.extend(self._snapshot_done(op_id) for op_id in ack.op_ids)
             else:
-                results.extend(RestoreDoneEvent(op_id=op_id) for op_id in ack.op_ids)
+                results.extend(self._restore_done(op_id) for op_id in ack.op_ids)
         self._collect_finished_backups(results)
         return results
 
@@ -1474,6 +1483,18 @@ class HostCacheExecutor:
     @staticmethod
     def _load_done(op_id: int, success: bool):
         return Cache.LoadBackDoneEvent(op_id, success)
+
+    @staticmethod
+    def _snapshot_done(op_id: int):
+        event = Cache.SnapshotDoneEvent()
+        event.op_id = op_id
+        return event
+
+    @staticmethod
+    def _restore_done(op_id: int):
+        event = Cache.RestoreDoneEvent()
+        event.op_id = op_id
+        return event
 
     def shutdown(self) -> None:
         # The fences and start events live on streams the callers named per

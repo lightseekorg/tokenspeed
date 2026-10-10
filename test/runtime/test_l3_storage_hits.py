@@ -305,7 +305,7 @@ def test_vanished_l3_prefetch_unregisters_and_retracts(monkeypatch) -> None:
     retracts: list[str] = []
 
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: retracts.append(rid) or f"retract:{rid}",
     )
 
@@ -332,7 +332,7 @@ def test_vanished_l3_prefetch_retracts_remote_prefill(monkeypatch) -> None:
     retracts: list[str] = []
 
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: retracts.append(rid) or f"retract:{rid}",
     )
 
@@ -361,7 +361,7 @@ def test_vanished_l3_prefetch_retracts_forward_and_remote_prefill_once(
     retracts: list[str] = []
 
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: retracts.append(rid) or f"retract:{rid}",
     )
 
@@ -386,7 +386,7 @@ def test_failed_l3_prefetch_is_not_reregistered_while_exists_stays_true(
     """A get-failure must not be re-admitted from a later batch_exists hit."""
 
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: f"retract:{rid}",
     )
     ctx = _Harness(exists_flags=[True])
@@ -432,7 +432,7 @@ def test_unread_miss_is_min_reduced_with_exists() -> None:
 
 def test_namespace_delete_forgets_unread_l3_keys(monkeypatch) -> None:
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: f"retract:{rid}",
     )
     ctx = _Harness(exists_flags=[True])
@@ -453,7 +453,7 @@ def test_prefetch_rpc_error_converges_then_retracts(monkeypatch) -> None:
     """A local batch_get_into exception must still enter the replica MIN."""
 
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: f"retract:{rid}",
     )
     ctx = _Harness(exists_flags=[True])
@@ -524,7 +524,7 @@ def test_exists_length_mismatch_converges_as_misses() -> None:
 
 def test_prefetch_length_mismatch_converges_as_misses(monkeypatch) -> None:
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: f"retract:{rid}",
     )
     ctx = _Harness(exists_flags=[True])
@@ -568,7 +568,7 @@ def test_mixed_l3_prefetch_blacklists_only_failed_pages(monkeypatch) -> None:
     """A vanished tail must not unread pages whose replica get succeeded."""
 
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: f"retract:{rid}",
     )
     ctx = _Harness(exists_flags=[True, True])
@@ -601,7 +601,7 @@ def test_successful_republish_clears_unread_l3_key(monkeypatch) -> None:
     """A Host backup that creates a missing object may restore L3 reuse."""
 
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: f"retract:{rid}",
     )
     ctx = _Harness(exists_flags=[True])
@@ -738,7 +738,7 @@ def test_l3_recovery_preserves_round_order(
         pp_cpu_group=None,
     )
     monkeypatch.setattr(
-        "tokenspeed.runtime.engine.l3_cache_hooks.make_retract_event",
+        "tokenspeed.runtime.engine.l3_cache_hooks.make_recompute_retract_event",
         lambda rid: f"retract:{rid}",
     )
 

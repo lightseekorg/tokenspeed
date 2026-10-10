@@ -639,8 +639,11 @@ DSA-family attention backend (GPU DSA) with a bf16 KV cache, `--dense-tp-size`
 and the MoE TP×EP group each 1 or `N` (attention returns complete rows, so
 the drafter's replicated decode rows are never scattered and a narrower group
 would have nothing to gather), and `--decode-context-parallel-size` 1 or `N`
-(with `--disable-kvstore`, as DCP requires). The drafter's extend step is
-sharded like the target's; its decode steps run every row on every rank.
+(a KV-page-sharded engine may keep the Host KVStore and the retraction
+snapshot pool -- every Host block sits in its Device block's residue class and
+each rank copies the blocks it owns -- but not L3 storage, whose keys have no
+owner-stable form under sharding). The drafter's extend step is sharded like
+the target's; its decode steps run every row on every rank.
 
 **Head TP over the query shards.** Without `--attn-head-tp-size` the shard
 group's ranks hold different rows and every rank holds every head of

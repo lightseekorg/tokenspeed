@@ -84,6 +84,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -175,13 +176,10 @@ class DeviceSpecs:
         num_snapshot_pages: The retraction snapshot pool's page count (incl.
             the null page), sized like the L2 tier's from
             ``--retraction-snapshot-host-gb``; 1 (the null page alone)
-            without a pool. Reserved by this phase; the scheduler consumes
-            it once it emits snapshot/restore ops (the retraction-snapshot
-            design's scheduler phase). Today's retraction behaviour does not
-            depend on it.
+            without a pool, which tells the scheduler never to retract.
         max_retracted_requests: Slot-state image rows of the snapshot pool,
-            i.e. how many requests may be retracted at once once those ops
-            exist; 0 without a pool.
+            i.e. how many requests may be retracted at once; 0 without a
+            pool.
         expert_rebalance: The expert placement's geometry and this rank's
             position in its EP group, for the online rebalance controller;
             None unless the server started with ``--enable-eplb``.
@@ -307,8 +305,8 @@ class DeviceHandle:
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
         # transfers and records events. Snapshot stores ride ``execute``
-        # with the write-backs and restores with the load-backs once the
-        # scheduler emits them; their ACKs already ride the cache poll.
+        # with the write-backs and restores with the load-backs; all four
+        # ACK kinds ride the cache poll.
         self._l2 = host_cache_executor
         # The PD transfer peer's execution face: its transfers move KV-pool
         # device memory over RDMA, so they need the same ordering against
@@ -338,22 +336,35 @@ class DeviceHandle:
         """Execute one scheduler plan; never blocks on the per-round path.
 
         The whole plan on the FIFO -- one thread, explicitly ordered streams -- in an order
-        that IS the correctness argument for same-round page reuse:
-        write-backs first (a stream-ordered one -- a retraction's snapshot,
-        whose sources this plan may re-grant -- fences the caller's stream
-        on its completion so it reads the reused pages' old bytes; a pinned
-        one -- an ordinary publication, whose sources the scheduler holds
-        until the ACK -- rides the write stream and fences nothing), then
-        page zeroing (the new owner's sanitization), then load-backs (they
-        target zeroed pages), the transfer peer's remote streams, and finally
-        the ``ForwardBatch``. The loop hands the round over and does not
-        branch on it, except withholding ``plan.remote_prefill`` after
-        vanished-L3 recovery -- the same snapshot-less retract that skips
-        the model forward.
+        that IS the correctness argument for same-round page reuse: the
+        Host-bound stores first (``WriteBackOp`` and ``SnapshotOp``: a
+        retraction image's two legs -- the stream-ordered L2 write-back of
+        the victim's hash-complete pages and the snapshot store of its tail
+        pages and slot state -- read pages this plan re-grants, so they ride
+        the write stream consecutively and ONE completion event fences the
+        forward thread's default stream before anything else of the plan is
+        enqueued; a pinned write-back -- an ordinary publication, whose
+        sources the scheduler holds until the ACK -- rides the write stream
+        and fences nothing), then page zeroing (the new owner's
+        sanitization), then the Device-bound copies (``LoadBackOp`` and
+        ``RestoreOp``, ordered behind the zeroing: a load-back lands on
+        zeroed pages, a restore overwrites its destinations whole), the
+        transfer peer's remote streams, and finally the ``ForwardBatch``. The
+        loop hands the round over and does not branch on it, except
+        withholding ``plan.remote_prefill`` after vanished-L3 recovery -- the
+        same recompute retract that skips the model forward.
+
+        A store's ``request_pool_index`` names the victim's slot, which the
+        scheduler frees in the same plan build: the slot's next owner first
+        writes it in a forward, and every forward of this plan is enqueued
+        behind the store fence, so the slot-state export reads the victim's
+        bytes. A restore's names the resumed request's new slot.
 
         Args:
             execution_plan: The round's plan, a per-round value copy out of
-                C++; its cache ops are read on the data plane.
+                C++. Its cache ops are adapted here, once, on the control
+                plane (``cache_ops_from_plan``: the binding's batched snapshot
+                ops become per-request ops) and read on the data plane.
             planned: The control plane's half of the round — the gathered
                 per-batch state only it can produce (sampling params, live
                 grammar matchers, the multimodal snapshot, DP metadata).
@@ -364,8 +375,8 @@ class DeviceHandle:
                 transfers — retraction writebacks, load-back destinations —
                 still run; they do not depend on a forward.
             submit_remote_prefill: Whether to submit ``plan.remote_prefill``.
-                False after vanished-L3 recovery: those requests retract
-                snapshot-less, and pulling suffix-only KV onto empty prefix
+                False after vanished-L3 recovery: those requests retract for
+                recompute, and pulling suffix-only KV onto empty prefix
                 pages would land invalid cache on the decode node. Cache
                 ops still run so LoadBackDone can unpin without publishing.
 
@@ -382,7 +393,8 @@ class DeviceHandle:
         )
 
         executor = self._executor
-        l2 = self._l2 if execution_plan.cache else None
+        cache_ops = cache_ops_from_plan(execution_plan)
+        l2 = self._l2 if cache_ops else None
         if l2 is not None:
             # Ahead of the zeroing: a stream-ordered store's sources may be
             # this very plan's pages_to_zero, and its fence lands on the
@@ -392,7 +404,7 @@ class DeviceHandle:
             self._l2_submissions.append(
                 self._thread.submit(
                     lambda: l2.submit_write_backs(
-                        execution_plan,
+                        cache_ops,
                         prerequisite_stream=executor.execution_stream,
                         fence_stream=executor.default_stream,
                     )
@@ -413,7 +425,7 @@ class DeviceHandle:
             self._l2_submissions.append(
                 self._thread.submit(
                     lambda: l2.submit_load_backs(
-                        execution_plan,
+                        cache_ops,
                         prerequisite_stream=executor.default_stream,
                         l3_prefetch_ok=l3_prefetch_ok,
                     )
@@ -508,6 +520,10 @@ class DeviceHandle:
 
     def poll_cache_results(self) -> list:
         """Collect completed Host cache ops (both tiers); never blocks.
+
+        Yields the scheduler's four ACK kinds -- ``WriteBackDoneEvent``,
+        ``LoadBackDoneEvent``, ``SnapshotDoneEvent``, ``RestoreDoneEvent`` --
+        for ``CacheOpHooks`` to replica-intersect and the loop to advance.
 
         Stays on the control plane deliberately: completion is CUDA event
         queries plus queue drains (serialized against the data-plane submit

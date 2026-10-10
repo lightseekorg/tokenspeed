@@ -39,7 +39,12 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.cache.transfer.ops import RestoreDoneEvent, SnapshotDoneEvent
+from tokenspeed.runtime.cache.transfer.ops import (
+    CacheTransfer,
+    HostTier,
+    RestoreOp,
+    SnapshotOp,
+)
 from tokenspeed.runtime.execution.types import (
     InputLogprobPlan,
     NGramInputs,
@@ -53,19 +58,16 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     scheduler_role,
 )
 
+# The Host cache's ACKs, as the scheduler binds them: an L2 write-back or
+# load-back ticket, a retraction image's snapshot store, a restore. The hooks
+# carry them across ranks as ``(kind, op_id)`` payloads and rebuild the binding
+# event from the payload.
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
-    # The retraction snapshot's ACKs (cache/transfer/ops.py): runtime-side
-    # types until the scheduler binding carries them.
-    "SnapshotDoneEvent": SnapshotDoneEvent,
-    "RestoreDoneEvent": RestoreDoneEvent,
+    "LoadBackDoneEvent": Cache.LoadBackDoneEvent,
+    "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
+    "RestoreDoneEvent": Cache.RestoreDoneEvent,
 }
-# Emitted only by the host tier. Keep the lookup guarded so an older extension
-# still imports this module and fails later with a targeted compatibility error.
-if hasattr(Cache, "LoadBackDoneEvent"):
-    _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
-# Constructed from the payload's op id directly (frozen dataclasses).
-_OP_ID_CONSTRUCTED_EVENTS = frozenset({"SnapshotDoneEvent", "RestoreDoneEvent"})
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
@@ -184,13 +186,16 @@ class RequestHistoryRows:
     rid has started there at position 0 or been seeded there, until another
     request runs in the slot. That ownership decides when a forward must
     seed its committed prefix: a prefix-cache hit, a slot handoff, a
-    retraction recovery into another slot, or a PD decode landing, whose
+    retracted request's restore into another slot (its history row is
+    token-derived and not part of its image), or a PD decode landing, whose
     first local forward is a decode over a remotely prefilled prompt. Later
     chunks of one prefill and ordinary decode steps never reseed.
 
     Ownership is recorded per admission — the request's state object, held
     weakly — not per request id: clients may reuse a finished request's id,
     and a later request landing in the same slot must not inherit the row.
+    A restored request keeps its state object but lands in a new slot, so
+    the row ownership check reseeds it there.
 
     Call :meth:`seeds_for_forward` exactly once per forward the executor
     runs, in dispatch order (the executor runs forwards in that order).
@@ -368,6 +373,10 @@ def make_config(
     disable_l2_cache: bool,
     enable_l3_storage: bool,
     role: str,
+    *,
+    num_snapshot_pages: int,
+    max_retracted_requests: int,
+    debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
@@ -376,10 +385,52 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
 ) -> SchedulerConfig:
+    """Build the C++ scheduler's configuration.
+
+    Args:
+        num_device_pages: Device LCM blocks including the null page.
+        max_scheduled_tokens: Per-step prefill token budget.
+        max_batch_size: Per-rank batch slots.
+        prefix_granularity: Prefix-hash page size in tokens.
+        num_host_pages: Host L2 LCM blocks including the null page; 0 without
+            the L2 tier.
+        disable_l2_cache: No Host L2 tier.
+        enable_l3_storage: An L3 store backs the L2 tier.
+        role: ``server_args.disaggregation_mode``.
+        num_snapshot_pages: The retraction snapshot pool's LCM blocks
+            including the null page (``DeviceSpecs.num_snapshot_pages``).
+            Required on every role: 1 -- the null page alone -- means the
+            engine never retracts; more enables retraction on the fused and
+            decode roles (the prefill role refuses a pool).
+        max_retracted_requests: Slot-state arena rows, hence the most
+            requests retracted at once; positive exactly when a pool exists.
+        debug_force_retraction_interval: ``--debug-force-retraction-interval``:
+            0 is off; every ``|N|`` plans the scheduler retracts the oldest
+            quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
+            without capacity pressure. A test knob, never set in serving.
+        enable_kv_cache_events: Publish KV cache events.
+        decode_input_tokens: Verify width per decode step.
+        overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
+        disable_prefix_cache: No prefix matching at admission.
+        cache_groups: The arena's scheduler group configs.
+        enable_mixed_prefill_decode: Mixed prefill/decode batches.
+        prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
+    """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
             "prefix_replay_tokens must fit a non-negative int32; "
             f"got {prefix_replay_tokens}."
+        )
+    if num_snapshot_pages < 1:
+        raise ValueError(
+            "num_snapshot_pages must include the null page (1 = never retract); "
+            f"got {num_snapshot_pages}."
+        )
+    if (num_snapshot_pages > 1) != (max_retracted_requests > 0):
+        raise ValueError(
+            "a retraction snapshot pool and its slot-state rows go together; got "
+            f"num_snapshot_pages={num_snapshot_pages}, "
+            f"max_retracted_requests={max_retracted_requests}."
         )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -388,6 +439,9 @@ def make_config(
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages
+    cfg.num_snapshot_pages = num_snapshot_pages
+    cfg.max_retracted_requests = max_retracted_requests
+    cfg.debug_force_retraction_interval = debug_force_retraction_interval
     cfg.enable_l3_storage = enable_l3_storage
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
@@ -526,13 +580,16 @@ def make_abort_event(request_id: str) -> "ForwardEvent.Abort":
     return fe
 
 
-def make_retract_event(request_id: str) -> "ForwardEvent.Retract":
-    """Release pages and requeue as prefill without finishing the client.
+def make_recompute_retract_event(request_id: str) -> "ForwardEvent.RecomputeRetract":
+    """Release pages and requeue as a new prompt without finishing the client.
 
-    Snapshot-less: dest pages were not filled. The next admit recomputes
-    missing prefix tokens from Device/Host plus remaining L3 keys.
+    The L3-miss-after-admit path: the destination pages were never filled, so
+    there is nothing to image and the request drops to Submitted to
+    re-prefill like a newcomer (its generated tokens rebased into the prompt).
+    A capacity retraction is the scheduler's own suspend-with-image path and
+    never comes through here.
     """
-    fe = ForwardEvent.Retract()
+    fe = ForwardEvent.RecomputeRetract()
     fe.request_id = request_id
     return fe
 
@@ -624,11 +681,145 @@ def cache_event_from_payload(payload: dict):
         raise ValueError(f"Unsupported cache event type: {kind}")
     if kind == "LoadBackDoneEvent":
         return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]), bool(payload["success"]))
-    if kind in _OP_ID_CONSTRUCTED_EVENTS:
-        return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]))
     event = _CACHE_EVENT_TYPES[kind]()
     event.op_id = int(payload["op_id"])
     return event
+
+
+def _check_batch_rows(op, columns: Sequence[Sequence]) -> int:
+    """The row count of a wire batch whose per-op columns must all agree."""
+    lengths = {len(column) for column in columns}
+    if len(lengths) != 1:
+        raise ValueError(
+            f"ragged {type(op).__name__} batch: column lengths {sorted(lengths)}"
+        )
+    return lengths.pop()
+
+
+def _wire_transfers(
+    op_id: int,
+    groups: Sequence[int],
+    sources: Sequence[int],
+    destinations: Sequence[int],
+    hashes: Sequence[str] | None,
+    offsets: Sequence[int] | None,
+) -> tuple[CacheTransfer, ...]:
+    """One op's rows of a wire batch as ``CacheTransfer`` values."""
+    if hashes is None:
+        hashes = [""] * len(groups)
+        offsets = [0] * len(groups)
+    if not (
+        len(groups) == len(sources) == len(destinations) == len(hashes) == len(offsets)
+    ):
+        raise ValueError(f"ragged cache operation {op_id}")
+    return tuple(
+        CacheTransfer(
+            group_id=int(group),
+            source_page=int(source),
+            destination_page=int(destination),
+            content_hash=str(content_hash),
+            page_offset=int(page_offset),
+        )
+        for group, source, destination, content_hash, page_offset in zip(
+            groups, sources, destinations, hashes, offsets
+        )
+    )
+
+
+def _snapshot_batch_columns(op) -> tuple[Sequence, ...]:
+    return (
+        op.op_ids,
+        op.request_ids,
+        op.request_pool_indices,
+        op.snapshot_slots,
+        op.group_ids,
+        op.src_pages,
+        op.dst_pages,
+    )
+
+
+def snapshot_ops_from_wire(op) -> list[SnapshotOp]:
+    """One ``SnapshotOp`` per request of a ``Cache.SnapshotOp`` batch."""
+    rows = _check_batch_rows(op, _snapshot_batch_columns(op))
+    return [
+        SnapshotOp(
+            op_id=int(op.op_ids[i]),
+            request_id=str(op.request_ids[i]),
+            request_pool_index=int(op.request_pool_indices[i]),
+            snapshot_slot=int(op.snapshot_slots[i]),
+            transfers=_wire_transfers(
+                int(op.op_ids[i]),
+                op.group_ids[i],
+                op.src_pages[i],
+                op.dst_pages[i],
+                None,
+                None,
+            ),
+        )
+        for i in range(rows)
+    ]
+
+
+def restore_ops_from_wire(op) -> list[RestoreOp]:
+    """One ``RestoreOp`` per request of a ``Cache.RestoreOp`` batch."""
+    rows = _check_batch_rows(
+        op,
+        _snapshot_batch_columns(op)
+        + (op.content_hashes, op.page_offsets, op.source_tiers),
+    )
+    ops = []
+    for i in range(rows):
+        transfers = _wire_transfers(
+            int(op.op_ids[i]),
+            op.group_ids[i],
+            op.src_pages[i],
+            op.dst_pages[i],
+            op.content_hashes[i],
+            op.page_offsets[i],
+        )
+        tiers = tuple(HostTier(int(tier)) for tier in op.source_tiers[i])
+        if len(tiers) != len(transfers):
+            raise ValueError(f"ragged cache operation {op.op_ids[i]}")
+        ops.append(
+            RestoreOp(
+                op_id=int(op.op_ids[i]),
+                request_id=str(op.request_ids[i]),
+                request_pool_index=int(op.request_pool_indices[i]),
+                snapshot_slot=int(op.snapshot_slots[i]),
+                transfers=transfers,
+                source_tier=tiers,
+            )
+        )
+    return ops
+
+
+def cache_ops_from_plan(execution_plan) -> list:
+    """The plan's cache ops as the runtime consumes them, in plan order.
+
+    The one adapter between the scheduler's wire batches and the Host cache
+    executor. An L2 ``Cache.WriteBackOp`` / ``Cache.LoadBackOp`` batch passes
+    through: the executor consumes its lists-of-lists as one ticket per
+    ``op_ids`` entry. A ``Cache.SnapshotOp`` / ``Cache.RestoreOp`` batch
+    becomes one ``SnapshotOp`` / ``RestoreOp`` per request
+    (``cache/transfer/ops.py``): the executor exports or imports one slot per
+    request, so the per-request op is its unit of work and its ACK. Each
+    consumer evaluates it once per plan: the binding copies the ops out of
+    C++ on every read of ``plan.cache``.
+
+    Raises:
+        TypeError: The plan carries a cache op kind the runtime cannot run.
+    """
+    ops: list = []
+    for op in execution_plan.cache:
+        if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
+            ops.append(op)
+        elif isinstance(op, Cache.SnapshotOp):
+            ops.extend(snapshot_ops_from_wire(op))
+        elif isinstance(op, Cache.RestoreOp):
+            ops.extend(restore_ops_from_wire(op))
+        else:
+            raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
+    return ops
 
 
 def cache_event_key(payload: dict) -> tuple[str, int]:

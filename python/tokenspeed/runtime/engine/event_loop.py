@@ -288,9 +288,9 @@ class EventLoop:
         # Cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when the engine cannot emit cache
         # ops -- armed hooks cost a gloo all-reduce per round. The Host L2
-        # tier arms them; the retraction snapshot pool does once the
-        # scheduler emits snapshot ops (cache_hooks.SNAPSHOT_POOL_EMITS_CACHE_OPS).
-        # The hooks get the handle, not the executor: polling goes through it.
+        # tier arms them, and so does the retraction snapshot pool (its
+        # stores and restores are cache ops too). The hooks get the handle,
+        # not the executor: polling goes through it.
         armed = cache_hooks_armed(
             enable_kvstore=server_args.enable_kvstore,
             max_retracted_requests=specs.max_retracted_requests,
@@ -361,6 +361,9 @@ class EventLoop:
             disable_l2_cache=not server_args.enable_kvstore,
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
             role=server_args.disaggregation_mode,
+            num_snapshot_pages=specs.num_snapshot_pages,
+            max_retracted_requests=specs.max_retracted_requests,
+            debug_force_retraction_interval=server_args.debug_force_retraction_interval,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=self.overlap_schedule_depth,
@@ -377,6 +380,10 @@ class EventLoop:
             f"overlap_schedule_depth={scheduler_cfg.overlap_schedule_depth!s} "
             f"disable_l2_cache={scheduler_cfg.disable_l2_cache!s} "
             f"enable_l3_storage={scheduler_cfg.enable_l3_storage!s} "
+            f"num_snapshot_pages={scheduler_cfg.num_snapshot_pages!s} "
+            f"max_retracted_requests={scheduler_cfg.max_retracted_requests!s} "
+            f"debug_force_retraction_interval="
+            f"{scheduler_cfg.debug_force_retraction_interval!s} "
             f"max_batch_size={scheduler_cfg.max_batch_size!s} (global max_num_seqs="
             f"{server_args.max_num_seqs!s}, dp_size={self.dp_size!s}) "
             f"disable_prefix_cache={scheduler_cfg.disable_prefix_cache!s} "

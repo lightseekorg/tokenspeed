@@ -669,10 +669,15 @@ class RequestHandler:
             )
             return
         if _weight_op_wants_flush(recv_req) and not flush_success:
+            # The scheduler refuses ClearCache while Host cache ops (write-backs,
+            # retraction image stores and restores) are in flight or a request
+            # is suspended with a retraction image, whose pinned Host entries
+            # the flush would invalidate under it.
             ok = False
             msg = (
-                "cache flush failed; retry the update after in-flight "
-                "Host writebacks drain"
+                "cache flush failed; retry the update after in-flight Host "
+                "cache ops drain and no request is suspended with a retraction "
+                "image (retracted or restoring)"
             )
         else:
             local_ok, msg = self._device.update_weights(recv_req)

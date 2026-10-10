@@ -432,12 +432,15 @@ class ServerArgs:
     kvstore_storage_backend_extra_config: str | None = None
 
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
-    # arena rows. This phase reserves them; the scheduler consumes them once
-    # it emits snapshot/restore ops (the retraction-snapshot design's
-    # scheduler phase). 0 is the explicit "no pool". Today's retraction
-    # behaviour is unchanged either way.
+    # arena rows: a retracted request is suspended with its image and
+    # resumed by restore. 0 is the explicit "no pool": the scheduler then
+    # never retracts and a blocked admission waits for completions.
     retraction_snapshot_host_gb: float = 0.0
     retraction_snapshot_max_requests: int = 0
+    # Test knob: every |N| plans the scheduler retracts the oldest quiescent
+    # Decoding (N > 0) or Prefilling (N < 0) request without capacity
+    # pressure, to exercise the suspend/restore path. 0 (off) in serving.
+    debug_force_retraction_interval: int = 0
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -1155,6 +1158,11 @@ class ServerArgs:
                 f"the {self.disaggregation_mode} role never retracts; drop "
                 "--retraction-snapshot-host-gb"
             )
+        if self.debug_force_retraction_interval != 0 and host_gb <= 0:
+            raise ValueError(
+                "--debug-force-retraction-interval forces retractions, which need "
+                "a retraction snapshot pool (--retraction-snapshot-host-gb)"
+            )
 
     def resolve_speculative_decoding(self):
         # Keep drafter backend consistent with the main model unless explicitly set.
@@ -1620,22 +1628,23 @@ class ServerArgs:
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
-        # The Host cache copies translate ownership on both ends of every row
-        # (cache/transfer/ownership.py), but the scheduler does not yet
-        # allocate Host blocks by residue class, so under DCP a Host block
-        # need not sit in its Device block's class and the copy would be
-        # refused at submit. Both Host tiers -- the L2 KVStore and the
-        # retraction snapshot pool -- wait for that scheduler change and are
-        # refused together here; the retraction-snapshot design's runtime
-        # consumption phase lifts both at once.
+        # Both Host tiers -- the L2 KVStore and the retraction snapshot pool --
+        # are legal under KV-page sharding (--decode-context-parallel-size):
+        # the scheduler allocates every Host block in its Device block's
+        # residue class and the executor translates ownership on both ends of
+        # every row (cache/transfer/ownership.py), so each rank copies the
+        # blocks it owns. L3 is not: its keys name content and position, but
+        # which rank owns a block is decided at allocation, so a rank cannot
+        # answer an existence probe for blocks it did not own when the object
+        # was written (docs/design/cache-concepts.md, the retraction image).
         if self.decode_context_parallel_size > 1 and (
-            self.enable_kvstore or self.retraction_snapshot_host_gb > 0
+            self.kvstore_storage_backend is not None
         ):
             raise ValueError(
-                "--decode-context-parallel-size > 1 does not yet support the Host "
-                "cache tiers (the Host KVStore and the retraction snapshot pool): "
-                "the scheduler does not yet allocate Host blocks by residue class; "
-                "pass --disable-kvstore and leave --retraction-snapshot-host-gb at 0."
+                "--kvstore-storage-backend (L3) is not supported under "
+                "--decode-context-parallel-size > 1: a page-cyclic sharded group "
+                "has no owner-stable L3 key. The Host KVStore itself and the "
+                "retraction snapshot pool are supported."
             )
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
@@ -2241,11 +2250,13 @@ class ServerArgs:
             default=ServerArgs.retraction_snapshot_host_gb,
             help="Per-rank pinned Host pool, in gigabytes, that images a retracted "
             "request's unaligned tail pages, its groups Host L2 never holds, and "
-            "its slot state (the hash-complete blocks go to Host L2; without "
-            "--enable-kvstore the pool must hold the whole image). This release "
-            "reserves the pool; the scheduler consumes it once it emits "
-            "snapshot/restore ops, and retraction behaves as before until then. "
-            "0 (the default) means no pool. Fused and decode roles only.",
+            "its slot state (the hash-complete blocks go to Host L2 and stay "
+            "pinned there until the request is restored; with --disable-kvstore "
+            "the pool must hold whole images). A retracted request is suspended "
+            "with its image and resumes exactly where it stopped once the image "
+            "is copied back; nothing is recomputed. 0 (the default) means no "
+            "pool: the scheduler never retracts and a blocked admission waits "
+            "for completions. Fused and decode roles only.",
         )
         parser.add_argument(
             "--retraction-snapshot-max-requests",
@@ -2254,6 +2265,16 @@ class ServerArgs:
             help="Slot-state image rows of the retraction snapshot pool, i.e. the "
             "most requests retracted at once. Required with a non-zero pool; "
             "a rule of thumb is 2 x --max-num-seqs / dp_size.",
+        )
+        parser.add_argument(
+            "--debug-force-retraction-interval",
+            type=int,
+            default=ServerArgs.debug_force_retraction_interval,
+            help="TEST ONLY. Every |N| scheduler plans retract the oldest quiescent "
+            "decoding request (N > 0) or the one prefilling request between its "
+            "chunks (N < 0) without capacity pressure, so the suspend/restore "
+            "path runs on every request of a test run. Needs a retraction "
+            "snapshot pool. 0 (the default) is off; never set it in serving.",
         )
         # Mamba Cache
         parser.add_argument(
@@ -3161,8 +3182,9 @@ class ServerArgs:
             default=ServerArgs.decode_context_parallel_size,
             help="Shard full-history KV pages (MLA/DSA latent, DeepSeek V4 "
             "compressed KV) cyclically over a consecutive subgroup of attention "
-            "TP. Allowed on aggregated engines and the PD prefill role; the "
-            "decode role and the Host KVStore are not supported yet.",
+            "TP. Allowed on aggregated engines and the PD prefill role, with the "
+            "Host KVStore and the retraction snapshot pool; the decode role and "
+            "L3 storage (--kvstore-storage-backend) are not supported yet.",
         )
         parser.add_argument(
             "--attn-head-tp-size",

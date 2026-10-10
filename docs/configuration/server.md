@@ -363,8 +363,9 @@ are not advertised as control URLs; use a concrete address for gateway discovery
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
-| `--retraction-snapshot-host-gb` | Per-rank pinned Host pool, in gigabytes, for the retraction image's tail: a retracted request's unaligned tail pages, its blocks of groups Host L2 never holds, and its slot state (the hash-complete blocks go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool must hold whole images, about `--max-model-len` x bytes-per-token each). This release reserves the pool and its slot-state arena; the scheduler consumes them once it emits snapshot/restore ops (the retraction-snapshot design's scheduler and runtime-consumption phases), and until then retraction behaves exactly as before, pool or not. `0` (the default) means no pool. Fused and decode roles only; refused on prefill/encode, and under `--decode-context-parallel-size > 1` together with the Host KVStore. Startup logs the pool in LCM blocks and tokens. |
-| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, i.e. the most requests that will be retracted at once once the scheduler emits snapshot ops. Required with a non-zero pool and refused without one; a rule of thumb is `2 x --max-num-seqs / dp_size`. |
+| `--retraction-snapshot-host-gb` | Per-rank pinned Host pool, in gigabytes, for the retraction image's tail: a retracted request's unaligned tail pages, its blocks of groups Host L2 never holds, and its slot state (the hash-complete blocks go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool must hold whole images, about `--max-model-len` x bytes-per-token each). A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. `0` (the default) means no pool: the scheduler never retracts, and an admission that does not fit waits for completions. Fused and decode roles only; refused on prefill/encode. Allowed under `--decode-context-parallel-size > 1`. Startup logs the pool in LCM blocks and tokens. |
+| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, i.e. the most requests retracted at once. Required with a non-zero pool and refused without one; a rule of thumb is `2 x --max-num-seqs / dp_size`. |
+| `--debug-force-retraction-interval` | **Test only.** Every `N` scheduler plans retract the oldest quiescent decoding request (`N > 0`), or with `-N` the one prefilling request between its chunks, without capacity pressure, so a test run exercises the suspend/restore path on every request (the bitwise continuation oracle of [Numerics](../design/numerics.md)). Needs a retraction snapshot pool. `0` (the default) is off; never set it in serving. |
 
 For pure prefill, token capacities count newly computed tokens, not cached
 prefixes or each request's full sequence length. Two requests extending by
@@ -541,10 +542,14 @@ requests sample at temperature. Greedy requests behave identically under both
 rules. `top_k`, `top_p`, `min_p`, penalties and `logit_bias` stay on the
 verifier's side; `q` only follows the temperature.
 
-A request admitted (or re-admitted after retraction) has no recorded `q` for
-its first chain: its rows hold a sentinel above
+A request admitted (or re-admitted after a recompute retract) has no
+recorded `q` for its first chain: its rows hold a sentinel above
 `--spec-reject-draft-prob-threshold`, which rejects at the first draft and
-samples the first token from the full target. The sentinel is written as
+samples the first token from the full target. A request a capacity
+retraction suspends keeps its `q`: the recorded distributions travel in its
+slot-state image and come back with the restore, so its first verify after
+resuming accepts drafts exactly as the uninterrupted run would. The
+sentinel is written as
 `threshold + 1.0` in fp32, hence the range: below `1.0` a real probability
 would read as the sentinel, and the cap keeps the `+ 1.0` representable.
 Under PD disaggregation the prefill node's candidates land the same way, so
@@ -745,28 +750,36 @@ features directly:
 
 ### Retraction snapshot pool
 
+A capacity retraction suspends a resident request instead of recomputing
+it: the request's cache pages and its per-slot Device state are imaged to
+pinned Host memory, and once Device pages are free again the image is copied
+back and the request continues exactly where it stopped -- a decoding
+request decodes, a mid-prompt request runs its next chunk
+(`docs/design/scheduler.md` section 4). The image is split: the
+hash-complete prefix pages go to Host L2 as a stream-ordered write-back and
+stay pinned there until the restore; the unaligned tail, the blocks of
+groups L2 never holds (a drafter-private group, a state group's live block)
+and the slot-state blob go to the request-private pool
 `--retraction-snapshot-host-gb` / `--retraction-snapshot-max-requests` size
-the second pinned Host buffer of the Host cache executor: the
-request-private pool a retracted request's tail is imaged into, next to the
-Host L2 entries that hold its bulk (`docs/design/cache-concepts.md`,
-"Retraction image"). The two buffers are separate allocations and both count
-against the executor's Host-memory headroom check. The pool is independent
-of the KVStore: with `--disable-kvstore` there is no L2 leg and the pool holds
-whole images, so it must be sized for the victims the operator wants to hold
-at once; with L2 it holds about one page per group per retracted request plus
-the slot-state blob. `0` is the explicit "no pool".
+(`docs/design/cache-concepts.md`, "Retraction image"). The two buffers are
+separate allocations of one Host cache executor and both count against its
+Host-memory headroom check. The pool is independent of the KVStore: with
+`--disable-kvstore` there is no L2 leg and the pool holds whole images, so it
+must be sized for the victims the operator wants to hold at once; with L2 it
+holds about one page per group per retracted request plus the slot-state
+blob. `0` is the explicit "no pool": the scheduler then never retracts, and
+an admission that does not fit waits for completions.
 
-This release reserves the pool and the arena and wires their transfer paths
-(`HostCacheExecutor`, `cache/transfer/ops.py`); the C++ scheduler does not
-yet emit the snapshot store and restore ops that would use them, so today a
-retraction still recomputes as before whether or not a pool is configured.
-The scheduler phase of the retraction-snapshot design adds the ops and the
-runtime-consumption phase that follows it turns them on (one switch,
-`cache_hooks.SNAPSHOT_POOL_EMITS_CACHE_OPS`, arms the completion hooks for a
-pool without L2). Both Host tiers are refused under
-`--decode-context-parallel-size > 1` until that phase, which also lifts the
-refusal: the copies already translate ownership, the scheduler's residue-class
-Host allocation is what is missing.
+The ops ride the round's `DeviceHandle.execute` with the L2 write-backs and
+load-backs (`docs/design/event-loop.md`), their ACKs the same cache poll, and
+the pool arms the completion hooks like the L2 tier does. Both Host tiers are
+allowed under `--decode-context-parallel-size > 1`: the scheduler allocates
+every Host block in its Device block's residue class and each rank copies the
+blocks it owns; L3 storage stays refused there. The weight-update cache flush
+is refused while a request is suspended with an image, so an image of
+old-weight KV is never restored under new weights.
+`--debug-force-retraction-interval` exercises the path without pressure in
+tests (see the flag above).
 
 ### Host L2 and Mooncake Store L3
 
@@ -841,8 +854,9 @@ fails so the caller retries instead of serving new weights against the
 previous checkpoint or entering NCCL weight broadcasts alone. A
 `batch_exists` hit is not a lease: if
 `batch_get_into` misses after Admit, the runtime unregisters the key,
-skips publishing empty Host pages, and retracts the batch snapshot-less
-so the next admit recomputes those tokens. A short Mooncake read (fewer
+skips publishing empty Host pages, and retracts the batch for recompute
+(`RecomputeRetract`: the pages were never filled, so there is nothing to
+image) so the next admit recomputes those tokens. A short Mooncake read (fewer
 bytes than the requested page) is a miss, not a success. Failed `batch_get_into` pages
 stay unread so a later `batch_exists` hit cannot re-register them and
 retry the same prefetch; only replica-converged misses are blacklisted.
@@ -876,7 +890,8 @@ starts a cold L3 cache instead of reusing objects written without backend identi
 `global_segment_size` is split across
 attention-TP × pipeline-parallel ranks so the mounted total matches the
 configured size. Use the resolved `mapping.attn.tp_size`, not
-`--attn-tp-size` alone. L3 requires Host L2 (do not pass `--disable-kvstore`).
+`--attn-tp-size` alone. L3 requires Host L2 (do not pass `--disable-kvstore`)
+and an unsharded KV cache (not `--decode-context-parallel-size > 1`).
 Pass Mooncake client settings as JSON
 in `--kvstore-storage-backend-extra-config`, for example:
 
