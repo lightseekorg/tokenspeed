@@ -794,3 +794,70 @@ normalization produces the combination matrix. The pre coefficients mix the
 four residual streams into the layer input, rounded to BF16 before optional
 output RMS normalization. The kernel reuses staged projection weights across
 token rows, and masks the final projection tile for arbitrary token counts.
+
+### gfx950 mHC mixes, post-mapping and stream collapse
+
+DeepSeek V4.1 splits the hc=4 mHC into three registered operations:
+`mhc_mixes` derives the coefficients from the full residual, `mhc_apply_pre`
+collapses the streams with the previous sublayer's pre coefficients (with an
+optional fused RMSNorm), and `mhc_post` applies the post/combination update.
+All three stream the `[T, 4, H]` BF16 residual from HBM, so they are sized
+against bandwidth rather than math.
+
+#### Contract
+
+- `mhc_mixes` takes a contiguous BF16 residual `[T, 4, H]` (`4 * H` divisible
+  by 64), FP32 weights `[24, 4 * H]`, scales `[3]` and biases `[24]`, and
+  returns FP32 pre `[T, 4]`, post `[T, 4]` and combination `[T, 4, 4]`
+  indexed [input stream, output stream]. Results are at least as accurate as
+  the portable kernel (absolute error near 1e-6 against FP64 at 8192 tokens).
+- `mhc_apply_pre` returns the BF16 layer input. The plain collapse rounds each
+  product like the portable kernel and matches it bit for bit; with a norm
+  weight, the stream sum is rounded to BF16 before RMSNorm, and only the
+  RMS reduction order differs (a rare one-ulp BF16 difference).
+- `mhc_post` returns the updated BF16 streams, bit-identical to the portable
+  kernel.
+- All offsets are 32-bit buffer offsets, so the residual holds fewer than
+  2^31 elements. Token counts are runtime arguments; the mixes kernel has two
+  compile-time block buckets (64 rows up to 1024 tokens, 256 rows above).
+
+#### Algorithm
+
+The mixes projection is one pass over the residual. Each CTA owns a row block
+and a K split and loads residual tiles straight into BF16 MFMA operand
+registers. Because the K reduction is order-free, the logical MFMA K index is
+permuted so every lane reads one contiguous 32-byte run per row. The FP32
+weights are split exactly into three BF16 terms (two 8-bit truncations and a
+remainder) once per CTA, shared through LDS, and accumulated with three
+`16x16x32` BF16 MFMAs, which reproduces FP32-weight products without the
+FP32 MFMA rate limit. The squared row sums for the RMS factor come from the
+same registers. Split partials go to a small FP32 buffer; a reduction kernel
+assigns sixteen lanes to a token's 4x4 matrix, sums the splits over
+registers (and lanes or waves when decode uses many splits), and runs the
+sigmoid, softmax and Sinkhorn steps with lane-local row and column sums. The
+Sinkhorn divisions use the hardware reciprocal (about one ulp).
+
+The post and collapse kernels move eight contiguous BF16 values per lane.
+Post runs one token per CTA so its twenty coefficients are scalar loads that
+never wait behind the vector stores. The collapse runs one token per CTA so
+the optional RMSNorm reduces the whole row once.
+
+## Quantization
+
+### gfx950 group-32 UE8M0 FP8 activations
+
+#### Contract
+
+The kernel quantizes `[M, K]` BF16 or FP16 rows (contiguous K divisible by
+32, any row stride) to E4M3 with one UE8M0 scale byte per 32 values. Rounding
+is the DeepSeek V4.1 reference: the group amax is floored at `1e-4`,
+multiplied by `1/448`, and rounded up to a power of two through its FP32
+bits. The output is bit-identical to `triton_quantize_fp8_group32_ue8m0`.
+
+#### Algorithm
+
+Four lanes share a group, each loading one 16-byte vector, and a CTA covers
+256 groups so large batches keep many vectors in flight. Groups flatten rows,
+so any K and ragged M fill whole CTAs. A power-of-two scale has an exact
+reciprocal, so one multiply per value rounds exactly like the reference
+division; infinite inputs keep the `x / inf` behavior through `1 / inf`.
