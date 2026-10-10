@@ -78,11 +78,17 @@ def gluon_mla_normalize_project_query_gfx1250(
             [1, 0],
         )
         n_layout: gl.constexpr = gl.SliceLayout(1, layout)
-        k_layout: gl.constexpr = gl.SliceLayout(0, layout)
         offs_n = pid * BLOCK_N + gl.arange(0, BLOCK_N, layout=n_layout)
+        # Load contiguous BF16 vectors, then restore the reduction layout.
+        load_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 4], [1, 32], [NUM_WARPS, 1], [1, 0]
+        )
+        load_n = pid * BLOCK_N + gl.arange(
+            0, BLOCK_N, layout=gl.SliceLayout(1, load_layout)
+        )
         acc = gl.zeros([BLOCK_N, _Q_TILE], gl.float32, layout)
         for k0 in range(0, _Q_LORA, _Q_TILE):
-            offs_k = k0 + gl.arange(0, _Q_TILE, layout=k_layout)
+            offs_k = k0 + gl.arange(0, _Q_TILE, layout=gl.SliceLayout(0, load_layout))
             q = gl.amd.cdna5.buffer_load(q_ptr, offs_k.to(gl.int32)).to(gl.float32)
             norm_weight = gl.amd.cdna5.buffer_load(
                 q_norm_weight_ptr, offs_k.to(gl.int32)
@@ -91,11 +97,12 @@ def gluon_mla_normalize_project_query_gfx1250(
             weight = gl.amd.cdna5.buffer_load(
                 projection_weight_ptr,
                 (
-                    offs_n[:, None].to(gl.int64) * _Q_LORA
+                    load_n[:, None].to(gl.int64) * _Q_LORA
                     + offs_k[None, :].to(gl.int64)
                 ).to(gl.int32),
             ).to(gl.float32)
             normalized = gl.convert_layout(normalized[None, :], layout)
+            weight = gl.convert_layout(weight, layout)
             acc += weight * normalized.to(gl.float32)
         result = gl.sum(acc, axis=1).to(output_ptr.dtype.element_ty)
         if SPLIT_OUTPUT:

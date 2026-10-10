@@ -470,6 +470,14 @@ When the grid leaves CUs idle, the launcher splits the KV stream and
 most one wave of CTAs and stream at least four pages each, since every split
 pays a fixed prologue and an FP32 partial store.
 
+### gfx1250 MLA query normalization and projection
+
+The single-token kernel normalizes a 1536-wide BF16 query, projects it to
+2304 or 3072 columns, and normalizes a 512-wide KV latent in place. Projection
+loads use contiguous BF16 vectors and convert to the existing accumulation
+layout before arithmetic, preserving the reduction order. Flat and split
+NoPE/RoPE outputs share the same computation.
+
 ### gfx1250 MLA prefill
 
 `gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention

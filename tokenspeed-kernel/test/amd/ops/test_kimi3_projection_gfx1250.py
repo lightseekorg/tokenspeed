@@ -526,3 +526,72 @@ def test_kimi3_shared_down_strided_inputs_use_torch(noncontiguous) -> None:
         wmma.assert_not_called()
     assert actual is out
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("width", [2304, 3072])
+@pytest.mark.parametrize("split", [False, True])
+def test_mla_decode_query_graph_refreshes_strided_outputs(width, split):
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.normalize_project_query import (
+        launch_gluon_mla_normalize_project_query_gfx1250,
+    )
+
+    torch.manual_seed(3401)
+    query = torch.randn(1, 1536, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
+    query_weight = torch.randn(1536, device="cuda", dtype=torch.bfloat16)
+    kv_weight = torch.randn(512, device="cuda", dtype=torch.bfloat16)
+    projection = torch.randn(width, 1536, device="cuda", dtype=torch.bfloat16) * 0.02
+    heads = width // 192
+    backing = torch.full(
+        (1, heads, 208) if split else (1, width + 16),
+        -17.0,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    out = backing[:, :, :128] if split else backing[:, :width]
+    tail = backing[:, :, 128:192] if split else None
+
+    def run():
+        launch_gluon_mla_normalize_project_query_gfx1250(
+            query,
+            kv,
+            query_weight,
+            kv_weight,
+            projection,
+            eps=1e-5,
+            out=out,
+            tail_out=tail,
+        )
+
+    def projected():
+        return torch.cat((out, tail), dim=-1).flatten(1) if split else out.clone()
+
+    snapshot = kv.clone()
+    run()
+    previous = projected()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    query.mul_(-0.75)
+    snapshot.mul_(-0.5)
+    kv.copy_(snapshot)
+    graph.replay()
+    actual = projected()
+    actual_kv = kv.clone()
+    assert not torch.equal(actual, previous)
+    kv.copy_(snapshot)
+    run()
+    torch.testing.assert_close(actual, projected(), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(actual_kv, kv, atol=0.0, rtol=0.0)
+    q = query.float()
+    normalized = (
+        q * torch.rsqrt(q.square().mean(-1, keepdim=True) + 1e-5) * query_weight.float()
+    ).to(query.dtype)
+    expected = normalized @ projection.T
+    v = snapshot.float()
+    expected_kv = (
+        v * torch.rsqrt(v.square().mean(-1, keepdim=True) + 1e-5) * kv_weight.float()
+    ).to(kv.dtype)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_kv, expected_kv, atol=2e-2, rtol=2e-2)
+    assert torch.all(backing[..., -16:] == -17.0)
