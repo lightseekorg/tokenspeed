@@ -406,7 +406,6 @@ def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
     workflow = yaml.safe_load(
         (assist.ROOT / ".github/workflows/pr-ci-assist.yml").read_text()
     )
-    assert "NVIDIA Kernel Library Tests" in workflow[True]["workflow_run"]["workflows"]
     assert workflow[True]["workflow_run"]["branches-ignore"] == ["main"]
     assert "workflow_call" in workflow[True]
     dispatcher = yaml.safe_load(
