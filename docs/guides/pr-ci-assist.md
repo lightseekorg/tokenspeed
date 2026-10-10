@@ -42,8 +42,9 @@ notify subscribers. Progress, new pushes and new commands update the latest
 comment in place, and terminal outcome comments are never edited.
 
 Each repair and validation attempt has a one-hour budget. The overrun is
-recognized the next time the workflow runs — on a completion event or a manual
-trigger — and stops the attempt for manual intervention. Running **PR CI
+recognized the next time the workflow runs — on a completion event, a manual
+trigger, or the twenty-minute sweep — and stops the attempt for manual
+intervention. Running **PR CI
 Assist** manually with the PR number retries from the current state: with a
 retained candidate it gets a 15-minute window to verify the existing results
 and publish the same repair, starting no new repair or GPU validation; without

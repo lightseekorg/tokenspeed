@@ -2506,3 +2506,107 @@ def test_rerun_redispatches_and_failure_escalates_to_repair(
         "deadline",
         "lint_run",
     }
+
+
+def test_sweep_picks_the_oldest_active_authorized_pr(monkeypatch, tmp_path):
+    prs = [
+        {
+            "number": 1,
+            "state": "open",
+            "head": {"repo": {"full_name": REPO}, "sha": "a" * 40},
+            "base": {"ref": "main"},
+        },
+        {
+            "number": 2,
+            "state": "open",
+            "head": {"repo": {"full_name": REPO}, "sha": "b" * 40},
+            "base": {"ref": "main"},
+        },
+        {
+            "number": 3,
+            "state": "open",
+            "head": {"repo": None},
+            "base": {"ref": "main"},
+        },
+        {
+            "number": 4,
+            "state": "open",
+            "head": {"repo": {"full_name": REPO}, "sha": "c" * 40},
+            "base": {"ref": "dev"},
+        },
+    ]
+    comments = {
+        1: [{"id": 11, "updated_at": "2026-10-10T00:00:01Z"}],
+        2: [{"id": 22, "updated_at": "2026-10-10T00:00:02Z"}],
+        5: [{"id": 55, "updated_at": "2026-10-10T00:00:03Z"}],
+    }
+    states = {
+        1: {"phase": "done"},
+        2: {"phase": "watching"},
+        5: ValueError("revoked"),
+    }
+
+    def pages(path, field):
+        if path == "pulls?state=open":
+            return prs
+        number = int(path.split("/")[1])
+        return comments.get(number, [])
+
+    monkeypatch.setattr(assist, "pages", pages)
+    monkeypatch.setattr(
+        assist,
+        "latest_state_comment",
+        lambda cs, number: (cs or [None])[-1],
+    )
+
+    def load_state(cs, pr):
+        state = states[pr["number"]]
+        if isinstance(state, Exception):
+            raise state
+        return state
+
+    monkeypatch.setattr(assist, "load_state", load_state)
+    assert assist.sweep() == 2
+    states[2] = {"phase": "manual"}
+    assert assist.sweep() is None
+
+
+def test_resolve_schedule_outputs_the_swept_pr(monkeypatch, tmp_path):
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(tmp_path / "event.json"))
+    tmp_path.joinpath("event.json").write_text("{}")
+    pr = {
+        "number": 2,
+        "state": "open",
+        "head": {"repo": {"full_name": REPO}, "sha": "b" * 40},
+        "base": {"ref": "main"},
+    }
+    monkeypatch.setattr(assist, "sweep", lambda: 2)
+    monkeypatch.setattr(assist, "api", lambda path: pr)
+    assist.resolve()
+    assert output.read_text().strip() == "pr=2"
+    monkeypatch.setattr(assist, "sweep", lambda: None)
+    output.unlink()
+    assist.resolve()
+    assert not output.exists()
+
+
+def test_assist_workflow_wakes_only_for_owned_dispatches_and_sweeps():
+    workflow = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[2] / ".github/workflows/pr-ci-assist.yml"
+        ).read_text()
+    )
+    triggers = workflow.get("on", workflow.get(True))
+    workflows = set(triggers["workflow_run"]["workflows"])
+    assert "Slurm Dispatch" in workflows and "K8s Dispatch" in workflows
+    assert not {
+        "NVIDIA B200 Tests",
+        "NVIDIA GB200 Tests",
+        "NVIDIA GB300 Tests",
+        "PR Test NVIDIA ARM",
+        "AMD Tests",
+    }.intersection(workflows)
+    assert triggers["schedule"] == [{"cron": "13,33,53 * * * *"}]

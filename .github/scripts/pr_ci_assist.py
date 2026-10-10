@@ -127,6 +127,29 @@ def latest_command(comments: list[dict]) -> dict | None:
     return None
 
 
+def sweep():
+    """Return the open PR whose active request most needs a reconcile, if any."""
+    active = []
+    for pr in pages("pulls?state=open", None):
+        if (
+            not pr["head"]["repo"]
+            or pr["head"]["repo"]["full_name"] != REPO
+            or pr["base"]["ref"] != "main"
+        ):
+            continue
+        comments = pages(f"issues/{pr['number']}/comments", None)
+        comment = latest_state_comment(comments, pr["number"])
+        if not comment:
+            continue
+        try:
+            state = load_state(comments, pr)
+        except ValueError:
+            continue
+        if state and state["phase"] not in FINISHED_PHASES:
+            active.append((comment["updated_at"], pr["number"]))
+    return min(active)[1] if active else None
+
+
 def resolve():
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     name = os.environ["GITHUB_EVENT_NAME"]
@@ -142,6 +165,11 @@ def resolve():
         value = event["inputs"]["pr"]
         if re.fullmatch(r"[1-9][0-9]*", value):
             number = int(value)
+    elif name == "schedule":
+        number = sweep()
+        if number is None:
+            print("No active watch/fix/rerun request; skipping the sweep.")
+            return
     elif name == "workflow_run" and event["action"] == "completed":
         run = event["workflow_run"]
         if run["event"] not in {"pull_request", "workflow_dispatch"}:
