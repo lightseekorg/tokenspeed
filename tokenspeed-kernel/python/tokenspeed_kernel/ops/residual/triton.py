@@ -418,12 +418,24 @@ def _mhc_prenorm_gemm_triton_kernel(
             mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
             other=0.0,
         )
-        dot_acc = tl.dot(
-            x_values.to(tl.float32),
-            fn_values,
-            dot_acc,
-            input_precision="ieee",
-        )
+        if x_values.dtype == tl.bfloat16:
+            # FP32 weights as three BF16 parts: every BF16 x BF16 product is
+            # exact in FP32, so three BF16 MMAs match an IEEE FP32 dot to
+            # rounding order at several times its throughput.
+            hi = fn_values.to(tl.bfloat16)
+            rest = fn_values - hi.to(tl.float32)
+            mid = rest.to(tl.bfloat16)
+            lo = (rest - mid.to(tl.float32)).to(tl.bfloat16)
+            dot_acc = tl.dot(x_values, hi, dot_acc)
+            dot_acc = tl.dot(x_values, mid, dot_acc)
+            dot_acc = tl.dot(x_values, lo, dot_acc)
+        else:
+            dot_acc = tl.dot(
+                x_values.to(tl.float32),
+                fn_values,
+                dot_acc,
+                input_precision="ieee",
+            )
         x_fp32 = x_values.to(tl.float32)
         square_acc += tl.sum(x_fp32 * x_fp32, axis=1)
 
