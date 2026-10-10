@@ -315,25 +315,64 @@ two raw FP8 buffers. Lifetime reuse keeps the physical LDS allocation unchanged.
 
 ### DeepSeek V4.1 CSA2 index selection
 
-The gfx950 scorer uses scaled MXFP4 MFMA; gfx1250 dequantizes keys to BF16
-and uses wave32 WMMA. Both accept 32 padded index heads of dimension 128 and
-64-row, page-planar MXFP4 caches. Launch metadata reports score-capacity FLOPs
-and estimated tensor traffic without reading device-resident sequence lengths.
+CSA2 picks, for each query, the KV rows its sparse attention reads. The
+`tokenspeed-kernel` adapter (`run_dsv41_csa2_index_topk`) owns query
+preparation, validation and tiling, and runs two steps per query tile: a
+scorer writes one row of FP32 logits per query, one per candidate column, and
+a selector turns each row into that query's sorted list of logical KV row ids.
+gfx950 runs both steps in Gluon (`gluon_dsv41_index_topk_gfx950`, then
+`gluon_dsv41_index_topk_select_gfx950`); gfx1250 has a Gluon scorer and the
+portable torch selector.
 
-The `tokenspeed-kernel` adapter owns query preparation, validation, and sorted
-row/block selection. Gluon accepts one local or replicated shard with 1..32
-heads and the 68-byte MXFP4 index format; sharded heads, wider head counts, and
-132-byte FP8 index rows use portable Triton. Full selection scores the
-configured page-table capacity without reading device lengths on the host.
-Its query tile shrinks with history width to keep FP32 logits within 32 MiB
-(at most 256 queries at 32K rows, 64 at 128K, and 8 at 1M). Reindex scores
-at most the candidate-list capacity. Score CTAs honor the caller's row-chunk
-bound up to the 256-row tuned maximum; masked 32-row hardware tiles cover
-smaller bounds. Selection preserves arena page strides without copying the full
-cache, and normalizes a non-unit stride between page bytes to contiguous
-storage before scoring. Missing or out-of-range cache pages never contribute
-rows or blocks, including the newest visible block. A valid newest block
-remains eligible regardless of its score.
+#### Contract
+
+- Queries have 1..32 index heads of dimension 128 from one local or
+  replicated shard, with FP32 head weights. The index cache uses 64-row,
+  page-planar pages of 68-byte MXFP4 rows. Sharded heads, wider head counts
+  and 132-byte FP8 index rows use portable Triton.
+- Column `c` of a query's logits is logical row `c`, or
+  `candidates[q, c // 8] * 8 + c % 8` when candidate blocks are given. Its
+  logit is `sum_h w_h * relu(q_h . k_c)`; columns past the visible length,
+  without a candidate, or on a missing or out-of-range page stay `-inf`.
+- Row selection writes the logical ids of the `min(topk, width)` largest
+  finite logits in ascending order, then -1, plus their count (the
+  `select_rows_torch` contract). On gfx950, equal-score boundary ties keep
+  the lowest columns.
+- Optional block selection keeps the best 8-row blocks by their maximum logit.
+  A valid newest visible block remains eligible regardless of its score.
+- Selection scores the configured page-table or candidate capacity without
+  reading device lengths on the host. The query tile shrinks with that width
+  to keep FP32 logits within 32 MiB (at most 256 queries at 32K rows, 64 at
+  128K, and 8 at 1M). Score CTAs honor the caller's row-chunk bound up to the
+  256-row tuned maximum.
+- Arena page strides are kept without copying the cache; a non-unit stride
+  between page bytes is normalized to contiguous storage before scoring.
+- Launch metadata reports score-capacity FLOPs and estimated tensor traffic,
+  also without reading device lengths.
+
+#### Algorithm
+
+The gfx950 scorer runs one program per query and chunk of up to 256 columns.
+The 32 padded heads form two 16-head MFMA groups. For each 32-column tile it
+maps columns to pages through the candidate ids and page table, loads the
+MXFP4 key rows, and scores them with E2M1 scaled MFMA against the E8M0
+scales, then applies ReLU and the weighted head sum. A chunk bound that is
+not a multiple of 32 masks its last tile. The gfx1250 scorer dequantizes keys
+to BF16 and uses wave32 WMMA.
+
+The gfx950 selector runs one workgroup per query in a single launch,
+replacing `torch.topk`, a sort and about ten elementwise kernels. A
+three-pass MSD radix select (11+11+10 key bits, LDS-atomic histograms) finds
+the order key of the K-th largest logit. One column-order compaction pass,
+with a single packed scan per chunk, keeps every larger key plus the first
+ties and maps candidate columns to logical rows. The picks are already
+ascending without candidates and with ascending candidate lists; otherwise an
+all-pairs rank sorts them. LDS atomics cost about one wave instruction per 64
+lanes regardless of conflicts, so the radix passes dominate on wide rows.
+
+Block selection stays in torch: it takes the maximum logit of each 8-row
+block, forces the newest visible block to `+inf`, and keeps the top blocks
+in ascending order.
 
 ### gfx1250 MLA decode
 

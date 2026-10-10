@@ -27,6 +27,8 @@ from tokenspeed_kernel.ops.attention.dsv41._gluon.indexer import (
     launch_gfx950_logits,
     launch_gfx1250_logits,
     run_dsv41_csa2_index_topk,
+    select_rows_gfx950,
+    select_rows_torch,
 )
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -84,7 +86,10 @@ if current_platform().is_amd:
     )
     def gluon_dsv41_index_topk_gfx950(*args, **kwargs):
         return run_dsv41_csa2_index_topk(
-            *args, **kwargs, launch_logits=launch_gfx950_logits
+            *args,
+            **kwargs,
+            launch_logits=launch_gfx950_logits,
+            select_rows=select_rows_gfx950,
         )
 
     @register_kernel(
@@ -119,5 +124,8 @@ if current_platform().is_amd:
     )
     def gluon_dsv41_index_topk_gfx1250(*args, **kwargs):
         return run_dsv41_csa2_index_topk(
-            *args, **kwargs, launch_logits=launch_gfx1250_logits
+            *args,
+            **kwargs,
+            launch_logits=launch_gfx1250_logits,
+            select_rows=select_rows_torch,
         )
