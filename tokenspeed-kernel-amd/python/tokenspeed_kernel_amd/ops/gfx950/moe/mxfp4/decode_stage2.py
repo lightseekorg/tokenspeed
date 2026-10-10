@@ -78,6 +78,7 @@ def _stage2_mxfp4_direct_mfma_gluon(
     BLOCK_N: gl.constexpr,
     M_DUP: gl.constexpr,
     PIPELINE_K: gl.constexpr,
+    LOAD_SLOTS: gl.constexpr,
 ):
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
@@ -116,7 +117,63 @@ def _stage2_mxfp4_direct_mfma_gluon(
     TOTAL_KT: gl.constexpr = gl.cdiv(I_PACKED, BLOCK_K_PACKED)
     acc_total = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
 
-    if token < M:
+    if token < M and LOAD_SLOTS > 0:
+        gl.static_assert(TOPK % LOAD_SLOTS == 0, "LOAD_SLOTS must divide TOPK")
+        # Issue every K tile of LOAD_SLOTS slots before the first MFMA: each
+        # tile is a few VGPRs, and one memory latency then covers them all.
+        for group in gl.static_range(0, TOPK, LOAD_SLOTS):
+            tiles = ()
+            gates = ()
+            for slot in gl.static_range(group, group + LOAD_SLOTS):
+                expert = gl.load(topk_ids_ptr + token * stride_tit + slot * stride_tis)
+                gates += (
+                    gl.load(
+                        topk_weights_ptr + token * stride_twt + slot * stride_tws
+                    ).to(gl.float32),
+                )
+                row = token * TOPK + slot
+                for kt in gl.static_range(0, TOTAL_KT):
+                    tiles += (
+                        _direct_mxfp4_load_tile(
+                            kt,
+                            ak,
+                            bk,
+                            ask,
+                            bsk,
+                            am,
+                            asm,
+                            inter_ptr,
+                            inter_scale_ptr,
+                            w2_ptr,
+                            w2s_ptr,
+                            row.to(gl.int64) * stride_im,
+                            expert.to(gl.int64) * stride_we,
+                            expert.to(gl.int64) * stride_se,
+                            n_cols,
+                            n_cols_s,
+                            row,
+                            stride_ik,
+                            stride_xslin,
+                            stride_xsnb,
+                            stride_slin,
+                            stride_snb,
+                            N_PHYS,
+                            I_DIM,
+                            D,
+                            I_PACKED,
+                            BLOCK_K_PACKED,
+                            BLOCK_K_SCALE,
+                        ),
+                    )
+            for i in gl.static_range(0, LOAD_SLOTS):
+                acc = gl.zeros((M_DUP, BLOCK_N), dtype=gl.float32, layout=mfma_layout)
+                for kt in gl.static_range(0, TOTAL_KT):
+                    a, b, a_scale, b_scale = tiles[i * TOTAL_KT + kt]
+                    acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
+                partial = acc.to(out_ptr.dtype.element_ty)
+                routed_weight = gates[i].to(partial.dtype)
+                acc_total += (partial * routed_weight).to(gl.float32)
+    elif token < M:
         for slot in gl.static_range(0, TOPK):
             expert = gl.load(topk_ids_ptr + token * stride_tit + slot * stride_tis)
             gate = gl.load(
@@ -272,6 +329,7 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
     BLOCK_K: int = 128,
     M_DUP: int = 4,
     PIPELINE_K: bool = True,
+    LOAD_SLOTS: int = 0,
 ):
     assert inter_states_mxfp4.dtype == torch.uint8
     assert inter_scale.dtype == torch.uint8
@@ -323,6 +381,7 @@ def invoke_stage2_mxfp4_mfma_decode_gluon(
         BLOCK_N=BLOCK_N,
         M_DUP=M_DUP,
         PIPELINE_K=PIPELINE_K,
+        LOAD_SLOTS=LOAD_SLOTS,
         num_warps=1,
     )
     return out
