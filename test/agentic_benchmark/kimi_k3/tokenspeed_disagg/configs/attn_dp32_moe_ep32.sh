@@ -2,13 +2,20 @@
 
 set -euo pipefail
 
+export TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4
+
+# TODO: --gpu-memory-utilization 0.9 causes OOM; need a revisit
+
 exec ts serve \
     --model nvidia/Kimi-K3-NVFP4 \
-    --attn-tp-size 8 \
-    --moe-tp-size 8 \
+    --data-parallel-size 32 \
+    --ep-size 32 \
     --max-model-len 80000 \
-    --max-num-seqs 64 \
-    --gpu-memory-utilization 0.9 \
+    --max-num-seqs 1024 \
+    --max-prefill-tokens 4096 \
+    --chunked-prefill-size 4096 \
+    --gpu-memory-utilization 0.8 \
+    --kvstore-size 80 \
     --disable-cuda-graph-padding \
     --trust-remote-code \
     --attention-backend tokenspeed_mla \
@@ -22,6 +29,9 @@ exec ts serve \
     --speculative-eagle-topk 1 \
     --drafter-attention-backend tokenspeed_mla \
     --mm-encoder-tp-mode data \
+    --policy round_robin \
+    --dp-aware \
+    --sticky-sessions \
     --reasoning-parser passthrough \
     --tool-call-parser passthrough \
     --host 0.0.0.0 \

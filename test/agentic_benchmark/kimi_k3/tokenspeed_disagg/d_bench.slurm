@@ -12,6 +12,7 @@ set -euo pipefail
 
 CONFIGS=(
     attn_dp16_moe_ep16
+    attn_dp32_moe_ep32
 )
 
 # Passing this file to sbatch directly runs a spool copy and loses this
@@ -168,6 +169,9 @@ LADDER=(
     "32 32"
     "64 64"
     "128 128"
+    "256 256"
+    "384 384"
+    "512 512"
 )
 
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)

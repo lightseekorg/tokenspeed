@@ -3413,6 +3413,9 @@ class KimiLinearModel(nn.Module):
         shared_parallel = validate_shared_expert_settings(mapping, shared_size)
         if shared_parallel is not None:
             initialize_shared_expert_group(shared_parallel)
+            logger.info(
+                f"K3 shared-expert TP enabled: tp_size={shared_parallel.tp_size}, num_groups={shared_parallel.dp_size}"
+            )
 
         qkv_parallel, output_parallel = validate_projection_settings(
             mapping,
