@@ -75,7 +75,10 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
+from tokenspeed.runtime.execution.forward_step import (
+    get_is_capture_mode,
+    get_is_cuda_graph_phase,
+)
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.dcp.indexer import merge_index_candidates
 from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
@@ -1921,7 +1924,11 @@ class DeepseekV4MoE(nn.Module):
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
         shared = None
-        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+        # Warmups take the auxiliary stream serially, so its first library
+        # call (e.g. hipBLASLt stream setup) never lands inside a capture.
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+        ) as fork:
             with nvtx_range("moe_mega_experts"):
                 routed = self._forward_routed_experts(
                     hidden_states,
@@ -1949,7 +1956,11 @@ class DeepseekV4MoE(nn.Module):
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
         shared = None
-        with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
+        # Warmups take the auxiliary stream serially, so its first library
+        # call (e.g. hipBLASLt stream setup) never lands inside a capture.
+        with self.stream_fork.scope(
+            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
+        ) as fork:
             with nvtx_range("moe_experts"):
                 routed = self._forward_routed_experts(
                     hidden_states,
