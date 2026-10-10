@@ -106,6 +106,29 @@ def _logical_from_scan(columns: torch.Tensor, candidate_blocks: torch.Tensor | N
     return torch.where(block >= 0, logical, torch.iinfo(torch.int64).max)
 
 
+def select_rows_torch(logits, candidates, topk, row_out, row_lens):
+    """Write each row's top-``topk`` finite logits as position-sorted ids.
+
+    Column c maps to logical row c, or ``candidates[q, c // 8] * 8 + c % 8``.
+    Row q of ``row_out`` gets the ids ascending, then -1; ``row_lens`` the
+    count. Equal-score boundary ties may pick any equivalent subset.
+    """
+    width = logits.shape[1]
+    values_topk, columns = logits.topk(min(int(topk), width), dim=1, sorted=False)
+    logical = _logical_from_scan(columns, candidates)
+    packed = torch.where(
+        values_topk > -torch.inf,
+        logical,
+        torch.iinfo(torch.int64).max,
+    )
+    ordered = packed.sort(dim=1).values
+    ordered = ordered.masked_fill(ordered == torch.iinfo(torch.int64).max, -1)
+    take = ordered.shape[1]
+    row_out[:, :take].copy_(ordered.to(row_out.dtype))
+    row_out[:, take:].fill_(-1)
+    row_lens.copy_((values_topk > -torch.inf).sum(dim=1).to(row_lens.dtype))
+
+
 def run_dsv41_csa2_index_topk(
     index_q,
     weights,
@@ -121,8 +144,13 @@ def run_dsv41_csa2_index_topk(
     process_group,
     out,
     launch_logits,
+    select_rows,
 ):
-    """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch."""
+    """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch.
+
+    ``launch_logits`` scores a query tile into -inf-initialized FP32 logits;
+    ``select_rows`` has the ``select_rows_torch`` contract.
+    """
     out = _index_topk_outputs(
         index_q,
         weights,
@@ -151,11 +179,11 @@ def run_dsv41_csa2_index_topk(
 
     tokens = index_q.shape[0]
     row_out, row_lens, block_out, block_lens = out
-    row_out.fill_(-1)
-    row_lens.zero_()
-    block_out.fill_(-1)
-    block_lens.zero_()
     if not tokens or not page_table.shape[1] or need < 1:
+        row_out.fill_(-1)
+        row_lens.zero_()
+        block_out.fill_(-1)
+        block_lens.zero_()
         return out
 
     # Arena pages have gaps between them but contiguous bytes within each page.
@@ -167,6 +195,8 @@ def run_dsv41_csa2_index_topk(
         cache_2d = cache_2d.contiguous()
     query_chunk_size = min(int(query_chunk_size), 256)
     make_blocks = bool(candidate_topk)
+    if not make_blocks:
+        block_lens.zero_()
 
     for start in range(0, tokens, query_chunk_size):
         end = min(start + query_chunk_size, tokens)
@@ -208,21 +238,12 @@ def run_dsv41_csa2_index_topk(
                 logits,
                 score_chunk_size,
             )
-            values_topk, columns = logits.topk(
-                min(int(topk), width), dim=1, sorted=False
-            )
-            logical = _logical_from_scan(columns, tile_candidates)
-            packed = torch.where(
-                values_topk > -torch.inf,
-                logical,
-                torch.iinfo(torch.int64).max,
-            )
-            ordered = packed.sort(dim=1).values
-            ordered = ordered.masked_fill(ordered == torch.iinfo(torch.int64).max, -1)
-            take = ordered.shape[1]
-            row_out[output_begin:output_end, :take].copy_(ordered.to(row_out.dtype))
-            row_lens[output_begin:output_end].copy_(
-                (values_topk > -torch.inf).sum(dim=1).to(row_lens.dtype)
+            select_rows(
+                logits,
+                tile_candidates,
+                int(topk),
+                row_out[output_begin:output_end],
+                row_lens[output_begin:output_end],
             )
             if make_blocks:
                 n_blocks = width // 8
@@ -288,4 +309,14 @@ def launch_gfx1250_logits(
         candidates,
         logits,
         score_chunk_size,
+    )
+
+
+def select_rows_gfx950(logits, candidates, topk, row_out, row_lens):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
+        launch_gluon_dsv41_index_topk_select_gfx950,
+    )
+
+    launch_gluon_dsv41_index_topk_select_gfx950(
+        logits, candidates, topk, row_out, row_lens
     )
