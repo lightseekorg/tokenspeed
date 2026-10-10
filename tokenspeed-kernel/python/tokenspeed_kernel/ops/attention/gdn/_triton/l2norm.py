@@ -59,7 +59,10 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["T"],
+    do_not_specialize_on_alignment=["T"],
+)
 def l2norm_fwd_kernel(
     x,
     y,
@@ -139,7 +142,6 @@ def l2norm_fwd(
 
 
 class L2NormFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(ctx, x, eps=1e-6, output_dtype=None):
