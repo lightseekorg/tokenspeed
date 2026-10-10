@@ -179,6 +179,54 @@ if current_platform().is_amd:
         """
         return _mm_a16w16_decode_impl(x, weight, x.dtype, out=out)
 
+    @register_kernel(
+        "gemm",
+        "dsv4_linear_fp32",
+        name="gluon_dsv4_linear_fp32_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        traits={
+            "has_tokens": frozenset({True}),
+            "hidden_rank": frozenset({2}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_dsv4_linear_fp32_gfx950(
+        hidden_states: torch.Tensor,
+        weight: torch.Tensor,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """DeepSeek V4 router projection with FP32 output.
+
+        Uses the measured decode GEMM where it has a config for the shape and
+        torch.mm otherwise.
+
+        Args:
+            hidden_states: ``[M, K]`` bf16 activations.
+            weight: ``[N, K]`` bf16 weight.
+            enable_pdl: Unused on AMD.
+
+        Returns:
+            ``[M, N]`` FP32 projection.
+        """
+        del enable_pdl
+        m, k = hidden_states.shape
+        if (
+            hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and _supports_mm_a16w16_decode(m, weight.shape[0], k)
+        ):
+            return _mm_a16w16_decode_impl(hidden_states, weight, torch.float32)
+        return torch.mm(hidden_states, weight.t(), out_dtype=torch.float32)
+
     _MXFP8_SIGNATURES = frozenset(
         {
             format_signature(
