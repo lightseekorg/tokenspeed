@@ -190,9 +190,70 @@ struct BlockTransfer {
     CacheBlockRef source;
     CacheBlockRef destination;
     CacheKey key{};
-    // True when source is a freshly allocated Host block that L3 must fill
-    // before the Host→Device copy.
-    bool prefetch_from_storage{false};
+};
+
+// A Host L2 entry a store's ACK published: the key and the block that is now
+// canonical for it -- the ticket's own block, or an existing entry the index
+// redirected the publication to (an L3 prefetch of the same key may have
+// landed first). Whoever pinned the ticket's block for that key follows it.
+struct HostPublication {
+    CacheKey key;
+    CacheBlockRef block;
+};
+
+// One imaged block of a retracted request's table: the logical slot it sat
+// in and the Host block that holds its bytes. A slot whose Device block was
+// a published prefix entry rides Host L2 as that entry (key set; the image
+// pins the entry until the restore lands); every other slot -- the unaligned
+// tail page, unpublished pages, groups that never publish -- rides the
+// request-private snapshot pool (key empty). Either way the Host block is in
+// the same bucket (slot % shard_count) as the Device block it images, so
+// under page-cyclic sharding the rank that owns the Device page owns the
+// Host page too; a restore reads the bucket back off this reference.
+struct ImageSlot {
+    std::int32_t slot_index{0};
+    CacheBlockRef block;
+    CacheKey key{};
+
+    bool InHostCache() const noexcept { return !key.content_hash.empty(); }
+};
+
+// One cache group's table as it stood at retraction, truncated to the slots
+// that hold computed data: the restore rebuilds exactly this shape (block
+// count, null holes, unconsumed tail capacity, reclaimed prefix) with fresh
+// Device blocks and re-reserves whatever lay beyond.
+struct ImageTable {
+    std::int32_t num_blocks{0};
+    std::int32_t reclaimed_prefix_blocks{0};
+    std::int32_t available_tokens{0};
+    std::vector<ImageSlot> slots;  // ascending slot_index
+};
+
+// A retracted request's KV image: one ImageTable per cache group. The
+// references are what keeps the Host blocks for the request -- a snapshot
+// block's only owner, a Host L2 entry's pin -- and dropping the image
+// releases both.
+struct RetractionImage {
+    std::vector<ImageTable> tables;
+
+    // Re-points every L2 slot whose key one of `published` names to the block
+    // now canonical for it. A slot pinned on a store ticket's block follows
+    // the ACK's redirect this way, so the image never holds an unindexed Host
+    // block; the old block's last reference drops here.
+    void FollowPublished(std::span<const HostPublication> published) {
+        for (ImageTable& table : tables) {
+            for (ImageSlot& slot : table.slots) {
+                if (!slot.InHostCache()) {
+                    continue;
+                }
+                for (const HostPublication& entry : published) {
+                    if (entry.key == slot.key && entry.block != slot.block) {
+                        slot.block = entry.block;
+                    }
+                }
+            }
+        }
+    }
 };
 
 }  // namespace tokenspeed

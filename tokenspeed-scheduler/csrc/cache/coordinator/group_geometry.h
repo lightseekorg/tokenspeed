@@ -43,12 +43,20 @@ public:
 
     std::int32_t BlockGranularity() const noexcept { return block_granularity_; }
 
-    std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
-        if (num_tokens <= table.AvailableTokens()) {
+    // Blocks that num_tokens need beyond available_tokens of unconsumed tail
+    // capacity -- the capacity of a live table, or of a recorded shape a
+    // restore is about to rebuild.
+    std::int32_t BlocksNeededBeyond(std::int32_t available_tokens, std::int32_t num_tokens) const {
+        _assert(available_tokens >= 0, "available tokens must be non-negative");
+        if (num_tokens <= available_tokens) {
             return 0;
         }
-        const std::int32_t over = num_tokens - table.AvailableTokens();
+        const std::int32_t over = num_tokens - available_tokens;
         return (over + block_granularity_ - 1) / block_granularity_;
+    }
+
+    std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
+        return BlocksNeededBeyond(table.AvailableTokens(), num_tokens);
     }
 
     std::int32_t BlocksNeededFor(const BlockTable& table, const GroupDemand& demand) const {

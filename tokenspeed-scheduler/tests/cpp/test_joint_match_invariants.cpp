@@ -120,6 +120,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
         {
             CacheCoordinator coordinator =
                 MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                /*snapshot_pool=*/nullptr,
                                 /*stream_device_cache_to_host=*/false);
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
@@ -197,6 +198,7 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
         BlockPool pool(64, {1, 1});
         CacheCoordinator coordinator =
             MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                            /*snapshot_pool=*/nullptr,
                             /*stream_device_cache_to_host=*/false);
         std::uniform_int_distribution<std::int32_t> depth_dist(0, kBlocks);
         const std::int32_t full_depth = depth_dist(rng);
@@ -240,8 +242,9 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
          .block_granularity = kBlockTokens},
     };
     BlockPool pool(64, {1, 2, 1});
-    CacheCoordinator coordinator = MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
-                                                   /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
+                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the

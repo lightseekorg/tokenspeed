@@ -48,6 +48,7 @@ protected:
                 .family = id == "full" ? CacheGroupFamily::History : CacheGroupFamily::State,
             });
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -72,6 +73,25 @@ protected:
         const auto history_blocks =
             std::count_if(history.begin(), history.end(), [](std::int32_t page) { return page > 0; });
         return ResidentBlocks() - static_cast<std::int32_t>(history_blocks);
+    }
+
+    // Decodes `survivor` until no unpinned Device cache entry is left: its
+    // growth evicts the suspended victim's still-cached blocks, so the restore
+    // that follows must copy them back from Host instead of claiming them. (A
+    // flush is refused while a request is suspended, so this is the way to
+    // reach that state.) Streams the survivor publishes are acknowledged as
+    // they appear.
+    void DecodeUntilDeviceCacheIsConsumed(const std::string& survivor, std::int32_t& next_token) {
+        for (std::int32_t round = 0; round < 64 && scheduler_->AvailableLcmBlocks() > 0; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_NE(batch, nullptr);
+            if (std::ranges::find(batch->request_ids, survivor) != batch->request_ids.end()) {
+                SendForwardDone(survivor, {next_token++});
+            }
+        }
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0) << "the survivor took every evictable block";
     }
 
     static std::int32_t StateStoreCount(const ExecutionPlan& plan) {
@@ -122,7 +142,7 @@ protected:
         EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{expected_prefix});
         for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(plan)) {
             for (std::uint32_t op_id : std::get<LoadBackBatch>(operation).op_ids) {
-                SendLoadBackDone(op_id, /*success=*/true);
+                SendLoadBackDone(op_id);
             }
         }
         AckWriteBacks(plan);
@@ -548,7 +568,7 @@ TEST_F(StatePublicationSuite, LongUnalignedDecodeKeepsOnlyItsBoundedWorkingState
     ExpectReplay("decode_boundary_not_cached", ConversationPrefix(8), 4);
 }
 
-TEST_F(StatePublicationSuite, IncompletePrefillRetractionPublishesItsComputedStateForHostReplay) {
+TEST_F(StatePublicationSuite, IncompletePrefillRetractionPublishesItsComputedStateAndResumesFromIt) {
     Reset(true, 1, 0);
     config_.device_allocator.total_pages = 11;
     config_.max_batch_size = 2;
@@ -556,6 +576,10 @@ TEST_F(StatePublicationSuite, IncompletePrefillRetractionPublishesItsComputedSta
     for (CacheGroupConfig& group : config_.cache_groups) {
         group.total_pages = config_.device_allocator.total_pages;
     }
+    SetTestSnapshotPool(config_);
+    // The test knob: at the fourth plan, retract the one Prefilling request
+    // between its chunks.
+    config_.debug_force_retraction_interval = -4;
     scheduler_ = std::make_unique<Scheduler>(config_);
 
     Submit(RequestSpec{.request_id = "resident", .tokens = MakeTokens(8, 1)});
@@ -580,10 +604,12 @@ TEST_F(StatePublicationSuite, IncompletePrefillRetractionPublishesItsComputedSta
     SendForwardDone("partial", {});
     ASSERT_EQ(ResidentBlocks(), 8);
 
-    // The resident uses five blocks; this prompt uses three and needs three
-    // more. The ten-block pool cannot admit its next chunk, so retraction
-    // publishes the completed token-8 state as a recovery Endpoint.
+    // The knob retracts the mid-prompt prefill between its chunks while the
+    // resident decodes on: its computed token-8 state is published as an
+    // Endpoint and, with its two history pages, rides Host L2 as the image's
+    // L2 leg; nothing is left for the snapshot pool.
     const ExecutionPlan retract = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
     ASSERT_EQ(scheduler_->WaitingSize(), 1u);
     const ForwardBatch* resident_decode = FindForwardBatch(retract);
     ASSERT_NE(resident_decode, nullptr);
@@ -599,31 +625,47 @@ TEST_F(StatePublicationSuite, IncompletePrefillRetractionPublishesItsComputedSta
         }
     }
     EXPECT_EQ(history_stores, 2);
-    AckWriteBacks(retract);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    const SnapshotStoreBatch* tail = FindSnapshotStore(retract);
+    ASSERT_NE(tail, nullptr);
+    EXPECT_TRUE(tail->src_pages.at(0).empty()) << "8 computed tokens end on a page boundary";
     SendForwardDone("resident", {43});
+    EXPECT_FALSE(scheduler_->ClearL1Cache()) << "a flush is refused while a request is suspended with an image";
+    // The image has not landed, so no restore is attempted (it would claim
+    // the victim's still-cached Device blocks) while the resident's growth
+    // evicts them.
+    std::int32_t next_token = 44;
+    DecodeUntilDeviceCacheIsConsumed("resident", next_token);
+    AckImageStores(retract);
+    EXPECT_GE(scheduler_->HostPoolCachedBlocks(), 6) << "the ACK publishes the image's entries beside the resident's";
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 3) << "the suspended prompt pins its three Host entries";
     SendAbortEvent("resident");
-    ASSERT_TRUE(scheduler_->ClearL1Cache());
 
+    // With the victim's Device entries evicted the restore copies the three
+    // published blocks back from Host -- history and the state checkpoint
+    // alike -- and the prompt then runs its second chunk from the checkpoint.
     const ExecutionPlan recovery = PlanOnce();
-    const ForwardBatch* recovered = FindForwardBatch(recovery);
+    const SnapshotRestoreBatch* restore = FindRestore(recovery);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"partial"});
+    EXPECT_EQ(std::count(restore->group_ids.at(0).begin(), restore->group_ids.at(0).end(), 0u), 2);
+    EXPECT_EQ(std::count(restore->group_ids.at(0).begin(), restore->group_ids.at(0).end(), 1u), 1)
+        << "the published state checkpoint comes back from Host";
+    for (const std::uint8_t tier : restore->source_tiers.at(0)) {
+        EXPECT_EQ(tier, static_cast<std::uint8_t>(HostTier::kL2));
+    }
+    EXPECT_TRUE(FindForwardBatch(recovery)->request_ids.empty());
+    AckRestores(recovery);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+
+    const ExecutionPlan resumed = PlanOnce();
+    const ForwardBatch* recovered = FindForwardBatch(resumed);
     ASSERT_NE(recovered, nullptr);
     ASSERT_EQ(recovered->request_ids, std::vector<std::string>{"partial"});
     EXPECT_EQ(recovered->extend_prefix_lens, std::vector<std::int32_t>{8});
     EXPECT_EQ(recovered->input_lengths, std::vector<std::int32_t>{8});
     EXPECT_EQ(recovered->prefill_lengths, std::vector<std::int32_t>{20});
-    bool loaded_state = false;
-    for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(recovery)) {
-        const auto& loads = std::get<LoadBackBatch>(operation);
-        for (const auto& group_ids : loads.group_ids) {
-            loaded_state |= std::ranges::find(group_ids, 1u) != group_ids.end();
-        }
-        for (std::uint32_t op_id : loads.op_ids) {
-            SendLoadBackDone(op_id, /*success=*/true);
-        }
-    }
-    EXPECT_TRUE(loaded_state);
-    AckWriteBacks(recovery);
+    EXPECT_GT(recovered->block_tables.at("state0").at(0).at(1), 0) << "the restored checkpoint is the chunk's input";
+    AckWriteBacks(resumed);
     SendForwardDone("partial", {});
     SendAbortEvent("partial");
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
@@ -639,6 +681,7 @@ TEST_F(StatePublicationSuite, PrefillDoneRetractionUsesActualPrefillEndWithSpecu
     for (CacheGroupConfig& group : config_.cache_groups) {
         group.total_pages = config_.device_allocator.total_pages;
     }
+    SetTestSnapshotPool(config_);
     scheduler_ = std::make_unique<Scheduler>(config_);
     Submit({RequestSpec{.request_id = "a", .tokens = MakeTokens(8, 1)},
             RequestSpec{.request_id = "b", .tokens = MakeTokens(8, 101)},
@@ -671,19 +714,20 @@ TEST_F(StatePublicationSuite, PrefillDoneRetractionUsesActualPrefillEndWithSpecu
         }
     }
     EXPECT_EQ(history_stores, 2);
-    AckWriteBacks(retract);
+    AckImageStores(retract);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
     SendForwardDone("c", {241});
     for (const std::string& id : {"a", "b", "c"}) {
         SendAbortEvent(id);
     }
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "an aborted victim releases its Host pins";
     ASSERT_TRUE(scheduler_->ClearL1Cache());
     auto replay_tokens = MakeTokens(8, 1);
     replay_tokens.push_back(999);
     ExpectReplay("recovered_prefill", std::move(replay_tokens), 8, 0);
 }
 
-TEST_F(StatePublicationSuite, RetractionRecomputesDecodeFromPrefillOrFromScratch) {
+TEST_F(StatePublicationSuite, ADecodingVictimResumesDecodingWithOrWithoutHostCache) {
     for (const bool host_cache : {false, true}) {
         SCOPED_TRACE(host_cache);
         Reset(host_cache, 1, 0);
@@ -694,6 +738,7 @@ TEST_F(StatePublicationSuite, RetractionRecomputesDecodeFromPrefillOrFromScratch
         for (CacheGroupConfig& group : config_.cache_groups) {
             group.total_pages = config_.device_allocator.total_pages;
         }
+        SetTestSnapshotPool(config_);
         scheduler_ = std::make_unique<Scheduler>(config_);
         Submit({RequestSpec{.request_id = "a", .tokens = MakeTokens(8, 1)},
                 RequestSpec{.request_id = "b", .tokens = MakeTokens(8, 101)}});
@@ -703,10 +748,15 @@ TEST_F(StatePublicationSuite, RetractionRecomputesDecodeFromPrefillOrFromScratch
         SendForwardDone("a", {41});
         SendForwardDone("b", {141});
 
+        // The two residents decode until one needs a page the other holds;
+        // the victim is suspended with its image. Its L2 leg carries only
+        // what prefill published -- decode records no state checkpoint, so
+        // the live state block rides the snapshot pool.
         bool retracted = false;
+        ExecutionPlan retract;
         for (std::int32_t round = 0; round < 32 && !retracted; ++round) {
-            const ExecutionPlan plan = PlanOnce();
-            for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
+            retract = PlanOnce();
+            for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(retract)) {
                 const auto& stores = std::get<WriteBackBatch>(operation);
                 for (std::size_t i = 0; i < stores.op_ids.size(); ++i) {
                     if (!stores.source_pinned.at(i)) {
@@ -715,54 +765,56 @@ TEST_F(StatePublicationSuite, RetractionRecomputesDecodeFromPrefillOrFromScratch
                     }
                 }
             }
-            AckWriteBacks(plan);
-            retracted = scheduler_->WaitingSize() == 1u;
-            if (!retracted) {
-                const ForwardBatch* batch = FindForwardBatch(plan);
-                ASSERT_NE(batch, nullptr);
-                for (const std::string& id : batch->request_ids) {
-                    SendForwardDone(id, {id == "a" ? 42 + round : 142 + round});
-                }
+            AckImageStores(retract);
+            retracted = scheduler_->RetractedSize() == 1u;
+            const ForwardBatch* batch = FindForwardBatch(retract);
+            ASSERT_NE(batch, nullptr);
+            for (const std::string& id : batch->request_ids) {
+                SendForwardDone(id, {id == "a" ? 42 + round : 142 + round});
             }
         }
         ASSERT_TRUE(retracted);
-        const std::int32_t token_count = scheduler_->RequestTokenSize("a");
+        const std::string victim = scheduler_->DecodingSize() == 1u && FindForwardBatch(retract) != nullptr &&
+                                           std::ranges::find(FindForwardBatch(retract)->request_ids, "a") !=
+                                               FindForwardBatch(retract)->request_ids.end()
+                                       ? "b"
+                                       : "a";
+        const std::string survivor = victim == "a" ? "b" : "a";
+        const std::int32_t token_count = scheduler_->RequestTokenSize(victim);
         ASSERT_GT(token_count, 9);
-        SendAbortEvent("b");
-        ASSERT_TRUE(scheduler_->ClearL1Cache());
+        const SnapshotStoreBatch* tail = FindSnapshotStore(retract);
+        ASSERT_NE(tail, nullptr);
+        EXPECT_GE(std::count(tail->group_ids.at(0).begin(), tail->group_ids.at(0).end(), 1u), 1)
+            << "the live state block is private to the request and rides the snapshot pool";
+        EXPECT_EQ(ExtractCacheOpsOfKind<WriteBackBatch>(retract).empty(), !host_cache)
+            << "the published history pages ride Host L2 exactly when there is one";
+
+        EXPECT_FALSE(scheduler_->ClearL1Cache()) << "a flush is refused while a request is suspended with an image";
+        EXPECT_FALSE(scheduler_->CanClearCache());
+        std::int32_t next_token = 1000;
+        DecodeUntilDeviceCacheIsConsumed(survivor, next_token);
+        SendAbortEvent(survivor);
         const ExecutionPlan recovery = PlanOnce();
-        const ForwardBatch* recovered = FindForwardBatch(recovery);
-        ASSERT_NE(recovered, nullptr);
-        ASSERT_EQ(recovered->request_ids, std::vector<std::string>{"a"});
-        const std::int32_t prefix = host_cache ? 8 : 0;
-        EXPECT_EQ(recovered->extend_prefix_lens, std::vector<std::int32_t>{prefix});
-        EXPECT_EQ(recovered->input_lengths, std::vector<std::int32_t>{host_cache ? 8 : token_count});
-        std::int32_t computed = prefix + recovered->input_lengths.at(0);
-        bool loaded_state = false;
-        for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(recovery)) {
-            const auto& loads = std::get<LoadBackBatch>(operation);
-            for (const auto& group_ids : loads.group_ids) {
-                loaded_state |= std::ranges::find(group_ids, 1u) != group_ids.end();
-            }
-            for (std::uint32_t op_id : loads.op_ids) {
-                SendLoadBackDone(op_id, /*success=*/true);
-            }
-        }
-        EXPECT_EQ(loaded_state, host_cache);
-        while (computed < token_count) {
-            SendForwardDone("a", {});
-            const ExecutionPlan tail = PlanOnce();
-            AckWriteBacks(tail);
-            const ForwardBatch* batch = FindForwardBatch(tail);
-            ASSERT_NE(batch, nullptr);
-            ASSERT_EQ(batch->request_ids, std::vector<std::string>{"a"});
-            EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{computed});
-            computed += batch->input_lengths.at(0);
-        }
-        EXPECT_EQ(computed, token_count);
-        SendForwardDone("a", {99});
-        SendFinish("a");
+        const SnapshotRestoreBatch* restore = FindRestore(recovery);
+        ASSERT_NE(restore, nullptr);
+        ASSERT_EQ(restore->request_ids, std::vector<std::string>{victim});
+        EXPECT_TRUE(FindForwardBatch(recovery)->request_ids.empty()) << "nothing is recomputed";
+        const auto& tiers = restore->source_tiers.at(0);
+        EXPECT_EQ(std::ranges::count(tiers, static_cast<std::uint8_t>(HostTier::kL2)) > 0, host_cache);
+        EXPECT_GT(std::ranges::count(tiers, static_cast<std::uint8_t>(HostTier::kSnapshotPool)), 0);
+        AckRestores(recovery);
+        EXPECT_EQ(scheduler_->RequestTokenSize(victim), token_count) << "the same tokens, resumed where it stopped";
+        EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+
+        const ExecutionPlan decode = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(decode);
+        ASSERT_NE(batch, nullptr);
+        ASSERT_EQ(batch->request_ids, std::vector<std::string>{victim});
+        EXPECT_EQ(batch->NumExtends(), 0u);
+        SendForwardDone(victim, {99});
+        SendFinish(victim);
         AckWriteBacks(PlanOnce());
+        EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), config_.snapshot_allocator.NumUsableBlocks());
     }
 }
 

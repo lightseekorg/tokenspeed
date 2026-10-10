@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -133,15 +134,62 @@ public:
         return true;
     }
 
+    // The bucket a block's bytes belong to under page-cyclic sharding: the
+    // residue of its slot inside the parent, which equals (virtual id - 1) %
+    // shard_count because packing is a multiple of the shard count.
+    std::int32_t BucketOf(CacheBlockLocation location) const noexcept { return location.slot_index % shard_count_; }
+
+    // Rebuilds a table from a recorded shape: identical block count, null
+    // holes, tail capacity and reclaimed prefix. `claimed` is parallel to
+    // shape.slots: a non-empty entry is a Device block the coordinator claims
+    // for that slot (a still-cached canonical block of the slot's key), every
+    // empty entry gets one fresh block in the slot's bucket (read off its
+    // Host block, which shares the Device block's residue). Returns false
+    // without mutation when the pool cannot place the bucket demand. One
+    // bucket degenerates to ordinary placement, so the shard count stays a
+    // parameter of one path.
+    bool AcquireShape(BlockPool& pool, BlockTable& table, const ImageTable& shape, std::vector<CacheBlockRef> claimed) {
+        _assert(table.NumBlocks() == 0, "AcquireShape requires a fresh (empty) table");
+        _assert(claimed.size() == shape.slots.size(), "claimed blocks must parallel the recorded slots");
+        std::vector<std::int32_t> buckets;
+        buckets.reserve(shape.slots.size());
+        for (std::size_t i = 0; i < shape.slots.size(); ++i) {
+            const ImageSlot& slot = shape.slots[i];
+            _assert(slot.block && 0 <= slot.slot_index && slot.slot_index < shape.num_blocks,
+                    "image slot must hold a block inside the recorded table");
+            if (!claimed[i]) {
+                buckets.push_back(BucketOf(slot.block->Location()));
+            }
+        }
+        std::vector<CacheBlockRef> fresh = pool.AcquireBlocksInBuckets(group_id_, buckets);
+        if (fresh.size() != buckets.size()) {
+            return false;
+        }
+        table.blocks_.resize(static_cast<std::size_t>(shape.num_blocks));
+        std::size_t next_fresh = 0;
+        for (std::size_t i = 0; i < shape.slots.size(); ++i) {
+            CacheBlockRef& destination = table.blocks_[static_cast<std::size_t>(shape.slots[i].slot_index)];
+            destination = claimed[i] ? std::move(claimed[i]) : std::move(fresh[next_fresh++]);
+        }
+        table.available_tokens_ = shape.available_tokens;
+        table.reclaimed_prefix_blocks_ = shape.reclaimed_prefix_blocks;
+        return true;
+    }
+
+    // Appends one Device destination per Host hit, each in its Host block's
+    // bucket so the copy's two ends share an owner under page-cyclic sharding.
     void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
                              std::vector<BlockTransfer>& load_pairs) {
         _assert(table.available_tokens_ == 0, "host extension must append on a full-page boundary");
-        const std::int32_t num_pages = static_cast<std::int32_t>(std::ranges::count_if(
-            host_block_refs, [](const CacheBlockRef& block_ref) { return static_cast<bool>(block_ref); }));
+        std::vector<std::int32_t> buckets;
+        for (const CacheBlockRef& block_ref : host_block_refs) {
+            if (block_ref) {
+                buckets.push_back(BucketOf(block_ref->Location()));
+            }
+        }
         table.blocks_.reserve(table.blocks_.size() + host_block_refs.size());
-        std::vector<CacheBlockRef> destination_refs = pool.AcquireBlocks(group_id_, num_pages, BucketLoads(table));
-        FatalCheck(static_cast<std::int32_t>(destination_refs.size()) == num_pages,
-                   "admission plan no longer fits the block pool");
+        std::vector<CacheBlockRef> destination_refs = pool.AcquireBlocksInBuckets(group_id_, buckets);
+        FatalCheck(destination_refs.size() == buckets.size(), "admission plan no longer fits the block pool");
         auto destination_it = destination_refs.begin();
         for (CacheBlockRef& host_block_ref : host_block_refs) {
             if (!host_block_ref) {

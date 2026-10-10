@@ -65,10 +65,10 @@ the admitted prompt's KV in), `plan.remote_decode` the peer's on a P node
 (the completed prompt decodes over there, so its KV goes out). The remote
 streams ride beside whatever forward work the round schedules, occupy no
 batch slot, and go out even on rounds with no batch at all — everything
-dispatchable dispatches in one round. Vanished-L3 recovery is the one
-withhold: it retracts `plan.remote_prefill` request ids with the local
-forward and does not submit that stream, so the peer cannot land
-suffix-only KV on empty prefix pages. The transfer moves
+dispatchable dispatches in one round; nothing is ever withheld after
+planning (an L3 object is fetched into Host before its request is admitted,
+so no planned forward or remote stream depends on a fetch that can miss).
+The transfer moves
 KV-pool device memory over RDMA rather than through a CUDA kernel, but it
 needs the same ordering against forwards and page zeroing — so its execution
 face lives behind the handle too, attached once at startup. Its control face
@@ -222,7 +222,7 @@ whose overlap the drain registry in Principle 4 breaks instead.
 
 `EventLoop.event_loop` sequences components. It does not implement them.
 Domain logic — pause/resume semantics, EPD admission, PD transfer handling,
-L2 cache-op tracking, L3 admission/recovery, wire handshakes, multimodal batch
+L2 cache-op tracking, L3 key registration and prefetch convergence, wire handshakes, multimodal batch
 assembly — lives in its own module and enters the loop as a **single-line hook**.
 The loop body
 should read, top to bottom, as the schedule of one scheduling round, with no
@@ -250,12 +250,11 @@ There are exactly two call sites, each with a documented reason:
 
 * **Head of the round** — completed L2 cache-op events
   (`_cache_hooks.poll_ready_events()`). These must advance *before*
-  `next_execution_plan`, otherwise cache-gated admissions slip a full
-  round.
-* **Tail of the round** — forward results, PD transfer events and L3 prefetch
-  recovery retracts, funneled through the single `request_changes` list.
-  Recovery retracts follow commits of older in-flight forwards. All events
-  must advance before the *next* round plans.
+  `next_execution_plan`, otherwise cache-gated admissions are delayed by a
+  full round.
+* **Tail of the round** — forward results and PD transfer events, funneled
+  through the single `request_changes` list. All events must advance before
+  the *next* round plans.
 
 Anything that produces scheduler events (a new transfer backend, a new async
 op kind) either returns events into one of these two points or adds a new
@@ -337,7 +336,7 @@ Current inventory:
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
 | `_cache_hooks` | `CacheOpHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries; counts the Host L2 write-backs/load-backs and the retraction image's snapshot stores/restores alike) | `count_plan_ops`, `poll_ready_events` |
-| `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `revalidate_queued_hits`, `prepare_forward` |
+| `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests` (the `batch_exists` probe that registers L3 keys), per-round MIN convergence of in-flight `PrefetchOp`s into `PrefetchDoneEvent`s |
 | `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
 
 `_pause_hooks` and `_pd_hooks` also receive the `DeviceHandle`: both have
@@ -361,14 +360,16 @@ seconds the greedy packing takes). The loop's one line is
 `note_round(forwarded=...)` after its forward submission. Nothing in the
 loop body knows a rebalance exists.
 
-`L3CacheHooks` owns prefix registration at submission, candidate revalidation
-before planning, and replica-wide prefetch recovery. It returns the safe forward
-and recovery events, never advancing the scheduler. A miss suppresses the
-model batch and remote-prefill submission while the plan's cache ops still
-execute. The loop drains older forwards before applying recovery at its tail.
-With L3 disabled, the same hooks submit requests without token hashing, storage
-probes or replica collectives. Storage state and per-plan prefetch snapshots
-remain behind `DeviceHandle`. Namespace deletion and flush coordination stay
+`L3CacheHooks` owns prefix registration at submission (the `batch_exists`
+probe that tells the scheduler which objects exist) and the per-round replica
+MIN convergence of in-flight `PrefetchOp`s into `PrefetchDoneEvent`s, which
+reach the scheduler through the cache ACK path like every other completion. It
+never advances the scheduler and never touches a planned forward: an L3 hit
+is fetched into Host while its request still waits (`fsm::Prefetching`), and
+the admission that follows is an ordinary Host hit. With L3 disabled, the
+same hooks submit requests without token hashing, storage probes or replica
+collectives. Storage state remains behind `DeviceHandle`; namespace deletion
+and flush coordination stay
 in `RequestHandler`.
 
 Per-round dispatch needs no hooks class at all: the loop hands
@@ -403,10 +404,12 @@ For orientation, one iteration of `event_loop`:
    stores/restores); **advance the scheduler (head call site)** so this
    round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
-   step. Otherwise: revalidate queued L3 hits, plan (`next_execution_plan`),
-   derive the forward op, record metrics, DP-sync, and gather per-batch state
-   (draining the in-flight queue first if the dispatch depends on a pending
-   commit, Principle 4).
+   step. Otherwise: plan (`next_execution_plan`), derive the forward op,
+   record metrics, DP-sync, and gather per-batch state (draining the
+   in-flight queue first if the dispatch depends on a pending commit,
+   Principle 4). Nothing re-probes L3 here: an L3 hit is fetched into Host by
+   a `PrefetchOp` before the request is admitted, so no planned forward can
+   be skipped for a vanished object.
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse:
    host-cache stores first (a retraction image's two legs -- the
@@ -416,7 +419,9 @@ For orientation, one iteration of `event_loop`:
    completion event fences the forward thread's stream here; an ordinary
    store's sources are pinned by the scheduler until the ACK, so its copy
    rides the write stream and fences nothing), then page zeroing (the new
-   owner's sanitization), then load-backs and restores (they target zeroed
+   owner's sanitization), then L3 prefetches (Host-lane submissions with no
+   stream dependency: nothing in the round reads their pages), then
+   load-backs and restores (they target zeroed
    pages; a restore reads both Host tiers under one event and arms no
    layerwise fence, its request being unschedulable until the ACK), then the
    plan's remote streams to the transfer peer (a D-node remote prefill
@@ -502,32 +507,17 @@ For orientation, one iteration of `event_loop`:
   Mooncake objects — then MIN-reduce an error-returning L3
   `remove_by_prefix`, before any rank mutates Device/Host. The frontend
   ANDs every DP worker's reply. Independent TokenSpeed jobs that share a
-  tenant are not in those groups. The L3 hooks re-probe queued
-  Submitted/Retracted hashes of requests that can take a batch slot and
-  Device pages this round immediately before `next_execution_plan` so a
-  hit registered at submit cannot be admitted after the object is gone. A
-  full decode batch, a head-of-line incomplete prefill, or an exhausted
-  Device pool skips the rest of the wait queue so the hooks do not hash
-  and remotely probe a long prompt on every token step.
+  tenant are not in those groups.
   PP fans the request stream across WORLD so every cache-owning rank enters
-  the same exists MIN. Without PP the attention-TP broadcast already does.
-  After Admit, the L3 hooks recover vanished L3 objects on the same path:
-  control-plane `batch_get_into`, replica MIN, skip H2D / skip
-  publishing empty Host pages and empty Device prefetch destinations,
-  snapshot-less retract of the batch so the next admit recomputes.
-  D-role admit rides `plan.remote_prefill` with no local forward: those
-  request ids retract with the same events, and the loop withholds that
-  stream from `DeviceHandle.execute` so the peer does not land
-  suffix-only KV on empty prefix pages. Cache ops still run so
-  LoadBackDone can unpin without publishing.
-  Failed `batch_get_into` pages stay unread so a later `batch_exists` hit
-  cannot re-register them. The L3 hooks blacklist only the replica-converged
-  misses, so a restored prefix page stays readable. Replica
-  admission MIN-reduces local readability (exists and not unread). A
-  later Host backup forgets an unread entry only when it created a
-  missing object. A create-only skip of an unreadable object keeps the
-  blacklist. The unread set is bounded to Host CacheBlock capacity
-  (LCM parents times each group's `cache_blocks_per_lcm_block`). A backend
-  exception or malformed existence / prefetch result is a local miss so
-  every cache-owning rank still enters the replica MIN. Raising would
-  hang healthy peers. The hooks do not fail clients.
+  the same exists MIN; without PP the attention-TP broadcast already does.
+  A registered object that is gone by the time it is wanted is discovered by
+  the pre-admission `PrefetchOp`, not by a planned forward: the Host transfer
+  lane fetches the op's rows in prefix order, stops at the first page that
+  fails or at its timeout, the hook MIN-reduces the landed prefix across the
+  replica every round, and exactly one `PrefetchDoneEvent(op_id,
+  landed_pages)` reaches the scheduler, which publishes the landed pages,
+  frees the rest, forgets the unlanded keys and admits the request on what
+  landed. Nothing is skipped, retracted or blacklisted. A backend exception
+  or malformed existence / prefetch result is a local miss so every
+  cache-owning rank still enters the replica MIN; raising would hang
+  healthy peers. Clients are not failed.
