@@ -683,6 +683,34 @@ def test_restore_reads_both_tiers_imports_the_slot_and_acks_once():
     assert _acks(executor.poll_results()) == _restore_done(9)
 
 
+def test_load_backs_start_before_restores_on_the_load_stream():
+    """The forward reads a load-back layer by layer behind the layerwise
+    fences; a restore is read by nothing this round, so it queues behind the
+    loads on the shared stream instead of delaying them."""
+    layout = _layout(4, [("full", 4)])
+    executor, _, _ = _build(layout=layout, shard_counts=[1])
+    order = Mock()
+    load = Mock(return_value=0)
+    restore = Mock()
+    order.attach_mock(load, "load")
+    order.attach_mock(restore, "restore")
+    with (
+        patch.object(executor_module.Cache, "LoadBackOp", _LoadBackOp, create=True),
+        patch.object(executor, "_start_loading", load),
+        patch.object(executor, "_start_restore", restore),
+    ):
+        executor.submit_load_backs(
+            [
+                _restore_op(3, 0, [(HostTier.SNAPSHOT_POOL, _transfer(0, 1, 2))]),
+                _LoadBackOp([4], [[0]], [[5]], [[3]]),
+            ],
+            prerequisite_stream="default-stream",
+        )
+    assert [c[0] for c in order.mock_calls] == ["load", "restore"]
+    assert load.call_args.args[0] == [4]
+    assert restore.call_args.kwargs["prerequisite_stream"] == "default-stream"
+
+
 def test_restore_rows_need_their_tier_and_run_outside_capture():
     layout = _layout(2, [("full", 2)])
     # Without an L2 tier a restore naming L2 rows is a configuration error.

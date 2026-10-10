@@ -448,10 +448,12 @@ For orientation, one iteration of `event_loop`:
    then L3 prefetches (`PrefetchOp`: Host-lane submissions with no stream
    dependency, nothing in the round reads their pages), then the
    Device-bound copies -- `LoadBackOp` and `RestoreOp`, ordered
-   behind the zeroing: a load-back lands on zeroed pages; a restore
-   overwrites its destination blocks whole (the scheduler lists none of them
-   for zeroing), reads both Host tiers under one event and arms no layerwise
-   fence, its request being unschedulable until the ACK -- then the plan's
+   behind the zeroing: a load-back lands on zeroed pages and the forward
+   reads it layer by layer behind the layerwise fences, so the loads start
+   first on the load stream; a restore queues behind them, overwrites its
+   destination blocks whole (the scheduler lists none of them for zeroing),
+   reads both Host tiers under one event and arms no layerwise fence, its
+   request being unschedulable until the ACK -- then the plan's
    remote streams to the transfer peer (a D-node remote prefill waits on the
    zeroing fence inside its submission, which the FIFO orders after the
    store fence), then the plan's batch to the model. A store names the

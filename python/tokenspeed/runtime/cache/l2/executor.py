@@ -628,15 +628,18 @@ class HostCacheExecutor:
                 restore_ops.append(operation)
                 self._append_restore(operation, rows_by_tier=restore_rows)
         self._check_distinct(restore_ops)
-        if restore_ops:
-            self._start_restore(
-                restore_ops, restore_rows, prerequisite_stream=prerequisite_stream
-            )
+        # Loads first: the forward reads them layer by layer behind the
+        # layerwise fences, while a restore is read by nothing this round, so
+        # it rides the same stream behind them instead of delaying them.
         load_index = self._start_loading(
             op_ids, transfers, prerequisite_stream=prerequisite_stream
         )
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
+        if restore_ops:
+            self._start_restore(
+                restore_ops, restore_rows, prerequisite_stream=prerequisite_stream
+            )
 
     # ------------------------------------------------------------------
     # L3 prefetch lane (control plane submits, a CPU thread fetches)
