@@ -457,13 +457,13 @@ zeroed). The decoder graphs depend only on their row count, so one ladder
 serves every token bucket; it is the token ladder clipped to
 `max_decoder_rows_per_request × max_num_seqs` (a request contributes at most
 its window). A replay is encoder graph → eager narrowing → decoder graph,
-all under the bucket-pinned ambient context; the narrowing and decoder
+all under the bucket-pinned ambient context. The narrowing and decoder
 stages size their own collectives from their row counts
-(`report_collective_sizing`), the decoder graph replays with the narrowed
-row count as its valid rows so its breaks scrub the static tail, and a
-forward whose narrowed rows exceed the largest decoder bucket runs its
-decoder stage eager. Layers read their row plan from the live context, never
-from a loose argument a captured break would freeze. Capture runs the
+(`report_collective_sizing`). The decoder graph replays with the narrowed
+row count as its valid rows, so its breaks scrub the static tail. A forward
+whose narrowed rows exceed the largest decoder bucket runs its decoder
+stage eager. Layers read their row plan from the live context, never from a
+loose argument a captured break would freeze. Capture runs the
 narrowing before every decoder run, as serving does: the decoder consumes
 per-forward backend state its predecessor produces (V4.1's reuse layers read
 the index source's selection, which later sources overwrite). Under
@@ -561,7 +561,7 @@ NOWHERE else — the same two steps in every round:
 Backends' `init_forward_metadata` must NOT double-fill draft decode metadata
 as a side effect (the deleted `is_extend() and self.is_draft` arms); the
 mixed/idle decode arms that remain serve the target's decode requests only.
-Drafters republish their in-loop seq_lens edits explicitly each step via
+Drafters republish their in-loop seq_lens edits explicitly each step through
 `advance_draft_forward_metadata` (Eagle) / `update_draft_forward_metadata`
 (vanilla MTP frontier re-anchor) — metadata never aliases a buffer the
 drafter mutates behind the backend's back. Those two hooks are deliberately
@@ -1379,11 +1379,11 @@ capacity and request capacity; `None` in the request-count position selects
 the ordinary attention-break capture. The backend retains startup metadata for
 the exact shapes that need stable addresses, not graphs or request state. Serving
 forwards never grow this retained table. The outer owner's serial shared-pool
-discipline applies to all variants; there is no separate KDA graph pool. Before
-recapture, it releases the old captures and resets retained prefill metadata via
-`init_prefill_graph_state`. Publishing a cache pool also drops retained prefill
-metadata. Graph release and cache-pool rebind remain coordinated by the
-orchestrator.
+discipline applies to all variants; there is no separate KDA graph pool.
+Before recapture, it releases the old captures and resets retained prefill
+metadata through `init_prefill_graph_state`. Publishing a cache pool also
+drops retained prefill metadata. Graph release and cache-pool rebind remain
+coordinated by the orchestrator.
 
 ### Fixed-capacity execution metadata
 

@@ -1,10 +1,10 @@
-# Event Loop: Design Principles
+# Event loop: design principles
 
 This document records the design principles of the scheduler event loop
 (`python/tokenspeed/runtime/engine/event_loop.py`). It is the reference for
 where new logic belongs, how components feed results back into the scheduler,
-and what the loop body itself is allowed to contain. The rules below were
-established deliberately; treat deviations as bugs in review.
+and what the loop body itself is allowed to contain. The rules below are
+deliberate; treat deviations as bugs in review.
 
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
@@ -17,13 +17,13 @@ find every rank promptly, however deep the GPUs are in queued work — a stage's
 launch-queue backpressure stalls only its own forward thread, never the round.
 
 FIFO describes submission ownership, not a promise that every model kernel
-uses one CUDA stream. Main-stream scratch and persistent kernel protocol state
-may be shared across calls only while those calls are ordered on that stream.
-Work deliberately forked to a side stream must use private storage or establish
-an ordering edge before touching a shared layout; joining the side stream later
-does not make concurrent reuse safe.
+uses one CUDA stream. Model kernels may share main-stream scratch and
+persistent kernel protocol state across calls only while those calls are
+ordered on that stream. Work deliberately forked to a side stream must use
+private storage or establish an ordering edge before touching a shared layout.
+Joining the side stream later does not make concurrent reuse safe.
 
-This is enforced by **visibility**, not by discipline. `build_device_side`
+**Visibility**, not discipline, enforces this. `build_device_side`
 (`execution/device.py`) constructs the model runners, attention backends, KV
 pools and executor as its own locals, and returns one `DeviceBuild`, split by
 how long the caller may hold each piece:
@@ -35,26 +35,26 @@ how long the caller may hold each piece:
 | `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
-The device side is built **complete**, not built-then-wired: the transfer peer
-is constructed inside the builder from its prepared components and startup
-arguments, and the engine's role is read off it once, at construction. An
+`build_device_side` builds the device side **complete**, not built-then-wired:
+it constructs the transfer peer from its prepared components and startup
+arguments, and reads the engine's role off the peer once, at construction. An
 earlier shape had the loop assemble the peer and hand it back through a setter,
 which left the role mutable after startup for no reason.
 
-Persistent DeepEP communication storage is reserved during common MoE weight
-processing, before attention/cache construction profiles available memory.
-The kernel package owns allocation and compatible reuse; this rule is shared
-by every DeepEP backend. Runtime orchestration supplies configuration but does
-not infer token layouts or capacities from model names. Backend dispatchers
-reuse that storage when model execution begins.
+Common MoE weight processing reserves persistent DeepEP communication
+storage, before attention/cache construction profiles available memory. The
+kernel package owns allocation and compatible reuse. Every DeepEP backend
+shares this rule. Runtime orchestration supplies configuration but does not
+infer token layouts or capacities from model names. Backend dispatchers reuse
+that storage when model execution begins.
 
 Attention construction returns a frozen, named `AttentionBuild` containing its
 backends, pools, cache storage, field placement/readiness and optional logical plan.
 `build_device_side` consumes this result locally and passes stage field
 placement, producer readiness and `logical_plan` explicitly through PD
 construction to `get_kv_args`.
-These startup dependencies stay within device construction; neither the build
-result nor its ownership/layout fields are exposed to the event loop.
+These startup dependencies stay within device construction. The event loop
+never sees the build result or its ownership/layout fields.
 
 The handle owns BOTH executors of a scheduler plan, and treats their work
 identically: a model forward runs asynchronously on the GPU, and handing a
@@ -81,10 +81,10 @@ Consequences:
   pass one implicitly or mutate one a forward is still using. A test asserts
   this over the AST of `EventLoop.__init__` — locals included, because a name
   it can write is a name a later change can keep.
-* A new device interaction belongs **inside the builder** if it runs once at
-  startup, and on `DeviceHandle` only if the running loop genuinely needs it —
-  the second widens what the loop can do to the GPU mid-flight. Hand over the
-  capability, never the object.
+* A new device interaction that runs once at startup belongs **inside the
+  builder**; it belongs on `DeviceHandle` only when the running loop genuinely
+  needs it — the second widens what the loop can do to the GPU mid-flight.
+  Hand over the capability, never the object.
 * Every method on the handle is a **named operation**, with one registered
   exception: `run_multimodal_work`, because multimodal feature lifecycle is a
   state machine reached from several control-plane points (EPD admission's
@@ -95,25 +95,25 @@ Consequences:
   size limit. L3 adds named Host-tier operations for existence/readability
   probes, prefetch planning/results, failed-read invalidation, namespace and
   weight-version changes, and cache shutdown. These keep the executor and
-  Host buffer hidden; they do not introduce another generic work slot.
+  Host buffer hidden. They do not introduce another generic work slot.
   The `EXPERT_LOAD` profile activity adds two more named operations,
   `reset_expert_load` and `dump_expert_load`: the routing kernels bump the
   expert placement's load counters on the execution stream, so zeroing and
   reading them back ride the forward thread on that stream (the read-back is
   a deliberate, low-rate host wait, like the other `run_*` methods). The
   dump is rank-local by contract -- it runs no collective. A profile stop
-  reaches attention-DP workers independently (`stop_profile` is delivered
-  per DP worker), so a rank reducing inside the request would block in the
-  collective while its peer is still in `_dp_sync_and_check`; the ranks'
-  records are summed where they are consumed (`--init-expert-location`).
+  reaches attention-DP workers independently (each DP worker receives
+  `stop_profile`), so a rank reducing inside the request would block in the
+  collective while its peer is still in `_dp_sync_and_check`.
+  `--init-expert-location` sums the ranks' records where it consumes them.
   Online expert rebalancing (`--enable-eplb`) adds two more named
   operations on the same counters: `snapshot_expert_load` (read the window
   to the host and zero it, one stream-ordered step) and
   `apply_expert_placement` (one chunk of layers: P2P over the EP device
   group into a startup-reserved staging buffer, slot copies, then each
-  layer's routing tables switched in place after its slots landed; the
-  execution stream is synchronized at the end so a P2P failure surfaces in
-  the op). Both are rank-local on the handle; the rebalance may reduce the
+  layer's routing tables switched in place after its slots landed, and a
+  final execution-stream synchronization so a P2P failure surfaces in the
+  op). Both are rank-local on the handle. The rebalance may reduce the
   snapshot over the EP group because its ops ride the same-round gate
   (below), unlike the profile's dump.
   Changing this surface requires updating both this contract and the explicit
@@ -123,19 +123,19 @@ Consequences:
   could call back into it — a reference cycle for about a dozen lines of
   difference. With every remote op on its own plan stream, the batch needs
   no per-role reading at all: a `ForwardBatch` is model work, full stop, and
-  a DP rank counts work by simply asking whether the batch has tokens.
-* Collaborators are **given** the handle in their constructor. Do not reach it
+  a DP rank counts work by asking whether the batch has tokens.
+* Collaborators **receive** the handle in their constructor. Do not reach it
   through another object (`loop._device...`): a traversal is the seam the next
   change widens, first to the handle and then to whatever it exposes.
 * On the per-round path only commit waits, through `PendingExecution.result()`:
   join the forward thread's future (launches issued), then its copy event (D2H
-  landed). Dispatch never waits — model forwards and the peer's remote
-  prefills/decodes alike are submitted fire-and-forget, which is what keeps a
+  landed). Dispatch never waits — it submits model forwards and the peer's
+  remote prefills/decodes alike fire-and-forget, which is what keeps a
   backpressured stage off the control plane. The remote submissions' only
   failure surface is a settle at the next round's `execute` (their semantic
   completion arrives through the transfer events; a submission that RAISED
-  produces none, so it must not be swallowed). The handle's remaining `run_*`
-  methods do block, deliberately — the DP idle forward, the landing of a
+  produces none, so the settle must not swallow it). The handle's remaining
+  `run_*` methods do block, deliberately — the DP idle forward, the landing of a
   completed remote prefill, the KV repair after a wake, the RL weight sync —
   but each is a low-rate path whose caller cannot proceed without the result
   (the landing's failure must surface BEFORE the scheduler advances the
@@ -145,10 +145,10 @@ Consequences:
   through tensor indexing can stage a CPU tensor and introduce a hidden
   synchronous H2D copy, blocking further forward launches.
 
-The rule is also mechanically enforced, on by default: a thread-local
-dispatch mode over the loop raises on any CUDA tensor op run from the
+A thread-local dispatch mode over the loop also enforces the rule
+mechanically, on by default: it raises on any CUDA tensor op run from the
 control thread. Event waits — the inbound channel — and metadata-only view
-ops pass untouched; neither submits device work.
+ops pass untouched. Neither submits device work.
 ``TOKENSPEED_GUARD_CONTROL_PLANE=0`` is the escape hatch for a deployment
 that trips on an unrouted op (report it). EPD prefill admission, the one
 known violator, now crosses through ``DeviceHandle.run_multimodal_work``:
@@ -166,26 +166,26 @@ synchronization it performs — `.cpu()`, `.item()`, `.tolist()`,
 the step in flight, so the next step's prologue and graph launch slip
 behind the current step's completion and `in_flight_depth` degrades to 0
 however it is configured. Results cross back through pinned non-blocking
-copies and an event the control plane waits on. This rule is enforced by
-torch's sync-debug mode, armed by `run_event_loop` as its last step before
+copies and an event the control plane waits on. Torch's sync-debug mode
+enforces this rule, and `run_event_loop` arms it as its last step before
 entering the round loop (weight loading, tuning, capture, the transfer and
 L2 builders and `EventLoop.__init__` all synchronize on purpose):
 `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` reports each offending site with its
 Python location, `error` raises there. CI runs the serving paths with
-`error`; the control plane's event wait and non-blocking copies are not
-flagged, so a report is always a real stall.
+`error`; the control plane's event wait and non-blocking copies pass
+unflagged, so a report is always a real stall.
 
 A JIT compilation on the forward thread is the same kind of stall, only
 longer: the round waits 100 ms to seconds while a kernel compiles for a new
 compile-cache key. Startup compiles on purpose (graph capture, tuning), so
 `run_event_loop` installs `tokenspeed_kernel.compile_monitor` before building
 anything and marks the end of startup right after arming the sync-debug
-mode; the encode loop marks it after its ready message. From then on every
-Triton compilation is logged with its duration and cause, exported as
-`tokenspeed:jit_serving_compiles` / `tokenspeed:jit_serving_compile_seconds`
-from the per-round metrics call, and a compile-time kernel parameter that
-keeps taking new values from one call site -- a per-batch value passed as
-`tl.constexpr` -- is reported by name. `TOKENSPEED_JIT_COMPILE_CHECK=error`
+mode. The encode loop marks it after its ready message. From then on the
+monitor logs every Triton compilation with its duration and cause and reports
+by name any compile-time kernel parameter that keeps taking new values from
+one call site -- a per-batch value passed as `tl.constexpr`; the per-round
+metrics call exports them as `tokenspeed:jit_serving_compiles` /
+`tokenspeed:jit_serving_compile_seconds`. `TOKENSPEED_JIT_COMPILE_CHECK=error`
 raises there instead, and CI serving jobs run with it.
 The same mark closes the kernel package's compile switch
 (`compile_monitor.is_serving()`), installed monitor or not. A kernel whose
@@ -198,10 +198,10 @@ compiles instead of compiling on the forward thread.
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,
-and is frozen once submitted: no attribute rebinding, no in-place edit, no
+and freezes once submitted: no attribute rebinding, no in-place edit, no
 releasing a resource the closure captured. Capture plain values or a snapshot,
-and bind at capture time rather than closing over a variable the caller will
-rebind. Results cross back **only** through `PendingExecution.result()`.
+and bind at capture time rather than closing over a variable the caller later
+rebinds. Results cross back **only** through `PendingExecution.result()`.
 
 L3 Host prefetch results follow the same capture rule. The control plane
 prefetches and converges each plan's outcome, then `DeviceHandle.execute`
@@ -210,12 +210,12 @@ never reads the executor's current-round prefetch dictionary: another round
 may already have replaced or invalidated it while the submission was queued.
 
 `execution/forward_thread.py` states this in full, including the single
-registered exception — grammar matchers, whose ownership is split by path and
-whose overlap is instead broken by the drain registry in Principle 4.
+registered exception — grammar matchers, whose ownership splits by path and
+whose overlap the drain registry in Principle 4 breaks instead.
 
 ## Principle 2: the event loop is a coordinator, nothing more
 
-`EventLoop.event_loop` sequences components; it does not implement them.
+`EventLoop.event_loop` sequences components. It does not implement them.
 Domain logic — pause/resume semantics, EPD admission, PD transfer handling,
 L2 cache-op tracking, L3 admission/recovery, wire handshakes, multimodal batch
 assembly — lives in its own module and enters the loop as a **single-line hook**.
@@ -236,20 +236,20 @@ Consequences:
 ## Principle 3: scheduler feedback is explicit and centralized
 
 `advance_scheduler` (`scheduler_utils.py`) is the **only** caller of
-`scheduler.advance`, and it is invoked **only explicitly and directly in the
-`event_loop` body — never from helpers**. Helpers RETURN their events; the
-loop applies them. Reading the loop body alone must reveal every point where
+`scheduler.advance`, and the `event_loop` body **invokes it only explicitly
+and directly — never from helpers**. Helpers RETURN their events. The loop
+applies them. Reading the loop body alone must reveal every point where
 the scheduler's state advances, and why.
 
 There are exactly two call sites, each with a documented reason:
 
 * **Head of the round** — completed L2 cache-op events
   (`_cache_hooks.poll_ready_events()`). These must advance *before*
-  `next_execution_plan`, otherwise cache-gated admissions are delayed by a
-  full round.
+  `next_execution_plan`, otherwise cache-gated admissions slip a full
+  round.
 * **Tail of the round** — forward results, PD transfer events and L3 prefetch
   recovery retracts, funneled through the single `request_changes` list.
-  Recovery retracts follow commits of older in-flight forwards; all events
+  Recovery retracts follow commits of older in-flight forwards. All events
   must advance before the *next* round plans.
 
 Anything that produces scheduler events (a new transfer backend, a new async
@@ -259,9 +259,9 @@ points don't fit. It must not call `advance_scheduler` itself.
 
 ## Principle 4: correctness never depends on the in-flight depth
 
-The loop is parameterized by `in_flight_depth`: 0 (classic synchronous
+`in_flight_depth` parameterizes the loop: 0 (classic synchronous
 commit), 1 (the overlap schedule), or `pp_size` (the prefill chunk pipeline).
-Dispatched forwards await commit in the `in_flight` queue; the tail commits
+Dispatched forwards await commit in the `in_flight` queue. The tail commits
 once the queue exceeds the effective depth (0 when the round dispatched no
 new work, so results never wait on future traffic).
 
@@ -279,13 +279,13 @@ beside the batch): a request turns `PrefillDone` when its last chunk is
 *scheduled*, so the transfer was being planned while that chunk was still in
 flight, and satisfying it meant draining the whole queue — under PP,
 emptying the chunk pipeline every time a prompt finished prefill. The
-dependency was real; the right fix was upstream, not a drain.
+dependency was real. The right fix was upstream, not a drain.
 
-Depth ≥ 1 also means a round is planned *before* the previous round's commit,
-so a batch can contain a request that commit is about to finish. Anything the
-control plane frees on that commit — a request's shared multimodal features,
-for instance — must be released through the handle so the FIFO orders it
-behind the forward that captured it, not inline.
+Depth ≥ 1 also means the loop plans a round *before* the previous round's
+commit, so a batch can contain a request that commit is about to finish.
+Anything the control plane frees on that commit — a request's shared
+multimodal features, for instance — must be released through the handle so
+the FIFO orders it behind the forward that captured it, not inline.
 
 ## Principle 5: publishing drains, once per round
 
@@ -294,16 +294,16 @@ accumulate inside the C++ scheduler across any number of calls (advance,
 `next_execution_plan`), so a single unconditional call at the loop tail
 publishes everything the round produced, in order, as one batch. The batch
 is the round's net change: a block evicted and cached again within the round
-produces no event. Do not add per-mutation publish calls; they only fragment
+produces no event. Do not add per-mutation publish calls. They only fragment
 batches.
 
-The same reasoning fixes the metrics call: scheduler iteration metrics are
-recorded once per round, from the same pre-dispatch snapshot as the
+The same reasoning fixes the metrics call: the loop records scheduler
+iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
 
 Page gauges count LCM parents, excluding the reserved null parent. The
-per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`;
-cached-only parents are `num_usable_pages - empty - active`. Active and cached
+per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`.
+Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
 `LoadSnapshot.num_used_pages` sums active and cached parents to report all
 resident occupancy, including evictable cache, rather than cache alone.
@@ -317,9 +317,9 @@ subsystem's only entry points from the loop. Two shapes exist:
 
 * **Glue hooks** hold a loop back-reference and act on its collaborators;
   they are stateless (or nearly so) because the real state machine lives in a
-  controller the request handler or device drives. The controller DECIDES;
-  the hooks ACT with the loop's collaborators. Any capability they need — the
-  `DeviceHandle` above all — is injected in their constructor, per Principle 1.
+  controller the request handler or device drives. The controller DECIDES.
+  The hooks ACT with the loop's collaborators. They receive any capability they
+  need — the `DeviceHandle` above all — in their constructor, per Principle 1.
 * **Self-contained components** own their state outright and depend only on
   static configuration — they need no loop reference at all. Prefer this
   shape whenever the subsystem doesn't genuinely need the loop's live state.
@@ -335,25 +335,25 @@ Current inventory:
 | `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `revalidate_queued_hits`, `prepare_forward` |
 | `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
 
-`_pause_hooks` and `_pd_hooks` are also handed the `DeviceHandle`: both have
+`_pause_hooks` and `_pd_hooks` also receive the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
-after a memory-saver wake, and the device writes a completed remote prefill
-lands. `PauseHooks` additionally supplies `reset_caches_for_release` and
-`kv_repair_after_wake` to the memory-occupation controller as callbacks; those
-are not loop entry points, they fire on release/wake.
+after a memory-saver wake, and the device writes that land a completed remote
+prefill. `PauseHooks` additionally supplies `reset_caches_for_release` and
+`kv_repair_after_wake` to the memory-occupation controller as callbacks.
+Those are not loop entry points — they fire on release/wake.
 
 `EplbHooks` is the online expert rebalance (`--enable-eplb`). The
 controller counts the forwards this rank submitted — real or DP-idle, so the
-count is rank-identical — and decides when a rebalance's steps are due; the
+count is rank-identical — and decides when a rebalance's steps are due. The
 hooks enqueue them as *internal control ops* on the request handler's second
 FIFO and complete them, once the same-round gate (below) agrees, through two
 named handle operations (`snapshot_expert_load`, `apply_expert_placement`)
 and two EP-group gloo agreements (the summed load under all-to-all EP, the
-committed map broadcast from EP rank 0). The placement itself is derived on
-EP rank 0 in a spawned CPU worker process, off both planes and off this
-process's GIL (a Python-bound thread would contend with the forward thread
-for the seconds the greedy packing takes). The loop's one line is
-`note_round(forwarded=...)` after its forward submission; nothing in the
+committed map broadcast from EP rank 0). A spawned CPU worker process derives
+the placement itself on EP rank 0, off both planes and off this process's
+GIL (a Python-bound thread would contend with the forward thread for the
+seconds the greedy packing takes). The loop's one line is
+`note_round(forwarded=...)` after its forward submission. Nothing in the
 loop body knows a rebalance exists.
 
 `L3CacheHooks` owns prefix registration at submission, candidate revalidation
@@ -363,7 +363,7 @@ model batch and remote-prefill submission while the plan's cache ops still
 execute. The loop drains older forwards before applying recovery at its tail.
 With L3 disabled, the same hooks submit requests without token hashing, storage
 probes or replica collectives. Storage state and per-plan prefetch snapshots
-remain behind `DeviceHandle`; namespace deletion and flush coordination stay
+remain behind `DeviceHandle`. Namespace deletion and flush coordination stay
 in `RequestHandler`.
 
 Per-round dispatch needs no hooks class at all: the loop hands
@@ -377,11 +377,11 @@ SMG startup handshake lives in `zmq_msgpack.connect_msgpack_engine_for_loop`
 `multimodal/inputs.py::multimodal_context_for_forward` (which also snapshots
 each request's multimodal inputs, per Principle 1's capture contract), and
 P-side layerwise KV streaming setup, which happens inside the device builder
-(the step counter is backend surgery; the sender just receives it). Dest-
-contiguous CachePD fragments are 2D-packed in the Prefill transfer path
-before Mooncake WRITE — that CUDA copy is data-plane work, not loop work.
+(the step counter is backend surgery; the sender only receives it). The
+Prefill transfer path 2D-packs dest-contiguous CachePD fragments before
+Mooncake WRITE — that CUDA copy is data-plane work, not loop work.
 
-All hooks obey Principle 3: they return events or decisions; they never call
+All hooks obey Principle 3: they return events or decisions. They never call
 `advance_scheduler`.
 
 An empty memory-resume request is a successful no-op while a drain is
@@ -412,7 +412,7 @@ For orientation, one iteration of `event_loop`:
    plan's remote streams to the transfer peer (a D-node remote prefill
    waits on the zeroing fence inside its submission, which the FIFO orders
    after the write-back fence), then the plan's batch to the model. `planned` is
-   None on idle and empty rounds; the plan's own work (hygiene, the remote
+   None on idle and empty rounds. The plan's own work (hygiene, the remote
    streams) still runs. The rebalance hook notes whether this rank forwarded
    (`_eplb_hooks.note_round`). Then commit from the queue head down to the
    effective depth and poll PD transfer events.
@@ -425,8 +425,8 @@ For orientation, one iteration of `event_loop`:
 * New logic that reacts to scheduler/transfer/cache progress: put it in the
   matching hooks class (or add one), return events, and apply them at an
   existing advance point.
-* New device interaction: inside `build_device_side` if it is startup-only,
-  `DeviceHandle` if the running loop needs it — and inject the handle into
+* New device interaction: if it is startup-only, inside `build_device_side`;
+  if the running loop needs it, `DeviceHandle` — and inject the handle into
   whoever needs it rather than traversing to it.
 * New reason a dispatch cannot overlap a pending commit: add it to
   `_dispatch_depends_on_pending_commit`.
@@ -444,19 +444,19 @@ For orientation, one iteration of `event_loop`:
   `--kvstore-storage-backend` is set. Hashing every admitted prefix on the
   default (`--disable-kvstore`) path is a control-plane cost the loop must
   not pay: a round is microseconds, and agentic history is tens of thousands
-  of tokens. When L3 is on, existence is MIN-reduced across every
-  cache-owning rank in the replica (attention TP, then CP, then PP) so
-  those ranks admit the same prefix pages. L2 ``WriteBackDone`` /
-  ``LoadBackDone`` completions are intersected the same way before
+  of tokens. When L3 is on, the replica MIN-reduces existence across every
+  cache-owning rank (attention TP, then CP, then PP) so those ranks admit
+  the same prefix pages. The replica intersects L2 ``WriteBackDone`` /
+  ``LoadBackDone`` completions the same way before
   ``CompleteWriteBack``: L3 Host backups finish asynchronously, so a
   rank-local ACK would publish a Host block on one mirrored scheduler
-  while a CP/PP peer still has the op pending. A backup future that
-  fails is MAX-reduced on the same replica all_reduce that agrees
-  whether any rank has cache work; every rank raises after that
-  collective instead of one rank raising out of ``poll_results`` while
-  peers wait in ``all_gather_object``. Every rank stays in every
-  replica-group gather, even when an earlier TP/CP intersection is empty;
-  breaking out leaves a peer unmatched on the next ``all_gather_object``.
+  while a CP/PP peer still has the op pending. The replica MAX-reduces a
+  failed backup future on the same all_reduce that agrees whether any
+  rank has cache work. Every rank raises after that collective instead
+  of one rank raising out of ``poll_results`` while peers wait in
+  ``all_gather_object``. Every rank stays in every
+  replica-group gather, even when an earlier TP/CP intersection is empty.
+  Breaking out leaves a peer unmatched on the next ``all_gather_object``.
   Weight-update `flush_cache` and standalone `/flush_cache` first
   MAX-reduce flush intent across attention DP so every DP worker enters
   the same collectives — the frontend sends `FlushCacheReqInput`
@@ -467,41 +467,41 @@ For orientation, one iteration of `event_loop`:
   head only in a round where every DP rank reports one of the same kind
   at its head (a mismatch raises — the frontend sends every op to every
   worker in one order). The device call blocks the control thread in a
-  collective the trainer drives or an SDK read; a DP peer that had not
+  collective the trainer drives or an SDK read. A DP peer that had not
   yet dequeued its copy would keep looping and wait for this rank in the
-  per-round all-reduce, a deadlock. One op completes per round, and its
-  result is MIN-reduced across the replica before the L3 weight version
-  is published or the reply sent. The same gate carries the online expert
+  per-round all-reduce, a deadlock. One op completes per round, and the
+  replica MIN-reduces its result before the loop publishes the L3 weight
+  version or sends the reply. The same gate carries the online expert
   rebalance's *internal* ops (`EplbSnapshot`, `EplbCommit`,
   `EplbApplyChunk`) from a second FIFO with three more lanes: frontend
-  ops arrive on different DP workers in different rounds while internal
-  ops are enqueued at rank-identical rounds, so one shared FIFO would
+  ops arrive on different DP workers in different rounds while the hooks
+  enqueue internal ops at rank-identical rounds, so one shared FIFO would
   make the heads differ in kind across ranks and trip the mismatch
-  check; two FIFOs compare kind-for-kind. When both are ready the
+  check. Two FIFOs compare kind-for-kind. When both are ready the
   frontend op completes this round and the internal op the next — still
   one blocking device call per round. Because every EP rank is inside a
   gated op at once, the rebalance may run a gloo collective over the EP
   group there (summing the load under all-to-all EP, broadcasting the
   committed map), which the profile's `dump_expert_load` must not. The
   manual `POST /rebalance_experts` is a frontend op on the first FIFO
-  that starts the same internal sequence; a memory-saver release is
-  refused while a rebalance is in progress and, once drained, waits while
-  chunk ops still write the weights. They then MIN-reduce a
+  that starts the same internal sequence. The loop refuses a memory-saver
+  release while a rebalance is in progress and, once drained, the release
+  waits while chunk ops still write the weights. They then MIN-reduce a
   non-mutating `can_clear_cache` probe across the replica (attention TP,
   then CP, then PP) and then across attention DP — DP replicas share
   Mooncake objects — then MIN-reduce an error-returning L3
   `remove_by_prefix`, before any rank mutates Device/Host. The frontend
   ANDs every DP worker's reply. Independent TokenSpeed jobs that share a
-  tenant are not in those groups. Queued Submitted/Retracted
-  hashes of requests that can take a batch slot and Device pages this
-  round are re-probed immediately before `next_execution_plan` so a hit
-  registered at submit cannot be admitted after the object is gone. A
+  tenant are not in those groups. The loop re-probes queued
+  Submitted/Retracted hashes of requests that can take a batch slot and
+  Device pages this round immediately before `next_execution_plan` so a
+  hit registered at submit cannot be admitted after the object is gone. A
   full decode batch, a head-of-line incomplete prefill, or an exhausted
-  Device pool skips the rest of the wait queue so a long prompt is not
-  hashed and remotely probed on every token step.
+  Device pool skips the rest of the wait queue so the loop does not hash
+  and remotely probe a long prompt on every token step.
   PP fans the request stream across WORLD so every cache-owning rank enters
-  the same exists MIN; without PP the attention-TP broadcast already does.
-  After Admit, vanished L3 objects are recovered on the same path:
+  the same exists MIN. Without PP the attention-TP broadcast already does.
+  After Admit, the loop recovers vanished L3 objects on the same path:
   control-plane `batch_get_into`, replica MIN, skip H2D / skip
   publishing empty Host pages and empty Device prefetch destinations,
   snapshot-less retract of the batch so the next admit recomputes.
@@ -511,13 +511,13 @@ For orientation, one iteration of `event_loop`:
   suffix-only KV on empty prefix pages. Cache ops still run so
   LoadBackDone can unpin without publishing.
   Failed `batch_get_into` pages stay unread so a later `batch_exists` hit
-  cannot re-register them; only the replica-converged misses are
-  blacklisted, so a restored prefix page stays readable. Replica
+  cannot re-register them. The loop blacklists only the replica-converged
+  misses, so a restored prefix page stays readable. Replica
   admission MIN-reduces local readability (exists and not unread). A
   later Host backup forgets an unread entry only when it created a
-  missing object; a create-only skip of an unreadable object keeps the
+  missing object. A create-only skip of an unreadable object keeps the
   blacklist. The unread set is bounded to Host CacheBlock capacity
   (LCM parents times each group's `cache_blocks_per_lcm_block`). A backend
   exception or malformed existence / prefetch result is a local miss so
-  every cache-owning rank still enters the replica MIN; raising would
-  hang healthy peers. Clients are not failed.
+  every cache-owning rank still enters the replica MIN. Raising would
+  hang healthy peers. The loop does not fail clients.

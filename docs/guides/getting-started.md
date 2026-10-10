@@ -1,4 +1,4 @@
-# Getting Started
+# Getting started
 
 This guide brings up a TokenSpeed development environment and verifies that the
 runtime can start.
@@ -10,7 +10,7 @@ runtime can start.
 - enough shared memory for model serving
 - access to the model checkpoints you plan to serve
 
-## Start a Runner Container
+## Start a runner container
 
 ```bash
 docker pull lightseekorg/tokenspeed-runner:latest
@@ -35,7 +35,7 @@ git clone https://github.com/lightseekorg/tokenspeed.git
 cd tokenspeed
 ```
 
-## Install Packages
+## Install packages
 
 ### Nightly wheels
 
@@ -70,15 +70,15 @@ ROCm nightly indexes at once: kernel wheels have the same version but different
 backend dependencies. Preinstalling ROCm PyTorch matters because pip's extra
 index does not take priority over PyPI when selecting dependencies. You can
 pin `tokenspeed==0.1.1.postYYYYMMDD` once that date is present in both ROCm
-nightly package indexes; avoid accidentally choosing a newer CUDA-only PyPI
-release when upgrading.
+nightly package indexes. When upgrading, avoid accidentally choosing a newer
+CUDA-only PyPI release.
 
-Kernel builds are scheduled at 02:00 UTC and TokenSpeed at 03:00 UTC. TokenSpeed
-checks the CUDA nightly index for its exact kernel dependency before building
-and publishing; it checks the ROCm index before adding the same wheel there.
-Each check waits up to one hour, and the ROCm check cannot block CUDA
-publication. Historical nightly wheels remain available. Nightlies publish to
-the wheel indexes, not PyPI.
+The nightly workflows build kernels at 02:00 UTC and TokenSpeed at 03:00 UTC.
+TokenSpeed checks the CUDA nightly index for its exact kernel dependency
+before building and publishing. It checks the ROCm index before adding the
+same wheel there. Each check waits up to one hour, and the ROCm check cannot
+block CUDA publication. Historical nightly wheels remain available. Nightlies
+publish to the wheel indexes, not PyPI.
 
 For a manual nightly, run **Build and Release tokenspeed-kernel for ROCm**
 from `main` with `nightly=true` and `publish_github=true`, then run **Build and
@@ -96,7 +96,7 @@ To rebuild and replace an existing TokenSpeed nightly, select `main` in
 | `version_date` | The date to replace as `YYYYMMDD`, or blank for today (UTC) |
 
 This rebuilds the distributions and refreshes their hashes and download URLs in
-both the CUDA and ROCm indexes. Replacement defaults to off; normal reruns keep
+both the CUDA and ROCm indexes. Replacement defaults to off. Normal reruns keep
 existing files. TokenSpeed uses one pure-Python wheel for both backends, so it
 does not need the kernel workflow's CUDA build-variant inputs. To install a
 replacement of an already installed version, add `--no-cache-dir --force-reinstall`
@@ -157,8 +157,8 @@ For model-specific examples, continue with [Model Recipes](../recipes/models.md)
 `gfx1201` devices, including the Radeon AI PRO R9700, use the existing portable
 Triton kernels and ROCm library implementations. Install a ROCm PyTorch build
 that includes `gfx1201` device support. Dense BF16 inference is the initial
-supported path; the `gfx950` and `gfx1250` specialized kernels are not enabled
-for this architecture.
+supported path. TokenSpeed does not enable the `gfx950` and `gfx1250`
+specialized kernels for this architecture.
 
 For a small single-GPU model, start with Triton attention and eager execution:
 
