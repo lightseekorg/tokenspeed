@@ -870,3 +870,36 @@ def test_scheduler_aborts_finish_toward_the_client_with_a_capacity_code():
     assert metrics.capacity_aborts == 1
     (out,) = sender.items
     assert out.rids == ["victim"] and out.finished_reasons[0] == reason
+
+
+def test_a_client_abort_crossing_a_capacity_abort_keeps_the_clients_finish():
+    """The scheduler's abort of a request the client already cancelled in the
+    same round: the client's reason stands, no capacity abort is counted and
+    nothing is streamed (the tokenizer manager tore down) -- unless a
+    pause-initiated abort left a passive client that still needs its finish.
+    Either way the state is released: the scheduler emits nothing further."""
+    from types import SimpleNamespace
+
+    sender = _Sender()
+    metrics = _Metrics()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=metrics)
+    cancelled = _state([1, 2, 3], computed_length=3)
+    paused = _state([4, 5, 6], computed_length=3)
+    processor.rid_to_state["cancelled"] = cancelled
+    processor.rid_to_state["paused"] = paused
+    processor.mark_abort("cancelled")
+    processor.mark_abort("paused", notify_client=True)
+    aborts = [
+        SimpleNamespace(request_id=rid, reason="ImageDoesNotFit", detail="x")
+        for rid in ("cancelled", "paused")
+    ]
+
+    processor.finish_scheduler_aborted_requests(aborts)
+
+    assert processor.rid_to_state == {}
+    assert metrics.capacity_aborts == 0
+    assert cancelled.finished_reason.message == "AbortReq from client"
+    assert paused.finished_reason.message == "Aborted by pause"
+    (out,) = sender.items
+    assert out.rids == ["paused"]
+    assert out.finished_reasons[0] == paused.finished_reason.to_json()

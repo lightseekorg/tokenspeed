@@ -1126,8 +1126,12 @@ class OutputProcesser:
         (the shortfall and the knobs to raise), which a caller that can
         resubmit retries on. Returns no scheduler event: the request is
         already ``Finished`` there. A victim is quiescent when chosen, so no
-        in-flight forward names it; an id already gone (a client abort that
-        crossed the same round) is skipped.
+        in-flight forward names it. A client abort may cross the same round:
+        its state is already finished with the client's reason (and the
+        tokenizer manager has torn down, unless a pause-initiated abort left
+        a passive client waiting for its terminating finish), so it is
+        released here without a capacity finish, count or stream; an id
+        already gone is skipped.
 
         Args:
             aborts: The plan's ``SchedulerAbort`` entries (``request_id``,
@@ -1144,13 +1148,16 @@ class OutputProcesser:
                     message=f"Request aborted by the scheduler: {detail}",
                     err_type=ABORT_CODE.CapacityAbort,
                 )
-            self.metrics.record_capacity_abort()
-            if self.attn_tp_rank == 0:
-                logger.warning(
-                    f"Req {rid!s} aborted by the scheduler ({abort.reason!s}): {detail}"
-                )
+                self.metrics.record_capacity_abort()
+                if self.attn_tp_rank == 0:
+                    logger.warning(
+                        f"Req {rid!s} aborted by the scheduler ({abort.reason!s}): "
+                        f"{detail}"
+                    )
+                self.stream_output([rid], [state])
+            elif state.abort_notify_client:
+                self.stream_output([rid], [state])
             self._log_request_stats(rid, state, time.time())
-            self.stream_output([rid], [state])
             self._release_multimodal_features(state)
             self.rid_to_state.pop(rid)
 
