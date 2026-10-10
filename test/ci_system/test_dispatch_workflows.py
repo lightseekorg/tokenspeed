@@ -1226,6 +1226,21 @@ def test_mi450_sim_uses_bounded_smoke_suite():
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
 
 
+def test_mi450_sim_pins_one_rocm_nightly():
+    env = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")["env"]
+    setup_script = (REPO_ROOT / "test/ci_system/setup_mi450_sim.sh").read_text()
+
+    # PyTorch requires the exact ROCm SDK build it was built against.
+    rocm_build = f"+rocm{env['ROCM_SDK_VERSION']}"
+    for name in ("TORCH_VERSION", "TORCHVISION_VERSION", "TORCH_DEVICE_PACKAGE"):
+        assert env[name].endswith(rocm_build), name
+    # Standalone runs of the setup script default to the lane's pins, and a
+    # cached rocJITsu build is reused only for those same pins.
+    for name in ("ROCM_SYSTEMS_REF", "ROCM_SDK_VERSION"):
+        assert f"{name}=${{{name}:-{env[name]}}}" in setup_script
+    assert 'build_key="${ROCM_SYSTEMS_REF}:${ROCM_SDK_VERSION}"' in setup_script
+
+
 def test_mi450_sim_uses_stock_triton_compatible_libhip_path():
     script = (REPO_ROOT / "test/ci_system/run_mi450_rocjitsu.sh").read_text()
 
