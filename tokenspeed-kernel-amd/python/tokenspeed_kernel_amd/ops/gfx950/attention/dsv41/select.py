@@ -71,6 +71,7 @@ def dsv41_index_select_gfx950(
     HAS_CANDIDATES: tl.constexpr,
     SORT_ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
+    CANDIDATE_BLOCK: tl.constexpr,
 ):
     query = tl.program_id(0)
     BLOCKS = tl.program_id(1) == 1
@@ -78,7 +79,15 @@ def dsv41_index_select_gfx950(
     seen = tl.load(visible + query).to(tl.int32)
     latest = tl.where(seen > 0, (seen - 1) // 8, -1)
     if HAS_CANDIDATES:
-        n = width
+        # Rows past the last valid (>= 0) candidate block are never scored;
+        # padded candidate lists are mostly -1 at short contexts.
+        slot = tl.arange(0, CANDIDATE_BLOCK)
+        listed = tl.load(
+            candidates + query.to(tl.int64) * stride_candidates + slot,
+            mask=slot < width // 8,
+            other=-1,
+        )
+        n = tl.minimum(width, (tl.max(tl.where(listed >= 0, slot, -1)) + 1) * 8)
         k = topk
         out = row_out + query.to(tl.int64) * stride_row_out
         lens = row_lens + query
@@ -199,5 +208,6 @@ def launch_dsv41_index_select_gfx950(
         HAS_CANDIDATES=has_candidates,
         SORT_ROWS=has_candidates,
         BLOCK=2048,
+        CANDIDATE_BLOCK=triton.next_power_of_2(max(width // 8, 1)),
         num_warps=8,
     )
