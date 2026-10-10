@@ -36,6 +36,7 @@ from pr_ci_common import (
     require_bot,
     require_public_repo,
     run_command,
+    upsert_comment,
 )
 from pr_ci_plan import (  # noqa: F401  source_url stays re-exported for tests
     context,
@@ -43,7 +44,7 @@ from pr_ci_plan import (  # noqa: F401  source_url stays re-exported for tests
     render,
     source_url,
 )
-from pr_ci_state import marker
+from pr_ci_state import marker, record
 
 
 def _command(*args: str) -> str:
@@ -232,23 +233,35 @@ def publish(root: Path) -> None:
     ):
         print("PR head changed; skipping the obsolete plan.")
         return
-    comment_url = _command(
-        "gh",
-        "pr",
-        "comment",
-        number,
-        "--repo",
-        repo,
-        "--body-file",
-        str(root / "comment.md"),
-    ).strip()
-    comment_id = comment_url.rsplit("issuecomment-", 1)[-1]
-    published = _command(
-        "gh", "api", f"repos/{repo}/issues/comments/{comment_id}", "--jq", ".body"
+    # Update the PR's single plan comment in place; only the first plan
+    # notifies subscribers. Old plans are superseded, never referenced.
+    comments = json.loads(
+        _command(
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{repo}/issues/{number}/comments?per_page=100",
+        )
     )
-    root.joinpath("published.md").write_text(published)
-    # gh's --jq output adds a newline; compare after trimming it.
-    if not published_matches(published, root.joinpath("comment.md").read_text()):
+    prior = None
+    for page in comments:
+        for comment in page:
+            plan = record(comment, "plan")
+            if plan and plan["pr"] == int(number):
+                prior = comment["id"]
+    published = upsert_comment(
+        _command,
+        lambda path: json.loads(_command("gh", "api", f"repos/{repo}/{path}")),
+        repo,
+        number,
+        root.joinpath("comment.md").read_text(),
+        prior,
+    )
+    root.joinpath("published.md").write_text(published["body"])
+    if not published_matches(
+        published["body"], root.joinpath("comment.md").read_text()
+    ):
         raise SystemExit("Published plan differs from the checked body.")
 
 
