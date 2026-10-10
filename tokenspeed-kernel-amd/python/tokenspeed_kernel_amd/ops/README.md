@@ -640,6 +640,21 @@ This avoids the per-route partials buffer and FP32 reduction kernel, at the cost
 of order-dependent BF16 rounding. Stage 2 clears the destination on each call
 and graph replay. Larger token counts retain the FP32 reduction path.
 
+### MoE route from precomputed top-k
+
+`_precomputed_topk_route` builds the ragged expert metadata, gather/scatter
+indices and gate scales from `[M, topk]` ids and weights in one launch for
+any `M * topk <= 65536`, replacing the torch stable argsort, scatter-add
+histogram and two metadata kernels (~120 us -> 5 us at M=192, topk=6,
+384 experts; 170 us -> 56 us at M=8192). Rows are stably sorted by expert,
+bit-identical to `_route_from_topk_torch`; ids outside `[0, E)` sort last with
+a zero gate and count in no slice. Each program owns 64 rows and builds the
+full and preceding-chunk expert histograms with LDS atomics, so it places a
+row at `offset[e] + earlier[e] + rank-in-chunk` without a global sort. Every
+program re-reads all ids, so work grows as `G^2 / 64` and nears the torch
+route's cost around 10^5 rows; larger routes use it. Five trailing programs
+write the block offsets and schedules, one per block size.
+
 ### MXFP8 SiTU experts
 
 On gfx950, the MoE API selects Gluon kernels with MXFP8 activations and MXFP4

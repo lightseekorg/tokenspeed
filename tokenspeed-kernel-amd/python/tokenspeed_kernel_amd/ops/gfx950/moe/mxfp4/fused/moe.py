@@ -56,7 +56,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.quantize import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
     _ROUTING_METHOD_RENORMALIZE,
-    GLUON_ROUTE_MAX_G,
     SMALLM_MAX_M,
     _biased_grouped_topk_reference,
     _grouped_topk_reference,
@@ -1807,22 +1806,12 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     )
     if direct_out is not None:
         return direct_out
-    if n_tokens < SMALLM_MAX_M and n_tokens * top_k <= GLUON_ROUTE_MAX_G:
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = (
-            gluon_precomputed_topk_fused_route(
-                topk_weights,
-                topk_ids,
-                num_experts,
-                dtype=topk_weights.dtype,
-            )
-        )
-    else:
-        ragged_metadata, gather_indx, scatter_indx, gate_scal = _route_from_topk(
-            topk_weights,
-            topk_ids,
-            num_experts,
-            dtype=topk_weights.dtype,
-        )
+    ragged_metadata, gather_indx, scatter_indx, gate_scal = _route_from_topk(
+        topk_weights,
+        topk_ids,
+        num_experts,
+        dtype=topk_weights.dtype,
+    )
 
     return _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
         hidden_states,

@@ -164,11 +164,9 @@ def test_mxfp4_precomputed_route_row_count():
         assert torch.equal(gate, weights.flatten()[scatter.long()])
         assert torch.equal(gather, scatter // topk)
 
-    # 5 to 8 tokens share the power-of-two route tiles; the block counts
-    # alternate between the two integer classes.
+    # Row and block counts are unspecialized runtime arguments.
     run(5)
-    run(6)
-    with assert_no_triton_compile(routing._fused_precomputed_topk_route_small_m):
+    with assert_no_triton_compile(routing._precomputed_topk_route):
         for tokens in (7, 8):
             run(tokens)
 
