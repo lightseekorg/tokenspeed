@@ -1929,6 +1929,37 @@ def mhc_apply_pre(residual: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@register_kernel(
+    "residual",
+    "mhc_apply_pre",
+    name="triton_mhc_apply_pre",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                pre=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_mhc_apply_pre(
+    residual: torch.Tensor,
+    pre: torch.Tensor,
+    *,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> torch.Tensor:
+    """Collapse residual streams with ``pre``, optionally fusing RMSNorm (hc=4)."""
+    if norm_weight is None:
+        return mhc_apply_pre(residual, pre)
+    out = residual.new_empty((*residual.shape[:-2], residual.shape[-1]))
+    mhc_pre_layer_norm_hc4(pre, residual, norm_weight, out, eps=norm_eps)
+    return out
+
+
 @triton.jit
 def _normalized_dot_gate_kernel(
     H,
