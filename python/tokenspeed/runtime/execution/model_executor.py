@@ -1591,7 +1591,8 @@ class ModelExecutor:
                 accept_lengths=accept_lengths,
             )
             # _update_runtime_state skips future_input_map when drafter is
-            # active — drafter writes the next-round inputs directly.
+            # active — drafter writes the next-round inputs directly, and the
+            # row's candidate columns are real from here on.
             indices = self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
             for requests in (
                 ctx.output_layout.prefill_slice,
@@ -1602,6 +1603,7 @@ class ModelExecutor:
                 self.runtime_states.future_input_map[indices[requests]] = (
                     next_round_input_ids[requests].to(torch.int32)
                 )
+                self.runtime_states.mark_spec_candidates_drafted(indices[requests])
                 if self.tree_spec is not None:
                     self.runtime_states.future_parent_map[indices[requests]] = (
                         self.tree_spec.draft_parent_buf[requests]

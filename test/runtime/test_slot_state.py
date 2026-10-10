@@ -390,39 +390,36 @@ def test_pack_copies_a_non_contiguous_slot_slice():
 # ----------------------------------------------------------------------
 
 
-# RuntimeStates.slot_state_rows order: cache length, next-step inputs,
-# candidate readiness, then the optional draft distributions and tree parents.
-_CANDIDATE_READY_ROW = 2
-
-
 @pytest.mark.parametrize("draft_probs", [False, True])
 @pytest.mark.parametrize("trees", [False, True])
 def test_runtime_states_round_trip(draft_probs, trees):
     states = _runtime_states(draft_probs=draft_probs, trees=trees, history=True)
-    _round_trip(
-        states,
-        src_slot=3,
-        dst_slot=7,
-        rows_rewritten_on_import=frozenset({_CANDIDATE_READY_ROW}),
-    )
+    _round_trip(states, src_slot=3, dst_slot=7)
     # Token-derived rows stay out of the image and untouched by it.
     assert states.request_token_history_ids.abs().sum() == 0
 
 
-def test_runtime_states_import_marks_the_imaged_candidates_ready():
+@pytest.mark.parametrize("candidates_real", [True, False])
+def test_runtime_states_image_whether_the_candidates_are_real(candidates_real):
     """A restored request's first decode op carries its token explicitly (no
-    forward of its own is in flight), and the prologue treats an explicit id
-    on a row whose candidates are not marked ready as a bootstrap row to
-    verify single-token. The imaged candidates are the ones the victim's last
-    forward drafted, so the import marks them ready and the first verify
-    after the restore consumes them as the unretracted step would have."""
+    forward of its own is in flight), and the prologue verifies an explicit id
+    single-token unless the row's candidates are marked real. The bit travels
+    with the row as it stood: True after the victim's last drafter forward or
+    a landing that shipped candidates, False for a PD decode role's victim
+    landed without them -- whose stale candidate columns must not be verified."""
     states = _runtime_states(draft_probs=False, trees=False, history=False)
-    states.remote_spec_candidate_ready[3] = False  # a fused victim's row
-    states.future_input_map[3] = torch.arange(1, states.future_input_map.shape[1] + 1)
+    width = states.future_input_map.shape[1]
+    states.future_input_map[3] = torch.arange(1, width + 1)
+    if candidates_real:
+        states.mark_spec_candidates_drafted(torch.tensor([3]))
+    else:
+        states.reset_states(torch.tensor([3]), torch.tensor([40], dtype=torch.int32))
+    assert bool(states.spec_candidates_ready[3]) is candidates_real
+    states.spec_candidates_ready[7] = not candidates_real  # the new slot's past
     image = torch.empty((states.slot_state_bytes(),), dtype=torch.uint8)
     states.export_slot_state(3, image, None, request_id="restored")
     states.import_slot_state(7, image, None, request_id="restored")
-    assert bool(states.remote_spec_candidate_ready[7])
+    assert bool(states.spec_candidates_ready[7]) is candidates_real
     assert torch.equal(states.future_input_map[7], states.future_input_map[3])
 
 

@@ -229,7 +229,7 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         "vocab_size",
         "valid_cache_lengths",
         "future_input_map",
-        "remote_spec_candidate_ready",
+        "spec_candidates_ready",
         "draft_probs",
         "draft_probs_sentinel",
         "chain_parents",

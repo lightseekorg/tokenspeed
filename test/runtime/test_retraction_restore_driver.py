@@ -255,8 +255,8 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
     # RestoreDone: Decoding again, same token count, nothing left in the pool
     # or pinned in L2, and the next decode runs in the restored slot with
     # the request's last token stated explicitly (no forward of the request
-    # is in flight to capture it from; RuntimeStates.import_slot_state keeps
-    # the imaged candidates beside it).
+    # is in flight to capture it from; the imaged row keeps the candidates
+    # beside it and whether they are real).
     rnd = driver.round()
     assert scheduler.retracted_size() == 0 and scheduler.decoding_size() == 1
     assert scheduler.request_token_size("a") == tokens_before

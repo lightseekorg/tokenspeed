@@ -29,7 +29,6 @@ from tokenspeed.runtime.execution.request_token_history import RequestTokenHisto
 from tokenspeed.runtime.execution.slot_state import (
     pack_slot_rows,
     slot_state_image_bytes,
-    stream_scope,
     unpack_slot_rows,
 )
 from tokenspeed.runtime.execution.types import RequestHistorySeeds
@@ -77,7 +76,15 @@ class RuntimeStates:
         self.future_input_map = torch.empty(
             (req_pool_size + 1, output_length), dtype=torch.int32, device=device
         )
-        self.remote_spec_candidate_ready = torch.zeros(
+        # True while ``future_input_map[slot, 1:]`` holds real draft candidates
+        # for the slot's next step: set by the drafter's epilogue after every
+        # forward and by a landed remote prefill's candidates, cleared when an
+        # explicit decode id consumes the row (``write_decode_input_ids``) and
+        # at admission (``reset_states``). The prologue verifies an explicit
+        # id single-token unless this says the candidates beside it are real;
+        # a retraction images it with the row, so a restored request's first
+        # decode is exactly the unretracted step.
+        self.spec_candidates_ready = torch.zeros(
             req_pool_size + 1, dtype=torch.bool, device=device
         )
         # The drafter's recorded proposal distributions
@@ -322,15 +329,15 @@ class RuntimeStates:
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         """The per-slot rows a retraction snapshot images, in a fixed order.
 
-        The next step's inputs (``future_input_map``, the tree parents), the
-        committed frontier, the PD candidate-readiness bit and the verifier's
-        recorded proposal distributions: re-deriving any of them needs a
-        forward, so a restore copies them byte for byte.
+        The next step's inputs (``future_input_map``, the tree parents),
+        whether their candidate columns are real, the committed frontier and
+        the verifier's recorded proposal distributions: re-deriving any of
+        them needs a forward, so a restore copies them byte for byte.
         """
         rows = [
             self.valid_cache_lengths[slot],
             self.future_input_map[slot],
-            self.remote_spec_candidate_ready[slot],
+            self.spec_candidates_ready[slot],
         ]
         if self.draft_probs is not None:
             rows.append(self.draft_probs[slot])
@@ -350,20 +357,16 @@ class RuntimeStates:
     def import_slot_state(
         self, slot: int, src: torch.Tensor, stream, *, request_id: str
     ) -> None:
+        # The restored row is the request's next-step input in full, and the
+        # imaged ``spec_candidates_ready`` says whether its candidate columns
+        # are real: True after a drafter forward or a landing that shipped
+        # candidates, False for a victim landed without them. The scheduler
+        # hands a restored request its first decode with an explicit
+        # ``decode_input_id`` (no forward of its own is in flight), and the
+        # prologue verifies that id single-token exactly when the bit is
+        # False -- the unretracted step would have done the same.
         del request_id
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
-        # The restored row is the request's next-step input in full: its
-        # verified token in column 0 and, with a drafter, the candidates its
-        # last forward drafted (the victim was quiescent when imaged). The
-        # scheduler hands a restored request its first decode with an
-        # explicit ``decode_input_id`` -- no forward of its own is in flight
-        # to capture it from -- and the prologue takes an explicit id on a
-        # row whose candidates are not marked ready for a bootstrap row,
-        # verifying it single-token; the imaged candidates are real, so mark
-        # them ready and the first verify after the restore consumes them as
-        # the unretracted step would have. The prologue clears the mark.
-        with stream_scope(stream):
-            self.remote_spec_candidate_ready[slot] = True
 
     def reset_states(
         self,
@@ -373,9 +376,7 @@ class RuntimeStates:
         self.valid_cache_lengths[extend_request_pool_indices] = extend_prefix_lens
         # Scalar indexed assignment stages a CPU tensor and synchronizes CUDA.
         # Keep the reset ordered on the execution stream without a host wait.
-        self.remote_spec_candidate_ready.index_fill_(
-            0, extend_request_pool_indices, False
-        )
+        self.spec_candidates_ready.index_fill_(0, extend_request_pool_indices, False)
         # Runs in the forward's prologue, before this round's drafter records
         # the rows, so a (re)admitted request verifies its first chain against
         # the sentinel and never a previous occupant's distributions.
@@ -384,6 +385,14 @@ class RuntimeStates:
             assert self.ngram_needs_seed is not None
             self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
             self.ngram_needs_seed.index_fill_(0, extend_request_pool_indices, True)
+
+    def mark_spec_candidates_drafted(self, req_pool_indices: torch.Tensor) -> None:
+        """The drafter wrote these slots' next-step rows: their candidates are real.
+
+        Tensor-only (``index_fill_``), so it records into a decode graph with
+        the row writes it follows.
+        """
+        self.spec_candidates_ready.index_fill_(0, req_pool_indices, True)
 
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]
@@ -400,7 +409,7 @@ class RuntimeStates:
             pin_memory=True,
         ).to(self.device, non_blocking=True)
         self.future_input_map[req_pool_idx, :width] = ids
-        self.remote_spec_candidate_ready[req_pool_idx] = True
+        self.spec_candidates_ready[req_pool_idx] = True
         # The candidates come without their draft distribution; the row's
         # draft_probs still hold the sentinel reset_states wrote when the
         # remote cache length was seeded, so the first local verify rejects

@@ -434,15 +434,16 @@ class InputBuffers:
                 mask, ids, first_slot
             )
             # Cols 1.. are real candidates only when the local drafter, the
-            # remote P-side path or a restored image populated them. Bootstrap
-            # rows with no candidate source still feed a full-width target forward, so
-            # use a valid dummy token in model inputs and force the verifier to
-            # consume only the first target token for those rows.
+            # remote P-side path or a restored image populated them
+            # (``spec_candidates_ready``). Bootstrap rows with no candidate
+            # source still feed a full-width target forward, so use a valid
+            # dummy token in model inputs and force the verifier to consume
+            # only the first target token for those rows.
             width = runtime_states.future_input_map.shape[1]
-            remote_candidate_ready = runtime_states.remote_spec_candidate_ready[
+            candidates_ready = runtime_states.spec_candidates_ready[
                 decode_req_pool_indices
             ]
-            force_single_token = mask.squeeze(1) & ~remote_candidate_ready
+            force_single_token = mask.squeeze(1) & ~candidates_ready
             if width > 1:
                 tail = runtime_states.future_input_map[decode_req_pool_indices, 1:]
                 dummy_tail = ids.expand(-1, width - 1)
@@ -459,7 +460,7 @@ class InputBuffers:
             self.force_single_token_verify_buf[
                 row_offset : row_offset + expected_count
             ] = force_single_token
-            runtime_states.remote_spec_candidate_ready[decode_req_pool_indices] = False
+            runtime_states.spec_candidates_ready[decode_req_pool_indices] = False
 
         # Decode-only fast path: one fused Triton kernel writes positions and
         # seq_lens in a single launch and reads valid_cache_lengths[pool_idx]

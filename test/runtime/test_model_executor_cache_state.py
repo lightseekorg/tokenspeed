@@ -172,6 +172,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
+        mark_spec_candidates_drafted=lambda _rows: events.append("candidates-real"),
         vocab_size=32,
     )
     executor.nan_guard = SimpleNamespace(
@@ -206,6 +207,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         "draft-write-1",
         "draft-return",
         "future-input",
+        "candidates-real",
         "draft-final",
     ]
 
