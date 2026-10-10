@@ -492,16 +492,16 @@ For orientation, one iteration of `event_loop`:
   Mooncake objects — then MIN-reduce an error-returning L3
   `remove_by_prefix`, before any rank mutates Device/Host. The frontend
   ANDs every DP worker's reply. Independent TokenSpeed jobs that share a
-  tenant are not in those groups. The loop re-probes queued
+  tenant are not in those groups. The L3 hooks re-probe queued
   Submitted/Retracted hashes of requests that can take a batch slot and
   Device pages this round immediately before `next_execution_plan` so a
   hit registered at submit cannot be admitted after the object is gone. A
   full decode batch, a head-of-line incomplete prefill, or an exhausted
-  Device pool skips the rest of the wait queue so the loop does not hash
+  Device pool skips the rest of the wait queue so the hooks do not hash
   and remotely probe a long prompt on every token step.
   PP fans the request stream across WORLD so every cache-owning rank enters
   the same exists MIN. Without PP the attention-TP broadcast already does.
-  After Admit, the loop recovers vanished L3 objects on the same path:
+  After Admit, the L3 hooks recover vanished L3 objects on the same path:
   control-plane `batch_get_into`, replica MIN, skip H2D / skip
   publishing empty Host pages and empty Device prefetch destinations,
   snapshot-less retract of the batch so the next admit recomputes.
@@ -511,7 +511,7 @@ For orientation, one iteration of `event_loop`:
   suffix-only KV on empty prefix pages. Cache ops still run so
   LoadBackDone can unpin without publishing.
   Failed `batch_get_into` pages stay unread so a later `batch_exists` hit
-  cannot re-register them. The loop blacklists only the replica-converged
+  cannot re-register them. The L3 hooks blacklist only the replica-converged
   misses, so a restored prefix page stays readable. Replica
   admission MIN-reduces local readability (exists and not unread). A
   later Host backup forgets an unread entry only when it created a
@@ -520,4 +520,4 @@ For orientation, one iteration of `event_loop`:
   (LCM parents times each group's `cache_blocks_per_lcm_block`). A backend
   exception or malformed existence / prefetch result is a local miss so
   every cache-owning rank still enters the replica MIN. Raising would
-  hang healthy peers. The loop does not fail clients.
+  hang healthy peers. The hooks do not fail clients.

@@ -136,9 +136,10 @@ Notes:
 - The draft's 1024-token sliding window is an attention mask its own layers
   apply. It is deliberately not a cache-retention policy, because the draft's
   pages are the target's pages.
-- The draft captures target features from the residual stream after each layer
-  in `dflash_config.target_layer_ids` (`[1, 12, 23, 35, 46, 57]` of M3's 60
-  layers) and concatenates them in ascending layer order to feed its `fc`.
+- The target model captures features from the residual stream after each
+  layer in `dflash_config.target_layer_ids` (`[1, 12, 23, 35, 46, 57]` of M3's
+  60 layers); the draft concatenates them in ascending layer order to feed its
+  `fc`.
 - The draft checkpoint stores fp32 master weights. TokenSpeed loads it in the
   target's dtype rather than the standalone fp32-to-fp16 default, because the
   two exchange hidden states and share the target's embedding and LM head.
@@ -289,7 +290,7 @@ Notes:
 - For Kimi K3, an eight-token verify window uses seven DSpark draft queries.
   The anchor query directly predicts the first draft through the Markov head.
   Do not pad it with an eighth, unused mask row.
-- The draft captures target features from K3's completed-layer prefix stream
+- The target model captures features from K3's completed-layer prefix stream
   before the model-level AttnRes mix and final norm, matching the DSpark
   checkpoint's vLLM training and inference contract. A draft trained instead
   against the pre-norm AttnRes mixture declares

@@ -37,7 +37,8 @@ rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
 `PagedAttention.forward` runs a GQA layer's prologue before core attention.
 Flows that dispatch core attention themselves call `PagedAttention.prologue`
 (GQA) or `PagedAttention.latent_prologue` (MLA). Passing `k = v = None` means
-the caller has prepared the inputs and written the cache. A decode forward
+that `prologue`/`latent_prologue` call has prepared the inputs and written
+the cache. A decode forward
 carries exactly one row per write slot. `prologue` rejects any other count. A
 native cache is bf16 (`--kv-cache-dtype auto`). An fp16 model's rows round to
 it at the store, as the pool converted them on write, and its activations stay
