@@ -30,7 +30,6 @@ import tempfile
 import time
 from pathlib import Path
 from urllib.parse import quote
-from urllib.request import Request, urlopen
 
 from pr_ci_common import (
     manifest_task_result,
@@ -40,6 +39,7 @@ from pr_ci_common import (
     result_status,
     run_command,
     screen_public_output,
+    upsert_comment,
 )
 from pr_ci_plan import (
     CoverageError,
@@ -236,7 +236,7 @@ def public_gate():
 
 
 def publish(state: dict, message: str):
-    """Save every state update, but only notify on starts and final outcomes."""
+    """Save every state update; notify only the first record and final outcomes."""
     public_gate()
     if (
         record(
@@ -250,10 +250,10 @@ def publish(state: dict, message: str):
         pages(f"issues/{state['pr']}/comments", None), state["pr"]
     )
     prior = record(previous, "assist") if previous else None
-    same_request = prior and all(
-        prior[k] == state[k] for k in ("command", "action", "head", "base")
-    )
-    notify = not same_request or (
+    # New comments notify subscribers; edits do not. Notify only for the first
+    # record and when a phase crosses into or out of a finished state, so new
+    # pushes, new commands and progress counts update in place instead.
+    notify = not prior or (
         prior["phase"] != state["phase"]
         and (prior["phase"] in FINISHED_PHASES or state["phase"] in FINISHED_PHASES)
     )
@@ -304,39 +304,9 @@ def publish(state: dict, message: str):
         max_length=None,
     ):
         raise ValueError("Public output rejected.")
-    WORK.mkdir(parents=True, exist_ok=True)
-    file = WORK / "comment.md"
-    file.write_text(body)
-    if notify:
-        url = command(
-            "gh",
-            "pr",
-            "comment",
-            str(state["pr"]),
-            "--repo",
-            REPO,
-            "--body-file",
-            str(file),
-        )
-        comment_id = int(url.rsplit("issuecomment-", 1)[-1])
-    else:
-        # Other bot comments may follow this one; never use --edit-last.
-        comment_id = previous["id"]
-        token = command("gh", "auth", "token", "--hostname", "github.com")
-        request = Request(
-            f"https://api.github.com/repos/{REPO}/issues/comments/{comment_id}",
-            data=json.dumps({"body": file.read_text()}).encode(),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "Content-Type": "application/json",
-                "X-GitHub-Api-Version": "2026-03-10",
-            },
-            method="PATCH",
-        )
-        with urlopen(request, timeout=30) as response:
-            response.read()
-    live = api(f"issues/comments/{comment_id}")
+    live = upsert_comment(
+        command, api, REPO, str(state["pr"]), body, None if notify else previous["id"]
+    )
     if not published_matches(live["body"], body) or record(live, "assist") != state:
         raise ValueError("Published state differs from reviewed content.")
 

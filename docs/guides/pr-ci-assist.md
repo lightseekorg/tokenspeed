@@ -29,8 +29,10 @@ manual intervention.
 
 Repairs are checked and tested on a candidate commit before updating the PR.
 Passing another backend does not satisfy the requested task. Required PR CI
-still applies after the update. Status comments are created at the start and
-at completion or a blocker; intermediate progress updates the same comment.
+still applies after the update. A status comment is created when assistance
+first engages and again at each completion or blocker — the only events that
+notify subscribers. Progress, new pushes and new commands update the latest
+comment in place, and terminal outcome comments are never edited.
 
 Each repair and validation attempt has a one-hour budget. The overrun is
 recognized the next time the workflow runs — on a completion event or a manual

@@ -28,9 +28,44 @@ import subprocess
 from collections.abc import Callable, Collection, Iterable
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from pr_ci_plan import source_url
 from pr_ci_state import BOT
+
+
+def upsert_comment(
+    command: Callable[..., str],
+    api: Callable[[str], dict],
+    repo: str,
+    number: str,
+    body: str,
+    comment_id: int | None,
+) -> dict:
+    """Create or update a PR comment and return the live record.
+
+    With ``comment_id`` None a new comment is created, notifying subscribers;
+    otherwise that comment is patched in place, producing no notification.
+    """
+    if comment_id is None:
+        url = command("gh", "pr", "comment", number, "--repo", repo, "--body", body)
+        comment_id = int(url.rsplit("issuecomment-", 1)[-1])
+    else:
+        token = command("gh", "auth", "token", "--hostname", "github.com")
+        request = Request(
+            f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}",
+            data=json.dumps({"body": body}).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "X-GitHub-Api-Version": "2026-03-10",
+            },
+            method="PATCH",
+        )
+        with urlopen(request, timeout=30) as response:
+            response.read()
+    return api(f"issues/comments/{comment_id}")
 
 
 def run_command(

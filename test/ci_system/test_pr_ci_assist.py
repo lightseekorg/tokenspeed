@@ -30,6 +30,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
 import pr_ci_assist as assist
+import pr_ci_common
 import pr_ci_repair as repair
 from ci_result_source import write_source
 from pr_ci_state import BOT, BOT_ID, NATIVE_CHECKS, REPO, marker, record
@@ -490,7 +491,7 @@ def published_comments(monkeypatch, tmp_path):
         comment = dict(
             id=len(comments) + 1,
             user={"login": BOT, "id": BOT_ID},
-            body=Path(args[-1]).read_text(),
+            body=args[-1],
         )
         comments.append(comment)
         return f"https://github.com/{REPO}/pull/123#issuecomment-{comment['id']}"
@@ -510,7 +511,7 @@ def published_comments(monkeypatch, tmp_path):
     monkeypatch.setattr(assist, "pages", lambda *args: comments)
     monkeypatch.setattr(assist, "api", get_comment)
     monkeypatch.setattr(assist, "command", command)
-    monkeypatch.setattr(assist, "urlopen", patch)
+    monkeypatch.setattr(pr_ci_common, "urlopen", patch)
     return comments
 
 
@@ -544,17 +545,25 @@ def test_publish_saves_progress_without_new_comments(selected, published_comment
 def test_publish_keeps_latest_record_readable(selected, published_comments):
     _, state = selected
     assist.publish(state, "Started.")
-    first = published_comments[0]["body"]
-    newer = {**state, "command": 43}
-    assist.publish(newer, "Started.")
-    assert len(published_comments) == 2
-    second = published_comments[1]["body"]
+    first_id = published_comments[0]["id"]
+    # A newer command updates the same record instead of adding a comment.
+    assist.publish({**state, "command": 43}, "Started.")
+    assert len(published_comments) == 1
+    # A new push also updates the same record without notifying subscribers.
+    assist.publish({**state, "head": "b" * 40}, "Started.")
+    assert len(published_comments) == 1
     state["statuses"] = ["waiting"]
     assist.publish(state, "1 waiting.")
-    assert len(published_comments) == 3
-    assert [c["body"] for c in published_comments[:2]] == [first, second]
+    assert len(published_comments) == 1
     latest = assist.latest_state_comment(published_comments, state["pr"])
-    assert record(latest, "assist") == state
+    assert latest["id"] == first_id and record(latest, "assist") == state
+    # Terminal outcomes notify once and their records are never edited.
+    state.update(phase="done", statuses=["passed"])
+    assist.publish(state, "1 passed.")
+    assert len(published_comments) == 2
+    assist.publish({**state, "command": 43, "phase": "watching"}, "Started.")
+    assert len(published_comments) == 3
+    assert "1 passed." in published_comments[-2]["body"]
 
 
 def test_publish_verifies_edited_state(monkeypatch, selected, published_comments):
