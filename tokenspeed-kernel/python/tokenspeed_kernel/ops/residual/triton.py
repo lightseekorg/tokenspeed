@@ -444,7 +444,12 @@ def _mhc_prenorm_gemm_launch_config(
 ) -> tuple[int, int, int, int, int]:
     if (num_tokens, k, n, n_splits) == (64, 16384, 24, 64):
         return 16, 16, 64, 2, 3
-    return 16, 32, 64, 4, 1
+    # Measured on MI355 at K=16384, N=24: 64-token tiles from 192 tokens
+    # (T=2048: 121.7 -> 71.4 us, T=8192: 473.8 -> 261.8 us); 128-wide K tiles
+    # below (T=6: 8.3 -> 7.4 us).
+    if num_tokens >= 192:
+        return 64, 32, 128, 4, 2
+    return 16, 32, 128, 4, 1
 
 
 def _mhc_prenorm_gemm_triton(
