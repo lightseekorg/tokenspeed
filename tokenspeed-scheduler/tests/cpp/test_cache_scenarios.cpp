@@ -2952,8 +2952,12 @@ TEST_F(SlotPinSuite, AnAbortWhileRestoringKeepsTheRowAndSlotUntilTheAck) {
     // The client gives up while the import is still writing row and slot:
     // both stay with the op. A newcomer takes the other row; a second one
     // finds none until the ACK.
+    const std::int32_t device_free_restoring = scheduler_->AvailableLcmBlocks();
     SendAbortEvent("a");
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14 - 8) << "the image's pool blocks are the copy's sources";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), device_free_restoring + 2)
+        << "only the decode slots return now; the 8 copy destinations stay pinned";
     Submit(MakeRequestSpec("c", /*num_pages=*/1, /*start=*/201));
     const ExecutionPlan admit_c = PlanOnce();
     const ForwardBatch* c_op = FindForwardBatch(admit_c);
@@ -3166,6 +3170,50 @@ TEST_F(L2TailOnlyPoolSuite, AnUnhashedCompletedPageRidesL2AndTheVictimIsRetracte
     const ForwardBatch* granted = FindForwardBatch(round);
     ASSERT_NE(granted, nullptr);
     EXPECT_EQ(granted->request_ids, std::vector<std::string>{"b"}) << "the blocked decode runs on a's pages";
+}
+
+// The probe assumes the published pages ride Host L2; a Host pool too small
+// for the L2 leg sends them to the snapshot pool at retraction time, where
+// the image can turn out not to fit after all. That is the one abort decided
+// after a passed probe, and it aborts the chosen victim.
+class L2LegFallbackSuite : public L2TailOnlyPoolSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = L2TailOnlyPoolSuite::MakeConfig();
+        cfg.host_allocator.total_pages = 2;  // one usable Host block: the L2 leg cannot hold a prefix
+        return cfg;
+    }
+};
+
+TEST_F(L2LegFallbackSuite, AnL2LegThatFallsBackToATooSmallPoolAbortsTheChosenVictim) {
+    Submit(MakeRequestSpec("a", /*num_pages=*/3));
+    Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("a", {42});
+    SendForwardDone("b", {142});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("a", {43});
+    SendForwardDone("b", {143});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("a", {44});
+    SendForwardDone("b", {144});
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+
+    // a passes the probe (its tail is empty), but of its eight published
+    // blocks at most one gets a Host block; the rest fall back to a pool of
+    // one block and the image does not fit. a -- the victim the policy
+    // chose, not the newest resident -- is aborted and its pages serve b.
+    const ExecutionPlan round = PlanOnce();
+    ASSERT_EQ(round.aborts.size(), 1u);
+    EXPECT_EQ(round.aborts.front().request_id, "a");
+    EXPECT_EQ(round.aborts.front().reason, AbortReason::kImageDoesNotFit);
+    EXPECT_NE(round.aborts.front().detail.find("snapshot pool"), std::string::npos) << round.aborts.front().detail;
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(FindSnapshotStore(round), nullptr);
+    const ForwardBatch* granted = FindForwardBatch(round);
+    ASSERT_NE(granted, nullptr);
+    EXPECT_EQ(granted->request_ids, std::vector<std::string>{"b"});
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the attempt's Host block is released with it";
 }
 
 // The null page alone: the engine never images, and says so.
@@ -6570,6 +6618,34 @@ protected:
         return cfg;
     }
 };
+
+TEST_F(L3SingleGroupSuite, ALandingOfNothingReturnsTheRequestToComputeItsPrompt) {
+    RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4);
+    const std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(r1.tokens);
+    scheduler_->RegisterStorageKeys(scheduler_->ExpandPrefixKeys(hashes));
+    Submit(r1);
+    const ExecutionPlan plan = PlanOnce();
+    const PrefetchBatch* prefetch = FindPrefetch(plan);
+    ASSERT_NE(prefetch, nullptr);
+    ASSERT_EQ(prefetch->num_pages.at(0), 3);
+    const std::int32_t host_free_fetching = scheduler_->HostPoolFreeBlocks();
+
+    // Every object was gone: nothing is published, every block returns, the
+    // keys are forgotten, and r1 admits as a cold prompt.
+    SendPrefetchDone(prefetch->op_ids.at(0), /*landed_pages=*/0);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), host_free_fetching + 3);
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "Submitted again";
+    const ExecutionPlan admit = PlanOnce();
+    EXPECT_EQ(FindPrefetch(admit), nullptr) << "the unlanded keys are forgotten: no second attempt";
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(admit).empty());
+    const ForwardBatch* op = FindForwardBatch(admit);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0);
+    EXPECT_EQ(op->input_lengths.at(0), 8);
+}
 
 TEST_F(L3SingleGroupSuite, APartialLandingPublishesThePrefixAndTheRequestAdmitsOnIt) {
     RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/5);
