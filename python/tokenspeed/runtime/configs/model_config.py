@@ -112,6 +112,7 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
 _CACHE_LAYER_VIEW_ARCHITECTURES = frozenset(
     {
         "NemotronHForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     }
 )
 
@@ -1036,6 +1037,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -1053,6 +1055,7 @@ def is_audio_model(model_architectures: list[str] | None):
         "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     }
     return any(arch in audio_architectures for arch in model_architectures or [])
 

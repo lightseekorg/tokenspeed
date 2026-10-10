@@ -66,6 +66,7 @@ from tokenspeed.runtime.configs import (
 )
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
+from tokenspeed.runtime.configs.nemotron_omni_config import NemotronHOmniConfig
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
@@ -93,6 +94,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     InklingMMConfig.model_type: InklingMMConfig,
     Glm53FlashConfig.model_type: Glm53FlashConfig,
     NemotronHConfig.model_type: NemotronHConfig,
+    NemotronHOmniConfig.model_type: NemotronHOmniConfig,
     "glm5_next": Glm53FlashConfig,
 }
 
@@ -507,6 +509,8 @@ def get_config(
         "Qwen3ASRForConditionalGeneration",
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronHOmniConfig",
     ]:
         if config is text_config:
             return config
