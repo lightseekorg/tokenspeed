@@ -30,12 +30,14 @@ Host entries that exist (`PrefixProbe::host`), so nothing it loads can miss and
 the Host-to-Device leg keeps its layer-wise overlap with the first chunk. The
 objects the L3 shadow knows beyond the Host hit (`PrefixProbe::storage`, the
 same matchers run over "Host-cached or registered") are handled by
-`CacheCoordinator::PlanPrefetch` first: it acquires a Host block for every
-storage-tier row, prefix page by prefix page, stops at the first page the Host
-pool cannot take whole (the pages before it stay), and gives up — holding
-nothing — below `SchedulerConfig::l3_prefetch_min_pages` (the explicit
-threshold; required with L3), in which case the request admits normally and
-computes those pages. With a plan, `schedulePrefillFirstChunk` emits one
+`CacheCoordinator::PlanPrefetch` first: it decides before it touches the Host
+pool — sizing the first `SchedulerConfig::l3_prefetch_min_pages` pages (the
+explicit threshold; required with L3) against the free slots, the evictable
+entries and the empty LCM parents, so a prefetch that cannot reach the
+threshold evicts nothing and the request admits normally and computes those
+pages — and only then acquires a Host block for every storage-tier row, prefix
+page by prefix page, stopping at the first page the Host pool cannot take
+whole (the pages before it stay). With a plan, `schedulePrefillFirstChunk` emits one
 `PrefetchOperation` (`Cache.PrefetchOp`: rows in prefix-page order with their
 `page_indices`, one op per request) and the request moves to
 **`fsm::Prefetching`**: it pins only the Host blocks being filled — no Device
@@ -47,7 +49,9 @@ acknowledges once with `cache::PrefetchDone{op_id, landed_pages}`
 (replica-converged); the scheduler publishes the first `landed_pages` pages as
 Host entries, frees the rest, forgets the unlanded keys from the storage
 shadow, and returns the request to `Submitted` at its original queue position,
-holding the published entries pinned until its admission acquires them. The
+holding the published entries pinned until its admission acquires them. A
+`landed_pages` outside `[0, num_pages]` is a runtime bug, not a scheduler
+invariant: the ACK is logged and ignored and the op stays in flight. The
 next admission is an ordinary Host hit. The cost: an L3 hit waits one fetch
 before it is admitted, holding no Device page meanwhile. The D role probes the
 Device alone (`ProbeDecodeDevicePrefix`) and never prefetches.
