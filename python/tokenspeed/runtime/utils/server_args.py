@@ -146,22 +146,22 @@ def _nonempty_str(value: str) -> str:
     return value
 
 
-def validate_dcp_disaggregation_role(
-    *, has_dcp: bool, disaggregation_mode: str
+def validate_kvp_disaggregation_role(
+    *, has_kvp: bool, disaggregation_mode: str
 ) -> None:
-    """Reject DCP on PD roles whose transfer path cannot shard pages yet.
+    """Reject KVP on PD roles whose transfer path cannot shard pages yet.
 
     An aggregated engine and the prefill role may shard: the prefill sender
-    copies only the pages each rank owns and every rank of the DCP subgroup
+    copies only the pages each rank owns and every rank of the KVP subgroup
     serves every decode rank. The decode role receives into an unsharded
     cache only -- no receive path lands a block on its owner alone -- and the
     encode role has no KV cache to shard.
     """
-    if has_dcp and disaggregation_mode not in ("null", "prefill"):
+    if has_kvp and disaggregation_mode not in ("null", "prefill"):
         raise ValueError(
-            "--decode-context-parallel-size > 1 requires --disaggregation-mode "
+            "--kv-parallel-size > 1 requires --disaggregation-mode "
             f"null or prefill (got {disaggregation_mode!r}): only the prefill "
-            "side of a PD transfer can be DCP-sharded"
+            "side of a PD transfer can be KVP-sharded"
         )
 
 
@@ -187,7 +187,7 @@ def validate_qcp(
     attn_dp_size: int,
     dense_tp_size: int,
     moe_tp_ep_size: int,
-    dcp_size: int,
+    kvp_size: int,
     disaggregation_mode: str,
     disable_prefill_graph: bool,
     enable_mixed_batch: bool,
@@ -261,10 +261,10 @@ def validate_qcp(
             f"backend ({sorted(QCP_ATTENTION_BACKENDS)}), got "
             f"--attention-backend {attention_backend!r}"
         )
-    if dcp_size not in (1, qcp_size):
+    if kvp_size not in (1, qcp_size):
         raise ValueError(
-            "--decode-context-parallel-size must be 1 or equal to "
-            f"--prefill-context-parallel-size (got dcp={dcp_size}, qcp={qcp_size}): "
+            "--kv-parallel-size must be 1 or equal to "
+            f"--prefill-context-parallel-size (got kvp={kvp_size}, qcp={qcp_size}): "
             "the history gather splits by the page owners of the whole shard group"
         )
 
@@ -486,8 +486,9 @@ class ServerArgs:
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
-    # DeepSeek V4
-    decode_context_parallel_size: int = 1
+    # KV parallelism: shard the full-history KV pages page-cyclically over a
+    # consecutive subgroup of attention TP (1 = off).
+    kv_parallel_size: int = 1
     # Query context parallelism on the PD prefill role: shard every extend
     # forward's rows over the attention TP group (1 = off).
     prefill_context_parallel_size: int = 1
@@ -970,7 +971,7 @@ class ServerArgs:
             world_size=world_size,
             attn_tp_size=attn_tp_size,
             attn_dp_size=attn_dp_size,
-            attn_dcp_size=self.decode_context_parallel_size,
+            attn_kvp_size=self.kv_parallel_size,
             attn_head_tp_size=self.attn_head_tp_size,
             lm_head_tp_size=self.lm_head_tp_size,
             attn_qcp_size=self.prefill_context_parallel_size,
@@ -990,8 +991,8 @@ class ServerArgs:
         )
 
         # Impl constraints:
-        validate_dcp_disaggregation_role(
-            has_dcp=self.mapping.attn.has_dcp,
+        validate_kvp_disaggregation_role(
+            has_kvp=self.mapping.attn.has_kvp,
             disaggregation_mode=self.disaggregation_mode,
         )
         validate_qcp(
@@ -1000,7 +1001,7 @@ class ServerArgs:
             attn_dp_size=self.mapping.attn.dp_size,
             dense_tp_size=self.mapping.dense.tp_size,
             moe_tp_ep_size=self.mapping.moe.tp_ep_size,
-            dcp_size=self.mapping.attn.dcp_size,
+            kvp_size=self.mapping.attn.kvp_size,
             disaggregation_mode=self.disaggregation_mode,
             disable_prefill_graph=bool(self.disable_prefill_graph),
             enable_mixed_batch=self.enable_mixed_batch,
@@ -1739,7 +1740,7 @@ class ServerArgs:
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
         # Both Host tiers -- the L2 KVStore and the retraction snapshot pool --
-        # are legal under KV-page sharding (--decode-context-parallel-size):
+        # are legal under KV-page sharding (--kv-parallel-size):
         # the scheduler allocates every Host block in its Device block's
         # residue class and the executor translates ownership on both ends of
         # every row (cache/transfer/ownership.py), so each rank copies the
@@ -1747,12 +1748,10 @@ class ServerArgs:
         # which rank owns a block is decided at allocation, so a rank cannot
         # answer an existence probe for blocks it did not own when the object
         # was written (docs/design/cache-concepts.md, the retraction image).
-        if self.decode_context_parallel_size > 1 and (
-            self.kvstore_storage_backend is not None
-        ):
+        if self.kv_parallel_size > 1 and (self.kvstore_storage_backend is not None):
             raise ValueError(
                 "--kvstore-storage-backend (L3) is not supported under "
-                "--decode-context-parallel-size > 1: a page-cyclic sharded group "
+                "--kv-parallel-size > 1: a page-cyclic sharded group "
                 "has no owner-stable L3 key. The Host KVStore itself and the "
                 "retraction snapshot pool are supported."
             )
@@ -3346,14 +3345,17 @@ class ServerArgs:
             help="Specify tp size for attn part",
         )
         parser.add_argument(
-            "--decode-context-parallel-size",
+            "--kv-parallel-size",
             type=int,
-            default=ServerArgs.decode_context_parallel_size,
-            help="Shard full-history KV pages (MLA/DSA latent, DeepSeek V4 "
-            "compressed KV) cyclically over a consecutive subgroup of attention "
-            "TP. Allowed on aggregated engines and the PD prefill role, with the "
-            "Host KVStore and the retraction snapshot pool; the decode role and "
-            "L3 storage (--kvstore-storage-backend) are not supported yet.",
+            default=ServerArgs.kv_parallel_size,
+            help="KV parallelism (KVP): shard full-history KV pages (MLA/DSA "
+            "latent, DeepSeek V4 compressed KV) cyclically over a consecutive "
+            "subgroup of attention TP, each rank storing one shard of every "
+            "request's pages; decode attends the owned pages and merges the "
+            "partials (DCP). Allowed on aggregated engines and the PD prefill "
+            "role, with the Host KVStore and the retraction snapshot pool; the "
+            "decode role and L3 storage (--kvstore-storage-backend) are not "
+            "supported yet.",
         )
         parser.add_argument(
             "--attn-head-tp-size",
@@ -3403,7 +3405,7 @@ class ServerArgs:
             "computes a contiguous slice of the chunk's rows against the gathered "
             "KV history of its requests. Must equal --attn-tp-size and requires "
             "--disaggregation-mode prefill, --disable-prefill-graph, a DSA-family "
-            "attention backend and --decode-context-parallel-size 1 or equal. "
+            "attention backend and --kv-parallel-size 1 or equal. "
             "The attention weights are head-replicated unless --attn-head-tp-size "
             "equals it, which shards them over the shard group.",
         )

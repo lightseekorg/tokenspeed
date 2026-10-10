@@ -164,12 +164,12 @@ def _run(rank: int, port: int) -> None:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     mapping = Mapping(
-        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_dcp_size=WORLD
+        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
     )
     pg_manager.init_distributed(
         mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
     )
-    group = mapping.attn.dcp_group
+    group = mapping.attn.kvp_group
     pg_manager.init_process_group(group, backend="gloo")
     pg_manager.register_process_group(
         "nccl", group, pg_manager.get_process_group("gloo", group)
@@ -345,12 +345,12 @@ def _run_index_k(
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     mapping = Mapping(
-        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_dcp_size=WORLD
+        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
     )
     pg_manager.init_distributed(
         mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
     )
-    group = mapping.attn.dcp_group
+    group = mapping.attn.kvp_group
     pg_manager.init_process_group(group, backend="gloo")
     pg_manager.register_process_group(
         "nccl", group, pg_manager.get_process_group("gloo", group)

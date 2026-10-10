@@ -168,15 +168,15 @@ def test_dcp_takes_both_host_tiers_but_not_l3():
     args = ServerArgs(
         model="x",
         world_size=2,
-        decode_context_parallel_size=2,
+        kv_parallel_size=2,
         retraction_snapshot_host_gb=1.0,
     )
     assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
-    with pytest.raises(ValueError, match="L3.*decode-context-parallel-size"):
+    with pytest.raises(ValueError, match="L3.*kv-parallel-size"):
         ServerArgs(
             model="x",
             world_size=2,
-            decode_context_parallel_size=2,
+            kv_parallel_size=2,
             kvstore_storage_backend="mooncake",
             **PREFETCH,
         )

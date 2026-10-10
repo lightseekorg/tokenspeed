@@ -192,9 +192,10 @@ class DistributedInitializer:
         pg_manager.init_process_group(config.mapping.world_group)
         pg_manager.init_process_group(config.mapping.attn.world_group)
         pg_manager.init_process_group(config.mapping.attn.tp_group)
-        # A DCP group of one is still the group the decode path collectives
-        # address; init_process_group is idempotent and handles size 1.
-        pg_manager.init_process_group(config.mapping.attn.dcp_group)
+        # The KVP group is the group the DCP decode collectives address; a
+        # group of one still is. init_process_group is idempotent and handles
+        # size 1.
+        pg_manager.init_process_group(config.mapping.attn.kvp_group)
         # The query-context-parallel group of a sharded extend; equal to the
         # attention TP group while qcp == tp, so this is idempotent there.
         pg_manager.init_process_group(config.mapping.attn.qcp_group)

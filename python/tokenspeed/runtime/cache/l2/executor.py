@@ -185,7 +185,7 @@ class HostCacheExecutor:
         slot_state_exporters: Sequence[SlotStateExporter] | None,
         io_backend: str,
         attn_tp_rank: int,
-        dcp_rank: int,
+        kvp_rank: int,
     ):
         """
         Args:
@@ -212,9 +212,8 @@ class HostCacheExecutor:
             io_backend: ``"direct"`` (DMA ranges) or ``"kernel"`` (mapped-Host
                 Triton copies).
             attn_tp_rank: Attention-TP rank; rank 0 logs.
-            dcp_rank: This rank in the KVP (DCP) subgroup; selects the blocks
-                it owns of a sharded group (the identity for replicated
-                groups).
+            kvp_rank: This rank in the KVP subgroup; selects the blocks it
+                owns of a sharded group (the identity for replicated groups).
         """
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -287,7 +286,7 @@ class HostCacheExecutor:
                 self.layout,
                 contract,
                 num_host_lcm_blocks=host_lcm_blocks,
-                rank=dcp_rank,
+                rank=kvp_rank,
             )
         # The scheduler wire includes logical null LCMBlock 0 in its counts;
         # 0 L2 pages means no L2 tier, 1 snapshot page means no pool (nothing
@@ -315,7 +314,7 @@ class HostCacheExecutor:
                 self.layout,
                 contract,
                 num_host_lcm_blocks=snapshot_lcm_blocks,
-                rank=dcp_rank,
+                rank=kvp_rank,
             )
             # One row per retracted request, indexed by the op's snapshot_slot.
             self.blob_arena = allocate_blob_arena(

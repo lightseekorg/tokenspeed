@@ -2,12 +2,12 @@
 
 set -euo pipefail
 
-# DCP requires KVStore disabled; disable it in the DCP1 baseline too when
-# comparing DCP overhead.
+# This KVP config disables the KVStore; disable it in the KVP1 baseline too
+# when comparing KVP overhead.
 exec ts serve \
     --model nvidia/Kimi-K3-NVFP4 \
     --attn-tp-size 8 \
-    --decode-context-parallel-size 4 \
+    --kv-parallel-size 4 \
     --disable-kvstore \
     --moe-tp-size 8 \
     --max-model-len 80000 \

@@ -247,8 +247,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # consumed within each op and never zero-initialized, so sharing the
         # block is safe. Warm to the verify-path peak now: graph capture runs
         # the decode forward with the pool frozen.
-        self.dcp_group = tuple(config.dcp_group)
-        self.dcp_rank = config.dcp_rank
+        self.dcp_group = tuple(config.kvp_group)
+        self.dcp_rank = config.kvp_rank
         self._num_heads_per_tp = spec.num_attention_heads // spec.attn_tp_size
         self._workspace_pool = workspace_pool(config.device)
         self.cutedsl_workspace = self._cutedsl_workspace(
@@ -298,7 +298,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
     ) -> None:
         super().configure_runtime(**kwargs)
         if shard_count != len(self.dcp_group):
-            raise ValueError("CuTe MLA cache and DCP topology disagree")
+            raise ValueError("CuTe MLA cache and KVP topology disagree")
         self._dcp = (
             _DCPDecodeState(
                 CachePlacement(
@@ -774,7 +774,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         )
         if len(self.dcp_group) == 1:
             return support
-        reason = f"{type(self).__name__} has no draft-tree path under decode context parallelism"
+        reason = f"{type(self).__name__} has no draft-tree path under KV parallelism"
         return TreeSupport(verify_blocker=reason, draft_blocker=reason)
 
     def _tree_cascade(

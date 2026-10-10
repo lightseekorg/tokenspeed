@@ -115,9 +115,9 @@ def test_flashmla_dcp_rejects_unsupported_execution(override, message):
             *config.components[1:],
         ),
         pd_disaggregation_enabled=False,
-        dcp_size=4,
-        dcp_rank=0,
-        dcp_group=(0, 1, 2, 3),
+        kvp_size=4,
+        kvp_rank=0,
+        kvp_group=(0, 1, 2, 3),
     )
     with pytest.raises(ValueError, match=message):
         replace(config, **override)
@@ -156,9 +156,9 @@ def test_kimi_capacity_shards_only_mla():
                 *components[1:],
             ),
             pd_disaggregation_enabled=False,
-            dcp_size=degree,
-            dcp_rank=0,
-            dcp_group=tuple(range(degree)),
+            kvp_size=degree,
+            kvp_rank=0,
+            kvp_group=tuple(range(degree)),
         )
         recipes.append(recipe)
     base, sharded = [r.setup().spec for r in recipes]
@@ -564,9 +564,9 @@ def test_kimi_capacity_fits_physical_parents_with_state_reservations(degree):
         device="cuda",
         components=(replace(components[0], backend_name="flashmla"), *components[1:]),
         pd_disaggregation_enabled=False,
-        dcp_size=degree,
-        dcp_rank=0,
-        dcp_group=tuple(range(degree)),
+        kvp_size=degree,
+        kvp_rank=0,
+        kvp_group=tuple(range(degree)),
     )
     groups = recipe.groups()
     layout = pack(
@@ -630,9 +630,9 @@ def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
         config,
         device="cuda",
         components=(replace(config.components[0], backend_name="flashmla"),),
-        dcp_size=degree,
-        dcp_rank=0,
-        dcp_group=tuple(range(degree)),
+        kvp_size=degree,
+        kvp_rank=0,
+        kvp_group=tuple(range(degree)),
     )
     setup = prepare_cache_setup(
         family="mla",
@@ -680,9 +680,9 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
         base,
         device="cuda",
         components=(spec,),
-        dcp_size=degree,
-        dcp_group=tuple(range(degree)),
-        dcp_rank=0,
+        kvp_size=degree,
+        kvp_group=tuple(range(degree)),
+        kvp_rank=0,
     )
     setup = prepare_cache_setup(
         family="dsa",

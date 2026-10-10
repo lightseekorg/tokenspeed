@@ -14,7 +14,7 @@ set -euo pipefail
 # Sweep configs
 CONFIGS=(
     attn_tp8_moe_tp8
-    attn_tp8_dcp4_moe_tp8
+    attn_tp8_kvp4_moe_tp8
     attn_tp8_moe_ep8
 )
 

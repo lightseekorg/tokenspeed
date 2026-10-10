@@ -98,7 +98,7 @@ class DeepseekV4AttentionMetadata:
     swa_indices: torch.Tensor | None = None
     swa_lens: torch.Tensor | None = None
     # All-zero lengths shaped like ``swa_lens``: the SWA cache is replicated
-    # across a DCP group, so every rank but the first attends to none of it.
+    # across a KVP group, so every rank but the first attends to none of it.
     swa_lens_none: torch.Tensor | None = None
     swa_window_size: int = 0
     swa_block_size: int = 0

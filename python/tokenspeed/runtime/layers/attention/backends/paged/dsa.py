@@ -165,15 +165,15 @@ class DSABackend(PagedAttentionBackend):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         platform = current_platform()
         self._dense_backend = _make_dense_leaf(config, spec, platform, kernel_page_size)
-        self.dcp_group = tuple(config.dcp_group)
-        self.dcp_rank = config.dcp_rank
+        self.dcp_group = tuple(config.kvp_group)
+        self.dcp_rank = config.kvp_rank
         self.dcp_block_granularity: int | None = None
         self.dcp_virtual_block_count: int | None = None
         if len(self.dcp_group) > 1 and spec.index_kpool is not None:
-            raise ValueError("DSA DCP does not yet support KPool selection")
+            raise ValueError("DSA KVP does not yet support KPool selection")
         # Query context parallelism: the extend rows this rank computes are a
         # shard of the chunk and attend the gathered history of their
-        # requests; the gather splits by page owner (the DCP group, or this
+        # requests; the gather splits by page owner (the KVP group, or this
         # rank alone) and lands in a workspace sized for one whole history.
         self.qcp_group = tuple(config.qcp_group)
         self.qcp_rank = config.qcp_rank
@@ -271,7 +271,7 @@ class DSABackend(PagedAttentionBackend):
             shard_count != len(self.dcp_group)
             or block_granularity % self.kernel_page_size
         ):
-            raise ValueError("DSA cache geometry does not match DCP topology")
+            raise ValueError("DSA cache geometry does not match KVP topology")
         self.dcp_block_granularity = block_granularity
         self.dcp_virtual_block_count = virtual_block_count
 
@@ -334,7 +334,7 @@ class DSABackend(PagedAttentionBackend):
         if len(self.dcp_group) == 1:
             return None
         if self.dcp_block_granularity is None or self.dcp_virtual_block_count is None:
-            raise RuntimeError("DSA DCP cache geometry is not configured")
+            raise RuntimeError("DSA KVP cache geometry is not configured")
         return CachePlacement(
             self.dcp_block_granularity,
             self.dcp_virtual_block_count,

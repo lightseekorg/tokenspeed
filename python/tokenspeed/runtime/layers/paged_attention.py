@@ -285,7 +285,7 @@ class PagedAttention(nn.Module):
     def _local_target(
         self, slots: torch.Tensor, ctx: ForwardContext
     ) -> HeadKVCache | LatentKVCache:
-        """The pool's target for ``slots``, local to this rank's shard under DCP."""
+        """The pool's target for ``slots``, local to this rank's shard under KVP."""
         slots, owned = resolve_cache_slots(
             slots, ctx.attn_backend.cache_placement(self)
         )

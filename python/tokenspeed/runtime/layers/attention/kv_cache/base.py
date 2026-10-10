@@ -399,7 +399,7 @@ class CachePool(ABC):
         self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
     ) -> HeadKVCache | LatentKVCache:
         """Where the attention prologue writes this layer's rows at ``slots``;
-        ``write_mask`` skips the rows another DCP rank owns."""
+        ``write_mask`` skips the rows another KVP rank owns."""
         raise NotImplementedError(
             f"{type(self).__name__} serves no attention prologue writes"
         )

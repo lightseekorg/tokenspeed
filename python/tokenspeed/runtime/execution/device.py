@@ -1443,7 +1443,7 @@ def build_device_side(
             slot_state_exporters=executor.slot_state_exporters(),
             io_backend=server_args.kvstore_io_backend,
             attn_tp_rank=attn_tp_rank,
-            dcp_rank=server_args.mapping.attn.dcp_rank,
+            kvp_rank=server_args.mapping.attn.kvp_rank,
         )
     elif attn_tp_rank == 0:
         # With an executor the line comes from its resolved sizing.

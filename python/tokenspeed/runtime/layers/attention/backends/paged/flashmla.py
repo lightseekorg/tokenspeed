@@ -152,8 +152,8 @@ class FlashMLABackend(PagedAttentionBackend):
             )
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
 
-        self.dcp_group = tuple(config.dcp_group)
-        self.dcp_rank = config.dcp_rank
+        self.dcp_group = tuple(config.kvp_group)
+        self.dcp_rank = config.kvp_rank
         self.dcp_block_granularity: int | None = None
         self.dcp_virtual_block_count: int | None = None
         self.dcp_metadata: CompactDCPMetadata | None = None
@@ -247,7 +247,7 @@ class FlashMLABackend(PagedAttentionBackend):
                 "FlashMLA ownership blocks must contain whole kernel pages"
             )
         if shard_count != len(self.dcp_group):
-            raise ValueError("FlashMLA cache and DCP topology disagree")
+            raise ValueError("FlashMLA cache and KVP topology disagree")
         self.dcp_block_granularity = block_granularity
         self.dcp_virtual_block_count = virtual_block_count
 
@@ -259,7 +259,7 @@ class FlashMLABackend(PagedAttentionBackend):
                 or self.dcp_virtual_block_count is None
             ):
                 raise RuntimeError(
-                    "FlashMLA DCP ownership geometry has not been configured"
+                    "FlashMLA KVP ownership geometry has not been configured"
                 )
             self.dcp_metadata = refresh_dcp_page_table_metadata(
                 page_table=self.page_table_buf,
@@ -575,7 +575,7 @@ class FlashMLABackend(PagedAttentionBackend):
             return None
         if self.dcp_block_granularity is None or self.dcp_virtual_block_count is None:
             raise RuntimeError(
-                "FlashMLA DCP ownership geometry has not been configured"
+                "FlashMLA KVP ownership geometry has not been configured"
             )
         return CachePlacement(
             block_granularity=self.dcp_block_granularity,
@@ -700,9 +700,10 @@ class FlashMLABackend(PagedAttentionBackend):
         token_to_kv_pool,
     ):
         if len(self.dcp_group) > 1:
-            # The prefill wrapper plans on the virtual page table; DCP history comes from chunked prefill.
+            # The prefill wrapper plans on the virtual page table; the KVP-sharded
+            # history comes from chunked prefill.
             raise RuntimeError(
-                "FlashMLA's absorbed extend cannot attend a DCP-sharded cache"
+                "FlashMLA's absorbed extend cannot attend a KVP-sharded cache"
             )
         # flashinfer prefill_wrapper.run() takes q_nope / q_pe split: slice views.
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)

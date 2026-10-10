@@ -302,13 +302,13 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         # init_cuda_graph_state (unconditionally at wrapper construction).
         self.graph: DeepseekV4GraphBuffers | None = None
         self._init_cache_group_latches()
-        # The DCP topology is one more parameter of the decode path: a group
+        # The KVP topology is one more parameter of the decode path: a group
         # of one attends to a fully replicated cache and combines nothing.
-        self.dcp_size = int(config.dcp_size)
-        self.dcp_rank = int(config.dcp_rank)
-        self.dcp_group = tuple(config.dcp_group)
+        self.dcp_size = int(config.kvp_size)
+        self.dcp_rank = int(config.kvp_rank)
+        self.dcp_group = tuple(config.kvp_group)
         if len(self.dcp_group) != self.dcp_size or self.dcp_rank >= self.dcp_size:
-            raise ValueError("DeepSeek V4 DCP group, size and rank disagree")
+            raise ValueError("DeepSeek V4 KVP group, size and rank disagree")
         self._cuda_graph_active_page_validity: torch.Tensor | None = None
         self._prefill_workspace_buffer: torch.Tensor | None = None
         self._prefill_workspace_rows = 0
@@ -485,7 +485,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             )
             if spec.shard_count != expected_shards:
                 raise ValueError(
-                    "DeepSeek V4 attention and cache DCP topologies disagree"
+                    "DeepSeek V4 attention and cache KVP topologies disagree"
                 )
         contract = self._derive_cache_group_contract(
             runtime_contract.group_specs,
@@ -545,8 +545,8 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             page_size=self.kernel_page_size,
             page_table=page_table,
             block_tables=block_tables,
-            dcp_size=self.dcp_size,
-            dcp_rank=self.dcp_rank,
+            kvp_size=self.dcp_size,
+            kvp_rank=self.dcp_rank,
             runtime_contract=self.cache_pool.arena.runtime_contract,
         )
         cache.refresh_page_tables()
@@ -927,7 +927,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         **kwargs,
     ) -> None:
         """Build extend/mixed metadata; ``block_tables_cpu`` mirrors
-        ``block_tables`` on the host so the DCP history exchange is planned
+        ``block_tables`` on the host so the KVP history exchange is planned
         without waiting on the device."""
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "DeepseekV4AttentionBackend")
@@ -1351,7 +1351,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
                 f"metadata_tokens={metadata.token_to_req_indices.numel()}, "
                 f"q_tokens={q.shape[0]}"
             )
-        # A layer's attention group is the DCP group when its compressed cache
+        # A layer's attention group is the KVP group when its compressed cache
         # is sharded and just this rank otherwise (SWA-only layers read the
         # replicated SWA cache). Everything below is parameterized by that
         # group; a group of one gathers, weights and combines nothing.
@@ -1562,12 +1562,12 @@ class DeepseekV4AttentionBackend(AttentionBackend):
         """
         workspace_bounds = DeepseekV4AttentionBackend._prefill_workspace_bounds
         cache = metadata.cache
-        degree, rank = cache.dcp_size, cache.dcp_rank
+        degree, rank = cache.kvp_size, cache.kvp_rank
         count = metadata.num_prefill_reqs
         if degree <= 1 or chunk_size <= 0 or count <= 0:
-            raise ValueError("DCP prefill planning requires a nonempty prefill batch")
+            raise ValueError("KVP prefill planning requires a nonempty prefill batch")
         if block_table_cpu.device.type != "cpu" or block_table_cpu.shape[0] < count:
-            raise ValueError("DCP prefill planning needs the host block table")
+            raise ValueError("KVP prefill planning needs the host block table")
         seq_cpu = (
             metadata.seq_lens_cpu[:count] if metadata.seq_lens_cpu is not None else None
         )
@@ -1689,7 +1689,7 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             chunk = chunks[start, start + out.shape[0]]
             if offset != 0 or out.shape[1] != chunk.workspace_width:
                 raise RuntimeError(
-                    "DCP prefill workspace differs from its prepared layout"
+                    "KVP prefill workspace differs from its prepared layout"
                 )
         # The read table maps virtual pages to local physical pages; pages of
         # other owners and the null block are -1 and dequantize to zero.
@@ -2161,11 +2161,11 @@ class DeepseekV4AttentionBackend(AttentionBackend):
             ),
             max_num_pages=self.max_num_pages,
             device=self.device,
-            dcp_size=self.dcp_size,
-            dcp_rank=self.dcp_rank,
+            kvp_size=self.dcp_size,
+            kvp_rank=self.dcp_rank,
             runtime_contract=self.cache_pool.arena.runtime_contract,
         )
-        # A layer attends over its TP-local heads, or over the DCP group's
+        # A layer attends over its TP-local heads, or over the KVP group's
         # gathered heads when its cache is sharded; each width that FlashMLA
         # must pad gets one zero-tailed persistent workspace.
         self._decode_q_padding_workspaces = {}

@@ -437,11 +437,11 @@ def _apply_backend_overrides(
     if (
         draft is not None
         and "K3DSparkModel" in draft.architectures
-        and server_args.decode_context_parallel_size > 1
+        and server_args.kv_parallel_size > 1
     ):
         raise ValueError(
-            "K3 DSpark does not support DCP: context KV injection does not "
-            "translate virtual slots or mask nonowner writes"
+            "K3 DSpark does not support KVP (--kv-parallel-size > 1): context "
+            "KV injection does not translate virtual slots or mask nonowner writes"
         )
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
@@ -459,12 +459,12 @@ def _apply_backend_overrides(
             draft is not None
             and target.is_kda
             and not target.is_dsa_kda
-            and server_args.decode_context_parallel_size > 1
+            and server_args.kv_parallel_size > 1
             and server_args.drafter_attention_backend
             in (None, HYBRID_LINEAR_ATTN_BACKEND)
         ):
             # A K3 continuation must resolve its history consumer before
-            # AttnConfig validates DCP. Inherit the target's resolved leaf,
+            # AttnConfig validates its DCP decode. Inherit the target's resolved leaf,
             # while preserving an explicitly requested draft leaf.
             server_args.drafter_attention_backend = _resolve_hybrid_full_backend_name(
                 target.requested_backend,
@@ -1164,24 +1164,24 @@ def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
         )
 
 
-def _validate_hybrid_dcp_cache(spec: CachePoolSpec, *, dcp_size: int) -> None:
+def _validate_hybrid_kvp_cache(spec: CachePoolSpec, *, kvp_size: int) -> None:
     """Validate declared storage, independent of recipe name or inheritance."""
     groups = spec.cache_group_specs
     if not any(
         group.family == "history" and group.retention == "full_history"
         for group in groups
     ):
-        raise ValueError("Hybrid MLA DCP requires a full-history cache group")
+        raise ValueError("Hybrid MLA KVP requires a full-history cache group")
     for group in groups:
         if group.family == "history" and group.retention != "full_history":
             raise ValueError(
-                f"Hybrid MLA DCP cache group {group.group_id!r} "
+                f"Hybrid MLA KVP cache group {group.group_id!r} "
                 "must use full-history retention"
             )
-        expected = dcp_size if group.family == "history" else 1
+        expected = kvp_size if group.family == "history" else 1
         if group.shard_count != expected:
             raise ValueError(
-                f"Hybrid MLA DCP cache group {group.group_id!r} ({group.family}) "
+                f"Hybrid MLA KVP cache group {group.group_id!r} ({group.family}) "
                 f"requires shard_count={expected}, got {group.shard_count}"
             )
 
@@ -1235,9 +1235,9 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
-    # DeepSeek V4 validates its specialized DCP cache contract in its backend.
+    # DeepSeek V4 validates its specialized KVP cache contract in its backend.
     if (
-        config.dcp_size > 1
+        config.kvp_size > 1
         and not target.is_deepseek_v4
         and (
             model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
@@ -1246,7 +1246,7 @@ def create_attn_components(
         _validate_mla_dcp_backend(
             target_full_attn_backend_name, model_config.attention_arch
         )
-    if config.dcp_size > 1 and target.is_hybrid_linear:
+    if config.kvp_size > 1 and target.is_hybrid_linear:
         resolved_softmax = dataclasses.replace(
             softmax_attn, backend_name=target_full_attn_backend_name
         )
@@ -1316,8 +1316,8 @@ def create_attn_components(
         probe_batch_rows=probe_batch_rows,
     )
     spec = cache_setup.spec
-    if config.dcp_size > 1 and target.is_hybrid_linear:
-        _validate_hybrid_dcp_cache(spec, dcp_size=config.dcp_size)
+    if config.kvp_size > 1 and target.is_hybrid_linear:
+        _validate_hybrid_kvp_cache(spec, kvp_size=config.kvp_size)
     num_target_cache_layers = cache_setup.num_target_layers
     num_draft_cache_layers = cache_setup.num_draft_layers
     if server_args.mapping.has_pp:

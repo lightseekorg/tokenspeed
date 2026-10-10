@@ -175,7 +175,7 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
-        shard_count = self.attn_config.dcp_size
+        shard_count = self.attn_config.kvp_size
         return tuple(
             (
                 (

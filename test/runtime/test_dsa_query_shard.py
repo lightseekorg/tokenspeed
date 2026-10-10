@@ -171,7 +171,7 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
             min(max(lo, start), end) - start, min(max(hi, start), end) - start
         )
         assert group.local_query == expected
-    # One owner (no DCP): the gather is local and holds every history row.
+    # One owner (no KVP): the gather is local and holds every history row.
     for group in meta.groups:
         assert group.gather.group == (0,)
         assert group.gather.owned_rows_per_rank == (group.rows,)

@@ -63,7 +63,7 @@ MAX_CACHE_TP_SIZE = 1024
 class CachePageOwnerFilter:
     """Which of a sharded group's scheduler blocks one source rank holds.
 
-    A DCP-sharded group deals virtual blocks cyclically to ``owner_count``
+    A KVP-sharded group deals virtual blocks cyclically to ``owner_count``
     ranks; the rank with ``owner_rank`` holds block ``v`` when
     ``(v - 1) % owner_count == owner_rank`` (block 0 is the null block). The
     sender keeps only those blocks of a manifest, translated to its local
@@ -179,7 +179,7 @@ class CacheTransferPlanner:
     """Plan model-neutral dense cache fields across unequal TP sizes.
 
     Two source geometries compose here: head partitions split a page's rows
-    over TP ranks, and DCP page sharding (``CacheGroupSpec.shard_count``)
+    over TP ranks, and KVP page sharding (``CacheGroupSpec.shard_count``)
     deals whole pages over a consecutive TP subgroup. The destination is
     always unsharded.
     """
@@ -219,7 +219,7 @@ class CacheTransferPlanner:
             field.field_id: prefill_layout.transfer_schema.partition_for(field.field_id)
             for field in prefill_layout.plan.fields
         }
-        # DCP page sharding on the source: a sharded group's virtual blocks are
+        # KVP page sharding on the source: a sharded group's virtual blocks are
         # dealt cyclically over a consecutive subgroup of shard_count Prefill
         # TP ranks, so every rank of the chosen subgroup is a source and sends
         # only the blocks it owns. The destination must hold every block
@@ -231,7 +231,7 @@ class CacheTransferPlanner:
             if decode_spec.shard_count != 1:
                 raise UnsupportedPDLayoutError(
                     f"cache group {decode_spec.group_id!r} is sharded on Decode; "
-                    "PD transfer into a DCP-sharded destination is not supported"
+                    "PD transfer into a KVP-sharded destination is not supported"
                 )
             if prefill_spec.shard_count == 1:
                 continue
@@ -327,7 +327,7 @@ class CacheTransferPlanner:
     ) -> dict[str, CachePageOwnerFilter | None]:
         """Decide, for every sharded group, which blocks one source rank sends.
 
-        A rank whose fragments name the group owns the blocks of its DCP
+        A rank whose fragments name the group owns the blocks of its KVP
         subgroup position (``prefill_rank % shard_count``, subgroups being
         aligned runs of ``shard_count`` consecutive TP ranks); a rank whose
         fragments do not name the group sends nothing for it, recorded as
@@ -384,7 +384,7 @@ class CacheTransferPlanner:
                     fragments.setdefault(replica_rank, []).append(fragment)
                     continue
                 # The replica this decode rank would read whole is spread over
-                # its DCP subgroup (consecutive TP ranks); every member sends
+                # its KVP subgroup (consecutive TP ranks); every member sends
                 # the blocks it owns, which owner_filters_for records.
                 subgroup_base = replica_rank - replica_rank % shard_count
                 for prefill_rank in range(subgroup_base, subgroup_base + shard_count):

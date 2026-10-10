@@ -205,9 +205,9 @@ def _v4_backend(flat: SimpleNamespace) -> DeepseekV4AttentionBackend:
     config_fields = {k: v for k, v in fields.items() if k not in _V4_SPEC_FIELDS}
     config_fields.setdefault("speculative_num_steps", 0)
     config_fields.setdefault("speculative_num_draft_tokens", 1)
-    config_fields.setdefault("dcp_size", 1)
-    config_fields.setdefault("dcp_rank", 0)
-    config_fields.setdefault("dcp_group", (0,))
+    config_fields.setdefault("kvp_size", 1)
+    config_fields.setdefault("kvp_rank", 0)
+    config_fields.setdefault("kvp_group", (0,))
     backend = DeepseekV4AttentionBackend(
         SimpleNamespace(**config_fields), SimpleNamespace(**spec_fields)
     )
@@ -299,7 +299,7 @@ def _v4_recipe(
             max_bs=1,
             context_len=4096,
             pd_disaggregation_enabled=False,
-            dcp_size=1,
+            kvp_size=1,
         ),
         draft_model_config=None,
         draft_attn_config=None,
@@ -377,8 +377,8 @@ def _make_deepseek_v4_cache_metadata(*, page_size, page_table, block_tables):
         page_size=page_size,
         page_table=page_table,
         block_tables=block_tables,
-        dcp_size=1,
-        dcp_rank=0,
+        kvp_size=1,
+        kvp_rank=0,
         runtime_contract=_replicated_placement(block_tables),
     )
     cache.refresh_page_tables()
@@ -2909,9 +2909,9 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_num_draft_tokens=1,
                 head_dim=4,
                 context_len=4096,
-                dcp_size=2,
-                dcp_rank=1,
-                dcp_group=(0, 1),
+                kvp_size=2,
+                kvp_rank=1,
+                kvp_group=(0, 1),
             )
         )
         backend.init_cuda_graph_state(max_bs=4, max_tokens_per_req=1)
@@ -6907,7 +6907,7 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
             ),
         ),
         attn_config=SimpleNamespace(
-            dcp_size=1,
+            kvp_size=1,
             pd_disaggregation_enabled=True,
             prefix_granularity=256,
             max_bs=2,

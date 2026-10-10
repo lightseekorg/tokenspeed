@@ -18,4 +18,5 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Decode context parallel attention over virtual cache blocks."""
+"""Decode context parallel (DCP) attention over KV-parallel (KVP) virtual cache
+blocks: each rank attends the pages it owns and the partials are merged by LSE."""
