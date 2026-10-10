@@ -1017,15 +1017,10 @@ namespace {
 // Slots covering [0, num_tokens) of a table and the capacity left inside the
 // last of them. The computed tokens always lie inside the table: the
 // admission that scheduled them acquired their blocks first.
-struct DataSpan {
-    std::int32_t blocks{0};
-    std::int32_t tail_tokens{0};
-};
-
-DataSpan dataSpan(const BlockTable& table, std::int32_t block_granularity, std::int32_t num_tokens) {
+CacheCoordinator::DataSpan dataSpan(const BlockTable& table, std::int32_t block_granularity, std::int32_t num_tokens) {
     const std::int32_t covering = (num_tokens + block_granularity - 1) / block_granularity;
     _assert(covering <= table.NumBlocks(), "snapshot token count exceeds the table's logical fill");
-    return DataSpan{.blocks = covering, .tail_tokens = covering * block_granularity - num_tokens};
+    return CacheCoordinator::DataSpan{.blocks = covering, .tail_tokens = covering * block_granularity - num_tokens};
 }
 
 }  // namespace
@@ -1048,43 +1043,44 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlots(std::sp
     return published;
 }
 
-std::optional<CacheCoordinator::ImageTaken> CacheCoordinator::TakeImage(
+std::optional<CacheCoordinator::SnapshotPoolPlan> CacheCoordinator::planSnapshotPool(
     std::span<const BlockTable> tables, std::int32_t num_tokens,
-    std::span<const std::vector<ImageSlot>> host_cached_slots) {
+    std::span<const std::vector<ImageSlot>> host_served_slots) const {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
-    _assert(host_cached_slots.size() == groups_.size(), "host slots/groups size mismatch");
+    _assert(host_served_slots.size() == groups_.size(), "host slots/groups size mismatch");
     _assert(num_tokens >= 0, "snapshot token count must be non-negative");
     if (snapshot_pool_ == nullptr) {
         return std::nullopt;
     }
-    // Every group's bucket demand against the pool's empty parents first, so
-    // a retraction that does not fit acquires nothing: releasing a partial
-    // acquisition would reorder the pool's FIFO.
-    std::vector<DataSpan> spans(groups_.size());
-    std::vector<std::vector<std::int32_t>> private_slots(groups_.size());
-    std::vector<std::vector<std::int32_t>> private_buckets(groups_.size());
+    // Every group's bucket demand against the pool's empty parents, with no
+    // acquisition: a retraction that does not fit must take nothing, since
+    // releasing a partial acquisition would reorder the pool's FIFO.
+    SnapshotPoolPlan plan{
+        .spans = std::vector<DataSpan>(groups_.size()),
+        .private_slots = std::vector<std::vector<std::int32_t>>(groups_.size()),
+        .private_buckets = std::vector<std::vector<std::int32_t>>(groups_.size()),
+    };
     std::int64_t parents_needed = 0;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupAllocator& allocator = groups_[i].Allocator();
-        spans[i] = dataSpan(tables[i], geometry_[i].BlockGranularity(), num_tokens);
-        std::vector<std::uint8_t> served(static_cast<std::size_t>(spans[i].blocks), 0);
-        for (const ImageSlot& slot : host_cached_slots[i]) {
-            _assert(slot.InHostCache() && slot.block && slot.block.IsOwnedBy(*host_pool_),
-                    "a Host-cached snapshot slot must carry its Host L2 block and key");
-            _assert(slot.slot_index >= 0 && slot.slot_index < spans[i].blocks,
-                    "a Host-cached snapshot slot must be a data slot");
+        plan.spans[i] = dataSpan(tables[i], geometry_[i].BlockGranularity(), num_tokens);
+        std::vector<std::uint8_t> served(static_cast<std::size_t>(plan.spans[i].blocks), 0);
+        for (const ImageSlot& slot : host_served_slots[i]) {
+            _assert(slot.InHostCache(), "a Host-served snapshot slot carries the key it is published under");
+            _assert(slot.slot_index >= 0 && slot.slot_index < plan.spans[i].blocks,
+                    "a Host-served snapshot slot must be a data slot");
             served[static_cast<std::size_t>(slot.slot_index)] = 1;
         }
         std::vector<std::int64_t> need(static_cast<std::size_t>(allocator.ShardCount()), 0);
         const std::span<const CacheBlockRef> blocks = tables[i].Blocks();
-        for (std::int32_t slot = 0; slot < spans[i].blocks; ++slot) {
+        for (std::int32_t slot = 0; slot < plan.spans[i].blocks; ++slot) {
             const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)];
             if (!block || served[static_cast<std::size_t>(slot)]) {
                 continue;
             }
             const std::int32_t bucket = allocator.BucketOf(block->Location());
-            private_slots[i].push_back(slot);
-            private_buckets[i].push_back(bucket);
+            plan.private_slots[i].push_back(slot);
+            plan.private_buckets[i].push_back(bucket);
             ++need[static_cast<std::size_t>(bucket)];
         }
         parents_needed += ParentsNeededForBuckets(need, snapshot_pool_->FreeSlotsByBucket(groups_[i].Id()),
@@ -1093,27 +1089,50 @@ std::optional<CacheCoordinator::ImageTaken> CacheCoordinator::TakeImage(
     if (parents_needed > snapshot_pool_->NumEmptyLcmBlocks()) {
         return std::nullopt;
     }
+    return plan;
+}
+
+bool CacheCoordinator::SnapshotPoolHolds(std::span<const BlockTable> tables, std::int32_t num_tokens,
+                                         std::span<const std::vector<ImageSlot>> host_served_slots) const {
+    return planSnapshotPool(tables, num_tokens, host_served_slots).has_value();
+}
+
+std::optional<CacheCoordinator::ImageTaken> CacheCoordinator::TakeImage(
+    std::span<const BlockTable> tables, std::int32_t num_tokens,
+    std::span<const std::vector<ImageSlot>> host_cached_slots) {
+    for (std::size_t i = 0; i < host_cached_slots.size(); ++i) {
+        for (const ImageSlot& slot : host_cached_slots[i]) {
+            _assert(slot.block && host_pool_ != nullptr && slot.block.IsOwnedBy(*host_pool_),
+                    "a Host-cached snapshot slot must carry its Host L2 block");
+        }
+    }
+    std::optional<SnapshotPoolPlan> plan = planSnapshotPool(tables, num_tokens, host_cached_slots);
+    if (!plan) {
+        return std::nullopt;
+    }
 
     ImageTaken image;
     image.image.tables.reserve(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         ImageTable shape{
-            .num_blocks = spans[i].blocks,
-            .reclaimed_prefix_blocks = std::min(tables[i].ReclaimedPrefixBlocks(), spans[i].blocks),
-            .available_tokens = spans[i].tail_tokens,
+            .num_blocks = plan->spans[i].blocks,
+            .reclaimed_prefix_blocks = std::min(tables[i].ReclaimedPrefixBlocks(), plan->spans[i].blocks),
+            .available_tokens = plan->spans[i].tail_tokens,
             .slots = host_cached_slots[i],
         };
         std::vector<CacheBlockRef> snapshot_blocks =
-            snapshot_pool_->AcquireBlocksInBuckets(groups_[i].Id(), private_buckets[i]);
-        FatalCheck(snapshot_blocks.size() == private_buckets[i].size(), "snapshot pool no longer fits a probed image");
+            snapshot_pool_->AcquireBlocksInBuckets(groups_[i].Id(), plan->private_buckets[i]);
+        FatalCheck(snapshot_blocks.size() == plan->private_buckets[i].size(),
+                   "snapshot pool no longer fits a probed image");
         for (std::size_t j = 0; j < snapshot_blocks.size(); ++j) {
-            const CacheBlockRef& source = tables[i].Blocks()[static_cast<std::size_t>(private_slots[i][j])];
+            const CacheBlockRef& source = tables[i].Blocks()[static_cast<std::size_t>(plan->private_slots[i][j])];
             image.store_pairs.push_back(BlockTransfer{
                 .group_id = groups_[i].Id(),
                 .source = source,
                 .destination = snapshot_blocks[j],
             });
-            shape.slots.push_back(ImageSlot{.slot_index = private_slots[i][j], .block = std::move(snapshot_blocks[j])});
+            shape.slots.push_back(
+                ImageSlot{.slot_index = plan->private_slots[i][j], .block = std::move(snapshot_blocks[j])});
         }
         std::ranges::sort(shape.slots, {}, &ImageSlot::slot_index);
         image.image.tables.push_back(std::move(shape));

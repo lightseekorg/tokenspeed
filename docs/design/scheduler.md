@@ -366,10 +366,10 @@ request instead of accepting a request that can never produce a forward.
 (`PlanBuild::NoPrefillProgress()`: nothing was admitted and no resident prefill
 advanced a chunk) and an admission failed for capacity. Decode steps do not
 count as progress — they release no capacity, so a round of pure decode leaves
-a stalled prefill exactly as stuck as an empty one. Retraction exists only
-where a snapshot pool does (`SchedulerConfig::HasSnapshotPool()`, §4): with
-the null page alone configured, `chooseVictim` finds nobody, residents run to
-completion and the blocked admission waits.
+a stalled prefill exactly as stuck as an empty one. Imaging a victim needs a
+snapshot pool (`SchedulerConfig::HasSnapshotPool()`, §4) and a blob slot; a
+round that finds no victim it can image falls back to the last resort below
+and **aborts** one instead, so a capacity block never waits on a host budget.
 
 **A retracted request loses no work.** It is *suspended*: its block tables are
 imaged to Host byte-for-byte, its Device pages are released, and the restore
@@ -426,11 +426,28 @@ classifies every data slot of every table:
   A published slot whose Host L2 block cannot be acquired after evicting
   unpinned entries falls back to the pool.
 
-The retraction is **refused** — the victim keeps running, the publication it
-did is written back as its progress — only when the pool cannot hold tail plus
-fallback, or when no blob slot is free (`SnapshotSlotAllocator`,
-`max_retracted_requests` slots). Nothing is kept on refusal, though the
-unpinned Host entries evicted for the attempt stay evicted.
+An image **does not fit** when the pool cannot hold tail plus fallback, or
+when no blob slot is free (`SnapshotSlotAllocator`, `max_retracted_requests`
+slots). `retractVictim` then changes nothing (the publication it did is
+written back as the victim's progress; unpinned Host entries evicted for the
+attempt stay evicted) and reports the shortfall. **The last resort is an
+abort, in one place.** `chooseVictim` ranks only candidates whose image fits
+(`imageFits`: a blob slot is free and `CacheCoordinator::SnapshotPoolHolds`
+the tail, the published pages being assumed to ride L2); when none does — and
+without a pool none ever does — it names the newest retractable resident (the
+least work lost; exempt requests excluded, they finish on their own reserve)
+and `Scheduler::onImageDoesNotFit` aborts it: `fsm::AbortEvent` frees its
+pages and slot in that very round, the blocked grant proceeds exactly as after
+a retraction, and the plan records it (`ExecutionPlan::aborts`, a
+`SchedulerAbort{request_id, AbortReason::kImageDoesNotFit, detail}`) so the
+runtime fails the request toward its client with the shortfall and the knob
+to raise (`--retraction-snapshot-host-gb`, `--retraction-snapshot-max-requests`).
+The same site handles a victim that passed the probe but whose L2 leg fell
+back to a pool that then could not take it. Waiting instead would deadlock
+once every resident needs a page; charging worst-case host room at admission
+would cost concurrency on every request to protect against a rare shortfall.
+The debug knob (§2, below) never aborts: a forced retraction whose image does
+not fit is refused and logged.
 
 **The victim's pages are released — and grantable — immediately**, before
 either copy has run. Both legs are stream-ordered: their tickets pin only the
@@ -506,10 +523,12 @@ shortest path out of head-of-line — largest first, freeing the most at once;
 then decode work by most newly releasable LCM blocks and fewest **generated**
 tokens — the needed pages with the fewest victims disturb the fewest clients,
 and among equal frees the client that has streamed least is interrupted.
-Exempt in both tiers: a request whose reserve already covers its whole
-generation (`Request::ReserveCoversGeneration`) — retracting it frees exactly
-what its restore must take back, pure thrash. Excluded by state: `Retracted`,
-`Restoring`, `RemotePrefilling`.
+Only candidates whose image fits are ranked (the abort fallback above takes
+over when none does). Exempt in both tiers: a request whose reserve already
+covers its whole generation (`Request::ReserveCoversGeneration`) — retracting
+it frees exactly what its restore must take back, pure thrash — and it is not
+aborted either. Excluded by state: `Retracted`, `Restoring`,
+`RemotePrefilling`.
 
 **Forced retraction** (`debug_force_retraction_interval`, a debug knob; `0`
 off) exercises the path without pressure: every `|interval|` plans the oldest
@@ -818,7 +837,8 @@ runtime never hits either refusal; they are defence in depth.
 with no request suspended both must read empty and zero.
 
 **Configuration** is explicit on every role: `snapshot_allocator.total_pages`
-(`1` = the null page alone = never retract) and `max_retracted_requests`
+(`1` = the null page alone = no image ever fits, so a capacity block aborts
+the newest resident instead of imaging one; §2) and `max_retracted_requests`
 (`0` with no pool, `> 0` with one; the runtime's slot-state arena has that
 many rows plus the null row) are validated together, the P role refuses a
 pool, and L3 storage is refused with a page-cyclic sharded group
@@ -839,7 +859,9 @@ engines that never retract), `ForwardEvent.Retract` is renamed
 and its caller in `engine/l3_cache_hooks.py` follow), and the plan carries two
 new cache op kinds (`Cache.SnapshotOp`, `Cache.RestoreOp`) with two new ACKs
 (`Cache.SnapshotDoneEvent`, `Cache.RestoreDoneEvent`) that `DeviceHandle` and
-the cache hooks must execute and count. Following AGENTS.md's release
+the cache hooks must execute and count, and `ExecutionPlan.aborts` lists the
+requests a capacity retraction aborted (§2) for the runtime to fail toward
+their clients. Following AGENTS.md's release
 sequence, the `tokenspeed-scheduler` version bump is published first and the
 runtime PR that pins it (`feat/retraction-snapshot-consume`: server args,
 `make_config`, the event rename, the op dispatch and the slot-state exporters)
@@ -867,11 +889,12 @@ lands in the same change as the pin, never a release apart.
   to it: they consume no fresh capacity within their reserve, so they keep
   running beside a stalled prefill.
 - Retraction fires only when no prefill progressed and an admission failed
-  (2), and only with a snapshot pool configured. The chosen victim must be
-  quiescent — no forward of its own in flight, no PD transfer against its
-  pages (§3.1) — and an in-flight load-back or an in-flight pinned store
-  defers all retraction; stream-ordered stores and in-flight restores defer
-  nothing. A victim that would serve nobody is not retracted.
+  (2). The chosen victim must be quiescent — no forward of its own in flight,
+  no PD transfer against its pages (§3.1) — and an in-flight load-back or an
+  in-flight pinned store defers all retraction; stream-ordered stores and
+  in-flight restores defer nothing. A victim that would serve nobody is not
+  retracted. A victim whose image does not fit is aborted through
+  `onImageDoesNotFit` and nowhere else; the debug knob never aborts.
 - Freed capacity is granted to the request it was freed for in the same plan
   build whenever the round's grammar admits the grant (2); the image copies →
   zero → load → forward order on the forward thread's stream is what makes

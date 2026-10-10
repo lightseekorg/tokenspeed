@@ -2809,6 +2809,120 @@ TEST_F(RetractSuite, AbortWhileRestoringFreesPagesOnceTheCopyIsAcknowledged) {
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 }
 
+// The host side is finite: when no candidate's image fits the snapshot pool
+// (or no blob slot is free), the capacity retraction aborts the newest
+// retractable resident instead of imaging anyone -- its pages free in the
+// same round and the blocked grant proceeds. RetractSuite's pool arithmetic:
+// "a" (3-page prompt, decoding at 9 tokens) images 4 pages x 2 groups = 8
+// blocks, "b" (2-page prompt, at 7 tokens) 3 x 2 = 6.
+class ImageDoesNotFitSuite : public RetractSuite {
+protected:
+    virtual std::int32_t SnapshotPoolBlocks() const = 0;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = RetractSuite::MakeConfig();
+        cfg.snapshot_allocator.total_pages = SnapshotPoolBlocks() + 1;
+        cfg.max_retracted_requests = cfg.max_batch_size;
+        return cfg;
+    }
+
+    // Both residents decode to the exact-fit capacity block (RetractSuite's
+    // DriveToRetractOfA up to the blocked round), without asserting who gives
+    // way. Post: a at 9 tokens and b at 7, both quiescent, the pool full.
+    void DriveToTheBlockedRound() {
+        Submit(MakeRequestSpec("a", /*num_pages=*/3));
+        Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
+        PlanOnce();
+        SendForwardDone("a", {42});
+        SendForwardDone("b", {142});
+        PlanOnce();
+        SendForwardDone("a", {43});
+        SendForwardDone("b", {143});
+        PlanOnce();
+        SendForwardDone("a", {44});
+        SendForwardDone("b", {144});
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    }
+};
+
+// Six pool blocks: b's image fits, a's does not.
+class SmallerCandidateFitsSuite : public ImageDoesNotFitSuite {
+protected:
+    std::int32_t SnapshotPoolBlocks() const override { return 6; }
+};
+
+// One pool block: no image fits.
+class NoImageFitsSuite : public ImageDoesNotFitSuite {
+protected:
+    std::int32_t SnapshotPoolBlocks() const override { return 1; }
+};
+
+TEST_F(SmallerCandidateFitsSuite, ACandidateWhoseImageFitsIsRetractedInsteadOfAbortingTheNewest) {
+    DriveToTheBlockedRound();
+    // The victim policy would take a (8 releasable blocks against b's 6),
+    // but a's image does not fit the six-block pool and b's does: b is
+    // retracted, nobody is aborted, and a's blocked decode gets b's pages.
+    const ExecutionPlan round = PlanOnce();
+    EXPECT_TRUE(round.aborts.empty());
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_EQ(scheduler_->RequestTokenSize("b"), 7) << "b is the one suspended";
+    const SnapshotStoreBatch* store = FindSnapshotStore(round);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{"b"});
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 0) << "b's six blocks fill the pool exactly";
+    const ForwardBatch* granted = FindForwardBatch(round);
+    ASSERT_NE(granted, nullptr);
+    EXPECT_EQ(granted->request_ids, std::vector<std::string>{"a"}) << "the blocked decode runs on b's pages";
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+}
+
+TEST_F(NoImageFitsSuite, WhenNoImageFitsTheNewestResidentIsAbortedAndTheGrantProceeds) {
+    DriveToTheBlockedRound();
+    // Neither image fits one pool block: the newest resident, b, is aborted
+    // in this very round -- recorded on the plan for the runtime, its pages
+    // granted to a's blocked decode -- and nothing is imaged.
+    const ExecutionPlan round = PlanOnce();
+    ASSERT_EQ(round.aborts.size(), 1u);
+    EXPECT_EQ(round.aborts.front().request_id, "b");
+    EXPECT_EQ(round.aborts.front().reason, AbortReason::kImageDoesNotFit);
+    EXPECT_NE(round.aborts.front().detail.find("--retraction-snapshot-host-gb"), std::string::npos)
+        << round.aborts.front().detail;
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(FindSnapshotStore(round), nullptr);
+    EXPECT_TRUE(ExtractCacheOps(round).empty());
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 1);
+    const ForwardBatch* granted = FindForwardBatch(round);
+    ASSERT_NE(granted, nullptr);
+    EXPECT_EQ(granted->request_ids, std::vector<std::string>{"a"}) << "the grant proceeds as after a retraction";
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+
+    // A late client abort for the same id is harmless, and the next plan
+    // reaps the finished request.
+    SendAbortEvent("b");
+    SendForwardDone("a", {45});
+    PlanOnce();
+    EXPECT_EQ(scheduler_->RequestTokenSize("b"), -1) << "b is gone once the plan reaped it";
+    SendForwardDone("a", {46});
+    SendFinish("a");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "the pool balances after the abort";
+}
+
+TEST_F(NoImageFitsSuite, TheDebugKnobNeverAborts) {
+    // Forced retraction is not capacity pressure: a victim it cannot image
+    // keeps running.
+    config_.debug_force_retraction_interval = 1;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    Submit(MakeRequestSpec("a", /*num_pages=*/2));
+    PlanOnce();
+    SendForwardDone("a", {42});
+    const ExecutionPlan forced = PlanOnce();  // arms a at plan 2 and retracts it if it fits
+    EXPECT_TRUE(forced.aborts.empty());
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u) << "a keeps its pages and runs";
+}
+
 // A mid-prefill victim resumes its next chunk: with max_scheduled_tokens = 4
 // the 6-token prompt of "a" takes two chunks, and "a" is retracted between
 // them.

@@ -31,6 +31,24 @@
 
 namespace tokenspeed {
 
+// Why the scheduler finished a request on its own.
+enum class AbortReason : std::uint8_t {
+    // A capacity retraction chose it and its KV image did not fit the host
+    // budgets (snapshot pool or blob slots), so its pages were freed by
+    // aborting it instead of imaging it (Scheduler::onImageDoesNotFit).
+    kImageDoesNotFit = 0,
+};
+
+// A request the scheduler finished this round: already Finished on every
+// rank (the plan is built identically), so the runtime only has to fail it
+// toward the client with `detail` as the message. A later Abort/Finish for
+// the id is harmless.
+struct SchedulerAbort {
+    std::string request_id;
+    AbortReason reason{AbortReason::kImageDoesNotFit};
+    std::string detail;
+};
+
 class ExecutionPlan {
 public:
     template <typename OperationType>
@@ -64,6 +82,11 @@ public:
     // receive pulls their KV into the freshly admitted (and sanitized)
     // pages. The model sees the request only after RemotePrefillDone.
     std::optional<ForwardBatch> remote_prefill;
+
+    // Requests the scheduler aborted while building this plan (none on most
+    // rounds): the last resort of a capacity retraction whose victim could
+    // not be imaged.
+    std::vector<SchedulerAbort> aborts;
 
 private:
     std::vector<Operation> operations_;

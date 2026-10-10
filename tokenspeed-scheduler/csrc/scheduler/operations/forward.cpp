@@ -619,44 +619,74 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // fewest clients, and among equal frees the client that has streamed least
 // is interrupted. (On the D role everything resident is decoding.)
 //
-// Exempt: a request whose reserve already covers its whole generation --
-// retracting it frees exactly what its readmission must take back, pure
-// thrash. Excluded by state: Retracted, Restoring, RemotePrefilling.
-// Transient obstacles (a forward still out, a PD transfer pin) do NOT
-// redirect the choice; the caller waits for the chosen victim to quiesce
-// rather than sacrificing a worse-ranked request. Without a snapshot pool
-// nothing is ever a victim: residents complete and the blocked admission
-// waits.
-Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
-    if (!config_.HasSnapshotPool()) {
-        return nullptr;
-    }
+// Only candidates whose image fits the host budgets (imageFits) are ranked.
+// When none does, the host side is out of room and the last resort is to
+// abort a resident instead of imaging one: the newest retractable resident
+// (the least work lost) is returned with image_fits = false. Without a
+// snapshot pool nothing ever fits, so a capacity block there always ends in
+// that abort rather than in a wait that could deadlock once every resident
+// needs a page.
+//
+// Exempt in both tiers: a request whose reserve already covers its whole
+// generation -- retracting it frees exactly what its readmission must take
+// back, pure thrash -- and it is not aborted either: it completes on its own
+// reserve and frees its pages then. Excluded by state: Retracted, Restoring,
+// RemotePrefilling. Transient obstacles (a forward still out, a PD transfer
+// pin) do NOT redirect the choice; the caller waits for the chosen victim to
+// quiesce rather than sacrificing a worse-ranked request.
+Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates) const {
+    const auto retractable = [](const Request& request) {
+        return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
+               !request.ReserveCoversGeneration(kRetractionSafeSteps);
+    };
     Request* victim = nullptr;
     for (Request* request : candidates) {
-        const auto* prefilling = request->GetIf<fsm::Prefilling>();
-        if (prefilling != nullptr && !request->ReserveCoversGeneration(kRetractionSafeSteps) &&
-            (victim == nullptr || request->TokenSize() > victim->TokenSize())) {
+        if (request->Is<fsm::Prefilling>() && retractable(*request) &&
+            (victim == nullptr || request->TokenSize() > victim->TokenSize()) && imageFits(*request)) {
             victim = request;
         }
     }
     if (victim != nullptr) {
-        return victim;
+        return VictimChoice{.victim = victim, .image_fits = true};
     }
 
     std::optional<std::tuple<std::int32_t, std::int32_t, std::string>> victim_rank;
+    Request* newest = nullptr;
     for (Request* request : candidates) {
-        if ((!request->Is<fsm::Decoding>() && !request->Is<fsm::PrefillDone>()) ||
-            request->ReserveCoversGeneration(kRetractionSafeSteps)) {
+        if (!retractable(*request)) {
+            continue;
+        }
+        newest = request;  // candidates arrive in submission order
+        if (!request->IsAnyOf<fsm::Decoding, fsm::PrefillDone>()) {
             continue;
         }
         auto rank = std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),
                                request->GeneratedTokens(), request->Id()};
-        if (!victim_rank || rank < *victim_rank) {
+        if ((!victim_rank || rank < *victim_rank) && imageFits(*request)) {
             victim = request;
             victim_rank = std::move(rank);
         }
     }
-    return victim;
+    if (victim != nullptr) {
+        return VictimChoice{.victim = victim, .image_fits = true};
+    }
+    return VictimChoice{.victim = newest, .image_fits = false};
+}
+
+bool Scheduler::imageFits(const Request& request) const {
+    if (snapshot_slots_.AvailableSlots() == 0) {
+        return false;
+    }
+    const std::int32_t num_computed_tokens = request.NumComputedTokens();
+    // The published slots ride Host L2 (StartRetractionStores pins or copies
+    // them there); only the rest must fit the pool. Pages the request has
+    // completed but not yet hashed are published at retraction and join the
+    // L2 leg too, so the probe is conservative only by those pages.
+    const std::vector<std::vector<ImageSlot>> published =
+        coordinator_.PublishedDataSlots(request.BlockTablesRef(), num_computed_tokens);
+    return coordinator_.SnapshotPoolHolds(
+        request.BlockTablesRef(), num_computed_tokens,
+        coordinator_.HasHostPool() ? published : std::vector<std::vector<ImageSlot>>(published.size()));
 }
 
 // Suspends a quiescent victim with its image. First the completed prefix
@@ -669,12 +699,12 @@ Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
 // retract event and may be granted away in this very round, because the
 // runtime orders both copies on the forward thread's stream ahead of the
 // plan's page reuse. A victim whose image cannot be held, or with no blob
-// slot free, is not retracted: the caller waits, and the publication it did
-// is written back as the victim's progress so it is not redone.
-bool Scheduler::retractVictim(Request& victim, PlanBuild& build,
-                              std::vector<WriteBackOperation>& write_back_operations) {
+// slot free, is not retracted: the shortfall is returned, and the publication
+// it did is written back as the victim's progress so it is not redone.
+std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
+    Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations) {
     if (snapshot_slots_.AvailableSlots() == 0) {
-        return false;
+        return ImageShortfall::kBlobSlot;
     }
     fsm::CacheProgress cache_progress = victim.CacheProgress();
     // Only what has actually been computed may be published as a prefix: an
@@ -702,9 +732,7 @@ bool Scheduler::retractVictim(Request& victim, PlanBuild& build,
     if (!stores) {
         // The publication stands; the victim keeps running with it recorded.
         victim.CacheProgressRef() = std::move(cache_progress);
-        spdlog::info("[Scheduler] retract: request {} ({} tokens) keeps its pages, its image does not fit", victim.Id(),
-                     victim.TokenSize());
-        return false;
+        return ImageShortfall::kSnapshotPool;
     }
     victim.NoteRetracted();
     victim.CacheProgressRef() = std::move(cache_progress);
@@ -717,7 +745,27 @@ bool Scheduler::retractVictim(Request& victim, PlanBuild& build,
                                            std::move(stores->pending_store_ops)});
     spdlog::info("[Scheduler] retract: suspended request {} ({} tokens) with its image", victim.Id(),
                  victim.TokenSize());
-    return true;
+    return std::nullopt;
+}
+
+void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build) {
+    const std::string detail =
+        shortfall == ImageShortfall::kBlobSlot
+            ? "no slot-state blob slot is free (max_retracted_requests=" +
+                  std::to_string(config_.max_retracted_requests) + "; raise --retraction-snapshot-max-requests)"
+            : "the snapshot pool cannot hold the image (num_snapshot_pages=" +
+                  std::to_string(config_.snapshot_allocator.total_pages) + "; raise --retraction-snapshot-host-gb)";
+    spdlog::warn(
+        "[Scheduler] capacity abort: request {} ({} tokens) cannot be imaged -- {}; aborting it to free its "
+        "pages for the blocked admission",
+        victim.Id(), victim.TokenSize(), detail);
+    build.plan.aborts.push_back(SchedulerAbort{
+        .request_id = victim.Id(),
+        .reason = AbortReason::kImageDoesNotFit,
+        .detail = detail,
+    });
+    // Pages and request-pool slot return now; the grant proceeds on them.
+    victim.Apply(fsm::AbortEvent{&coordinator_});
 }
 
 // Fires only when no prefill progressed this round and an admission failed
@@ -742,6 +790,13 @@ bool Scheduler::retractVictim(Request& victim, PlanBuild& build,
 // Device pages come back at the ACK without anyone giving way, so retracting
 // for capacity they hold would be the same thrash.
 //
+// The host side is finite too. When no candidate's image fits (no blob slot,
+// or a snapshot pool too small for the tail -- always, without a pool) the
+// last resort is to ABORT the newest retractable resident instead of imaging
+// anyone (onImageDoesNotFit): its pages free in this round exactly as a
+// retraction's would and the grant proceeds. The alternative, waiting, can
+// deadlock once every resident needs a page.
+//
 // A grant that cannot join its round (a fused prefill beside an already-built
 // decode batch outside mixed mode) still retracts one victim: the next
 // round's phase order tries the blocker before any other claim on the freed
@@ -765,7 +820,8 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     }
 
     while (true) {
-        Request* victim = chooseVictim(candidates);
+        const VictimChoice choice = chooseVictim(candidates);
+        Request* victim = choice.victim;
         if (victim == nullptr) {
             return;  // everything resident is exempt; only a completion can free capacity
         }
@@ -798,8 +854,18 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                 return;
             }
         }
-        if (!retractVictim(*victim, build, write_back_operations)) {
-            return;  // its image does not fit; the blocked admission waits, nobody else gives way
+        // A victim nobody can image (or whose image turns out not to fit
+        // once the L2 leg is tried) is aborted: the last resort frees its
+        // pages for the grant all the same.
+        std::optional<ImageShortfall> shortfall;
+        if (choice.image_fits) {
+            shortfall = retractVictim(*victim, build, write_back_operations);
+        } else {
+            shortfall =
+                snapshot_slots_.AvailableSlots() == 0 ? ImageShortfall::kBlobSlot : ImageShortfall::kSnapshotPool;
+        }
+        if (shortfall) {
+            onImageDoesNotFit(*victim, *shortfall, build);
         }
         if (build.Full(config_.max_batch_size)) {
             return;
@@ -885,7 +951,9 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
         return;
     }
     forced_victim_id_.clear();
-    if (!retractVictim(*armed, build, write_back_operations)) {
+    // The knob is not capacity pressure: a victim it cannot image is left
+    // running, never aborted (onImageDoesNotFit is the retraction loop's).
+    if (retractVictim(*armed, build, write_back_operations)) {
         spdlog::info("[Scheduler] forced retraction of request {} refused: its image does not fit", armed->Id());
     }
 }

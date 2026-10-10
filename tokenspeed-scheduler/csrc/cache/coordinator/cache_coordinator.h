@@ -207,6 +207,18 @@ public:
     // the probe over every group precedes the first acquisition.
     std::optional<ImageTaken> TakeImage(std::span<const BlockTable> tables, std::int32_t num_tokens,
                                         std::span<const std::vector<ImageSlot>> host_cached_slots);
+    // TakeImage's fit probe alone, no mutation: whether the snapshot pool
+    // holds every data slot of [0, num_tokens) that host_served_slots (per
+    // group, by slot_index and key; the blocks are not read) does not cover.
+    // The victim policy asks this before choosing a victim.
+    bool SnapshotPoolHolds(std::span<const BlockTable> tables, std::int32_t num_tokens,
+                           std::span<const std::vector<ImageSlot>> host_served_slots) const;
+    // Slots covering [0, num_tokens) of a table and the capacity left inside
+    // the last of them.
+    struct DataSpan {
+        std::int32_t blocks{0};
+        std::int32_t tail_tokens{0};
+    };
     // Rebuilds every group's table from its image -- identical block count,
     // null holes, tail capacity and reclaimed prefix, one fresh Device block
     // per imaged slot in the imaged bucket -- and then admits `demands` on
@@ -346,6 +358,15 @@ private:
         CoordinatorMatch host;
     };
 
+    // The snapshot pool's share of an image, probed without acquiring: per
+    // group the data span and the slots (with their buckets) that ride the pool.
+    struct SnapshotPoolPlan {
+        std::vector<DataSpan> spans;
+        std::vector<std::vector<std::int32_t>> private_slots;
+        std::vector<std::vector<std::int32_t>> private_buckets;
+    };
+    std::optional<SnapshotPoolPlan> planSnapshotPool(std::span<const BlockTable> tables, std::int32_t num_tokens,
+                                                     std::span<const std::vector<ImageSlot>> host_served_slots) const;
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     void rememberStorageKey(const CacheKey& key);
     void evictStorageKeysToLimit();

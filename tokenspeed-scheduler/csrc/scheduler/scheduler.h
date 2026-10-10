@@ -329,12 +329,34 @@ private:
     // free page waiting for whoever asks first next round.
     void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
-    Request* chooseVictim(std::span<Request* const> candidates) const;
+    // Who gives way, and whether it can be imaged. `victim` is nullptr when
+    // nobody can (every resident is exempt or there is no resident); with
+    // image_fits false it is the newest retractable resident, to be aborted
+    // because no candidate's image fits the host budgets.
+    struct VictimChoice {
+        Request* victim{nullptr};
+        bool image_fits{false};
+    };
+    VictimChoice chooseVictim(std::span<Request* const> candidates) const;
+    // Whether the host budgets hold the request's image right now: a blob
+    // slot is free and the snapshot pool holds the tail, the published pages
+    // being assumed to ride Host L2 (an L2 shortfall falls back to the pool
+    // at retraction time, where it can still turn out not to fit).
+    bool imageFits(const Request& request) const;
+    // Why a victim could not be imaged.
+    enum class ImageShortfall { kBlobSlot, kSnapshotPool };
     // Images the victim (Host L2 for its published pages, the snapshot pool
-    // for the rest), issues both store legs and suspends it. False, with
-    // nothing changed but Host entries evicted for the attempt, when the
-    // image cannot be held or no blob slot is free: the caller waits.
-    bool retractVictim(Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations);
+    // for the rest), issues both store legs and suspends it. Returns the
+    // shortfall -- with nothing changed but Host entries evicted for the
+    // attempt -- when the image cannot be held or no blob slot is free.
+    std::optional<ImageShortfall> retractVictim(Request& victim, PlanBuild& build,
+                                                std::vector<WriteBackOperation>& write_back_operations);
+    // The one site of the last-resort policy: a capacity retraction whose
+    // victim cannot be imaged aborts that victim instead -- its pages and
+    // slot return in this very round and the blocked grant proceeds as after
+    // a retraction -- and records it on the plan for the runtime to fail the
+    // request toward its client.
+    void onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build);
     // The debug_force_retraction_interval knob: arms the oldest Decoding
     // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
     // the batch until it is quiescent, then retracts it.

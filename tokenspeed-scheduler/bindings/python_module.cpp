@@ -376,10 +376,22 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         return result;
     };
 
+    // A request the scheduler finished on its own while building the plan:
+    // the last resort of a capacity retraction whose victim's KV image did not
+    // fit the host budgets. Already Finished on every rank; the runtime fails
+    // it toward the client with `detail` as the message.
+    nb::enum_<tokenspeed::AbortReason>(m, "AbortReason", nb::is_arithmetic())
+        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit);
+    nb::class_<tokenspeed::SchedulerAbort>(m, "SchedulerAbort")
+        .def_ro("request_id", &tokenspeed::SchedulerAbort::request_id)
+        .def_ro("reason", &tokenspeed::SchedulerAbort::reason)
+        .def_ro("detail", &tokenspeed::SchedulerAbort::detail);
+
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
+        .def_ro("aborts", &tokenspeed::ExecutionPlan::aborts)
         .def_prop_ro("remote_decode",
                      [](const tokenspeed::ExecutionPlan& plan) -> nb::object {
                          if (!plan.remote_decode) {
