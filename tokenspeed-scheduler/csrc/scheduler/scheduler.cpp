@@ -200,7 +200,7 @@ bool Scheduler::cacheIsClearable(bool include_host) const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
-    if (has_pd_transfers || has_tier_transfers) {
+    if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0) {
         return false;
     }
     return coordinator_.CacheIsClearable(include_host);
@@ -211,13 +211,19 @@ bool Scheduler::clearCache(bool include_host) {
     // completes its pin check before mutating anything -- so residency is not
     // this function's business. What IS its business are the writers the pins
     // do not cover: an asynchronous transfer still landing into a cached
-    // block would race a clear that succeeded on the pin check alone.
+    // block would race a clear that succeeded on the pin check alone. And the
+    // images the pins do not show: a request suspended with its KV on Host
+    // continues from those bytes once restored, so a flush (a weight update)
+    // under it would resume old-weight KV under new weights. Its L2 leg is
+    // pinned and would refuse the Host clear by itself; its snapshot-pool leg
+    // is not indexed anywhere, so the suspended set is checked directly.
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
-    if (has_pd_transfers || has_tier_transfers) {
-        spdlog::info("[Scheduler] flush L1 cache rejected: pd_transfers={} tier_transfers={}", has_pd_transfers,
-                     has_tier_transfers);
+    const std::size_t suspended = RetractedSize();
+    if (has_pd_transfers || has_tier_transfers || suspended > 0) {
+        spdlog::info("[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={}",
+                     include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended);
         return false;
     }
     const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();

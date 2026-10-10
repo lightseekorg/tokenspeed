@@ -785,12 +785,19 @@ the skipped forward retract together so ranks stay aligned, and a D-role
 so suffix-only KV cannot land on empty prefix pages. The client is not failed.
 
 **Weight updates and flushes.** `Scheduler::RetractedSize()` counts the
-requests suspended with an image (`Retracted` + `Restoring`); a cache flush is
-refused while any image copy is in flight (`HasAnyInFlight` includes the
-snapshot ops) and `ClearCache` refuses pinned Host entries, so an image is
-never invalidated under a suspended request. `SnapshotPoolFreeBlocks()` and
-`HostPoolPinnedBlocks()` are the leak checks: with no request suspended both
-must read empty and zero.
+requests suspended with an image (`Retracted` + `Restoring`), and every flush
+(`ClearCache`, `ClearL1Cache`, and the `CanClearCache` probe the replica
+MIN-reduces before clearing) refuses while it is non-zero: a suspended
+request continues from its image once restored, so a flush under it — a
+weight update — would resume old-weight KV under new weights. The pinned Host
+entries of an L2 leg would refuse the Host clear by themselves, but a
+snapshot-pool leg (always, with `--disable-kvstore`) is indexed nowhere and
+visible through no pin, hence the explicit count. A flush is likewise refused
+while any image copy is in flight (`HasAnyInFlight` includes the snapshot
+ops). The pause drain counts suspended requests as waiting, so a correct
+runtime never hits either refusal; they are defence in depth.
+`SnapshotPoolFreeBlocks()` and `HostPoolPinnedBlocks()` are the leak checks:
+with no request suspended both must read empty and zero.
 
 **Configuration** is explicit on every role: `snapshot_allocator.total_pages`
 (`1` = the null page alone = never retract) and `max_retracted_requests`

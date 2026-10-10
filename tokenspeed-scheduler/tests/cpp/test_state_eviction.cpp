@@ -75,6 +75,25 @@ protected:
         return ResidentBlocks() - static_cast<std::int32_t>(history_blocks);
     }
 
+    // Decodes `survivor` until no unpinned Device cache entry is left: its
+    // growth evicts the suspended victim's still-cached blocks, so the restore
+    // that follows must copy them back from Host instead of claiming them. (A
+    // flush is refused while a request is suspended, so this is the way to
+    // reach that state.) Streams the survivor publishes are acknowledged as
+    // they appear.
+    void DecodeUntilDeviceCacheIsConsumed(const std::string& survivor, std::int32_t& next_token) {
+        for (std::int32_t round = 0; round < 64 && scheduler_->AvailableLcmBlocks() > 0; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_NE(batch, nullptr);
+            if (std::ranges::find(batch->request_ids, survivor) != batch->request_ids.end()) {
+                SendForwardDone(survivor, {next_token++});
+            }
+        }
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0) << "the survivor took every evictable block";
+    }
+
     static std::int32_t StateStoreCount(const ExecutionPlan& plan) {
         std::int32_t count = 0;
         for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
@@ -609,16 +628,21 @@ TEST_F(StatePublicationSuite, IncompletePrefillRetractionPublishesItsComputedSta
     const SnapshotStoreBatch* tail = FindSnapshotStore(retract);
     ASSERT_NE(tail, nullptr);
     EXPECT_TRUE(tail->src_pages.at(0).empty()) << "8 computed tokens end on a page boundary";
-    AckImageStores(retract);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 3) << "the suspended prompt pins its three Host entries";
     SendForwardDone("resident", {43});
+    EXPECT_FALSE(scheduler_->ClearL1Cache()) << "a flush is refused while a request is suspended with an image";
+    // The image has not landed, so no restore is attempted (it would claim
+    // the victim's still-cached Device blocks) while the resident's growth
+    // evicts them.
+    std::int32_t next_token = 44;
+    DecodeUntilDeviceCacheIsConsumed("resident", next_token);
+    AckImageStores(retract);
+    EXPECT_GE(scheduler_->HostPoolCachedBlocks(), 6) << "the ACK publishes the image's entries beside the resident's";
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 3) << "the suspended prompt pins its three Host entries";
     SendAbortEvent("resident");
-    ASSERT_TRUE(scheduler_->ClearL1Cache());
 
-    // With the Device index cleared the restore copies the three published
-    // blocks back from Host -- history and the state checkpoint alike -- and
-    // the prompt then runs its second chunk from the checkpoint.
+    // With the victim's Device entries evicted the restore copies the three
+    // published blocks back from Host -- history and the state checkpoint
+    // alike -- and the prompt then runs its second chunk from the checkpoint.
     const ExecutionPlan recovery = PlanOnce();
     const SnapshotRestoreBatch* restore = FindRestore(recovery);
     ASSERT_NE(restore, nullptr);
@@ -765,8 +789,11 @@ TEST_F(StatePublicationSuite, ADecodingVictimResumesDecodingWithOrWithoutHostCac
         EXPECT_EQ(ExtractCacheOpsOfKind<WriteBackBatch>(retract).empty(), !host_cache)
             << "the published history pages ride Host L2 exactly when there is one";
 
+        EXPECT_FALSE(scheduler_->ClearL1Cache()) << "a flush is refused while a request is suspended with an image";
+        EXPECT_FALSE(scheduler_->CanClearCache());
+        std::int32_t next_token = 1000;
+        DecodeUntilDeviceCacheIsConsumed(survivor, next_token);
         SendAbortEvent(survivor);
-        ASSERT_TRUE(scheduler_->ClearL1Cache()) << "the victim's own Device entries are unpinned cache";
         const ExecutionPlan recovery = PlanOnce();
         const SnapshotRestoreBatch* restore = FindRestore(recovery);
         ASSERT_NE(restore, nullptr);

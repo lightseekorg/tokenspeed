@@ -2617,6 +2617,35 @@ TEST_F(RetractSuite, ARestoreWaitsForBothStoreAcksAndNeverRunsAPrefill) {
     EXPECT_TRUE(FindForwardBatch(readmit)->request_ids.empty());
 }
 
+TEST_F(RetractSuite, AFlushIsRefusedWhileARequestIsSuspendedWithASnapshotOnlyImage) {
+    // Without a Host cache the whole image rides the snapshot pool, which no
+    // prefix index sees: once the stores are acknowledged and the survivor
+    // is gone, nothing is in flight and no cached block is pinned -- only the
+    // suspended request itself stands between a flush and KV that would be
+    // restored under new weights.
+    DriveToRetractOfA();
+    AckImageStores(retract_round_);
+    SendFinish("b");
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    ASSERT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "no Host cache: the image is visible through no pin";
+    EXPECT_FALSE(scheduler_->CanClearCache());
+    EXPECT_FALSE(scheduler_->ClearCache());
+    EXPECT_FALSE(scheduler_->ClearL1Cache());
+
+    // Restoring counts as suspended too: the image is still the request's KV.
+    ExecutionPlan readmit = PlanOnce();
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    EXPECT_FALSE(scheduler_->CanClearCache());
+    AckRestores(readmit);
+    ASSERT_EQ(scheduler_->RetractedSize(), 0u);
+
+    // With the request resumed and then finished, the flush goes through.
+    SendFinish("a");
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->CanClearCache());
+    EXPECT_TRUE(scheduler_->ClearCache());
+}
+
 TEST_F(RetractSuite, AbortWhileRetractedReleasesTheImage) {
     DriveToRetractOfA();
     EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14 - 8);

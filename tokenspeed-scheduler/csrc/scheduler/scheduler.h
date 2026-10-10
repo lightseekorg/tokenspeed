@@ -62,8 +62,12 @@ public:
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
-    // Same in-flight and pin checks as ClearCache, with no mutation. Weight
-    // updates MIN-reduce this across the replica before any rank clears.
+    // Same in-flight, pin and suspended-request checks as ClearCache, with no
+    // mutation. Weight updates MIN-reduce this across the replica before any
+    // rank clears. Every flush refuses while RetractedSize() > 0: a
+    // suspended request's image would otherwise resume old KV under a flushed
+    // (re-weighted) engine, and its snapshot-pool leg is visible through no
+    // pin.
     bool CanClearCache() const;
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
