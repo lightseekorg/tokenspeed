@@ -470,7 +470,8 @@ class DeviceHandle:
             )
             return self._submit_forward(planned, capture_next_input_ids=True)
 
-        # Plain engine, or a D-role decode / local recovery prefill. A
+        # Plain engine, or a D-role decode (the D role runs no local prefill:
+        # a retracted request resumes by restore, not by recompute). A
         # constrained request's matcher was advanced past the prefill node's
         # token when its RemotePrefillDoneEvent landed, so masking continues
         # from the right state.

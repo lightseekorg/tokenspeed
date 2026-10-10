@@ -121,9 +121,10 @@ D arguments:
 ```
 
 `auto` keeps ordinary decode on low latency and CUDA graph. If cache
-pressure retracts a request and the scheduler performs a recovery prefill,
-that extend-shaped work uses normal dispatch and eager execution. Disabling
-KVStore does not eliminate recovery prefills.
+pressure retracts a request, the scheduler images it to Host and restores it
+by a copy, never by a prefill, so the decode node runs no extend-shaped work
+(`--retraction-snapshot-host-gb` sizes the image pool; without it the
+scheduler never retracts and a blocked admission waits).
 
 `max-num-seqs` is global across DP: this example allows 32 requests per D
 replica and captures through that local batch size. Keep graph padding

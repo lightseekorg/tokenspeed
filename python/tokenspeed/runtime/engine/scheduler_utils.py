@@ -328,15 +328,6 @@ def aligned_max_scheduled_tokens(
 # "No bound" for RequestSpec.max_cached_prefix_tokens (the C++ default).
 UNBOUNDED_CACHED_PREFIX_TOKENS = 2**31 - 1
 
-# The scheduler's retraction safe-step window (``kRetractionSafeSteps`` in
-# ``tokenspeed-scheduler/csrc/scheduler/operations/forward.cpp``; see
-# ``docs/design/scheduler.md`` section 4): a decoding role prepays this many
-# decode tokens of headroom at admission, so a request declaring
-# ``max_new_tokens`` within it holds its whole generation up front and is never
-# a retraction victim. A decode engine whose attention cannot run a recovery
-# prefill (``--attn-head-tp-size``) admits only such requests.
-RETRACTION_SAFE_STEPS = 4096
-
 
 def make_spec(
     rid: str,

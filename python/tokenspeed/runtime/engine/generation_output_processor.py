@@ -136,7 +136,8 @@ class RequestState:
         # ingress rejected out-of-range values). ``input_token_logprobs`` is
         # the position-indexed accumulator for the prompt positions that need
         # logits, ``[start, input_length - 1)``, filled across prefill chunks
-        # (a re-prefill after retraction overwrites with equal values);
+        # (a re-prefill after a recompute retract overwrites with equal values;
+        # a restored request re-prefills nothing);
         # ``_val``/``_idx`` are the finalized lists, None until the prompt's
         # final chunk commits. A decode-role request never finalizes -- the
         # prefill node returns them -- so it ships [] like a request that did
@@ -277,8 +278,9 @@ class RequestState:
     def finalize_input_token_logprobs(self) -> None:
         """Assemble the SGLang lists once the prompt's final chunk committed.
 
-        Idempotent: a retracted request re-prefills its prompt but keeps the
-        lists it already built. Element 0 is ``(None, ids[start])``; element
+        Idempotent: a request retracted for recompute re-prefills its prompt
+        but keeps the lists it already built. Element 0 is ``(None,
+        ids[start])``; element
         ``k`` is the logprob of ``ids[start + k]`` given its prefix. The ids are
         the tokenizer-valid prompt (multimodal pad hashes are not tokens).
         """
@@ -802,9 +804,11 @@ class OutputProcesser:
         output_tokens_list = model_execution_results.output_tokens.tolist()
         self._record_input_token_logprobs(forward_op, model_execution_results)
         # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
-        # After a retract the victim's generated tokens are rebased into the
-        # prefill window (RebasePrefill), so this can exceed the original prompt
-        # length that RequestState.prefill_finished compares against.
+        # After a recompute retract (the L3-miss path; a capacity retraction
+        # restores the request instead and re-prefills nothing) the victim's
+        # generated tokens are rebased into the prefill window
+        # (RebasePrefill), so this can exceed the original prompt length that
+        # RequestState.prefill_finished compares against.
         prefill_lengths = forward_op.prefill_lengths
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
@@ -829,7 +833,7 @@ class OutputProcesser:
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
             # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
-            # retract; C++ owes no token and the sampled one is garbage).
+            # a recompute retract; C++ owes no token and the sampled one is garbage).
             # Fresh requests: prefill_length == prompt length, same as the gate below.
             if (
                 not is_decode_slot
@@ -838,10 +842,10 @@ class OutputProcesser:
             ):
                 # It owes no token, but the chunk's KV has landed -- report
                 # that much, so the scheduler stops counting a forward
-                # against these pages and may retract the request if the
-                # next round needs them. A NaN flag on this chunk (its prompt
-                # logprobs, or its last row's logits) terminates the request
-                # when the prompt completes.
+                # against these pages and may retract the request (imaging
+                # the landed chunk) if the next round needs them. A NaN flag
+                # on this chunk (its prompt logprobs, or its last row's
+                # logits) terminates the request when the prompt completes.
                 if nan_flags_list is not None and nan_flags_list[i]:
                     request_state.numerical_error_detected = True
                 request_changes.append(make_extend_result_event(rid))
@@ -1043,7 +1047,7 @@ class OutputProcesser:
         The flat result follows the plan's extend-slot order; each slot's
         rows start at the prompt position the plan recorded, so a chunk lands
         at its own positions whatever earlier chunks (or a re-prefill after
-        retraction) delivered.
+        a recompute retract) delivered.
         """
         plan = model_execution_results.input_logprob_plan
         logprobs = model_execution_results.input_token_logprobs

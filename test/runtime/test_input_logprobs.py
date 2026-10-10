@@ -728,10 +728,9 @@ def _handler(disaggregation_mode: str) -> RequestHandler:
     handler.tokenizer = None
     handler.hf_eos_token_id = None
     handler.max_req_len = 4096
-    # The layouts that refuse prompt logprobs or cap the generation budget
-    # (LM-head TP / head TP under attention DP) are off in these cases.
+    # The layout that refuses prompt logprobs (LM-head TP under attention DP)
+    # is off in these cases.
     handler.supports_input_logprobs = True
-    handler.max_new_tokens_budget = None
     return handler
 
 

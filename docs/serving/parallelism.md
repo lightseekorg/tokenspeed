@@ -118,14 +118,11 @@ engine keeps every extend-shaped forward off its path:
 - startup tunes on a decode step instead of the usual extend-shaped dummy
   forward, and the prefill CUDA graph (which records extend forwards) is
   turned off (`--disable-prefill-graph` is set, with a log line);
-- the one prefill a decode node otherwise runs -- the local recovery after a
-  capacity retraction (`docs/design/scheduler.md`, sections 2 and 4) -- is
-  kept unreachable through the scheduler's own rule: a request whose declared
-  generation fits one retraction safe-step window (4096 new tokens) has its
-  whole generation reserved at admission and is never a retraction victim. A
-  head-TP decode engine therefore admits only requests with
-  `max_new_tokens <= 4096` (declared explicitly; an undeclared budget is the
-  context remainder) and finishes any other with an abort error.
+- a decode node runs no prefill of its own in any case: a request a capacity
+  retraction suspends is imaged to Host and copied back by a restore
+  (`docs/design/scheduler.md`, sections 2 and 4), never recomputed, so the
+  layout needs no admission rule and no generation cap -- any
+  `max_new_tokens` is admitted, as on every other engine.
 
 A prefill row reaching the attention is then an invariant violation and
 raises, not a configuration the operator can hit.
@@ -668,8 +665,8 @@ the page-sharded KV of `--decode-context-parallel-size` -- as attention TP
 runs it) and all-reduce the `o_proj` partials (all-gather the
 hidden shards under `--tp-batch-invariant attn`). The expanded (dense MLA)
 prefill still refuses head TP; the layout serves the absorbed sparse prefill
-only. The decode-only rules of the DP layout (role, decode-shaped autotune,
-the generation budget) do not apply: the prefill role's rules above and
+only. The decode-only rules of the DP layout (role, decode-shaped autotune)
+do not apply: the prefill role's rules above and
 `--attn-head-tp-size == --prefill-context-parallel-size` gate it.
 
 Memory: the head-shardable weights of one attention instance go from the

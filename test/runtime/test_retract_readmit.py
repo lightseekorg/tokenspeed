@@ -18,17 +18,23 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Unit tests for ``OutputProcesser.post_process_forward_op`` after retraction.
+"""Unit tests for ``OutputProcesser.post_process_forward_op`` after a recompute retract.
 
-Retraction rebases the victim's generated tokens into its prefill window
-(C++ RebasePrefill), so on re-admission the op's ``prefill_lengths`` exceeds
-the original prompt length that RequestState.prefill_finished compares
-against. A mid-chunk re-prefill slot must emit an EMPTY ExtendResultEvent --
-the arrival clears the in-flight count that protects the chunk's pages, but
-the C++ FSM is still Prefilling and a token would make it throw -- and
-stream NO token (the sampled one is garbage). The gate is the op's own
-chunking criterion:
+The recompute path is the L3-miss-after-admit retract (``RecomputeRetract``):
+the destination pages were never filled, so the request drops to Submitted
+and re-prefills like a newcomer, with its generated tokens rebased into its
+prefill window (C++ RebasePrefill). On re-admission the op's
+``prefill_lengths`` therefore exceeds the original prompt length that
+RequestState.prefill_finished compares against. A mid-chunk re-prefill slot
+must emit an EMPTY ExtendResultEvent -- the arrival clears the in-flight
+count that protects the chunk's pages, but the C++ FSM is still Prefilling
+and a token would make it throw -- and stream NO token (the sampled one is
+garbage). The gate is the op's own chunking criterion:
 ``extend_prefix_lens[i] + input_lengths[i] < prefill_lengths[i]``.
+
+A capacity retraction never reaches this code: the scheduler suspends the
+victim with its image and restores it to the state it left, so no
+re-prefill and no rebase happen.
 """
 
 from __future__ import annotations
@@ -141,7 +147,7 @@ def _kinds(events) -> list[str]:
 
 
 def test_mid_chunk_readmit_slot_reports_empty_and_streams_nothing():
-    # Retract-rebase shape: prompt is 3 tokens but the op's prefill length is 9
+    # Recompute-retract rebase shape: prompt is 3 tokens but the op's prefill length is 9
     # (prompt + 6 generated tokens rebased into the prefill window). First
     # re-admission chunk covers 4+4=8 < 9 — mid-chunk, C++ owes no result.
     sender = _Sender()

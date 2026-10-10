@@ -260,9 +260,12 @@ class AttentionLayerMapping(MappingBase):
     def head_tp_serves_decode_only(self) -> bool:
         """Head TP over attention-DP ranks serves decode rows only: an expanded
         prefill needs every head's K/V for the cached prefix, which the
-        head-sharded ``kv_b_proj`` cannot produce. Over the query shards of a
-        QCP group the sparse prefill is absorbed and the extend rows take the
-        exchange, so that layout serves the prefill role."""
+        head-sharded ``kv_b_proj`` cannot produce. The engine therefore tunes
+        on a decode step and runs no prefill graph; it needs no admission
+        rule for it, because a retracted request resumes by restore, not by
+        a recovery prefill. Over the query shards of a QCP group the sparse
+        prefill is absorbed and the extend rows take the exchange, so that
+        layout serves the prefill role."""
         return self.has_head_tp and not self.has_qcp
 
     @cached_property
