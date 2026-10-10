@@ -34,8 +34,14 @@ __all__ = ["launch_gluon_dsv4_prefill_gfx950"]
 
 
 def _use_sparse_prefill(q: torch.Tensor, indices: torch.Tensor) -> bool:
-    # Compact H=64/128 helper does not skip -1 pads; width 128 uses the generic kernel.
-    return q.shape[1] in (64, 128) and indices.shape[1] > 128
+    # Compact H=64/128 helper does not skip -1 pads; width 128 uses the generic
+    # kernel. Below 64 heads the helper masks the missing heads of its 64-head
+    # block and checks every row; still faster than the generic kernel (V4.1
+    # TP4, 16 heads, 8192 tokens x 640 rows: 2288 -> 1939 us).
+    heads, width = q.shape[1], indices.shape[1]
+    if heads < 64:
+        return width > 128 and width % 64 == 0
+    return heads in (64, 128) and width > 128
 
 
 @gluon.jit
@@ -514,6 +520,9 @@ def launch_gluon_dsv4_prefill_gfx950(
             attn_sink=attn_sink,
             softmax_scale=scale,
             out=output,
+            # Below 64 heads (DSV4.1 TP4) the selected rows may hold -1 holes
+            # below ``lens``, which only the non-compact mode skips.
+            assume_compact_indices=q.shape[1] >= 64,
         )
 
     kv_rows = kv.reshape(-1, 512)
