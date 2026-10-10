@@ -111,6 +111,13 @@ def _routing_kind(
     return "plain"
 
 
+# sqrt-softplus top-k kernels that apply routed_scaling_factor before their
+# FP32 weight store, saving the separate multiply launch.
+_SQRT_SOFTPLUS_TOPK_KERNELS_WITH_SCALING = frozenset(
+    {"triton_sqrt_softplus_topk", "gluon_sqrt_softplus_topk_gfx950"}
+)
+
+
 def moe_topk(
     router_logits: torch.Tensor,
     top_k: int,
@@ -310,6 +317,7 @@ def moe_topk(
                     (0, top_k), dtype=topk_indices_dtype, device=router_logits.device
                 ),
             )
+        scales_in_kernel = kernel.name in _SQRT_SOFTPLUS_TOPK_KERNELS_WITH_SCALING
         topk_weights, topk_ids, _ = kernel(
             router_logits,
             top_k,
@@ -318,8 +326,9 @@ def moe_topk(
             hash_indices_table,
             input_ids,
             False,
+            **({"routed_scaling_factor": scaling_factor} if scales_in_kernel else {}),
         )
-        if scaling_factor != 1.0:
+        if scaling_factor != 1.0 and not scales_in_kernel:
             topk_weights = topk_weights * scaling_factor
         return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
 
