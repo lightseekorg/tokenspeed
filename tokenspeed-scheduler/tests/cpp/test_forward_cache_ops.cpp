@@ -695,6 +695,48 @@ TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether
     EXPECT_NO_THROW(config.Validate());
 }
 
+TEST(SchedulerConfigValidateTest, ForcedRetractionRequiresASnapshotPool) {
+    // The knob retracts through the capacity path, which images the victim:
+    // with the null page alone there is nowhere to put the image.
+    SchedulerConfig config = MakeValidConfig();
+    config.snapshot_allocator.total_pages = 1;
+    config.max_retracted_requests = 0;
+    for (const std::int32_t interval : {3, -3}) {
+        config.debug_force_retraction_interval = interval;
+        EXPECT_THROW(config.Validate(), std::invalid_argument) << "interval " << interval << " without a pool";
+    }
+    config.snapshot_allocator.total_pages = 16;
+    config.max_retracted_requests = 4;
+    EXPECT_NO_THROW(config.Validate());
+    config.debug_force_retraction_interval = 0;
+    EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
+    // The runtime surfaces these messages verbatim at startup, so each one
+    // names the server arg the operator has to change.
+    SchedulerConfig config = MakeValidConfig();
+    config.snapshot_allocator.total_pages = 16;
+    config.max_retracted_requests = 0;
+    try {
+        config.Validate();
+        FAIL() << "a pool without slots must be rejected";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string(error.what()).find("--retraction-snapshot-max-requests"), std::string::npos)
+            << error.what();
+        EXPECT_NE(std::string(error.what()).find("--retraction-snapshot-host-gb"), std::string::npos) << error.what();
+    }
+    config.snapshot_allocator.total_pages = 1;
+    config.debug_force_retraction_interval = 2;
+    try {
+        config.Validate();
+        FAIL() << "the knob without a pool must be rejected";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string(error.what()).find("--debug-force-retraction-interval"), std::string::npos)
+            << error.what();
+    }
+}
+
 TEST(SchedulerConfigValidateTest, L3StorageRequiresReplicatedGroups) {
     SchedulerConfig config = MakeValidConfig();
     config.host_allocator.total_pages = 32;

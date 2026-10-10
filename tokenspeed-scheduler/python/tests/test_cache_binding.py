@@ -133,12 +133,21 @@ def test_snapshot_pool_is_stated_explicitly():
             group_id="full_attention", block_granularity=16, total_pages=64
         )
     ]
-    # Unset: the pool is a behavioural choice, not a default.
-    with pytest.raises(ValueError, match="snapshot_allocator"):
+    # Unset: the pool is a behavioural choice, not a default. The diagnostics
+    # name the server args the operator has to change.
+    with pytest.raises(ValueError, match="--retraction-snapshot-host-gb"):
         ts.Scheduler(cfg)
     cfg.num_snapshot_pages = 9
-    with pytest.raises(ValueError, match="max_retracted_requests"):
+    with pytest.raises(ValueError, match="--retraction-snapshot-max-requests"):
         ts.Scheduler(cfg)
+    cfg.max_retracted_requests = 2
+    # The debug knob needs somewhere to put the images it forces.
+    cfg.num_snapshot_pages = 1
+    cfg.max_retracted_requests = 0
+    cfg.debug_force_retraction_interval = 3
+    with pytest.raises(ValueError, match="--debug-force-retraction-interval"):
+        ts.Scheduler(cfg)
+    cfg.num_snapshot_pages = 9
     cfg.max_retracted_requests = 2
     cfg.debug_force_retraction_interval = 0
     scheduler = ts.Scheduler(cfg)

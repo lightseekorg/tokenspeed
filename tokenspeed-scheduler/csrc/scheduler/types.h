@@ -50,8 +50,8 @@ struct SchedulerConfig {
     // Test knob: every |N| plans the fused/D grammar retracts the oldest
     // quiescent Decoding request (N > 0) or the one Prefilling request
     // between its chunks (N < 0), bypassing ReserveCoversGeneration but not
-    // the image-fit refusal. 0 is off. Lives here so every mirrored rank
-    // decides identically.
+    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool.
+    // Lives here so every mirrored rank decides identically.
     std::int32_t debug_force_retraction_interval{0};
 
     std::vector<CacheGroupConfig> cache_groups{};

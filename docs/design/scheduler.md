@@ -798,7 +798,27 @@ must read empty and zero.
 many rows plus the null row) are validated together, the P role refuses a
 pool, and L3 storage is refused with a page-cyclic sharded group
 (`cache-concepts.md`). `debug_force_retraction_interval` (§2) is the only
-knob that chooses victims outside capacity pressure.
+knob that chooses victims outside capacity pressure, and it is refused
+without a pool. Every diagnostic names the binding field and the server arg
+behind it (`num_snapshot_pages` from `--retraction-snapshot-host-gb`,
+`max_retracted_requests` from `--retraction-snapshot-max-requests`,
+`--debug-force-retraction-interval`), because the runtime surfaces the message
+verbatim at startup.
+
+**Release note — the runtime lands with the pin.** This scheduler is not a
+drop-in for the runtime on `main`: `SchedulerConfig.num_snapshot_pages` is
+required (there is no default; `make_config` in
+`python/tokenspeed/runtime/engine/scheduler_utils.py` must pass it, `1` on
+engines that never retract), `ForwardEvent.Retract` is renamed
+`ForwardEvent.RecomputeRetract` (`make_retract_event` in `scheduler_utils.py`
+and its caller in `engine/l3_cache_hooks.py` follow), and the plan carries two
+new cache op kinds (`Cache.SnapshotOp`, `Cache.RestoreOp`) with two new ACKs
+(`Cache.SnapshotDoneEvent`, `Cache.RestoreDoneEvent`) that `DeviceHandle` and
+the cache hooks must execute and count. Following AGENTS.md's release
+sequence, the `tokenspeed-scheduler` version bump is published first and the
+runtime PR that pins it (`feat/retraction-snapshot-consume`: server args,
+`make_config`, the event rename, the op dispatch and the slot-state exporters)
+lands in the same change as the pin, never a release apart.
 
 ## 5. Invariants a change must preserve
 
