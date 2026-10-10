@@ -257,6 +257,12 @@ def gluon_dsv41_index_topk_gfx950(
     else:
         width = vis
     candidate_start = split * SCORE_CHUNK
+    if CANDIDATES < 0:
+        # Full rows are sized by the page-table capacity, but the select reads
+        # only the visible prefix (its 8-row block tail lies in the last live
+        # split), so splits past it neither score nor write.
+        if candidate_start >= width:
+            return
     candidate_end = gl.minimum(width, candidate_start + SCORE_CHUNK)
     candidate_end = gl.minimum(candidate_end, max_candidates)
     if CANDIDATES >= 0:
@@ -271,7 +277,7 @@ def gluon_dsv41_index_topk_gfx950(
         )
         if gl.max(listed, axis=0) < 0:
             candidate_end = candidate_start
-    # Every logits element of this split's chunk is written: scores where
+    # Every logits element of a live split's chunk is written: scores where
     # live, -inf elsewhere, so callers need not pre-fill the logits.
     chunk_end = gl.minimum(candidate_start + SCORE_CHUNK, max_candidates)
     layouts: gl.constexpr = _indexer_mfma_layouts(NUM_WARPS)
@@ -415,8 +421,9 @@ def dsv41_index_logits_gfx950(
         table: Physical page IDs shaped [T, logical_pages].
         visible: Visible logical row counts shaped [T].
         candidates: Optional candidate block IDs shaped [T, blocks].
-        logits: FP32 destination shaped [T, scored_rows]; every element is
-            written (scores, or -inf for unscored rows).
+        logits: FP32 destination shaped [T, scored_rows]. Every element the
+            select reads is written (scores, or -inf for unscored rows); full
+            rows are left unwritten past the split holding the visible end.
         score_chunk_size: Positive multiple-of-eight upper bound on rows per CTA.
 
     Returns:
