@@ -1014,8 +1014,9 @@ void CacheCoordinator::Free(std::span<BlockTable> tables) {
 
 namespace {
 
-// Slots covering [0, num_tokens) of a table, capped at the table's length,
-// and the capacity left inside the last of them.
+// Slots covering [0, num_tokens) of a table and the capacity left inside the
+// last of them. The computed tokens always lie inside the table: the
+// admission that scheduled them acquired their blocks first.
 struct DataSpan {
     std::int32_t blocks{0};
     std::int32_t tail_tokens{0};
@@ -1023,10 +1024,8 @@ struct DataSpan {
 
 DataSpan dataSpan(const BlockTable& table, std::int32_t block_granularity, std::int32_t num_tokens) {
     const std::int32_t covering = (num_tokens + block_granularity - 1) / block_granularity;
-    DataSpan span{.blocks = std::min(covering, table.NumBlocks())};
-    span.tail_tokens = span.blocks * block_granularity - num_tokens;
-    _assert(span.tail_tokens >= 0, "snapshot token count exceeds the table's logical fill");
-    return span;
+    _assert(covering <= table.NumBlocks(), "snapshot token count exceeds the table's logical fill");
+    return DataSpan{.blocks = covering, .tail_tokens = covering * block_granularity - num_tokens};
 }
 
 }  // namespace

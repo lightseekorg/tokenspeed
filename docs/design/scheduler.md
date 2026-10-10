@@ -697,10 +697,12 @@ rebuilds the request on fresh Device pages:
   own block, cache-only since it was freed — and protected from the planner's
   eviction like a prefix hit). Every other slot becomes one row of a single
   `SnapshotRestoreOperation`, tagged with its source tier (`HostTier::kL2`
-  rows carry their key, `kSnapshotPool` rows none), and its destination page
-  is listed in `plan.pages_to_zero` so the plan sanitizes it before the copy.
-  The op also names the blob slot and the request's **new** request-pool
-  index: the runtime imports the slot-state blob into that row.
+  rows carry their key, `kSnapshotPool` rows none). A copy fills its
+  destination block whole, so — as for a Host hit's load-back — only the
+  reserve pages appended beyond the imaged shape are listed in
+  `plan.pages_to_zero`. The op also names the blob slot and the request's
+  **new** request-pool index: the runtime imports the slot-state blob into
+  that row.
 - The request moves to **`fsm::Restoring`**: it holds the rebuilt tables (a
   `ForwardResources` bundle, so it occupies capacity like any resident), the
   image and the op id, is never scheduled, never a victim and never a

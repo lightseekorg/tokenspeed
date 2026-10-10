@@ -520,7 +520,8 @@ def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     [restored_pool_index] = restore.request_pool_indices
     assert restored_pool_index >= 1
     # Every row comes back from the snapshot pool (no L2 leg to claim from),
-    # in image order, into pages the same plan zeroes first.
+    # in image order. The copies fill their destinations whole, so the plan
+    # zeroes none of them -- only the decode growth appended beyond the image.
     [restore_groups] = restore.group_ids
     [restore_sources] = restore.src_pages
     [restore_destinations] = restore.dst_pages
@@ -531,7 +532,8 @@ def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     assert all(not key for key in restore.content_hashes[0])
     zeroed = dict(restore_plan.pages_to_zero)
     for group_index, page in zip(restore_groups, restore_destinations):
-        assert page in zeroed[K3_GROUP_IDS[group_index]]
+        assert page not in zeroed[K3_GROUP_IDS[group_index]]
+    assert any(len(pages) > 0 for pages in zeroed.values())
     # The restore holds the rebuilt tables plus decode growth, yet nothing is
     # schedulable until the copy lands and the pool keeps a's blocks.
     assert scheduler.retracted_size() == 1

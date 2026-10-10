@@ -190,8 +190,9 @@ def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks() -> None:
     assert set(tiers) == {int(ts.Cache.HostTier.L2)}
     assert 0 < len(sources) <= 5
     assert [host_rows[key] for key in keys] == list(sources)
+    # A copy fills its destination whole: the plan zeroes none of them.
     zeroed = set(dict(restore_plan.pages_to_zero)["full"])
-    assert set(destinations) <= zeroed
+    assert not set(destinations) & zeroed
     assert scheduler.retracted_size() == 1
     assert scheduler.decoding_size() == 0
 

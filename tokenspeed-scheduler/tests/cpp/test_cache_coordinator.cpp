@@ -4768,12 +4768,25 @@ TEST(RetractionImageTest, RestoreRebuildsDenseSlidingAndSparseShapes) {
         EXPECT_TRUE(std::ranges::find(table.Blocks(), pair.destination) != table.Blocks().end())
             << "each copy lands in the rebuilt table";
     }
-    // Every copied page is zeroed before the copy lands. The closed group's
-    // reserve fits inside its imaged tail page; the two others ended on a
-    // page boundary and re-reserve one fresh page each.
-    EXPECT_EQ(restore->new_page_ids[0].size(), 4u);
-    EXPECT_EQ(restore->new_page_ids[1].size(), 3u + 1u);
-    EXPECT_EQ(restore->new_page_ids[2].size(), 1u + 1u);
+    // The copies fill their destinations whole, so only the re-reserved pages
+    // are fresh memory for the plan to zero: the closed group's reserve fits
+    // inside its imaged tail page; the two others ended on a page boundary
+    // and re-reserve one fresh page each.
+    EXPECT_TRUE(restore->new_page_ids[0].empty());
+    EXPECT_EQ(restore->new_page_ids[1].size(), 1u);
+    EXPECT_EQ(restore->new_page_ids[2].size(), 1u);
+    for (std::size_t g = 0; g < restored.size(); ++g) {
+        for (const std::int32_t page : restore->new_page_ids[g]) {
+            for (const BlockTransfer& pair : restore->snapshot_pairs) {
+                if (pair.group_id == g) {
+                    EXPECT_NE(coordinator.Allocator(static_cast<std::int32_t>(g))
+                                  .ResolveCacheBlockId(pair.destination->Location()),
+                              page)
+                        << "a copy destination is never zeroed";
+                }
+            }
+        }
+    }
     EXPECT_EQ(restore->access_epoch, admission->access_epoch);
 
     coordinator.Free(restored);
@@ -4847,7 +4860,7 @@ TEST(RetractionImageTest, PublishedSlotsRideHostCacheAndRestoreAsKeyedLoads) {
     ASSERT_TRUE(restore);
     EXPECT_EQ(restored[0].NumBlocks(), 3);
     EXPECT_EQ(restored[0].AvailableTokens(), 1);
-    EXPECT_EQ(restore->new_page_ids[0].size(), 3u) << "every copied page is zeroed first";
+    EXPECT_TRUE(restore->new_page_ids[0].empty()) << "the copies fill every rebuilt page; the reserve fits the tail";
     ASSERT_EQ(restore->load_pairs.size(), 2u);
     EXPECT_EQ(restore->load_pairs[0].key, Key("h0", 0));
     EXPECT_EQ(restore->load_pairs[1].key, Key("h1", 0));
@@ -4946,7 +4959,7 @@ TEST(RetractionImageTest, RestoreEvictsCacheOnlyBlocksAndFailsCleanlyWhenPinned)
     EXPECT_EQ(restored[0].NumBlocks(), 4);
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0) << "the restore evicted the cache-only blocks";
     ASSERT_EQ(restore->new_page_ids.size(), 1u);
-    EXPECT_EQ(restore->new_page_ids[0].size(), 3u + 1u) << "the copied pages and the re-reserved page are zeroed";
+    EXPECT_EQ(restore->new_page_ids[0].size(), 1u) << "only the re-reserved page is zeroed; the copies fill the rest";
     coordinator.Free(restored);
 }
 
@@ -4995,7 +5008,7 @@ TEST(RetractionImageTest, RestoreClaimsStillCachedDeviceBlocksInsteadOfCopying) 
     EXPECT_NE(restored[0].Blocks()[2], original[2]) << "the tail page is a fresh block filled by the copy";
     EXPECT_TRUE(restore->load_pairs.empty()) << "nothing to copy from Host L2";
     ASSERT_EQ(restore->snapshot_pairs.size(), 1u);
-    EXPECT_EQ(restore->new_page_ids[0].size(), 1u) << "only the copied tail page is zeroed";
+    EXPECT_TRUE(restore->new_page_ids[0].empty()) << "claimed and copied pages alike need no zeroing";
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumPinnedEntries(pool), 2) << "the claims pin the entries";
     coordinator.Free(restored);
 }

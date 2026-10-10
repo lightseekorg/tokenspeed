@@ -691,7 +691,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         for (const ImageSlot& slot : shape.slots) {
             const CacheBlockRef& destination = table.Blocks()[static_cast<std::size_t>(slot.slot_index)];
             if (slot.InHostCache() && groups_[i].Index().Contains(destination)) {
-                continue;  // claimed: already the published Device block, nothing to copy or zero
+                continue;  // claimed: already the published Device block, nothing to copy
             }
             BlockTransfer transfer{
                 .group_id = groups_[i].Id(),
@@ -700,15 +700,17 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
                 .key = slot.key,
             };
             // A published slot comes back from Host L2 (and is re-published at
-            // the ACK); a private slot from the snapshot pool. Both land in a
-            // page the plan zeroes first.
-            result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(destination->Location()));
+            // the ACK); a private slot from the snapshot pool. Neither is
+            // listed in new_page_ids: the copy fills the whole block, as a
+            // Host hit's load-back does.
             if (slot.InHostCache()) {
                 result.load_pairs.push_back(std::move(transfer));
             } else {
                 result.snapshot_pairs.push_back(std::move(transfer));
             }
         }
+        // Only the reserve appended beyond the imaged shape is fresh, unfilled
+        // Device memory for the plan to zero.
         const std::int32_t first_new_block = table.NumBlocks();
         FatalCheck(allocator.Acquire(pool_, table, geometry_[i].PlanAcquire(table, demands[i])),
                    "restore plan no longer fits the block pool");

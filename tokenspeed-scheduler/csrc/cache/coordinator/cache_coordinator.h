@@ -215,9 +215,10 @@ public:
     // are evicted exactly as for an admission and a failed restore leaves
     // nothing allocated. load_pairs carries the Host L2 -> Device copies
     // (keyed, like an ordinary prefix load-back), snapshot_pairs the snapshot
-    // pool -> Device copies, new_page_ids the appended reserve pages for the
-    // plan to zero. request_access_epoch is the request's first-admission
-    // epoch, carried on.
+    // pool -> Device copies, new_page_ids only the reserve pages appended
+    // beyond the imaged shape (the copies fill their destinations whole, so
+    // the plan zeroes nothing it restores). request_access_epoch is the
+    // request's first-admission epoch, carried on.
     std::optional<AdmissionResult> Restore(const RetractionImage& snapshot, std::span<const GroupDemand> demands,
                                            std::uint64_t request_access_epoch);
     bool HasHostPool() const { return host_pool_ != nullptr; }
