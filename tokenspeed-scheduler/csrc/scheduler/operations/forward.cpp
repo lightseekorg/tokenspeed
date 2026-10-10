@@ -719,12 +719,24 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
 }
 
 void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build) {
-    const std::string detail =
-        shortfall == ImageShortfall::kBlobSlot
-            ? "no slot-state blob slot is free (max_retracted_requests=" +
-                  std::to_string(config_.max_retracted_requests) + "; raise --retraction-snapshot-max-requests)"
-            : "the snapshot pool cannot hold the image (num_snapshot_pages=" +
-                  std::to_string(config_.snapshot_allocator.total_pages) + "; raise --retraction-snapshot-host-gb)";
+    std::string detail;
+    switch (shortfall) {
+        case ImageShortfall::kNoPool:
+            detail =
+                "the engine has no snapshot pool, so a capacity block aborts a request instead of imaging one "
+                "(--retraction-snapshot-ratio 0 / --retraction-snapshot-host-gb 0 selects this; set either above 0 "
+                "to retract and restore)";
+            break;
+        case ImageShortfall::kBlobSlot:
+            detail = "no slot-state blob slot is free (max_retracted_requests=" +
+                     std::to_string(config_.max_retracted_requests) + "; raise --retraction-snapshot-max-requests)";
+            break;
+        case ImageShortfall::kSnapshotPool:
+            detail = "the snapshot pool cannot hold the image (num_snapshot_pages=" +
+                     std::to_string(config_.snapshot_allocator.total_pages) +
+                     "; raise --retraction-snapshot-ratio / --retraction-snapshot-host-gb)";
+            break;
+    }
     spdlog::warn(
         "[Scheduler] capacity abort: request {} ({} tokens) cannot be imaged -- {}; aborting it to free its "
         "pages for the blocked admission",
@@ -830,6 +842,8 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         std::optional<ImageShortfall> shortfall;
         if (choice.image_fits) {
             shortfall = retractVictim(*victim, build, write_back_operations);
+        } else if (!config_.HasSnapshotPool()) {
+            shortfall = ImageShortfall::kNoPool;
         } else {
             shortfall =
                 snapshot_slots_.AvailableSlots() == 0 ? ImageShortfall::kBlobSlot : ImageShortfall::kSnapshotPool;

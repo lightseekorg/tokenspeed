@@ -4821,12 +4821,18 @@ TEST(RetractionImageTest, PublishedSlotsRideHostCacheAndRestoreAsKeyedLoads) {
 
     // The transfer manager swaps the Host L2 block in for each published slot
     // (here: one already cached on Host, one freshly allocated for the store).
+    // (as StartRetractionStores does: the published slot with its Host block
+    // swapped in, keeping how the Device entry was published)
+    EXPECT_EQ(published[0][0].logical_block_index, 0);
+    EXPECT_EQ(published[0][1].logical_block_index, 1);
     std::vector<std::vector<ImageSlot>> host_slots(1);
     CacheBlockRef warm = coordinator.AcquireHostBlock(0, /*bucket=*/0);
     coordinator.CacheHostBlock(warm, Key("h0", 0));
-    host_slots[0].push_back(ImageSlot{.slot_index = 0, .block = warm, .key = Key("h0", 0)});
+    host_slots[0].push_back(published[0][0]);
+    host_slots[0][0].block = warm;
     CacheBlockRef fresh = coordinator.AcquireHostBlock(0, /*bucket=*/0);
-    host_slots[0].push_back(ImageSlot{.slot_index = 1, .block = fresh, .key = Key("h1", 0)});
+    host_slots[0].push_back(published[0][1]);
+    host_slots[0][1].block = fresh;
 
     auto image = coordinator.TakeImage(tables, /*num_tokens=*/5, host_slots);
     ASSERT_TRUE(image);
@@ -4866,6 +4872,17 @@ TEST(RetractionImageTest, PublishedSlotsRideHostCacheAndRestoreAsKeyedLoads) {
     EXPECT_EQ(restore->load_pairs[1].key, Key("h1", 0));
     EXPECT_TRUE(restore->load_pairs[0].source.IsOwnedBy(host_pool));
     EXPECT_EQ(restore->load_pairs[0].destination, restored[0].Blocks()[0]);
+    // The rows carry how the entries were published before the retraction,
+    // and the ACK's republication keeps that metadata.
+    EXPECT_EQ(restore->load_pairs[0].logical_block_index, 0);
+    EXPECT_EQ(restore->load_pairs[1].logical_block_index, 1);
+    EXPECT_EQ(restore->load_pairs[1].boundary_kind, CacheBoundaryKind::kChunk);
+    coordinator.CacheDeviceBlock(restore->load_pairs[1].destination, restore->load_pairs[1].key,
+                                 restore->load_pairs[1].logical_block_index, restore->load_pairs[1].boundary_kind);
+    const auto republished = coordinator.GroupPrefixIndex(0).MetadataFor(pool, restored[0].Blocks()[1]->Location());
+    ASSERT_TRUE(republished);
+    EXPECT_EQ(republished->logical_block_index, 1);
+    EXPECT_EQ(republished->boundary_kind, CacheBoundaryKind::kChunk);
     ASSERT_EQ(restore->snapshot_pairs.size(), 1u);
     EXPECT_TRUE(restore->snapshot_pairs[0].key.content_hash.empty());
     EXPECT_TRUE(restore->snapshot_pairs[0].source.IsOwnedBy(snapshot_pool));

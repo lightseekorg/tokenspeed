@@ -354,21 +354,22 @@ public:
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
-    // Publishes a filled Device destination after a successful L3 prefetch
-    // ACK. First-chunk admit must not CacheFullBlocks those pages: they are
-    // empty until LoadBackDone.success, and a vanished object must not leave
-    // Device prefix hits for the next admit to reuse.
-    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key);
+    // Publishes a Device block a restore filled from Host L2
+    // (CompleteSnapshotRestore): the entry comes back with the logical block
+    // index and boundary kind it was published under before the retraction,
+    // so eviction ranks it as it did the original.
+    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
+                          CacheBoundaryKind boundary_kind);
 
     // L3 storage sits below Host: a bounded shadow of keys known to exist in
-    // the remote store, with no local Host block. Probe treats them as Host
-    // hits that require prefetch. Capacity tracks Host pages so the set
-    // cannot grow with every historical writeback. A single registration
-    // keeps the earliest contiguous prefix keys so prefix-closed matchers
-    // still hit, even when sequential write-backs already filled the
-    // shadow with this prompt's suffix. Later unrelated keys LRU-evict
-    // older prompts. Admit-time revalidation re-inserts keys that were
-    // dropped from the shadow.
+    // the remote store, with no local Host block. ProbePrefix reports them as
+    // the storage tier beyond the Host hit, which PlanPrefetch turns into a
+    // pre-admission Host fill. Capacity tracks Host pages so the set cannot
+    // grow with every historical writeback. A single registration keeps the
+    // earliest contiguous prefix keys so prefix-closed matchers still hit,
+    // even when sequential write-backs already filled the shadow with this
+    // prompt's suffix. Later unrelated keys LRU-evict older prompts;
+    // submit-time registration re-inserts keys that were dropped.
     bool EnablesL3Storage() const { return enable_l3_storage_; }
     void RegisterStorageKeys(std::span<const CacheKey> keys);
     void UnregisterStorageKeys(std::span<const CacheKey> keys);

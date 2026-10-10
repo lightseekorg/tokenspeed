@@ -362,8 +362,10 @@ private:
     // being assumed to ride Host L2 (an L2 shortfall falls back to the pool
     // at retraction time, where it can still turn out not to fit).
     bool imageFits(const Request& request) const;
-    // Why a victim could not be imaged.
-    enum class ImageShortfall { kBlobSlot, kSnapshotPool };
+    // Why a victim could not be imaged: no snapshot pool at all (the null
+    // page alone is configured, so nothing is ever imaged), no blob slot
+    // free, or a pool too small for the image.
+    enum class ImageShortfall { kNoPool, kBlobSlot, kSnapshotPool };
     // Images the victim (Host L2 for its published pages, the snapshot pool
     // for the rest), issues both store legs and suspends it. Returns the
     // shortfall -- with nothing changed but Host entries evicted for the
@@ -415,7 +417,7 @@ private:
     std::int32_t max_single_request_tokens_{0};
 
     // Stamped onto each retraction; the readmission order lives on the
-    // Retracted states themselves (nextReadmission).
+    // Retracted states themselves (rankedReadmissions).
     std::int64_t next_retraction_epoch_{1};
     // The forced-retraction knob's clock and the request it has armed (empty
     // when none): kept out of every batch until it is quiescent, then

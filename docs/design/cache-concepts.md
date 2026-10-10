@@ -756,13 +756,17 @@ Its responsibilities:
   stream when published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`, and every store it
   issues pins its Device sources until the ACK. A retraction does not use the
-  queue: `StartRetractionStores` publishes the victim's computed prefix the
-  same way and then builds its image from the tables themselves — the
-  published slots not yet on Host become one stream-ordered write-back whose
-  Host entries the image pins (keys already Host-cached, or carried by a store
-  in flight, are pinned instead of copied), every other slot goes to the
-  request-private **snapshot pool** on the same stream-ordered footing — because
-  the victim's sources are re-granted in the same round (`scheduler.md` §2).
+  queue: the scheduler publishes the victim's computed prefix the same way,
+  `CacheCoordinator::PublishedDataSlots` names the data slots that are
+  published entries (with the key, logical index and boundary kind each was
+  published under), `TierTransferManager::StartRetractionStores` gives those
+  their Host blocks — keys already Host-cached, or carried by a store in
+  flight, are pinned; the rest become one stream-ordered write-back whose
+  Host entries the image pins — and `CacheCoordinator::TakeImage` places only
+  the remainder (unpublished slots, and published ones L2 could not take) in
+  the request-private **snapshot pool** on the same stream-ordered footing —
+  because the victim's sources are re-granted in the same round
+  (`scheduler.md` §2).
   The snapshot pool is a third `BlockPool` the coordinator owns beside Device
   and Host L2: never prefix-indexed, never evicted, its blocks held only by
   the `Retracted`/`Restoring` state that imaged them, and `Validate` requires

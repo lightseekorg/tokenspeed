@@ -20,8 +20,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <concepts>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <span>
 #include <string>
@@ -213,7 +215,12 @@ struct SchedulePrefetchEvent : InvalidTransitionHandler<SchedulePrefetchEvent> {
         : host_blocks_{std::move(host_blocks)}, prefetch_op_{prefetch_op} {}
 
     Prefetching operator()(Submitted&& state) {
-        return Prefetching{state.TokenContainerPtr(), state.PrefixGranularity(), std::move(host_blocks_), prefetch_op_};
+        // The entries an earlier prefetch landed stay pinned through this one:
+        // the admission after it claims both.
+        std::vector<CacheBlockRef> host_blocks = state.TakePrefetchedHostEntries();
+        host_blocks.insert(host_blocks.end(), std::make_move_iterator(host_blocks_.begin()),
+                           std::make_move_iterator(host_blocks_.end()));
+        return Prefetching{state.TokenContainerPtr(), state.PrefixGranularity(), std::move(host_blocks), prefetch_op_};
     }
 
 private:
@@ -230,7 +237,18 @@ struct PrefetchDoneEvent : InvalidTransitionHandler<PrefetchDoneEvent> {
     explicit PrefetchDoneEvent(std::vector<CacheBlockRef> published) : published_{std::move(published)} {}
 
     Submitted operator()(Prefetching&& state) {
-        return Submitted{state.token_container, state.prefix_granularity, std::move(published_)};
+        // Entries an earlier prefetch landed (carried in host_blocks beside the
+        // blocks this op filled) stay pinned together with the new ones. The
+        // blocks this op did not land were let go by its completion, so the
+        // reference here is their last and they return now; the ones it did
+        // land are already in `published_`.
+        std::vector<CacheBlockRef> pinned = std::move(published_);
+        for (CacheBlockRef& block : state.host_blocks) {
+            if (block && !block.unique() && std::ranges::find(pinned, block) == pinned.end()) {
+                pinned.push_back(std::move(block));
+            }
+        }
+        return Submitted{state.token_container, state.prefix_granularity, std::move(pinned)};
     }
 
 private:

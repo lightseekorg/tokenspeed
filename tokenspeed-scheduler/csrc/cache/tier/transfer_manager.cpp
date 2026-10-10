@@ -419,11 +419,12 @@ ReqPoolIndex TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, b
         return ReqPoolIndex{};
     }
     // The L2-tier rows are the request's own prefix pages, copied back whole:
-    // publish them like an ordinary load-back's destinations.
+    // publish them as they were published before the retraction.
     if (publish) {
         for (BlockTransfer& transfer : it->second.transfers) {
             if (transfer.destination && !transfer.key.content_hash.empty()) {
-                coordinator_.CacheDeviceBlock(transfer.destination, transfer.key);
+                coordinator_.CacheDeviceBlock(transfer.destination, transfer.key, transfer.logical_block_index,
+                                              transfer.boundary_kind);
             }
         }
     }

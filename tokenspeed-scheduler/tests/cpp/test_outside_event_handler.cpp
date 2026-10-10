@@ -205,7 +205,7 @@ protected:
 
 // After host cache is populated, a new request with same tokens should see
 // the host cache and be scheduled with reduced input_length (host pages already cached).
-TEST_F(LoadBackDoneTestSuite, LoadBackDone_Success_PrefixLenChangesInForward) {
+TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
     SetupHostCache();
 
     Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/1));

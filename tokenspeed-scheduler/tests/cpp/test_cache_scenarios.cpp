@@ -3029,7 +3029,8 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.snapshot_allocator.total_pages = SnapshotPoolBlocks() + 1;
-        cfg.max_retracted_requests = cfg.max_batch_size;
+        // The null page alone takes no blob slots (Validate ties the two).
+        cfg.max_retracted_requests = SnapshotPoolBlocks() == 0 ? 0 : cfg.max_batch_size;
         return cfg;
     }
 
@@ -3114,6 +3115,31 @@ TEST_F(NoImageFitsSuite, WhenNoImageFitsTheNewestResidentIsAbortedAndTheGrantPro
     SendFinish("a");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "the pool balances after the abort";
+}
+
+// The null page alone: the engine never images, and says so.
+class NoPoolSuite : public ImageDoesNotFitSuite {
+protected:
+    std::int32_t SnapshotPoolBlocks() const override { return 0; }
+};
+
+TEST_F(NoPoolSuite, WithoutAPoolACapacityBlockAbortsAndNamesThePoolKnobNotTheSlots) {
+    ASSERT_FALSE(Config().HasSnapshotPool());
+    ASSERT_EQ(Config().max_retracted_requests, 0);
+    DriveToTheBlockedRound();
+    const ExecutionPlan round = PlanOnce();
+    ASSERT_EQ(round.aborts.size(), 1u);
+    EXPECT_EQ(round.aborts.front().request_id, "b");
+    EXPECT_EQ(round.aborts.front().reason, AbortReason::kImageDoesNotFit);
+    const std::string& detail = round.aborts.front().detail;
+    EXPECT_NE(detail.find("--retraction-snapshot-ratio"), std::string::npos) << detail;
+    EXPECT_NE(detail.find("--retraction-snapshot-host-gb"), std::string::npos) << detail;
+    EXPECT_EQ(detail.find("--retraction-snapshot-max-requests"), std::string::npos)
+        << "slots are not the shortfall when no pool exists: " << detail;
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    const ForwardBatch* granted = FindForwardBatch(round);
+    ASSERT_NE(granted, nullptr);
+    EXPECT_EQ(granted->request_ids, std::vector<std::string>{"a"});
 }
 
 TEST_F(NoImageFitsSuite, TheDebugKnobNeverAborts) {
@@ -6394,6 +6420,56 @@ TEST_F(L3StorageHitSuite, HostEvictionKeepsL3HitAsAPrefetchBeforeAdmission) {
     }
     SendForwardDone("r3", {9002});
     SendFinish("r3");
+    PlanOnce();
+}
+
+TEST_F(L3StorageHitSuite, ARemainderPrefetchKeepsTheFirstFetchsEntriesPinned) {
+    // r1: four L3 pages. The full group needs every page, the 4-token
+    // sliding group only the last two (pages 2 and 3).
+    RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/5);
+    const std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(r1.tokens);
+    ASSERT_EQ(hashes.size(), 4u);
+    scheduler_->RegisterStorageKeys(scheduler_->ExpandPrefixKeys(hashes));
+    Submit(r1);
+    const ExecutionPlan first_plan = PlanOnce();
+    const PrefetchBatch* first = FindPrefetch(first_plan);
+    ASSERT_NE(first, nullptr);
+    ASSERT_EQ(first->num_pages.at(0), 4);
+    ASSERT_EQ(first->host_pages.at(0).size(), 6u) << "4 full rows + the window's 2";
+
+    // Only pages 0 and 1 land: the full group's entries for them are
+    // published and pinned by r1; the window's rows were for pages 2 and 3,
+    // so at the shortened boundary it now needs pages 0 and 1 instead --
+    // a second, remainder prefetch of exactly those two rows.
+    SendPrefetchDone(first->op_ids.at(0), /*landed_pages=*/2);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 2);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 2);
+    const ExecutionPlan second_plan = PlanOnce();
+    const PrefetchBatch* second = FindPrefetch(second_plan);
+    ASSERT_NE(second, nullptr) << "the window's lookback at the new boundary is still an L3 hit";
+    EXPECT_EQ(second->num_pages.at(0), 2);
+    EXPECT_EQ(second->host_pages.at(0).size(), 2u);
+    EXPECT_TRUE(FindForwardBatch(second_plan)->request_ids.empty());
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 2)
+        << "the first fetch's entries stay pinned through the second: an eviction would waste the fetch";
+
+    SendPrefetchDone(second->op_ids.at(0), /*landed_pages=*/2);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 4) << "both fetches' entries, until admission claims them";
+    const ExecutionPlan admit = PlanOnce();
+    EXPECT_EQ(FindPrefetch(admit), nullptr);
+    const ForwardBatch* op = FindForwardBatch(admit);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 4) << "both groups hit the two landed pages";
+    auto lb = FindLoadBack(admit);
+    ASSERT_TRUE(lb.has_value());
+    EXPECT_EQ(lb->src_pages.at(0).size(), 4u);
+    SendLoadBackDone(lb->op_ids.at(0));
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+    SendForwardDone("r1", {9001});
+    SendFinish("r1");
+    AckWriteBacks(PlanOnce());
     PlanOnce();
 }
 
