@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -49,6 +50,8 @@ from test.runtime.test_gdn_state_paging import (
 )
 
 from tokenspeed_kernel.ops.attention.gdn import (
+    GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
+    gdn_decode_mtp,
     gdn_replay_commit_supported,
     gdn_tree_verify_needs_node_states,
 )
@@ -383,6 +386,37 @@ def test_qwen_replay_tree_matches_staged_tree(state_dtype, parents, paths):
             else dict(atol=1e-6, rtol=1e-5)
         ),
     )
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_qwen_replay_chain_verifies_chunked_where_faster(state_dtype, chunked):
+    """A ReplaySSM chain hands the GDN verify its ancestor masks exactly where the
+    chunked form is faster, and matches the per-position scratch verify."""
+    draft_tokens = GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+    conv, recurrent = _initial_pools(state_dtype=state_dtype)
+    replay_backend, replay_pool = _make_backend(
+        conv.clone(), recurrent.clone(), replay=True, draft_tokens=draft_tokens
+    )
+    scratch_backend, scratch_pool = _make_backend(
+        conv, recurrent, replay=False, draft_tokens=draft_tokens
+    )
+    inputs = _inputs(draft_tokens=draft_tokens)
+
+    module = MambaAttnBackend.__module__
+    with (
+        patch(
+            f"{module}.gdn_chain_verify_is_chunked", return_value=chunked
+        ) as is_chunked,
+        patch(f"{module}.gdn_decode_mtp", wraps=gdn_decode_mtp) as verify,
+    ):
+        replay_out = _prepare_verify(replay_backend, replay_pool, inputs)
+    scratch_out = _prepare_verify(scratch_backend, scratch_pool, inputs)
+    is_chunked.assert_called_with(draft_tokens, BATCH * NUM_V_HEADS)
+    assert (verify.call_args.kwargs["tree_ancestors"] is not None) == chunked
+    # The chunked verify and the step-by-step one round differently.
+    tol = dict(atol=1e-4, rtol=2**-7) if chunked else dict(atol=0.0, rtol=0.0)
+    torch.testing.assert_close(replay_out, scratch_out, **tol)
 
 
 @pytest.mark.parametrize(
