@@ -39,7 +39,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     _local_visible_lengths,
-    dcp_local_visible_lengths,
+    kvp_local_visible_lengths,
 )
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
@@ -66,7 +66,7 @@ def test_dcp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         )
         out = backing[:, :queries]
         local = torch.empty(batch, dtype=torch.int32, device=device)
-        dcp_local_visible_lengths(
+        kvp_local_visible_lengths(
             prefix, visible, page_size=64, out=out, local_lengths=local
         )
         torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)

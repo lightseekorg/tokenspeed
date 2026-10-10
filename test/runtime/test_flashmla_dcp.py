@@ -24,7 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
-    compact_dcp_pages,
+    compact_kvp_pages,
     virtual_slots_to_local,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
@@ -68,7 +68,7 @@ def test_noncontiguous_pages_and_partial_tail(degree, device):
     for rank in range(degree):
         out = torch.empty_like(table)
         local = torch.empty_like(lengths)
-        compact_dcp_pages(
+        compact_kvp_pages(
             table,
             lengths,
             page_size=64,
@@ -228,7 +228,7 @@ def test_flashmla_shards_merge_to_full_attention(degree):
         )
         assert not local_cache[:128].any()
         out, local = torch.empty_like(table), torch.empty_like(lengths)
-        compact_dcp_pages(
+        compact_kvp_pages(
             table,
             lengths,
             page_size=64,
@@ -256,7 +256,7 @@ def test_compaction_graph_replay_refreshes_lengths_and_owners():
     out, local = torch.empty_like(table), torch.empty_like(lengths)
 
     def refresh():
-        compact_dcp_pages(
+        compact_kvp_pages(
             table,
             lengths,
             page_size=64,
