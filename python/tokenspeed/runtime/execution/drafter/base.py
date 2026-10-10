@@ -49,6 +49,11 @@ if TYPE_CHECKING:
 
 
 class BaseDrafter:
+    #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
+    #: none by default; a drafter that keeps some names them.
+    token_derived_slot_state: tuple[str, ...] = ()
+    constant_slot_state: tuple[str, ...] = ()
+
     # Whether the draft model reuses the target's embedding and LM head
     # weights (set via set_embed_and_head right after both models load, in
     # create_model_runner, so the draft's own copies are dropped before the

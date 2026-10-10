@@ -172,8 +172,10 @@ class SamplingBackend(ABC):
 
     #: Pool-shaped buffers whose rows never change (every slot reads the same
     #: constant), so a retraction image carries nothing for them. The
-    #: architecture test accepts these beside the exported rows.
+    #: architecture test accepts these beside the exported rows; no sampling
+    #: row is token-derived.
     constant_slot_state: tuple[str, ...] = ("_zero_offsets_pool",)
+    token_derived_slot_state: tuple[str, ...] = ()
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 

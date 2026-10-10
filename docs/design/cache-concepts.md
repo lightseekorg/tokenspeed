@@ -511,10 +511,13 @@ unclaimed and the first forward prepares it from the request's own
 parameters, as the unretracted request's would have. Token-derived rows —
 the committed-token history and the n-gram tail — are not imaged; they are
 reseeded from the control plane's token list as on any slot handoff.
-`test/runtime/test_slot_state.py` enumerates every tensor these classes
-allocate with a slot-sized dimension and fails when one is neither exported
-nor declared token-derived: backend-private per-slot state is the exception
-(`AGENTS.md`), and when it exists it must have an exporter.
+`test/runtime/test_slot_state.py` constructs these owners (and a
+`ModelExecutor` over them) and enumerates every tensor they or their runtime
+components allocate with a slot-sized dimension, failing when one is neither
+exported nor declared in the exporter's `token_derived_slot_state` /
+`constant_slot_state` (required class attributes, empty or not): backend-
+private per-slot state is the exception (`AGENTS.md`), and when it exists it
+must have an exporter -- and a builder in that test to be guarded.
 
 **One ownership translation for every leg.** The scheduler places every Host
 block — L2 or pool, store or load or restore — in the same residue class as

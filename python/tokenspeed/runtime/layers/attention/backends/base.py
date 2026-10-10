@@ -113,6 +113,11 @@ class SparseTopKShare:
 class CachePoolBinding:
     """A node's bound cache pool."""
 
+    #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
+    #: none by default; a node that keeps some names them.
+    token_derived_slot_state: tuple[str, ...] = ()
+    constant_slot_state: tuple[str, ...] = ()
+
     def _init_pool_binding(self) -> None:
         self.cache_pool: CachePool | None = None
 

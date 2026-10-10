@@ -53,6 +53,7 @@ class RuntimeStates:
         "ngram_accepted_tokens",
         "ngram_needs_seed",
     )
+    constant_slot_state: tuple[str, ...] = ()
 
     def __init__(
         self,

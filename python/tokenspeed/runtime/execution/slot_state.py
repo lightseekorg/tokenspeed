@@ -80,7 +80,19 @@ PREPARED_MARKER_BYTES = SLOT_STATE_ALIGNMENT
 
 @runtime_checkable
 class SlotStateExporter(Protocol):
-    """One owner of per-slot Device state outside the cache groups."""
+    """One owner of per-slot Device state outside the cache groups.
+
+    Besides the three operations, every exporter class declares two tuples
+    of attribute names for the completeness test
+    (``test/runtime/test_slot_state.py``): ``token_derived_slot_state``, the
+    slot-sized tensors a restore does not copy because the control plane's
+    token list reseeds them, and ``constant_slot_state``, the slot-shaped
+    tensors every slot reads the same value from. Both may be empty; neither
+    may be missing.
+    """
+
+    token_derived_slot_state: tuple[str, ...]
+    constant_slot_state: tuple[str, ...]
 
     def slot_state_bytes(self) -> int:
         """Bytes of one slot's image; fixed for the executor's lifetime."""

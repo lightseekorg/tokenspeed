@@ -26,10 +26,13 @@ aggregate):
 
 * a round trip -- export one slot's rows into a uint8 image, wipe them, import
   into another slot, compare byte for byte;
-* the completeness test -- every tensor an owner allocates with a slot-sized
-  dimension is either reachable from ``slot_state_rows`` or named in
-  ``token_derived_slot_state``. A per-slot buffer added without an exporter
-  fails here instead of silently breaking a restored request.
+* the completeness test -- every tensor an owner (or a runtime component it
+  holds) allocates with a slot-sized dimension is either reachable from
+  ``slot_state_rows`` or named in the exporter's ``token_derived_slot_state``
+  / ``constant_slot_state``, which every exporter class must declare. A
+  per-slot buffer added to a constructed owner without an exporter fails
+  here instead of silently breaking a restored request; an owner class this
+  file does not construct is not guarded.
 """
 
 from __future__ import annotations
@@ -673,13 +676,25 @@ def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
 # ----------------------------------------------------------------------
 
 
+def _is_runtime_component(value) -> bool:
+    """A helper object of the runtime an owner keeps its tensors in (a conv
+    pool, a tail workspace) -- not a tensor, not another exporter, not a test
+    fake (``SimpleNamespace``) and not a module."""
+    return (
+        not isinstance(value, (torch.Tensor, torch.nn.Module, SlotStateExporter))
+        and hasattr(value, "__dict__")
+        and type(value).__module__.startswith("tokenspeed.")
+    )
+
+
 def _tensor_attributes(obj) -> dict[str, torch.Tensor]:
-    """``name -> tensor`` over the object's own attributes and listed sub-owners."""
+    """``name -> tensor`` over the object's own attributes and, one level down,
+    the runtime components it holds (``component.tensor``)."""
     found: dict[str, torch.Tensor] = {}
     for name, value in vars(obj).items():
         if isinstance(value, torch.Tensor):
             found[name] = value
-        elif name in ("conv_pool", "_kpool_tail_workspace"):
+        elif _is_runtime_component(value):
             for sub_name, sub_value in vars(value).items():
                 if isinstance(sub_value, torch.Tensor):
                     found[f"{name}.{sub_name}"] = sub_value
@@ -699,9 +714,12 @@ def _storage_ids(rows) -> set[int]:
 
 
 def _assert_slot_state_complete(owner, *, exporter, slot_domains: set[int]) -> None:
+    """Every slot-sized tensor of ``owner`` (and its components) is exported by
+    ``exporter`` or declared by the exporter's class; the declarations are
+    required attributes, empty or not."""
     exported = _storage_ids(exporter.slot_state_rows(0))
-    declared = set(getattr(type(owner), "token_derived_slot_state", ())) | set(
-        getattr(type(owner), "constant_slot_state", ())
+    declared = set(type(exporter).token_derived_slot_state) | set(
+        type(exporter).constant_slot_state
     )
     uncovered = sorted(
         name
@@ -714,6 +732,26 @@ def _assert_slot_state_complete(owner, *, exporter, slot_domains: set[int]) -> N
         "token_derived_slot_state (reseeded from the request's tokens) or in "
         "constant_slot_state (identical for every slot)."
     )
+
+
+def test_every_owner_a_constructed_executor_lists_is_complete():
+    """The owners as the model executor lists them for the blob, each checked
+    against its own tensors: a per-slot buffer added to any of them without an
+    exporter fails here."""
+    states = _runtime_states(draft_probs=True, trees=True, history=True)
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.runtime_states = states
+    executor.attn_backend = _inkling()
+    executor.draft_attn_backend = _inkling()
+    executor.drafter = _dspark(states)
+    executor.sampling_backend = _sampling_backend(FlashInferFullSamplingBackend)
+    exporters = executor.slot_state_exporters()
+    assert len(exporters) == 7
+    for owner in exporters:
+        assert isinstance(owner, SlotStateExporter)
+        _assert_slot_state_complete(
+            owner, exporter=owner, slot_domains={POOL_ROWS, WINDOW_SLOTS}
+        )
 
 
 def test_runtime_states_slot_state_is_complete():
