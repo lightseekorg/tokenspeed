@@ -431,6 +431,12 @@ class ServerArgs:
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
 
+    # Retraction snapshot pool (pinned Host, per rank). 0 is the explicit
+    # "no pool": a retracting role then never retracts and a blocked
+    # admission waits for completions.
+    retraction_snapshot_host_gb: float = 0.0
+    retraction_snapshot_max_requests: int = 0
+
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
     dist_init_addr: str | None = None
@@ -1118,6 +1124,35 @@ class ServerArgs:
         # Handle KVStore settings.
         self._handle_kvstore()
         self.validate_cache_options()
+        self.validate_retraction_snapshot_options()
+
+    def validate_retraction_snapshot_options(self):
+        """The retraction snapshot pool: both knobs or neither, retracting roles only.
+
+        A positive ``--retraction-snapshot-host-gb`` builds the pinned pool
+        and needs ``--retraction-snapshot-max-requests`` for the slot-state
+        arena it comes with; 0 is the explicit "no pool" and must not come
+        with arena slots. Prefill and encode roles never retract, so a pool
+        there is a configuration error rather than idle memory.
+        """
+        host_gb = self.retraction_snapshot_host_gb
+        max_requests = self.retraction_snapshot_max_requests
+        if host_gb < 0 or max_requests < 0:
+            raise ValueError(
+                "--retraction-snapshot-host-gb and "
+                "--retraction-snapshot-max-requests must be non-negative"
+            )
+        if (host_gb > 0) != (max_requests > 0):
+            raise ValueError(
+                "--retraction-snapshot-host-gb and --retraction-snapshot-max-requests "
+                "go together: a pool needs slot-state rows and rows need a pool "
+                f"(got {host_gb} GB, {max_requests} requests)"
+            )
+        if host_gb > 0 and self.disaggregation_mode in ("prefill", "encode"):
+            raise ValueError(
+                f"the {self.disaggregation_mode} role never retracts; drop "
+                "--retraction-snapshot-host-gb"
+            )
 
     def resolve_speculative_decoding(self):
         # Keep drafter backend consistent with the main model unless explicitly set.
@@ -2188,6 +2223,26 @@ class ServerArgs:
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
+        )
+        # Retraction snapshot pool
+        parser.add_argument(
+            "--retraction-snapshot-host-gb",
+            type=float,
+            default=ServerArgs.retraction_snapshot_host_gb,
+            help="Per-rank pinned Host pool, in gigabytes, that images a retracted "
+            "request's unaligned tail pages, its groups Host L2 never holds, and "
+            "its slot state (the hash-complete blocks go to Host L2; without "
+            "--enable-kvstore the pool must hold the whole image). 0 (the "
+            "default) means no pool: the engine never retracts and a blocked "
+            "admission waits for completions. Fused and decode roles only.",
+        )
+        parser.add_argument(
+            "--retraction-snapshot-max-requests",
+            type=int,
+            default=ServerArgs.retraction_snapshot_max_requests,
+            help="Slot-state image rows of the retraction snapshot pool, i.e. the "
+            "most requests retracted at once. Required with a non-zero pool; "
+            "a rule of thumb is 2 x --max-num-seqs / dp_size.",
         )
         # Mamba Cache
         parser.add_argument(

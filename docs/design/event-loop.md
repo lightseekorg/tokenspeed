@@ -95,7 +95,11 @@ Consequences:
   size limit. L3 adds named Host-tier operations for existence/readability
   probes, prefetch planning/results, failed-read invalidation, namespace and
   weight-version changes, and cache shutdown. These keep the executor and
-  Host buffer hidden; they do not introduce another generic work slot.
+  Host buffer hidden; they do not introduce another generic work slot. The
+  retraction snapshot pool adds no operation at all: its stores ride
+  `execute` with the write-backs, its restores with the load-backs, its ACKs
+  `poll_cache_results`, and `shutdown_cache` closes it with L2 -- one
+  `HostCacheExecutor` behind the handle, two Host buffers inside it.
   The `EXPERT_LOAD` profile activity adds two more named operations,
   `reset_expert_load` and `dump_expert_load`: the routing kernels bump the
   expert placement's load counters on the execution stream, so zeroing and
@@ -331,7 +335,7 @@ Current inventory:
 | `_pause_hooks` | `PauseHooks` — `engine/pause.py`              | glue (PauseController is the state machine) | `apply_transitions`, `withhold_admissions`, `paused_idle_step` |
 | `_epd_hooks`   | `EpdPrefillHooks` — `epd/prefill_hooks.py`    | glue (EpdPrefillAdmission decides)          | `try_stage`, `drain_ready_embeddings`, `assert_embeddings_received` |
 | `_pd_hooks`    | `PdTransferHooks` — `pd/transfer_hooks.py`    | glue (transfer executors decide)            | `poll_transfer_events` |
-| `_cache_hooks` | `L2CacheHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries) | `count_plan_ops`, `poll_ready_events` |
+| `_cache_hooks` | `CacheOpHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries; counts the Host L2 write-backs/load-backs and the retraction image's snapshot stores/restores alike) | `count_plan_ops`, `poll_ready_events` |
 | `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `revalidate_queued_hits`, `prepare_forward` |
 | `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
 
@@ -394,8 +398,9 @@ For orientation, one iteration of `event_loop`:
 
 1. Receive and admit new requests (`_process_new_requests`), with the pause
    and EPD admission hooks inline as single lines.
-2. Poll completed L2 cache ops; **advance the scheduler (head call site)** so
-   this round's plan sees them.
+2. Poll completed Host cache ops (L2 write-backs/load-backs, snapshot
+   stores/restores); **advance the scheduler (head call site)** so this
+   round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle
    step. Otherwise: revalidate queued L3 hits, plan (`next_execution_plan`),
    derive the forward op, record metrics, DP-sync, and gather per-batch state
@@ -403,15 +408,19 @@ For orientation, one iteration of `event_loop`:
    commit, Principle 4).
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse:
-   host-cache write-backs first (a retraction's snapshot copy must read the
-   reused pages' old bytes, so its op is stream-ordered and fences the
-   forward thread's stream on its completion here; an ordinary store's
-   sources are pinned by the scheduler until the ACK, so its copy rides the
-   write stream and fences nothing), then page zeroing (the new owner's
-   sanitization), then load-backs (they target zeroed pages), then the
+   host-cache stores first (a retraction image's two legs -- the
+   stream-ordered L2 write-back of the victim's hash-complete pages and the
+   snapshot store of its tail pages and slot state -- must read the reused
+   pages' old bytes, so they ride the write stream consecutively and ONE
+   completion event fences the forward thread's stream here; an ordinary
+   store's sources are pinned by the scheduler until the ACK, so its copy
+   rides the write stream and fences nothing), then page zeroing (the new
+   owner's sanitization), then load-backs and restores (they target zeroed
+   pages; a restore reads both Host tiers under one event and arms no
+   layerwise fence, its request being unschedulable until the ACK), then the
    plan's remote streams to the transfer peer (a D-node remote prefill
    waits on the zeroing fence inside its submission, which the FIFO orders
-   after the write-back fence), then the plan's batch to the model. `planned` is
+   after the store fence), then the plan's batch to the model. `planned` is
    None on idle and empty rounds; the plan's own work (hygiene, the remote
    streams) still runs. The rebalance hook notes whether this rank forwarded
    (`_eplb_hooks.note_round`). Then commit from the queue head down to the

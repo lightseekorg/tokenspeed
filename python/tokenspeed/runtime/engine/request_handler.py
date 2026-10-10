@@ -259,7 +259,7 @@ class RequestHandler:
         # Flush MIN includes attention DP after TP/PP: object keys omit
         # DP rank, so DP replicas share the Mooncake namespace. Exists,
         # prefetch, and WriteBackDone stay TP/PP only (EventLoop /
-        # L2CacheHooks); those ranks hold different sequences.
+        # CacheOpHooks); those ranks hold different sequences.
         self.attn_dp_size = mapping.attn.dp_size
         self.attn_dp_cpu_group = (
             pg_manager.get_process_group("gloo", mapping.attn.dp_group)

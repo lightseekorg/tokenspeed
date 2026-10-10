@@ -18,7 +18,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Descriptor-driven executor for compact Host cache transfers."""
+"""Descriptor-driven executor for compact Host cache transfers, two tiers.
+
+One executor, two pinned Host buffers over the same field geometry:
+
+* the **L2 prefix tier** (``--enable-kvstore``): hash-complete prefix pages the
+  scheduler publishes, stored by ``WriteBackOp``, loaded by ``LoadBackOp``
+  with layerwise consumer fences, optionally backed by L3;
+* the **retraction snapshot pool** (``--retraction-snapshot-host-gb``): the
+  request-private tail of a retracted request's image -- its unaligned tail
+  pages, every block of a group L2 never holds, and its slot-state blob --
+  stored by ``SnapshotOp`` and read back, together with the request's pinned
+  L2 entries, by one ``RestoreOp`` whose rows name their source tier.
+
+A retraction image is split between the two by publishability (the
+scheduler's ``TakeImage``); the executor only chooses a buffer per row. Both
+legs of a store ride the write stream under one fence on the forward
+thread's default stream, because the victim's Device pages are re-granted in
+the same plan; a restore rides the load stream after the plan's zeroing and
+is acknowledged asynchronously, nothing in the round reading its pages. Every
+row of every op passes one ownership translation on both ends (``ownership.py``),
+so under KVP each rank copies exactly the blocks it owns.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +48,7 @@ from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import NamedTuple
 
+import torch
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
     transfer_cache_blocks,
@@ -46,6 +68,7 @@ from tokenspeed.runtime.cache.l3.backend import (
 )
 from tokenspeed.runtime.cache.l3.executor import L3HostStore, StoragePage
 from tokenspeed.runtime.cache.transfer.lanes import (
+    CompletionQueue,
     HostTransferLane,
     build_transfer_geometry,
     check_host_memory,
@@ -53,7 +76,16 @@ from tokenspeed.runtime.cache.transfer.lanes import (
     new_cache_stream,
 )
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
+from tokenspeed.runtime.cache.transfer.ops import (
+    HostTier,
+    RestoreDoneEvent,
+    RestoreOp,
+    SnapshotDoneEvent,
+    SnapshotOp,
+)
+from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
+from tokenspeed.runtime.execution.slot_state import SlotStateExporter
 from tokenspeed.runtime.utils import get_colorful_logger, get_device_module
 
 logger = get_colorful_logger(__name__)
@@ -95,60 +127,156 @@ def _num_host_lcm_blocks(
     return count
 
 
-class L2CacheExecutor:
-    """Execute group-aware D2H/H2D operations against one compact Host pool."""
+def num_snapshot_lcm_blocks(*, host_gb: float, host_lcm_block_bytes: int) -> int:
+    """LCM blocks of a snapshot pool of ``host_gb`` gigabytes (decimal, like L2).
+
+    Raises:
+        ValueError: ``host_gb`` is not positive or holds no whole block.
+    """
+    if host_gb <= 0:
+        raise ValueError(
+            "--retraction-snapshot-host-gb must be positive to build a pool"
+        )
+    count = int(host_gb * 1e9 // host_lcm_block_bytes)
+    if count <= 0:
+        raise ValueError(
+            f"--retraction-snapshot-host-gb {host_gb} holds no whole LCM block "
+            f"({host_lcm_block_bytes} bytes each)"
+        )
+    return count
+
+
+def allocate_blob_arena(rows: int, nbytes: int) -> torch.Tensor:
+    """The pinned ``[rows, nbytes]`` uint8 slot-state arena."""
+    return torch.empty((rows, nbytes), dtype=torch.uint8, pin_memory=nbytes > 0)
+
+
+class HostCacheExecutor:
+    """Execute group-aware D2H/H2D operations against the two compact Host tiers."""
 
     def __init__(
         self,
         device_pool,
         *,
         draft_pool=None,
+        l2_tier: bool,
         host_ratio: float,
         host_size_gb: float,
+        snapshot_host_gb: float,
+        max_retracted_requests: int,
+        slot_state: SlotStateExporter | None,
         io_backend: str,
         attn_tp_rank: int,
+        dcp_rank: int,
     ):
+        """
+        Args:
+            device_pool: The target cache pool; its arena publishes the
+                transfer layout, the runtime contract and the group order.
+            draft_pool: The draft pool sharing the arena, or None.
+            l2_tier: Whether to allocate the L2 prefix tier
+                (``--enable-kvstore``). Without it ``WriteBackOp`` /
+                ``LoadBackOp`` are refused and a retraction image lives
+                wholly in the snapshot pool.
+            host_ratio: L2 LCM blocks as a multiple of the Device's, when
+                ``host_size_gb`` is 0.
+            host_size_gb: L2 size in decimal gigabytes; overrides the ratio
+                when positive.
+            snapshot_host_gb: Snapshot pool size in decimal gigabytes; 0 is
+                no pool (``SnapshotOp`` / ``RestoreOp`` are then refused).
+            max_retracted_requests: Slot-state arena rows; positive with a
+                pool, 0 without one.
+            slot_state: The model executor, as the aggregate of every
+                per-slot state owner; sizes and fills the arena rows. May be
+                None only without a pool.
+            io_backend: ``"direct"`` (DMA ranges) or ``"kernel"`` (mapped-Host
+                Triton copies).
+            attn_tp_rank: Attention-TP rank; rank 0 logs.
+            dcp_rank: This rank in the KVP (DCP) subgroup; selects the blocks
+                it owns of a sharded group (the identity for replicated
+                groups).
+        """
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
+        if not l2_tier and snapshot_host_gb <= 0:
+            raise ValueError(
+                "a Host cache executor needs the L2 tier, a snapshot pool or both"
+            )
+        if (snapshot_host_gb > 0) != (max_retracted_requests > 0):
+            raise ValueError(
+                "a snapshot pool and its slot-state rows go together: got "
+                f"{snapshot_host_gb} GB and {max_retracted_requests} requests"
+            )
+        if snapshot_host_gb > 0 and slot_state is None:
+            raise ValueError("a snapshot pool needs the slot-state exporter")
         self.attn_tp_rank = attn_tp_rank
         self.transfer_backend = "dma" if io_backend == "direct" else "auto"
         target_layout = device_pool.cache_transfer_layout()
         draft_layout = (
             draft_pool.cache_transfer_layout() if draft_pool is not None else None
         )
-        scheduler_group_ids = tuple(
-            spec.group_id for spec in device_pool.arena.cache_group_specs
-        )
+        contract = device_pool.arena.runtime_contract
+        scheduler_group_ids = tuple(spec.group_id for spec in contract.group_specs)
         self.layout = combine_cache_transfer_layouts(
             target_layout,
             draft_layout,
             group_ids=scheduler_group_ids or None,
         )
         host_lcm_block_bytes = compute_host_lcm_block_bytes(self.layout)
-        host_lcm_blocks = _num_host_lcm_blocks(
-            host_lcm_block_bytes=host_lcm_block_bytes,
-            device_lcm_blocks=self.layout.num_lcm_blocks,
-            host_ratio=host_ratio,
-            host_size_gb=host_size_gb,
-        )
-        requested_host_bytes = host_lcm_blocks * host_lcm_block_bytes
+
+        # --- L2 prefix tier -------------------------------------------------
+        host_lcm_blocks = 0
+        if l2_tier:
+            host_lcm_blocks = _num_host_lcm_blocks(
+                host_lcm_block_bytes=host_lcm_block_bytes,
+                device_lcm_blocks=self.layout.num_lcm_blocks,
+                host_ratio=host_ratio,
+                host_size_gb=host_size_gb,
+            )
+        l2_bytes = host_lcm_blocks * host_lcm_block_bytes
+        # --- retraction snapshot pool -----------------------------------------
+        snapshot_lcm_blocks = 0
+        self.blob_bytes = 0
+        if snapshot_host_gb > 0:
+            snapshot_lcm_blocks = num_snapshot_lcm_blocks(
+                host_gb=snapshot_host_gb, host_lcm_block_bytes=host_lcm_block_bytes
+            )
+            self.blob_bytes = int(slot_state.slot_state_bytes())
+        self.max_retracted_requests = int(max_retracted_requests)
+        snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
+        arena_bytes = self.max_retracted_requests * self.blob_bytes
+        # Both tiers count against the one headroom check.
         check_host_memory(
-            requested_host_bytes,
+            l2_bytes + snapshot_bytes + arena_bytes,
             headroom_bytes=_HOST_MEM_HEADROOM_BYTES,
-            purpose="L2",
+            purpose="the compact Host cache",
         )
-        self.host_storage = HostCacheStorage(
-            self.layout,
-            num_host_lcm_blocks=host_lcm_blocks,
-        )
+
+        self.host_storage: HostCacheStorage | None = None
+        self.block_owners: BlockOwnerTranslation | None = None
+        self._transfer_geometry = None
+        if l2_tier:
+            self.host_storage = HostCacheStorage(
+                self.layout, num_host_lcm_blocks=host_lcm_blocks
+            )
+            # Scheduler block ids on both ends of every L2 copy to this rank's
+            # local ids.
+            self.block_owners = BlockOwnerTranslation.for_host_pool(
+                self.layout,
+                contract,
+                num_host_lcm_blocks=host_lcm_blocks,
+                rank=dcp_rank,
+            )
+        # The scheduler wire includes logical null LCMBlock 0 in its counts;
+        # 0 L2 pages means no L2 tier, 1 snapshot page means never retract.
+        self.num_host_pages = host_lcm_blocks + 1 if l2_tier else 0
+        self.num_snapshot_pages = snapshot_lcm_blocks + 1
         self.l3_store = None
         self._l3_prefix_for_weight_version = None
         # L3 is attached after Host allocation via ``attach_l3_storage`` with
         # the complete namespace and shard identity. The constructor does
         # not take a storage backend: a partial attach would share an empty
         # prefix across ranks.
-        # The scheduler wire includes logical null LCMBlock 0 in its count.
-        self.num_host_pages = host_lcm_blocks + 1
         self._l3_unread = L3UnreadKeySet(
             capacity=l3_unread_key_capacity(
                 num_host_pages=self.num_host_pages,
@@ -158,54 +286,103 @@ class L2CacheExecutor:
                 ),
             )
         )
-        logger.info(
-            f"Allocated {requested_host_bytes / 1000000000.0:.2f} GB compact Host L2 ("
-            f"{host_lcm_blocks!s} LCM blocks, {host_lcm_block_bytes!s} bytes/block)",
-        )
+        self.snapshot_storage: HostCacheStorage | None = None
+        self.snapshot_block_owners: BlockOwnerTranslation | None = None
+        self._snapshot_geometry = None
+        self._slot_state = slot_state
+        self.blob_arena: torch.Tensor | None = None
+        if snapshot_lcm_blocks:
+            self.snapshot_storage = HostCacheStorage(
+                self.layout, num_host_lcm_blocks=snapshot_lcm_blocks
+            )
+            self.snapshot_block_owners = BlockOwnerTranslation.for_host_pool(
+                self.layout,
+                contract,
+                num_host_lcm_blocks=snapshot_lcm_blocks,
+                rank=dcp_rank,
+            )
+            # One row per retracted request, indexed by the op's snapshot_slot.
+            self.blob_arena = allocate_blob_arena(
+                self.max_retracted_requests, self.blob_bytes
+            )
+        if l2_tier:
+            logger.info(
+                f"Allocated {l2_bytes / 1000000000.0:.2f} GB compact Host L2 ("
+                f"{host_lcm_blocks!s} LCM blocks, {host_lcm_block_bytes!s} bytes/block)",
+            )
+        if snapshot_lcm_blocks:
+            tokens_per_lcm_block = max(
+                1, int(contract.token_capacity) // int(contract.num_lcm_blocks)
+            )
+            logger.info(
+                f"Allocated {snapshot_bytes / 1e9:.2f} GB pinned retraction snapshot "
+                f"pool ({snapshot_lcm_blocks} LCM blocks, {host_lcm_block_bytes} "
+                f"bytes/block, about {snapshot_lcm_blocks * tokens_per_lcm_block} "
+                f"tokens) and a {arena_bytes / 1e6:.2f} MB slot-state arena "
+                f"({self.max_retracted_requests} x {self.blob_bytes} bytes); "
+                f"images are {'tails, with the bulk in L2' if l2_tier else 'whole (no L2 tier)'}"
+            )
 
-        pool_layouts = [(device_pool, target_layout)]
-        if draft_pool is not None and self.layout is not target_layout:
-            pool_layouts.append((draft_pool, draft_layout))
+        # Layerwise load fences exist for L2 prefix loads only: a restore's
+        # pages are read by nothing in the round, and without an L2 tier no
+        # load-back can occur, so the pools keep no tracker.
         self._load_trackers = []
-        for pool, layout in pool_layouts:
-            tracker = LayerwiseLoadTracker(len(layout.consumers))
-            pool.register_layerwise_load_tracker(tracker)
-            self._load_trackers.append((tracker, len(layout.consumers)))
+        if l2_tier:
+            pool_layouts = [(device_pool, target_layout)]
+            if draft_pool is not None and self.layout is not target_layout:
+                pool_layouts.append((draft_pool, draft_layout))
+            for pool, layout in pool_layouts:
+                tracker = LayerwiseLoadTracker(len(layout.consumers))
+                pool.register_layerwise_load_tracker(tracker)
+                self._load_trackers.append((tracker, len(layout.consumers)))
         # Every copy runs on its own stream, ordered after the prerequisite
-        # stream the caller names per submission: for a write-back the one
-        # the forwards wrote the source pages on, for a load the one that
-        # zeroed the destination pages. What differs per write-back op is who
-        # waits on the copy: a stream-ordered op (a retraction's snapshot,
-        # whose sources this very plan may re-grant) fences the fence stream
-        # the caller names on its completion, so the plan's zeroing,
-        # load-backs and forwards stay behind it; a pinned op (an ordinary
-        # publication, whose sources the scheduler holds until the ACK) fences
-        # nothing and never holds up the round. A load's consumers are fenced
-        # per layer by the tracker events.
+        # stream the caller names per submission: for a store the one the
+        # forwards wrote the source pages on, for a load the one that zeroed
+        # the destination pages. What differs per store is who waits on the
+        # copy: a stream-ordered op (a retraction image's L2 leg, and every
+        # snapshot store, whose sources this very plan may re-grant) fences
+        # the fence stream the caller names on its completion, so the plan's
+        # zeroing, load-backs, restores and forwards stay behind it; a pinned
+        # op (an ordinary publication, whose sources the scheduler holds
+        # until the ACK) fences nothing and never holds up the round. An L2
+        # load's consumers are fenced per layer by the tracker events; a
+        # restore's by its ACK.
         self.write_stream = new_cache_stream(None)
         self.load_stream = new_cache_stream(load_stream_priority())
-        # Both the write stream (D2H) and load stream (H2D) consume this
-        # immutable table; the kernel backend publishes it to the Device once.
-        self._transfer_geometry = build_transfer_geometry(
-            self.layout, self.host_storage, io_backend=io_backend
-        )
-        # Two lanes, so the two kinds a round may submit (stream-ordered, then
-        # pinned) never wait on each other's metadata staging.
+        # Both streams consume these immutable tables; the kernel backend
+        # publishes them to the Device once. One geometry per Host buffer.
+        if l2_tier:
+            self._transfer_geometry = build_transfer_geometry(
+                self.layout, self.host_storage, io_backend=io_backend
+            )
+        if snapshot_lcm_blocks:
+            self._snapshot_geometry = build_transfer_geometry(
+                self.layout, self.snapshot_storage, io_backend=io_backend
+            )
+        # One staging lane per submission kind a round may make, so none
+        # waits on another's pinned metadata tables: the stream-ordered and
+        # pinned L2 write-backs, the snapshot store, and the restore's two
+        # tiers.
         self._ordered_write_lane = HostTransferLane()
         self._pinned_write_lane = HostTransferLane()
+        self._snapshot_write_lane = HostTransferLane()
+        self._restore_l2_lane = HostTransferLane()
+        self._restore_pool_lane = HostTransferLane()
         # A tracker waits for an event set's previous final-layer event before
         # reusing its index. Aligning workspaces to those indices keeps each
         # load's pinned and Device block-ID tables immutable until all
         # consumers of that table have completed.
-        load_workspace_count = len(self._load_trackers[0][0].event_sets)
-        if any(
-            len(tracker.event_sets) != load_workspace_count
-            for tracker, _ in self._load_trackers
-        ):
-            raise RuntimeError("target and draft Host-load event sets diverged")
-        self._load_workspaces = tuple(
-            HostTransferWorkspace() for _ in range(load_workspace_count)
-        )
+        self._load_workspaces: tuple[HostTransferWorkspace, ...] = ()
+        if self._load_trackers:
+            load_workspace_count = len(self._load_trackers[0][0].event_sets)
+            if any(
+                len(tracker.event_sets) != load_workspace_count
+                for tracker, _ in self._load_trackers
+            ):
+                raise RuntimeError("target and draft Host-load event sets diverged")
+            self._load_workspaces = tuple(
+                HostTransferWorkspace() for _ in range(load_workspace_count)
+            )
 
         # Submission runs on the forward thread and polling on the control
         # plane (event queries only), so the completion queues below are the
@@ -215,6 +392,9 @@ class L2CacheExecutor:
         self._load_acks: list[_Ack] = []
         self._load_poisoned = False
         self._ready_load_acks: list[tuple[int, bool]] = []
+        # Snapshot stores and restores: one event per submission, released
+        # as SnapshotDone / RestoreDone.
+        self._snapshot_acks = CompletionQueue()
         self._l3_prefetch_ok: dict[StoragePage, bool] = {}
         self._backup_futures: list[tuple[Future, list[int], list[StoragePage]]] = []
         self._backup_poll_failed = False
@@ -242,6 +422,8 @@ class L2CacheExecutor:
             raise ValueError("storage_backend is required")
         if prefix_for_weight_version is None:
             raise ValueError("prefix_for_weight_version is required")
+        if self.host_storage is None:
+            raise RuntimeError("L3 storage needs the L2 tier (--enable-kvstore)")
         self._l3_prefix_for_weight_version = prefix_for_weight_version
         self.l3_store = L3HostStore(
             storage_backend,
@@ -268,25 +450,33 @@ class L2CacheExecutor:
         for future, _op_ids, _pages in inflight:
             future.result()
 
+    # ------------------------------------------------------------------
+    # Submission (forward thread)
+    # ------------------------------------------------------------------
+
     def submit_write_backs(self, plan, *, prerequisite_stream, fence_stream) -> None:
         """Enqueue the plan's D2H copies on the write stream.
 
         Must run BEFORE the plan's page zeroing. Every copy is ordered behind
         ``prerequisite_stream`` -- here the stream the forwards wrote the
         source pages on -- so it reads their final bytes. The scheduler marks
-        each op ``source_pinned``: a pinned op's sources stay cached and
+        each L2 op ``source_pinned``: a pinned op's sources stay cached and
         unevictable until the ACK, so its copy rides the write stream and
         nobody waits on it; an unpinned op's sources may already be granted to
         another request in this very plan, so it goes first and
         ``fence_stream`` waits on its completion -- the plan's zeroing,
-        load-backs and forwards are ordered behind that wait.
+        load-backs, restores and forwards are ordered behind that wait. A
+        retraction image's snapshot leg (``SnapshotOp``: tail pages into the
+        pool, then the victim's slot state into the arena) follows the
+        stream-ordered L2 rows on the same stream, so the one fence covers
+        both legs.
 
         Args:
-            plan: The round's ExecutionPlan; its ``Cache.WriteBackOp``
-                entries are read here.
+            plan: The round's ExecutionPlan; its ``Cache.WriteBackOp`` and
+                ``SnapshotOp`` entries are read here.
             prerequisite_stream: The stream whose completed work every copy
                 must observe -- the model executor's execution stream, where
-                the forwards wrote the source pages.
+                the forwards wrote the source pages and the slot state.
             fence_stream: The stream a stream-ordered op's completion fences
                 -- the one the plan's page zeroing runs on next.
         """
@@ -296,6 +486,8 @@ class L2CacheExecutor:
         pinned_transfers: list[tuple[int, int, int]] = []
         ordered_pages: list[StoragePage] = []
         pinned_pages: list[StoragePage] = []
+        snapshot_ops: list[SnapshotOp] = []
+        snapshot_transfers: list[tuple[int, int, int]] = []
         for operation in plan.cache:
             if isinstance(operation, Cache.WriteBackOp):
                 self._append_write_backs(
@@ -307,6 +499,9 @@ class L2CacheExecutor:
                     ordered_pages=ordered_pages,
                     pinned_pages=pinned_pages,
                 )
+            elif isinstance(operation, SnapshotOp):
+                snapshot_ops.append(operation)
+                self._append_snapshot_store(operation, transfers=snapshot_transfers)
         fence = self._start_writing(
             ordered_op_ids,
             ordered_transfers,
@@ -314,6 +509,14 @@ class L2CacheExecutor:
             lane=self._ordered_write_lane,
             prerequisite_stream=prerequisite_stream,
         )
+        if snapshot_ops:
+            # Recorded after the ordered L2 rows on the same stream, so
+            # waiting on it waits on both legs.
+            fence = self._start_snapshot_store(
+                snapshot_ops,
+                snapshot_transfers,
+                prerequisite_stream=prerequisite_stream,
+            )
         if fence is not None:
             fence_stream.wait_event(fence)
         self._start_writing(
@@ -331,10 +534,14 @@ class L2CacheExecutor:
 
         L3 prefetch runs before this submission. Failed prefetch skips H2D
         and reports failure so empty pages cannot be published or consumed.
+        A ``RestoreOp`` rides the same load stream with its rows split by
+        source tier (the request's pinned L2 entries, the pool's tail pages),
+        then its slot-state import; it arms no layerwise tracker, because the
+        request is not schedulable until the ACK.
 
         Args:
-            plan: The round's ExecutionPlan; its ``Cache.LoadBackOp``
-                entries are read here.
+            plan: The round's ExecutionPlan; its ``Cache.LoadBackOp`` and
+                ``RestoreOp`` entries are read here.
             prerequisite_stream: The stream whose completed work every copy
                 must observe -- the one the plan's page zeroing ran on, so the
                 loads land on zeroed destination pages.
@@ -344,6 +551,11 @@ class L2CacheExecutor:
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
         prefetch_ok = True
+        restore_ops: list[RestoreOp] = []
+        restore_rows: dict[HostTier, list[tuple[int, int, int]]] = {
+            HostTier.L2: [],
+            HostTier.SNAPSHOT_POOL: [],
+        }
         for operation in plan.cache:
             if isinstance(operation, Cache.LoadBackOp):
                 self._append_transfers(
@@ -354,6 +566,7 @@ class L2CacheExecutor:
                     collected_op_ids=op_ids,
                     transfers=transfers,
                     source_is_device=False,
+                    tier=HostTier.L2,
                 )
                 prefetch_pages = self._storage_pages(
                     operation,
@@ -365,6 +578,13 @@ class L2CacheExecutor:
                     l3_prefetch_ok.get(page, False) for page in prefetch_pages
                 ):
                     prefetch_ok = False
+            elif isinstance(operation, RestoreOp):
+                restore_ops.append(operation)
+                self._append_restore(operation, rows_by_tier=restore_rows)
+        if restore_ops:
+            self._start_restore(
+                restore_ops, restore_rows, prerequisite_stream=prerequisite_stream
+            )
         if not prefetch_ok:
             self._start_loading(
                 op_ids, [], success=False, prerequisite_stream=prerequisite_stream
@@ -378,9 +598,8 @@ class L2CacheExecutor:
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
 
-    @classmethod
     def _append_write_backs(
-        cls,
+        self,
         operation,
         *,
         ordered_op_ids: list[int],
@@ -399,7 +618,7 @@ class L2CacheExecutor:
                 if pinned
                 else (ordered_op_ids, ordered_transfers)
             )
-            cls._append_transfers(
+            self._append_transfers(
                 operation.op_ids[index : index + 1],
                 operation.group_ids[index : index + 1],
                 operation.src_pages[index : index + 1],
@@ -407,9 +626,10 @@ class L2CacheExecutor:
                 collected_op_ids=op_ids,
                 transfers=transfers,
                 source_is_device=True,
+                tier=HostTier.L2,
             )
             (pinned_pages if pinned else ordered_pages).extend(
-                cls._storage_pages(
+                self._storage_pages(
                     operation,
                     host_is_destination=True,
                     prefetch_only=False,
@@ -417,8 +637,24 @@ class L2CacheExecutor:
                 )
             )
 
-    @staticmethod
+    def _owners(self, tier: HostTier) -> BlockOwnerTranslation:
+        """The ownership translation of one Host tier; raises without the tier."""
+        if tier is HostTier.L2:
+            if self.block_owners is None:
+                raise RuntimeError(
+                    "cache op names Host L2 blocks but this engine has no L2 tier "
+                    "(--disable-kvstore)"
+                )
+            return self.block_owners
+        if self.snapshot_block_owners is None:
+            raise RuntimeError(
+                "cache op names snapshot-pool blocks but this engine has no "
+                "retraction snapshot pool (--retraction-snapshot-host-gb)"
+            )
+        return self.snapshot_block_owners
+
     def _append_transfers(
+        self,
         operation_ids: Sequence[int],
         group_ids: Sequence[Sequence[int]],
         src_blocks: Sequence[Sequence[int]],
@@ -427,11 +663,22 @@ class L2CacheExecutor:
         collected_op_ids: list[int],
         transfers: list[tuple[int, int, int]],
         source_is_device: bool,
+        tier: HostTier,
     ) -> None:
+        """Turn one batch's wire rows into this rank's local block triples.
+
+        The one place rows become ``(group_index, device_block, host_block)``:
+        every row passes the ownership translation of ``tier`` on both ends,
+        so a sharded group's row is kept only by the rank that owns it (the
+        scheduler pairs blocks of equal residue) and a replicated group's row
+        translates to itself. An op whose every row belongs to other ranks is
+        still collected: this rank acknowledges it from an empty copy.
+        """
         if not (
             len(operation_ids) == len(group_ids) == len(src_blocks) == len(dst_blocks)
         ):
             raise ValueError("ragged cache operation batch")
+        owners = self._owners(tier)
         for op_id, groups, sources, destinations in zip(
             operation_ids, group_ids, src_blocks, dst_blocks
         ):
@@ -443,11 +690,186 @@ class L2CacheExecutor:
             if not groups:
                 raise ValueError(f"cache operation {op_id} carries no transfers")
             collected_op_ids.append(int(op_id))
+            rows = []
             for group, source, destination in zip(groups, sources, destinations):
                 device_block_id, host_block_id = (
                     (source, destination) if source_is_device else (destination, source)
                 )
-                transfers.append((int(group), int(device_block_id), int(host_block_id)))
+                rows.append((int(group), int(device_block_id), int(host_block_id)))
+            transfers.extend(owners.owned_rows(rows))
+
+    def _check_snapshot_op(self, op: SnapshotOp | RestoreOp) -> None:
+        if self.snapshot_storage is None:
+            raise RuntimeError(
+                f"{type(op).__name__} {op.op_id} needs the retraction snapshot pool "
+                "(--retraction-snapshot-host-gb)"
+            )
+        if not 0 <= int(op.snapshot_slot) < self.max_retracted_requests:
+            raise IndexError(
+                f"snapshot slot {op.snapshot_slot} outside "
+                f"[0, {self.max_retracted_requests}) for op {op.op_id}"
+            )
+
+    def _append_snapshot_store(
+        self, op: SnapshotOp, *, transfers: list[tuple[int, int, int]]
+    ) -> None:
+        """A store's tail rows. Empty transfers are legal: every page of the
+        victim went to L2 and the image is its slot state alone."""
+        self._check_snapshot_op(op)
+        if not op.transfers:
+            return
+        ignored: list[int] = []
+        self._append_transfers(
+            [op.op_id],
+            [[t.group_id for t in op.transfers]],
+            [[t.source_page for t in op.transfers]],
+            [[t.destination_page for t in op.transfers]],
+            collected_op_ids=ignored,
+            transfers=transfers,
+            source_is_device=True,
+            tier=HostTier.SNAPSHOT_POOL,
+        )
+
+    def _append_restore(
+        self, op: RestoreOp, *, rows_by_tier: dict[HostTier, list[tuple[int, int, int]]]
+    ) -> None:
+        """A restore's rows, split by the Host tier each one reads."""
+        self._check_snapshot_op(op)
+        if len(op.source_tier) != len(op.transfers):
+            raise ValueError(f"ragged cache operation {op.op_id}")
+        if not op.transfers:
+            raise ValueError(f"cache operation {op.op_id} carries no transfers")
+        for tier in (HostTier.L2, HostTier.SNAPSHOT_POOL):
+            rows = [
+                transfer
+                for transfer, source_tier in zip(op.transfers, op.source_tier)
+                if HostTier(source_tier) is tier
+            ]
+            if not rows:
+                continue
+            ignored: list[int] = []
+            self._append_transfers(
+                [op.op_id],
+                [[t.group_id for t in rows]],
+                [[t.source_page for t in rows]],
+                [[t.destination_page for t in rows]],
+                collected_op_ids=ignored,
+                transfers=rows_by_tier[tier],
+                source_is_device=False,
+                tier=tier,
+            )
+
+    @staticmethod
+    def _check_distinct(ops: Sequence[SnapshotOp | RestoreOp]) -> None:
+        op_ids = [int(op.op_id) for op in ops]
+        if len(set(op_ids)) != len(op_ids):
+            raise ValueError(f"duplicate snapshot op id in one plan: {op_ids}")
+        slots = [int(op.snapshot_slot) for op in ops]
+        if len(set(slots)) != len(slots):
+            raise ValueError(f"duplicate snapshot slot in one plan: {slots}")
+
+    def _start_snapshot_store(
+        self,
+        ops: Sequence[SnapshotOp],
+        transfers: Sequence[tuple[int, int, int]],
+        *,
+        prerequisite_stream,
+    ):
+        """Image the ops' tail rows and slot state on the write stream.
+
+        Returns the completion event the caller fences the default stream on.
+        The slot-state exporters' tensors live on the execution stream the
+        pages were written on, so the one wait covers the rows and the
+        exports; the victim's req-pool slot is reused only behind the fence,
+        so the export reads its bytes.
+        """
+        self._check_distinct(ops)
+        if self.attn_tp_rank == 0:
+            logger.info(
+                f"[snapshot] store started: operations={len(ops):d} blocks="
+                f"{len(transfers):d}",
+            )
+        self.write_stream.wait_stream(prerequisite_stream)
+        if transfers:
+            self._snapshot_write_lane.start_d2h(
+                transfers,
+                device_buffers=self.layout.buffers,
+                host_buffer=self.snapshot_storage.host_buffer,
+                geometry=self._snapshot_geometry,
+                stream=self.write_stream,
+                prerequisite_stream=None,
+                backend=self.transfer_backend,
+            )
+        for op in ops:
+            self._slot_state.export_slot_state(
+                int(op.request_pool_index),
+                self.blob_arena[int(op.snapshot_slot)],
+                self.write_stream,
+            )
+        finish = device_module.Event()
+        finish.record(self.write_stream)
+        self._snapshot_acks.push(
+            finish, [SnapshotDoneEvent(op_id=int(op.op_id)) for op in ops]
+        )
+        return finish
+
+    def _start_restore(
+        self,
+        ops: Sequence[RestoreOp],
+        rows_by_tier: dict[HostTier, Sequence[tuple[int, int, int]]],
+        *,
+        prerequisite_stream,
+    ) -> None:
+        """Copy both tiers' rows and the slot state into the restored requests.
+
+        One event after the L2-tier rows, the pool-tier rows and the imports,
+        so the scheduler sees one ``RestoreDone`` per op; the layerwise
+        tracker is not armed.
+        """
+        if get_is_capture_mode():
+            raise RuntimeError("a snapshot restore must run outside graph capture")
+        self._check_distinct(ops)
+        l2_rows = rows_by_tier[HostTier.L2]
+        pool_rows = rows_by_tier[HostTier.SNAPSHOT_POOL]
+        if self.attn_tp_rank == 0:
+            logger.info(
+                f"[snapshot] restore started: operations={len(ops):d} "
+                f"l2_blocks={len(l2_rows):d} pool_blocks={len(pool_rows):d}",
+            )
+        # Behind the zeroing of the destinations on the stream the caller named.
+        self.load_stream.wait_stream(prerequisite_stream)
+        if l2_rows:
+            self._restore_l2_lane.start_h2d(
+                l2_rows,
+                device_buffers=self.layout.buffers,
+                host_buffer=self.host_storage.host_buffer,
+                geometry=self._transfer_geometry,
+                stream=self.load_stream,
+                prerequisite_stream=None,
+                backend=self.transfer_backend,
+            )
+        if pool_rows:
+            self._restore_pool_lane.start_h2d(
+                pool_rows,
+                device_buffers=self.layout.buffers,
+                host_buffer=self.snapshot_storage.host_buffer,
+                geometry=self._snapshot_geometry,
+                stream=self.load_stream,
+                prerequisite_stream=None,
+                backend=self.transfer_backend,
+            )
+        for op in ops:
+            self._slot_state.import_slot_state(
+                int(op.request_pool_index),
+                self.blob_arena[int(op.snapshot_slot)],
+                self.load_stream,
+                request_id=str(op.request_id),
+            )
+        finish = device_module.Event()
+        finish.record(self.load_stream)
+        self._snapshot_acks.push(
+            finish, [RestoreDoneEvent(op_id=int(op.op_id)) for op in ops]
+        )
 
     @staticmethod
     def _storage_pages(
@@ -841,6 +1263,7 @@ class L2CacheExecutor:
                         pass
 
     def poll_results(self) -> list:
+        """The completed ops' ACKs, both tiers; event queries only, never blocks."""
         results: list = []
         with self._ack_lock:
             results.extend(
@@ -853,12 +1276,14 @@ class L2CacheExecutor:
         for ack in ready_writes:
             self._complete_or_queue_write(ack, results)
         self._collect_finished_backups(results)
+        for events in self._snapshot_acks.pop_ready():
+            results.extend(events)
         return results
 
     def consume_backup_poll_failure(self) -> bool:
         """Return whether an L3 backup future failed since the last consume.
 
-        ``poll_results`` must not raise that failure: ``L2CacheHooks`` has
+        ``poll_results`` must not raise that failure: ``CacheOpHooks`` has
         not entered its replica collectives yet, and a rank-local raise
         hangs peers waiting in ``all_reduce`` / ``all_gather_object``.
         """
@@ -996,6 +1421,7 @@ class L2CacheExecutor:
         self._write_acks.clear()
         self._load_acks.clear()
         self._ready_load_acks.clear()
+        self._snapshot_acks.drop_all()
         self._l3_prefetch_ok.clear()
         self._l3_unread.clear()
         for tracker, _ in self._load_trackers:

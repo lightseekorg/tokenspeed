@@ -1018,7 +1018,7 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         SimpleNamespace(
             forward_thread=SimpleNamespace(submit=submit), execute_forward_op=execute
         ),
-        l2_cache_executor=None,
+        host_cache_executor=None,
         kv_transfer=None,
     )
     planned = PlannedForward(

@@ -363,6 +363,8 @@ are not advertised as control URLs; use a concrete address for gateway discovery
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
+| `--retraction-snapshot-host-gb` | Per-rank pinned Host pool, in gigabytes, for the retraction image's tail: a retracted request's unaligned tail pages, its blocks of groups Host L2 never holds, and its slot state (the hash-complete blocks go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool must hold whole images, about `--max-model-len` x bytes-per-token each). `0` (the default) means no pool: the engine never retracts and a blocked admission waits for completions. Fused and decode roles only; refused on prefill/encode. Startup logs the pool in LCM blocks and tokens. |
+| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, i.e. the most requests retracted at once. Required with a non-zero pool and refused without one; a rule of thumb is `2 x --max-num-seqs / dp_size`. |
 
 For pure prefill, token capacities count newly computed tokens, not cached
 prefixes or each request's full sequence length. Two requests extending by
@@ -734,11 +736,25 @@ features directly:
 - `--dense-tp-size`
 - `--moe-tp-size`
 - `--kvstore-*`
+- `--retraction-snapshot-*`
 - `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`
 - `--comm-fusion-max-num-tokens`
 - `--enable-allreduce-fusion`
+
+### Retraction snapshot pool
+
+`--retraction-snapshot-host-gb` / `--retraction-snapshot-max-requests` size
+the second pinned Host buffer of the Host cache executor: the
+request-private pool a retracted request's tail is imaged into, next to the
+Host L2 entries that hold its bulk (`docs/design/cache-concepts.md`,
+"Retraction image"). The two buffers are separate allocations and both count
+against the executor's Host-memory headroom check. The pool is independent
+of the KVStore: with `--disable-kvstore` there is no L2 leg and the pool holds
+whole images, so it must be sized for the victims the operator wants to hold
+at once; with L2 it holds about one page per group per retracted request plus
+the slot-state blob. `0` is the explicit "no pool" and disables retraction.
 
 ### Host L2 and Mooncake Store L3
 

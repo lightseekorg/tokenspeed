@@ -391,16 +391,17 @@ waiting on the default stream in its prologue; that wait is one-way, the
 zeroing's and the writeback's own waits are what order the default and write
 streams behind the forwards). A load-back's prerequisite stream is the
 default stream that zeroed its destinations; its start event is recorded
-there rather than on whatever stream is current. Every stream the L2
-executor orders against is an argument, never ambient thread state. The
-two kinds use separate staging lanes: each lane uploads block metadata
-asynchronously and records an event after both metadata copies to protect its
-pinned CPU staging tables — before refilling them, the next submission on
-that lane waits only if that event is incomplete. This does not wait for the
-payload transfer or publish a writeback ACK. Device metadata reuse stays
-ordered after the previous payload by write-stream FIFO. Even a partially
-submitted metadata upload records its retirement event before propagating a
-staging failure.
+there rather than on whatever stream is current. Every stream the Host
+cache executor orders against is an argument, never ambient thread state.
+Each submission kind uses its own staging lane (`cache/transfer/lanes.py`:
+the stream-ordered and pinned write-backs, the snapshot store, and the
+restore's two tiers): a lane uploads block metadata asynchronously and
+records an event after both metadata copies to protect its pinned CPU
+staging tables — before refilling them, the next submission on that lane
+waits only if that event is incomplete. This does not wait for the payload
+transfer or publish an ACK. Device metadata reuse stays ordered after the
+previous payload by stream FIFO. Even a partially submitted metadata upload
+records its retirement event before propagating a staging failure.
 
 Ready flags are valid only for a full-geometry H2D transfer. Consumers first
 wait for the current generation's flag initialization event, then its layer
@@ -420,6 +421,91 @@ hold its tickets forever.
 An L3 prefetch failure is an explicit unsuccessful completion: it skips H2D
 and releases the failed load through `LoadBackDone(success=False)` so the
 request can recompute. It never acknowledges or publishes a successful copy.
+
+### Retraction image: two Host tiers, one executor, one ownership translation
+
+Retraction suspends a resident request instead of recomputing it: the
+request's cache-group pages and its per-slot Device state are imaged to
+pinned Host memory, and readmission allocates Device pages again and copies
+the image back, so the request continues exactly where it stopped. The image
+is **split by publishability** (the C++ coordinator's `TakeImage` decides per
+slot; `scheduler.md` §2 and §4 describe the FSM side):
+
+* the **bulk** — every block under a hash-complete prefix page the group
+  publishes — goes to Host L2 as today's stream-ordered retraction store
+  (`WriteBackOp`, `source_pinned=false`), and the `Retracted` request pins
+  those Host entries until it is restored. The entries stay published, so
+  other requests may hit them; they are merely unevictable for that span, so
+  L2's evictable capacity shrinks only by the retracted set, never by a
+  separate copy of it;
+* the **tail** — each group's unaligned tail page(s), every block of a group
+  L2 never holds (a drafter-private group, a state group's live block, a
+  replayable group's private pages) and the request's slot-state blob — goes
+  to the **retraction snapshot pool**: a small, request-private, pinned pool
+  sized by `--retraction-snapshot-host-gb`, never evicted, never
+  prefix-indexed, allocated by the scheduler like the Host L2 pool and
+  addressed by scheduler (virtual) block id. Without the L2 tier
+  (`--disable-kvstore`) the whole image goes there.
+
+The runtime side is **one** `HostCacheExecutor` (`cache/l2/executor.py`)
+owning two `HostCacheStorage` buffers over the same field geometry, each with
+its own `build_transfer_geometry`; the executor only chooses a buffer per row.
+Wire ops (`cache/transfer/ops.py`, the runtime image of the scheduler's
+`SnapshotStoreOperation`/`SnapshotRestoreOperation`): a `SnapshotOp`
+(`op_id, request_id, request_pool_index, snapshot_slot, transfers`) stores
+the tail rows and the victim's slot state; a `RestoreOp` adds a `source_tier`
+per row (`HostTier.L2` or `HostTier.SNAPSHOT_POOL`) and carries the prefix
+key on its L2 rows so the scheduler can publish the restored Device blocks.
+The two legs of a store are two ops under **one fence**: the ordered L2 rows,
+then the tail rows, then the slot-state export ride the write stream
+consecutively behind the execution stream the forwards wrote on, and the
+forward thread's default stream waits on the event recorded after all of
+them before the plan's zeroing (the victim's Device pages are re-granted in
+the same plan). The restore is one op: on the load stream behind the
+zeroing, the L2-tier rows, the pool-tier rows, the slot-state import, one
+event — no layerwise tracker, because the request is `Restoring` and
+unschedulable until the ACK. Three ACK kinds ride the one cache poll
+(`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and `CacheOpHooks`
+replica-intersects them alike; a readmission needs both store ACKs.
+
+**Slot-state image.** Device state keyed by `req_pool_index` that lives in no
+cache group must travel with the pages or the continuation is not exact: the
+next step's inputs and the verifier's recorded draft distributions
+(`RuntimeStates`), the MTP stash, DSpark's context windows, Eagle's draft
+history frontier, the Inkling conv ring and its pending-hydration bit, the
+DSA KPool tail. Each owner implements `SlotStateExporter`
+(`execution/slot_state.py`) by listing its per-slot rows once
+(`slot_state_rows`); the export, the import and the size derive from that
+list, composites (`child_backends`) concatenate their children, and
+`ModelExecutor` concatenates `RuntimeStates`, the attention trees and the
+drafter into one blob per slot. The executor keeps a pinned arena of
+`--retraction-snapshot-max-requests` × `blob_bytes`, indexed by the op's
+`snapshot_slot`; the store exports the victim's slot on the write stream
+(the slot is reused only behind the fence), the restore imports into the
+new slot and lets a request-keyed owner claim it. Token-derived rows — the
+committed-token history and the n-gram tail — are not imaged; they are
+reseeded from the control plane's token list as on any slot handoff.
+`test/runtime/test_slot_state.py` enumerates every tensor these classes
+allocate with a slot-sized dimension and fails when one is neither exported
+nor declared token-derived: backend-private per-slot state is the exception
+(`AGENTS.md`), and when it exists it must have an exporter.
+
+**One ownership translation for every leg.** The scheduler places every Host
+block — L2 or pool, store or load or restore — in the same residue class as
+the Device block it mirrors, so under KVP one rank owns both ends of every
+copy it performs. `BlockOwnerTranslation` (`cache/transfer/ownership.py`)
+applies the same `owned_local_pages` placement the zeroing and PD paths use
+to both ends of every row at the one place rows are formed
+(`HostCacheExecutor._append_transfers`): a sharded group's row is kept by the
+owning rank alone and translated to local ids on both sides, a mismatch of
+owners is an error, and a replicated group translates to the identity. Each
+Host tier holds one translation (same Device bound, its own Host bound,
+`1 + host_lcm_blocks × packing × shard_count`). An op whose every row belongs
+to other ranks is still acknowledged by this rank from an empty copy; the
+hooks' replica intersection completes the op only once every owner has. The
+scheduler side (residue-class allocation, the Host L2 pool's sharded virtual
+count) is what makes the translation exact; until it lands every group is
+replicated and the filter is the identity.
 
 ## block vs. page
 
@@ -1178,10 +1264,12 @@ draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
 the sharded MLA history group), each subject to its backend's `AttnConfig`
 gate. The draft's decode steps would run the same sparse/dense DCP branches as
 the target's, but that path has not been validated for the ordinary recipe, so
-its exclusion is a gate rather than a geometry limit. All DCP paths exclude the Host KVStore: the L2
-copies address device pages by scheduler block ID with no ownership
-translation (`cache/l2/executor.py`), so a sharded engine must pass
-`--disable-kvstore`.
+its exclusion is a gate rather than a geometry limit. All DCP paths still
+exclude the Host KVStore today: the L2 copies pass the ownership translation
+of the retraction-image design ("Retraction image" above, the identity while
+every group is replicated), but the scheduler does not yet allocate Host
+blocks by residue class, so a sharded engine must pass `--disable-kvstore`
+until it does.
 
 PD transfer supports a sharded **prefill** role against an unsharded decode
 role. Manifests carry scheduler (virtual) IDs on both sides and are bounded

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU-only tests for L2CacheHooks.
+"""CPU-only tests for CacheOpHooks (Host L2 and retraction snapshot ops).
 
 Single-rank cases (every replica group size 1) skip collectives. Cross-rank
 WriteBackDone agreement is driven here with mocked all_reduce /
@@ -45,7 +45,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from tokenspeed_scheduler import Cache  # noqa: E402
 
 from tokenspeed.runtime.engine import cache_hooks as cache_hooks_module  # noqa: E402
-from tokenspeed.runtime.engine.cache_hooks import L2CacheHooks  # noqa: E402
+from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks  # noqa: E402
 
 
 class _FakeWriteBackOp:
@@ -79,8 +79,8 @@ def _hooks(
     attn_tp_cpu_group,
     pp_size,
     pp_cpu_group,
-) -> L2CacheHooks:
-    return L2CacheHooks(
+) -> CacheOpHooks:
+    return CacheOpHooks(
         device,
         speculative_algorithm=speculative_algorithm,
         attn_tp_rank=0,
@@ -92,7 +92,7 @@ def _hooks(
     )
 
 
-def _single_rank_hooks(device) -> L2CacheHooks:
+def _single_rank_hooks(device) -> CacheOpHooks:
     return _hooks(
         device,
         speculative_algorithm=None,

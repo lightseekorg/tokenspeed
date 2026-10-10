@@ -265,7 +265,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs():
     plan = _plan(pages_to_zero=[3, 4], cache=["op"])
     handle = _handle(
         trace,
-        l2_cache_executor=SimpleNamespace(
+        host_cache_executor=SimpleNamespace(
             submit_write_backs=lambda p, *, prerequisite_stream, fence_stream: (
                 trace.append(
                     ("write_backs", p.cache, prerequisite_stream, fence_stream)
@@ -311,7 +311,7 @@ def test_page_zeroing_without_l2_submits_only_zeroing():
 
 def test_a_plan_with_no_device_work_submits_nothing():
     trace: list = []
-    handle = _handle(trace, l2_cache_executor=SimpleNamespace())
+    handle = _handle(trace, host_cache_executor=SimpleNamespace())
 
     handle.execute(_plan(), None, submit_remote_prefill=True)
 
@@ -328,7 +328,7 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
 
     handle = _handle(
         trace,
-        l2_cache_executor=SimpleNamespace(
+        host_cache_executor=SimpleNamespace(
             submit_write_backs=exploding,
             submit_load_backs=lambda p, *, prerequisite_stream, l3_prefetch_ok: None,
             take_l3_prefetch_results=lambda: {},
@@ -347,17 +347,17 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll():
 @pytest.mark.parametrize("second_ok", [True, False])
 def test_queued_load_backs_capture_each_plans_l3_results(second_ok):
     """Two control-plane rounds run before either queued H2D submission."""
-    from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+    from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
 
     queued = []
     observed = []
-    l2 = L2CacheExecutor.__new__(L2CacheExecutor)
+    l2 = HostCacheExecutor.__new__(HostCacheExecutor)
     l2._l3_prefetch_ok = {(0, 1, "first", 0): True}
     l2.submit_write_backs = lambda p, *, prerequisite_stream, fence_stream: None
     l2.submit_load_backs = lambda p, *, prerequisite_stream, l3_prefetch_ok: (
         observed.append((p, l3_prefetch_ok))
     )
-    handle = _handle([], l2_cache_executor=l2)
+    handle = _handle([], host_cache_executor=l2)
 
     def enqueue(fn):
         future = Future()
@@ -388,7 +388,7 @@ def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
     trace: list = []
     handle = _handle(
         trace,
-        l2_cache_executor=SimpleNamespace(
+        host_cache_executor=SimpleNamespace(
             shutdown=lambda: trace.append("l2_shutdown"),
         ),
     )

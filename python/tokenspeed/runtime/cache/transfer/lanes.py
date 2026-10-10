@@ -18,17 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Host-transfer machinery shared by the compact Host executors.
+"""Host-transfer machinery under the compact Host cache executor.
 
-Two executors move whole CacheBlocks between the Device arena and a compact
-pinned Host buffer with ``transfer_cache_blocks``: the L2 prefix tier
-(``cache/l2/executor.py``) and the retraction snapshot pool
-(``cache/snapshot/executor.py``). What they share lives here -- the transfer
-streams, the static field geometry derived from a transfer layout, the
-staging lane that owns one workspace's pinned metadata tables, and the
-completion queue the control plane polls. What differs stays with each
-executor: L3 backups and layerwise load fences belong to L2 alone; owner
-translation and the slot-state image belong to the snapshot executor.
+``HostCacheExecutor`` (``cache/l2/executor.py``) moves whole CacheBlocks
+between the Device arena and two compact pinned Host buffers -- the L2 prefix
+tier and the retraction snapshot pool -- with ``transfer_cache_blocks``. The
+machinery that is indifferent to which buffer a copy targets lives here: the
+transfer streams, the static field geometry derived from a transfer layout
+and one Host buffer, the staging lane that owns one workspace's pinned
+metadata tables and its retirement event, the D2H/H2D launch discipline, and
+the completion queue the control plane polls. Tier-specific behaviour -- L3
+backups and layerwise load fences for L2, the slot-state image for the pool
+-- stays in the executor.
 """
 
 from __future__ import annotations
@@ -75,7 +76,9 @@ def new_cache_stream(priority: int | None):
         return device_module.Stream()
 
 
-def check_host_memory(requested_bytes: int, *, headroom_bytes: int, purpose: str) -> None:
+def check_host_memory(
+    requested_bytes: int, *, headroom_bytes: int, purpose: str
+) -> None:
     """Refuse a pinned allocation that would leave less than ``headroom_bytes``.
 
     Args:
@@ -95,7 +98,9 @@ def check_host_memory(requested_bytes: int, *, headroom_bytes: int, purpose: str
         )
 
 
-def build_transfer_geometry(layout, host_storage, *, io_backend: str) -> HostTransferGeometry:
+def build_transfer_geometry(
+    layout, host_storage, *, io_backend: str
+) -> HostTransferGeometry:
     """The static field geometry one executor's transfers share.
 
     One row per field in consumer (layer) order, each naming the field's
@@ -124,7 +129,9 @@ def build_transfer_geometry(layout, host_storage, *, io_backend: str) -> HostTra
     for group_index, group in enumerate(layout.groups):
         for field_index, field in enumerate(group.fields):
             if field.field_id in fields_by_id:
-                raise ValueError(f"cache transfer field {field.field_id!r} appears twice")
+                raise ValueError(
+                    f"cache transfer field {field.field_id!r} appears twice"
+                )
             fields_by_id[field.field_id] = (group_index, field_index, group, field)
 
     rows = []
@@ -164,7 +171,9 @@ def build_transfer_geometry(layout, host_storage, *, io_backend: str) -> HostTra
     geometry = build_host_transfer_geometry(
         rows=tuple(rows),
         layer_slices=tuple(layer_slices),
-        group_packing=tuple(group.cache_blocks_per_lcm_block for group in layout.groups),
+        group_packing=tuple(
+            group.cache_blocks_per_lcm_block for group in layout.groups
+        ),
         host_lcm_block_bytes=host_storage.host_lcm_block_bytes,
         num_host_lcm_blocks=host_storage.num_host_lcm_blocks,
         num_device_lcm_blocks=layout.num_lcm_blocks,
@@ -212,7 +221,9 @@ class HostTransferLane:
         """
         if self.metadata_done is not None and not self.metadata_done.query():
             self.metadata_done.synchronize()
-        num_blocks, _ = self.workspace.load_block_transfers(transfers, geometry=geometry)
+        num_blocks, _ = self.workspace.load_block_transfers(
+            transfers, geometry=geometry
+        )
         with device_module.stream(stream):
             mode = self.workspace.prepare_backend(
                 device_buffers, host_buffer, backend=backend

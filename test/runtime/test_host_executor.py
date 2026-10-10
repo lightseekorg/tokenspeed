@@ -24,15 +24,37 @@ class _LoadEvents(SimpleNamespace):
         self.layer_done_events[:] = [event] * len(self.layer_done_events)
 
 
+def _replicated_contract(layout, *, num_lcm_blocks=None):
+    """An arena contract for ``layout`` with every group replicated (shard 1)."""
+    if num_lcm_blocks is None:
+        num_lcm_blocks = layout.num_lcm_blocks
+    specs = tuple(
+        SimpleNamespace(group_id=group.group_id, shard_count=1)
+        for group in layout.groups
+    )
+    return SimpleNamespace(
+        group_specs=specs,
+        virtual_block_counts={
+            group.group_id: 1 + num_lcm_blocks * group.cache_blocks_per_lcm_block
+            for group in layout.groups
+        },
+        num_lcm_blocks=num_lcm_blocks,
+        token_capacity=num_lcm_blocks,
+    )
+
+
+def _synthetic_arena(layout):
+    contract = _replicated_contract(layout)
+    return SimpleNamespace(
+        cache_group_specs=contract.group_specs, runtime_contract=contract
+    )
+
+
 class _SyntheticPool:
     def __init__(self, layout, arena=None):
         self._layout = layout
         if arena is None:
-            arena = SimpleNamespace(
-                cache_group_specs=tuple(
-                    SimpleNamespace(group_id=group.group_id) for group in layout.groups
-                )
-            )
+            arena = _synthetic_arena(layout)
         self.arena = arena
 
     def cache_transfer_layout(self):
@@ -58,7 +80,10 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     host_transfer.build_host_transfer_geometry = Mock()
     host_transfer.transfer_cache_blocks = Mock()
     host_transfer.wait_layer_ready = Mock()
+    ownership = ModuleType("tokenspeed.runtime.cache.transfer.ownership")
+    ownership.BlockOwnerTranslation = Mock
     lanes = ModuleType("tokenspeed.runtime.cache.transfer.lanes")
+    lanes.CompletionQueue = Mock
     lanes.HostTransferLane = Mock
     lanes.build_transfer_geometry = Mock()
     lanes.check_host_memory = Mock()
@@ -103,6 +128,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
         "tokenspeed.runtime.cache.l2.storage": storage,
         "tokenspeed.runtime.cache.transfer.lanes": lanes,
         "tokenspeed.runtime.cache.transfer.layout": layout,
+        "tokenspeed.runtime.cache.transfer.ownership": ownership,
         "tokenspeed.runtime.execution.forward_step": forward_step,
         "tokenspeed.runtime.utils": runtime_utils,
     }
@@ -183,6 +209,18 @@ def _lanes_module():
     return import_module("tokenspeed.runtime.cache.transfer.lanes")
 
 
+def _identity_owners(num_groups=1, bound=64):
+    """A replicated (shard 1) owner translation: local ids are scheduler ids."""
+    from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+
+    return BlockOwnerTranslation(
+        shard_counts=[1] * num_groups,
+        device_virtual_counts=[bound] * num_groups,
+        host_virtual_counts=[bound] * num_groups,
+        rank=0,
+    )
+
+
 class GroupAwareWireTest(unittest.TestCase):
     def _executor_module(self):
         try:
@@ -200,8 +238,8 @@ class GroupAwareWireTest(unittest.TestCase):
         load_stream=None,
     ):
         executor_module = self._executor_module()
-        executor = executor_module.L2CacheExecutor.__new__(
-            executor_module.L2CacheExecutor
+        executor = executor_module.HostCacheExecutor.__new__(
+            executor_module.HostCacheExecutor
         )
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
@@ -210,6 +248,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._load_poisoned = False
         executor._l3_prefetch_ok = {}
         executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
+        executor._snapshot_acks = _lanes_module().CompletionQueue()
         executor.load_stream = object() if load_stream is None else load_stream
         executor.transfer_backend = backend
         device = SimpleNamespace(type="cuda")
@@ -321,13 +360,14 @@ class GroupAwareWireTest(unittest.TestCase):
         )
 
     def test_submit_load_backs_clears_layerwise_waits_without_load(self):
-        L2CacheExecutor = self._executor_module().L2CacheExecutor
+        HostCacheExecutor = self._executor_module().HostCacheExecutor
 
         tracker = Mock()
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
         executor._load_trackers = [(tracker, 1)]
         executor._load_poisoned = False
+        executor.block_owners = _identity_owners()
 
         executor.submit_load_backs(
             SimpleNamespace(cache=[]), prerequisite_stream=object(), l3_prefetch_ok={}
@@ -339,9 +379,10 @@ class GroupAwareWireTest(unittest.TestCase):
         module = _load_executor_module_without_triton(force_isolated=True)
         for second_outcome in ("success", "replica_miss", "exception", "empty"):
             with self.subTest(second_outcome=second_outcome):
-                executor = module.L2CacheExecutor.__new__(module.L2CacheExecutor)
+                executor = module.HostCacheExecutor.__new__(module.HostCacheExecutor)
                 executor._l3_prefetch_ok = {}
                 executor._load_trackers = []
+                executor.block_owners = SimpleNamespace(owned_rows=list)
                 executor._start_loading = Mock(return_value=0)
                 executor._prefetch_from_storage = Mock(return_value=[True])
 
@@ -397,12 +438,23 @@ class GroupAwareWireTest(unittest.TestCase):
                     )
                 self.assertEqual(executor.take_l3_prefetch_results(), {})
 
-    def test_submit_preserves_group_identity(self):
-        L2CacheExecutor = self._executor_module().L2CacheExecutor
+    def _owner_executor(self, *, num_groups=2):
+        """An executor with replicated (identity) owner translations only."""
+        executor_module = self._executor_module()
+        executor = executor_module.HostCacheExecutor.__new__(
+            executor_module.HostCacheExecutor
+        )
+        executor.block_owners = _identity_owners(num_groups)
+        executor.snapshot_block_owners = _identity_owners(num_groups)
+        return executor_module, executor
 
+    def test_submit_preserves_group_identity(self):
+        from tokenspeed.runtime.cache.transfer.ops import HostTier
+
+        _, executor = self._owner_executor()
         op_ids = []
         transfers = []
-        L2CacheExecutor._append_transfers(
+        executor._append_transfers(
             [7],
             [[0, 1]],
             [[5, 5]],
@@ -410,14 +462,60 @@ class GroupAwareWireTest(unittest.TestCase):
             collected_op_ids=op_ids,
             transfers=transfers,
             source_is_device=True,
+            tier=HostTier.L2,
         )
         self.assertEqual(op_ids, [7])
         self.assertEqual(transfers, [(0, 5, 9), (1, 5, 9)])
 
+    def test_sharded_rows_keep_only_this_ranks_owned_blocks_on_both_ends(self):
+        # A group dealt to two owners: rank r keeps the rows whose Device AND
+        # Host block have residue r, in local ids; the op is collected even
+        # when every row belongs to the other rank.
+        from tokenspeed.runtime.cache.transfer.ops import HostTier
+        from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+
+        executor_module = self._executor_module()
+        for rank, expected in ((0, [(0, 1, 2), (0, 2, 3)]), (1, [(0, 1, 1)])):
+            with self.subTest(rank=rank):
+                executor = executor_module.HostCacheExecutor.__new__(
+                    executor_module.HostCacheExecutor
+                )
+                executor.block_owners = BlockOwnerTranslation(
+                    shard_counts=[2],
+                    device_virtual_counts=[9],
+                    host_virtual_counts=[9],
+                    rank=rank,
+                )
+                op_ids: list[int] = []
+                transfers: list[tuple[int, int, int]] = []
+                executor._append_transfers(
+                    [7],
+                    [[0, 0, 0]],
+                    [[1, 3, 2]],
+                    [[3, 5, 2]],
+                    collected_op_ids=op_ids,
+                    transfers=transfers,
+                    source_is_device=True,
+                    tier=HostTier.L2,
+                )
+                self.assertEqual(op_ids, [7])
+                self.assertEqual(transfers, expected)
+        with self.assertRaisesRegex(ValueError, "residue class"):
+            executor._append_transfers(
+                [8],
+                [[0]],
+                [[1]],
+                [[2]],
+                collected_op_ids=[],
+                transfers=[],
+                source_is_device=True,
+                tier=HostTier.L2,
+            )
+
     def _make_write_executor(self, executor_module):
-        L2CacheExecutor = executor_module.L2CacheExecutor
+        HostCacheExecutor = executor_module.HostCacheExecutor
         lanes_module = _lanes_module()
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
         device = SimpleNamespace(type="cuda")
@@ -425,6 +523,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor.transfer_backend = "auto"
         executor._write_acks = []
+        executor.block_owners = _identity_owners()
         executor.write_stream = Mock(name="write_stream")
         # Real lanes over mocked workspaces: the staging discipline under test
         # is the lane's, the executor only picks which lane an op rides.
@@ -644,6 +743,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._backup_futures = []
         executor._l3_workers = None
+        executor._snapshot_acks = _lanes_module().CompletionQueue()
         executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
         executor.l3_store.exists.return_value = [False]
@@ -800,13 +900,15 @@ class GroupAwareWireTest(unittest.TestCase):
         # An op is acknowledged by its copy's completion event, so one with
         # nothing to copy could never be acknowledged; the scheduler never
         # emits one, and the runtime refuses rather than inventing an ack.
-        L2CacheExecutor = self._executor_module().L2CacheExecutor
+        from tokenspeed.runtime.cache.transfer.ops import HostTier
+
+        _, executor = self._owner_executor()
         for source_is_device in (True, False):
             with self.subTest(source_is_device=source_is_device):
                 op_ids: list[int] = []
                 transfers: list[tuple[int, int, int]] = []
                 with self.assertRaisesRegex(ValueError, "operation 11 carries no"):
-                    L2CacheExecutor._append_transfers(
+                    executor._append_transfers(
                         [7, 11],
                         [[0], []],
                         [[1], []],
@@ -814,6 +916,7 @@ class GroupAwareWireTest(unittest.TestCase):
                         collected_op_ids=op_ids,
                         transfers=transfers,
                         source_is_device=source_is_device,
+                        tier=HostTier.L2,
                     )
 
     def test_loadback_logs_non_empty_batch(self):
@@ -903,7 +1006,7 @@ class GroupAwareWireTest(unittest.TestCase):
     def test_kernel_init_builds_consumer_ordered_static_geometry_once(self):
         executor_module = self._executor_module()
         lanes_module = _lanes_module()
-        L2CacheExecutor = executor_module.L2CacheExecutor
+        HostCacheExecutor = executor_module.HostCacheExecutor
 
         device = SimpleNamespace(type="cuda")
         buffer = SimpleNamespace(device=device)
@@ -935,10 +1038,12 @@ class GroupAwareWireTest(unittest.TestCase):
             buffers=(buffer, SimpleNamespace(device=device)),
             groups=(
                 SimpleNamespace(
+                    group_id="state",
                     cache_blocks_per_lcm_block=4,
                     fields=(fields["target.2.state"],),
                 ),
                 SimpleNamespace(
+                    group_id="full",
                     cache_blocks_per_lcm_block=8,
                     fields=(fields["target.0.k"], fields["draft.0.k"]),
                 ),
@@ -957,7 +1062,9 @@ class GroupAwareWireTest(unittest.TestCase):
         draft_layout = SimpleNamespace(consumers=(("draft.0.k",),))
         target_pool = Mock()
         target_pool.cache_transfer_layout.return_value = target_layout
-        target_pool.arena.cache_group_specs = (SimpleNamespace(group_id="state"),)
+        target_pool.arena.runtime_contract = _replicated_contract(
+            combined_layout, num_lcm_blocks=11
+        )
         draft_pool = Mock()
         draft_pool.cache_transfer_layout.return_value = draft_layout
         storage = SimpleNamespace(
@@ -1007,13 +1114,18 @@ class GroupAwareWireTest(unittest.TestCase):
                 return_value=unbound_geometry,
             ) as build_geometry,
         ):
-            executor = L2CacheExecutor(
+            executor = HostCacheExecutor(
                 target_pool,
                 draft_pool=draft_pool,
+                l2_tier=True,
                 host_ratio=1.0,
                 host_size_gb=0,
+                snapshot_host_gb=0,
+                max_retracted_requests=0,
+                slot_state=None,
                 io_backend="kernel",
                 attn_tp_rank=0,
+                dcp_rank=0,
             )
 
         build_geometry.assert_called_once_with(
@@ -1036,10 +1148,13 @@ class GroupAwareWireTest(unittest.TestCase):
     def test_direct_and_npu_init_keep_geometry_on_the_host(self):
         executor_module = self._executor_module()
         lanes_module = _lanes_module()
-        L2CacheExecutor = executor_module.L2CacheExecutor
+        HostCacheExecutor = executor_module.HostCacheExecutor
 
         pool = Mock()
-        pool.arena.cache_group_specs = (SimpleNamespace(group_id="group"),)
+        pool.arena.runtime_contract = SimpleNamespace(
+            group_specs=(SimpleNamespace(group_id="group", shard_count=1),),
+            virtual_block_counts={"group": 3},
+        )
         storage = SimpleNamespace(
             host_cache_block_bytes=(16,),
             host_field_offsets=((0,),),
@@ -1091,6 +1206,7 @@ class GroupAwareWireTest(unittest.TestCase):
                         ),
                         groups=(
                             SimpleNamespace(
+                                group_id="group",
                                 cache_blocks_per_lcm_block=1,
                                 fields=(field,),
                             ),
@@ -1098,12 +1214,17 @@ class GroupAwareWireTest(unittest.TestCase):
                         consumers=(("field",),),
                     )
                     pool.cache_transfer_layout.return_value = layout
-                    executor = L2CacheExecutor(
+                    executor = HostCacheExecutor(
                         pool,
+                        l2_tier=True,
                         host_ratio=1.0,
                         host_size_gb=0,
+                        snapshot_host_gb=0,
+                        max_retracted_requests=0,
+                        slot_state=None,
                         io_backend=io_backend,
                         attn_tp_rank=0,
+                        dcp_rank=0,
                     )
                     self.assertIsNone(executor._transfer_geometry.device_rows)
                     executor._transfer_geometry.bind.assert_not_called()
@@ -1118,6 +1239,7 @@ class GroupAwareWireTest(unittest.TestCase):
             "tokenspeed.runtime.cache.l2.storage",
             "tokenspeed.runtime.cache.transfer.lanes",
             "tokenspeed.runtime.cache.transfer.layout",
+            "tokenspeed.runtime.cache.transfer.ownership",
             "tokenspeed.runtime.execution.forward_step",
             "tokenspeed.runtime.utils",
             "tokenspeed.runtime.cache.l2.executor",
@@ -1360,16 +1482,16 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             _ack_lock=lock,
             _backup_futures=PendingBackups([(future, [7], [(0, 1, "h0", 0)])]),
         )
-        module.L2CacheExecutor._wait_l3_backups(executor)
+        module.HostCacheExecutor._wait_l3_backups(executor)
         self.assertEqual(observed, ["done"])
         future.result.side_effect = RuntimeError("backup failed")
         with self.assertRaisesRegex(RuntimeError, "backup failed"):
-            module.L2CacheExecutor._wait_l3_backups(executor)
+            module.HostCacheExecutor._wait_l3_backups(executor)
         self.assertFalse(lock.locked())
 
     def test_storage_pages_skip_non_prefetch_sources(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -1381,14 +1503,14 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             dst_pages=[[7, 8]],
             prefetch_from_storage=[[1, 0]],
         )
-        pages = L2CacheExecutor._storage_pages(
+        pages = HostCacheExecutor._storage_pages(
             operation,
             host_is_destination=False,
             prefetch_only=True,
             operation_indices=range(len(operation.group_ids)),
         )
         self.assertEqual(pages, [(0, 3, "h0", 0)])
-        write_pages = L2CacheExecutor._storage_pages(
+        write_pages = HostCacheExecutor._storage_pages(
             operation,
             host_is_destination=True,
             prefetch_only=False,
@@ -1396,15 +1518,15 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         )
         self.assertEqual(write_pages, [(0, 7, "h0", 0), (1, 8, "h1", 1)])
         with self.assertRaises(TypeError):
-            L2CacheExecutor._storage_pages(operation, host_is_destination=True)
-        signature = inspect.signature(L2CacheExecutor._storage_pages)
+            HostCacheExecutor._storage_pages(operation, host_is_destination=True)
+        signature = inspect.signature(HostCacheExecutor._storage_pages)
         self.assertIs(
             signature.parameters["prefetch_only"].default, inspect.Parameter.empty
         )
 
     def test_ack_requires_backup_pages_and_success(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor, _Ack
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -1417,20 +1539,20 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             _Ack(object(), [1])
         with self.assertRaises(TypeError):
             _Ack(object(), [1], [])
-        start_writing = inspect.signature(L2CacheExecutor._start_writing)
+        start_writing = inspect.signature(HostCacheExecutor._start_writing)
         self.assertIs(
             start_writing.parameters["backup_pages"].default, inspect.Parameter.empty
         )
         with self.assertRaises(TypeError):
-            L2CacheExecutor._start_writing(object(), [7], [(0, 1, 1)])
+            HostCacheExecutor._start_writing(object(), [7], [(0, 1, 1)])
 
     def test_l2_constructor_does_not_attach_l3_from_optional_storage(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
-        signature = inspect.signature(L2CacheExecutor.__init__)
+        signature = inspect.signature(HostCacheExecutor.__init__)
         self.assertNotIn("storage_backend", signature.parameters)
         self.assertNotIn("storage_key_prefix", signature.parameters)
         self.assertNotIn("storage_rank", signature.parameters)
@@ -1440,8 +1562,9 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_poll_results_backs_up_host_pages_asynchronously(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor, _Ack
             from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -1455,13 +1578,14 @@ class L3FlatKvExecutorTest(unittest.TestCase):
                 raise TimeoutError("L3 backup was not released")
             return [True]
 
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
         executor._write_acks = []
         executor._load_acks = []
         executor._ready_load_acks = []
         executor._backup_futures = []
         executor._l3_workers = None
+        executor._snapshot_acks = CompletionQueue()
         executor._l3_unread = L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
         executor.l3_store.exists.return_value = [False]
@@ -1499,8 +1623,8 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_backup_probes_only_unread_pages(self):
         executor_module = _load_executor_module_without_triton(force_isolated=False)
-        executor = executor_module.L2CacheExecutor.__new__(
-            executor_module.L2CacheExecutor
+        executor = executor_module.HostCacheExecutor.__new__(
+            executor_module.HostCacheExecutor
         )
         executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
@@ -1528,8 +1652,8 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             ([False], False),
         ]:
             with self.subTest(existed=existed, put_ok=put_ok):
-                executor = executor_module.L2CacheExecutor.__new__(
-                    executor_module.L2CacheExecutor
+                executor = executor_module.HostCacheExecutor.__new__(
+                    executor_module.HostCacheExecutor
                 )
                 executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
                 executor._l3_unread.mark(groups=[0], hashes=["h"], offsets=[0])
@@ -1546,8 +1670,8 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_backup_keeps_keys_marked_unread_after_snapshot(self):
         executor_module = _load_executor_module_without_triton(force_isolated=False)
-        executor = executor_module.L2CacheExecutor.__new__(
-            executor_module.L2CacheExecutor
+        executor = executor_module.HostCacheExecutor.__new__(
+            executor_module.HostCacheExecutor
         )
         executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
@@ -1563,12 +1687,13 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_backup_failure_does_not_ack_writeback(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor, _Ack
             from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
         executor._write_acks = []
         executor._load_acks = []
@@ -1576,6 +1701,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._backup_futures = []
         executor._backup_poll_failed = False
         executor._l3_workers = None
+        executor._snapshot_acks = CompletionQueue()
         executor._l3_unread = L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
         executor.l3_store.exists.return_value = [False]
@@ -1611,11 +1737,11 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_prefetch_failure_returns_false(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor.l3_store = Mock()
         executor.l3_store.prefetch.return_value = [True, False]
         self.assertEqual(
@@ -1625,17 +1751,19 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_failed_prefetch_acks_unsuccessful_without_h2d(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
         executor._load_poisoned = False
         executor._write_acks = []
         executor._load_acks = []
         executor._backup_futures = []
+        executor._snapshot_acks = CompletionQueue()
         executor.l3_store = None
         with self.assertRaisesRegex(ValueError, "must not launch transfers"):
             executor._start_loading(
@@ -1655,12 +1783,12 @@ class L3FlatKvExecutorTest(unittest.TestCase):
     def test_shutdown_persists_completed_d2h_before_closing_l3(self):
         try:
             import tokenspeed.runtime.cache.l2.executor as executor_module
-            from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor, _Ack
             from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
-        executor = L2CacheExecutor.__new__(L2CacheExecutor)
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
         executor._write_acks = [
             _Ack(
@@ -1721,13 +1849,18 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             else None
         )
         with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
-            executor = self.executor_module.L2CacheExecutor(
+            executor = self.executor_module.HostCacheExecutor(
                 pool,
                 draft_pool=draft_pool,
+                l2_tier=True,
                 host_ratio=1.0,
                 host_size_gb=0,
+                snapshot_host_gb=0,
+                max_retracted_requests=0,
+                slot_state=None,
                 io_backend=io_backend,
                 attn_tp_rank=0,
+                dcp_rank=0,
             )
         self.addCleanup(executor.shutdown)
         return executor, pool, draft_pool

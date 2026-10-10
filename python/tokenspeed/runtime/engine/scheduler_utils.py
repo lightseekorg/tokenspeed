@@ -39,6 +39,7 @@ from tokenspeed_scheduler import (
     SchedulerConfig,
 )
 
+from tokenspeed.runtime.cache.transfer.ops import RestoreDoneEvent, SnapshotDoneEvent
 from tokenspeed.runtime.execution.types import (
     InputLogprobPlan,
     NGramInputs,
@@ -54,11 +55,17 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
+    # The retraction snapshot's ACKs (cache/transfer/ops.py): runtime-side
+    # types until the scheduler binding carries them.
+    "SnapshotDoneEvent": SnapshotDoneEvent,
+    "RestoreDoneEvent": RestoreDoneEvent,
 }
 # Emitted only by the host tier. Keep the lookup guarded so an older extension
 # still imports this module and fails later with a targeted compatibility error.
 if hasattr(Cache, "LoadBackDoneEvent"):
     _CACHE_EVENT_TYPES["LoadBackDoneEvent"] = Cache.LoadBackDoneEvent
+# Constructed from the payload's op id directly (frozen dataclasses).
+_OP_ID_CONSTRUCTED_EVENTS = frozenset({"SnapshotDoneEvent", "RestoreDoneEvent"})
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
@@ -617,6 +624,8 @@ def cache_event_from_payload(payload: dict):
         raise ValueError(f"Unsupported cache event type: {kind}")
     if kind == "LoadBackDoneEvent":
         return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]), bool(payload["success"]))
+    if kind in _OP_ID_CONSTRUCTED_EVENTS:
+        return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]))
     event = _CACHE_EVENT_TYPES[kind]()
     event.op_id = int(payload["op_id"])
     return event

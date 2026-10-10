@@ -39,7 +39,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.batch_log import BatchLogger
-from tokenspeed.runtime.engine.cache_hooks import L2CacheHooks
+from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks
 from tokenspeed.runtime.engine.eplb_hooks import (
     EplbHooks,
     make_expert_rebalance_controller,
@@ -285,11 +285,13 @@ class EventLoop:
         # The cache hooks gather over the TP CPU group, so the gather is sized
         # by that group, which --emulate-rank-zero backs with this process alone.
         cache_replica_tp_size = self.attn_tp_cpu_group.size()
-        # L2 cache-op accounting + rank-synced completion tracking (see
-        # cache_hooks.py); a no-op shell when kvstore is disabled. The hooks
-        # get the handle, not the L2 executor: polling goes through it.
-        self._cache_hooks = L2CacheHooks(
-            self._device if server_args.enable_kvstore else None,
+        # Cache-op accounting + rank-synced completion tracking (see
+        # cache_hooks.py) for the Host L2 tier and the retraction snapshot
+        # pool; a no-op shell when the engine has neither. The hooks get the
+        # handle, not the executors: polling goes through it.
+        has_cache_ops = server_args.enable_kvstore or specs.max_retracted_requests > 0
+        self._cache_hooks = CacheOpHooks(
+            self._device if has_cache_ops else None,
             speculative_algorithm=server_args.speculative_algorithm,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=cache_replica_tp_size,

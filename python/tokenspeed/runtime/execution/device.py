@@ -172,6 +172,12 @@ class DeviceSpecs:
         num_host_pages: The L2 host tier's page count (incl. the null page),
             sized here because it depends on the pools' transfer layout; 0
             without ``--enable-kvstore``. The scheduler is configured from it.
+        num_snapshot_pages: The retraction snapshot pool's page count (incl.
+            the null page), sized like the L2 tier's from
+            ``--retraction-snapshot-host-gb``; 1 (the null page alone) without
+            a pool, which tells the scheduler never to retract.
+        max_retracted_requests: Slot-state image rows of the snapshot pool,
+            i.e. how many requests may be retracted at once; 0 without a pool.
         expert_rebalance: The expert placement's geometry and this rank's
             position in its EP group, for the online rebalance controller;
             None unless the server started with ``--enable-eplb``.
@@ -189,6 +195,8 @@ class DeviceSpecs:
     supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
+    num_snapshot_pages: int
+    max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
 
 
@@ -285,16 +293,19 @@ class DeviceHandle:
         self,
         executor,
         *,
-        l2_cache_executor=None,
+        host_cache_executor=None,
         kv_transfer=None,
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
         self._thread = executor.forward_thread
-        # The host cache tier, or None without --enable-kvstore. Behind the
-        # handle for the same reason the pools are: its submit path launches
-        # transfers and records events.
-        self._l2 = l2_cache_executor
+        # The compact Host cache -- the L2 prefix tier, the retraction
+        # snapshot pool, or both -- or None with neither. Behind the handle
+        # for the same reason the pools are: its submit path launches
+        # transfers and records events. Snapshot stores ride ``execute``
+        # with the write-backs and restores with the load-backs once the
+        # scheduler emits them; their ACKs already ride the cache poll.
+        self._l2 = host_cache_executor
         # The PD transfer peer's execution face: its transfers move KV-pool
         # device memory over RDMA, so they need the same ordering against
         # forwards and page zeroing as everything else behind this handle.
@@ -492,7 +503,7 @@ class DeviceHandle:
         return PendingExecution(self._thread.submit(_forward))
 
     def poll_cache_results(self) -> list:
-        """Collect completed L2 cache ops; never blocks.
+        """Collect completed Host cache ops (both tiers); never blocks.
 
         Stays on the control plane deliberately: completion is CUDA event
         queries plus queue drains (serialized against the data-plane submit
@@ -512,7 +523,10 @@ class DeviceHandle:
         """
         l2 = self._l2
         if l2 is None:
-            raise RuntimeError("cache results polled without --enable-kvstore")
+            raise RuntimeError(
+                "cache results polled without --enable-kvstore or a retraction "
+                "snapshot pool"
+            )
         _settle(
             self._l2_submissions,
             "L2 cache-plan submission failed on the data plane; its ops have "
@@ -524,7 +538,7 @@ class DeviceHandle:
         """Whether an L3 backup future failed since the last consume.
 
         ``poll_cache_results`` must not raise that failure:
-        ``L2CacheHooks.poll_ready_events`` still has to enter replica
+        ``CacheOpHooks.poll_ready_events`` still has to enter replica
         collectives. A rank-local raise hangs peers in those waits.
         """
 
@@ -643,7 +657,7 @@ class DeviceHandle:
             self._l2.set_l3_weight_version(weight_version)
 
     def shutdown_cache(self) -> None:
-        """Join queued cache submissions, then close L2/L3 on the data plane."""
+        """Join queued cache submissions, then close the Host cache (L2/L3, pool)."""
 
         if self._l2 is None:
             return
@@ -1380,143 +1394,146 @@ def build_device_side(
             draft_kv_pool=views.draft_token_to_kv_pool,
         )
 
-    l2_cache_executor = None
-    if server_args.enable_kvstore:
-        from tokenspeed.runtime.cache.l2.executor import L2CacheExecutor
+    # The compact Host cache: the L2 prefix tier (--enable-kvstore), the
+    # retraction snapshot pool (--retraction-snapshot-host-gb), or both in one
+    # executor over the same field geometry. The executor is the model
+    # executor's peer: it needs the slot-state exporter the model executor
+    # aggregates, so it is built after it.
+    host_cache_executor = None
+    if server_args.enable_kvstore or server_args.retraction_snapshot_host_gb > 0:
+        from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
 
-        l2_cache_executor = L2CacheExecutor(
+        host_cache_executor = HostCacheExecutor(
             views.token_to_kv_pool,
             draft_pool=views.draft_token_to_kv_pool,
+            l2_tier=server_args.enable_kvstore,
             host_ratio=server_args.kvstore_ratio,
             host_size_gb=server_args.kvstore_size,
+            snapshot_host_gb=server_args.retraction_snapshot_host_gb,
+            max_retracted_requests=server_args.retraction_snapshot_max_requests,
+            slot_state=executor,
             io_backend=server_args.kvstore_io_backend,
             attn_tp_rank=attn_tp_rank,
+            dcp_rank=server_args.mapping.attn.dcp_rank,
         )
-        if server_args.kvstore_storage_backend is not None:
-            from tokenspeed.runtime.cache.l3.backend import (
-                L3_RUNTIME_COMPAT,
-                cache_layout_signature,
-                l3_cache_quantization_id,
-                l3_checkpoint_id,
-                share_l3_checkpoint_ids,
-                storage_key_prefix,
-            )
-            from tokenspeed.runtime.cache.l3.factory import (
-                create_kvstore_storage_backend,
-            )
+    if server_args.enable_kvstore and server_args.kvstore_storage_backend is not None:
+        # L3 under the L2 tier.
+        from tokenspeed.runtime.cache.l3.backend import (
+            L3_RUNTIME_COMPAT,
+            cache_layout_signature,
+            l3_cache_quantization_id,
+            l3_checkpoint_id,
+            share_l3_checkpoint_ids,
+            storage_key_prefix,
+        )
+        from tokenspeed.runtime.cache.l3.factory import (
+            create_kvstore_storage_backend,
+        )
 
-            storage_backend = create_kvstore_storage_backend(
-                server_args.kvstore_storage_backend,
-                server_args.kvstore_storage_backend_extra_config,
-                host_buffer=l2_cache_executor.host_storage.host_buffer,
-                tp_size=server_args.mapping.attn.tp_size,
-                pp_size=(
-                    server_args.mapping.pp_size if server_args.mapping.has_pp else 1
-                ),
-            )
-            cache_signature = cache_layout_signature(
-                l2_cache_executor.layout,
-                cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
-            )
-            import torch.distributed as dist
+        storage_backend = create_kvstore_storage_backend(
+            server_args.kvstore_storage_backend,
+            server_args.kvstore_storage_backend_extra_config,
+            host_buffer=host_cache_executor.host_storage.host_buffer,
+            tp_size=server_args.mapping.attn.tp_size,
+            pp_size=(server_args.mapping.pp_size if server_args.mapping.has_pp else 1),
+        )
+        cache_signature = cache_layout_signature(
+            host_cache_executor.layout,
+            cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
+        )
+        import torch.distributed as dist
 
-            world_size = (
-                dist.get_world_size()
-                if dist.is_available() and dist.is_initialized()
-                else 1
-            )
-            rank = dist.get_rank() if world_size > 1 else 0
-            checkpoint_id = l3_checkpoint_id(
-                model_config.model_path,
-                hf_config=model_config.hf_config,
-                revision=str(model_config.revision or ""),
+        world_size = (
+            dist.get_world_size()
+            if dist.is_available() and dist.is_initialized()
+            else 1
+        )
+        rank = dist.get_rank() if world_size > 1 else 0
+        checkpoint_id = l3_checkpoint_id(
+            model_config.model_path,
+            hf_config=model_config.hf_config,
+            revision=str(model_config.revision or ""),
+            load_format=str(server_args.load_format),
+            # LoadConfig currently gets the same empty extra-config;
+            # both must stay aligned if a shard pattern is wired through.
+            model_loader_extra_config={},
+            ext_yaml=str(server_args.ext_yaml or ""),
+        )
+        if draft_model_config is not None:
+            draft_revision = l3_checkpoint_id(
+                draft_model_config.model_path,
+                hf_config=draft_model_config.hf_config,
+                revision=str(draft_model_config.revision or ""),
                 load_format=str(server_args.load_format),
-                # LoadConfig currently gets the same empty extra-config;
-                # both must stay aligned if a shard pattern is wired through.
                 model_loader_extra_config={},
                 ext_yaml=str(server_args.ext_yaml or ""),
             )
-            if draft_model_config is not None:
-                draft_revision = l3_checkpoint_id(
-                    draft_model_config.model_path,
-                    hf_config=draft_model_config.hf_config,
-                    revision=str(draft_model_config.revision or ""),
-                    load_format=str(server_args.load_format),
-                    model_loader_extra_config={},
-                    ext_yaml=str(server_args.ext_yaml or ""),
-                )
-            else:
-                draft_revision = ""
+        else:
+            draft_revision = ""
 
-            def gather_checkpoint_ids(payload: list) -> list:
-                gathered = [None] * world_size
-                dist.all_gather_object(gathered, payload)
-                return gathered
+        def gather_checkpoint_ids(payload: list) -> list:
+            gathered = [None] * world_size
+            dist.all_gather_object(gathered, payload)
+            return gathered
 
-            checkpoint_id, draft_revision = share_l3_checkpoint_ids(
-                [checkpoint_id, draft_revision],
-                rank=rank,
-                world_size=world_size,
-                gather=gather_checkpoint_ids,
+        checkpoint_id, draft_revision = share_l3_checkpoint_ids(
+            [checkpoint_id, draft_revision],
+            rank=rank,
+            world_size=world_size,
+            gather=gather_checkpoint_ids,
+        )
+        pipeline_rank = server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
+        if draft_model_config is not None:
+            draft_model = str(draft_model_config.model_path)
+            draft_quantization = str(draft_model_config.quantization or "")
+        else:
+            draft_model = ""
+            draft_quantization = ""
+        cache_quantization = l3_cache_quantization_id(
+            quantization=str(model_config.quantization or ""),
+            quantization_param_path=str(server_args.quantization_param_path or ""),
+            draft_quantization=draft_quantization,
+        )
+        attn_tp_size = int(server_args.mapping.attn.tp_size)
+        eagle3_layers_to_capture: list[int] = []
+        if server_args.speculative_algorithm == "EAGLE3":
+            configured_layers = server_args.eagle3_layers_to_capture
+            if configured_layers:
+                eagle3_layers_to_capture = [int(layer) for layer in configured_layers]
+            elif draft_model_config is not None:
+                draft_layers = _eagle_aux_layer_ids(draft_model_config.hf_config)
+                if draft_layers:
+                    eagle3_layers_to_capture = [int(layer) for layer in draft_layers]
+
+        attention_backend_name = attention.attention_backend_name
+        draft_attention_backend_name = attention.draft_attention_backend_name
+
+        def prefix_for_weight_version(weight_version: str) -> str:
+            return storage_key_prefix(
+                server_args.model,
+                revision=checkpoint_id,
+                weight_version=weight_version,
+                model_overrides=dict(model_config.model_override_args),
+                cache_signature=cache_signature,
+                pipeline_rank=pipeline_rank,
+                attn_tp_size=attn_tp_size,
+                draft_model=draft_model,
+                draft_revision=draft_revision,
+                draft_weight_version=weight_version if draft_model else "",
+                cache_quantization=cache_quantization,
+                runtime_compat=L3_RUNTIME_COMPAT,
+                attention_backend=attention_backend_name,
+                draft_attention_backend=draft_attention_backend_name,
+                skip_softmax_threshold=float(server_args.skip_softmax_threshold),
+                eagle3_layers_to_capture=eagle3_layers_to_capture,
             )
-            pipeline_rank = (
-                server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
-            )
-            if draft_model_config is not None:
-                draft_model = str(draft_model_config.model_path)
-                draft_quantization = str(draft_model_config.quantization or "")
-            else:
-                draft_model = ""
-                draft_quantization = ""
-            cache_quantization = l3_cache_quantization_id(
-                quantization=str(model_config.quantization or ""),
-                quantization_param_path=str(server_args.quantization_param_path or ""),
-                draft_quantization=draft_quantization,
-            )
-            attn_tp_size = int(server_args.mapping.attn.tp_size)
-            eagle3_layers_to_capture: list[int] = []
-            if server_args.speculative_algorithm == "EAGLE3":
-                configured_layers = server_args.eagle3_layers_to_capture
-                if configured_layers:
-                    eagle3_layers_to_capture = [
-                        int(layer) for layer in configured_layers
-                    ]
-                elif draft_model_config is not None:
-                    draft_layers = _eagle_aux_layer_ids(draft_model_config.hf_config)
-                    if draft_layers:
-                        eagle3_layers_to_capture = [
-                            int(layer) for layer in draft_layers
-                        ]
 
-            attention_backend_name = attention.attention_backend_name
-            draft_attention_backend_name = attention.draft_attention_backend_name
-
-            def prefix_for_weight_version(weight_version: str) -> str:
-                return storage_key_prefix(
-                    server_args.model,
-                    revision=checkpoint_id,
-                    weight_version=weight_version,
-                    model_overrides=dict(model_config.model_override_args),
-                    cache_signature=cache_signature,
-                    pipeline_rank=pipeline_rank,
-                    attn_tp_size=attn_tp_size,
-                    draft_model=draft_model,
-                    draft_revision=draft_revision,
-                    draft_weight_version=weight_version if draft_model else "",
-                    cache_quantization=cache_quantization,
-                    runtime_compat=L3_RUNTIME_COMPAT,
-                    attention_backend=attention_backend_name,
-                    draft_attention_backend=draft_attention_backend_name,
-                    skip_softmax_threshold=float(server_args.skip_softmax_threshold),
-                    eagle3_layers_to_capture=eagle3_layers_to_capture,
-                )
-
-            l2_cache_executor.attach_l3_storage(
-                storage_backend,
-                key_prefix=prefix_for_weight_version(server_args.weight_version),
-                rank=attn_tp_rank,
-                prefix_for_weight_version=prefix_for_weight_version,
-            )
+        host_cache_executor.attach_l3_storage(
+            storage_backend,
+            key_prefix=prefix_for_weight_version(server_args.weight_version),
+            rank=attn_tp_rank,
+            prefix_for_weight_version=prefix_for_weight_version,
+        )
 
     kv_transfer = _build_kv_transfer(
         server_args,
@@ -1557,7 +1574,17 @@ def build_device_side(
             if spec.family == "state"
         ),
         num_host_pages=(
-            l2_cache_executor.num_host_pages if l2_cache_executor is not None else 0
+            host_cache_executor.num_host_pages if host_cache_executor is not None else 0
+        ),
+        num_snapshot_pages=(
+            host_cache_executor.num_snapshot_pages
+            if host_cache_executor is not None
+            else 1
+        ),
+        max_retracted_requests=(
+            host_cache_executor.max_retracted_requests
+            if host_cache_executor is not None
+            else 0
         ),
         expert_rebalance=(
             target.expert_location_updater.specs
@@ -1592,7 +1619,7 @@ def build_device_side(
         encoder_model_facts=encoder_model_facts,
         handle=DeviceHandle(
             executor,
-            l2_cache_executor=l2_cache_executor,
+            host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,
         ),
     )

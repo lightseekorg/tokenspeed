@@ -97,18 +97,33 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 self.load_tracker = tracker
 
         pool = SyntheticPool()
+        specs = tuple(
+            SimpleNamespace(group_id=group.group_id, shard_count=1)
+            for group in layout.groups
+        )
         pool.arena = SimpleNamespace(
-            cache_group_specs=tuple(
-                SimpleNamespace(group_id=group.group_id) for group in layout.groups
+            cache_group_specs=specs,
+            runtime_contract=SimpleNamespace(
+                group_specs=specs,
+                virtual_block_counts={
+                    group.group_id: 1
+                    + layout.num_lcm_blocks * group.cache_blocks_per_lcm_block
+                    for group in layout.groups
+                },
             ),
         )
         with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
-            executor = self.executor_module.L2CacheExecutor(
+            executor = self.executor_module.HostCacheExecutor(
                 pool,
+                l2_tier=True,
                 host_ratio=1.0,
                 host_size_gb=0,
+                snapshot_host_gb=0,
+                max_retracted_requests=0,
+                slot_state=None,
                 io_backend="direct",
                 attn_tp_rank=0,
+                dcp_rank=0,
             )
         store = self.MemoryKvStore()
         executor.attach_l3_storage(
