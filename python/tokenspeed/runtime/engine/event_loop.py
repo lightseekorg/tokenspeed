@@ -39,7 +39,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.engine.batch_log import BatchLogger
-from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks
+from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks, cache_hooks_armed
 from tokenspeed.runtime.engine.eplb_hooks import (
     EplbHooks,
     make_expert_rebalance_controller,
@@ -286,12 +286,17 @@ class EventLoop:
         # by that group, which --emulate-rank-zero backs with this process alone.
         cache_replica_tp_size = self.attn_tp_cpu_group.size()
         # Cache-op accounting + rank-synced completion tracking (see
-        # cache_hooks.py) for the Host L2 tier and the retraction snapshot
-        # pool; a no-op shell when the engine has neither. The hooks get the
-        # handle, not the executors: polling goes through it.
-        has_cache_ops = server_args.enable_kvstore or specs.max_retracted_requests > 0
+        # cache_hooks.py); a no-op shell when the engine cannot emit cache
+        # ops -- armed hooks cost a gloo all-reduce per round. The Host L2
+        # tier arms them; the retraction snapshot pool does once the
+        # scheduler emits snapshot ops (cache_hooks.SNAPSHOT_POOL_EMITS_CACHE_OPS).
+        # The hooks get the handle, not the executor: polling goes through it.
+        armed = cache_hooks_armed(
+            enable_kvstore=server_args.enable_kvstore,
+            max_retracted_requests=specs.max_retracted_requests,
+        )
         self._cache_hooks = CacheOpHooks(
-            self._device if has_cache_ops else None,
+            self._device if armed else None,
             speculative_algorithm=server_args.speculative_algorithm,
             attn_tp_rank=attn_tp_rank,
             attn_tp_size=cache_replica_tp_size,

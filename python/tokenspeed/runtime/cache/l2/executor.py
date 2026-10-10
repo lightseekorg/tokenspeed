@@ -286,7 +286,9 @@ class HostCacheExecutor:
                 rank=dcp_rank,
             )
         # The scheduler wire includes logical null LCMBlock 0 in its counts;
-        # 0 L2 pages means no L2 tier, 1 snapshot page means never retract.
+        # 0 L2 pages means no L2 tier, 1 snapshot page means no pool. The
+        # pool count is reserved for the scheduler's snapshot ops (a later
+        # phase); it does not change today's retraction behaviour.
         self.num_host_pages = host_lcm_blocks + 1 if l2_tier else 0
         self.num_snapshot_pages = snapshot_lcm_blocks + 1
         self.l3_store = None

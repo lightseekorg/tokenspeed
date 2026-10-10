@@ -45,7 +45,10 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from tokenspeed_scheduler import Cache  # noqa: E402
 
 from tokenspeed.runtime.engine import cache_hooks as cache_hooks_module  # noqa: E402
-from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks  # noqa: E402
+from tokenspeed.runtime.engine.cache_hooks import (  # noqa: E402
+    CacheOpHooks,
+    cache_hooks_armed,
+)
 
 
 class _FakeWriteBackOp:
@@ -157,6 +160,21 @@ def test_disabled_kvstore_is_a_no_op() -> None:
     hooks = _single_rank_hooks(None)
     hooks.count_plan_ops(SimpleNamespace(cache=[SimpleNamespace()]))
     assert hooks.poll_ready_events() == []
+
+
+def test_hooks_arm_for_l2_and_for_the_pool_only_behind_the_phase_switch(
+    monkeypatch,
+) -> None:
+    # Armed hooks all-reduce every round, so a pool nothing can emit ops for
+    # must not arm them until the scheduler does (the one phase-4 switch).
+    assert cache_hooks_armed(enable_kvstore=True, max_retracted_requests=0)
+    assert cache_hooks_armed(enable_kvstore=True, max_retracted_requests=4)
+    assert not cache_hooks_armed(enable_kvstore=False, max_retracted_requests=0)
+    assert cache_hooks_module.SNAPSHOT_POOL_EMITS_CACHE_OPS is False
+    assert not cache_hooks_armed(enable_kvstore=False, max_retracted_requests=4)
+    monkeypatch.setattr(cache_hooks_module, "SNAPSHOT_POOL_EMITS_CACHE_OPS", True)
+    assert cache_hooks_armed(enable_kvstore=False, max_retracted_requests=4)
+    assert not cache_hooks_armed(enable_kvstore=False, max_retracted_requests=0)
 
 
 def test_submit_counts_in_flight_and_rejects_unknown_ops(fake_cache_ops) -> None:

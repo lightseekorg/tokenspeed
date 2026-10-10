@@ -64,3 +64,24 @@ def test_the_pool_is_independent_of_the_kvstore():
     )
     assert args.enable_kvstore is False
     assert args.retraction_snapshot_host_gb == 1.0
+
+
+def test_dcp_refuses_both_host_tiers_with_one_guard():
+    # The scheduler does not yet allocate Host blocks by residue class, so a
+    # sharded engine gets neither Host tier; the refusal names both and is
+    # lifted for both at once.
+    with pytest.raises(ValueError, match="Host cache tiers.*residue class"):
+        ServerArgs(model="x", world_size=2, decode_context_parallel_size=2)
+    with pytest.raises(ValueError, match="Host cache tiers.*residue class"):
+        ServerArgs(
+            model="x",
+            world_size=2,
+            decode_context_parallel_size=2,
+            disable_kvstore=True,
+            retraction_snapshot_host_gb=1.0,
+            retraction_snapshot_max_requests=2,
+        )
+    args = ServerArgs(
+        model="x", world_size=2, decode_context_parallel_size=2, disable_kvstore=True
+    )
+    assert args.enable_kvstore is False and args.retraction_snapshot_host_gb == 0.0

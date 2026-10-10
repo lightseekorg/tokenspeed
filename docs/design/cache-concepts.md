@@ -1274,11 +1274,13 @@ the sharded MLA history group), each subject to its backend's `AttnConfig`
 gate. The draft's decode steps would run the same sparse/dense DCP branches as
 the target's, but that path has not been validated for the ordinary recipe, so
 its exclusion is a gate rather than a geometry limit. All DCP paths still
-exclude the Host KVStore today: the L2 copies pass the ownership translation
-of the retraction-image design ("Retraction image" above, the identity while
-every group is replicated), but the scheduler does not yet allocate Host
-blocks by residue class, so a sharded engine must pass `--disable-kvstore`
-until it does.
+exclude both Host tiers today -- the KVStore and the retraction snapshot
+pool, under one shared refusal: the Host copies pass the ownership
+translation of the retraction-image design ("Retraction image" above, the
+identity while every group is replicated), but the scheduler does not yet
+allocate Host blocks by residue class, so a sharded engine must pass
+`--disable-kvstore` and leave `--retraction-snapshot-host-gb` at 0 until the
+runtime-consumption phase lifts both together.
 
 PD transfer supports a sharded **prefill** role against an unsharded decode
 role. Manifests carry scheduler (virtual) IDs on both sides and are bounded

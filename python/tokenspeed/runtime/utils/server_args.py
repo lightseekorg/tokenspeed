@@ -431,9 +431,11 @@ class ServerArgs:
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
 
-    # Retraction snapshot pool (pinned Host, per rank). 0 is the explicit
-    # "no pool": a retracting role then never retracts and a blocked
-    # admission waits for completions.
+    # Retraction snapshot pool (pinned Host, per rank) and its slot-state
+    # arena rows. This phase reserves them; the scheduler consumes them once
+    # it emits snapshot/restore ops (the retraction-snapshot design's
+    # scheduler phase). 0 is the explicit "no pool". Today's retraction
+    # behaviour is unchanged either way.
     retraction_snapshot_host_gb: float = 0.0
     retraction_snapshot_max_requests: int = 0
 
@@ -1618,14 +1620,22 @@ class ServerArgs:
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
-        # The Host L2 copies address device pages by scheduler block ID with
-        # no ownership translation (cache/l2/executor.py), so a sharded group
-        # would read and write the wrong local pages.
-        if self.decode_context_parallel_size > 1 and self.enable_kvstore:
+        # The Host cache copies translate ownership on both ends of every row
+        # (cache/transfer/ownership.py), but the scheduler does not yet
+        # allocate Host blocks by residue class, so under DCP a Host block
+        # need not sit in its Device block's class and the copy would be
+        # refused at submit. Both Host tiers -- the L2 KVStore and the
+        # retraction snapshot pool -- wait for that scheduler change and are
+        # refused together here; the retraction-snapshot design's runtime
+        # consumption phase lifts both at once.
+        if self.decode_context_parallel_size > 1 and (
+            self.enable_kvstore or self.retraction_snapshot_host_gb > 0
+        ):
             raise ValueError(
                 "--decode-context-parallel-size > 1 does not yet support the Host "
-                "KVStore (L2 addresses device pages without DCP ownership "
-                "translation); pass --disable-kvstore."
+                "cache tiers (the Host KVStore and the retraction snapshot pool): "
+                "the scheduler does not yet allocate Host blocks by residue class; "
+                "pass --disable-kvstore and leave --retraction-snapshot-host-gb at 0."
             )
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
@@ -2232,9 +2242,10 @@ class ServerArgs:
             help="Per-rank pinned Host pool, in gigabytes, that images a retracted "
             "request's unaligned tail pages, its groups Host L2 never holds, and "
             "its slot state (the hash-complete blocks go to Host L2; without "
-            "--enable-kvstore the pool must hold the whole image). 0 (the "
-            "default) means no pool: the engine never retracts and a blocked "
-            "admission waits for completions. Fused and decode roles only.",
+            "--enable-kvstore the pool must hold the whole image). This release "
+            "reserves the pool; the scheduler consumes it once it emits "
+            "snapshot/restore ops, and retraction behaves as before until then. "
+            "0 (the default) means no pool. Fused and decode roles only.",
         )
         parser.add_argument(
             "--retraction-snapshot-max-requests",

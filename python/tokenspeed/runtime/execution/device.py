@@ -174,10 +174,14 @@ class DeviceSpecs:
             without ``--enable-kvstore``. The scheduler is configured from it.
         num_snapshot_pages: The retraction snapshot pool's page count (incl.
             the null page), sized like the L2 tier's from
-            ``--retraction-snapshot-host-gb``; 1 (the null page alone) without
-            a pool, which tells the scheduler never to retract.
+            ``--retraction-snapshot-host-gb``; 1 (the null page alone)
+            without a pool. Reserved by this phase; the scheduler consumes
+            it once it emits snapshot/restore ops (the retraction-snapshot
+            design's scheduler phase). Today's retraction behaviour does not
+            depend on it.
         max_retracted_requests: Slot-state image rows of the snapshot pool,
-            i.e. how many requests may be retracted at once; 0 without a pool.
+            i.e. how many requests may be retracted at once once those ops
+            exist; 0 without a pool.
         expert_rebalance: The expert placement's geometry and this rank's
             position in its EP group, for the online rebalance controller;
             None unless the server started with ``--enable-eplb``.

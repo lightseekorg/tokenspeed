@@ -42,8 +42,8 @@ returns events for the event loop to apply — feedback into the scheduler
 stays an explicit ``advance_scheduler`` call in the loop body.
 
 Depends only on the device handle and static parallel-layout config, not on
-live event-loop state. ``device=None`` (no Host L2 and no snapshot pool)
-makes every method a cheap no-op.
+live event-loop state. ``device=None`` (the engine can emit no cache op, see
+``cache_hooks_armed``) makes every method a cheap no-op.
 """
 
 from __future__ import annotations
@@ -65,6 +65,28 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: PHASE-4 SWITCH. Armed hooks poll completions and run a gloo all-reduce on
+#: every round, so they are armed only for an engine that can emit cache ops.
+#: Today that is the Host L2 tier. The retraction snapshot pool is reserved
+#: by this phase but nothing emits ``SnapshotOp`` / ``RestoreOp`` until the
+#: scheduler does; the runtime consumption phase of the retraction-snapshot
+#: design flips this to True, with the scheduler pin, so a pool without L2
+#: arms the hooks too. One switch, flipped once; nothing else gates it.
+SNAPSHOT_POOL_EMITS_CACHE_OPS = False
+
+
+def cache_hooks_armed(*, enable_kvstore: bool, max_retracted_requests: int) -> bool:
+    """Whether the engine can emit cache ops, so the hooks must poll for them.
+
+    Args:
+        enable_kvstore: The Host L2 tier is configured.
+        max_retracted_requests: The retraction snapshot pool's slot-state
+            rows; positive when a pool is configured.
+    """
+    return bool(enable_kvstore) or (
+        SNAPSHOT_POOL_EMITS_CACHE_OPS and max_retracted_requests > 0
+    )
 
 
 class CacheOpHooks:
