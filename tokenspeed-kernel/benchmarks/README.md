@@ -1,4 +1,4 @@
-# Kernel Benchmarks
+# Kernel benchmarks
 
 This directory contains suites for measuring TokenSpeed operations and their
 selected kernel registrations. The benchmark harness separates operation-specific
@@ -10,11 +10,11 @@ the hardware suite. They use representative model inputs and exercise normal
 operation dispatch, covering both kernel selection and execution.
 
 Each operation family and mode owns one generator under
-`tokenspeed_kernel/benchmark/generators/`. Built-in generators are loaded by the
-harness, and additional ones are registered with `set_benchmark_generator`.
+`tokenspeed_kernel/benchmark/generators/`. The harness loads built-in
+generators, and `set_benchmark_generator` registers additional ones.
 Every generator reuses the same harness, timer, and validators.
 
-## Benchmark Requests
+## Benchmark requests
 
 Each request identifies an operation family and mode, supplies parameters for
 that operation's generator, and may select a solution or exact registration.
@@ -66,8 +66,8 @@ result = harness.run(
 ```
 
 Exact-registration benchmarks invoke the named registration through its normal
-public behavior. Any internal fallback remains owned by the operation and is
-not changed by the benchmark harness.
+public behavior. Any internal fallback remains owned by the operation, and the
+benchmark harness does not change it.
 
 ## Timing
 
@@ -77,15 +77,15 @@ warmup, correctness checks, and result serialization are outside the reported
 device time.
 
 By default, each captured invocation clears the device caches immediately
-before the operation runs. Device events surround only the operation, so cache
-clearing is excluded from its reported time. A case can set `cold_cache` to
+before the operation runs. Device events surround only the operation, so the
+reported time excludes cache clearing. A case can set `cold_cache` to
 `false` for hot-cache experiments.
 
 Each measurement block reports the device time for one captured operation
 invocation. Cases inherit the suite's `measurement_blocks` value unless they set
 an explicit override. Eager and graph-replay warmup counts remain suite-wide.
 Warmup settings and cache mode must match across revisions before measurements
-can be compared; measurement-block counts may differ.
+can be compared. Measurement-block counts may differ.
 
 The result contains the raw device-time samples, resolved registration, timing
 mode, and structured failure information. Suite-level comparison uses the
@@ -93,23 +93,24 @@ sample median and relative median absolute deviation.
 
 ## Correctness
 
-Correctness is opt-in and owned by the operation generator. The generator
-selects a registered reference solution, constructs candidate and reference
-calls over the same fresh inputs, and declares a validator for each output that
-needs checking. Outputs that do not require validation use no validator.
+The operation generator owns correctness checking, which is opt-in. The
+generator selects a registered reference solution, constructs candidate and
+reference calls over the same fresh inputs, and declares a validator for
+each output that needs checking. Outputs that do not require validation use
+no validator.
 
 The generator declares how many fresh input sets to run, and each validator
 receives every run's candidate/reference pair for its output along with
 validator-specific options. The built-in `close` validator accepts absolute
-and relative tolerances; additional validators are registered with
-`set_output_validator`. Generators typically compare against the operation's
+and relative tolerances; `set_output_validator` registers additional
+validators. Generators typically compare against the operation's
 registered `reference` solution.
 
 Correctness runs before timing. A failure prevents the case from producing a
 successful measurement. Correctness remains within the revision-local process,
 and tensor values are never serialized for cross-revision comparison.
 
-## Suite Contract
+## Suite contract
 
 A suite declares:
 
@@ -120,18 +121,19 @@ A suite declares:
 - per-case relative regression, absolute regression, and noise limits.
 
 A case may set `measurement_blocks` when its noise profile requires more samples
-than the suite default. The effective value is recorded with that case's result;
-the suite's single benchmark harness receives that value for each case.
+than the suite default. The suite's single benchmark harness receives the
+effective value for each case and records it with that case's result.
 
 The optional `case_files` list composes model-and-operation case files into the
 hardware suite. Case IDs remain unique across the composed suite.
-Case files may define `common_parameters`; these are merged into every case,
-with parameters written on an individual case taking precedence.
+Case files may define `common_parameters`; the loader merges them into every
+case, with parameters written on an individual case taking precedence.
 
 A top-level parameter may be a non-empty list. The loader expands all such lists
-as a Cartesian product and appends `_0`, `_1`, and so on to the case ID. Parameter
-names are sorted alphabetically to determine dimension order; list order determines
-each dimension's value order. A one-element product retains the original case ID.
+as a Cartesian product and appends an index (`_0`, `_1`, and higher) to the case
+ID. Parameter names are sorted alphabetically to determine dimension order;
+list order determines each dimension's value order. A one-element product
+retains the original case ID.
 Use separate case entries when shape classes need
 different policies or do not form a Cartesian product. This expansion applies only
 to direct parameter values; lists inside nested parameter objects remain literal.
@@ -141,19 +143,21 @@ the case identity.
 
 `comparison_epoch` is an opaque equality token used only to decide whether
 baseline and candidate measurements are comparable. It has no ordering and
-creates no backward-compatibility requirement. Advance it when an operation's
+creates no backward-compatibility requirement. When an operation's
 performance-relevant semantics change while retaining the same operation and
-case identity. For example, adding a consumer fusion without renaming the
-operation starts a new comparison epoch. Do not advance it for ordinary kernel
-implementation changes or benchmark harness and CI changes. Those kernel
-implementation changes are what the benchmark is intended to compare, while
-timing-infrastructure compatibility is represented and checked separately.
+case identity, advance it. For example, adding a consumer fusion without
+renaming the operation starts a new comparison epoch. For ordinary kernel
+implementation changes or benchmark harness and CI changes, do not advance it.
+Those kernel implementation changes are what the benchmark is intended to
+compare, while CI represents and checks timing-infrastructure compatibility
+separately.
 
 Compatible cases must have the same ID, comparison epoch, definition, warmup
 settings, cache mode, and recorded hardware. Their measurement-block counts may
-differ. The resolved registration is reported but may change because dispatch is
-part of the behavior under test. Added and changed cases are reported but not
-compared. A baseline case missing from the candidate is also reported. If any
+differ. The comparison reports the resolved registration, which may change
+because dispatch is part of the behavior under test. Added and changed cases
+appear in the report without comparison. A baseline case missing from the
+candidate also appears in the report. If any
 otherwise-compatible run is too noisy, its result is inconclusive rather than a
 regression.
 
@@ -161,7 +165,7 @@ Regression policy comes from the merge-base suite, so a candidate cannot weaken
 its own gate by changing a threshold. A benchmark is a regression only when its
 median slowdown exceeds both the configured relative and absolute limits.
 
-## Running A Suite
+## Running a suite
 
 From the repository root and a prepared TokenSpeed kernel environment, run the
 revision-local worker:
@@ -175,11 +179,11 @@ python3 -m tokenspeed_kernel.benchmark.ci \
 
 On AMD, a direct worker run profiles the measured graph replays with Proton and
 adds a per-case diagnostic summary to the result JSON. It reuses launch metadata
-from the final eager warm-up to calculate per-kernel TFLOP/s. Use
-`--profiler none` to disable it. Automated CI explicitly selects no profiler so
+from the final eager warm-up to calculate per-kernel TFLOP/s. To disable it,
+use `--profiler none`. Automated CI explicitly selects no profiler so
 its regression measurements stay as close to production execution as possible.
-Repeated launches with the same runtime kernel name are reported as one combined
-kernel entry because Proton groups them in graph-replay profiles.
+Repeated launches with the same runtime kernel name appear as one combined
+kernel entry in the summary because Proton groups them in graph-replay profiles.
 `--case-filter REGEX` selects expanded case IDs with `re.search`; repeat the
 option to match any expression. For example, `--case-filter '_0$'` selects the
 first expanded combination for each parameterized case.
@@ -194,9 +198,9 @@ python3 test/ci_system/kernel_benchmark_ci.py \
 ```
 
 The default comparison creates separate worktrees and virtual environments for
-the two revisions and installs each revision's ROCm kernel requirements. Use
-`--environment-mode current` to reuse an already prepared environment during
-local development.
+the two revisions and installs each revision's ROCm kernel requirements. To
+reuse an already prepared environment during local development, use
+`--environment-mode current`.
 
 The output directory contains revision-local JSON results and logs, setup logs,
 the structured comparison, and a Markdown summary. When the merge base does not

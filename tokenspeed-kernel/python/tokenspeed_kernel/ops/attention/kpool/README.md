@@ -37,6 +37,6 @@ addressing physical cache rows directly. The eager-only compatibility path
 reconstructs request IDs and causal lengths and scores through the index page
 table.
 
-Scoring workspaces are row-tiled under `max_logits_bytes`. The cap includes
+Scoring workspaces use row tiling under `max_logits_bytes`. The cap includes
 the persistent sort or radix intermediates as well as logits; one row remains
 legal when its workspace exceeds the cap.

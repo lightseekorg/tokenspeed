@@ -8,8 +8,8 @@ performant kernels for multi-silicon AI inference. It features:
 * Plugin mechanism for multi-silicon extensibility
 * A minimal list of curated dependencies for fast iteration
 
-TokenSpeed-kernel is pip-installable on its own and can be directly used by
-others.
+TokenSpeed-kernel is pip-installable on its own. Others can use it
+directly.
 
 ## Nightly installation
 
@@ -30,27 +30,27 @@ The `Build and Release tokenspeed-kernel` workflow also supports manual nightly
 builds from pull request branches. To publish manually, run it from `main` with
 both `nightly` and `publish_github` enabled. Same-day reruns preserve already
 published wheels.
-Historical nightlies are retained; automatic cleanup is deferred.
+Historical nightlies are retained. Automatic cleanup is deferred.
 
-## Design Goals
+## Design goals
 
-TokenSpeed-kernel is designed with the following functionality goals in mind:
+TokenSpeed-kernel is designed with these functionality goals in mind:
 
-* Support various kernels in AI models (attention, MoE, etc.)
+* Support various kernels in AI models (such as attention and MoE)
 * Support multiple silicon vendors and generations
 * Marry default portability and performance solutions
 
-In addition, to have a better devflow for fast iteration:
+Additional goals target a better devflow for fast iteration:
 
 * Provide unified infra to verify and debug kernel numerics standalone
 * Provide unified infra to run and benchmark kernels standalone
 * Support tracing shapes and profiling workloads at runtime
 * Stay forward-looking, with guardrails for agentic devflow
 
-## Overall Design
+## Overall design
 
-With the above goals in mind, we have made the following opinionated design
-choices (still evolving; subject to change):
+TokenSpeed-kernel makes these opinionated design choices toward the
+preceding goals (still evolving; subject to change):
 
 ### Layered system
 
@@ -114,8 +114,8 @@ Each `ops/<family>/` directory groups implementations by operator variant and
 then solution. For example, attention uses `attention/<variant>/<solution>.py`
 such as `attention/mha/triton.py`. A solution is either an in-tree JIT kernel
 (Triton/Gluon/CuteDSL), or a thin wrapper around an external library.
-All of them register through the same decorator and are scored by the same
-selection logic, so adding a backend is one new file in the right family
+All of them register through the same decorator, and the same selection
+logic scores them, so adding a backend is one new file in the right family
 folder.
 
 ### Solution choices
@@ -127,14 +127,14 @@ folder.
   decode-shaped batches and tuned BF16 Gluon kernels for prefill. BF16 expert
   copies are created at load time while compact FP8 experts remain available
   for decode
-- **Vendor libraries** — wrapped (FlashAttention, TRT-LLM, etc.);
+- **Vendor libraries** — wrapped (such as FlashAttention and TRT-LLM);
   no in-tree C++ build
 - **PyTorch reference** — under `numerics/reference/`; never auto-selects
   over a real backend but always available as ground truth
 
-Overall we carefully curate external dependencies and actively re-evaluate
-their inclusion, in order to maintain minimal dependencies and enable faster
-iteration.
+TokenSpeed-kernel carefully curates external dependencies and actively
+re-evaluates their inclusion to maintain minimal dependencies and enable
+faster iteration.
 
 ### Numerics, benchmarking, profiling
 
@@ -146,7 +146,7 @@ iteration.
 - `KernelBenchmarkHarness` — registration-level device timing through warmed
   graph replay, with raw samples, resolved registration metadata, and explicit
   failure outcomes.
-- Runtime shape capture feeds replay and tuning workflows; `kernel_scope`
+- Runtime shape capture feeds replay and tuning workflows. `kernel_scope`
   scopes are visible in Proton/Chrome traces. The joint BF16 `mm` fast path
   records the same shape metadata and scopes as registry-selected kernels.
 - End-to-end serving: POST `/start_profile` with
@@ -164,7 +164,7 @@ iteration.
 
 Registration-level benchmarks combine operation-owned input and correctness
 logic with graph-replay device timing. Each operation family and mode
-contributes one benchmark generator; suites reference them by family, mode,
+contributes one benchmark generator. Suites reference them by family, mode,
 and parameters. Pull request CI compares compatible cases between the merge
 base and candidate revision. See the
 [benchmark documentation](benchmarks/README.md) for the harness and suite
@@ -174,30 +174,31 @@ for workflow behavior and runner requirements.
 ### JIT compilation while serving
 
 Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`) key the
-Triton compile cache, so a per-batch value passed as one compiles a new binary
+Triton compile cache. A per-batch value passed as one compiles a new binary
 on the forward thread for every new batch shape (100 ms to seconds each).
 `tokenspeed_kernel.compile_monitor` hooks Triton's JIT (Gluon shares it) and
 records every compilation. The runtime installs it in each scheduler process
-and marks the end of startup; after that each compilation is logged with its
-duration, what changed in the compile key, and the launching call site, and a
-compile-time parameter that keeps taking new values from one call site is
-named (`TOKENSPEED_JIT_COMPILE_CHECK=warn`, the default) or raises (`error`,
-which CI serving jobs use). Kernel tests guard batch-varying launches with
-`assert_no_triton_compile` in `test/utils.py`. JITs outside Triton, such as
-DeepGEMM's per-shape kernels, are not observed and need the same discipline
-at their call sites.
+and marks the end of startup. After that, the monitor logs each compilation
+with its duration, what changed in the compile key, and the launching call
+site. When a compile-time parameter keeps taking new values from one call
+site, the monitor names it (`TOKENSPEED_JIT_COMPILE_CHECK=warn`, the
+default) or raises (`error`, which CI serving jobs use). Kernel tests guard
+batch-varying launches with `assert_no_triton_compile` in `test/utils.py`.
+The monitor does not observe JITs outside Triton, such as DeepGEMM's
+per-shape kernels; they need the same discipline at their call sites.
 A runtime argument still keys the cache: Triton specializes an integer on
-whether it is 1 or divisible by 16, and a pointer on 16-byte alignment. Startup
-warms only the classes graph capture happens to see, so on the serving path a
-per-batch count (tokens, rows, requests) belongs in `do_not_specialize`, and a
-pointer into a buffer sliced at a per-batch offset in
-`do_not_specialize_on_alignment`. A stride that changes between call sites but
-stays a multiple of 16, such as a projection's row width, stays a plain runtime
-argument: one class covers it, and the hint keeps row loads vectorized. A
-batch-derived block size is a fixed block with a loop rather than a
-power-of-two bucket, which still compiles once per new bucket while serving.
-The end-of-startup mark is also the package's compile switch, set whether or
-not the monitor is installed. A kernel whose library compiles once per batch
+whether it is 1 or divisible by 16, and a pointer on 16-byte alignment.
+Startup warms only the classes graph capture happens to see. On the serving
+path, a per-batch count (tokens, rows, requests) belongs in
+`do_not_specialize`, and a pointer into a buffer sliced at a per-batch
+offset belongs in `do_not_specialize_on_alignment`. A stride that changes
+between call sites but stays a multiple of 16, such as a projection's row
+width, stays a plain runtime argument: one class covers it, and the hint
+keeps row loads vectorized. Use a fixed block with a loop for a
+batch-derived block size rather than a power-of-two bucket; the bucket form
+still compiles once per new bucket while serving. The end-of-startup mark is
+also the package's compile switch, set whether or not the monitor is
+installed. A kernel whose library compiles once per batch
 shape and cannot bucket it, such as FlashInfer's joint BF16 GEMM (some runners
 compile per exact row count) or the ll_bf16 router's dot-product kernel, checks
 `compile_monitor.is_serving()` where it is dispatched: startup tuning and graph capture use it, and eager calls while
@@ -206,9 +207,9 @@ serving take a GEMM that never compiles (cuBLAS through torch on NVIDIA).
 ### Plugins
 
 `python -m tokenspeed_kernel.plugins list` lists discovered out-of-tree backends.
-Plugins register via the same `@register_kernel` decorator from their own
-package, set their own priority, and participate in selection like in-tree
-backends. See `tokenspeed_kernel/plugins/README.md`.
+Plugins register through the same `@register_kernel` decorator from their
+own package, set their own priority, and participate in selection like
+in-tree backends. See `tokenspeed_kernel/plugins/README.md`.
 
 ## Public API
 
@@ -228,9 +229,9 @@ from tokenspeed_kernel.ops.attention.msa import (
 )
 ```
 
-Using the above platform and solution-agnostic public APIs can get the most
-value out of TokenSpeed-kernel; but one can also directly call into a
-specific solution under `ops/<family>/`, or manually `select_kernel` with
+The preceding platform- and solution-agnostic public APIs provide the most
+value from TokenSpeed-kernel. You can also call directly into a specific
+solution under `ops/<family>/`, or run `select_kernel` manually with
 targeted filters.
 
 For targeted selection:

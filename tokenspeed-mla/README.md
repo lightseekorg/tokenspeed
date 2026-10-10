@@ -16,17 +16,17 @@ Speed-of-light TokenSpeed MLA kernels for `SM100/SM103/SM107` with:
 This package includes performance-oriented optimizations for latency-sensitive
 serving workloads, especially coding agent style use cases with high request
 concurrency, short decode steps, and strict time-to-first-token/next-token
-requirements. For MLA decode kernel, small `q_len * num_heads`
+requirements. For the MLA decode kernel, small `q_len * num_heads`
 configurations can fold a query-token group (`fold_sq_factor`) into heads for
-better tile utilization; remaining query groups are scheduled across the query
-sequence dimension.
+better tile utilization; the scheduler places remaining query groups across
+the query sequence dimension.
 
 SM107 support requires CuTe DSL 4.8.0 or newer and a compatible CUDA toolkit.
 Decode compilation and GPU regression tests also reject CuTe DSL warnings.
 
-## Performance Numbers
+## Performance numbers
 
-### Prefill Performance
+### Prefill performance
 ![Prefill Latency Comparison](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comp_prefill.png)
 
 Where:
@@ -38,11 +38,11 @@ use case 4: batch_size = 4, seqlen_qo = 512,      seqlen_kv = 80 * 1024
 use case 5: batch_size = 4, seqlen_qo = 1024,     seqlen_kv = 80 * 1024
 ```
 
-The prefill comparison above includes historical results from an AOT
+The preceding prefill comparison includes historical results from an AOT
 implementation. Current releases ship the public CuTe DSL JIT implementation;
 the historical AOT backend is not included in the package.
 
-The performance numbers can be collected using the following command line:
+Collect the performance numbers with this command line:
 ```
 python ./tokenspeed-mla/python/tokenspeed_mla/fmha.py \
   --is_causal \
@@ -56,12 +56,12 @@ python ./tokenspeed-mla/python/tokenspeed_mla/fmha.py \
   --skip_ref_check
 ```
 
-### Decode Performance
+### Decode performance
 
 ![Decode Latency Comparison for num_heads=16](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comparison_numHead16.png)
 ![Decode Latency Comparison for num_heads=32](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comparison_numHead32.png)
 
-In the above test cases, `q_seqlen = 4` and `kv_seqlen = 80K`.
+In these test cases, `q_seqlen = 4` and `kv_seqlen = 80K`.
 
 TensorRT-LLM uses a single kernel for MLA decode, which appears to adopt a swap-AB strategy in the tested cases. In contrast, TokenSpeed’s MLA decode kernel uses a two-kernel implementation: one kernel computes the MLA decode with split-KV, and a second kernel performs the reduction of the split-KV partial results.
 
@@ -79,10 +79,10 @@ The folded execution shape becomes:
 - `q_seqlen_eff = q_seqlen / F`
 
 This improves BMM1 `M`-dimension utilization and reduces tile waste in small-head
-decode scenarios, especially token-by-token agent traffic. Example:
-`num_heads=64, q_seqlen=4` chooses `F=2`, so two query tokens are folded into
-`M` (`H_eff=128`) and the remaining two query groups are scheduled on the
-scheduler second dimension (`q_seqlen_eff=2`).
+decode scenarios, especially token-by-token agent traffic. Example: with
+`num_heads=64, q_seqlen=4`, the runtime chooses `F=2`, so the kernel folds two
+query tokens into `M` (`H_eff=128`) and schedules the remaining two query
+groups on the scheduler second dimension (`q_seqlen_eff=2`).
 
 The public `tokenspeed_mla_decode` also accepts `enable_packed_q=True` to
 opt into continuous query/head packing on the FP8 and FP16/BF16 M128 paths, adapted from
@@ -90,7 +90,7 @@ FlashInfer PR #4178. The default is **False**, preserving the folded-query
 implementation. M64 and token-gapped Q/output views continue to
 use that implementation even when the option is enabled.
 
-Packed rows are ordered as `query_token * num_heads + head`. Each 2-CTA
+The packing orders rows as `query_token * num_heads + head`. Each 2-CTA
 group owns 128 consecutive rows, including across query boundaries. Thus
 H96/Sq4 uses three query tiles instead of four, and H96/Sq8 uses six
 instead of eight. Only the final tile may contain padding. This is a tensor
@@ -119,7 +119,7 @@ From the repository root, select this checkout's sources explicitly:
 PYTHONPATH=tokenspeed-mla/python python -m pytest -q tokenspeed-mla/tests/test_mla_decode.py
 ```
 
-GPU cases require SM100, SM103 or SM107 and are skipped on other devices.
+GPU cases require SM100, SM103 or SM107; pytest skips them on other devices.
 Add `-k 'not TestGPU and not TestCompile'` for CPU checks, `-k TestCompile`
 for compilation checks across all three architectures, or `-k TestGPU` for
 GPU checks. Compilation checks require a CuTe DSL and CUDA toolchain that
@@ -145,9 +145,9 @@ FP16 softmax remains an explicit option for direct kernel construction.
 FP8 output supports up to four M256 tiles per request. By default, `H` must
 divide 256 and `q_len` must be a multiple of `256 / H`;
 `enable_packed_q=True` accepts other shapes such as H96 and partial tiles.
-Causal/non-causal attention, split-KV, LSE, PDL and CUDA graphs are supported;
-sliding windows, DCP and `local_visible_lens` are unsupported. Rows with no
-visible keys produce zero output and `-inf` LSE.
+The kernel supports causal/non-causal attention, split-KV, LSE, PDL and CUDA
+graphs; it does not support sliding windows, DCP, or `local_visible_lens`.
+Rows with no visible keys produce zero output and `-inf` LSE.
 
 SM107 FP8-output compilation and GPU regression tests reject CuTe DSL warnings.
 The mixed-cluster kernel issues CLC queries directly and owns its unswizzled
@@ -166,12 +166,12 @@ Other optimizations include:
   split-KV and reducer optimizations from FlashInfer PR #4178 to TokenSpeed's
   folded-query layout; both reducer settings are included in the compile cache.
 - Using 2CTA UTCMMA instruction to reduce shared memory usage.
-- Try to use as less mbarrier as possible.
-- Split kv loading warp to get more latency hiding ability. After loading K, V is already in the L2 cache. Loading K of next tile will not have to wait for the completion of V loading.
-- Using multiple stage (sub-tiling) for STG in epilogue.
+- Try to use as few mbarriers as possible.
+- Split the KV loading warp to get more latency-hiding ability. After loading K, V is already in the L2 cache. Loading K of the next tile does not have to wait for the completion of V loading.
+- Using multiple stages (sub-tiling) for STG in the epilogue.
 
 
-The performance numbers can be collected using the following command line:
+Collect the performance numbers with this command line:
 ```
 python ./tokenspeed-mla/python/tokenspeed_mla/mla_decode_fp8.py \
   --batch_size 4 \
@@ -187,7 +187,7 @@ python ./tokenspeed-mla/python/tokenspeed_mla/mla_decode_fp8.py \
   --skip_ref_check
 ```
 
-## Kernel Capability Summary
+## Kernel capability summary
 
 ### MLA Prefill (`tokenspeed_mla_prefill`)
 
@@ -201,16 +201,17 @@ What it supports:
 - Causal and non-causal execution
 - Optional LSE return (`return_lse=True`)
 - PDL enable/disable (`enable_pdl`)
-- Kernel compile cache keyed by static config (`dtype`, `d_qk`, `d_v`, causal, LSE, PDL, etc.)
-- Skip-correction is enabled in the wrapped FMHA path.
+- Kernel compile cache keyed by static config (such as `dtype`, `d_qk`, `d_v`,
+  causal, LSE, and PDL)
+- The wrapped FMHA path enables skip-correction.
 - ex2-emulation (disabled by default on B200, and not supported on B300)
 - CuTe DSL JIT backend
 
 Input/output dtype behavior:
 
-- CuTe DSL backend accepts input dtypes supported :
+- The CuTe DSL backend accepts these input dtypes:
   - `torch.float16`, `torch.bfloat16`, `torch.float8_e4m3fn`, `torch.float8_e5m2`
-  - MLA Prefill only support `torch.float8_e4m3fn`
+  - MLA Prefill supports only `torch.float8_e4m3fn`
 - Prefill output tensor is BF16 (`torch.bfloat16`)
 - Optional LSE output is FP32
 
@@ -227,7 +228,7 @@ What it supports:
   SM107 when `out` is FP8 (see [SM107 decode](#sm107-decode)).
 - Supports `H <= 128` and `1 <= q_len <= 4`; for example,
   `H=64, q_len=4` is supported.
-- `split_kv` and `workspace_size` are computed and cached from runtime shape/device info.
+- The wrapper computes and caches `split_kv` and `workspace_size` from runtime shape/device info.
 - `is_var_seq`, `is_persistent`, and `enable_pdl` affect scheduling/compile variants.
 - `causal_mask` supports causal and non-causal execution on FP16/BF16/FP8 paths.
 - `window_left` bounds each block row's history: row `i` sees keys
@@ -238,7 +239,7 @@ What it supports:
 - Optional `out` tensor reuse
 - `is_var_seq` and `enable_pdl` controls
 
-## Minimal Usage
+## Minimal usage
 
 ### 1) Decode
 

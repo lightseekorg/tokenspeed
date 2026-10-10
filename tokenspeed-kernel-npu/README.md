@@ -33,7 +33,7 @@ For the complete Qwen3-0.6B launch command, ACL Graph capture sizes, serving
 limits, and a request example, see the
 [Ascend model recipe](../docs/recipes/models.md#qwen3-06b-on-ascend-npu).
 
-## Serving Dependencies in a Source Checkout
+## Serving dependencies in a source checkout
 
 When running TokenSpeed directly from a checkout through `PYTHONPATH`, install
 the SMG serving packages explicitly. Run these commands from the repository
