@@ -760,7 +760,9 @@ def _launch_gdn_tree_verify_chunked(
     if scale is None:
         scale = K**-0.5
     o = q.new_empty(B, T, HV, V)
-    BV = min(triton.next_power_of_2(V), 64)
+    # Once the (request, head) programs outnumber the SMs, fewer and wider V tiles are faster.
+    wide = B * HV > current_platform().sm_count
+    BV = min(triton.next_power_of_2(V), 128 if wide else 64)
     T_BLOCK = triton.next_power_of_2(GDN_TREE_VERIFY_CHUNKED_MAX_NODES)
     _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](
         A_log=A_log,
