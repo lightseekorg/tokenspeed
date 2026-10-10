@@ -70,14 +70,21 @@ def gluon_mla_project_value_gfx1250(
         attention_ptr,
         (batch_head * LATENT + offs_k).to(gl.int32),
     ).to(gl.float32)
+    # Weight columns are contiguous; load across N before restoring the K reduction layout.
+    load_layout: gl.constexpr = gl.BlockedLayout([8, 1], [4, 8], [1, NUM_WARPS], [0, 1])
+    load_n = pid_n * BLOCK_N + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(1, load_layout)
+    )
+    load_k = gl.arange(0, LATENT, layout=gl.SliceLayout(0, load_layout))
     weight = gl.amd.cdna5.buffer_load(
         weight_ptr,
         (
             head * LATENT * VALUE
-            + offs_k[None, :].to(gl.int64) * VALUE
-            + offs_n[:, None].to(gl.int64)
+            + load_k[None, :].to(gl.int64) * VALUE
+            + load_n[:, None].to(gl.int64)
         ).to(gl.int32),
     )
+    weight = gl.convert_layout(weight, layout)
     attention = gl.convert_layout(attention[None, :], layout)
     projected = gl.sum(weight.to(gl.float32) * attention, axis=1)
     projected = projected.to(gl.bfloat16).to(gl.float32)

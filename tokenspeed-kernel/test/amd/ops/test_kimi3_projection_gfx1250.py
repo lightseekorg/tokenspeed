@@ -526,3 +526,44 @@ def test_kimi3_shared_down_strided_inputs_use_torch(noncontiguous) -> None:
         wmma.assert_not_called()
     assert actual is out
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "batch,heads,gated", [(1, 12, False), (2, 16, True), (4, 16, False), (8, 12, True)]
+)
+def test_mla_value_projection_graph_refreshes_inputs(batch, heads, gated):
+    from tokenspeed_kernel.ops.attention.mla import mla_project_value
+
+    torch.manual_seed(3402)
+    attention = torch.randn(batch, heads, 512, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(heads, 512, 128, device="cuda", dtype=torch.bfloat16) * 0.02
+    gate_storage = torch.randn(
+        batch, heads * 128 + 32, device="cuda", dtype=torch.bfloat16
+    )
+    gate = gate_storage[:, 32:] if gated else None
+    backing = torch.full(
+        (batch * heads * 128 + 256,), -17.0, device="cuda", dtype=torch.bfloat16
+    )
+    out = backing[128:-128].view(batch, heads * 128)
+
+    def run():
+        return mla_project_value(
+            attention, weight, gate=gate, out=out, solution="gluon"
+        )
+
+    previous = run().clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    attention.mul_(-0.75)
+    if gated:
+        gate.add_(0.5)
+    graph.replay()
+    actual = out.clone()
+    torch.testing.assert_close(actual, run(), atol=0.0, rtol=0.0)
+    expected = torch.einsum("bhl,hlv->bhv", attention, weight).reshape_as(out)
+    if gated:
+        expected = (expected.float() * gate.float().sigmoid()).to(out.dtype)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    assert not torch.equal(actual, previous)
+    assert torch.all(backing[:128] == -17.0) and torch.all(backing[-128:] == -17.0)

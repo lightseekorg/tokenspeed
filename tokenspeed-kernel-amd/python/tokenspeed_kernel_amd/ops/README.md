@@ -470,6 +470,14 @@ When the grid leaves CUs idle, the launcher splits the KV stream and
 most one wave of CTAs and stream at least four pages each, since every split
 pays a fixed prologue and an FP32 partial store.
 
+### gfx1250 MLA value projection
+
+The standalone BF16 value projection loads contiguous columns of the
+headwise weight matrix, then restores the original accumulation layout.
+It preserves the FP32 reduction order and the BF16 rounding boundary before
+an optional sigmoid gate. This kernel is separate from fused decode's
+reduce-and-project kernel.
+
 ### gfx1250 MLA prefill
 
 `gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention
