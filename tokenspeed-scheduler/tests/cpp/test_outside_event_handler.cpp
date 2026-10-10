@@ -582,8 +582,15 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestores
     ASSERT_NE(resumed, nullptr);
     EXPECT_EQ(resumed->request_ids, (std::vector<std::string>{"running"}));
     EXPECT_EQ(resumed->NumExtends(), 0u) << "the D role runs no prefill of any kind";
-    EXPECT_EQ(resumed->decode_input_ids.front(), -1) << "a decoding victim resumes an ordinary decode";
+    EXPECT_EQ(resumed->decode_input_ids.front(), 44)
+        << "the first decode after a restore carries its input: the new slot holds no in-flight capture";
     EXPECT_EQ(resumed->block_tables.at("full").at(0).size(), 4u) << "3 restored pages and the decode slot";
+    SendForwardDone("running", {45});
+    const ExecutionPlan next = PlanOnce();
+    const ForwardBatch* ordinary = FindForwardBatch(next.Operations());
+    ASSERT_NE(ordinary, nullptr);
+    ASSERT_EQ(ordinary->request_ids, (std::vector<std::string>{"running"}));
+    EXPECT_EQ(ordinary->decode_input_ids.front(), -1) << "from the second step on the device has its own capture";
 }
 
 TEST_F(DecodeRetractionNoPrefixCacheTestSuite, RestoreUsesItsOwnImageWithPrefixCachingDisabled) {

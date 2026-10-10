@@ -2715,7 +2715,15 @@ TEST_F(RetractSuite, DecodingVictimResumesDecodingWithTheSameTokens) {
     EXPECT_EQ(decode_op->NumExtends(), 0u) << "a decoding victim resumes with a decode step";
     EXPECT_EQ(decode_op->prefill_lengths.at(0), 6) << "the prompt window is not rebased";
     EXPECT_EQ(decode_op->input_lengths.at(0), 1);
+    EXPECT_EQ(decode_op->decode_input_ids.at(0), 44)
+        << "the first decode after a restore carries its input: the new slot holds no in-flight capture";
     SendForwardDone("a", {45});
+    ExecutionPlan second = PlanOnce();
+    const ForwardBatch* second_op = FindForwardBatch(second);
+    ASSERT_NE(second_op, nullptr);
+    ASSERT_EQ(second_op->request_ids, std::vector<std::string>{"a"});
+    EXPECT_EQ(second_op->decode_input_ids.at(0), -1) << "from then on the fused decode reads its own capture";
+    SendForwardDone("a", {46});
     SendFinish("a");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "pool balances after the full retract cycle";
@@ -3915,6 +3923,9 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
     EXPECT_EQ(request.ReserveNumTokensInNextScheduleEvent(), 1);
     EXPECT_EQ(request.BlockTablesRef()[0].NumBlocks(), 3) << "the imaged pages plus the re-reserved decode slot";
     EXPECT_EQ(slots.AvailableSlots(), 4) << "the blob slot returns with the image";
+    EXPECT_TRUE(request.ResumedByRestore()) << "the first decode must carry its token: the new slot has no capture";
+    request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
+    EXPECT_FALSE(request.ResumedByRestore()) << "consumed by the first decode";
     // The restore op's pairs (held by the transfer manager in production) are
     // the last owners of the image blocks.
     EXPECT_EQ(snapshot_pool.NumEmptyLcmBlocks(), 12 - 2);
@@ -3982,6 +3993,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.NumComputedTokens(), 4);
     EXPECT_EQ(request.LastToken(), 42) << "the bootstrap token for its first decode is still there";
+    EXPECT_TRUE(request.ResumedByRestore()) << "and that decode carries it explicitly on every role";
 }
 
 // The recompute path keeps every overload a forward state has: the runtime

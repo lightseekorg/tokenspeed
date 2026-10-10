@@ -616,7 +616,13 @@ in-flight prefill and never a victim. The image is taken from this node's own
 pages and nothing crosses the PD wire: the receiver and admission record were
 already released at `RemotePrefillDone`, and the bootstrap token lives in the
 request's token container, so a `PrefillDone` victim restored to `PrefillDone`
-still gets its first decode exactly as before. A restore runs no forward, so a
+still gets its first decode exactly as before. On every role the **first
+decode after a restore carries its input token explicitly**
+(`decode_input_id = LastToken()`, the marker `fsm::RestoreMarker` that
+`RestoreDoneEvent` sets and the first `ScheduleDecodeEvent` consumes): the
+request sits in a new request-pool slot, and the capture its last forward left
+belongs to the slot it was retracted from, so the device cannot fill the input
+itself as it does for an ordinary overlapped decode. A restore runs no forward, so a
 decode engine whose attention layout cannot run an extend (head TP,
 `--attn-head-tp-size`; see `docs/serving/parallelism.md`) retracts and
 restores like any other.

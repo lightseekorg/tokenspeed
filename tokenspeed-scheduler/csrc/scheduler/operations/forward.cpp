@@ -568,19 +568,24 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
 DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event) {
     // A decode op carries its token when its executor cannot otherwise know
     // it: the D side's first decode (the token crossed the wire with
-    // RemotePrefillDoneEvent) and the P side's remote decode (the peer sends
-    // it on as the bootstrap token, and the P grammar holds the op until the
-    // result lands). Fused stays -1 on purpose: overlap plans the decode
-    // BEFORE the result lands, and the device fills the input from its
-    // in-flight capture.
+    // RemotePrefillDoneEvent), the P side's remote decode (the peer sends it
+    // on as the bootstrap token, and the P grammar holds the op until the
+    // result lands), and the first decode after a restore on any role (the
+    // request sits in a new slot; the capture its last forward left belongs
+    // to the slot it was retracted from). Otherwise fused stays -1 on
+    // purpose: overlap plans the decode BEFORE the result lands, and the
+    // device fills the input from its in-flight capture. A restored request
+    // is quiescent at its first decode, so LastToken() is the landed input.
     const bool needs_bootstrap_token = request->Is<fsm::PrefillDone>() && config_.role != Role::kFused;
-    const std::int32_t bootstrap_token = needs_bootstrap_token ? request->LastToken() : -1;
+    const bool needs_explicit_token = needs_bootstrap_token || request->ResumedByRestore();
+    const std::int32_t explicit_token = needs_explicit_token ? request->LastToken() : -1;
     std::vector<std::int32_t> spec_candidate_ids =
         config_.role == Role::kP && needs_bootstrap_token ? request->TakeSpecCandidates() : std::vector<std::int32_t>{};
+    // The event builds a fresh Decoding, so the restore marker is consumed here.
     DecodeOperation operation =
         applyDecodeEvent(*request, std::move(event), config_.decode_input_tokens, coordinator_, cache_group_ids_);
-    if (needs_bootstrap_token) {
-        operation.decode_input_id = bootstrap_token;
+    if (needs_explicit_token) {
+        operation.decode_input_id = explicit_token;
         operation.spec_candidate_ids = std::move(spec_candidate_ids);
     }
     return operation;

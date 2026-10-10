@@ -167,7 +167,20 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-struct PrefillDone {
+// Set by RestoreDoneEvent on the state a restore resumes into: the device
+// holds no in-flight capture for this request's next input (its forward
+// history belongs to the slot it left), so the first decode after a restore
+// carries the token explicitly, as a D-role bootstrap decode does. The
+// ScheduleDecodeEvent that consumes it builds a fresh state without it.
+struct RestoreMarker {
+    bool ResumedByRestore() const { return resumed_by_restore_; }
+    void MarkResumedByRestore() { resumed_by_restore_ = true; }
+
+private:
+    bool resumed_by_restore_{false};
+};
+
+struct PrefillDone : RestoreMarker {
     PrefillDone(ForwardResources resources, TokenContainer::Window window,
                 std::int32_t reserve_num_tokens_in_next_schedule_event)
         : resources{std::move(resources)},
@@ -185,7 +198,7 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-struct Decoding {
+struct Decoding : RestoreMarker {
     Decoding(ForwardResources resources, std::int32_t reserve_num_tokens_in_next_schedule_event)
         : resources{std::move(resources)},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}

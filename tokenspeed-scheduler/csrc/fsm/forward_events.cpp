@@ -269,18 +269,25 @@ Restoring ScheduleRestoreEvent::operator()(Retracted&& state) {
 }
 
 std::variant<Prefilling, PrefillDone, Decoding> RestoreDoneEvent::operator()(Restoring&& state) {
+    // A resumed prefill chunk carries its input ids like any chunk; a resumed
+    // decode is marked so its first step carries the token explicitly (the
+    // device has no in-flight capture for the new slot).
     return std::visit(Overloaded{
                           [&](const ResumePrefilling& shape) -> std::variant<Prefilling, PrefillDone, Decoding> {
                               return Prefilling{std::move(state.resources), shape.window,
                                                 shape.reserve_num_tokens_in_next_schedule_event};
                           },
                           [&](const ResumePrefillDone& shape) -> std::variant<Prefilling, PrefillDone, Decoding> {
-                              return PrefillDone{std::move(state.resources), shape.window,
-                                                 shape.reserve_num_tokens_in_next_schedule_event};
+                              PrefillDone resumed{std::move(state.resources), shape.window,
+                                                  shape.reserve_num_tokens_in_next_schedule_event};
+                              resumed.MarkResumedByRestore();
+                              return resumed;
                           },
                           [&](const ResumeDecoding& shape) -> std::variant<Prefilling, PrefillDone, Decoding> {
-                              return Decoding{std::move(state.resources),
-                                              shape.reserve_num_tokens_in_next_schedule_event};
+                              Decoding resumed{std::move(state.resources),
+                                               shape.reserve_num_tokens_in_next_schedule_event};
+                              resumed.MarkResumedByRestore();
+                              return resumed;
                           },
                       },
                       state.shape);
