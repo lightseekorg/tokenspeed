@@ -1318,6 +1318,7 @@ def _maybe_gluon_package_mxfp4_prefill(
     out: torch.Tensor | None = None,
     force_reduce: bool | None = None,
     activation_format: str = "e2m1",
+    compact_route_programs: bool = False,
 ) -> torch.Tensor | None:
     """Dispatch into the dedicated gfx950 block-ragged prefill package.
 
@@ -1488,7 +1489,7 @@ def _maybe_gluon_package_mxfp4_prefill(
             hidden_dim,
             out_dtype,
             sort_block_m,
-            compact_route_programs=False,
+            compact_route_programs=compact_route_programs,
             expert_start=expert_start,
             out=out,
         )
@@ -1852,6 +1853,8 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             swiglu_beta=swiglu_beta,
             out=out,
             force_reduce=True,
+            # Decode-sized batches sort in two launches instead of four.
+            compact_route_programs=n_tokens * top_k <= 1024,
         )
         if package_out is not None:
             return package_out
