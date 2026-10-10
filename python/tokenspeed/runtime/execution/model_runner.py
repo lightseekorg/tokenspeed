@@ -134,6 +134,9 @@ class ModelRunner:
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker
         self.checkpoint_load_group = checkpoint_load_group
+        # Tensor shapes of the checkpoint the last disk reload read; until one
+        # succeeds, update_weights_from_disk reads them from model_path.
+        self._disk_reload_shapes: dict[str, tuple[int, ...]] | None = None
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
         # Model Updater SDK client for /update_weights_from_mooncake; None
@@ -510,6 +513,175 @@ class ModelRunner:
             return False, str(e)
         finally:
             torch.cuda.empty_cache()
+
+    def update_weights_from_disk(self, obj) -> tuple[bool, str]:
+        """Reload this worker's parameters in place from a checkpoint directory.
+
+        The checkpoint is streamed the way the startup loader streams it
+        (``DefaultModelLoader.get_checkpoint_weights``) into the model's own
+        ``load_weights``, so fused and stacked parameters map, the checkpoint
+        directory is bound and the load group is chosen as on the initial
+        load. The reported count comes from the tensors the loader actually
+        yielded, not from the request: a checkpoint that yields nothing is a
+        failure, not a success that updated nothing.
+
+        Refusals write nothing: a model whose weights the startup loader
+        transformed after loading (``post_load_transformed_modules``) cannot
+        take checkpoint tensors at all, and a safetensors checkpoint with an
+        unreadable shard or a tensor shaped differently from the checkpoint
+        the model holds would fail partway through the load. A failure after
+        tensors have reached the model says the weights may be partial.
+        """
+        from tokenspeed.runtime.configs.load_config import LoadConfig
+        from tokenspeed.runtime.model_loader.loader import (
+            DefaultModelLoader,
+            get_model_loader,
+            post_load_transformed_modules,
+        )
+
+        model_path = str(obj.model_path)
+        transformed = post_load_transformed_modules(self.model)
+        if transformed:
+            more = len(transformed) - 3
+            return False, (
+                "update_weights_from_disk cannot reload this model in place: the "
+                "startup loader transformed its weights after loading ("
+                + ", ".join(transformed[:3])
+                + (f", and {more} more" if more > 0 else "")
+                + "), and a checkpoint holds them untransformed. Nothing was "
+                f"written; restart the engine with {model_path!r} instead"
+            )
+        load_format = obj.load_format or self.server_args.load_format
+        consumed = 0
+        try:
+            loader = get_model_loader(
+                LoadConfig(
+                    load_format=load_format,
+                    download_dir=self.server_args.download_dir,
+                    ext_yaml=self.server_args.ext_yaml,
+                    weight_loader_prefetch_checkpoints=(
+                        self.server_args.weight_loader_prefetch_checkpoints
+                    ),
+                    weight_loader_prefetch_num_threads=(
+                        self.server_args.weight_loader_prefetch_num_threads
+                    ),
+                    checkpoint_load_group=self.checkpoint_load_group,
+                )
+            )
+            if not isinstance(loader, DefaultModelLoader):
+                return False, (
+                    f"load_format {load_format!r} selects "
+                    f"{type(loader).__name__}, which does not read checkpoint "
+                    "files; an in-place reload needs a file-backed format"
+                )
+
+            shapes, problem = self._check_disk_reload(loader, model_path)
+            if problem is not None:
+                return False, f"{problem}; nothing was written"
+            weights = loader.get_checkpoint_weights(model_path, None, self.model)
+
+            def _counted():
+                nonlocal consumed
+                for name, tensor in weights:
+                    consumed += 1
+                    yield name, tensor
+
+            # Same session as a distributed load. The loader's iterator
+            # already refuses KV-cache scales other than one.
+            with weight_update_session([self.model]):
+                self.model.load_weights(_counted())
+            if consumed == 0:
+                return False, (
+                    f"no checkpoint tensors found at {model_path!r}; "
+                    "nothing was updated"
+                )
+            if self.device != "cpu":
+                torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_disk failed")
+            if consumed == 0:
+                return False, str(e)
+            return False, (
+                f"{e} (after {consumed} checkpoint tensors had reached the "
+                "model, so its weights may now mix the old and new "
+                "checkpoints: reload a complete checkpoint or restart the "
+                "engine)"
+            )
+
+        self.model_config.model_path = model_path
+        if shapes is not None:
+            self._disk_reload_shapes = shapes
+        logger.info(f"weights reloaded from {model_path!s} ({consumed:d} tensors)")
+        return True, (
+            f"Succeeded to update model weights from {model_path} "
+            f"({consumed} checkpoint tensors read)"
+        )
+
+    def _check_disk_reload(
+        self, loader, model_path: str
+    ) -> tuple[dict[str, tuple[int, ...]] | None, str | None]:
+        """Check a safetensors checkpoint's headers before any tensor is loaded.
+
+        Both checks read headers only. A shard that will not parse or is
+        shorter than its header declares, or a tensor whose shape differs from
+        the same name in the checkpoint this model holds, would fail the load
+        partway, after the tensors before it were written. Names the two
+        checkpoints do not share are left to ``load_weights``, which alone
+        knows how it maps them.
+
+        Returns:
+            ``(shapes, problem)``: the checkpoint's tensor shapes (None when
+            it is not safetensors) and why it must be refused (None if not).
+        """
+        from tokenspeed.runtime.model_loader.weight_utils import (
+            safetensors_tensor_shapes,
+        )
+
+        fall_back_to_pt = getattr(self.model, "fall_back_to_pt_during_load", False)
+        _, files, use_safetensors = loader._prepare_weights(
+            model_path, None, fall_back_to_pt
+        )
+        if not use_safetensors:
+            return None, None
+        try:
+            shapes = safetensors_tensor_shapes(files)
+        except ValueError as e:
+            return None, str(e)
+
+        held = self._disk_reload_shapes
+        if held is None:
+            try:
+                _, held_files, held_safetensors = loader._prepare_weights(
+                    self.model_config.model_path,
+                    getattr(self.model_config, "revision", None),
+                    fall_back_to_pt,
+                )
+                held = safetensors_tensor_shapes(held_files) if held_safetensors else {}
+            except Exception as e:  # noqa: BLE001 - only the shape check is lost
+                logger.warning(
+                    "update_weights_from_disk: cannot read the shapes of "
+                    f"{self.model_config.model_path!s} ({e!s}); "
+                    "checking the new checkpoint's shards only"
+                )
+                held = {}
+        # The default loader fills a one-element parameter from any
+        # one-element tensor, so those match whatever their shapes.
+        mismatched = [
+            (name, shape, held[name])
+            for name, shape in shapes.items()
+            if name in held
+            and shape != held[name]
+            and not (torch.Size(shape).numel() == 1 == torch.Size(held[name]).numel())
+        ]
+        if mismatched:
+            name, shape, expected = mismatched[0]
+            more = len(mismatched) - 1
+            return shapes, (
+                f"{model_path}: tensor {name!r} has shape {list(shape)}, but "
+                f"{list(expected)} in the checkpoint the model holds"
+                + (f" ({more} more mismatched)" if more else "")
+            )
+        return shapes, None
 
     def destroy_weights_update_group(self, obj) -> tuple[bool, str]:
         """Tear down the trainer weight-update NCCL group joined in ``init``.

@@ -426,6 +426,22 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        yield from self.get_checkpoint_weights(
+            model_config.model_path, model_config.revision, model
+        )
+
+    def get_checkpoint_weights(
+        self,
+        model_path: str,
+        revision: str | None,
+        model: nn.Module,
+    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        """Stream the checkpoint at ``model_path`` the way ``load_model`` does.
+
+        The in-place reload (``ModelRunner.update_weights_from_disk``) reads
+        through here too, so a reloaded model binds the new checkpoint
+        directory and picks its load group exactly as at startup.
+        """
         # Draft (NextN/MTP) models embedded in the target checkpoint expose
         # ``checkpoint_weight_name_filter`` so only the shards holding their
         # weights are read instead of the whole checkpoint.
@@ -433,8 +449,8 @@ class DefaultModelLoader(BaseModelLoader):
         bind_checkpoint_dir = getattr(model, "bind_checkpoint_dir", None)
         if callable(bind_checkpoint_dir):
             hf_folder, _, _ = self._prepare_weights(
-                model_config.model_path,
-                model_config.revision,
+                model_path,
+                revision,
                 getattr(model, "fall_back_to_pt_during_load", False),
             )
             bind_checkpoint_dir(hf_folder)
@@ -445,8 +461,8 @@ class DefaultModelLoader(BaseModelLoader):
             checkpoint_load_group = self.load_config.checkpoint_load_group
 
         primary_weights = DefaultModelLoader.Source(
-            model_config.model_path,
-            model_config.revision,
+            model_path,
+            revision,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
@@ -489,6 +505,7 @@ class DefaultModelLoader(BaseModelLoader):
                 model.load_weights(self._get_all_weights(model_config, model))
 
             with startup_phase("weights.postprocess"):
+                # post_load_transformed_modules must recognise every hook run here.
                 for _, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
@@ -513,6 +530,68 @@ class DefaultModelLoader(BaseModelLoader):
                     post_quant_warmup()
 
         return model.eval()
+
+
+def no_op_post_load_hooks() -> frozenset[Callable]:
+    """The ``process_weights_after_loading`` hooks that leave weights as loaded."""
+    from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
+    from tokenspeed.runtime.layers.linear import (
+        MergedColumnParallelLinear,
+        QKVParallelLinear,
+        RowParallelLinear,
+    )
+
+    return frozenset(
+        {
+            QuantizeMethodBase.process_weights_after_loading,
+            UnquantizedLinearMethod.process_weights_after_loading,
+            MergedColumnParallelLinear.process_weights_after_loading,
+            QKVParallelLinear.process_weights_after_loading,
+            RowParallelLinear.process_weights_after_loading,
+        }
+    )
+
+
+def post_load_transformed_modules(model: nn.Module) -> list[str]:
+    """Name the modules whose weights the startup post-load step rewrote.
+
+    After ``load_weights``, ``DefaultModelLoader.load_model`` runs each module's
+    quant-method hook and the module's own ``process_weights_after_loading``
+    once. Those hooks repack, quantize, shuffle or derive copies of what was
+    loaded and cannot run a second time, so checkpoint tensors streamed into
+    such a module later land in the processed layout. A hook counts as a
+    transform unless it is in ``no_op_post_load_hooks``; an MoE layer's hook
+    transforms exactly when its planned kernel has a weight preprocessor.
+
+    Returns:
+        ``"<module name> (<hook owner>)"`` for each such module, in
+        ``named_modules`` order; empty when every hook is a no-op.
+    """
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+
+    no_op_hooks = no_op_post_load_hooks()
+    transformed: list[str] = []
+    for name, module in model.named_modules():
+        owners = [type(module)]
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            owners.insert(0, type(quant_method))
+        for owner in owners:
+            hook = getattr(owner, "process_weights_after_loading", None)
+            if hook is None or hook in no_op_hooks:
+                continue
+            if hook is MoELayer.process_weights_after_loading:
+                preprocessor = (getattr(module, "plan", None) or {}).get(
+                    "weight_preprocessor"
+                )
+                if preprocessor is None:
+                    continue
+                owner_name = getattr(preprocessor, "__name__", repr(preprocessor))
+            else:
+                owner_name = owner.__name__
+            transformed.append(f"{name or type(module).__name__} ({owner_name})")
+            break
+    return transformed
 
 
 class ExtensibleModelLoader:

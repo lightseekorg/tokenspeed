@@ -27,7 +27,6 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -45,10 +44,7 @@ from tokenspeed.runtime.engine.output_processor import (  # noqa: E402
     OutputProcessor,
     ReqState,
 )
-from tokenspeed.runtime.entrypoints import (  # noqa: E402
-    control_server,
-    sglang_compat_http,
-)
+from tokenspeed.runtime.entrypoints import control_server  # noqa: E402
 from tokenspeed.runtime.entrypoints.sglang_compat_http import (  # noqa: E402
     build_sglang_compat_app,
 )
@@ -123,18 +119,10 @@ class TestWeightVersionHTTP(unittest.TestCase):
         self.assertEqual(llm.server_args.weight_version, "v8")
 
         llm.succeed = False
-        # This build refuses the disk route with 501 before the engine sees it
-        # (the scheduler has no branch for it), so widen the supported set to
-        # keep exercising "stamp only after success" on a non-distributed route.
-        with mock.patch.object(
-            sglang_compat_http,
-            "SUPPORTED_WEIGHT_UPDATE_SOURCES",
-            frozenset({"disk", "tensor", "distributed"}),
-        ):
-            response = client.post(
-                "/update_weights_from_disk",
-                json={"model_path": "/tmp/model", "weight_version": "failed"},
-            )
+        response = client.post(
+            "/update_weights_from_disk",
+            json={"model_path": "/tmp/model", "weight_version": "failed"},
+        )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(llm.server_args.weight_version, "v8")
 
