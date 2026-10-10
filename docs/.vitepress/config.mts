@@ -53,7 +53,13 @@ export default defineConfig({
       },
       {
         text: "Recipes",
-        items: [{ text: "Model Recipes", link: "/recipes/models" }]
+        items: [
+          { text: "Model Recipes", link: "/recipes/models" },
+          {
+            text: "Offline Batch Inference",
+            link: "/recipes/offline-batch-inference"
+          }
+        ]
       },
       {
         text: "Serving",
