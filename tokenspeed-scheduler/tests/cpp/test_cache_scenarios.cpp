@@ -3029,7 +3029,8 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.snapshot_allocator.total_pages = SnapshotPoolBlocks() + 1;
-        cfg.max_retracted_requests = cfg.max_batch_size;
+        // The null page alone takes no blob slots (Validate ties the two).
+        cfg.max_retracted_requests = SnapshotPoolBlocks() == 0 ? 0 : cfg.max_batch_size;
         return cfg;
     }
 
@@ -3114,6 +3115,31 @@ TEST_F(NoImageFitsSuite, WhenNoImageFitsTheNewestResidentIsAbortedAndTheGrantPro
     SendFinish("a");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "the pool balances after the abort";
+}
+
+// The null page alone: the engine never images, and says so.
+class NoPoolSuite : public ImageDoesNotFitSuite {
+protected:
+    std::int32_t SnapshotPoolBlocks() const override { return 0; }
+};
+
+TEST_F(NoPoolSuite, WithoutAPoolACapacityBlockAbortsAndNamesThePoolKnobNotTheSlots) {
+    ASSERT_FALSE(Config().HasSnapshotPool());
+    ASSERT_EQ(Config().max_retracted_requests, 0);
+    DriveToTheBlockedRound();
+    const ExecutionPlan round = PlanOnce();
+    ASSERT_EQ(round.aborts.size(), 1u);
+    EXPECT_EQ(round.aborts.front().request_id, "b");
+    EXPECT_EQ(round.aborts.front().reason, AbortReason::kImageDoesNotFit);
+    const std::string& detail = round.aborts.front().detail;
+    EXPECT_NE(detail.find("--retraction-snapshot-ratio"), std::string::npos) << detail;
+    EXPECT_NE(detail.find("--retraction-snapshot-host-gb"), std::string::npos) << detail;
+    EXPECT_EQ(detail.find("--retraction-snapshot-max-requests"), std::string::npos)
+        << "slots are not the shortfall when no pool exists: " << detail;
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    const ForwardBatch* granted = FindForwardBatch(round);
+    ASSERT_NE(granted, nullptr);
+    EXPECT_EQ(granted->request_ids, std::vector<std::string>{"a"});
 }
 
 TEST_F(NoImageFitsSuite, TheDebugKnobNeverAborts) {
