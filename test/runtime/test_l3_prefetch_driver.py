@@ -155,7 +155,8 @@ def test_an_l3_hit_is_prefetched_before_admission_and_admitted_as_a_host_hit(
         (1, hashes[1]),
     ]
     assert scheduler.waiting_size() == 1 and scheduler.active_lcm_blocks() == 0
-    assert cache_hooks._num_inflight == 1
+    # Nothing is acknowledged before the lane lands and the replica converges.
+    assert cache_hooks.poll_ready_events() == []
 
     # The lane lands ``landed`` pages; the hooks converge and complete the op,
     # and its one ACK reaches the scheduler through the cache poll.
@@ -168,7 +169,8 @@ def test_an_l3_hit_is_prefetched_before_admission_and_admitted_as_a_host_hit(
         ("PrefetchDoneEvent", op.op_id, landed)
     ]
     advance_scheduler(scheduler, events)
-    assert cache_hooks._num_inflight == 0
+    # The one ticket was the one ACK: nothing further comes out of the poll.
+    assert cache_hooks.poll_ready_events() == []
 
     # Admitted as a Host hit of exactly the landed prefix: the first chunk
     # starts there and the L2 load-back brings those pages, nothing more.

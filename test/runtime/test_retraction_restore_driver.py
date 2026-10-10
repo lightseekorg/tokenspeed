@@ -134,14 +134,24 @@ class _Driver:
         self.hooks = _hooks(self.device)
         self.last_token = PROMPT[-1]
         self.next_token = 1000
+        # Tickets the plans put in flight and the ACK events the hooks
+        # delivered: equal once every op has been acknowledged.
+        self.tickets = 0
+        self.acked = 0
 
     def round(self) -> SimpleNamespace:
         # Head of the round: the completed cache ops reach the scheduler
         # before it plans, as in the event loop.
-        advance_scheduler(self.scheduler, self.hooks.poll_ready_events())
+        events = self.hooks.poll_ready_events()
+        self.acked += len(events)
+        advance_scheduler(self.scheduler, events)
         plan = self.scheduler.next_execution_plan()
         self.hooks.count_plan_ops(plan)
         ops = cache_ops_from_plan(plan)
+        self.tickets += sum(
+            1 if isinstance(op, (SnapshotOp, RestoreOp)) else len(op.op_ids)
+            for op in ops
+        )
         forwards = [op for op in plan.forward if op.request_ids]
         return SimpleNamespace(plan=plan, ops=ops, forwards=forwards)
 
@@ -269,7 +279,7 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
     driver.complete(rnd.ops)
     driver.land(decode)
     assert scheduler.request_token_size("a") == tokens_before + 1
-    assert driver.hooks._num_inflight == 0
+    assert driver.acked == driver.tickets
 
 
 def test_an_aborted_victims_store_is_still_acknowledged_and_frees_its_image() -> None:
@@ -290,7 +300,7 @@ def test_an_aborted_victims_store_is_still_acknowledged_and_frees_its_image() ->
     rnd = driver.round()
     assert rnd.ops == [] and rnd.forwards == []
     assert scheduler.snapshot_pool_free_blocks() == pool_free
-    assert driver.hooks._num_inflight == 0
+    assert driver.acked == driver.tickets
 
 
 def test_the_knob_is_off_by_default() -> None:
