@@ -79,7 +79,7 @@ def _mla(cls, kv_cache_dtype=torch.bfloat16, kvp_size=1):
     leaf = object.__new__(cls)
     leaf.data_type = kv_cache_dtype
     leaf.q_data_type = torch.bfloat16
-    leaf.dcp_group = tuple(range(kvp_size))
+    leaf.kvp_group = tuple(range(kvp_size))
     return leaf
 
 

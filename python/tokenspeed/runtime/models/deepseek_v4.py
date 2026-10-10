@@ -2520,7 +2520,7 @@ class DeepseekV4Indexer(nn.Module):
                 indexer_block_size,
                 positions,
                 metadata,
-                tuple(ctx.attn_backend.dcp_group),
+                tuple(ctx.attn_backend.kvp_group),
             )
 
         empty_cpu = torch.empty(0, dtype=torch.int32, device="cpu")

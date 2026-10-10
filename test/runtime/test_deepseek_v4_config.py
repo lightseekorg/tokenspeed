@@ -6975,9 +6975,9 @@ def _unbound_deepseek_v4_backend():
     backend = DeepseekV4AttentionBackend.__new__(DeepseekV4AttentionBackend)
     backend._init_pool_binding()
     backend._init_cache_group_latches()
-    backend.dcp_size = 1
-    backend.dcp_rank = 0
-    backend.dcp_group = (0,)
+    backend.kvp_size = 1
+    backend.kvp_rank = 0
+    backend.kvp_group = (0,)
     return backend
 
 
@@ -6986,7 +6986,7 @@ class DeepseekV4RebindTest(unittest.TestCase):
         for degree in (1, 4):
             with self.subTest(degree=degree):
                 backend = _unbound_deepseek_v4_backend()
-                backend.dcp_size = degree
+                backend.kvp_size = degree
                 pool = _cache_pool_with_page_counts(
                     {"v4.c4a.indexer_kv": 16, "v4.c4a.indexer_compressor_state": 4},
                     4,
@@ -7008,8 +7008,8 @@ class DeepseekV4RebindTest(unittest.TestCase):
         for degree in (1, 4):
             with self.subTest(degree=degree):
                 backend = _unbound_deepseek_v4_backend()
-                backend.dcp_size = degree
-                backend.dcp_group = tuple(range(degree))
+                backend.kvp_size = degree
+                backend.kvp_group = tuple(range(degree))
                 for pages in (4, 16):
                     pool = _cache_pool_with_page_counts(
                         {"v4.swa_kv": pages, "v4.c128a.compressed_kv": pages}, 4, 1

@@ -524,7 +524,7 @@ class PrefillExchangePlanTest(unittest.TestCase):
                     num_prefill_reqs=2,
                     num_prefill_tokens=68,
                 )
-                chunks = DeepseekV4AttentionBackend._build_dcp_prefill_chunks(
+                chunks = DeepseekV4AttentionBackend._build_kvp_prefill_chunks(
                     metadata, 4, table, chunk_size=8, window_size=128
                 )
                 self.assertEqual(list(chunks), [(0, 2)])

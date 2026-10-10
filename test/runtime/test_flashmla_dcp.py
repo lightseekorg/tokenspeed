@@ -131,7 +131,7 @@ def test_flashmla_absorbed_extend_refuses_sharded_cache():
         "tokenspeed.runtime.layers.attention.backends.paged.flashmla"
     )
     leaf = flashmla.FlashMLABackend.__new__(flashmla.FlashMLABackend)
-    leaf.dcp_group = (0, 1)
+    leaf.kvp_group = (0, 1)
     with pytest.raises(RuntimeError, match="absorbed extend"):
         leaf._forward_absorbed_extend(torch.empty(0), layer=None, token_to_kv_pool=None)
 
@@ -376,10 +376,10 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     )
     backend = object.__new__(flashmla.FlashMLABackend)
     backend.cache_pool = pool
-    backend.dcp_group = (0, 1)
-    backend.dcp_rank = 0
-    backend.dcp_block_granularity = 4
-    backend.dcp_virtual_block_count = arena.runtime_contract.virtual_block_counts[
+    backend.kvp_group = (0, 1)
+    backend.kvp_rank = 0
+    backend.kvp_block_granularity = 4
+    backend.kvp_virtual_block_count = arena.runtime_contract.virtual_block_counts[
         "full_attention"
     ]
     backend.kv_lora_rank = 512
@@ -437,8 +437,8 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     torch.testing.assert_close(
         torch.cat((local_nope, local_rope), dim=-1), values[[0, 2]].float()
     )
-    assert "dcp_group" not in vars(pool)
-    assert "dcp_rank" not in vars(pool)
+    assert "kvp_group" not in vars(pool)
+    assert "kvp_rank" not in vars(pool)
 
     def gather_owner_rows(local, group):
         assert group == (0, 1)
@@ -523,7 +523,7 @@ def test_unsharded_backends_preserve_physical_slots(kind):
     }[kind]
     backend = object.__new__(cls)
     if kind in ("flashmla", "dsa"):
-        backend.dcp_group = (0,)
+        backend.kvp_group = (0,)
     loc = torch.tensor([0, 3, 8])
     slots, mask = resolve_cache_slots(
         loc, backend.cache_placement(SimpleNamespace(layer_id=0))
@@ -720,10 +720,10 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     backend.qk_rope_head_dim = 0
     backend.index_topk = 512
     backend.max_context_len = 512
-    backend.dcp_group = (0, 1, 2, 3)
-    backend.dcp_rank = rank
-    backend.dcp_block_granularity = 64
-    backend.dcp_virtual_block_count = 5
+    backend.kvp_group = (0, 1, 2, 3)
+    backend.kvp_rank = rank
+    backend.kvp_block_granularity = 64
+    backend.kvp_virtual_block_count = 5
     backend.qcp_group = (0,)
     # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
     # combine form.
@@ -750,7 +750,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     )
 
     def gather(q, group):
-        assert group == backend.dcp_group
+        assert group == backend.kvp_group
         return q.repeat(1, 4, 1)
 
     def decode(**kwargs):
@@ -762,7 +762,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
         return torch.full((1, 8, 128), 7.0), torch.zeros(1, 8)
 
     def combine(out, lse, *, group, rank, sink, keep_all_heads):
-        assert sink is None and group == backend.dcp_group
+        assert sink is None and group == backend.kvp_group
         assert keep_all_heads is False
         assert lse.shape == out.shape[:-1]
         return out[:, rank * 2 : (rank + 1) * 2]

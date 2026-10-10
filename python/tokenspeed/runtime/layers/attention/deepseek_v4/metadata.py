@@ -140,7 +140,7 @@ class DeepseekV4SparseIndexerMetadata:
 
 
 @dataclass
-class DeepseekV4DcpPrefillChunk:
+class DeepseekV4KvpPrefillChunk:
     local_destinations: torch.Tensor
     counts: list[int]
     destinations: torch.Tensor
@@ -173,7 +173,7 @@ class DeepseekV4ForwardMetadata:
     num_prefill_reqs: int = 0
     num_prefill_tokens: int = 0
     # Prepared once for a live forward, shared by its request slices and layers.
-    dcp_prefill: dict[int, dict[tuple[int, int], DeepseekV4DcpPrefillChunk]] = field(
+    kvp_prefill: dict[int, dict[tuple[int, int], DeepseekV4KvpPrefillChunk]] = field(
         default_factory=dict
     )
     prefill_req_offset: int = 0

@@ -317,10 +317,10 @@ def _dsa_leaf(rank: int, index_k_format: str, *, max_model_len: int):
     backend.kv_cache_dim = DIM
     backend.index_head_dim = INDEX_HEAD_DIM
     backend.index_k_format = index_k_format
-    backend.dcp_group = tuple(range(WORLD))
-    backend.dcp_rank = rank
-    backend.dcp_block_granularity = GRANULARITY
-    backend.dcp_virtual_block_count = VIRTUAL_BLOCKS
+    backend.kvp_group = tuple(range(WORLD))
+    backend.kvp_rank = rank
+    backend.kvp_block_granularity = GRANULARITY
+    backend.kvp_virtual_block_count = VIRTUAL_BLOCKS
     backend._history_workspace = None
     backend.preallocate_history_gather_workspace(max_model_len)
     return backend
