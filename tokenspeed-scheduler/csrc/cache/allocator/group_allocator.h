@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -130,6 +131,39 @@ public:
             }
         }
         table.available_tokens_ = plan.available_tokens_after;
+        return true;
+    }
+
+    // The bucket a block's bytes belong to under page-cyclic sharding: the
+    // residue of its slot inside the parent, which equals (virtual id - 1) %
+    // shard_count because packing is a multiple of the shard count.
+    std::int32_t BucketOf(CacheBlockLocation location) const noexcept { return location.slot_index % shard_count_; }
+
+    // Rebuilds a table from a recorded shape: identical block count, null
+    // holes, tail capacity and reclaimed prefix, with one fresh block per
+    // recorded slot in that slot's bucket (read off its snapshot block, which
+    // shares the Device block's residue). Returns false without mutation when
+    // the pool cannot place the bucket demand. One bucket degenerates to
+    // ordinary placement, so the shard count stays a parameter of one path.
+    bool AcquireShape(BlockPool& pool, BlockTable& table, const SnapshotTable& shape) {
+        _assert(table.NumBlocks() == 0, "AcquireShape requires a fresh (empty) table");
+        std::vector<std::int32_t> buckets;
+        buckets.reserve(shape.slots.size());
+        for (const SnapshotSlot& slot : shape.slots) {
+            _assert(slot.host_block && 0 <= slot.slot_index && slot.slot_index < shape.num_blocks,
+                    "snapshot slot must hold a block inside the recorded table");
+            buckets.push_back(BucketOf(slot.host_block->Location()));
+        }
+        std::vector<CacheBlockRef> blocks = pool.AcquireBlocksInBuckets(group_id_, buckets);
+        if (blocks.size() != buckets.size()) {
+            return false;
+        }
+        table.blocks_.resize(static_cast<std::size_t>(shape.num_blocks));
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            table.blocks_[static_cast<std::size_t>(shape.slots[i].slot_index)] = std::move(blocks[i]);
+        }
+        table.available_tokens_ = shape.available_tokens;
+        table.reclaimed_prefix_blocks_ = shape.reclaimed_prefix_blocks;
         return true;
     }
 

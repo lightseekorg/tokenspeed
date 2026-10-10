@@ -195,4 +195,32 @@ struct BlockTransfer {
     bool prefetch_from_storage{false};
 };
 
+// One imaged block of a retracted request's table: the logical slot it sat
+// in and the snapshot-pool block that holds its bytes. The snapshot block is
+// in the same bucket (slot % shard_count) as the Device block it images, so
+// under page-cyclic sharding the rank that owns the Device page owns the
+// snapshot page too; a restore reads the bucket back off this reference.
+struct SnapshotSlot {
+    std::int32_t slot_index{0};
+    CacheBlockRef host_block;
+};
+
+// One cache group's table as it stood at retraction, truncated to the slots
+// that hold computed data: the restore rebuilds exactly this shape (block
+// count, null holes, unconsumed tail capacity, reclaimed prefix) with fresh
+// Device blocks and re-reserves whatever lay beyond.
+struct SnapshotTable {
+    std::int32_t num_blocks{0};
+    std::int32_t reclaimed_prefix_blocks{0};
+    std::int32_t available_tokens{0};
+    std::vector<SnapshotSlot> slots;
+};
+
+// A retracted request's KV, imaged into the request-private snapshot pool:
+// one SnapshotTable per cache group. The references are the only owners of
+// the snapshot blocks; dropping the image returns them to the pool.
+struct RetractionSnapshot {
+    std::vector<SnapshotTable> tables;
+};
+
 }  // namespace tokenspeed
