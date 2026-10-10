@@ -240,6 +240,8 @@ protected:
 };
 
 TEST_F(MambaStateCheckpointSuite, BatchesFinalExtentInOneForward) {
+    config_.enable_cache_trace = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
     RequestSpec first = MakeRequestSpec("a", /*num_pages=*/3);
     RequestSpec second = MakeRequestSpec("b", /*num_pages=*/3, /*start=*/100);
     first.tokens.resize(10);
@@ -260,6 +262,28 @@ TEST_F(MambaStateCheckpointSuite, BatchesFinalExtentInOneForward) {
         EXPECT_GT(row[2], 0);
         EXPECT_GT(row[3], 0);
     }
+    SendForwardDone("a", {11});
+    SendForwardDone("b", {12});
+    SendFinish("a");
+    SendFinish("b");
+    PlanOnce();
+    std::unordered_set<std::int32_t> stored_groups;
+    for (const auto& event : scheduler_->DrainCacheTrace()) {
+        if (event.kind == "stored" && event.tier == "L1") {
+            stored_groups.insert(event.group_id);
+        }
+    }
+    EXPECT_TRUE(stored_groups.contains(0));
+    EXPECT_TRUE(stored_groups.contains(1));
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    std::unordered_set<std::int32_t> removed_groups;
+    for (const auto& event : scheduler_->DrainCacheTrace()) {
+        if (event.kind == "removed" && event.tier == "L1") {
+            removed_groups.insert(event.group_id);
+            EXPECT_TRUE(event.request_id.empty());
+        }
+    }
+    EXPECT_EQ(removed_groups, stored_groups);
 }
 
 TEST(MambaStateCheckpointTest, KeepsAlignedDecodeEndpointWorkingOnlyUnderWideVerify) {
@@ -5489,6 +5513,8 @@ protected:
 };
 
 TEST_F(L3PrefetchRetractSuite, VanishedKeysRetractThenReadmitAsColdMiss) {
+    config_.enable_cache_trace = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
     RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/4);
     std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(spec.tokens);
     ASSERT_FALSE(hashes.empty());
@@ -5510,6 +5536,12 @@ TEST_F(L3PrefetchRetractSuite, VanishedKeysRetractThenReadmitAsColdMiss) {
     scheduler_->UnregisterStorageKeys(keys);
     SendRetractEvent("r1");
     SendLoadBackDone(load.op_ids.at(0), /*success=*/false);
+    const auto trace = scheduler_->DrainCacheTrace();
+    EXPECT_TRUE(std::ranges::any_of(trace, [](const auto& event) {
+        return event.kind == "load_back" && event.request_id == "r1" && event.reason == "failed";
+    }));
+    SendLoadBackDone(load.op_ids.at(0), /*success=*/false);
+    EXPECT_TRUE(scheduler_->DrainCacheTrace().empty());
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
 

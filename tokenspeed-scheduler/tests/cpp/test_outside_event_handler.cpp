@@ -57,6 +57,7 @@ protected:
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 8;
         cfg.host_allocator.total_pages = 8;
+        cfg.enable_cache_trace = true;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         return cfg;
     }
@@ -96,6 +97,18 @@ TEST_F(FinishOnlyWriteBackTestSuite, PrefillStreamsMlaPagesDecodeDefersUntilFini
         << "finish writes only the new decode MLA page";
     SendWriteBackDone(finish_write_back.op_ids.front());
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
+}
+
+TEST_F(FinishOnlyWriteBackTestSuite, FinishPublishesProducerCheckpointWithoutAnotherAdmission) {
+    Submit(MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1));
+    PlanOnce();
+    SendForwardDone("r0", {42});
+    SendFinish("r0");
+    const auto trace = scheduler_->DrainCacheTrace();
+    EXPECT_TRUE(std::ranges::any_of(trace, [](const auto& event) {
+        return event.kind == "checkpoint" && event.request_id == "r0" && event.hash_count == 2 &&
+               event.reason == "finish_computed_not_joint_readability";
+    }));
 }
 
 TEST_F(FinishOnlyWriteBackTestSuite, FinishWithoutEligiblePageEmitsNoStore) {
@@ -330,6 +343,7 @@ protected:
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = false;
+        cfg.enable_cache_trace = true;
         cfg.device_allocator.total_pages = 5;  // null parent + one four-page recovery working set
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         return cfg;
@@ -496,6 +510,11 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRun) {
     EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(retract).empty())
         << "recovering immediately would consume the capacity retraction just released";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "the Retracted request remains visible as scheduler pressure";
+    const auto trace = scheduler_->DrainCacheTrace();
+    EXPECT_TRUE(std::ranges::any_of(trace, [](const auto& event) {
+        return event.kind == "checkpoint" && event.request_id == "running" &&
+               event.reason == "retraction_computed_not_joint_readability";
+    }));
 
     SendWriteBackDone(write_back.op_ids.front());
     SendWriteBackDone(write_back.op_ids.front());  // Duplicate ACK is ignored.

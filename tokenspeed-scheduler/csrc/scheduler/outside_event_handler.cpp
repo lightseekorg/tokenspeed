@@ -109,21 +109,27 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                                       std::make_move_iterator(new_hashes.end()));
 
         registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
-        coordinator_.CacheCompletedBlocks(
-            request.BlockTablesRef(),
-            RequestProgress{
-                .completed_pages =
-                    CompletedPages{
-                        .prefix_hashes = progress.prefix_hashes,
-                        .first_new_prefix_page = first_new_prefix_page,
-                        .boundary_kind = CacheBoundaryKind::kEndpoint,
-                        .stream_completed_to_host = false,
-                        .materialized_state_boundaries = progress.materialized_state_boundaries,
-                    },
-                .num_computed_tokens = request.TokenSize() - 1,
-            },
-            progress.access_epoch);
+        const RequestProgress completed{
+            .completed_pages =
+                CompletedPages{
+                    .prefix_hashes = progress.prefix_hashes,
+                    .first_new_prefix_page = first_new_prefix_page,
+                    .boundary_kind = CacheBoundaryKind::kEndpoint,
+                    .stream_completed_to_host = false,
+                    .materialized_state_boundaries = progress.materialized_state_boundaries,
+                },
+            .num_computed_tokens = request.TokenSize() - 1,
+        };
+        beginCacheTracePublication(request, completed);
+        coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), completed, progress.access_epoch);
+        endCacheTracePublication();
+        if (config_.enable_cache_trace) {
+            recordCacheTrace(
+                {.kind = "checkpoint", .request_id = request.Id(), .reason = "finish_computed_not_joint_readability"},
+                progress.prefix_hashes);
+        }
     }
+    recordCacheTraceFrontier(request, progress.prefix_hashes);
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
@@ -147,10 +153,31 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (Request* request = findRequest(event.request_id)) {
         request->NoteResultLanded();
         request->Apply(fsm::ExtendResultEvent{event.tokens});
+        recordCacheTraceComputed(*request);
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);
         }
     }
+}
+
+void Scheduler::recordCacheTraceComputed(const Request& request) {
+    if (!config_.enable_cache_trace || !config_.enable_cache_trace_frontiers) {
+        return;
+    }
+    // Hash newly computed pages only. Accepted continuations can be a future
+    // request's prefix before cache publication, including between two steps.
+    const auto pages = request.FullPrefixPages(true);
+    const auto count = std::min(
+        pages.size(), static_cast<std::size_t>(request.NumComputedTokens() / coordinator_.PrefixGranularity()));
+    auto& hashes = cache_trace_computed_prefixes_[request.Id()];
+    if (count > hashes.size()) {
+        auto added =
+            AdvancePrefixHashes(pages, static_cast<std::int32_t>(hashes.size()),
+                                hashes.empty() ? std::string{} : hashes.back(), static_cast<std::int32_t>(count));
+        hashes.insert(hashes.end(), std::make_move_iterator(added.begin()), std::make_move_iterator(added.end()));
+    }
+    recordCacheTrace({.kind = "computed", .request_id = request.Id(), .computed_tokens = request.NumComputedTokens()},
+                     std::span<const std::string>{hashes}.first(count));
 }
 
 void Scheduler::handleEvent(const forward::Abort& event) {
@@ -175,6 +202,14 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
+    if (config_.enable_cache_trace) {
+        const auto producer = cache_trace_load_requests_.find(event.op_id);
+        if (producer != cache_trace_load_requests_.end()) {
+            recordCacheTrace(
+                {.kind = "load_back", .request_id = producer->second, .reason = event.success ? "success" : "failed"});
+            cache_trace_load_requests_.erase(producer);
+        }
+    }
     tier_transfers_.CompleteLoadBack(event.op_id, event.success);
 }
 

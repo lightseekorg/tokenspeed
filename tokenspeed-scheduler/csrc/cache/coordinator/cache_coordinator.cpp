@@ -137,7 +137,7 @@ bool CacheCoordinator::ClearDeviceCache() {
     storage_keys_.clear();
     storage_key_order_.clear();
     for (const auto& [group_id, location] : cached_locations) {
-        _assert(evictCachedBlock(group_id, location), "clearable Device cache entry disappeared");
+        _assert(evictCachedBlock(group_id, location, "clear"), "clearable Device cache entry disappeared");
     }
     return true;
 }
@@ -165,8 +165,11 @@ bool CacheCoordinator::ClearCache() {
         return false;
     }
     for (const auto& [group_id, location] : host_locations) {
-        _assert(groups_[group_id].Index().Evict(*host_pool_, location).has_value(),
-                "clearable Host cache entry disappeared");
+        const auto removed = groups_[group_id].Index().Evict(*host_pool_, location);
+        _assert(removed.has_value(), "clearable Host cache entry disappeared");
+        if (cache_trace_sink_) {
+            cache_trace_sink_(*removed, CacheTier::kHost, CacheMutation::kRemoved, "clear");
+        }
     }
     return true;
 }
@@ -696,20 +699,28 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
         (groups_[group_index].Spec().kind == AttnKind::kSlidingWindow || stream_completed_to_host);
     auto* inserted = [&]() -> std::vector<std::pair<CacheKey, CacheBlockRef>>* {
         if constexpr (Tier == CacheTier::kDevice) {
-            return automatically_streams_to_host || cache_mutation_sink_ ? &newly_cached : nullptr;
+            return automatically_streams_to_host || cache_mutation_sink_ || cache_trace_sink_ ? &newly_cached : nullptr;
         }
-        return nullptr;
+        return cache_trace_sink_ ? &newly_cached : nullptr;
     }();
     CacheGroup& group = groups_[group_index];
     group.Index().RegisterFullBlocks(tierPool<Tier>(),
                                      group.Allocator().BlocksToPublish(table, first_cache_block, keys.size()), keys,
                                      access_epoch, first_cache_block, boundary_kind, inserted);
     if constexpr (Tier == CacheTier::kHost) {
+        if (cache_trace_sink_) {
+            for (const auto& [key, block_ref] : newly_cached) {
+                cache_trace_sink_(key, Tier, CacheMutation::kStored, "committed");
+            }
+        }
         return;
     }
     for (auto& [key, block_ref] : newly_cached) {
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);
+        }
+        if (cache_trace_sink_) {
+            cache_trace_sink_(key, Tier, CacheMutation::kStored, "committed");
         }
         if (!automatically_streams_to_host) {
             continue;
@@ -793,8 +804,11 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                                       return value(group_id, candidate.location, candidate.metadata);
                                   });
         for (std::size_t i = 0; i < victim_count; ++i) {
-            _assert(groups_[group_id].Index().Evict(*host_pool_, local_victims[i].location).has_value(),
-                    "selected Host child is not evictable");
+            const auto removed = groups_[group_id].Index().Evict(*host_pool_, local_victims[i].location);
+            _assert(removed.has_value(), "selected Host child is not evictable");
+            if (cache_trace_sink_) {
+                cache_trace_sink_(*removed, CacheTier::kHost, CacheMutation::kRemoved, "capacity");
+            }
         }
         std::vector<CacheBlockRef> refs =
             host_pool_->AcquireUpToBlocks(group_id, static_cast<std::int32_t>(unresolved.size()));
@@ -848,8 +862,11 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                 for (std::int32_t slot = 0; slot < victim_packing; ++slot) {
                     const CacheBlockLocation location{.lcm_block_id = victim_parent, .slot_index = slot};
                     if (host_pool_->IsOccupied(location)) {
-                        _assert(groups_[*bound_group].Index().Evict(*host_pool_, location).has_value(),
-                                "selected Host parent changed before eviction");
+                        const auto removed = groups_[*bound_group].Index().Evict(*host_pool_, location);
+                        _assert(removed.has_value(), "selected Host parent changed before eviction");
+                        if (cache_trace_sink_) {
+                            cache_trace_sink_(*removed, CacheTier::kHost, CacheMutation::kRemoved, "capacity");
+                        }
                     }
                 }
 
@@ -874,13 +891,16 @@ CacheBlockRef CacheCoordinator::AcquireHostBlock(std::uint32_t group_id) {
     return batch.blocks.empty() ? CacheBlockRef{} : std::move(batch.blocks.front());
 }
 
-bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location) {
+bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location, const char* reason) {
     std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location);
     if (!removed) {
         return false;
     }
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
+    }
+    if (cache_trace_sink_) {
+        cache_trace_sink_(*removed, CacheTier::kDevice, CacheMutation::kRemoved, reason);
     }
     return true;
 }
@@ -1014,10 +1034,16 @@ std::int32_t CacheCoordinator::NumPinnedHostCachedBlocks() const {
 void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key) {
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
+    std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_,
                                            /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
-                                           /*newly_cached=*/nullptr);
+                                           cache_trace_sink_ ? &newly_cached : nullptr);
     rememberStorageKey(key);
+    if (cache_trace_sink_) {
+        for (const auto& [cached_key, cached_block] : newly_cached) {
+            cache_trace_sink_(cached_key, CacheTier::kHost, CacheMutation::kStored, "transfer_complete");
+        }
+    }
 }
 
 void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key) {
@@ -1026,12 +1052,17 @@ void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     groups_[key.group_id].Index().Register(pool_, block_ref, key, ++next_access_epoch_, /*logical_block_index=*/-1,
                                            CacheBoundaryKind::kChunk, &newly_cached);
-    if (!cache_mutation_sink_) {
+    if (!cache_mutation_sink_ && !cache_trace_sink_) {
         return;
     }
     for (const auto& [cached_key, cached_block] : newly_cached) {
         (void)cached_block;
-        cache_mutation_sink_(cached_key, CacheMutation::kStored);
+        if (cache_mutation_sink_) {
+            cache_mutation_sink_(cached_key, CacheMutation::kStored);
+        }
+        if (cache_trace_sink_) {
+            cache_trace_sink_(cached_key, CacheTier::kDevice, CacheMutation::kStored, "transfer_complete");
+        }
     }
 }
 

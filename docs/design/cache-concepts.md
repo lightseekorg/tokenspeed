@@ -1618,3 +1618,68 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 Verified end to end for this round: DeepSeek V3.2, R1 and V4-Flash, each
 × {CUDA graph, eager} × {spec, no spec}, against pre-refactor baselines
 (accuracy equal or better; speculative accept length within noise).
+
+
+## Diagnostic capture
+
+`--cache-trace-path` enables a private JSONL capture on attention-TP rank zero,
+with a separate epoch and file per attention-TP group and pipeline stage. The
+scheduler and transfer completions are replicated within that group. It is
+independent of the routing KV-event publisher and disabled by default.
+Admission records read the existing native probe and successful admission
+result. Submitted and computed-prefix records perform additional hashing, and
+final-publication frontier records perform an additional read-only cache probe.
+Repeated admission probes are recorded only when their matched lengths change.
+Cache accounting
+records the same deduplicated increments used by response usage.
+
+Ordered `stored` and `removed` records describe individual group entries in L1
+or L2, including transfer completion, capacity removal and explicit clearing.
+Removed entries carry no producer attribution. `load_back` records associate
+successful or failed transfer completions with the requesting engine ID.
+They do **not** establish joint checkpoint readability: a resumable prefix still
+requires every group's matching policy and dependencies. `checkpoint` identifies
+the producing request's computed prefix, rather than claiming it is reusable.
+L3 history is not captured. Readmission records must not be added to initial
+prompt hits. Root IDs must be joined through the router's explicit dispatch and
+servicer child-ID mapping, never by parsing engine IDs. This capture does not
+instrument the router: routing loss requires separate routing evidence.
+Native timestamps use each node's wall clock. Sequence numbers order events
+within one epoch only; cross-node joins require explicit request identities and
+causal relationships. Comparing wall clocks also requires measured clock-error
+bounds; timestamps alone cannot establish cross-node order.
+
+The native buffer holds at most 16,384 events or 16 MiB, whichever fills first.
+Hash lists are not truncated. The writer holds at most
+16 batches and stops at 2 GiB per file. Overflow emits `gap`; missing shutdown
+markers, L3 state and missing sources prevent a complete
+history claim. Unknown history cannot prove cold, eviction or routing loss.
+Captures contain content hashes and request IDs but no prompt text or token IDs.
+Keep them in private storage and compare trace-on/off overhead before enabling
+them for a serving workload. Native API changes require a scheduler release
+before the runtime can enable capture with a published wheel.
+
+### Diagnostic cache history
+
+Opt-in cache traces identify cumulative prefixes using a bounded parent-linked
+dictionary; later events carry a tip and page count. The native memoization map
+reclaims its entries at 131,072 prefixes and re-emits them as needed, with new
+monotonically increasing references. Readers retain previously emitted dictionary
+entries for the whole file; reclamation does not erase cache history or reset
+the native sequence. Static metadata appears only in `capture_start`; readers
+inherit it for subsequent records, which retain schema, epoch and event fields.
+Namespace, group, child offset, producer and computed boundary provenance stay
+separate from cache hit predictions. A native empty start certifies initialization;
+any dropped event or retention limit invalidates subsequent
+history. L3 starts remain unknown without an initial inventory.
+
+Final-publication frontier probes are read-only and enabled by default with
+capture. `--no-cache-trace-frontiers` disables computed-prefix, final-readability
+and capacity records to reduce diagnostic overhead. This also removes the
+evidence needed to distinguish pending computation and joint readability.
+Frontier records describe
+Device and Host matches per rank using the role's admission matcher, without
+pinning pages or allocating storage. Host matches still require transfer. A single
+rank's frontier or an Attention-group store cannot certify replica-wide readiness.
+Capacity observations accompany diagnostic drains; they describe actual execution,
+not a counterfactual scheduler or an achievable whole-workload cache optimum.

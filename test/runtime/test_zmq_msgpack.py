@@ -648,11 +648,14 @@ def test_handshake_structs_are_map_encoded():
     assert raw["status"] == "HELLO"
 
     engine_ready = zmq_wire.WireEngineCoreReadyResponse(
-        dtype="float16", multimodal_encoder_dtype="bfloat16"
+        dtype="float16",
+        multimodal_encoder_dtype="bfloat16",
+        cache_trace_epochs=["capture-epoch"],
     )
     raw_engine_ready = msgspec.msgpack.decode(zmq_wire.encode(engine_ready))
     assert raw_engine_ready["dtype"] == "float16"
     assert raw_engine_ready["multimodal_encoder_dtype"] == "bfloat16"
+    assert raw_engine_ready["cache_trace_epochs"] == ["capture-epoch"]
 
     init = zmq_wire.WireHandshakeInitMessage(
         addresses=zmq_wire.WireHandshakeAddresses(

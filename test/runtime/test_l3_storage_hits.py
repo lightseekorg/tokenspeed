@@ -787,6 +787,7 @@ def test_l3_recovery_preserves_round_order(
         _pd_hooks=SimpleNamespace(poll_transfer_events=Mock(return_value=[])),
         _commit_forward_results=commit,
         _publish_scheduler_kv_events=Mock(),
+        _cache_trace=None,
     )
     loop_methods["event_loop"](loop)
 

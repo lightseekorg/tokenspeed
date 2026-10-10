@@ -31,6 +31,7 @@ import psutil
 import setproctitle
 import zmq
 
+from tokenspeed.runtime.engine.cache_trace import collect_cache_trace_epochs
 from tokenspeed.runtime.engine.io_struct import (
     BlockReqInput,
     GetLoadReqOutput,
@@ -166,6 +167,7 @@ class DataParallelController:
 
     def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
         # Parse args
+        self.cache_trace_epochs: list[str] = []
         self.max_total_num_tokens = None
         self.max_req_input_len = None
         self.max_single_request_tokens = None
@@ -385,6 +387,7 @@ class DataParallelController:
         # Wait for model to finish loading
         scheduler_info = [reader.recv() for reader in scheduler_pipe_readers]
 
+        self.cache_trace_epochs = collect_cache_trace_epochs(scheduler_info)
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
         self.max_single_request_tokens = scheduler_info[0]["max_single_request_tokens"]
@@ -474,6 +477,7 @@ def run_data_parallel_controller_process(
         pipe_writer.send(
             {
                 "status": "ready",
+                "cache_trace_epochs": controller.cache_trace_epochs,
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
                 "max_single_request_tokens": controller.max_single_request_tokens,

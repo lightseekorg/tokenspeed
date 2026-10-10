@@ -64,6 +64,7 @@ class _EventLoopHarness:
 
     def __init__(self, *, pre_set: bool) -> None:
         self.trace: list[str] = []
+        self._cache_trace = None
         self.shutdown_event = threading.Event()
         if pre_set:
             self.shutdown_event.set()
@@ -228,6 +229,7 @@ def test_run_event_loop_reports_exit_and_finally_closes(
             shutdown_event,
         ) -> None:
             trace.append("construct")
+            self._cache_trace = None
             self.shutdown_event = shutdown_event
             self.max_total_num_tokens = 1024
             self.max_single_request_tokens = 768

@@ -40,6 +40,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.engine.batch_log import BatchLogger
 from tokenspeed.runtime.engine.cache_hooks import L2CacheHooks
+from tokenspeed.runtime.engine.cache_trace import CacheTraceWriter
 from tokenspeed.runtime.engine.eplb_hooks import (
     EplbHooks,
     make_expert_rebalance_controller,
@@ -303,6 +304,46 @@ class EventLoop:
             EventPublisherFactory.is_enabled(server_args.kv_events_config)
             and attn_tp_rank == 0
         )
+        self._cache_trace = (
+            CacheTraceWriter(
+                server_args.cache_trace_path,
+                {
+                    "global_rank": global_rank,
+                    "attn_tp_rank": attn_tp_rank,
+                    "attn_tp_size": cache_replica_tp_size,
+                    "capture_scope": "attention_tp_leader",
+                    "pp_rank": mapping.pp_rank,
+                    "pp_size": self.pp_size,
+                    "num_device_pages": geometry.num_device_pages,
+                    "num_host_pages": num_host_pages,
+                    "eviction_policy": "request_access_epoch",
+                    "compatibility": {
+                        "model": server_args.model,
+                        "revision": server_args.revision,
+                        "config": self.model_config.hf_config.to_dict(),
+                        "dtype": str(server_args.dtype),
+                        "kv_cache_dtype": str(server_args.kv_cache_dtype),
+                    },
+                    "prefix_granularity": geometry.prefix_granularity,
+                    "l2_enabled": server_args.enable_kvstore,
+                    "l3_enabled": server_args.kvstore_storage_backend is not None,
+                    "role": server_args.disaggregation_mode,
+                    "groups": [
+                        {
+                            "group_id": group.group_id,
+                            "block_granularity": group.block_granularity,
+                            "retention": str(group.retention),
+                            "family": str(group.family),
+                            "sliding_window_tokens": group.sliding_window_tokens,
+                            "replayable": group.replayable,
+                        }
+                        for group in cache_groups
+                    ],
+                },
+            )
+            if server_args.cache_trace_path is not None and attn_tp_rank == 0
+            else None
+        )
 
         # Encode nodes never build an EventLoop (they run the LM-free encode
         # loop), so here "disaggregation is on" means the cache-transfer PD
@@ -362,6 +403,11 @@ class EventLoop:
             cache_groups=cache_groups,
             enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         )
+        if self._cache_trace is not None:
+            scheduler_cfg.enable_cache_trace = True
+            scheduler_cfg.enable_cache_trace_frontiers = (
+                server_args.cache_trace_frontiers
+            )
         logger.info(
             f"Scheduler config: prefix_granularity={scheduler_cfg.prefix_granularity!s}"
             f" num_device_pages={scheduler_cfg.num_device_pages!s} "
@@ -528,6 +574,7 @@ class EventLoop:
         )
 
         self.output_processor = OutputProcesser(
+            cache_trace=self._cache_trace,
             send_to_tokenizer=self.send_to_tokenizer,
             attn_tp_rank=attn_tp_rank,
             spec_algorithm=self.server_args.speculative_algorithm,
@@ -1234,6 +1281,8 @@ class EventLoop:
                     advance_scheduler(self.scheduler, request_changes)
 
                 self._publish_scheduler_kv_events()
+                if self._cache_trace is not None:
+                    self._cache_trace.publish(self.scheduler.drain_cache_trace())
 
                 if self._pause.forward_blocked:
                     # Frozen rounds take no planning sample of their own; the
@@ -1394,6 +1443,11 @@ def run_event_loop(
         pipe_writer.send(
             {
                 "status": "ready",
+                "cache_trace_epochs": (
+                    [event_loop._cache_trace.epoch]
+                    if event_loop._cache_trace is not None
+                    else []
+                ),
                 "max_total_num_tokens": event_loop.max_total_num_tokens,
                 "max_req_input_len": event_loop.max_req_input_len,
                 "max_single_request_tokens": event_loop.max_single_request_tokens,

@@ -43,6 +43,11 @@ class _Sender:
         self.items.append(obj)
 
 
+class _CacheTrace(_Sender):
+    def publish(self, events):
+        self.items.append(events)
+
+
 class _Tokenizer:
     eos_token_id = None
     additional_stop_token_ids = None
@@ -124,16 +129,24 @@ def test_cached_tokens_count_the_replayed_window_as_a_hit():
     """A bounded-replay chunk starts its model input below the prefix hit;
     the request still hit through the end of the replayed window, and a
     later chunk of the same request adds nothing."""
-    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    trace = _CacheTrace()
+    processor = OutputProcesser(
+        _Sender(), attn_tp_rank=0, metrics=_Metrics(), cache_trace=trace
+    )
     processor.rid_to_state["hit"] = _state(list(range(20)))
+    processor.rid_to_state["hit2"] = _state(list(range(20)))
     processor.rid_to_state["fresh"] = _state(list(range(5)))
     # "hit": hit at 8, window 4 -> input starts at 4 with 4 replayed rows.
-    processor.add_cached_tokens(["hit", "fresh"], [4, 0], [4, 0])
+    processor.add_cached_tokens(["hit", "hit2", "fresh"], [4, 4, 0], [4, 4, 0])
     assert processor.rid_to_state["hit"].cached_tokens == 8
+
     assert processor.rid_to_state["fresh"].cached_tokens == 0
     processor.rid_to_state["hit"].computed_length = 12
     processor.add_cached_tokens(["hit"], [12], [0])
     assert processor.rid_to_state["hit"].cached_tokens == 8
+    assert len(trace.items) == 1
+    assert len(trace.items[0]) == 2
+    assert trace.items[0][0]["cached_tokens_delta"] == 8
 
 
 def test_mark_abort_notify_client_flag():

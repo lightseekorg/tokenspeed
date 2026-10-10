@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -56,6 +57,44 @@ public:
     ExecutionPlan NextExecutionPlan();
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
+    struct CacheTraceEvent {
+        std::uint64_t sequence{0};
+        std::int64_t timestamp_ns{0};
+        std::string kind;
+        std::string request_id;
+        std::string tier;
+        std::string reason;
+        std::vector<std::string> prefix_hashes;
+        std::int32_t hash_count{0};
+        std::uint64_t prefix_ref{0};
+        std::uint64_t parent_ref{0};
+        CacheNamespaceId namespace_id{kDefaultCacheNamespaceId};
+        std::string boundary_kind;
+        std::int32_t computed_tokens{-1};
+        std::int32_t group_id{-1};
+        std::int32_t page_offset{-1};
+        std::int32_t prompt_tokens{-1};
+        std::int32_t cacheable_tokens{-1};
+        std::int32_t device_match_tokens{-1};
+        std::int32_t host_match_tokens{-1};
+        std::int32_t admitted_tokens{-1};
+        std::int32_t replay_tokens{-1};
+        std::uint64_t dropped_events{0};
+        bool readmission{false};
+        std::int32_t device_total_blocks{-1};
+        std::int32_t device_empty_blocks{-1};
+        std::int32_t device_active_blocks{-1};
+        std::int32_t host_free_blocks{-1};
+        std::int32_t host_pinned_blocks{-1};
+        std::int32_t waiting_requests{-1};
+        std::int32_t running_requests{-1};
+        std::int32_t pd_transfer_requests{-1};
+        std::int32_t block_granularity{-1};
+        std::int32_t lookback_pages{-1};
+        bool prefix_closed{false};
+        bool group_replayable{false};
+    };
+    std::vector<CacheTraceEvent> DrainCacheTrace();
     // Testing/control-plane operation. A successful return means the complete
     // Device L1 prefix cache was removed; Host L2 is never touched.
     bool ClearL1Cache();
@@ -122,6 +161,7 @@ private:
     bool clearCache(bool include_host);
     bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
+        std::int32_t cacheable_tokens{0};
         CacheCoordinator::PrefixProbe probe;
         std::vector<std::string> candidate_prefix_hashes;
         std::vector<std::string> extension_hashes;
@@ -306,6 +346,23 @@ private:
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
+    void recordCacheTrace(CacheTraceEvent event, std::span<const std::string> prefix_hashes = {});
+    std::vector<CacheTraceEvent> cache_trace_events_;
+    std::uint64_t cache_trace_sequence_{0};
+    std::uint64_t cache_trace_dropped_{0};
+    std::size_t cache_trace_bytes_{0};
+    std::unordered_map<std::string, std::uint64_t> cache_trace_prefixes_;
+    std::uint64_t cache_trace_next_prefix_ref_{0};
+    std::unordered_map<std::string, std::vector<std::string>> cache_trace_computed_prefixes_;
+    std::unordered_map<std::string, std::array<std::int32_t, 4>> cache_trace_probes_;
+    std::unordered_map<std::uint32_t, std::string> cache_trace_load_requests_;
+    std::string cache_trace_producer_id_;
+    std::int32_t cache_trace_computed_tokens_{-1};
+    std::string cache_trace_boundary_kind_;
+    void beginCacheTracePublication(const Request& request, const RequestProgress& progress);
+    void endCacheTracePublication();
+    void recordCacheTraceComputed(const Request& request);
+    void recordCacheTraceFrontier(const Request& request, std::span<const std::string> hashes);
     ReqPoolAllocator req_pool_allocator_;
 
     // Pools outlive every CacheBlockRef stored below.
