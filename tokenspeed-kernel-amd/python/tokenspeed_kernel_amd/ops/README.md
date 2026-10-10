@@ -168,17 +168,23 @@ decisions.
 ### gfx1250 dense BF16 decode projection
 
 The gfx1250 package provides a small-M dense BF16 WMMA projection for K3
-decode, including the KDA QKVFAB shape.
+decode and EAGLE3 verify, including the KDA QKVFAB, MLA QKV+gate, and latent
+up-projection add3 shapes.
 
 #### Contract
 
 - The operation computes `A @ B.T` from contiguous BF16 matrices shaped
-  `[M, K]` and `[N, K]`, with `1 <= M <= 32`, `K` divisible by 128, and `N`
-  divisible by 16. A and B must share one CUDA device.
+  `[M, K]` and `[N, K]`, with `1 <= M <= 64`, `K` divisible by 128, and `N`
+  divisible by 16; from 17 rows `N` must be at most 8192. A and B must share
+  one CUDA device.
 - Output is BF16. A caller-owned output must be on that device, with a unit
   inner stride and a row stride of at least `N`.
-- KDA QKVFAB is the fixed shape `M` in `{1, 2, 4, 8, 16, 32}`, `K = 7168`,
-  `N = 6288`.
+- The fixed K3 shapes accept any `M` from 1 to 64 with `K = 7168`: KDA QKVFAB
+  has `N = 6288` and MLA QKV+gate has `N = 3648`.
+- The add3 variant computes `bf16(A @ B.T) + X + Y` for `K = 3584` and
+  `N = 7168`. `X` and `Y` are BF16 `[M, 7168]` with a unit inner stride. The
+  projection rounds to BF16 before each BF16 addition, matching `torch.mm`
+  followed by two adds, and always runs without split-K.
 - Callers must supply `split_k`; `None` selects the largest of 8, 4, or 2
   that divides the K tiles, leaves each split at least eight K tiles and one
   full TDM pipeline, and keeps `N`-tile count times the split within 256 CUs.
@@ -194,12 +200,20 @@ and unknown selectors always raise.
 
 #### Algorithm
 
-M is consumed in 16-row chunks, and each chunk re-reads B. General dense
-projections use a two-warp `16 x 32` tile when `N` is divisible by 32 and has
-at least 192 such tiles; other accepted `N` uses one warp and a `16 x 16`
-tile. They use 256-wide K tiles when K is divisible by 256, falling back to
-128-wide tiles otherwise, and request six TDM buffers. KDA QKVFAB keeps its
-one-warp `16 x 16 x 128` tile and seven buffers. The buffer count is clamped
+Every accepted `M` fits one row tile, so B streams once. From 17 rows, a
+four-warp `64 x 32` tile covers all of M; rows past M load as zero and are not
+stored. Through 8192 columns that tile gives each of the 256 CUs one
+32-column block; wider outputs would need a second round, so they stay on
+rocBLAS. QKVFAB's 6288 columns leave a masked 16-column tail in the last tile.
+QKVFAB, QKV+gate, and add3 run the 64-row tile without split-K.
+
+Up to 16 rows, general dense projections use a two-warp `16 x 32` tile when
+`N` is divisible by 32 and has at least 192 such tiles; other accepted `N`
+uses one warp and a `16 x 16` tile. They use 256-wide K tiles when K is
+divisible by 256, falling back to 128-wide tiles otherwise, and request six
+TDM buffers. At up to 16 rows, KDA QKVFAB keeps its one-warp `16 x 16 x 128`
+tile and seven buffers, and add3 uses a two-warp `16 x 32` tile. The add3
+epilogue loads `X` and `Y` for the stored tile. The buffer count is clamped
 to the K tiles available per split. Once the K tiles fill that pipeline, the
 tail lowers the TDM wait before each remaining LDS read. Short K dimensions
 prefetch only valid tiles and drain each remaining pair before reading it.
@@ -347,6 +361,44 @@ index and its two TDM loads go out before the current tile's math, and each
 split issues its first tile before loading the queries. The loop is unrolled
 by two so each slot index is a compile-time constant; waiting until two loads
 remain then leaves the other slot's loads in flight.
+
+### gfx1250 MLA query-block decode
+
+`gluon_mla_decode_query_blocks_gfx1250` decodes 2–16 causal queries per
+request, such as an EAGLE3 verify step, reading each KV tile once for all of a
+request's queries. It is selected for `mla_decode_with_kvcache` requests with
+queries blocked on the query axis.
+
+#### Contract
+
+- Queries are `(requests, queries, heads, 576)` with 2 to 16 queries and 1 to
+  128 heads, and a contiguous last dimension. The cache is a contiguous
+  `(pages, 64, 1, 576)` of the same dtype: FP16, BF16, FP8 E4M3, or FP8 E5M2.
+  `logit_cap` is unsupported.
+- The page table is Int32 `(requests, pages)` with a unit inner stride, one
+  row per request. Cache lengths are a contiguous Int32 `(requests,)`, at
+  least `queries` each, and include every query of the block: query `j` sees
+  `cache_seqlens - queries + j + 1` tokens.
+- The output is BF16 `(requests, queries, heads, 512)`, with an optional FP32
+  log-sum-exp `(requests, queries, heads)` in natural-log units.
+
+#### Algorithm
+
+The query-block decode reuses the flattened decode's scan and merge kernels.
+Each request's queries start at `request * queries`, so no query-start
+metadata is read. A program holds every head of a block of whole queries in
+16, 32, or 64 rows, the smallest that covers `queries * heads`. More than 64
+rows split the block by query; more than 64 heads split it by head. Each KV
+tile the program loads serves all of its rows, and per-query lengths apply the
+causal mask within the block. Programs of 16 rows use two warps and larger
+ones four; FP8 double-buffers its TDM loads as in the flattened decode.
+
+The KV split count is the largest power of two that is at most 64, the page
+count of `max_seqlen_k`, and the CU count divided by the program count. A query
+that sees no key in a split stores a negative-infinity maximum, so the merge
+skips that split without producing NaN. The page-table stride and the request
+and token counts are runtime arguments, so batch sizes that keep the split
+count reuse one binary.
 
 ### gfx950 MLA prefill
 

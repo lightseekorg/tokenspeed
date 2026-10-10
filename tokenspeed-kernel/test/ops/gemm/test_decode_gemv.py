@@ -129,9 +129,9 @@ def test_cdna5_route_admits_decode_shapes(m, n, k):
     """K3 decode shapes must route on CDNA5 through its registered kernels.
 
     The unquantized Linear path relies on this: o_proj is 93 calls a forward
-    and reached the vendor GEMM. M == 1 lands on row-CTA and the rest on the
-    dense16 WMMA kernel; 17 and 32 cross into a second 16-row chunk, where
-    the launcher masks the tail.
+    and reached the vendor GEMM. M == 1 lands on row-CTA, 2 and 16 rows on
+    one 16-row WMMA tile, and 17 and 32 on the 64-row tile, which masks the
+    rows past M.
     """
     torch.manual_seed(0)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -165,10 +165,20 @@ def test_cdna5_route_declines_unregistered_calls():
     thin_w = torch.randn(8448, 128, device="cuda", dtype=torch.bfloat16)
     assert not use_decode_gemv(thin, thin_w)
 
-    # Past the WMMA band nothing is registered: each 16-row chunk re-reads the
-    # whole weight, and by this M rocBLAS is measured faster.
-    wide = torch.randn(64, 1536, device="cuda", dtype=torch.bfloat16)
+    # Past the WMMA band nothing is registered: the widest WMMA tile holds
+    # 64 rows, and every further tile would re-read the whole weight.
+    wide = torch.randn(65, 1536, device="cuda", dtype=torch.bfloat16)
     assert not use_decode_gemv(wide, w_bf16)
+
+    # From 17 rows the 64-row tile takes a shape only while its 32-column
+    # blocks fit the CUs in one round; 16 rows stay on one 16-row tile.
+    wide_n_w = torch.randn(8208, 1536, device="cuda", dtype=torch.bfloat16)
+    assert not use_decode_gemv(
+        torch.randn(17, 1536, device="cuda", dtype=torch.bfloat16), wide_n_w
+    )
+    assert use_decode_gemv(
+        torch.randn(16, 1536, device="cuda", dtype=torch.bfloat16), wide_n_w
+    )
 
     # In-band M, but the WMMA kernel tiles K by 128 and N by its output tile.
     unaligned_k = torch.randn(16, 1600, device="cuda", dtype=torch.bfloat16)
