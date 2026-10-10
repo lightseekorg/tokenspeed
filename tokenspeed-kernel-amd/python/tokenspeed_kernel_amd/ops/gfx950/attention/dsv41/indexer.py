@@ -715,7 +715,11 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
     topk = int(topk)
     if not 1 <= topk <= 1024:
         raise ValueError(f"select topk must be in [1, 1024], got {topk}")
-    if logits.stride(1) != 1 or row_out.stride(1) != 1:
+    if (
+        logits.stride(1) != 1
+        or row_out.stride(1) != 1
+        or (candidates is not None and candidates.stride(1) != 1)
+    ):
         raise ValueError("select requires unit inner strides")
     cand = logits if candidates is None else candidates
     gluon_dsv41_index_topk_select_gfx950[(queries,)](
