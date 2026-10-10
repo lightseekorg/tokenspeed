@@ -362,6 +362,11 @@ class CompletionQueue:
             self._pending = []
         return dropped
 
+    def pending(self) -> list[tuple[Any, Any]]:
+        """A snapshot of the ``(finish_event, payload)`` entries not yet released."""
+        with self._lock:
+            return list(self._pending)
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._pending)

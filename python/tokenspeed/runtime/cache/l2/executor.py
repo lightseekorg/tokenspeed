@@ -46,6 +46,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from enum import Enum
 from typing import NamedTuple
 
 import torch
@@ -98,14 +99,26 @@ def _ordered_unique(values: Iterable[int]) -> list[int]:
     return list(dict.fromkeys(int(value) for value in values))
 
 
-class _Ack(NamedTuple):
-    """One in-flight Host copy whose CUDA event has not yet been polled.
+class _AckKind(Enum):
+    """Which scheduler ACK an in-flight copy's op ids become on completion."""
 
-    ``backup_pages`` and ``success`` are required so a write cannot omit
-    the L3 page list and a load cannot omit success.
+    WRITE_BACK = "WriteBackDone"
+    LOAD_BACK = "LoadBackDone"
+    SNAPSHOT = "SnapshotDone"
+    RESTORE = "RestoreDone"
+
+
+class _Ack(NamedTuple):
+    """The payload of one in-flight Host copy on the completion queue.
+
+    The queue holds the copy's completion event; this names the ACK its op
+    ids become. ``backup_pages`` (an L2 write-back's L3 pages) and
+    ``success`` (a load-back's outcome) are required so a write cannot omit
+    its page list and a load cannot omit its outcome; the other kinds pass
+    an empty list and True.
     """
 
-    finish_event: object
+    kind: _AckKind
     op_ids: list[int]
     backup_pages: list[StoragePage]
     success: bool
@@ -385,16 +398,17 @@ class HostCacheExecutor:
             )
 
         # Submission runs on the forward thread and polling on the control
-        # plane (event queries only), so the completion queues below are the
-        # cross-thread handoff; the lock covers every mutation of them.
+        # plane (event queries only). Every copy of every kind -- L2
+        # write-back and load-back, snapshot store and restore -- is one
+        # entry of the one completion queue, released as the ACK its _Ack
+        # names once its event completes; the queue is the cross-thread
+        # handoff. Loads that fail before launch (an L3 prefetch miss, or
+        # nothing owned to copy) have no event and are released from
+        # ``_ready_load_acks``; the lock covers it and the L3 backup futures.
+        self._completions = CompletionQueue()
         self._ack_lock = threading.Lock()
-        self._write_acks: list[_Ack] = []
-        self._load_acks: list[_Ack] = []
         self._load_poisoned = False
         self._ready_load_acks: list[tuple[int, bool]] = []
-        # Snapshot stores and restores: one event per submission, released
-        # as SnapshotDone / RestoreDone.
-        self._snapshot_acks = CompletionQueue()
         self._l3_prefetch_ok: dict[StoragePage, bool] = {}
         self._backup_futures: list[tuple[Future, list[int], list[StoragePage]]] = []
         self._backup_poll_failed = False
@@ -488,6 +502,9 @@ class HostCacheExecutor:
         pinned_pages: list[StoragePage] = []
         snapshot_ops: list[SnapshotOp] = []
         snapshot_transfers: list[tuple[int, int, int]] = []
+        # The whole plan is validated and translated before the first launch:
+        # a bad op must not leave the ordered rows in flight without the
+        # fence that follows them.
         for operation in plan.cache:
             if isinstance(operation, Cache.WriteBackOp):
                 self._append_write_backs(
@@ -502,6 +519,7 @@ class HostCacheExecutor:
             elif isinstance(operation, SnapshotOp):
                 snapshot_ops.append(operation)
                 self._append_snapshot_store(operation, transfers=snapshot_transfers)
+        self._check_distinct(snapshot_ops)
         fence = self._start_writing(
             ordered_op_ids,
             ordered_transfers,
@@ -558,7 +576,7 @@ class HostCacheExecutor:
         }
         for operation in plan.cache:
             if isinstance(operation, Cache.LoadBackOp):
-                self._append_transfers(
+                kept_rows = self._append_transfers(
                     operation.op_ids,
                     operation.group_ids,
                     operation.src_pages,
@@ -569,10 +587,7 @@ class HostCacheExecutor:
                     tier=HostTier.L2,
                 )
                 prefetch_pages = self._storage_pages(
-                    operation,
-                    host_is_destination=False,
-                    prefetch_only=True,
-                    operation_indices=range(len(operation.group_ids)),
+                    operation, prefetch_only=True, kept_rows=list(enumerate(kept_rows))
                 )
                 if prefetch_pages and not all(
                     l3_prefetch_ok.get(page, False) for page in prefetch_pages
@@ -581,6 +596,7 @@ class HostCacheExecutor:
             elif isinstance(operation, RestoreOp):
                 restore_ops.append(operation)
                 self._append_restore(operation, rows_by_tier=restore_rows)
+        self._check_distinct(restore_ops)
         if restore_ops:
             self._start_restore(
                 restore_ops, restore_rows, prerequisite_stream=prerequisite_stream
@@ -618,7 +634,7 @@ class HostCacheExecutor:
                 if pinned
                 else (ordered_op_ids, ordered_transfers)
             )
-            self._append_transfers(
+            (kept_rows,) = self._append_transfers(
                 operation.op_ids[index : index + 1],
                 operation.group_ids[index : index + 1],
                 operation.src_pages[index : index + 1],
@@ -628,12 +644,10 @@ class HostCacheExecutor:
                 source_is_device=True,
                 tier=HostTier.L2,
             )
+            # L3 backs up the Host pages this rank wrote, by local id.
             (pinned_pages if pinned else ordered_pages).extend(
                 self._storage_pages(
-                    operation,
-                    host_is_destination=True,
-                    prefetch_only=False,
-                    operation_indices=(index,),
+                    operation, prefetch_only=False, kept_rows=[(index, kept_rows)]
                 )
             )
 
@@ -653,6 +667,37 @@ class HostCacheExecutor:
             )
         return self.snapshot_block_owners
 
+    def _owned_rows(
+        self,
+        op_id: int,
+        groups: Sequence[int],
+        sources: Sequence[int],
+        destinations: Sequence[int],
+        *,
+        source_is_device: bool,
+        tier: HostTier,
+    ) -> list[tuple[int, tuple[int, int, int]]]:
+        """One op's wire rows through the ownership translation of ``tier``.
+
+        The one place rows become ``(group_index, device_block, host_block)``:
+        every row passes the translation on both ends, so a sharded group's
+        row is kept only by the rank that owns it (the scheduler pairs blocks
+        of equal residue) and a replicated group's row translates to itself.
+
+        Returns:
+            ``(position, local_row)`` for the rows this rank keeps, with
+            ``position`` indexing the op's wire rows.
+        """
+        if not (len(groups) == len(sources) == len(destinations)):
+            raise ValueError(f"ragged cache operation {op_id}")
+        rows = []
+        for group, source, destination in zip(groups, sources, destinations):
+            device_block_id, host_block_id = (
+                (source, destination) if source_is_device else (destination, source)
+            )
+            rows.append((int(group), int(device_block_id), int(host_block_id)))
+        return self._owners(tier).owned_positions(rows)
+
     def _append_transfers(
         self,
         operation_ids: Sequence[int],
@@ -664,39 +709,42 @@ class HostCacheExecutor:
         transfers: list[tuple[int, int, int]],
         source_is_device: bool,
         tier: HostTier,
-    ) -> None:
-        """Turn one batch's wire rows into this rank's local block triples.
+    ) -> list[list[tuple[int, int]]]:
+        """Collect one batch's ops and this rank's local block triples.
 
-        The one place rows become ``(group_index, device_block, host_block)``:
-        every row passes the ownership translation of ``tier`` on both ends,
-        so a sharded group's row is kept only by the rank that owns it (the
-        scheduler pairs blocks of equal residue) and a replicated group's row
-        translates to itself. An op whose every row belongs to other ranks is
-        still collected: this rank acknowledges it from an empty copy.
+        Every row passes :meth:`_owned_rows`. An op whose every row belongs
+        to other ranks is still collected: this rank acknowledges it from an
+        empty copy.
+
+        Returns:
+            Per op, the ``(position, local_host_block)`` of the rows this
+            rank keeps -- what the L3 page lists are built from, so a rank
+            backs up and prefetches only the Host pages it owns.
         """
         if not (
             len(operation_ids) == len(group_ids) == len(src_blocks) == len(dst_blocks)
         ):
             raise ValueError("ragged cache operation batch")
-        owners = self._owners(tier)
+        kept_hosts: list[list[tuple[int, int]]] = []
         for op_id, groups, sources, destinations in zip(
             operation_ids, group_ids, src_blocks, dst_blocks
         ):
-            if not (len(groups) == len(sources) == len(destinations)):
-                raise ValueError(f"ragged cache operation {op_id}")
-            # An op is acknowledged by its copy's completion event; one with
-            # nothing to copy could never be acknowledged and the scheduler
-            # would hold its tickets forever.
+            # An op with no rows at all is a malformed plan: the scheduler
+            # would hold a ticket for a copy nobody performs.
             if not groups:
                 raise ValueError(f"cache operation {op_id} carries no transfers")
+            kept = self._owned_rows(
+                op_id,
+                groups,
+                sources,
+                destinations,
+                source_is_device=source_is_device,
+                tier=tier,
+            )
             collected_op_ids.append(int(op_id))
-            rows = []
-            for group, source, destination in zip(groups, sources, destinations):
-                device_block_id, host_block_id = (
-                    (source, destination) if source_is_device else (destination, source)
-                )
-                rows.append((int(group), int(device_block_id), int(host_block_id)))
-            transfers.extend(owners.owned_rows(rows))
+            transfers.extend(row for _, row in kept)
+            kept_hosts.append([(position, row[2]) for position, row in kept])
+        return kept_hosts
 
     def _check_snapshot_op(self, op: SnapshotOp | RestoreOp) -> None:
         if self.snapshot_storage is None:
@@ -733,12 +781,12 @@ class HostCacheExecutor:
     def _append_restore(
         self, op: RestoreOp, *, rows_by_tier: dict[HostTier, list[tuple[int, int, int]]]
     ) -> None:
-        """A restore's rows, split by the Host tier each one reads."""
+        """A restore's rows, split by the Host tier each one reads. Empty
+        transfers are legal, mirroring the store: the image is its slot state
+        alone."""
         self._check_snapshot_op(op)
         if len(op.source_tier) != len(op.transfers):
             raise ValueError(f"ragged cache operation {op.op_id}")
-        if not op.transfers:
-            raise ValueError(f"cache operation {op.op_id} carries no transfers")
         for tier in (HostTier.L2, HostTier.SNAPSHOT_POOL):
             rows = [
                 transfer
@@ -761,6 +809,10 @@ class HostCacheExecutor:
 
     @staticmethod
     def _check_distinct(ops: Sequence[SnapshotOp | RestoreOp]) -> None:
+        """One plan names each snapshot op id and each arena row at most once.
+
+        Runs with the other plan checks, before any copy is launched.
+        """
         op_ids = [int(op.op_id) for op in ops]
         if len(set(op_ids)) != len(op_ids):
             raise ValueError(f"duplicate snapshot op id in one plan: {op_ids}")
@@ -781,9 +833,8 @@ class HostCacheExecutor:
         The slot-state exporters' tensors live on the execution stream the
         pages were written on, so the one wait covers the rows and the
         exports; the victim's req-pool slot is reused only behind the fence,
-        so the export reads its bytes.
+        so the export reads its bytes. The ops were validated at collection.
         """
-        self._check_distinct(ops)
         if self.attn_tp_rank == 0:
             logger.info(
                 f"[snapshot] store started: operations={len(ops):d} blocks="
@@ -808,8 +859,14 @@ class HostCacheExecutor:
             )
         finish = device_module.Event()
         finish.record(self.write_stream)
-        self._snapshot_acks.push(
-            finish, [SnapshotDoneEvent(op_id=int(op.op_id)) for op in ops]
+        self._completions.push(
+            finish,
+            _Ack(
+                kind=_AckKind.SNAPSHOT,
+                op_ids=[int(op.op_id) for op in ops],
+                backup_pages=[],
+                success=True,
+            ),
         )
         return finish
 
@@ -824,11 +881,11 @@ class HostCacheExecutor:
 
         One event after the L2-tier rows, the pool-tier rows and the imports,
         so the scheduler sees one ``RestoreDone`` per op; the layerwise
-        tracker is not armed.
+        tracker is not armed. The ops were validated at collection; an op
+        with no rows restores its slot state alone.
         """
         if get_is_capture_mode():
             raise RuntimeError("a snapshot restore must run outside graph capture")
-        self._check_distinct(ops)
         l2_rows = rows_by_tier[HostTier.L2]
         pool_rows = rows_by_tier[HostTier.SNAPSHOT_POOL]
         if self.attn_tp_rank == 0:
@@ -867,46 +924,60 @@ class HostCacheExecutor:
             )
         finish = device_module.Event()
         finish.record(self.load_stream)
-        self._snapshot_acks.push(
-            finish, [RestoreDoneEvent(op_id=int(op.op_id)) for op in ops]
+        self._completions.push(
+            finish,
+            _Ack(
+                kind=_AckKind.RESTORE,
+                op_ids=[int(op.op_id) for op in ops],
+                backup_pages=[],
+                success=True,
+            ),
         )
 
     @staticmethod
     def _storage_pages(
         operation,
         *,
-        host_is_destination: bool,
         prefetch_only: bool,
-        operation_indices: Iterable[int],
+        kept_rows: Sequence[tuple[int, Sequence[tuple[int, int]]]],
     ) -> list[StoragePage]:
-        """Collect hashed Host pages from one cache op.
+        """Collect hashed Host pages from the rows of one cache op this rank copies.
 
-        ``prefetch_only`` must be chosen at the call site: ``True`` keeps
-        only L3-prefetch sources, ``False`` keeps every storage-tagged page.
+        Args:
+            operation: The L2 wire op (``WriteBackOp`` or ``LoadBackOp``).
+            prefetch_only: Must be chosen at the call site: ``True`` keeps
+                only L3-prefetch sources, ``False`` keeps every
+                storage-tagged page.
+            kept_rows: Per op of the batch, ``(op_index, [(position,
+                local_host_block)])`` -- the rows the ownership translation
+                kept for this rank, as :meth:`_append_transfers` returns
+                them. A KVP rank thus backs up and prefetches only the Host
+                pages it owns, by local id.
         """
         hashes = getattr(operation, "content_hashes", None)
         offsets = getattr(operation, "page_offsets", None)
         if not hashes or not offsets:
             return []
-        host_pages = operation.dst_pages if host_is_destination else operation.src_pages
         prefetch_flags = getattr(operation, "prefetch_from_storage", None)
         pages: list[StoragePage] = []
-        for index in operation_indices:
-            groups = operation.group_ids[index]
-            hosts = host_pages[index]
-            hash_row = hashes[index]
-            offset_row = offsets[index]
-            flags = prefetch_flags[index] if prefetch_flags else None
-            flag_row = flags if flags is not None else [1] * len(groups)
-            for group, host_page, content_hash, page_offset, flag in zip(
-                groups, hosts, hash_row, offset_row, flag_row
-            ):
-                if prefetch_only and int(flag) == 0:
+        for op_index, kept in kept_rows:
+            groups = operation.group_ids[op_index]
+            hash_row = hashes[op_index]
+            offset_row = offsets[op_index]
+            flags = prefetch_flags[op_index] if prefetch_flags else None
+            for position, host_block in kept:
+                if prefetch_only and flags is not None and int(flags[position]) == 0:
                     continue
+                content_hash = hash_row[position]
                 if not content_hash:
                     continue
                 pages.append(
-                    (int(group), int(host_page), str(content_hash), int(page_offset))
+                    (
+                        int(groups[position]),
+                        int(host_block),
+                        str(content_hash),
+                        int(offset_row[position]),
+                    )
                 )
         return pages
 
@@ -971,12 +1042,24 @@ class HostCacheExecutor:
         pages: list[StoragePage] = []
         for operation in plan.cache:
             if isinstance(operation, Cache.LoadBackOp):
+                # The same ownership pass the submission makes, so the
+                # prefetch fills exactly the Host pages this rank will load.
+                kept_rows = []
+                for op_index, op_id in enumerate(operation.op_ids):
+                    kept = self._owned_rows(
+                        op_id,
+                        operation.group_ids[op_index],
+                        operation.src_pages[op_index],
+                        operation.dst_pages[op_index],
+                        source_is_device=False,
+                        tier=HostTier.L2,
+                    )
+                    kept_rows.append(
+                        (op_index, [(position, row[2]) for position, row in kept])
+                    )
                 pages.extend(
                     self._storage_pages(
-                        operation,
-                        host_is_destination=False,
-                        prefetch_only=True,
-                        operation_indices=range(len(operation.group_ids)),
+                        operation, prefetch_only=True, kept_rows=kept_rows
                     )
                 )
         return pages
@@ -1073,15 +1156,15 @@ class HostCacheExecutor:
             prerequisite_stream=prerequisite_stream,
             backend=self.transfer_backend,
         )
-        with self._ack_lock:
-            self._write_acks.append(
-                _Ack(
-                    finish_event=finish,
-                    op_ids=op_ids,
-                    backup_pages=backup_pages,
-                    success=True,
-                )
-            )
+        self._completions.push(
+            finish,
+            _Ack(
+                kind=_AckKind.WRITE_BACK,
+                op_ids=op_ids,
+                backup_pages=backup_pages,
+                success=True,
+            ),
+        )
         return finish
 
     def _start_loading(
@@ -1226,15 +1309,15 @@ class HostCacheExecutor:
                         flat_layer_index += 1
             if finish is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
-            with self._ack_lock:
-                self._load_acks.append(
-                    _Ack(
-                        finish_event=finish,
-                        op_ids=op_ids,
-                        backup_pages=[],
-                        success=success,
-                    )
-                )
+            self._completions.push(
+                finish,
+                _Ack(
+                    kind=_AckKind.LOAD_BACK,
+                    op_ids=op_ids,
+                    backup_pages=[],
+                    success=success,
+                ),
+            )
             return load_index
         except BaseException as original_error:
             self._retire_failed_load(active_trackers, flags, original_error)
@@ -1279,13 +1362,19 @@ class HostCacheExecutor:
                 for op_id, success in self._ready_load_acks
             )
             self._ready_load_acks.clear()
-            ready_writes, self._write_acks[:] = self._split_ready(self._write_acks)
-            self._load_acks[:] = self._drain(self._load_acks, self._load_done, results)
-        for ack in ready_writes:
-            self._complete_or_queue_write(ack, results)
+        for ack in self._completions.pop_ready():
+            if ack.kind is _AckKind.WRITE_BACK:
+                # An L2 write with L3 pages is acknowledged after its backup.
+                self._complete_or_queue_write(ack, results)
+            elif ack.kind is _AckKind.LOAD_BACK:
+                results.extend(
+                    self._load_done(op_id, ack.success) for op_id in ack.op_ids
+                )
+            elif ack.kind is _AckKind.SNAPSHOT:
+                results.extend(SnapshotDoneEvent(op_id=op_id) for op_id in ack.op_ids)
+            else:
+                results.extend(RestoreDoneEvent(op_id=op_id) for op_id in ack.op_ids)
         self._collect_finished_backups(results)
-        for events in self._snapshot_acks.pop_ready():
-            results.extend(events)
         return results
 
     def consume_backup_poll_failure(self) -> bool:
@@ -1371,27 +1460,6 @@ class HostCacheExecutor:
         self._l3_unread.forget_pages(l3_pages_newly_published(unread_pages, existed))
 
     @staticmethod
-    def _split_ready(queue):
-        ready = []
-        pending = []
-        for ack in queue:
-            if ack.finish_event.query():
-                ready.append(ack)
-            else:
-                pending.append(ack)
-        return ready, pending
-
-    @staticmethod
-    def _drain(queue, done, results):
-        pending = []
-        for ack in queue:
-            if ack.finish_event.query():
-                results.extend(done(op_id, ack.success) for op_id in ack.op_ids)
-            else:
-                pending.append(ack)
-        return pending
-
-    @staticmethod
     def _write_done(op_id: int):
         event = Cache.WriteBackDoneEvent()
         event.op_id = op_id
@@ -1405,16 +1473,16 @@ class HostCacheExecutor:
         # The fences and start events live on streams the callers named per
         # submission; the whole device covers them and the transfer streams.
         device_module.synchronize()
+        pending = self._completions.drop_all()
         with self._ack_lock:
-            pending_writes = list(self._write_acks)
-            self._write_acks.clear()
             inflight = list(getattr(self, "_backup_futures", ()))
             self._backup_futures = []
         # Synchronization above makes every D2H snapshot complete. Persist the
         # final batch before closing L3; otherwise a clean process shutdown can
         # acknowledge work in memory and silently lose the remote object.
-        for ack in pending_writes:
-            self._backup_to_storage(ack.backup_pages)
+        for ack in pending:
+            if ack.kind is _AckKind.WRITE_BACK:
+                self._backup_to_storage(ack.backup_pages)
         for future, _op_ids, _pages in inflight:
             future.result()
         workers = getattr(self, "_l3_workers", None)
@@ -1425,11 +1493,10 @@ class HostCacheExecutor:
             self.l3_store.close()
 
     def reset(self) -> None:
+        # ``shutdown`` drained the completion queue.
         self.shutdown()
-        self._write_acks.clear()
-        self._load_acks.clear()
-        self._ready_load_acks.clear()
-        self._snapshot_acks.drop_all()
+        with self._ack_lock:
+            self._ready_load_acks.clear()
         self._l3_prefetch_ok.clear()
         self._l3_unread.clear()
         for tracker, _ in self._load_trackers:

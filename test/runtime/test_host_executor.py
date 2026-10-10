@@ -244,11 +244,10 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ack_lock = threading.Lock()
         executor.attn_tp_rank = 0
         executor._ready_load_acks = []
-        executor._load_acks = []
+        executor._completions = _lanes_module().CompletionQueue()
         executor._load_poisoned = False
         executor._l3_prefetch_ok = {}
         executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
-        executor._snapshot_acks = _lanes_module().CompletionQueue()
         executor.load_stream = object() if load_stream is None else load_stream
         executor.transfer_backend = backend
         device = SimpleNamespace(type="cuda")
@@ -382,7 +381,9 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor = module.HostCacheExecutor.__new__(module.HostCacheExecutor)
                 executor._l3_prefetch_ok = {}
                 executor._load_trackers = []
-                executor.block_owners = SimpleNamespace(owned_rows=list)
+                executor.block_owners = SimpleNamespace(
+                    owned_positions=lambda rows: list(enumerate(rows))
+                )
                 executor._start_loading = Mock(return_value=0)
                 executor._prefetch_from_storage = Mock(return_value=[True])
 
@@ -522,7 +523,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.layout = SimpleNamespace(buffers=(SimpleNamespace(device=device),))
         executor.host_storage = SimpleNamespace(host_buffer="host")
         executor.transfer_backend = "auto"
-        executor._write_acks = []
+        executor._completions = lanes_module.CompletionQueue()
         executor.block_owners = _identity_owners()
         executor.write_stream = Mock(name="write_stream")
         # Real lanes over mocked workspaces: the staging discipline under test
@@ -721,12 +722,16 @@ class GroupAwareWireTest(unittest.TestCase):
             [ordered_lane.workspace, pinned_lane.workspace],
         )
         fence_stream.wait_event.assert_called_once_with(ordered_finish)
+        pending = executor._completions.pending()
         self.assertEqual(
-            [(ack.finish_event, ack.op_ids) for ack in executor._write_acks],
-            [(ordered_finish, [12]), (pinned_finish, [11, 13])],
+            [(finish, ack.kind, ack.op_ids) for finish, ack in pending],
+            [
+                (ordered_finish, executor_module._AckKind.WRITE_BACK, [12]),
+                (pinned_finish, executor_module._AckKind.WRITE_BACK, [11, 13]),
+            ],
         )
         self.assertEqual(
-            [ack.backup_pages for ack in executor._write_acks],
+            [ack.backup_pages for _, ack in pending],
             [[(0, 6, "ordered", 1)], [(0, 5, "pinned-a", 0), (0, 7, "pinned-b", 2)]],
         )
         self.assertEqual(
@@ -739,11 +744,9 @@ class GroupAwareWireTest(unittest.TestCase):
         executor_module = self._executor_module()
         lanes_module = _lanes_module()
         executor, _ = self._make_write_executor(executor_module)
-        executor._load_acks = []
         executor._ready_load_acks = []
         executor._backup_futures = []
         executor._l3_workers = None
-        executor._snapshot_acks = _lanes_module().CompletionQueue()
         executor._l3_unread = executor_module.L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
         executor.l3_store.exists.return_value = [False]
@@ -1333,7 +1336,11 @@ class GroupAwareWireTest(unittest.TestCase):
         self.assertEqual(load_events.layer_done_events, [finish, finish, finish])
         self.assertIs(load_events.layer_ready_flags, flags)
         self.assertIs(load_events.wait_layer_ready, executor_module.wait_layer_ready)
-        self.assertIs(executor._load_acks[0].finish_event, finish)
+        ((pending_finish, ack),) = executor._completions.pending()
+        self.assertIs(pending_finish, finish)
+        self.assertEqual(
+            (ack.kind, ack.op_ids), (executor_module._AckKind.LOAD_BACK, [9])
+        )
 
     def test_loadback_launch_failure_retires_all_target_and_draft_events(self):
         executor_module, executor, _, _, _ = self._make_load_executor(
@@ -1392,7 +1399,7 @@ class GroupAwareWireTest(unittest.TestCase):
         )
         self.assertEqual(draft_events.layer_done_events, [retirement])
         executor.load_stream.synchronize.assert_not_called()
-        self.assertEqual(executor._load_acks, [])
+        self.assertEqual(len(executor._completions), 0)
 
     def test_failed_retirement_sync_poisons_executor_and_preserves_original_error(self):
         executor_module, executor, _, _, _ = self._make_load_executor(
@@ -1401,7 +1408,6 @@ class GroupAwareWireTest(unittest.TestCase):
             device_rows=object(),
             load_stream=Mock(),
         )
-        executor._write_acks = []
         load_events = _LoadEvents(
             start_event=Mock(),
             layer_done_events=[Mock()],
@@ -1503,22 +1509,26 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             dst_pages=[[7, 8]],
             prefetch_from_storage=[[1, 0]],
         )
+        # The kept rows name the Host end by local id: a load reads the
+        # source pages, a write wrote the destination pages.
+        load_rows = [(0, [(0, 3), (1, 4)])]
         pages = HostCacheExecutor._storage_pages(
-            operation,
-            host_is_destination=False,
-            prefetch_only=True,
-            operation_indices=range(len(operation.group_ids)),
+            operation, prefetch_only=True, kept_rows=load_rows
         )
         self.assertEqual(pages, [(0, 3, "h0", 0)])
         write_pages = HostCacheExecutor._storage_pages(
-            operation,
-            host_is_destination=True,
-            prefetch_only=False,
-            operation_indices=range(len(operation.group_ids)),
+            operation, prefetch_only=False, kept_rows=[(0, [(0, 7), (1, 8)])]
         )
         self.assertEqual(write_pages, [(0, 7, "h0", 0), (1, 8, "h1", 1)])
+        # Only the rows this rank kept are listed: a KVP peer's row is not.
+        self.assertEqual(
+            HostCacheExecutor._storage_pages(
+                operation, prefetch_only=False, kept_rows=[(0, [(1, 2)])]
+            ),
+            [(1, 2, "h1", 1)],
+        )
         with self.assertRaises(TypeError):
-            HostCacheExecutor._storage_pages(operation, host_is_destination=True)
+            HostCacheExecutor._storage_pages(operation, kept_rows=load_rows)
         signature = inspect.signature(HostCacheExecutor._storage_pages)
         self.assertIs(
             signature.parameters["prefetch_only"].default, inspect.Parameter.empty
@@ -1526,7 +1536,11 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_ack_requires_backup_pages_and_success(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l2.executor import (
+                HostCacheExecutor,
+                _Ack,
+                _AckKind,
+            )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
@@ -1536,9 +1550,9 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         )
         self.assertIs(signature.parameters["success"].default, inspect.Parameter.empty)
         with self.assertRaises(TypeError):
-            _Ack(object(), [1])
+            _Ack(_AckKind.WRITE_BACK, [1])
         with self.assertRaises(TypeError):
-            _Ack(object(), [1], [])
+            _Ack(_AckKind.WRITE_BACK, [1], [])
         start_writing = inspect.signature(HostCacheExecutor._start_writing)
         self.assertIs(
             start_writing.parameters["backup_pages"].default, inspect.Parameter.empty
@@ -1562,7 +1576,11 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_poll_results_backs_up_host_pages_asynchronously(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l2.executor import (
+                HostCacheExecutor,
+                _Ack,
+                _AckKind,
+            )
             from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
@@ -1580,26 +1598,25 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
-        executor._write_acks = []
-        executor._load_acks = []
+        executor._completions = CompletionQueue()
         executor._ready_load_acks = []
         executor._backup_futures = []
         executor._l3_workers = None
-        executor._snapshot_acks = CompletionQueue()
         executor._l3_unread = L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
         executor.l3_store.exists.return_value = [False]
         executor.l3_store.backup.side_effect = backup
         finish = Mock()
         finish.query.return_value = True
-        executor._write_acks = [
+        executor._completions.push(
+            finish,
             _Ack(
-                finish_event=finish,
+                kind=_AckKind.WRITE_BACK,
                 op_ids=[7],
                 backup_pages=[(0, 1, "h0", 0)],
                 success=True,
-            )
-        ]
+            ),
+        )
 
         first = executor.poll_results()
         self.assertEqual(first, [])
@@ -1687,7 +1704,11 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
     def test_backup_failure_does_not_ack_writeback(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l2.executor import (
+                HostCacheExecutor,
+                _Ack,
+                _AckKind,
+            )
             from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
@@ -1695,27 +1716,26 @@ class L3FlatKvExecutorTest(unittest.TestCase):
 
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
-        executor._write_acks = []
-        executor._load_acks = []
+        executor._completions = CompletionQueue()
         executor._ready_load_acks = []
         executor._backup_futures = []
         executor._backup_poll_failed = False
         executor._l3_workers = None
-        executor._snapshot_acks = CompletionQueue()
         executor._l3_unread = L3UnreadKeySet(capacity=8)
         executor.l3_store = Mock()
         executor.l3_store.exists.return_value = [False]
         executor.l3_store.backup.return_value = [False]
         finish = Mock()
         finish.query.return_value = True
-        executor._write_acks = [
+        executor._completions.push(
+            finish,
             _Ack(
-                finish_event=finish,
+                kind=_AckKind.WRITE_BACK,
                 op_ids=[7],
                 backup_pages=[(0, 1, "h0", 0)],
                 success=True,
-            )
-        ]
+            ),
+        )
 
         first = None
         failed = False
@@ -1760,10 +1780,8 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
         executor._load_poisoned = False
-        executor._write_acks = []
-        executor._load_acks = []
+        executor._completions = CompletionQueue()
         executor._backup_futures = []
-        executor._snapshot_acks = CompletionQueue()
         executor.l3_store = None
         with self.assertRaisesRegex(ValueError, "must not launch transfers"):
             executor._start_loading(
@@ -1794,10 +1812,8 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
         executor._load_poisoned = False
-        executor._write_acks = []
-        executor._load_acks = []
+        executor._completions = CompletionQueue()
         executor._backup_futures = []
-        executor._snapshot_acks = CompletionQueue()
         executor._load_trackers = [(Mock(), 1)]
         executor.l3_store = None
         self.assertIsNone(
@@ -1810,21 +1826,28 @@ class L3FlatKvExecutorTest(unittest.TestCase):
     def test_shutdown_persists_completed_d2h_before_closing_l3(self):
         try:
             import tokenspeed.runtime.cache.l2.executor as executor_module
-            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor, _Ack
+            from tokenspeed.runtime.cache.l2.executor import (
+                HostCacheExecutor,
+                _Ack,
+                _AckKind,
+            )
             from tokenspeed.runtime.cache.l3.backend import L3UnreadKeySet
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs runtime dependencies: {exc}")
 
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
-        executor._write_acks = [
+        executor._completions = CompletionQueue()
+        executor._completions.push(
+            Mock(),
             _Ack(
-                finish_event=Mock(),
+                kind=_AckKind.WRITE_BACK,
                 op_ids=[7],
                 backup_pages=[(0, 1, "h0", 0)],
                 success=True,
-            )
-        ]
+            ),
+        )
         executor._backup_futures = []
         executor._l3_workers = None
         executor.load_stream = Mock()
@@ -1844,7 +1867,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         default_stream.synchronize.assert_called_once_with()
         executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
         executor.l3_store.close.assert_called_once_with()
-        self.assertEqual(executor._write_acks, [])
+        self.assertEqual(len(executor._completions), 0)
 
 
 class CompactLayoutRoundTripTest(unittest.TestCase):

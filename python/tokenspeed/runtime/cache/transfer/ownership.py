@@ -111,24 +111,27 @@ class BlockOwnerTranslation:
     def num_groups(self) -> int:
         return len(self.shard_counts)
 
-    def owned_rows(
+    def owned_positions(
         self, rows: Sequence[tuple[int, int, int]]
-    ) -> list[tuple[int, int, int]]:
-        """Keep this rank's rows of ``(group_index, device_block, host_block)``, in local ids.
+    ) -> list[tuple[int, tuple[int, int, int]]]:
+        """This rank's rows of ``(group_index, device_block, host_block)`` as
+        ``(position, local_row)`` pairs, ``position`` indexing ``rows``.
 
         Groups rows by group, translates each end through
         ``owned_local_pages`` against its own bound, and requires both ends
         to agree on the owner. Input order is kept within a group; groups
         come out in index order (the transfer workspace buckets by group
-        anyway).
+        anyway). The position lets a caller carry per-row side data -- the
+        L3 key of an L2 row -- for exactly the rows this rank copies.
 
         Raises:
             IndexError: A group index or block id is out of range.
             ValueError: A null block, or a pair owned by two different ranks.
         """
+        positions: list[list[int]] = [[] for _ in self.shard_counts]
         device_ids: list[list[int]] = [[] for _ in self.shard_counts]
         host_ids: list[list[int]] = [[] for _ in self.shard_counts]
-        for group, device_block, host_block in rows:
+        for position, (group, device_block, host_block) in enumerate(rows):
             group = int(group)
             if not 0 <= group < self.num_groups:
                 raise IndexError(f"cache transfer names unknown group {group}")
@@ -136,9 +139,10 @@ class BlockOwnerTranslation:
             host_block = int(host_block)
             if device_block <= 0 or host_block <= 0:
                 raise ValueError("a cache transfer cannot name the null block 0")
+            positions[group].append(position)
             device_ids[group].append(device_block)
             host_ids[group].append(host_block)
-        owned: list[tuple[int, int, int]] = []
+        owned: list[tuple[int, tuple[int, int, int]]] = []
         for group, shard in enumerate(self.shard_counts):
             if not device_ids[group]:
                 continue
@@ -160,10 +164,24 @@ class BlockOwnerTranslation:
                     "different ranks; a Host block must sit in its Device "
                     "block's residue class"
                 )
+            owned_positions = [
+                position
+                for position, is_owned in zip(positions[group], device_owned.tolist())
+                if is_owned
+            ]
             owned.extend(
-                (group, int(device_block), int(host_block))
-                for device_block, host_block in zip(
-                    device_local.tolist(), host_local.tolist()
+                (position, (group, int(device_block), int(host_block)))
+                for position, device_block, host_block in zip(
+                    owned_positions, device_local.tolist(), host_local.tolist()
                 )
             )
         return owned
+
+    def owned_rows(
+        self, rows: Sequence[tuple[int, int, int]]
+    ) -> list[tuple[int, int, int]]:
+        """Keep this rank's rows of ``(group_index, device_block, host_block)``, in local ids.
+
+        :meth:`owned_positions` without the positions.
+        """
+        return [row for _, row in self.owned_positions(rows)]
