@@ -145,10 +145,11 @@ _ROUTE_OWNED_DECODE_MAX_M = 2
 
 # Widest batch the precomputed-top-k entry (DeepSeek V4/V4.1) sends to the
 # direct MFMA decode instead of route + ragged GEMMs. Both give identical
-# results. At V4.1 TP4 shapes (384 experts, H=5120, I=640, top-6), with cold
-# experts, the direct path takes 47.8/122.5/213.3/385.3 us against
-# 62.4/190.4/301.6/447.9 us at M=4/16/32/64, and loses from M=96 (569 vs 544).
-_PRECOMPUTED_DIRECT_DECODE_MAX_M = 64
+# results. At V4.1 TP4 shapes (384 experts, H=5120, I=576, top-6) with top-k
+# ids recorded from serving (rows of a request share experts), the direct
+# path takes 140.8/187.6/243.6 us against 157.9/204.9/245.7 us for the
+# 32-row routed tiles at M=24/36/48, and loses from M=60 (297.3 vs 286.1).
+_PRECOMPUTED_DIRECT_DECODE_MAX_M = 48
 
 # Routed decode with few rows per expert: 32-row tiles instead of the
 # autotuner's 64 (which only drops to 32 from 1024 rows). Identical outputs;
