@@ -91,6 +91,7 @@ if current_platform().is_amd:
             **kwargs,
             launch_logits=launch_gfx950_logits,
             launch_select=launch_dsv41_index_select_gfx950,
+            logits_written=True,
         )
 
     @register_kernel(
