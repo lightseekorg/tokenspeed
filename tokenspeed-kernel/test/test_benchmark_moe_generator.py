@@ -121,6 +121,76 @@ def test_moe_generator_rejects_unimplemented_model_profile() -> None:
         prepare_moe_apply(request, None)
 
 
+def test_topk_generator_selects_and_calls_biased_sqrt_softplus_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    spec = KernelSpec(name="unit_topk", family="moe", mode="topk", solution="unit")
+
+    def capture_selection(_request, _platform, _signature, traits):
+        captured["traits"] = traits
+        return spec
+
+    def capture_topk(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    _use_cpu_allocations(monkeypatch)
+    monkeypatch.setattr(moe_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(moe_generator, "_selected_spec", capture_selection)
+    monkeypatch.setattr(
+        moe_generator,
+        "_generator",
+        lambda seed: torch.Generator().manual_seed(seed),
+    )
+    monkeypatch.setattr(
+        moe_generator,
+        "_randn",
+        lambda shape, *, generator, dtype: torch.randn(
+            shape, generator=generator, dtype=dtype
+        ),
+    )
+    monkeypatch.setattr(moe_ops, "moe_topk", capture_topk)
+    request = BenchmarkRequest(
+        family="moe",
+        mode="topk",
+        parameters={
+            "model_profile": "dsv41_flash_tp4",
+            "score_function": "sqrt_softplus",
+            "tokens": 6,
+            "num_experts": 384,
+            "topk": 6,
+            "router_logits_dtype": "float32",
+            "routed_scaling_factor": 1.5,
+            "normalize_topk_weights": True,
+        },
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+    prepared = moe_generator.prepare_topk(request, None)
+    prepared.invocation.invoke()
+
+    assert prepared.registration is spec
+    assert captured["traits"] == {
+        "tokens": 6,
+        "experts": 384,
+        "top_k": 6,
+        "renormalize": True,
+        "routing_kind": "bias",
+        "score_function": "sqrt_softplus",
+    }
+    router_logits, topk, score_function, selection, renormalize, scaling = captured[
+        "args"
+    ]
+    assert router_logits.shape == (6, 384) and router_logits.dtype is torch.float32
+    assert (topk, score_function, selection) == (6, "sqrt_softplus", "topk")
+    assert renormalize is True and scaling == 1.5
+    assert captured["kwargs"]["correction_bias"].shape == (384,)
+
+
 def test_moe_apply_generator_precomputes_local_ep_routes(
     fresh_registry,
     monkeypatch,

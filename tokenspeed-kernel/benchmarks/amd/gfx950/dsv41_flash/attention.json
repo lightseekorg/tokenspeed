@@ -1,0 +1,301 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "dsv41_flash_tp4",
+    "local_heads": 16,
+    "swa_window": 128,
+    "index_topk": 512,
+    "index_heads": 32,
+    "candidate_block_size": 8,
+    "candidate_topk_blocks": 2048
+  },
+  "cases": [
+    {
+      "id": "dsv41_flash.attention.dsv41_selected_attention/verify-swa-b32-t6-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_selected_attention",
+        "parameters": {
+          "batch": 32,
+          "q_len_per_req": 6,
+          "context_length": 8192,
+          "compress_ratio": 0
+        },
+        "registration": "gluon_dsv41_selected_attention_gfx950",
+        "cold_cache": true,
+        "seed": 5001
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_selected_attention/verify-csa-b32-t6-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_selected_attention",
+        "parameters": {
+          "batch": 32,
+          "q_len_per_req": 6,
+          "context_length": [8192, 65536],
+          "compress_ratio": [1, 2]
+        },
+        "registration": "gluon_dsv41_selected_attention_gfx950",
+        "cold_cache": true,
+        "seed": 5002
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_selected_attention/verify-csa-b1-t6-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_selected_attention",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 6,
+          "context_length": 8192,
+          "compress_ratio": 1
+        },
+        "registration": "gluon_dsv41_selected_attention_gfx950",
+        "cold_cache": true,
+        "seed": 5003
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv4_prefill/cold-swa-t8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv4_prefill",
+        "parameters": {
+          "prefix_tokens": 0,
+          "tokens": 8192,
+          "compress_ratio": 0
+        },
+        "registration": "gluon_dsv4_prefill_gfx950",
+        "cold_cache": true,
+        "seed": 5101
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv4_prefill/cold-csa2-t8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv4_prefill",
+        "parameters": {
+          "prefix_tokens": 0,
+          "tokens": 8192,
+          "compress_ratio": 2
+        },
+        "registration": "gluon_dsv4_prefill_gfx950",
+        "cold_cache": true,
+        "seed": 5102
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 50.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv4_prefill/extend-csa1-p8192-t8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv4_prefill",
+        "parameters": {
+          "prefix_tokens": 8192,
+          "tokens": 8192,
+          "compress_ratio": 1
+        },
+        "registration": "gluon_dsv4_prefill_gfx950",
+        "cold_cache": true,
+        "seed": 5103
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 50.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/verify-full-csa2-b32-t6-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 20,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 32,
+          "q_len_per_req": 6,
+          "context_length": 8192,
+          "compress_ratio": 2,
+          "selection": "full",
+          "table_pages": [1024, 8192],
+          "query_chunk_size": 256
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5201
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/verify-full-candidates-csa1-b32-t6-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 20,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 32,
+          "q_len_per_req": 6,
+          "context_length": 8192,
+          "compress_ratio": 1,
+          "selection": "full_candidates",
+          "table_pages": 16384,
+          "query_chunk_size": 256
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5202
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/verify-reindex-csa1-b32-t6-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 32,
+          "q_len_per_req": 6,
+          "context_length": 65536,
+          "compress_ratio": 1,
+          "selection": "reindex",
+          "table_pages": 16384,
+          "query_chunk_size": 256
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5203
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/cold-full-csa2-t8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 8192,
+          "context_length": 8192,
+          "compress_ratio": 2,
+          "selection": "full",
+          "table_pages": 64,
+          "query_chunk_size": 1024
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5204
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/cold-full-candidates-csa1-t8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 8192,
+          "context_length": 8192,
+          "compress_ratio": 1,
+          "selection": "full_candidates",
+          "table_pages": 128,
+          "query_chunk_size": 1024
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5205
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/extend-reindex-csa1-p8192-t8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 8192,
+          "context_length": 16384,
+          "compress_ratio": 1,
+          "selection": "reindex",
+          "table_pages": 256,
+          "query_chunk_size": 1024
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5206
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}

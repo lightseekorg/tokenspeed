@@ -35,12 +35,14 @@ from tokenspeed_kernel.benchmark.harness import (
 )
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
-from tokenspeed_kernel.selection import NoKernelFoundError
+from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["prepare_attn_res_fwd"]
+__all__ = ["prepare_attn_res_fwd", "prepare_mhc_mixes", "prepare_mhc_post"]
 
 
 _IMPLEMENTED_MODEL_PROFILES = frozenset({"kimi_k3_tp8"})
+_IMPLEMENTED_MHC_MODEL_PROFILES = frozenset({"dsv41_flash_tp4"})
 
 
 def _invalid(message: str) -> BenchmarkCaseError:
@@ -195,6 +197,178 @@ def prepare_attn_res_fwd(
             "eps": eps,
             "dtype": "bfloat16",
             "block_storage_rows": blocks.shape[0],
+        },
+        validation=None,
+    )
+
+
+def _mhc_common(request: BenchmarkRequest, mode: str) -> tuple[str, int, int, int]:
+    """Validate the shared mHC request fields; returns profile, T, HC and H."""
+    if request.registration is not None or request.solution is not None:
+        raise _invalid(f"{mode} cases use normal kernel selection")
+    parameters = request.parameters
+    if parameters.get("validation") is not None:
+        raise _invalid("mHC benchmark correctness validation is not implemented")
+    model_profile = parameters["model_profile"]
+    if model_profile not in _IMPLEMENTED_MHC_MODEL_PROFILES:
+        raise _invalid(
+            f"Implemented mHC model_profile values: "
+            f"{', '.join(sorted(_IMPLEMENTED_MHC_MODEL_PROFILES))}"
+        )
+    if parameters["dtype"] != "bfloat16":
+        raise _invalid("mHC dtype must be bfloat16")
+    return (
+        model_profile,
+        _positive(parameters, "tokens"),
+        _positive(parameters, "hc_mult"),
+        _positive(parameters, "hidden_size"),
+    )
+
+
+def _registered_spec(name: str):
+    spec = KernelRegistry.get().get_by_name(name)
+    if spec is None:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.REGISTRATION_MISSING,
+            f"Selected registration {name!r} is not available",
+        )
+    return spec
+
+
+def prepare_mhc_mixes(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one mHC coefficient computation over the full residual stream.
+
+    DeepSeek V4.1 runs this before attention and before the FFN of every layer:
+    an RMS-normalized ``[T, HC*H] x [HC*H, 2*HC + HC*HC]`` projection followed
+    by the sigmoid pre/post mixes and a Sinkhorn-normalized combine matrix.
+    """
+
+    model_profile, tokens, hc_mult, hidden_size = _mhc_common(request, "mhc_mixes")
+    parameters = request.parameters
+    if hc_mult != 4:
+        raise _invalid("mhc_mixes requires hc_mult 4")
+    sinkhorn_iters = _positive(parameters, "sinkhorn_iters")
+    rms_eps = float(parameters["rms_eps"])
+    hc_eps = float(parameters["hc_eps"])
+    mix_width = 2 * hc_mult + hc_mult * hc_mult
+
+    from tokenspeed_kernel.ops import residual as residual_ops
+
+    load_builtin_kernels()
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_mixes",
+            format_signature(residual=dense_tensor_format(torch.bfloat16)),
+            platform=platform,
+            traits=None,
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError as error:
+        raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
+
+    (residual,) = _random_tensors(request.seed, (tokens, hc_mult, hidden_size))
+    generator = torch.Generator(device="cuda").manual_seed(request.seed + 1)
+    weight = torch.randn(
+        (mix_width, hc_mult * hidden_size),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    ).mul_(0.01)
+    scale = torch.ones(3, device="cuda", dtype=torch.float32)
+    base = torch.zeros(mix_width, device="cuda", dtype=torch.float32)
+
+    def invoke() -> object:
+        return residual_ops.mhc_mixes(
+            residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters
+        )
+
+    return PreparedBenchmark(
+        registration=_registered_spec(kernel.name),
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            "model_profile": model_profile,
+            "tokens": tokens,
+            "hc_mult": hc_mult,
+            "hidden_size": hidden_size,
+            "sinkhorn_iters": sinkhorn_iters,
+            "rms_eps": rms_eps,
+            "hc_eps": hc_eps,
+            "dtype": "bfloat16",
+        },
+        validation=None,
+    )
+
+
+def prepare_mhc_post(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one mHC post-mapping: scatter a sublayer output into the streams."""
+
+    model_profile, tokens, hc_mult, hidden_size = _mhc_common(request, "mhc_post")
+    from tokenspeed_kernel.ops import residual as residual_ops
+
+    load_builtin_kernels()
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_post",
+            format_signature(
+                hidden_states=dense_tensor_format(torch.bfloat16),
+                residual=dense_tensor_format(torch.bfloat16),
+                post=dense_tensor_format(torch.float32),
+                comb=dense_tensor_format(torch.float32),
+            ),
+            platform=platform,
+            traits={
+                "num_tokens": tokens,
+                "hc_mult": hc_mult,
+                "hidden_size": hidden_size,
+            },
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError as error:
+        raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
+
+    hidden_states, residual = _random_tensors(
+        request.seed,
+        (tokens, hidden_size),
+        (tokens, hc_mult, hidden_size),
+    )
+    generator = torch.Generator(device="cuda").manual_seed(request.seed + 1)
+    post = 2.0 * torch.rand(
+        (tokens, hc_mult, 1), device="cuda", dtype=torch.float32, generator=generator
+    )
+    # Sinkhorn output is doubly stochastic; any row-normalized matrix has the
+    # same cost.
+    comb = torch.rand(
+        (tokens, hc_mult, hc_mult),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+    comb = comb / comb.sum(-1, keepdim=True)
+
+    def invoke() -> object:
+        return residual_ops.mhc_post(
+            hidden_states, residual, post, comb, override=None, solution=None
+        )
+
+    return PreparedBenchmark(
+        registration=_registered_spec(kernel.name),
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            "model_profile": model_profile,
+            "tokens": tokens,
+            "hc_mult": hc_mult,
+            "hidden_size": hidden_size,
+            "dtype": "bfloat16",
         },
         validation=None,
     )

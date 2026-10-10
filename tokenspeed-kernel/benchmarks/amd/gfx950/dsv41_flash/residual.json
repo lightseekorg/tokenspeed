@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "dsv41_flash_tp4",
+    "hc_mult": 4,
+    "hidden_size": 5120,
+    "dtype": "bfloat16"
+  },
+  "cases": [
+    {
+      "id": "dsv41_flash.residual.mhc_mixes/hc4-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "residual",
+        "mode": "mhc_mixes",
+        "parameters": {
+          "tokens": [192, 8192],
+          "sinkhorn_iters": 20,
+          "rms_eps": 1e-20,
+          "hc_eps": 1e-06
+        },
+        "cold_cache": true,
+        "seed": 5401
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.residual.mhc_post/hc4-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "residual",
+        "mode": "mhc_post",
+        "parameters": {
+          "tokens": [192, 8192]
+        },
+        "cold_cache": true,
+        "seed": 5402
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    }
+  ]
+}

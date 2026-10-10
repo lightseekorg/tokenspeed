@@ -290,6 +290,456 @@
         "max_regression_absolute_us": 0.5,
         "max_relative_mad": 0.05
       }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/idx_wq_b-m1024-n4096-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 1024,
+          "N": 4096,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 5501
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/gluon_mm_mxfp8_gfx950/idx_wq_b-m4096-n4096-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 4096,
+          "N": 4096,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "registration": "gluon_mm_mxfp8_gfx950",
+        "cold_cache": true,
+        "seed": 5502
+      },
+      "policy": {
+        "max_regression_relative": 0.1,
+        "max_regression_absolute_us": 0.5,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-shared_gate_up-m4096-n1152-k5120-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 4096,
+          "N": 1152,
+          "K": 5120,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5503
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-shared_down-m4096-n5120-k576-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 4096,
+          "N": 5120,
+          "K": 576,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5504
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/wq_a_wkv-m6-n1792-k5120-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 6,
+          "N": 1792,
+          "K": 5120,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5505
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-wq_b-m6-n8192-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 6,
+          "N": 8192,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5506
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-wo_b-m6-n5120-k2048-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 6,
+          "N": 5120,
+          "K": 2048,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5507
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/idx_wq_b-m6-n4096-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 6,
+          "N": 4096,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5508
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-shared_gate_up-m6-n1152-k5120-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 6,
+          "N": 1152,
+          "K": 5120,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5509
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-shared_down-m6-n5120-k576-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 6,
+          "N": 5120,
+          "K": 576,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5510
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/wq_a_wkv-m192-n1792-k5120-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 192,
+          "N": 1792,
+          "K": 5120,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5511
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-wq_b-m192-n8192-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 192,
+          "N": 8192,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5512
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-wo_b-m192-n5120-k2048-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 192,
+          "N": 5120,
+          "K": 2048,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5513
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/idx_wq_b-m192-n4096-k1280-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 192,
+          "N": 4096,
+          "K": 1280,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5514
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-shared_gate_up-m192-n1152-k5120-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 192,
+          "N": 1152,
+          "K": 5120,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5515
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/tp4-shared_down-m192-n5120-k576-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 192,
+          "N": 5120,
+          "K": 576,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5516
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
     }
   ]
 }
