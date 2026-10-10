@@ -144,12 +144,12 @@ _ROUTE_OWNED_DECODE_MAX_M = 2
 
 
 # Widest batch the precomputed-top-k entry (DeepSeek V4/V4.1) sends to the
-# direct MFMA decode instead of route + ragged GEMMs. Both give identical
-# results. At V4.1 TP4 shapes (384 experts, H=5120, I=576, top-6) with top-k
-# ids recorded from serving (rows of a request share experts), the direct
-# path takes 140.8/187.6/243.6 us against 157.9/204.9/245.7 us for the
-# 32-row routed tiles at M=24/36/48, and loses from M=60 (297.3 vs 286.1).
-_PRECOMPUTED_DIRECT_DECODE_MAX_M = 48
+# direct MFMA decode instead of the sorted package kernels. Both give
+# identical results. At V4.1 TP4 shapes (384 experts, H=5120, I=576, top-6)
+# with top-k ids recorded from serving, under CUDA graphs, the direct path
+# takes 70.4/97.4/135.1 us against 77.1/87.9/114.3 us for the package at
+# M=12/15/24.
+_PRECOMPUTED_DIRECT_DECODE_MAX_M = 12
 
 # Routed decode with few rows per expert: 32-row tiles instead of the
 # autotuner's 64 (which only drops to 32 from 1024 rows). Identical outputs;
@@ -1826,6 +1826,35 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     )
     if direct_out is not None:
         return direct_out
+    if w13_bias is None and w2_bias is None:
+        # The sorted package kernels beat route + ragged GEMMs at every size
+        # past the direct decode; the scratch + FP32 reduce epilogue keeps the
+        # result identical to the ragged path's.
+        package_out = _maybe_gluon_package_mxfp4_prefill(
+            hidden_states,
+            hidden_states.new_empty((n_tokens, 0)),
+            w13_weight,
+            w2_weight,
+            w13_mx_scale=w13_mx_scale,
+            w2_mx_scale=w2_mx_scale,
+            top_k=int(top_k),
+            correction_bias=None,
+            n_group=0,
+            topk_group=0,
+            routed_scaling_factor=1.0,
+            normalize_topk_weights=False,
+            routing_method_type=0,
+            precomputed_topk_weights=topk_weights,
+            precomputed_topk_ids=topk_ids,
+            out_dtype=out_dtype,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
+            out=out,
+            force_reduce=True,
+        )
+        if package_out is not None:
+            return package_out
     if n_tokens < SMALLM_MAX_M and n_tokens * top_k <= GLUON_ROUTE_MAX_G:
         ragged_metadata, gather_indx, scatter_indx, gate_scal = (
             gluon_precomputed_topk_fused_route(
