@@ -134,20 +134,28 @@ LoadBackOperation TierTransferManager::startLoadBack(std::vector<BlockTransfer> 
     return LoadBackOperation{op_id, std::move(transfers)};
 }
 
-void TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
+std::vector<HostPublication> TierTransferManager::CompleteWriteBack(std::uint32_t op_id) {
     // The runtime emits this ACK only after the asynchronous copy completes.
     // Transfer errors terminate the runtime and must never publish cache state.
     auto it = write_backs_.find(op_id);
     if (it == write_backs_.end()) {
-        return;
+        return {};
     }
     std::vector<StoreTicket> stores = std::move(it->second.tickets);
     write_backs_.erase(it);
     // Publishing the Host entry also drops the tickets' Device pins (if any)
-    // when `stores` goes out of scope: the source is evictable again.
+    // when `stores` goes out of scope: the source is evictable again. When
+    // the key already has a canonical Host entry (an L3 prefetch of it landed
+    // first), Register re-points the ticket's reference to that entry and the
+    // ticket's own block goes unindexed; the returned publication names the
+    // canonical block so the images pinned on the ticket's block follow.
+    std::vector<HostPublication> published;
+    published.reserve(stores.size());
     for (StoreTicket& ticket : stores) {
         coordinator_.CacheHostBlock(ticket.host_block_ref, ticket.key);
+        published.push_back(HostPublication{.key = ticket.key, .block = ticket.host_block_ref});
     }
+    return published;
 }
 
 void TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {

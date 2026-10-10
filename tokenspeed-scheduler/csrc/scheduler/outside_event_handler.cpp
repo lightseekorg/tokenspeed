@@ -173,13 +173,16 @@ void Scheduler::handleEvent(const forward::RecomputeRetract& event) {
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
-    tier_transfers_.CompleteWriteBack(event.op_id);
+    const std::vector<HostPublication> published = tier_transfers_.CompleteWriteBack(event.op_id);
     // A retraction image's L2 leg: every suspended request waiting for this
-    // store (its own, or an earlier one carrying one of its keys) notes it.
+    // store (its own, or an earlier one carrying one of its keys) notes it
+    // and follows the Host entries as published, which may differ from the
+    // ticket's blocks it pinned when the index redirected a key to an entry
+    // an L3 prefetch landed first.
     for (const std::unique_ptr<Request>& request : requests_) {
         const auto* retracted = request->GetIf<fsm::Retracted>();
         if (retracted != nullptr && retracted->WaitsForStore(event.op_id)) {
-            request->Apply(fsm::StoreLandedEvent{event.op_id});
+            request->Apply(fsm::StoreLandedEvent{event.op_id, published});
         }
     }
 }
@@ -195,7 +198,7 @@ void Scheduler::handleEvent(const cache::SnapshotDone& event) {
     }
     Request* request = findRequest(*request_id);
     if (request != nullptr && request->Is<fsm::Retracted>()) {
-        request->Apply(fsm::StoreLandedEvent{event.op_id});
+        request->Apply(fsm::StoreLandedEvent{event.op_id, /*published=*/{}});
     }
 }
 

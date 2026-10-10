@@ -80,7 +80,11 @@ public:
                                                   std::int32_t snapshot_slot, std::vector<BlockTransfer> load_pairs,
                                                   std::vector<BlockTransfer> snapshot_pairs);
 
-    void CompleteWriteBack(std::uint32_t op_id);
+    // Publishes every ticket's Host entry and drops the op's pins. Returns
+    // the entries as published -- the block canonical for each key after the
+    // index possibly redirected the publication to an existing entry -- so a
+    // retraction image pinned on a ticket's block can follow the redirect.
+    std::vector<HostPublication> CompleteWriteBack(std::uint32_t op_id);
     void CompleteLoadBack(std::uint32_t op_id, bool success);
     // Returns the request the op belonged to (nullopt for an unknown or
     // duplicate ACK) so the scheduler can advance its FSM.

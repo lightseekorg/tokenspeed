@@ -2453,6 +2453,119 @@ TEST_F(FusedRetractionL2TestSuite, FinishWhileRetractedReleasesTheImage) {
     EXPECT_EQ(FindRestore(PlanOnce()), nullptr);
 }
 
+// An L3 prefetch of a key the retraction's L2 leg is also storing: whichever
+// publication lands second is redirected to the first one's Host block, and
+// the image must end up pinning the canonical entry rather than an unindexed
+// block of its own. Mixed mode so the prefetching prompt is admitted beside
+// the victim's decode; the knob retracts the victim at the fourth plan.
+class ImageFollowsCanonicalHostEntrySuite : public FusedRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FusedRetractionL2TestSuite::MakeConfig();
+        cfg.enable_l3_storage = true;
+        cfg.enable_mixed_prefill_decode = true;
+        cfg.debug_force_retraction_interval = 4;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(ImageFollowsCanonicalHostEntrySuite, ARedirectedStoreAckRePointsTheImageToTheCanonicalEntry) {
+    // r1 = [1 2 3 4] decodes 42, 43, 44: its prompt pages stream to Host at
+    // the first decode; the decode page [42 43] completes at plan 3 and is
+    // published only when r1 is retracted at plan 4.
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    PlanOnce();  // plan 1
+    SendForwardDone("r1", {42});
+    const ExecutionPlan p2 = PlanOnce();
+    AckWriteBacks(p2);  // K1, K2 are Host-cached (and remembered as L3 objects)
+    SendForwardDone("r1", {43});
+
+    // r3 shares r1's first six tokens. Its third page [42 43] is not on the
+    // Device yet (r1 publishes it only at its retraction) but is registered as
+    // an L3 object, so r3's admission beside r1's decode at plan 3 prefetches
+    // it into a fresh Host block.
+    const RequestSpec r3{.request_id = "r3", .tokens = {1, 2, 3, 4, 42, 43, 7, 8}};
+    const std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(r3.tokens);
+    ASSERT_EQ(hashes.size(), 3u);
+    scheduler_->RegisterStorageKeys(scheduler_->ExpandPrefixKeys(hashes));
+    Submit(r3);
+    const ExecutionPlan p3 = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(p3)->request_ids.size(), 2u) << "r3's prefill rides beside r1's decode";
+    const auto load_ops = ExtractCacheOpsOfKind<LoadBackBatch>(p3);
+    ASSERT_EQ(load_ops.size(), 1u) << "the third page is an L3 hit";
+    const auto& load = std::get<LoadBackBatch>(load_ops.front());
+    ASSERT_EQ(load.src_pages.at(0).size(), 2u) << "[42 43] in both groups";
+    EXPECT_TRUE(std::ranges::all_of(load.prefetch_from_storage.at(0), [](std::uint8_t flag) { return flag != 0; }));
+    SendForwardDone("r1", {44});
+    SendForwardDone("r3", {9});
+
+    // Plan 4: the knob retracts r1. Its L2 leg finds [42 43] neither
+    // Host-cached nor on an in-flight store (the prefetch is a load) and
+    // copies it into Host blocks of its own.
+    const ExecutionPlan p4 = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    const auto write_backs = ExtractCacheOpsOfKind<WriteBackBatch>(p4);
+    ASSERT_EQ(write_backs.size(), 1u);
+    const auto& batch = std::get<WriteBackBatch>(write_backs.front());
+    // The batch carries the image's stream-ordered leg and r3's pinned
+    // publication of [7 8]; the latter is acknowledged at once, the former
+    // held back to lose the race.
+    std::uint32_t image_store = 0;
+    for (std::size_t i = 0; i < batch.op_ids.size(); ++i) {
+        if (batch.source_pinned.at(i)) {
+            SendWriteBackDone(batch.op_ids.at(i));
+        } else {
+            image_store = batch.op_ids.at(i);
+            ASSERT_EQ(batch.src_pages.at(i).size(), 2u) << "[42 43] in both groups";
+        }
+    }
+    ASSERT_NE(image_store, 0u);
+    const std::int32_t host_free_during_race = scheduler_->HostPoolFreeBlocks();
+
+    // The prefetch lands first: its blocks become canonical for [42 43].
+    SendLoadBackDone(load.op_ids.at(0), /*success=*/true);
+    const std::int32_t host_cached_after_prefetch = scheduler_->HostPoolCachedBlocks();
+    // The image's store lands second and is redirected: the image follows the
+    // canonical entries, its own two blocks return to the pool, and every
+    // Host entry of the image is pinned by it.
+    SendWriteBackDone(image_store);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), host_cached_after_prefetch) << "no second entry for [42 43]";
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), host_free_during_race + 2) << "the redirected store's blocks return";
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6) << "the image pins K1, K2 and the canonical [42 43] entries";
+
+    // Make the restore copy [42 43] back from Host: r3 leaves and a churn
+    // prompt evicts every cache-only Device block before the image lands.
+    SendForwardDone("r3", {10});
+    SendFinish("r3");
+    AckWriteBacks(PlanOnce());
+    Submit(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
+    const ExecutionPlan churn = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(churn)->request_ids, std::vector<std::string>{"churn"});
+    AckWriteBacks(churn);
+    SendForwardDone("churn", {509});
+    SendFinish("churn");
+    AckWriteBacks(PlanOnce());
+    for (const CacheOperation& op : ExtractCacheOpsOfKind<SnapshotStoreBatch>(p4)) {
+        for (const std::uint32_t id : std::get<SnapshotStoreBatch>(op).op_ids) {
+            SendSnapshotDone(id);
+        }
+    }
+
+    const ExecutionPlan readmit = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr) << "a pinned entry the restore cannot find would have asserted here";
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_GE(restore->src_pages.at(0).size(), 2u) << "[42 43] comes back from the canonical Host entries";
+    for (const std::uint8_t tier : restore->source_tiers.at(0)) {
+        EXPECT_EQ(tier, static_cast<std::uint8_t>(HostTier::kL2));
+    }
+    AckRestores(readmit);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+    EXPECT_EQ(scheduler_->RequestTokenSize("r1"), 7);
+    AckWriteBacks(readmit);
+}
+
 // Two victims whose images share pages carried by one earlier, still
 // unacknowledged store: neither copies them again, and both wait for it.
 class SharedImagePagesSuite : public FusedRetractionL2TestSuite {

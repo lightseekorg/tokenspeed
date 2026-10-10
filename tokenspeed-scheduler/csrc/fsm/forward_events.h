@@ -22,6 +22,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -224,20 +225,24 @@ private:
 };
 
 // One of the image's store ops was acknowledged (WriteBackDone for the L2
-// leg, SnapshotDone for the tail leg); once none is pending the image has
-// landed and the request may be restored.
+// leg, with the Host entries it published; SnapshotDone for the tail leg,
+// with none); once none is pending the image has landed and the request may
+// be restored. The published entries let the image follow a publication the
+// Host index redirected to an existing canonical block.
 struct StoreLandedEvent : InvalidTransitionHandler<StoreLandedEvent> {
     using InvalidTransitionHandler<StoreLandedEvent>::operator();
 
-    explicit StoreLandedEvent(std::uint32_t op_id) : op_id_{op_id} {}
+    StoreLandedEvent(std::uint32_t op_id, std::span<const HostPublication> published)
+        : op_id_{op_id}, published_{published} {}
 
     Retracted operator()(Retracted&& state) {
-        state.NoteStoreLanded(op_id_);
+        state.NoteStoreLanded(op_id_, published_);
         return std::move(state);
     }
 
 private:
     std::uint32_t op_id_{0};
+    std::span<const HostPublication> published_;
 };
 
 // The restore was admitted: fresh Device pages for the whole image (the

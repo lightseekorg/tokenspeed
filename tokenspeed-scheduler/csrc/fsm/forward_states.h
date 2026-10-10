@@ -268,7 +268,13 @@ struct Retracted {
     bool WaitsForStore(std::uint32_t op_id) const {
         return std::find(pending_store_ops.begin(), pending_store_ops.end(), op_id) != pending_store_ops.end();
     }
-    void NoteStoreLanded(std::uint32_t op_id) { std::erase(pending_store_ops, op_id); }
+    // The store landed; its publications say which Host block is canonical
+    // for each key, and the image's L2 slots follow (an L3 prefetch of the
+    // same key may have published first, leaving the ticket's block unindexed).
+    void NoteStoreLanded(std::uint32_t op_id, std::span<const HostPublication> published) {
+        std::erase(pending_store_ops, op_id);
+        image.FollowPublished(published);
+    }
 };
 
 // The image is being copied back into freshly allocated Device pages: the

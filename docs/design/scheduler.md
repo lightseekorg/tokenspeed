@@ -414,7 +414,16 @@ classifies every data slot of every table:
   `StoreSourceGuard::kStreamOrdered`. The image holds a pinned `CacheBlockRef`
   on each Host entry until the restore lands, so the planner cannot evict it
   and `ClearCache` refuses, but the entries are published prefix cache like any
-  other and later prompts may hit them.
+  other and later prompts may hit them. The pin follows the publication, not
+  the ticket's block: when the store's ACK finds the key already canonical on
+  Host (an L3 prefetch of the same page by another prompt landed first),
+  `PrefixCacheIndex::Register` redirects the ticket to that entry, and
+  `CompleteWriteBack` hands the entries as published to every `Retracted`
+  request waiting for the op (`StoreLandedEvent`,
+  `RetractionImage::FollowPublished`), which re-points its slot to the
+  canonical block and lets its own unindexed block return to the pool. An
+  image therefore never pins a Host block the index does not know, and the
+  restore's L2 rows always come from published entries.
 - *The tail leg.* Every other slot — the unaligned tail, groups that never
   publish (snapshot-state working blocks, replayable groups), and with no Host
   cache the whole image — gets a block of the request-private

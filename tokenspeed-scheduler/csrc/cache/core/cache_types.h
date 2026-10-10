@@ -195,6 +195,15 @@ struct BlockTransfer {
     bool prefetch_from_storage{false};
 };
 
+// A Host L2 entry a store's ACK published: the key and the block that is now
+// canonical for it -- the ticket's own block, or an existing entry the index
+// redirected the publication to (an L3 prefetch of the same key may have
+// landed first). Whoever pinned the ticket's block for that key follows it.
+struct HostPublication {
+    CacheKey key;
+    CacheBlockRef block;
+};
+
 // One imaged block of a retracted request's table: the logical slot it sat
 // in and the Host block that holds its bytes. A slot whose Device block was
 // a published prefix entry rides Host L2 as that entry (key set; the image
@@ -229,6 +238,25 @@ struct ImageTable {
 // releases both.
 struct RetractionImage {
     std::vector<ImageTable> tables;
+
+    // Re-points every L2 slot whose key one of `published` names to the block
+    // now canonical for it. A slot pinned on a store ticket's block follows
+    // the ACK's redirect this way, so the image never holds an unindexed Host
+    // block; the old block's last reference drops here.
+    void FollowPublished(std::span<const HostPublication> published) {
+        for (ImageTable& table : tables) {
+            for (ImageSlot& slot : table.slots) {
+                if (!slot.InHostCache()) {
+                    continue;
+                }
+                for (const HostPublication& entry : published) {
+                    if (entry.key == slot.key && entry.block != slot.block) {
+                        slot.block = entry.block;
+                    }
+                }
+            }
+        }
+    }
 };
 
 }  // namespace tokenspeed
