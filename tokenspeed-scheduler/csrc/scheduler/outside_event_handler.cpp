@@ -200,16 +200,23 @@ void Scheduler::handleEvent(const cache::SnapshotDone& event) {
 }
 
 void Scheduler::handleEvent(const cache::RestoreDone& event) {
-    const std::optional<std::string> request_id = tier_transfers_.CompleteSnapshotRestore(event.op_id);
+    const std::optional<std::string> request_id = tier_transfers_.SnapshotRestoreRequest(event.op_id);
     if (!request_id) {
         return;  // unknown or duplicate ACK
     }
     Request* request = findRequest(*request_id);
-    if (request == nullptr) {
-        return;  // finished or aborted while restoring; the ACK only dropped the pins
+    const fsm::Restoring* restoring = request == nullptr ? nullptr : request->GetIf<fsm::Restoring>();
+    // Finished or aborted while restoring: the ACK only drops the pins.
+    const bool resumes = restoring != nullptr && restoring->restore_op == event.op_id;
+    if (resumes) {
+        // The ACK republishes the L2-tier destinations into the Device index,
+        // a KV-event mutation of boundaries whose descriptors DrainKvEvents
+        // dropped when the victim's pages left the Device: register them
+        // again first, as a first chunk does for the load-backs it issues.
+        registerKvEventPrefixPages(*request, restoring->resources.cache_progress.prefix_hashes, 0);
     }
-    const auto* restoring = request->GetIf<fsm::Restoring>();
-    if (restoring != nullptr && restoring->restore_op == event.op_id) {
+    tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
+    if (resumes) {
         request->Apply(fsm::RestoreDoneEvent{});
     }
 }

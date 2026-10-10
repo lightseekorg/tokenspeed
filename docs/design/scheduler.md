@@ -729,8 +729,20 @@ be invisible at once.
 pinned Host entries become ordinary evictable entries at once and the pool
 blocks return when the copies still writing them land (the tickets hold the
 refs); from `Restoring`, the rebuilt tables are freed and the restore's ACK
-only drops its pins (`CompleteSnapshotRestore` still republishes the L2 rows
-— the bytes are whole). A late ACK for a dropped image is harmless.
+only drops its pins — it republishes nothing, because the token descriptors
+the KV-event feed needs for a publication died with the request. A late ACK
+for a dropped image is harmless.
+
+**KV-event descriptors.** With `enable_kv_cache_events`, every Device
+publication is a mutation of a boundary that must already have its token
+descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
+descriptor of a boundary with no cached child. Retraction publishes twice
+without an admission: `retractVictim` registers the newly hashed pages before
+`CacheCompletedBlocks` (as the finish-time publication does), and the
+`RestoreDone` handler registers the restored request's whole prefix chain
+before `CompleteSnapshotRestore` republishes its L2-tier destinations — the
+victim's pages left the Device when they were granted away, so their
+descriptors are typically gone by the time the restore lands.
 
 **A readmission that does not fit, waits.** Its failed restore never
 triggers retraction (it is never recorded as the capacity blocker): when the

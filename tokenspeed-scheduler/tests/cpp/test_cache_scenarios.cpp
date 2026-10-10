@@ -23,6 +23,7 @@
 // writeback and recovery.
 
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -2243,6 +2244,128 @@ TEST_F(FusedRetractionL2TestSuite, ADecodingVictimResumesDecodingWithoutRecomput
     ASSERT_NE(hit_op, nullptr);
     ASSERT_EQ(hit_op->request_ids, std::vector<std::string>{"r3"});
     EXPECT_EQ(hit_op->extend_prefix_lens.at(0), 6);
+}
+
+// The KV-event feed on: every Device publication mutates a boundary that must
+// already carry its token descriptor, and a drain drops the descriptor of a
+// boundary with no cached child.
+class FusedRetractionKvEventsSuite : public FusedRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FusedRetractionL2TestSuite::MakeConfig();
+        cfg.enable_kv_cache_events = true;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // The boundaries the feed currently reports as stored, keyed by their
+    // tokens; a drain's events are applied in order (removals first).
+    using Published = std::map<std::vector<std::int32_t>, std::uint64_t>;
+    static void Apply(Published& published, const std::vector<KvCacheEvent>& events) {
+        std::map<std::uint64_t, std::vector<std::int32_t>> by_hash;
+        for (const auto& [tokens, hash] : published) {
+            by_hash.emplace(hash, tokens);
+        }
+        for (const KvCacheEvent& event : events) {
+            if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+                for (const std::uint64_t hash : removed->block_hashes) {
+                    ASSERT_TRUE(by_hash.contains(hash)) << "a removal names a boundary never stored";
+                    published.erase(by_hash.at(hash));
+                }
+            } else {
+                const auto& stored = std::get<KvBlockStoredEvent>(event);
+                ASSERT_EQ(stored.block_hashes.size(), 1u);
+                ASSERT_TRUE(published.emplace(stored.token_ids, stored.block_hashes.front()).second)
+                    << "a boundary is stored once until it is removed";
+            }
+        }
+    }
+    static std::size_t NumStored(const std::vector<KvCacheEvent>& events) {
+        return static_cast<std::size_t>(std::ranges::count_if(
+            events, [](const KvCacheEvent& event) { return std::holds_alternative<KvBlockStoredEvent>(event); }));
+    }
+    static std::size_t NumRemoved(const std::vector<KvCacheEvent>& events) { return events.size() - NumStored(events); }
+};
+
+TEST_F(FusedRetractionKvEventsSuite, RetractionAndRestorePublishWithTheirDescriptorsRegistered) {
+    // Both publications a retraction makes happen outside an admission: the
+    // retraction itself publishes the victim's decode-completed page (which
+    // no admission has registered), and the restore's ACK republishes the
+    // L2-tier destinations of boundaries whose descriptors a drain dropped
+    // when the victim's pages left the Device. Either would be fatal without
+    // the registration that precedes it.
+    Published published;
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    CompleteStores(PlanOnce());  // the first decodes publish both prompts' pages
+    Apply(published, scheduler_->DrainKvEvents());
+    EXPECT_EQ(published.size(), 4u) << "two prompt pages each";
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {144});
+
+    // r1 = [1 2 3 4 42 43 44]: the blocked round retracts it, publishing the
+    // decode page [42 43] on the way out, and grants two of its freed blocks
+    // to r2's decode in the same round, which evicts two of r1's six
+    // cache-only blocks: whichever boundary they belong to is incomplete by
+    // the time of the drain, so it is either reported removed or (published
+    // and evicted within the round) never reported at all -- and its
+    // descriptor is dropped either way.
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    CompleteStores(retraction);
+    Apply(published, scheduler_->DrainKvEvents());
+    const std::vector<std::vector<std::int32_t>> r1_pages{{1, 2}, {3, 4}, {42, 43}};
+    const auto missing = [&] {
+        std::vector<std::vector<std::int32_t>> result;
+        for (const auto& page : r1_pages) {
+            if (!published.contains(page)) {
+                result.push_back(page);
+            }
+        }
+        return result;
+    };
+    const std::vector<std::vector<std::int32_t>> broken = missing();
+    ASSERT_FALSE(broken.empty()) << "r2's grant evicted part of r1's published prefix";
+    EXPECT_TRUE(published.contains({142, 143})) << "r2's own decode page was published by the same admission";
+
+    CompleteStores(PlanOnce());
+    SendForwardDone("r2", {145});
+    SendFinish("r2");
+    Apply(published, scheduler_->DrainKvEvents());  // r2's finish publishes its own decode page
+    EXPECT_EQ(missing(), broken);
+
+    // The restore copies the evicted pages back from L2 and republishes them
+    // at the ACK: every boundary of r1's is whole again, through freshly
+    // registered descriptors, and nothing else moves.
+    const ExecutionPlan readmit = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(restore->src_pages.at(0).size(), 2u * broken.size()) << "the evicted pages, in both groups";
+    // The restore's own admission may evict r2's leftover cache-only entries
+    // for its pages; it publishes nothing before the copy lands.
+    const std::vector<KvCacheEvent> before_landing = scheduler_->DrainKvEvents();
+    EXPECT_EQ(NumStored(before_landing), 0u);
+    Apply(published, before_landing);
+    EXPECT_EQ(missing(), broken);
+    AckRestores(readmit);
+    const std::vector<KvCacheEvent> after_restore = scheduler_->DrainKvEvents();
+    EXPECT_EQ(NumStored(after_restore), broken.size());
+    EXPECT_EQ(NumRemoved(after_restore), 0u);
+    Apply(published, after_restore);
+    EXPECT_TRUE(missing().empty()) << "every page of the restored request is a stored boundary again";
+
+    const ExecutionPlan decode = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(decode)->request_ids, std::vector<std::string>{"r1"});
+    SendForwardDone("r1", {45});
+    SendFinish("r1");
+    PlanOnce();
 }
 
 TEST_F(FusedRetractionL2TestSuite, TheImageWaitsForAnEarlierStoreThatCarriesOneOfItsKeys) {

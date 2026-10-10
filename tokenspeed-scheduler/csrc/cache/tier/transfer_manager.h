@@ -82,12 +82,20 @@ public:
 
     void CompleteWriteBack(std::uint32_t op_id);
     void CompleteLoadBack(std::uint32_t op_id, bool success);
-    // Both return the request the op belonged to (nullopt for an unknown or
-    // duplicate ACK) so the scheduler can advance its FSM. CompleteSnapshotRestore
-    // republishes the L2-tier destinations into the Device prefix index, as
-    // CompleteLoadBack does for a prefix load.
+    // Returns the request the op belonged to (nullopt for an unknown or
+    // duplicate ACK) so the scheduler can advance its FSM.
     std::optional<std::string> CompleteSnapshotStore(std::uint32_t op_id);
-    std::optional<std::string> CompleteSnapshotRestore(std::uint32_t op_id);
+    // The request an in-flight restore belongs to (nullopt for an unknown or
+    // duplicate ACK). Looked up before CompleteSnapshotRestore so the
+    // scheduler can register the KV-event descriptors the republication
+    // mutates and decide whether the request is still there to resume.
+    std::optional<std::string> SnapshotRestoreRequest(std::uint32_t op_id) const;
+    // Drops the restore's pins. With publish, the L2-tier destinations are
+    // republished into the Device prefix index first, as CompleteLoadBack
+    // does for a prefix load; the caller passes false when the request was
+    // finished or aborted while restoring (its token descriptors are gone
+    // with it, and the pages return to the pool with the pins).
+    void CompleteSnapshotRestore(std::uint32_t op_id, bool publish);
 
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
     // Pinned stores hold Device capacity that returns by itself at the ACK;

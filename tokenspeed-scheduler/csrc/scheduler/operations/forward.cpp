@@ -682,6 +682,11 @@ bool Scheduler::retractVictim(Request& victim, PlanBuild& build,
     if (progress.completed_pages) {
         classifyCompletedStateBoundaries(*progress.completed_pages, num_computed_tokens,
                                          coordinator_.PrefixGranularity());
+        // A publication is a KV-event mutation: the newly hashed pages (decode
+        // pages no admission has registered yet) need their token descriptors
+        // first, exactly as publishCompletedPages registers before it caches.
+        registerKvEventPrefixPages(victim, cache_progress.prefix_hashes,
+                                   progress.completed_pages->first_new_prefix_page);
         coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
     }
     cache_progress.DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());

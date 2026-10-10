@@ -353,21 +353,26 @@ std::optional<std::string> TierTransferManager::CompleteSnapshotStore(std::uint3
     return request_id;
 }
 
-std::optional<std::string> TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id) {
+std::optional<std::string> TierTransferManager::SnapshotRestoreRequest(std::uint32_t op_id) const {
+    const auto it = snapshot_restores_.find(op_id);
+    return it == snapshot_restores_.end() ? std::nullopt : std::optional<std::string>{it->second.request_id};
+}
+
+void TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, bool publish) {
     auto it = snapshot_restores_.find(op_id);
     if (it == snapshot_restores_.end()) {
-        return std::nullopt;
+        return;
     }
     // The L2-tier rows are the request's own prefix pages, copied back whole:
     // publish them like an ordinary load-back's destinations.
-    for (BlockTransfer& transfer : it->second.transfers) {
-        if (transfer.destination && !transfer.key.content_hash.empty()) {
-            coordinator_.CacheDeviceBlock(transfer.destination, transfer.key);
+    if (publish) {
+        for (BlockTransfer& transfer : it->second.transfers) {
+            if (transfer.destination && !transfer.key.content_hash.empty()) {
+                coordinator_.CacheDeviceBlock(transfer.destination, transfer.key);
+            }
         }
     }
-    std::string request_id = std::move(it->second.request_id);
     snapshot_restores_.erase(it);
-    return request_id;
 }
 
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
