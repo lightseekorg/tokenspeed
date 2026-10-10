@@ -818,9 +818,15 @@ decodes run regardless, and only new-prompt admission is sealed behind it
 (a newcomer taking the pages it waits for would starve it) — the remote
 admission on the D role, the new-prompt tier on the fused role.
 
-**Escalating headroom** is what keeps a request from being retracted forever.
-Being retracted means the previous admission was still too optimistic, so
-each retraction raises the decode headroom the next admission must secure:
+**Escalating headroom and the exemption — kept, as thrash damping.** Both
+rules predate the snapshot model, when they also kept a recompute-style
+retraction from losing work without bound. That reason is gone (nothing is
+recomputed) and is not why they stay. They stay because a retraction is still
+an expensive interruption — two Host copies, a restore, a client-visible
+pause — and without them one long request can be imaged and restored on every
+page boundary for as long as the pool is tight. Being retracted means the
+previous admission was still too optimistic, so each retraction raises the
+decode headroom the next admission must secure:
 
 ```
 Request::AdmissionHeadroom(safe_steps)
@@ -833,10 +839,11 @@ prepays one window (see `schedulePrefillFirstChunk`), so for prompts with
 retraction never touches them. Capped by the generation budget the request
 could ever use, so after a couple of retractions it holds enough room to run
 to completion — at which point `ReserveCoversGeneration` exempts it from the
-victim policy and it **cannot be retracted again**. This is a per-request
-adaptive backoff: it penalises only the request whose admission proved
-over-optimistic, and never makes anyone else wait. Now that a retraction costs
-a copy rather than a recompute, the constant is a thrash bound only.
+victim policy and it **cannot be retracted again**, and is not aborted either
+(§2): it needs no further page, so it finishes on its own reserve and frees
+its pages then. This is a per-request adaptive backoff: it penalises only the
+request whose admission proved over-optimistic, and never makes anyone else
+wait. The constant is a thrash bound only; no liveness argument rests on it.
 
 The exemption compares the windows the admission secured against the budget
 that was open **at that admission** (`Request::RemainingNewTokensAtAdmission`,

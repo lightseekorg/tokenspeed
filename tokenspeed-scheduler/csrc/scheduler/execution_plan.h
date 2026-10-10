@@ -70,9 +70,9 @@ public:
     // occupies a batch slot or token budget, and the runtime submits them on
     // every round the plan carries one -- rounds with no batch included.
     //
-    // remote_decode rides beside any forward work. remote_prefill does not:
-    // a D-role round is either a decode batch, one remote admission, or a
-    // local recovery prefill (see buildDecodeWorkerPlan).
+    // remote_decode rides beside any forward work, and so does remote_prefill
+    // on the D role: at most one remote admission per round, beside the
+    // decode batch and a restore (see buildDecodeWorkerPlan).
     //
     // P role: completed prefills whose final chunk's result has landed; each
     // one's decode happens on the peer node, so its KV goes out. Rows are
