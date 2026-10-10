@@ -325,28 +325,25 @@ class FlashInferSamplingBackend(SamplingBackend):
             self._seed_pool[slot],
         ]
 
-    def slot_state_bytes(self) -> int:
-        return self._generator_image_bytes + super().slot_state_bytes()
+    def _slot_payload_bytes(self) -> int:
+        return self._generator_image_bytes + super()._slot_payload_bytes()
 
-    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
+    def _export_slot_payload(self, slot: int, out: torch.Tensor, stream) -> None:
+        # Only a prepared slot is exported (the base checks the marker), and
+        # _reset_slot gave every prepared slot its own CPU generator.
         generator = self._cpu_generator_per_slot[slot]
         if generator is None or generator.device.type != "cpu":
             raise RuntimeError(
                 f"sampling slot {slot} has no per-request coin generator to image"
             )
-        state = generator.get_state()
-        out[: self._generator_state_bytes].copy_(state)
-        super().export_slot_state(slot, out[self._generator_image_bytes :], stream)
+        out[: self._generator_state_bytes].copy_(generator.get_state())
+        super()._export_slot_payload(slot, out[self._generator_image_bytes :], stream)
 
-    def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
-    ) -> None:
+    def _import_slot_payload(self, slot: int, src: torch.Tensor, stream) -> None:
         generator = torch.Generator(device="cpu")
         generator.set_state(src[: self._generator_state_bytes].clone())
         self._cpu_generator_per_slot[slot] = generator
-        super().import_slot_state(
-            slot, src[self._generator_image_bytes :], stream, request_id=request_id
-        )
+        super()._import_slot_payload(slot, src[self._generator_image_bytes :], stream)
 
     def _init_shared_buffers(self, config: SamplingBackendConfig) -> None:
 

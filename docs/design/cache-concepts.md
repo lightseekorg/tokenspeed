@@ -501,8 +501,15 @@ forward thread. The executor keeps a pinned arena of
 `--retraction-snapshot-max-requests` × `blob_bytes`, indexed by the op's
 `snapshot_slot`; the store exports the victim's slot on the write stream
 (the slot is reused only behind the fence), the restore imports into the
-new slot and lets a request-keyed owner claim it. Token-derived rows — the
-committed-token history and the n-gram tail — are not imaged; they are
+new slot and lets a request-keyed owner claim it. A request-keyed owner —
+the sampling backends, DSpark — prepares a slot at the request's first
+forward, so it images a **prepared marker** ahead of its rows: a victim
+retracted before any forward on this engine (a PD decode role's request
+between its landing and its first decode) still holds the previous
+occupant's rows, which are not imaged; the restore then leaves the new slot
+unclaimed and the first forward prepares it from the request's own
+parameters, as the unretracted request's would have. Token-derived rows —
+the committed-token history and the n-gram tail — are not imaged; they are
 reseeded from the control plane's token list as on any slot handoff.
 `test/runtime/test_slot_state.py` enumerates every tensor these classes
 allocate with a slot-sized dimension and fails when one is neither exported

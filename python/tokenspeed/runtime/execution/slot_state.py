@@ -33,6 +33,16 @@ Token-derived rows are deliberately NOT part of the image: the request's
 committed-token history and the n-gram tail are reseeded from the control
 plane's token list on a slot change, exactly as a slot handoff is today.
 
+An owner that keys its slots by request -- the sampling backends' pools, the
+DSpark windows -- prepares a slot at the request's first forward and skips
+that reset while the slot's recorded request id matches. Such an owner images
+a **prepared marker** in front of its rows: a victim that never ran a forward
+on this engine (a PD decode role's request retracted between its landing and
+its first decode) still holds the slot's previous occupant's rows, so the
+image carries the marker as not-prepared and no rows, and the restore leaves
+the new slot unclaimed for the first forward to prepare from the request's own
+parameters -- exactly what the unretracted request would have met.
+
 Every owner lists its per-slot tensors once, as ``slot_state_rows(slot)``,
 and the two copies and the size derive from that list, so an owner cannot
 export a row it does not import. The architecture test in
@@ -62,6 +72,11 @@ device_module = get_device_module()
 #: the uint8 blob is always aligned, whatever the dtypes before it.
 SLOT_STATE_ALIGNMENT = 16
 
+#: The prepared marker of a request-keyed owner: one alignment unit in front
+#: of its rows, byte 0 being 1 when the imaged slot was prepared for the
+#: imaged request (``write_prepared_marker`` / ``read_prepared_marker``).
+PREPARED_MARKER_BYTES = SLOT_STATE_ALIGNMENT
+
 
 @runtime_checkable
 class SlotStateExporter(Protocol):
@@ -70,11 +85,16 @@ class SlotStateExporter(Protocol):
     def slot_state_bytes(self) -> int:
         """Bytes of one slot's image; fixed for the executor's lifetime."""
 
-    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
         """Copy ``slot``'s state into ``out`` (uint8, ``slot_state_bytes()`` long).
 
         Enqueued on ``stream``; the caller orders that stream behind the
         stream the state was written on and records the completion event.
+        ``request_id`` is the victim the slot is imaged for: an owner that
+        keys its slots by request images whether the slot was prepared for
+        it (the module docstring).
         """
 
     def import_slot_state(
@@ -130,6 +150,20 @@ def _image_views(rows: Sequence[torch.Tensor], image: torch.Tensor):
             f"{slot_state_image_bytes(rows)} bytes"
         )
     return views
+
+
+def write_prepared_marker(image: torch.Tensor, prepared: bool) -> None:
+    """Write the prepared marker at the head of ``image`` (a CPU write)."""
+    if image.numel() < PREPARED_MARKER_BYTES:
+        raise ValueError("a slot-state image is too short for the prepared marker")
+    image[0] = 1 if prepared else 0
+
+
+def read_prepared_marker(image: torch.Tensor) -> bool:
+    """Whether the image's head marker says the slot was prepared."""
+    if image.numel() < PREPARED_MARKER_BYTES:
+        raise ValueError("a slot-state image is too short for the prepared marker")
+    return bool(image[0].item())
 
 
 def pack_slot_rows(rows: Sequence[torch.Tensor], image: torch.Tensor, stream) -> None:
@@ -198,11 +232,14 @@ class SlotStateLayout:
                 f"{image.numel()}"
             )
 
-    def export(self, slot: int, out: torch.Tensor, stream) -> None:
-        """Image ``slot`` into ``out`` on ``stream``, one segment per exporter."""
+    def export(self, slot: int, out: torch.Tensor, stream, *, request_id: str) -> None:
+        """Image ``slot``, ``request_id``'s, into ``out`` on ``stream``, one
+        segment per exporter."""
         self._check(out)
         for exporter, begin, end in self.segments:
-            exporter.export_slot_state(slot, out[begin:end], stream)
+            exporter.export_slot_state(
+                slot, out[begin:end], stream, request_id=request_id
+            )
 
     def import_(self, slot: int, src: torch.Tensor, stream, *, request_id: str) -> None:
         """Restore ``src`` into ``slot``, now ``request_id``'s, on ``stream``."""

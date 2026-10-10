@@ -28,9 +28,12 @@ import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.execution.slot_state import (
+    PREPARED_MARKER_BYTES,
     pack_slot_rows,
+    read_prepared_marker,
     slot_state_image_bytes,
     unpack_slot_rows,
+    write_prepared_marker,
 )
 
 if TYPE_CHECKING:
@@ -443,26 +446,51 @@ class SamplingBackend(ABC):
         return []
 
     def slot_state_bytes(self) -> int:
+        # A pool-stateful backend images the prepared marker ahead of its
+        # payload (``slot_state.py``); a stateless one images nothing.
+        if not self._HAS_POOL_STATE:
+            return 0
+        return PREPARED_MARKER_BYTES + self._slot_payload_bytes()
+
+    def _slot_payload_bytes(self) -> int:
+        """Bytes of the slot's rows behind the marker; subclasses add theirs."""
         return slot_state_image_bytes(self.slot_state_rows(0))
 
-    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
+    def _export_slot_payload(self, slot: int, out: torch.Tensor, stream) -> None:
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def _import_slot_payload(self, slot: int, src: torch.Tensor, stream) -> None:
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        if not self._HAS_POOL_STATE:
+            return
+        # The slot holds ``request_id``'s state only once prepare_step ran a
+        # forward for it there; a victim retracted before its first forward
+        # (a PD decode role's landed request) still holds the previous
+        # occupant's, so the image carries the marker alone.
+        prepared = self._last_rid_per_slot[slot] == request_id
+        write_prepared_marker(out, prepared)
+        if prepared:
+            self._export_slot_payload(slot, out[PREPARED_MARKER_BYTES:], stream)
 
     def import_slot_state(
         self, slot: int, src: torch.Tensor, stream, *, request_id: str
     ) -> None:
-        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
-        self._claim_slot(slot, request_id)
-
-    def _claim_slot(self, slot: int, request_id: str) -> None:
-        """Mark ``slot`` as ``request_id``'s after a restore imported its rows.
-
-        ``prepare_step`` compares the incoming rid against this sentinel; a
-        match is not a flip, so the restored rows are not reset as a new
-        occupant's.
-        """
-        if self._HAS_POOL_STATE:
+        if not self._HAS_POOL_STATE:
+            return
+        if read_prepared_marker(src):
+            self._import_slot_payload(slot, src[PREPARED_MARKER_BYTES:], stream)
+            # ``prepare_step`` compares the incoming rid against this sentinel;
+            # a match is not a flip, so the restored rows are not reset as a
+            # new occupant's.
             self._last_rid_per_slot[slot] = request_id
+        else:
+            # Nobody's: the first prepare_step resets the slot from the
+            # request's own SamplingParams, as it would have unretracted.
+            self._last_rid_per_slot[slot] = None
 
     def get_packed_output_d2h(
         self,

@@ -1083,6 +1083,7 @@ class HostCacheExecutor:
                 int(op.request_pool_index),
                 self.blob_arena[int(op.snapshot_slot)],
                 self.write_stream,
+                request_id=str(op.request_id),
             )
         finish = device_module.Event()
         finish.record(self.write_stream)

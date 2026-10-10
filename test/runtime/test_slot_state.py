@@ -56,10 +56,12 @@ from tokenspeed.runtime.execution.drafter.mtp import Mtp  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E402
 from tokenspeed.runtime.execution.slot_state import (  # noqa: E402
+    PREPARED_MARKER_BYTES,
     SLOT_STATE_ALIGNMENT,
     SlotStateExporter,
     SlotStateLayout,
     pack_slot_rows,
+    read_prepared_marker,
     slot_state_image_bytes,
     unpack_slot_rows,
 )
@@ -280,7 +282,7 @@ def _sampling_backend(cls) -> SamplingBackend:
 
 
 def _sampling_params(rid: str, **overrides) -> SamplingParams:
-    params = SamplingParams(
+    fields = dict(
         temperature=0.7,
         top_k=5,
         top_p=0.9,
@@ -288,8 +290,9 @@ def _sampling_params(rid: str, **overrides) -> SamplingParams:
         frequency_penalty=0.5,
         presence_penalty=0.25,
         repetition_penalty=1.5,
-        **overrides,
     )
+    fields.update(overrides)
+    params = SamplingParams(**fields)
     params.resolve_seed(rid)
     params.normalize(None)
     return params
@@ -305,27 +308,35 @@ def _randomize(rows: list[torch.Tensor]) -> None:
             row.copy_(torch.randint(1, 100, row.shape).to(row.dtype))
 
 
+RESTORED = "req-restored"
+
+
 def _round_trip(
     exporter: SlotStateExporter,
     *,
     src_slot: int,
     dst_slot: int,
     rows_rewritten_on_import: frozenset[int] = frozenset(),
+    request_keyed: bool = False,
 ) -> None:
-    """Export ``src_slot``, wipe it, import into ``dst_slot``; both must match
-    except the rows an owner deliberately rewrites on import."""
+    """Export ``src_slot`` as ``RESTORED``'s, wipe it, import into ``dst_slot``;
+    both must match except the rows an owner deliberately rewrites on import.
+    A request-keyed owner images the prepared marker ahead of its rows."""
     torch.manual_seed(0)
     source_rows = exporter.slot_state_rows(src_slot)
     _randomize(source_rows)
     expected = [row.clone() for row in source_rows]
-    assert exporter.slot_state_bytes() == slot_state_image_bytes(source_rows)
+    marker = PREPARED_MARKER_BYTES if request_keyed else 0
+    assert exporter.slot_state_bytes() == marker + slot_state_image_bytes(source_rows)
     assert exporter.slot_state_bytes() % SLOT_STATE_ALIGNMENT == 0
     image = torch.full((exporter.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
 
-    exporter.export_slot_state(src_slot, image, None)
+    exporter.export_slot_state(src_slot, image, None, request_id=RESTORED)
+    if request_keyed:
+        assert read_prepared_marker(image)
     for row in source_rows:
         row.zero_()
-    exporter.import_slot_state(dst_slot, image, None, request_id="req-restored")
+    exporter.import_slot_state(dst_slot, image, None, request_id=RESTORED)
 
     for index, (restored, original) in enumerate(
         zip(exporter.slot_state_rows(dst_slot), expected)
@@ -409,7 +420,7 @@ def test_runtime_states_import_marks_the_imaged_candidates_ready():
     states.remote_spec_candidate_ready[3] = False  # a fused victim's row
     states.future_input_map[3] = torch.arange(1, states.future_input_map.shape[1] + 1)
     image = torch.empty((states.slot_state_bytes(),), dtype=torch.uint8)
-    states.export_slot_state(3, image, None)
+    states.export_slot_state(3, image, None, request_id="restored")
     states.import_slot_state(7, image, None, request_id="restored")
     assert bool(states.remote_spec_candidate_ready[7])
     assert torch.equal(states.future_input_map[7], states.future_input_map[3])
@@ -430,12 +441,42 @@ def test_eagle_history_frontier_round_trip():
 def test_dspark_windows_round_trip_and_claim_the_slot():
     states = _runtime_states(draft_probs=False, trees=False, history=False)
     dspark = _dspark(states)
-    _round_trip(dspark, src_slot=4, dst_slot=6)
+    # The victim ran a forward in slot 4: its windows are its own.
+    dspark._request_by_pool_slot[4] = RESTORED
+    _round_trip(dspark, src_slot=4, dst_slot=6, request_keyed=True)
     # The import claims the new slot for the request, so the next prologue
     # does not reset the imported windows as a previous occupant's.
-    assert dspark._request_by_pool_slot[6] == "req-restored"
+    assert dspark._request_by_pool_slot[6] == RESTORED
     with pytest.raises(ValueError, match="persistent state domain"):
         dspark.slot_state_rows(MAX_REQ_POOL_SIZE)
+
+
+def test_dspark_images_an_unprepared_slot_as_nobodys():
+    """A PD decode role's request retracted before its first decode never ran
+    ``prepare_request_state`` here: the slot's windows are a previous
+    occupant's, so the image carries no windows and the restore leaves the
+    new slot for the first forward to prepare, as it would have unretracted."""
+    states = _runtime_states(draft_probs=False, trees=False, history=False)
+    dspark = _dspark(states)
+    dspark._request_by_pool_slot[4] = "previous-occupant"
+    dspark.kv_windows[4].fill_(3.0)
+    dspark.context_lengths[4] = 11
+    image = torch.full((dspark.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
+    dspark.export_slot_state(4, image, None, request_id=RESTORED)
+    assert not read_prepared_marker(image)
+    assert torch.all(image[PREPARED_MARKER_BYTES:] == 0xEE), "no windows imaged"
+
+    dspark._request_by_pool_slot[6] = "stale-occupant"
+    dspark.kv_windows[6].fill_(5.0)
+    dspark.context_lengths[6] = 13
+    dspark.import_slot_state(6, image, None, request_id=RESTORED)
+    assert dspark._request_by_pool_slot[6] is None
+    assert float(dspark.kv_windows[6].sum()) != 0, "the import wrote nothing"
+    # The first forward prepares the slot: a flip, so the windows are reset.
+    dspark.prepare_request_state([RESTORED], [6], num_extends=0)
+    assert dspark._request_by_pool_slot[6] == RESTORED
+    assert float(dspark.kv_windows[6].abs().sum()) == 0
+    assert int(dspark.context_lengths[6]) == 0
 
 
 def test_inkling_ring_round_trip_through_the_wrapper():
@@ -480,7 +521,7 @@ def test_sampling_backend_round_trip_continues_where_the_victim_stopped(cls):
 
     assert backend.slot_state_bytes() % SLOT_STATE_ALIGNMENT == 0
     image = torch.full((backend.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
-    backend.export_slot_state(src_slot, image, None)
+    backend.export_slot_state(src_slot, image, None, request_id=victim)
     for row in rows:
         row.zero_()
     backend.import_slot_state(dst_slot, image, None, request_id=victim)
@@ -515,17 +556,53 @@ def test_sampling_backend_round_trip_continues_where_the_victim_stopped(cls):
         assert torch.equal(backend._final_coins_buf[0], unretracted_final[0])
 
 
-def test_sampling_backend_refuses_to_image_a_slot_never_prepared():
-    backend = _sampling_backend(FlashInferSamplingBackend)
-    image = torch.zeros(backend.slot_state_bytes(), dtype=torch.uint8)
-    with pytest.raises(RuntimeError, match="no per-request coin generator"):
-        backend.export_slot_state(5, image, None)
+@pytest.mark.parametrize("cls", SAMPLING_BACKENDS[1:], ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize("previous_occupant", [None, "req-previous"])
+def test_sampling_backend_images_an_unprepared_slot_as_nobodys(cls, previous_occupant):
+    """A PD decode role's request retracted between its landing and its first
+    decode never went through prepare_step: the slot is either untouched or
+    the previous occupant's (scalars, seed, coin generator). The image says
+    so and carries no payload; the restore leaves the new slot unclaimed, and
+    the request's first prepare_step resets it from its own SamplingParams,
+    exactly as the unretracted first decode would have."""
+    backend = _sampling_backend(cls)
+    victim, params = "req-victim", _sampling_params("req-victim", temperature=0.3)
+    src_slot, dst_slot = 4, 8
+    if previous_occupant is not None:
+        backend.prepare_step(
+            [previous_occupant], [src_slot], [_sampling_params(previous_occupant)]
+        )
+    image = torch.full((backend.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
+    backend.export_slot_state(src_slot, image, None, request_id=victim)
+    assert not read_prepared_marker(image)
+    assert torch.all(image[PREPARED_MARKER_BYTES:] == 0xEE), "no payload imaged"
+
+    # The new slot held someone else; the restore makes it nobody's.
+    backend.prepare_step(["req-stale"], [dst_slot], [_sampling_params("req-stale")])
+    backend.import_slot_state(dst_slot, image, None, request_id=victim)
+    assert backend._last_rid_per_slot[dst_slot] is None
+    with patch.object(type(backend), "_reset_slot", wraps=backend._reset_slot) as reset:
+        backend.prepare_step([victim], [dst_slot], [params], num_tokens_per_req=2)
+    reset.assert_called_once()
+    assert reset.call_args.args[:2] == (dst_slot, params)
+    assert backend._last_rid_per_slot[dst_slot] == victim
+    assert float(backend._temperature_pool[dst_slot]) == pytest.approx(0.3)
+    assert int(backend._seed_pool[dst_slot]) == int(params.seed)
+    if isinstance(backend, FlashInferSamplingBackend):
+        # The coin stream starts from the request's own seed: the step above
+        # drew its coins from a generator seeded by the reset.
+        expected = torch.Generator(device="cpu")
+        expected.manual_seed(int(params.seed))
+        lo = coin_eps(torch.float32)
+        coins = torch.empty((1, 2), dtype=torch.float32)
+        coins[0, :2].uniform_(lo, 1.0, generator=expected)
+        assert torch.equal(backend._coins_buf[0, :2], coins[0])
 
 
 def test_a_leaf_without_slot_state_images_nothing():
     leaf = _Leaf()
     assert leaf.slot_state_bytes() == 0
-    leaf.export_slot_state(0, torch.zeros(0, dtype=torch.uint8), None)
+    leaf.export_slot_state(0, torch.zeros(0, dtype=torch.uint8), None, request_id="r")
     leaf.import_slot_state(0, torch.zeros(0, dtype=torch.uint8), None, request_id="r")
 
 
@@ -578,13 +655,13 @@ def test_model_executor_lists_every_owner_once_and_the_layout_is_fixed():
     with patch.object(
         RuntimeStates, "slot_state_bytes", side_effect=AssertionError("re-measured")
     ):
-        layout.export(2, image, None)
+        layout.export(2, image, None, request_id="r2")
         for row in rows(2):
             row.zero_()
         layout.import_(6, image, None, request_id="r6")
     assert all(torch.equal(a, b) for a, b in zip(rows(6), expected))
     with pytest.raises(ValueError, match="need"):
-        layout.export(2, image[:-SLOT_STATE_ALIGNMENT], None)
+        layout.export(2, image[:-SLOT_STATE_ALIGNMENT], None, request_id="r2")
 
     class _Unpadded:
         def slot_state_bytes(self):

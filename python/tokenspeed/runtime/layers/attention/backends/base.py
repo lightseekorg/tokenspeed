@@ -176,7 +176,12 @@ class CachePoolBinding:
     def slot_state_bytes(self) -> int:
         return slot_state_image_bytes(self.slot_state_rows(0))
 
-    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # Backend rows are rewritten by every forward and prepared at a PD
+        # landing, never keyed by request: always valid, nothing to mark.
+        del request_id
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
     def import_slot_state(

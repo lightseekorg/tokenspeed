@@ -165,8 +165,8 @@ class _SlotState:
     def slot_state_bytes(self):
         return self.nbytes
 
-    def export_slot_state(self, slot, out, stream):
-        self.exports.append((slot, out, stream))
+    def export_slot_state(self, slot, out, stream, *, request_id):
+        self.exports.append((slot, out, stream, request_id))
 
     def import_slot_state(self, slot, src, stream, *, request_id):
         self.imports.append((slot, src, stream, request_id))
@@ -560,10 +560,11 @@ def test_both_store_legs_ride_the_write_stream_under_one_fence():
     )
     assert lanes["pinned"].start_d2h.call_args.args[0] == [(0, 3, 7)]
     fence_stream.wait_event.assert_called_once_with(snapshot_finish)
-    # Each victim's slot is exported into its arena row, on the write stream.
-    assert [(slot, stream) for slot, _, stream in slot_state.exports] == [
-        (3, executor.write_stream),
-        (6, executor.write_stream),
+    # Each victim's slot is exported into its arena row, on the write stream,
+    # as the victim's (a request-keyed owner images whether it prepared it).
+    assert [(slot, stream, rid) for slot, _, stream, rid in slot_state.exports] == [
+        (3, executor.write_stream, "r7"),
+        (6, executor.write_stream, "r8"),
     ]
     assert slot_state.exports[0][1].data_ptr() == executor.blob_arena[1].data_ptr()
     assert slot_state.exports[1][1].data_ptr() == executor.blob_arena[2].data_ptr()
@@ -596,7 +597,7 @@ def test_slot_state_only_image_round_trips_through_empty_ops():
     lanes["snapshot"].start_d2h.assert_not_called()
     lanes["ordered"].start_d2h.assert_not_called()
     fence_stream.wait_event.assert_called_once_with(finish)
-    assert [slot for slot, _, _ in slot_state.exports] == [2]
+    assert [slot for slot, _, _, _ in slot_state.exports] == [2]
     assert slot_state.exports[0][1].data_ptr() == executor.blob_arena[0].data_ptr()
     assert _acks(executor.poll_results()) == _snapshot_done(1)
 
@@ -816,7 +817,7 @@ def test_kvp_ranks_store_their_owned_subsets_on_both_legs():
             lanes["snapshot"].start_d2h.call_args.args[0],
         )
         # Slot state is per rank: every rank exports its own and ACKs every op.
-        assert [slot for slot, _, _ in slot_state.exports] == [1]
+        assert [slot for slot, _, _, _ in slot_state.exports] == [1]
         acks = _acks(executor.poll_results())
         assert ("SnapshotDoneEvent", 5) in acks
         assert sorted(
@@ -985,7 +986,7 @@ class _CudaSlotState:
     def slot_state_bytes(self):
         return slot_state_image_bytes(self.slot_state_rows(0))
 
-    def export_slot_state(self, slot, out, stream):
+    def export_slot_state(self, slot, out, stream, *, request_id):
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
     def import_slot_state(self, slot, src, stream, *, request_id):

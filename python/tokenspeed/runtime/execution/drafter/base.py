@@ -285,26 +285,23 @@ class BaseDrafter:
         del slot
         return []
 
-    def claim_slot(self, slot: int, request_id: str) -> None:
-        """Mark ``slot`` as ``request_id``'s after a restore imported its rows.
-
-        A drafter that keys slots by request id (``prepare_request_state``)
-        overrides this so the next prologue does not reset the imported rows
-        as a stale occupant's. The default has no such keying.
-        """
-        del slot, request_id
-
     def slot_state_bytes(self) -> int:
         return slot_state_image_bytes(self.slot_state_rows(0))
 
-    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # The default rows are rewritten by every forward of the slot, never
+        # keyed by request; a drafter that keys them (DSpark) overrides both
+        # copies to image the prepared marker (``slot_state.py``).
+        del request_id
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
     def import_slot_state(
         self, slot: int, src: torch.Tensor, stream, *, request_id: str
     ) -> None:
+        del request_id
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
-        self.claim_slot(slot, request_id)
 
     @abstractmethod
     def run(
