@@ -349,6 +349,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd_available",
         "gated_residual_combine",
         "gated_residual_mix",
+        "pad_gated_residual_projection_weight",
         "mhc_fused_hc",
         "mhc_mixes",
         "mhc_post",

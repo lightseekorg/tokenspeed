@@ -219,6 +219,7 @@ if _AVAILABLE:
         hc_count: int,
         hidden_size: int,
         lowrank: int,
+        projection_rows: int,
         projection_scale: float,
         weights_independent: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -246,6 +247,9 @@ if _AVAILABLE:
         must not scan unbounded scale or stream variants.
         """
         rows = int(normalized.shape[0])
+        # Native MMA tiles already cover the projection tail. TMA should see
+        # only logical rows instead of fetching model-loading padding.
+        projection_weight = projection_weight[:projection_rows]
         tensors = (normalized, projection_weight, up_weight)
         if (
             not supports_fused_hc(normalized.device)
@@ -258,7 +262,6 @@ if _AVAILABLE:
                 "fused CuTe HC requires six resident Blackwell clusters and 16-byte-aligned "
                 "contiguous BF16/FP16 tensors with HC4/H2560/R320 and at most 1024 rows"
             )
-        projection_rows = int(projection_weight.shape[0])
         with torch.cuda.device(normalized.device):
             out = torch.empty(
                 (rows, hidden_size), dtype=normalized.dtype, device=normalized.device
