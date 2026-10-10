@@ -104,6 +104,10 @@ struct Submitted {
     TokenContainer* TokenContainerPtr() const { return token_container_; }
     std::int32_t PrefixGranularity() const { return prefix_granularity_; }
     std::size_t NumPrefetchedHostEntries() const { return prefetched_host_entries_.size(); }
+    // A further prefetch (the remainder beyond what landed) carries these on,
+    // so the first fetch's entries stay pinned until the admission that
+    // claims them all.
+    std::vector<CacheBlockRef> TakePrefetchedHostEntries() { return std::exchange(prefetched_host_entries_, {}); }
 
 private:
     TokenContainer* token_container_{};
@@ -112,11 +116,13 @@ private:
 };
 
 // Before admission, with an L3 prefetch in flight: the request pins the Host
-// blocks the fetch fills (nothing on the Device, no request-pool row), is
-// skipped by admission -- later Submitted requests may be admitted past it,
-// it holds no head of line -- and is never a victim. The op's ACK
-// (PrefetchDone) returns it to Submitted holding the entries that landed; an
-// abort drops its pins, and the op's own pins keep the blocks until the ACK.
+// blocks the fetch fills -- and the entries an earlier prefetch of its own
+// already landed (host_blocks holds both) -- with nothing on the Device and
+// no request-pool row; it is skipped by admission (later Submitted requests
+// may be admitted past it, it holds no head of line) and is never a victim.
+// The op's ACK (PrefetchDone) returns it to Submitted holding every entry
+// that landed; an abort drops its pins, and the op's own pins keep the
+// blocks still being filled until the ACK.
 struct Prefetching {
     Prefetching(TokenContainer* token_container, std::int32_t prefix_granularity,
                 std::vector<CacheBlockRef> host_blocks, std::uint32_t prefetch_op)
