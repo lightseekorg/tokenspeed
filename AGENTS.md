@@ -1,38 +1,38 @@
-# General Agent Guidelines
+# General agent guidelines
 
 > If a `AGENTS.local.md` file exists alongside this file, read and respect it--
 > it contains developer-specific overrides that supplement this shared guidance.
 
 ## Collaboration principle
 
-Core features will be designed and implemented by the TokenSpeed core team.
+The TokenSpeed core team designs and implements core features.
 This isn't a matter of distrust in external contributions — writing code has
 gotten cheaper, but reviewing it, validating it, and deploying it safely at
 production scale hasn't. If anything, that cost has gone up. As Steve Jobs
-put it, A players want to work with A players. We believe the gap between the
-best people and average people is more than tenfold.
+put it, A players want to work with A players. The gap between the best
+people and average people is more than tenfold.
 
 ## Development environment
 
-* Before any work, check local Python venv and activate if one exists.
-* Don't install pip packages outside the local Python venv if one exists.
+* Before any work, check for a local Python venv and, if one exists, activate
+  it.
+* If a local Python venv exists, don't install pip packages outside it.
 
 ## Code changes
 
 * Add tests for the changed code. Don't be excessive--avoid checking trivial
   details or exceptions.
 * Update docs for the changed code. Use concise comments to explain code
-  where it might be tricky for humans to understand, and leave project/component
-  level (design) docs focusing on high-level picture. In general, put suitable
-  docs at the suitable place and avoid duplicating the same across a lot of
-  places.
+  where it might be tricky for humans to understand. Leave project/component
+  level (design) docs focusing on high-level picture. Put suitable docs at
+  the suitable place and avoid duplicating the same across a lot of places.
 * For code comments, use common/existing terms for easy human understanding;
   avoid obsecure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
   behavior must be explicit and have no defaults. This includes execution modes,
   backend selection, and flags that switch between implementations.
 * Genuinely optional inputs may have defaults when omission has a clear meaning
-  within the selected path. Review each default individually; convenience alone
+  within the selected path. Review each default individually. Convenience alone
   does not justify defaulting a behavioral choice.
 * Wrappers must preserve explicitly supplied arguments and must not silently
   discard unsupported arguments.
@@ -67,7 +67,7 @@ the languages involved:
 
 ## Design principles
 
-We value one scheduling path and one execution path. Prefill/decode
+TokenSpeed values one scheduling path and one execution path. Prefill/decode
 disaggregation or not, speculation or not, CUDA graph or not, overlap or not:
 these are parameters of the same path, never a second path. Make the general
 path cover the case instead of adding a mode-specific branch.
@@ -136,7 +136,7 @@ change.
 ## tokenspeed-scheduler releases
 
 Prefer separate PRs for scheduler code changes and version bumps. A scheduler
-code change does not require a version bump or an immediate release; multiple
+code change does not require a version bump or an immediate release. Multiple
 code changes may accumulate until a release is needed.
 
 Follow this sequence:
@@ -160,11 +160,11 @@ Inside the root `tokenspeed-kernel/` directory:
 * Avoid using `triton` directly; use `tokenspeed_triton` instead.
 * Avoid using `torch.compile`; prefer writing the fused kernel directly in
   Triton.
-* All direct third-party code should be placed in `thirdparty/` and imported
-  into `ops/` then registered via `register_kernel`.
+* Place all direct third-party code in `thirdparty/` and import it into
+  `ops/`, then register it through `register_kernel`.
 * Prefer CuteDSL for NVIDIA GPU kernels and Triton Gluon for AMD GPU kernels.
   Use Triton for portable solutions across vendors. Vendor libraries should
-  stay optional, and other solutions may be used as temporary transitions, but
+  stay optional. Other solutions may be used as temporary transitions, but
   new work should consolidate toward these backend choices.
 * Files under `ops/` should follow `<family>/<solution>` structure, like
   `gemm/trtllm.py`. Attention adds its variant before the solution, for example
@@ -176,34 +176,34 @@ Inside the root `tokenspeed-kernel/` directory:
   geared for human understanding. For per-op details, use `README.md` files
   under corresponding `ops/` directory.
 * Prefer to `@register_kernel` with the name as the Python `def` function
-  attached to, prefixed with its solution (e.g, `triton_mha_prefill`).
+  attached to, prefixed with its solution (such as `triton_mha_prefill`).
 * When defining new public APIs, explain arguments and returns in docstring.
 * Keep vendor-only code in files or private directories named after its
   vendor-specific solution (`cute_dsl`, `gluon`, ...). CI skips the other
   vendor's GPU jobs based on these names. Code that serves both vendors belongs
   in a shared solution (`triton`).
-* Vendor-specific tests should be placed under `test/<vendor>/` subdirectory.
+* Place vendor-specific tests under a `test/<vendor>/` subdirectory.
   Tests for common infra and covering multi-vendors reside under `test/`
   directly.
 * Use tight atol/rtol in correctness comparison tests.
 * Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`,
   `cutlass.Constexpr`) are part of the JIT cache key: a new value triggers a
   recompilation on the forward thread and stalls serving for 100+ ms. Use it
-  for fixed static values once the server starts (e.g., model dimensions,
+  for fixed static values once the server starts (such as model dimensions,
   feature flags) or scalar knob specialization that matters greatly for kernel
-  performance (e.g., block size, alignment). Values that vary per batch or
-  request (e.g, token, request, row counts, sequence lengths, block-table
-  widths), and values derived from them (e.g., the strides that follow those
+  performance (such as block size, alignment). Values that vary per batch or
+  request (such as token, request, row counts, sequence lengths, block-table
+  widths), and values derived from them (such as the strides that follow those
   widths, split counts computed from the batch size), must be runtime
-  arguments, or be bucketed first (e.g. `next_power_of_2`) when the kernel
+  arguments, or be bucketed first (such as `next_power_of_2`) when the kernel
   needs a compile-time bound. The same holds for template arguments of other
   JITs such as DeepGEMM. Reviews should check every new or changed kernel
   signature and launch site for this. Kernels should have tests to guard
   against excessive scalar parameter specialization with
-  `assert_no_triton_compile` from `test/utils.py`; for tensor parameters no
-  need to test. At runtime `tokenspeed_kernel.compile_monitor` logs every
+  `assert_no_triton_compile` from `test/utils.py`. Tensor parameters need no
+  such test. At runtime `tokenspeed_kernel.compile_monitor` logs every
   Triton compilation after startup and names a parameter that keeps taking
-  new values; CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
+  new values. CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
   parameter fails the model tests.
 
 ## tokenspeed-kernel-amd

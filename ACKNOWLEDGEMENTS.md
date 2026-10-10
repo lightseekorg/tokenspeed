@@ -1,7 +1,7 @@
 # Acknowledgements
 
-TokenSpeed builds on a broad open source ecosystem. We are grateful to the
-projects and contributors whose work is acknowledged in our package-level
+TokenSpeed builds on a broad open source ecosystem. It thanks the
+projects and contributors whose work is acknowledged in the package-level
 third-party notices.
 
 ## tokenspeed
@@ -35,9 +35,9 @@ The `tokenspeed-mla` package acknowledges and thanks:
 - `NVIDIA/cutlass`
 - `flashinfer-ai/flashinfer`
 
-## License Notices
+## License notices
 
-We follow open source license requirements by keeping package-level
+TokenSpeed follows open source license requirements by keeping package-level
 `THIRDPARTYNOTICES` files with the relevant third-party notices and license
 texts. For Python packages built with setuptools, these files are included in
 the package metadata with:
