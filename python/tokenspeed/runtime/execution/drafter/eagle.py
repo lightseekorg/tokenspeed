@@ -189,6 +189,14 @@ class Eagle(BaseDrafter):
             - 1
         )
 
+    @override
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # The draft history's write frontier is drafter-owned; the history
+        # rows themselves are token-derived and reseeded (RuntimeStates).
+        if self.draft_history_lengths_buf is None:
+            return []
+        return [self.draft_history_lengths_buf[slot]]
+
     def bind_tree(self, tree_spec: TreeSpec) -> None:
         """Draft trees: top-K lanes per step (tree.py) in the draft paged cache's lane window."""
         if self.draft_reads_token_history:

@@ -73,6 +73,11 @@ from tokenspeed.runtime.execution.prefill_graph import (
 )
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.execution.slot_state import (
+    SlotStateExporter,
+    export_slot_state_sequence,
+    import_slot_state_sequence,
+)
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -1796,6 +1801,54 @@ class ModelExecutor:
                     spec_step_idx=step_idx,
                     **draft_kwargs,
                 )
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter): the retraction snapshot's blob
+    # ------------------------------------------------------------------
+
+    def slot_state_exporters(self) -> tuple[SlotStateExporter, ...]:
+        """The owners of per-slot state outside the cache groups, in blob order.
+
+        The runtime states, the target attention tree, the draft tree when it
+        is a distinct object (a draft Inkling wrapper owns its own ring; a
+        shared tree is listed once) and the drafter. Each contributes a
+        fixed-size segment; the order is the blob layout.
+        """
+        exporters: list[SlotStateExporter] = [self.runtime_states, self.attn_backend]
+        draft_backend = self.draft_attn_backend
+        if draft_backend is not None and draft_backend is not self.attn_backend:
+            exporters.append(draft_backend)
+        if self.drafter is not None:
+            exporters.append(self.drafter)
+        return tuple(exporters)
+
+    def slot_state_bytes(self) -> int:
+        """Bytes of one request slot's image; the snapshot arena's row width."""
+        return sum(
+            exporter.slot_state_bytes() for exporter in self.slot_state_exporters()
+        )
+
+    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
+        """Image ``slot`` into ``out`` on ``stream`` (a retraction store).
+
+        The exporters' tensors are written on ``execution_stream``; the caller
+        orders ``stream`` behind it before this call and records the
+        completion event after it.
+        """
+        export_slot_state_sequence(self.slot_state_exporters(), slot, out, stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        """Restore an image into ``slot``, now ``request_id``'s, on ``stream``.
+
+        Runs after the plan's zeroing and before the request's first forward;
+        the restored request is not schedulable until the copy's ACK, so no
+        forward reads the slot meanwhile.
+        """
+        import_slot_state_sequence(
+            self.slot_state_exporters(), slot, src, stream, request_id=request_id
+        )
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.

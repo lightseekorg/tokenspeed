@@ -423,6 +423,17 @@ class DSABackend(PagedAttentionBackend):
     def child_backends(self):
         return (self._dense_backend,)
 
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # KPool keeps each request's incomplete index pool in a request-local
+        # tail outside the index-K pages. The tail workspace is one arena
+        # allocation shared by the target and draft views, so the target
+        # backend images it once and a draft backend lists nothing.
+        if self.kpool_runtime is None or self.is_draft:
+            return []
+        if self.cache_pool is None:
+            raise RuntimeError("DSA KPool slot state needs a bound cache pool")
+        return self.cache_pool.kpool_tail_slot_rows(slot)
+
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._prefill_page_table = None

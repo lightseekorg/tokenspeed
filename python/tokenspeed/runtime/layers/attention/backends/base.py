@@ -49,6 +49,13 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.slot_state import (
+    export_slot_state_sequence,
+    import_slot_state_sequence,
+    pack_slot_rows,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+)
 from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
     CudaGraphSupport,
     TreeSupport,
@@ -137,6 +144,41 @@ class CachePoolBinding:
     def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
         """Return logical-slot ownership, or None for local/replicated storage."""
         return None
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """This node's own per-slot rows a retraction snapshot images.
+
+        Backend-private state keyed by ``req_pool_index`` -- a recurrent
+        ring, a partial index pool not yet in a page -- is the exception
+        (``AGENTS.md``); a backend that keeps some lists it here, in a fixed
+        order, so a restore carries it with the pages. Paged state is in
+        cache groups and never listed. Composites image their children
+        through :meth:`child_backends`; a leaf's default is empty.
+        """
+        del slot
+        return []
+
+    def slot_state_bytes(self) -> int:
+        own = slot_state_image_bytes(self.slot_state_rows(0))
+        return own + sum(child.slot_state_bytes() for child in self.child_backends())
+
+    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
+        own = slot_state_image_bytes(self.slot_state_rows(0))
+        pack_slot_rows(self.slot_state_rows(slot), out[:own], stream)
+        export_slot_state_sequence(self.child_backends(), slot, out[own:], stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        own = slot_state_image_bytes(self.slot_state_rows(0))
+        unpack_slot_rows(self.slot_state_rows(slot), src[:own], stream)
+        import_slot_state_sequence(
+            self.child_backends(), slot, src[own:], stream, request_id=request_id
+        )
 
 
 class AttentionBackend(CachePoolBinding, ABC):

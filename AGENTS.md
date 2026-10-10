@@ -77,7 +77,10 @@ subsystem and the C++ scheduler can own it — as a cache group with its own
 block granularity, allocated, prefix-matched, transferred and freed with the
 request's other blocks — before adding state maintenance inside a particular
 model or attention backend. Backend-private state is the exception, not the
-default.
+default; when it exists and is keyed by the request slot, it must implement
+`SlotStateExporter` (`python/tokenspeed/runtime/execution/slot_state.py`) so a
+retraction snapshot carries it with the pages, and
+`test/runtime/test_slot_state.py` fails when it does not.
 
 `docs/design/` records the deliberate invariants of each subsystem — what
 belongs where, and why. Read the document covering the code you are touching

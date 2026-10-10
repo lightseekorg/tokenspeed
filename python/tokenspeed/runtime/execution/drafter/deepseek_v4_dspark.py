@@ -200,6 +200,21 @@ class DeepseekV4DSpark(BaseDrafter):
         self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
 
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # The request-persistent context windows and their lengths: the state
+        # ``dspark_prefix_replay_tokens`` exists to regenerate from a prefix.
+        if not 0 <= slot < self.first_padding_slot:
+            raise ValueError(
+                f"DSPARK slot {slot} is outside the persistent state domain "
+                f"[0, {self.first_padding_slot})"
+            )
+        return [self.kv_windows[slot], self.context_lengths[slot]]
+
+    def claim_slot(self, slot: int, request_id: str) -> None:
+        # Imported windows belong to ``request_id``: ``prepare_request_state``
+        # must not reset them as a previous occupant's at the first forward.
+        self._request_by_pool_slot[slot] = request_id
+
     def prepare_request_state(
         self,
         request_ids: list[object],

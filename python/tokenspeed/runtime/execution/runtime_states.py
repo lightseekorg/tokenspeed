@@ -26,11 +26,33 @@ import itertools
 import torch
 
 from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
+from tokenspeed.runtime.execution.slot_state import (
+    pack_slot_rows,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+)
 from tokenspeed.runtime.execution.types import RequestHistorySeeds
 
 
 class RuntimeStates:
-    """Own runtime state tensors keyed by request-pool index."""
+    """Own runtime state tensors keyed by request-pool index.
+
+    A retraction snapshot images each slot's rows (``slot_state_rows``); the
+    token-derived rows below are reseeded from the control plane's token list
+    instead and stay out of the image (``docs/design/cache-concepts.md``,
+    "Retraction snapshot").
+    """
+
+    #: Per-slot rows a restore does not copy: the history rows are reseeded
+    #: by ``seed_request_token_history`` and the n-gram tail by the per-round
+    #: snapshot in ``InputBuffers.fill_ngram_history`` (which resets a slot
+    #: whose request id changed).
+    token_derived_slot_state: tuple[str, ...] = (
+        "request_token_history_ids",
+        "draft_request_token_history_ids",
+        "ngram_accepted_tokens",
+        "ngram_needs_seed",
+    )
 
     def __init__(
         self,
@@ -289,6 +311,41 @@ class RuntimeStates:
                     device_tokens[offset + 1 : offset + prefix_length]
                 )
             offset += prefix_length
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """The per-slot rows a retraction snapshot images, in a fixed order.
+
+        The next step's inputs (``future_input_map``, the tree parents), the
+        committed frontier, the PD candidate-readiness bit and the verifier's
+        recorded proposal distributions: re-deriving any of them needs a
+        forward, so a restore copies them byte for byte.
+        """
+        rows = [
+            self.valid_cache_lengths[slot],
+            self.future_input_map[slot],
+            self.remote_spec_candidate_ready[slot],
+        ]
+        if self.draft_probs is not None:
+            rows.append(self.draft_probs[slot])
+        if self.future_parent_map is not None:
+            rows.append(self.future_parent_map[slot])
+        return rows
+
+    def slot_state_bytes(self) -> int:
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        del request_id
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
     def reset_states(
         self,

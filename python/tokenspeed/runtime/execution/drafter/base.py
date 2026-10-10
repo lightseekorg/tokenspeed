@@ -31,6 +31,11 @@ from tokenspeed.runtime.execution.drafter.speculative_sampling import (
     DraftProposalSampler,
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.slot_state import (
+    pack_slot_rows,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -262,6 +267,44 @@ class BaseDrafter:
             f"{type(self).__name__} cannot draft trees (--speculative-eagle-topk > 1); "
             "tree drafting needs an EAGLE-style drafter (EAGLE3, or MTP served by Eagle)"
         )
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """The drafter-owned per-slot rows a retraction snapshot images.
+
+        Cross-round state keyed by ``req_pool_index`` that a forward alone
+        regenerates -- a stash of target hiddens, a request-persistent
+        context window, a write frontier -- belongs here, in a fixed order.
+        A drafter whose state lives entirely in cache groups or batch rows
+        keeps the empty default. Draft KV pages are cache groups and travel
+        with the pages, not here.
+        """
+        del slot
+        return []
+
+    def claim_slot(self, slot: int, request_id: str) -> None:
+        """Mark ``slot`` as ``request_id``'s after a restore imported its rows.
+
+        A drafter that keys slots by request id (``prepare_request_state``)
+        overrides this so the next prologue does not reset the imported rows
+        as a stale occupant's. The default has no such keying.
+        """
+        del slot, request_id
+
+    def slot_state_bytes(self) -> int:
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(self, slot: int, out: torch.Tensor, stream) -> None:
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+        self.claim_slot(slot, request_id)
 
     @abstractmethod
     def run(
