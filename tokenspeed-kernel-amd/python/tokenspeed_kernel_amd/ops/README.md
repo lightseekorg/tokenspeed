@@ -484,6 +484,19 @@ code, and the boundary tiles mask keys only, since rows past `q_len` are
 never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
 those keys score `-inf`.
 
+## Transform
+
+### GFX950 Hadamard query transform
+
+The operation applies a length-128 Hadamard transform with an explicit output
+scale to contiguous BF16 query rows on gfx950, returning the same shape and
+dtype. Empty inputs return an empty output of the same shape.
+
+One 64-lane wave handles each row, keeping two FP32 values per lane during
+seven add/subtract butterfly stages. Their order matches the portable
+reduction tree so the BF16 results agree exactly. The output scale is fixed
+for a compiled kernel; the number of rows is supplied by the launch grid.
+
 ## Sampling
 
 ### Argmax

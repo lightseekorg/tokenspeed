@@ -4,9 +4,15 @@ on:
   issue_comment:
     types: [created]
   workflow_run:
-    workflows: [PR CI Plan, Lint, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
+    # Wake only for assist-owned dispatches and native checks; vendor CI
+    # completions are covered by the periodic sweep below instead.
+    workflows: [PR CI Plan, Lint, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, Slurm Dispatch, K8s Dispatch]
     types: [completed]
     branches-ignore: [main]
+  # Backstop sweep: reconcile active requests whose completions never fire a
+  # kept trigger (vendor CI, lost events, expired budgets).
+  schedule:
+    - cron: "13,33,53 * * * *"
   workflow_call:
   workflow_dispatch:
     inputs:
@@ -14,15 +20,6 @@ on:
         description: "PR whose existing authorized watch/fix should be reconciled"
         required: true
         type: string
-      repair_run:
-        description: "Completed repair run whose accepted source edits should seed this retry"
-        required: false
-        type: string
-      check_only:
-        description: "Recheck an accepted patch without requesting new source edits"
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -35,10 +32,13 @@ jobs:
        (github.event.issue.pull_request &&
         contains(github.event.comment.body, '@lightseek-bot') &&
         (contains(github.event.comment.body, 'watch') ||
-         contains(github.event.comment.body, 'fix')))) &&
+         contains(github.event.comment.body, 'fix') ||
+         contains(github.event.comment.body, 'rerun')))) &&
       (github.event_name != 'workflow_run' ||
-       github.event.workflow_run.event == 'pull_request' ||
-       github.event.workflow_run.event == 'workflow_dispatch')
+       ((github.event.workflow_run.event == 'pull_request' ||
+         github.event.workflow_run.event == 'workflow_dispatch') &&
+        (github.event.workflow_run.path != '.github/workflows/pr-ci-plan.yml' ||
+         github.event.workflow_run.conclusion != 'skipped')))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -74,8 +74,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           PR_NUMBER: ${{ needs.resolve.outputs.pr }}
-          REPAIR_RUN: ${{ inputs.repair_run }}
-          REPAIR_CHECK_ONLY: ${{ inputs.check_only }}
           TOKENSPEED_B200_RUNNER_LABEL: b200v2
         run: python3 .github/scripts/pr_ci_assist.py control --pr "$PR_NUMBER"
       - if: steps.control.outputs.repair == 'true'
@@ -83,7 +81,6 @@ jobs:
         with:
           name: repair-request
           path: ${{ runner.temp }}/pr-ci-assist/request.json
-          retention-days: 1
 
   repair:
     needs: control
@@ -100,38 +97,24 @@ jobs:
         with:
           name: repair-request
           path: ${{ runner.temp }}/pr-ci-assist
-      - if: inputs.repair_run != ''
-        uses: actions/download-artifact@v4
-        with:
-          name: repair-patch
-          run-id: ${{ inputs.repair_run }}
-          github-token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
-          path: ${{ runner.temp }}/pr-ci-assist/previous-repair
-      - if: '!inputs.check_only'
-        uses: actions/setup-node@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: '24'
-      - if: '!inputs.check_only'
-        run: npm install --global @moonshot-ai/kimi-code@2.1.1
+      - run: npm install --global @moonshot-ai/kimi-code@2.1.1
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - run: python3 -m pip install pyyaml ruff
       - name: Prepare provider configuration
-        if: '!inputs.check_only'
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
           KIMI_CODE_HOME: ${{ runner.temp }}/ci-assist-home
         run: python3 .github/scripts/pr_ci_repair.py configure
       - name: Prepare source repair
-        if: '!inputs.check_only'
         env:
           KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
           KIMI_CODE_HOME: ${{ runner.temp }}/ci-assist-home
         run: python3 .github/scripts/pr_ci_repair.py model
-      - name: Reuse accepted source repair
-        if: inputs.check_only
-        run: python3 .github/scripts/pr_ci_repair.py reuse
       - uses: actions/upload-artifact@v4
         with:
           name: repair-patch
@@ -173,7 +156,7 @@ jobs:
     needs: [resolve, control, check]
     if: needs.check.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     concurrency:
       group: pr-ci-assist-${{ needs.resolve.outputs.pr }}
       cancel-in-progress: false

@@ -133,7 +133,7 @@ def test_one_process_world_backs_every_logical_group(emulated_manager):
 def test_shared_expert_check_is_sized_by_its_process_group(emulated_manager):
     mapping = SimpleNamespace(world_size=8, world_group=TP8)
     with mock.patch.object(shared_expert_tp, "pg_manager", emulated_manager):
-        assert shared_expert_tp.validate_shared_expert_settings(mapping, "1") is None
+        assert shared_expert_tp.validate_shared_expert_settings(mapping, 1) is None
 
 
 def test_grammar_sync_is_sized_by_its_process_group():

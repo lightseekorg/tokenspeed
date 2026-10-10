@@ -6,13 +6,20 @@ On an open, same-repository PR, a repository writer can comment:
 @lightseek-bot watch
 @lightseek-bot fix
 @lightseek-bot fix <GitHub Actions job URL>
+@lightseek-bot rerun <GitHub Actions job URL>
 ```
 
-For a targeted repair, copy the failed job's URL from that PR's Actions run.
-The optional `?pr=NUMBER` suffix is accepted. The job must belong to the PR's
-current commit and latest run attempt, and must have failed or timed out.
-The rest of its workflow may still be running. Links to other repositories,
-PRs, or older commits cannot authorize a repair.
+For a targeted repair or rerun, copy the failed job's URL from that PR's
+Actions run. The optional `?pr=NUMBER` suffix is accepted. The job must belong
+to the PR's current commit and latest run attempt, and must have failed or
+timed out. The rest of its workflow may still be running. Links to other
+repositories, PRs, or older commits cannot authorize a repair or rerun.
+
+A rerun re-dispatches the failed job's validation task through Slurm or K8s
+dispatch and reports the outcome: a pass closes the request; a failure starts
+the repair flow as if `fix` had been requested for that job. Reruns of native
+checks, which have no independent dispatch channel, start the repair flow
+directly.
 
 The repair agent receives the requested job's metadata and log alongside the
 source and existing CI plan. It diagnoses the failure and proposes the source
@@ -29,21 +36,24 @@ manual intervention.
 
 Repairs are checked and tested on a candidate commit before updating the PR.
 Passing another backend does not satisfy the requested task. Required PR CI
-still applies after the update. Status comments are created at the start and
-at completion or a blocker; intermediate progress updates the same comment.
+still applies after the update. A status comment is created when assistance
+first engages and again at each completion or blocker — the only events that
+notify subscribers. Progress, new pushes and new commands update the latest
+comment in place, and terminal outcome comments are never edited.
 
-If queueing exhausts the one-hour repair budget, let the candidate checks finish.
-Then run **PR CI Assist** manually with the PR number and `repair_run` left empty.
-This gives reconciliation a 15-minute window to verify the existing results and
-publish the same candidate. It starts no new repair or GPU validation, and still
-requires the original command, PR source, and validation branch to match.
+Each repair and validation attempt has a one-hour budget. The overrun is
+recognized the next time the workflow runs — on a completion event, a manual
+trigger, or the twenty-minute sweep — and stops the attempt for manual
+intervention. Running **PR CI
+Assist** manually with the PR number retries from the current state: with a
+retained candidate it gets a 15-minute window to verify the existing results
+and publish the same repair, starting no new repair or GPU validation; without
+a candidate it starts a fresh repair. The candidate keeps its original repair
+plan; later plan comments do not replace its selected checks or start
+additional tasks.
 
-A new main commit does not by itself invalidate a repair. Assistance reuses the
-candidate when main advances without touching the PR or repair files or the
-inputs of its selected checks. Documentation and independent components or
-backends follow the existing CI path rules. Shared CI controls, build and
-dependency inputs, unknown paths, rewritten history, and merge conflicts still
-require fresh validation. The original validation base and result source remain
-unchanged; promotion checks compatibility again and publishes the same repair.
-Explicit reconciliation also accepts a retained candidate previously marked stale
-when these compatibility checks pass.
+A new main commit does not by itself invalidate a repair. The candidate stays
+valid while a trial merge against the current main is clean; a conflict stops
+assistance for manual intervention and requires a retry. Promotion repeats the
+trial merge immediately before publishing the same repair. Required PR CI
+still applies after the update.

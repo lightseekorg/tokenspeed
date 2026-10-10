@@ -31,6 +31,7 @@ import-guarded on missing optional backend packages are skipped.
 
 from __future__ import annotations
 
+import builtins
 import importlib
 import inspect
 import sys
@@ -111,6 +112,9 @@ import tokenspeed_kernel.ops.residual.triton as _residual_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
+import tokenspeed_kernel.ops.transform as _transform_pkg
+import tokenspeed_kernel.ops.transform.gluon as _transform_gluon
+import tokenspeed_kernel.ops.transform.triton as _transform_triton
 import torch
 from tokenspeed_kernel.ops.attention.dsa import triton as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.dsv4 import triton as _attention_triton_dsv4
@@ -155,6 +159,9 @@ from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize
 from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
 from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
+from tokenspeed_kernel.ops.transform import (
+    hadamard_transform as kernel_hadamard_transform,
+)
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
@@ -265,6 +272,10 @@ _RELOAD_MODULES = [
     _sampling_cute_dsl,
     _sampling_gluon,
     _sampling_pkg,
+    # Transform registration modules.
+    _transform_gluon,
+    _transform_triton,
+    _transform_pkg,
 ]
 
 
@@ -279,6 +290,57 @@ def test_attention_api_ownership_and_result_type_identity_are_stable():
     assert _attention_pkg.__all__ == ["attn_merge_state"]
     assert _attention_gdn_pkg.GdnChunkPrefillResult is GdnChunkPrefillResult
     assert _attention_kda_pkg.KdaPrefillResult is KdaPrefillResult
+
+
+@pytest.mark.parametrize("platform_fixture", ["h100_platform", "mi350_platform"])
+def test_hadamard_gluon_registration_uses_amd_backend_only(
+    platform_fixture: str,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _transform_gluon.__file__.endswith("/transform/gluon.py")
+    assert _transform_triton.__file__.endswith("/transform/triton.py")
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    host_registry = KernelRegistry.get()
+    imports = []
+    calls = []
+    real_import = builtins.__import__
+
+    def launch(x, *, scale):
+        calls.append((x, scale))
+        return x
+
+    def import_backend(name, *args, **kwargs):
+        if name == "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard":
+            imports.append(name)
+            assert platform.is_amd
+            return SimpleNamespace(launch_gluon_hadamard_transform_128_gfx950=launch)
+        return real_import(name, *args, **kwargs)
+
+    try:
+        Platform.override(platform)
+        KernelRegistry.reset()
+        with monkeypatch.context() as patch:
+            patch.setattr(builtins, "__import__", import_backend)
+            importlib.reload(_transform_gluon)
+            implementation = KernelRegistry.get().get_impl(
+                "gluon_hadamard_transform_128_gfx950"
+            )
+            if platform.is_amd:
+                x = torch.empty((1, 128), dtype=torch.bfloat16, device="meta")
+                assert implementation(x, scale=0.25) is x
+                assert calls == [(x, 0.25)]
+                assert imports == [
+                    "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard"
+                ]
+            else:
+                assert implementation is None
+                assert not imports
+    finally:
+        Platform.override(host_platform)
+        KernelRegistry._instance = host_registry
+        importlib.reload(_transform_gluon)
 
 
 def test_residual_family_exports_and_modes():
@@ -486,6 +548,18 @@ def _mm_dense() -> torch.Tensor:
     a = torch.empty((4, 16), dtype=torch.bfloat16)
     b = torch.empty((32, 16), dtype=torch.bfloat16)
     return kernel_mm(a, b)
+
+
+def _hadamard_transform(
+    *,
+    contiguous: bool,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if contiguous:
+        x = torch.empty((8_192, 32, 128), dtype=dtype, device="meta")
+    else:
+        x = torch.empty((8_192, 32, 256), dtype=dtype, device="meta")[..., ::2]
+    return kernel_hadamard_transform(x, scale=128**-0.5)
 
 
 def _mm_dense_cdna4_aligned() -> torch.Tensor:
@@ -4656,6 +4730,46 @@ def _case(
 
 
 _CASES = [
+    # Only contiguous BF16 on GFX950 uses Gluon; other AMD inputs retain Triton.
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "gluon_hadamard_transform_128_gfx950",
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
+        id_suffix="bf16-contiguous",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=False, dtype=torch.bfloat16),
+        id_suffix="bf16-strided-fallback",
+    ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "transform",
+            "hadamard_transform",
+            "triton_hadamard_transform_128",
+            partial(_hadamard_transform, contiguous=True, dtype=dtype),
+            id_suffix=f"{dtype}-fallback",
+        )
+        for dtype in (torch.float16, torch.float32)
+    ],
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
+        id_suffix="bf16-architecture-fallback",
+    ),
     *[
         _case(
             _is_blackwell_sm100,
@@ -6203,6 +6317,9 @@ def selected_kernel_spy(monkeypatch):
             return torch.empty(
                 (logits.shape[0],), dtype=torch.int64, device=logits.device
             )
+
+        if case.family == "transform":
+            return torch.empty_like(args[0])
 
         if case.family == "moe":
             if case.mode == "topk":

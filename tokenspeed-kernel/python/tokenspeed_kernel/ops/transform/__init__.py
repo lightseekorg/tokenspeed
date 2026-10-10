@@ -22,6 +22,7 @@ from __future__ import annotations
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.transform.faster_hadamard_transform  # noqa: F401
+import tokenspeed_kernel.ops.transform.gluon  # noqa: F401
 import tokenspeed_kernel.ops.transform.triton  # noqa: F401
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -61,6 +62,7 @@ def hadamard_transform(
 
     traits = {
         "last_dim": x.shape[-1],
+        "contiguous": x.is_contiguous(),
     }
     signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(

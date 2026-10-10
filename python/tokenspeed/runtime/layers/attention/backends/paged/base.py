@@ -41,6 +41,9 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeCascadeRows,
+)
 from tokenspeed.runtime.layers.attention.backends.support import (
     CudaGraphSupport,
     TreeSupport,
@@ -146,12 +149,14 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self.tree_verify: TreeVerifyInputs | None = None
         # Draft-tree lane inputs; set on the drafter's leaves only.
         self.tree_draft: TreeDraftInputs | None = None
+        # Draft-tree verify: committed keys per request, the cascade's prefix.
+        self.tree_prefix_lens_buf: torch.Tensor | None = None
 
     def tree_support(self) -> TreeSupport:
         name = type(self).__name__
         return TreeSupport(
-            verify_blocker=f"{name} has no tree verify path; use --attention-backend trtllm",
-            draft_blocker=f"{name} has no tree lane path; use --drafter-attention-backend trtllm",
+            verify_blocker=f"{name} has no tree verify path; use --attention-backend trtllm (MLA: trtllm_mla or tokenspeed_mla)",
+            draft_blocker=f"{name} has no tree lane path; use --drafter-attention-backend trtllm (MLA: trtllm_mla or tokenspeed_mla)",
         )
 
     def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
@@ -164,6 +169,48 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     def tree_lane_step_active(self) -> bool:
         return self.tree_draft is not None and self.tree_draft.active
 
+    def _refresh_tree_prefix(self, bs: int, verify_seq_lens: torch.Tensor) -> None:
+        """Publish the verify cascade's prefix (``verify_seq_lens`` minus the
+        window) when a tree is bound; ``verify_seq_lens`` is already clamped
+        to the window width."""
+        if self.tree_verify is not None:
+            torch.sub(
+                verify_seq_lens[:bs],
+                self.tree_verify.num_nodes,
+                out=self.tree_prefix_lens_buf[:bs],
+            )
+
+    def _tree_lane_rows(self, bs: int) -> TreeCascadeRows | None:
+        """The drafting lanes' cascade while a lane forward runs, else None."""
+        if not self.tree_lane_step_active:
+            return None
+        lanes = self.tree_draft
+        return TreeCascadeRows(
+            page_table=self.page_table_buf[:bs],
+            seq_lens=lanes.window_seq_lens[:bs],
+            prefix_lens=lanes.frontier[:bs],
+            mask=lanes.lane_mask[: bs * lanes.topk],
+            rows=lanes.topk,
+            window=lanes.num_slots,
+        )
+
+    def _tree_verify_rows(
+        self, bs: int, q_len: int, page_table: torch.Tensor, seq_lens: torch.Tensor
+    ) -> TreeCascadeRows | None:
+        """The verify cascade when a tree is bound and this forward verifies
+        (``q_len > 1``), else None; ``seq_lens`` include the window."""
+        if self.tree_verify is None or q_len <= 1:
+            return None
+        nodes = self.tree_verify.num_nodes
+        return TreeCascadeRows(
+            page_table=page_table,
+            seq_lens=seq_lens,
+            prefix_lens=self.tree_prefix_lens_buf[:bs],
+            mask=self.tree_verify.mask[: bs * nodes],
+            rows=nodes,
+            window=nodes,
+        )
+
     # ------------------------------------------------------------------
     # Static shape / lifecycle
     # ------------------------------------------------------------------
@@ -173,6 +220,7 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         # Graph buffers and views return with init_cuda_graph_state.
         self.page_table_buf = None
         self.seq_lens_buf = None
+        self.tree_prefix_lens_buf = None
         self._decode_views_by_bs = {}
 
     def configure_runtime(self, **kwargs) -> None:
@@ -243,6 +291,9 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
             self.spec_num_tokens if self.block_decode_active else 0,
             dtype=torch.int32,
             device=self.device,
+        )
+        self.tree_prefix_lens_buf = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
         )
         # Buffers were (re)allocated: cached per-bs views must rebuild.
         self._decode_views_by_bs = {}
