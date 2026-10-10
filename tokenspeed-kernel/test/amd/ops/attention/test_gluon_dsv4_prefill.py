@@ -97,6 +97,8 @@ def _reference(
         (1, 640),
         (7, 640),
         (16, 640),
+        (17, 384),
+        (32, 1152),
     ],
 )
 def test_gluon_dsv4_prefill_matches_reference(heads: int, width: int) -> None:
@@ -120,4 +122,35 @@ def test_gluon_dsv4_prefill_matches_reference(heads: int, width: int) -> None:
     torch.testing.assert_close(actual, expected, atol=8e-3, rtol=8e-3)
     triton = dsv4.dsv4_prefill(q, kv, indices, lens, sink, scale, solution="triton")
     torch.testing.assert_close(actual, triton, atol=8e-3, rtol=8e-3)
+    assert torch.count_nonzero(actual[2]).item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_gluon_dsv4_prefill_graph_refreshes_selected_rows():
+    if not current_platform().is_cdna5:
+        pytest.skip("gfx1250 selected prefill")
+    torch.manual_seed(29)
+    q = torch.randn(3, 17, 512, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+    indices = torch.randint(0, 256, (3, 128), device="cuda", dtype=torch.int32)
+    lens = torch.tensor([128, 17, 0], device="cuda", dtype=torch.int32)
+    sink = torch.randn(17, device="cuda")
+    scale = 512**-0.5
+
+    def run():
+        return dsv4.dsv4_prefill(q, kv, indices, lens, sink, scale, solution="gluon")
+
+    previous = run().clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    q.mul_(-0.75)
+    indices.add_(37).remainder_(256)
+    lens.copy_(torch.tensor([7, 128, 0], device="cuda", dtype=torch.int32))
+    graph.replay()
+    torch.testing.assert_close(actual, run(), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(
+        actual, _reference(q, kv, indices, lens, sink, scale), atol=8e-3, rtol=8e-3
+    )
+    assert not torch.equal(actual[:2], previous[:2])
     assert torch.count_nonzero(actual[2]).item() == 0

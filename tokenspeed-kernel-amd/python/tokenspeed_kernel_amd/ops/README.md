@@ -238,6 +238,10 @@ until the first call in an unwarmed range.
 
 ### DeepSeek V4 attention
 
+The gfx1250 dense selected-prefill kernel loads KV rows in eight-element BF16
+vectors before staging them in shared memory. This keeps each vector load
+contiguous across lanes while preserving the existing WMMA operands.
+
 The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
 provides dense-workspace selected prefill, while both architectures provide
 page-planar selected decode. Decode reads a sliding-window (SWA) cache and an

@@ -82,7 +82,7 @@ def gluon_dsv4_prefill_gfx1250(
         [1, 0],
     )
     kv_load_layout: gl.constexpr = gl.BlockedLayout(
-        [16, 1],
+        [8, 1],
         [WARP_SIZE, 1],
         [1, NUM_WARPS],
         [0, 1],
