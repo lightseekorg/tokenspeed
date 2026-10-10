@@ -317,10 +317,12 @@ storage before scoring. Missing or out-of-range cache pages never contribute
 rows or blocks, including the newest visible block. A valid newest block
 remains eligible regardless of its score.
 
-On gfx950, `gluon_dsv41_index_topk_select_gfx950` turns each logits tile into
-rows in one launch (one workgroup per query), replacing `torch.topk`, a sort
-and about ten elementwise kernels (~140 us -> 12-16 us for 192 decode queries
-over 2-5K rows). It keeps the `select_rows_torch` contract: the
+On gfx950, `gluon_dsv41_index_topk_select_gfx950` turns the indexer scores
+into the selected KV rows. The scorer leaves each query one row of logits, one
+per candidate column; for every query, this kernel picks the best columns from
+that row and writes them as the query's list of logical KV row ids. One launch
+covers all queries, one workgroup per query, replacing `torch.topk`, a sort and
+about ten elementwise kernels. It keeps the `select_rows_torch` contract: the
 `min(topk, width)` largest finite logits, written as ascending logical ids
 then -1, with their count. Equal-score boundary ties keep the lowest columns.
 A three-pass MSD radix select (11+11+10 key bits, LDS-atomic histograms) finds
@@ -329,7 +331,7 @@ per chunk keeps larger keys plus the first ties and maps candidate columns to
 logical rows. The picks are already ascending without candidates and with
 ascending candidate lists; otherwise an all-pairs rank sorts them. LDS
 atomics cost about one wave instruction per 64 lanes regardless of conflicts,
-so the radix passes dominate at wide rows (~45 us at 16K columns).
+so the radix passes dominate on wide rows.
 
 ### gfx1250 MLA decode
 
