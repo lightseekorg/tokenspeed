@@ -143,6 +143,14 @@ _PRECOMPUTED_MFMA_MIN_M = 4
 _ROUTE_OWNED_DECODE_MAX_M = 2
 
 
+# Widest batch the precomputed-top-k entry (DeepSeek V4/V4.1) sends to the
+# direct MFMA decode instead of route + ragged GEMMs. Both give identical
+# results. At V4.1 TP4 shapes (384 experts, H=5120, I=640, top-6), with cold
+# experts, the direct path takes 47.8/122.5/213.3/385.3 us against
+# 62.4/190.4/301.6/447.9 us at M=4/16/32/64, and loses from M=96 (569 vs 544).
+_PRECOMPUTED_DIRECT_DECODE_MAX_M = 64
+
+
 # Widest activation the precomputed-SiTU entry point serves with the
 # warp-decode kernels; anything wider goes to package prefill.
 #
@@ -817,6 +825,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     swiglu_limit: float,
     swiglu_beta: float,
     out: torch.Tensor | None = None,
+    direct_max_m: int = _DIRECT_DECODE_MAX_M,
 ) -> torch.Tensor | None:
     """Direct top-k MXFP4xMXFP4 decode for tiny precomputed-routing batches.
 
@@ -827,7 +836,6 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     the exact gdot128-shuffled runtime tensors.
     """
     n_tokens = int(hidden_states.shape[0])
-    direct_max_m = _DIRECT_DECODE_MAX_M
     if (
         precomputed_topk_weights is None
         or precomputed_topk_ids is None
@@ -1799,13 +1807,14 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         w13_bias=w13_bias,
         w2_bias=w2_bias,
         out_dtype=out_dtype,
-        max_m=_DECODE_MAX_M,
+        max_m=_PRECOMPUTED_DIRECT_DECODE_MAX_M,
         precomputed_topk_weights=topk_weights,
         precomputed_topk_ids=topk_ids,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
         out=out,
+        direct_max_m=_PRECOMPUTED_DIRECT_DECODE_MAX_M,
     )
     if direct_out is not None:
         return direct_out
