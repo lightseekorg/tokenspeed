@@ -93,6 +93,7 @@ if current_platform().is_amd:
             launch_logits=launch_gfx950_logits,
             select_rows=select_rows_gfx950,
             select_blocks=index_block_select,
+            logits_written=True,
         )
 
     @register_kernel(
