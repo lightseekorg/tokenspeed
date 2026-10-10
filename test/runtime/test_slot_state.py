@@ -305,8 +305,15 @@ def _randomize(rows: list[torch.Tensor]) -> None:
             row.copy_(torch.randint(1, 100, row.shape).to(row.dtype))
 
 
-def _round_trip(exporter: SlotStateExporter, *, src_slot: int, dst_slot: int) -> None:
-    """Export ``src_slot``, wipe it, import into ``dst_slot``; both must match."""
+def _round_trip(
+    exporter: SlotStateExporter,
+    *,
+    src_slot: int,
+    dst_slot: int,
+    rows_rewritten_on_import: frozenset[int] = frozenset(),
+) -> None:
+    """Export ``src_slot``, wipe it, import into ``dst_slot``; both must match
+    except the rows an owner deliberately rewrites on import."""
     torch.manual_seed(0)
     source_rows = exporter.slot_state_rows(src_slot)
     _randomize(source_rows)
@@ -320,9 +327,12 @@ def _round_trip(exporter: SlotStateExporter, *, src_slot: int, dst_slot: int) ->
         row.zero_()
     exporter.import_slot_state(dst_slot, image, None, request_id="req-restored")
 
-    for restored, original in zip(exporter.slot_state_rows(dst_slot), expected):
+    for index, (restored, original) in enumerate(
+        zip(exporter.slot_state_rows(dst_slot), expected)
+    ):
         assert restored.shape == original.shape
-        assert torch.equal(restored, original)
+        if index not in rows_rewritten_on_import:
+            assert torch.equal(restored, original)
 
 
 # ----------------------------------------------------------------------
@@ -369,13 +379,40 @@ def test_pack_copies_a_non_contiguous_slot_slice():
 # ----------------------------------------------------------------------
 
 
+# RuntimeStates.slot_state_rows order: cache length, next-step inputs,
+# candidate readiness, then the optional draft distributions and tree parents.
+_CANDIDATE_READY_ROW = 2
+
+
 @pytest.mark.parametrize("draft_probs", [False, True])
 @pytest.mark.parametrize("trees", [False, True])
 def test_runtime_states_round_trip(draft_probs, trees):
     states = _runtime_states(draft_probs=draft_probs, trees=trees, history=True)
-    _round_trip(states, src_slot=3, dst_slot=7)
+    _round_trip(
+        states,
+        src_slot=3,
+        dst_slot=7,
+        rows_rewritten_on_import=frozenset({_CANDIDATE_READY_ROW}),
+    )
     # Token-derived rows stay out of the image and untouched by it.
     assert states.request_token_history_ids.abs().sum() == 0
+
+
+def test_runtime_states_import_marks_the_imaged_candidates_ready():
+    """A restored request's first decode op carries its token explicitly (no
+    forward of its own is in flight), and the prologue treats an explicit id
+    on a row whose candidates are not marked ready as a bootstrap row to
+    verify single-token. The imaged candidates are the ones the victim's last
+    forward drafted, so the import marks them ready and the first verify
+    after the restore consumes them as the unretracted step would have."""
+    states = _runtime_states(draft_probs=False, trees=False, history=False)
+    states.remote_spec_candidate_ready[3] = False  # a fused victim's row
+    states.future_input_map[3] = torch.arange(1, states.future_input_map.shape[1] + 1)
+    image = torch.empty((states.slot_state_bytes(),), dtype=torch.uint8)
+    states.export_slot_state(3, image, None)
+    states.import_slot_state(7, image, None, request_id="restored")
+    assert bool(states.remote_spec_candidate_ready[7])
+    assert torch.equal(states.future_input_map[7], states.future_input_map[3])
 
 
 def test_mtp_stash_round_trip():

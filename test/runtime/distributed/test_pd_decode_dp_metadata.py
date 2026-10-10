@@ -84,20 +84,6 @@ def test_pd_decode_decode_step_is_reported_as_decode(monkeypatch):
     assert meta.all_decode_or_idle
 
 
-def test_local_recovery_prefill_is_model_work(monkeypatch):
-    # A D-role batch only ever contains model work (a remote prefill rides
-    # plan.remote_prefill, never the batch — pinned by the C++ scenario
-    # tests), so a recovery prefill's tokens count like any extend.
-    loop = _FakeLoop()
-    op = FakeForwardOp(input_lengths=[17], num_extends=1)
-
-    meta = _sync(loop, op, monkeypatch)
-
-    assert meta.global_num_tokens == [17]
-    assert meta.global_forward_mode == [int(ForwardMode.EXTEND)]
-    assert meta.all_extend
-
-
 def test_non_pd_extend_is_model_work(monkeypatch):
     loop = _FakeLoop()
     op = FakeForwardOp(input_lengths=[17], num_extends=1)

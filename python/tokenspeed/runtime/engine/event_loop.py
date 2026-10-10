@@ -288,9 +288,9 @@ class EventLoop:
         # Cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when the engine cannot emit cache
         # ops -- armed hooks cost a gloo all-reduce per round. The Host L2
-        # tier arms them; the retraction snapshot pool does once the
-        # scheduler emits snapshot ops (cache_hooks.SNAPSHOT_POOL_EMITS_CACHE_OPS).
-        # The hooks get the handle, not the executor: polling goes through it.
+        # tier arms them, and so does the retraction snapshot pool (its
+        # stores and restores are cache ops too). The hooks get the handle,
+        # not the executor: polling goes through it.
         armed = cache_hooks_armed(
             enable_kvstore=server_args.enable_kvstore,
             max_retracted_requests=specs.max_retracted_requests,
@@ -361,6 +361,10 @@ class EventLoop:
             disable_l2_cache=not server_args.enable_kvstore,
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
             role=server_args.disaggregation_mode,
+            num_snapshot_pages=specs.num_snapshot_pages,
+            max_retracted_requests=specs.max_retracted_requests,
+            l3_prefetch_min_pages=server_args.kvstore_prefetch_min_pages,
+            debug_force_retraction_interval=server_args.debug_force_retraction_interval,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=self.overlap_schedule_depth,
@@ -377,6 +381,10 @@ class EventLoop:
             f"overlap_schedule_depth={scheduler_cfg.overlap_schedule_depth!s} "
             f"disable_l2_cache={scheduler_cfg.disable_l2_cache!s} "
             f"enable_l3_storage={scheduler_cfg.enable_l3_storage!s} "
+            f"num_snapshot_pages={scheduler_cfg.num_snapshot_pages!s} "
+            f"max_retracted_requests={scheduler_cfg.max_retracted_requests!s} "
+            f"debug_force_retraction_interval="
+            f"{scheduler_cfg.debug_force_retraction_interval!s} "
             f"max_batch_size={scheduler_cfg.max_batch_size!s} (global max_num_seqs="
             f"{server_args.max_num_seqs!s}, dp_size={self.dp_size!s}) "
             f"disable_prefix_cache={scheduler_cfg.disable_prefix_cache!s} "
@@ -1084,6 +1092,11 @@ class EventLoop:
                 # rank-identical every cycle. A no-op without an EPD admission
                 # controller (every non-EPD deployment).
                 self._epd_hooks.drain_ready_embeddings()
+                # The in-flight L3 prefetches converge first (replica MIN of
+                # the landed prefix), so a finished one is acknowledged in
+                # this round's cache poll and its request is admissible in
+                # this round's plan.
+                self._l3_hooks.converge_prefetches()
                 cache_events = self._cache_hooks.poll_ready_events()
                 if cache_events:
                     # Advanced at the HEAD of the round (not funneled into the
@@ -1101,7 +1114,6 @@ class EventLoop:
                 # replaces this rank's model forward; bootstrap, admission and
                 # transfer completion still have to advance on every round.
                 paused_round = False
-                l3_prefetch_retracts = []
 
                 if self._pause.forward_blocked:
                     # Freeze: dispatched forwards can't be un-launched; commit them
@@ -1110,14 +1122,17 @@ class EventLoop:
                     self._pause_hooks.paused_idle_step()
                     paused_round = True
                 else:
-                    self._l3_hooks.revalidate_queued_hits()
                     execution_plan = self.scheduler.next_execution_plan()
                     self._cache_hooks.count_plan_ops(execution_plan)
+                    # A capacity retraction whose victim could not be imaged
+                    # aborted that request inside the plan build; it is gone
+                    # from the scheduler, so finish it toward the client here
+                    # (no event flows back).
+                    self.output_processor.finish_scheduler_aborted_requests(
+                        execution_plan.aborts
+                    )
 
                     forward_op = self._get_forward_op(execution_plan)
-                    forward_op, l3_prefetch_retracts = self._l3_hooks.prepare_forward(
-                        execution_plan, forward_op
-                    )
                     stats = self._get_scheduler_stats()
                     self.load_reporter.observe(stats, self._num_running())
                     num_iter_tokens = (
@@ -1201,11 +1216,7 @@ class EventLoop:
                     # transfers ride the FIFO first, then the batch the role
                     # routes. ``planned`` is None on idle/empty rounds — the
                     # plan hygiene still runs.
-                    pending = self._device.execute(
-                        execution_plan,
-                        planned,
-                        submit_remote_prefill=not l3_prefetch_retracts,
-                    )
+                    pending = self._device.execute(execution_plan, planned)
                     if need_idle_forward:
                         self._device.run_idle_forward(dp_metadata)
                     if pending is not None:
@@ -1228,9 +1239,6 @@ class EventLoop:
                         request_changes.extend(self._commit_forward_results(fo, res))
 
                     request_changes.extend(self._pd_hooks.poll_transfer_events())
-
-                # Recovery follows older commits, before the next round plans.
-                request_changes.extend(l3_prefetch_retracts)
 
                 # The forward-result feedback point: everything this round
                 # committed reaches the scheduler here, before the next round

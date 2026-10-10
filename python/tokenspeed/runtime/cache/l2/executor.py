@@ -31,6 +31,15 @@ One executor, two pinned Host buffers over the same field geometry:
   stored by ``SnapshotOp`` and read back, together with the request's pinned
   L2 entries, by one ``RestoreOp`` whose rows name their source tier.
 
+The L3 store beneath the L2 tier is reached on two CPU lanes: a backup lane
+that persists written-back Host pages, and a prefetch lane that fills a
+waiting request's Host pages from L3 before its admission (``PrefetchOp``,
+batched gets in prefix order that stop at the first missing page or at the
+deadline, reporting a prefix length the hooks MIN-reduce across the replica).
+Only that L3-to-Host leg can miss, and it never overlaps a forward: admission
+then sees a plain Host hit and the Host-to-Device leg keeps its layer-wise
+overlap with the first chunk.
+
 A retraction image is split between the two by publishability (the
 scheduler's ``TakeImage``); the executor only chooses a buffer per row. Both
 legs of a store ride the write stream under one fence on the forward
@@ -44,6 +53,7 @@ so under KVP each rank copies exactly the blocks it owns.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from enum import Enum
@@ -62,11 +72,6 @@ from tokenspeed.runtime.cache.l2.storage import (
     HostCacheStorage,
     compute_host_lcm_block_bytes,
 )
-from tokenspeed.runtime.cache.l3.backend import (
-    L3UnreadKeySet,
-    l3_pages_newly_published,
-    l3_unread_key_capacity,
-)
 from tokenspeed.runtime.cache.l3.executor import L3HostStore, StoragePage
 from tokenspeed.runtime.cache.transfer.lanes import (
     CompletionQueue,
@@ -79,9 +84,8 @@ from tokenspeed.runtime.cache.transfer.lanes import (
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.cache.transfer.ops import (
     HostTier,
-    RestoreDoneEvent,
+    PrefetchOp,
     RestoreOp,
-    SnapshotDoneEvent,
     SnapshotOp,
 )
 from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
@@ -112,16 +116,23 @@ class _Ack(NamedTuple):
     """The payload of one in-flight Host copy on the completion queue.
 
     The queue holds the copy's completion event; this names the ACK its op
-    ids become. ``backup_pages`` (an L2 write-back's L3 pages) and
-    ``success`` (a load-back's outcome) are required so a write cannot omit
-    its page list and a load cannot omit its outcome; the other kinds pass
-    an empty list and True.
+    ids become. ``backup_pages`` (an L2 write-back's L3 pages) is required
+    so a write cannot omit its page list; the other kinds pass an empty
+    list.
     """
 
     kind: _AckKind
     op_ids: list[int]
     backup_pages: list[StoragePage]
-    success: bool
+
+
+class _PrefetchJob(NamedTuple):
+    """One in-flight L3 prefetch on the lane: the op, its pages by prefix page,
+    and the future that resolves to the pages landed (a prefix length)."""
+
+    request_id: str
+    num_pages: int
+    future: Future
 
 
 def _num_host_lcm_blocks(
@@ -286,26 +297,19 @@ class HostCacheExecutor:
                 rank=dcp_rank,
             )
         # The scheduler wire includes logical null LCMBlock 0 in its counts;
-        # 0 L2 pages means no L2 tier, 1 snapshot page means no pool. The
-        # pool count is reserved for the scheduler's snapshot ops (a later
-        # phase); it does not change today's retraction behaviour.
+        # 0 L2 pages means no L2 tier, 1 snapshot page means no pool (nothing
+        # can be imaged; a capacity-blocked round aborts a resident instead).
         self.num_host_pages = host_lcm_blocks + 1 if l2_tier else 0
         self.num_snapshot_pages = snapshot_lcm_blocks + 1
         self.l3_store = None
         self._l3_prefix_for_weight_version = None
         # L3 is attached after Host allocation via ``attach_l3_storage`` with
-        # the complete namespace and shard identity. The constructor does
-        # not take a storage backend: a partial attach would share an empty
-        # prefix across ranks.
-        self._l3_unread = L3UnreadKeySet(
-            capacity=l3_unread_key_capacity(
-                num_host_pages=self.num_host_pages,
-                cache_blocks_per_lcm_block=tuple(
-                    int(group.cache_blocks_per_lcm_block)
-                    for group in self.layout.groups
-                ),
-            )
-        )
+        # the complete namespace, shard identity and prefetch knobs. The
+        # constructor does not take a storage backend: a partial attach would
+        # share an empty prefix across ranks.
+        self._l3_prefetch_timeout_base_s = 0.0
+        self._l3_prefetch_timeout_per_page_s = 0.0
+        self._l3_prefetch_batch_pages = 0
         self.snapshot_storage: HostCacheStorage | None = None
         self.snapshot_block_owners: BlockOwnerTranslation | None = None
         self._snapshot_geometry = None
@@ -408,17 +412,23 @@ class HostCacheExecutor:
         # write-back and load-back, snapshot store and restore -- is one
         # entry of the one completion queue, released as the ACK its _Ack
         # names once its event completes; the queue is the cross-thread
-        # handoff. Loads that fail before launch (an L3 prefetch miss, or
-        # nothing owned to copy) have no event and are released from
-        # ``_ready_load_acks``; the lock covers it and the L3 backup futures.
+        # handoff. Loads with nothing owned to copy have no event and are
+        # released from ``_ready_load_acks``; the lock covers it and the L3
+        # backup futures.
         self._completions = CompletionQueue()
         self._ack_lock = threading.Lock()
         self._load_poisoned = False
-        self._ready_load_acks: list[tuple[int, bool]] = []
-        self._l3_prefetch_ok: dict[StoragePage, bool] = {}
+        self._ready_load_acks: list[int] = []
         self._backup_futures: list[tuple[Future, list[int], list[StoragePage]]] = []
         self._backup_poll_failed = False
         self._l3_workers: ThreadPoolExecutor | None = None
+        # The L3 prefetch lane (one thread: the gets are prefix-ordered RPCs)
+        # and its bookkeeping, all under ``_ack_lock``: the jobs in flight by
+        # op id, and the ops the hooks converged -- replica-wide MIN of every
+        # rank's landed prefix -- waiting to be acknowledged by ``poll_results``.
+        self._l3_prefetch_lane: ThreadPoolExecutor | None = None
+        self._prefetch_jobs: dict[int, _PrefetchJob] = {}
+        self._prefetch_acks: list[tuple[int, int]] = []
 
     def attach_l3_storage(
         self,
@@ -427,6 +437,9 @@ class HostCacheExecutor:
         key_prefix: str,
         rank: int,
         prefix_for_weight_version,
+        prefetch_timeout_base_s: float,
+        prefetch_timeout_per_page_s: float,
+        prefetch_batch_pages: int,
     ) -> None:
         """Bind an L3 backend to the compact Host buffer after allocation.
 
@@ -434,6 +447,21 @@ class HostCacheExecutor:
         allocation, so the backend is constructed after ``HostCacheStorage``.
         ``prefix_for_weight_version`` rebuilds the hashed namespace after a
         live weight load so new KV is not published under the old checkpoint.
+
+        Args:
+            storage_backend: The L3 store client.
+            key_prefix: The object-key namespace of this checkpoint and rank.
+            rank: This rank's position in the L3 key.
+            prefix_for_weight_version: Builds the namespace of a weight version.
+            prefetch_timeout_base_s: A prefetch op's deadline is
+                ``base + per_page * pages`` seconds after it starts
+                (``--kvstore-prefetch-timeout-base-s``); batches past the
+                deadline are not fetched and the op lands what it has.
+            prefetch_timeout_per_page_s: The per-page term of that deadline
+                (``--kvstore-prefetch-timeout-per-page-s``).
+            prefetch_batch_pages: Prefix pages per ``batch_get_into``
+                (``--kvstore-prefetch-batch-pages``); the op stops at the
+                first batch with a missing page.
         """
 
         if self.l3_store is not None:
@@ -444,7 +472,18 @@ class HostCacheExecutor:
             raise ValueError("prefix_for_weight_version is required")
         if self.host_storage is None:
             raise RuntimeError("L3 storage needs the L2 tier (--enable-kvstore)")
+        if prefetch_timeout_base_s <= 0 or prefetch_timeout_per_page_s < 0:
+            raise ValueError(
+                "the L3 prefetch deadline needs a positive base and a non-negative "
+                f"per-page term; got {prefetch_timeout_base_s} + "
+                f"{prefetch_timeout_per_page_s} * pages"
+            )
+        if prefetch_batch_pages <= 0:
+            raise ValueError("the L3 prefetch batch must hold at least one page")
         self._l3_prefix_for_weight_version = prefix_for_weight_version
+        self._l3_prefetch_timeout_base_s = float(prefetch_timeout_base_s)
+        self._l3_prefetch_timeout_per_page_s = float(prefetch_timeout_per_page_s)
+        self._l3_prefetch_batch_pages = int(prefetch_batch_pages)
         self.l3_store = L3HostStore(
             storage_backend,
             self.host_storage,
@@ -470,11 +509,19 @@ class HostCacheExecutor:
         for future, _op_ids, _pages in inflight:
             future.result()
 
+    def _wait_l3_prefetches(self) -> None:
+        with self._ack_lock:
+            jobs = list(self._prefetch_jobs.values())
+        for job in jobs:
+            job.future.result()
+
     # ------------------------------------------------------------------
     # Submission (forward thread)
     # ------------------------------------------------------------------
 
-    def submit_write_backs(self, plan, *, prerequisite_stream, fence_stream) -> None:
+    def submit_write_backs(
+        self, cache_ops: Sequence, *, prerequisite_stream, fence_stream
+    ) -> None:
         """Enqueue the plan's D2H copies on the write stream.
 
         Must run BEFORE the plan's page zeroing. Every copy is ordered behind
@@ -492,8 +539,10 @@ class HostCacheExecutor:
         both legs.
 
         Args:
-            plan: The round's ExecutionPlan; its ``Cache.WriteBackOp`` and
-                ``SnapshotOp`` entries are read here.
+            cache_ops: The round's cache ops as ``scheduler_utils.
+                cache_ops_from_plan`` adapts them; the ``Cache.WriteBackOp``
+                batches and the per-request ``SnapshotOp`` entries are read
+                here, the rest belongs to ``submit_load_backs``.
             prerequisite_stream: The stream whose completed work every copy
                 must observe -- the model executor's execution stream, where
                 the forwards wrote the source pages and the slot state.
@@ -511,7 +560,7 @@ class HostCacheExecutor:
         # The whole plan is validated and translated before the first launch:
         # a bad op must not leave the ordered rows in flight without the
         # fence that follows them.
-        for operation in plan.cache:
+        for operation in cache_ops:
             if isinstance(operation, Cache.WriteBackOp):
                 self._append_write_backs(
                     operation,
@@ -551,38 +600,38 @@ class HostCacheExecutor:
             prerequisite_stream=prerequisite_stream,
         )
 
-    def submit_load_backs(
-        self, plan, *, prerequisite_stream, l3_prefetch_ok: dict[StoragePage, bool]
-    ) -> None:
+    def submit_load_backs(self, cache_ops: Sequence, *, prerequisite_stream) -> None:
         """Launch the plan's H2D loads; runs after the plan's page zeroing.
 
-        L3 prefetch runs before this submission. Failed prefetch skips H2D
-        and reports failure so empty pages cannot be published or consumed.
-        A ``RestoreOp`` rides the same load stream with its rows split by
-        source tier (the request's pinned L2 entries, the pool's tail pages),
-        then its slot-state import; it arms no layerwise tracker, because the
-        request is not schedulable until the ACK.
+        Every load-back row reads a Host L2 entry that is already there (an
+        L3 prefetch, when one ran, filled and published it before the
+        request was admitted), so a load cannot miss. A ``RestoreOp`` rides
+        the same load stream with its rows split by source tier (the
+        request's pinned L2 entries, the pool's tail pages), then its
+        slot-state import; it arms no layerwise tracker, because the request
+        is not schedulable until the ACK, and its destinations are
+        overwritten whole rather than zeroed first.
 
         Args:
-            plan: The round's ExecutionPlan; its ``Cache.LoadBackOp`` and
-                ``RestoreOp`` entries are read here.
+            cache_ops: The round's cache ops as ``scheduler_utils.
+                cache_ops_from_plan`` adapts them; the ``Cache.LoadBackOp``
+                batches and the per-request ``RestoreOp`` entries are read
+                here.
             prerequisite_stream: The stream whose completed work every copy
-                must observe -- the one the plan's page zeroing ran on, so the
-                loads land on zeroed destination pages.
-            l3_prefetch_ok: This submission's captured prefetch results. Later
-                control-plane rounds must not change the queued H2D decision.
+                must observe -- the one the plan's page zeroing ran on (behind
+                the store fence), so the loads land on zeroed destination
+                pages and nothing reads a restored page before its image.
         """
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
-        prefetch_ok = True
         restore_ops: list[RestoreOp] = []
         restore_rows: dict[HostTier, list[tuple[int, int, int]]] = {
             HostTier.L2: [],
             HostTier.SNAPSHOT_POOL: [],
         }
-        for operation in plan.cache:
+        for operation in cache_ops:
             if isinstance(operation, Cache.LoadBackOp):
-                kept_rows = self._append_transfers(
+                self._append_transfers(
                     operation.op_ids,
                     operation.group_ids,
                     operation.src_pages,
@@ -592,13 +641,6 @@ class HostCacheExecutor:
                     source_is_device=False,
                     tier=HostTier.L2,
                 )
-                prefetch_pages = self._storage_pages(
-                    operation, prefetch_only=True, kept_rows=list(enumerate(kept_rows))
-                )
-                if prefetch_pages and not all(
-                    l3_prefetch_ok.get(page, False) for page in prefetch_pages
-                ):
-                    prefetch_ok = False
             elif isinstance(operation, RestoreOp):
                 restore_ops.append(operation)
                 self._append_restore(operation, rows_by_tier=restore_rows)
@@ -607,18 +649,216 @@ class HostCacheExecutor:
             self._start_restore(
                 restore_ops, restore_rows, prerequisite_stream=prerequisite_stream
             )
-        if not prefetch_ok:
-            self._start_loading(
-                op_ids, [], success=False, prerequisite_stream=prerequisite_stream
-            )
-            for tracker, _ in self._load_trackers:
-                tracker.set_consumers(-1)
-            return
         load_index = self._start_loading(
-            op_ids, transfers, success=True, prerequisite_stream=prerequisite_stream
+            op_ids, transfers, prerequisite_stream=prerequisite_stream
         )
         for tracker, _ in self._load_trackers:
             tracker.set_consumers(load_index if load_index is not None else -1)
+
+    # ------------------------------------------------------------------
+    # L3 prefetch lane (control plane submits, a CPU thread fetches)
+    # ------------------------------------------------------------------
+
+    def submit_prefetches(self, cache_ops: Sequence) -> None:
+        """Start the plan's L3 prefetches on the lane; no stream dependency.
+
+        A ``PrefetchOp`` fills a waiting request's freshly allocated Host
+        pages from L3 before its admission: the lane fetches the op's rows
+        in prefix order, ``prefetch_batch_pages`` pages per
+        ``batch_get_into``, and stops at the first batch with a missing page
+        or at the deadline ``base + per_page * pages``; its result is the
+        pages landed, a prefix length. The hooks MIN-reduce that length
+        across the replica (``l3_prefetch_progress`` /
+        ``complete_l3_prefetch``) and the op is acknowledged once as
+        ``PrefetchDone(op_id, landed_pages)``. Under KVP each rank fetches
+        the Host pages it owns; the replica MIN then lands the common prefix.
+
+        Args:
+            cache_ops: The round's adapted cache ops; the ``PrefetchOp``
+                entries are read here.
+        """
+        ops = [op for op in cache_ops if isinstance(op, PrefetchOp)]
+        if not ops:
+            return
+        if self.l3_store is None:
+            raise RuntimeError(
+                "the plan prefetches from L3 but no storage backend is attached "
+                "(--kvstore-storage-backend)"
+            )
+        op_ids = [int(op.op_id) for op in ops]
+        if len(set(op_ids)) != len(op_ids):
+            raise ValueError(f"duplicate prefetch op id in one plan: {op_ids}")
+        owners = self._owners(HostTier.L2)
+        jobs: list[tuple[PrefetchOp, list[list[StoragePage]]]] = []
+        for op in ops:
+            if op.num_pages <= 0 or not op.rows:
+                raise ValueError(f"prefetch operation {op.op_id} carries no pages")
+            kept_by_position = dict(
+                owners.owned_host_positions(
+                    [(row.group_id, row.host_page) for row in op.rows]
+                )
+            )
+            # Rows come in prefix-page order; a page may have no rows (a
+            # sliding group's older pages) and lands trivially.
+            pages: list[list[StoragePage]] = [[] for _ in range(op.num_pages)]
+            last_index = op.first_page
+            for position, row in enumerate(op.rows):
+                page = row.page_index - op.first_page
+                if not 0 <= page < op.num_pages or row.page_index < last_index:
+                    raise ValueError(
+                        f"prefetch operation {op.op_id}: row {position} names page "
+                        f"{row.page_index} outside [{op.first_page}, "
+                        f"{op.first_page + op.num_pages}) or out of order"
+                    )
+                last_index = row.page_index
+                local = kept_by_position.get(position)
+                if local is None:
+                    continue  # another KVP rank owns this Host page
+                group, host_block = local
+                pages[page].append(
+                    (group, host_block, row.content_hash, int(row.page_offset))
+                )
+            jobs.append((op, pages))
+        with self._ack_lock:
+            if any(op_id in self._prefetch_jobs for op_id in op_ids):
+                raise ValueError(f"prefetch op already in flight: {op_ids}")
+            lane = self._l3_prefetch_lane
+            if lane is None:
+                lane = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="l3-prefetch"
+                )
+                self._l3_prefetch_lane = lane
+            for op, pages in jobs:
+                deadline_s = (
+                    self._l3_prefetch_timeout_base_s
+                    + self._l3_prefetch_timeout_per_page_s * len(pages)
+                )
+                self._prefetch_jobs[int(op.op_id)] = _PrefetchJob(
+                    request_id=str(op.request_id),
+                    num_pages=len(pages),
+                    future=lane.submit(
+                        self._run_prefetch,
+                        int(op.op_id),
+                        str(op.request_id),
+                        pages,
+                        deadline_s,
+                    ),
+                )
+        if self.attn_tp_rank == 0:
+            logger.info(
+                f"[L3] prefetch started: operations={len(jobs):d} pages="
+                f"{sum(len(pages) for _, pages in jobs):d}"
+            )
+
+    def _run_prefetch(
+        self,
+        op_id: int,
+        request_id: str,
+        pages: list[list[StoragePage]],
+        deadline_s: float,
+    ) -> int:
+        """The lane's job: fetch ``pages`` in prefix order; return the pages landed.
+
+        One ``batch_get_into`` per ``prefetch_batch_pages`` prefix pages. A
+        batch is not started past the deadline; the first page whose get
+        fails (any of its groups) ends the fetch, and the pages before it
+        are the result -- a page with no rows (nothing of it to fetch here)
+        lands trivially. A backend fault counts as a miss at that batch, so
+        the replica still converges on a prefix.
+        """
+        l3_store = self.l3_store
+        if l3_store is None:
+            raise RuntimeError("L3 prefetch ran without a storage backend")
+        deadline = time.monotonic() + deadline_s
+        landed = 0
+        batch = self._l3_prefetch_batch_pages
+        for start in range(0, len(pages), batch):
+            if time.monotonic() > deadline:
+                logger.warning(
+                    f"[L3] prefetch {op_id} ({request_id}) timed out after "
+                    f"{landed}/{len(pages)} pages"
+                )
+                break
+            chunk = pages[start : start + batch]
+            flat = [page for rows in chunk for page in rows]
+            if not flat:
+                # No row of the chunk is this rank's to fetch (none at all, or
+                # other KVP ranks own them): the pages land here so this rank
+                # does not shorten the replica's prefix.
+                landed += len(chunk)
+                continue
+            try:
+                ok = list(l3_store.prefetch(flat))
+            except Exception:
+                logger.exception(
+                    f"[L3] prefetch {op_id} ({request_id}) failed at page {landed}; "
+                    "landing the pages before it"
+                )
+                break
+            if len(ok) != len(flat):
+                logger.error(
+                    f"[L3] prefetch {op_id} ({request_id}): result has {len(ok)} "
+                    f"flags for {len(flat)} pages; landing the pages before this batch"
+                )
+                break
+            cursor = 0
+            stopped = False
+            for rows in chunk:
+                page_ok = all(ok[cursor : cursor + len(rows)])
+                cursor += len(rows)
+                if not page_ok:
+                    stopped = True
+                    break
+                landed += 1
+            if stopped:
+                logger.warning(
+                    f"[L3] prefetch {op_id} ({request_id}) missed page {landed}; "
+                    f"landing {landed}/{len(pages)} pages"
+                )
+                break
+        return landed
+
+    def l3_prefetch_progress(self) -> dict[int, tuple[bool, int]]:
+        """This rank's view of every in-flight prefetch op: ``(done, landed)``.
+
+        ``landed`` is the pages landed once ``done``, else 0. The set of op
+        ids is mirrored on every rank (the plans are), so the hooks can
+        MIN-reduce the vector in op-id order.
+        """
+        with self._ack_lock:
+            jobs = dict(self._prefetch_jobs)
+        progress: dict[int, tuple[bool, int]] = {}
+        for op_id, job in jobs.items():
+            if not job.future.done():
+                progress[op_id] = (False, 0)
+                continue
+            failed = job.future.exception()
+            if failed is not None:
+                logger.error(
+                    f"[L3] prefetch {op_id} ({job.request_id}) raised; landing nothing",
+                    exc_info=failed,
+                )
+                progress[op_id] = (True, 0)
+            else:
+                progress[op_id] = (True, int(job.future.result()))
+        return progress
+
+    def complete_l3_prefetch(self, op_id: int, landed_pages: int) -> None:
+        """Record the replica-converged outcome of a prefetch op.
+
+        ``landed_pages`` is the replica MIN of every rank's landed prefix;
+        ``poll_results`` yields the op's one ``PrefetchDone`` with it.
+        """
+        with self._ack_lock:
+            job = self._prefetch_jobs.get(int(op_id))
+            if job is None:
+                raise KeyError(f"prefetch op {op_id} is not in flight")
+            if not 0 <= int(landed_pages) <= job.num_pages:
+                raise ValueError(
+                    f"prefetch op {op_id} landed {landed_pages} of {job.num_pages} pages"
+                )
+            del self._prefetch_jobs[int(op_id)]
+            self._prefetch_acks.append((int(op_id), int(landed_pages)))
 
     def _append_write_backs(
         self,
@@ -652,9 +892,7 @@ class HostCacheExecutor:
             )
             # L3 backs up the Host pages this rank wrote, by local id.
             (pinned_pages if pinned else ordered_pages).extend(
-                self._storage_pages(
-                    operation, prefetch_only=False, kept_rows=[(index, kept_rows)]
-                )
+                self._storage_pages(operation, kept_rows=[(index, kept_rows)])
             )
 
     def _owners(self, tier: HostTier) -> BlockOwnerTranslation:
@@ -871,7 +1109,6 @@ class HostCacheExecutor:
                 kind=_AckKind.SNAPSHOT,
                 op_ids=[int(op.op_id) for op in ops],
                 backup_pages=[],
-                success=True,
             ),
         )
         return finish
@@ -887,8 +1124,12 @@ class HostCacheExecutor:
 
         One event after the L2-tier rows, the pool-tier rows and the imports,
         so the scheduler sees one ``RestoreDone`` per op; the layerwise
-        tracker is not armed. The ops were validated at collection; an op
-        with no rows restores its slot state alone.
+        tracker is not armed. A row overwrites its whole destination block,
+        so the scheduler lists no restore destination for zeroing; the copies
+        still order behind the stream the caller names, which carries the
+        plan's store fence and its zeroing of other pages. The ops were
+        validated at collection; an op with no rows restores its slot state
+        alone.
         """
         if get_is_capture_mode():
             raise RuntimeError("a snapshot restore must run outside graph capture")
@@ -899,7 +1140,7 @@ class HostCacheExecutor:
                 f"[snapshot] restore started: operations={len(ops):d} "
                 f"l2_blocks={len(l2_rows):d} pool_blocks={len(pool_rows):d}",
             )
-        # Behind the zeroing of the destinations on the stream the caller named.
+        # Behind the plan's zeroing and store fence on the stream the caller named.
         self.load_stream.wait_stream(prerequisite_stream)
         if l2_rows:
             self._restore_l2_lane.start_h2d(
@@ -936,7 +1177,6 @@ class HostCacheExecutor:
                 kind=_AckKind.RESTORE,
                 op_ids=[int(op.op_id) for op in ops],
                 backup_pages=[],
-                success=True,
             ),
         )
 
@@ -944,36 +1184,26 @@ class HostCacheExecutor:
     def _storage_pages(
         operation,
         *,
-        prefetch_only: bool,
         kept_rows: Sequence[tuple[int, Sequence[tuple[int, int]]]],
     ) -> list[StoragePage]:
         """Collect hashed Host pages from the rows of one cache op this rank copies.
 
         Args:
-            operation: The L2 wire op (``WriteBackOp`` or ``LoadBackOp``).
-            prefetch_only: Must be chosen at the call site: ``True`` keeps
-                only L3-prefetch sources, ``False`` keeps every
-                storage-tagged page.
+            operation: The L2 write-back wire op.
             kept_rows: Per op of the batch, ``(op_index, [(position,
                 local_host_block)])`` -- the rows the ownership translation
                 kept for this rank, as :meth:`_append_transfers` returns
-                them. A KVP rank thus backs up and prefetches only the Host
-                pages it owns, by local id.
+                them. A KVP rank thus backs up only the Host pages it owns,
+                by local id.
         """
-        hashes = getattr(operation, "content_hashes", None)
-        offsets = getattr(operation, "page_offsets", None)
-        if not hashes or not offsets:
-            return []
-        prefetch_flags = getattr(operation, "prefetch_from_storage", None)
+        hashes = operation.content_hashes
+        offsets = operation.page_offsets
         pages: list[StoragePage] = []
         for op_index, kept in kept_rows:
             groups = operation.group_ids[op_index]
             hash_row = hashes[op_index]
             offset_row = offsets[op_index]
-            flags = prefetch_flags[op_index] if prefetch_flags else None
             for position, host_block in kept:
-                if prefetch_only and flags is not None and int(flags[position]) == 0:
-                    continue
                 content_hash = hash_row[position]
                 if not content_hash:
                     continue
@@ -987,122 +1217,6 @@ class HostCacheExecutor:
                 )
         return pages
 
-    def prefetch_l3_load_backs(self, plan) -> list[bool]:
-        """Fill Host pages from L3 on the control plane.
-
-        Returns per-page ``batch_get_into`` success, aligned with
-        ``l3_prefetch_storage_keys``. ``batch_get_into`` is CPU work against
-        the already-allocated Host pages. Existence is not a lease: an
-        object can vanish after ``batch_exists`` and before this get.
-        Callers MIN-reduce the vector across the replica before H2D or
-        forward.
-        """
-        self._l3_prefetch_ok = {}
-        pages = self._plan_prefetch_pages(plan)
-        if not pages:
-            return []
-        results = self._prefetch_from_storage(pages)
-        if len(results) != len(pages):
-            raise RuntimeError(
-                "L3 prefetch result is not aligned with Host pages: "
-                f"ok_flags={len(results)} pages={len(pages)}"
-            )
-        self._l3_prefetch_ok = dict(zip(pages, results))
-        return [bool(flag) for flag in results]
-
-    def take_l3_prefetch_results(self) -> dict[StoragePage, bool]:
-        """Move this round's results into its queued submission on the control plane.
-
-        Returns the per-page outcomes, detached from subsequent prefetches or
-        replica-wide invalidations. The forward thread only reads this snapshot.
-        """
-        results = self._l3_prefetch_ok
-        self._l3_prefetch_ok = {}
-        return results
-
-    def invalidate_l3_prefetch(self) -> None:
-        """Force later H2D to skip every L3 source in this plan."""
-        self._l3_prefetch_ok = {
-            page: False for page in getattr(self, "_l3_prefetch_ok", {})
-        }
-
-    def plan_has_l3_prefetch(self, plan) -> bool:
-        return bool(self._plan_prefetch_pages(plan))
-
-    def l3_prefetch_storage_keys(self, plan) -> tuple[list[int], list[str], list[int]]:
-        groups: list[int] = []
-        hashes: list[str] = []
-        offsets: list[int] = []
-        for (
-            group_id,
-            _host_page,
-            content_hash,
-            page_offset,
-        ) in self._plan_prefetch_pages(plan):
-            groups.append(int(group_id))
-            hashes.append(str(content_hash))
-            offsets.append(int(page_offset))
-        return groups, hashes, offsets
-
-    def _plan_prefetch_pages(self, plan) -> list[StoragePage]:
-        pages: list[StoragePage] = []
-        for operation in plan.cache:
-            if isinstance(operation, Cache.LoadBackOp):
-                # The same ownership pass the submission makes, so the
-                # prefetch fills exactly the Host pages this rank will load.
-                kept_rows = []
-                for op_index, op_id in enumerate(operation.op_ids):
-                    kept = self._owned_rows(
-                        op_id,
-                        operation.group_ids[op_index],
-                        operation.src_pages[op_index],
-                        operation.dst_pages[op_index],
-                        source_is_device=False,
-                        tier=HostTier.L2,
-                    )
-                    kept_rows.append(
-                        (op_index, [(position, row[2]) for position, row in kept])
-                    )
-                pages.extend(
-                    self._storage_pages(
-                        operation, prefetch_only=True, kept_rows=kept_rows
-                    )
-                )
-        return pages
-
-    def _prefetch_from_storage(self, pages: Sequence[StoragePage]) -> list[bool]:
-        l3_store = getattr(self, "l3_store", None)
-        if l3_store is None:
-            raise RuntimeError(
-                "LoadBack requested L3 prefetch but no storage backend is configured"
-            )
-        return list(l3_store.prefetch(pages))
-
-    def mark_l3_keys_unread(
-        self, groups: list[int], hashes: list[str], offsets: list[int]
-    ) -> None:
-        """Remember keys whose ``batch_get_into`` failed after Admit."""
-
-        self._l3_unread.mark(groups=groups, hashes=hashes, offsets=offsets)
-
-    def l3_key_is_unread(
-        self, group_id: int, content_hash: str, page_offset: int
-    ) -> bool:
-        """True when this key already failed ``batch_get_into``."""
-
-        return self._l3_unread.contains(
-            group_id=int(group_id),
-            content_hash=str(content_hash),
-            page_offset=int(page_offset),
-        )
-
-    def forget_l3_unread_keys(
-        self, groups: list[int], hashes: list[str], offsets: list[int]
-    ) -> None:
-        """Allow a key to hit L3 again after this put created a missing object."""
-
-        self._l3_unread.forget(groups=groups, hashes=hashes, offsets=offsets)
-
     def l3_exists(self, pages: Sequence[StoragePage]) -> list[bool] | None:
         l3_store = getattr(self, "l3_store", None)
         if l3_store is None:
@@ -1114,22 +1228,20 @@ class HostCacheExecutor:
 
         Returns True when there is no L3 store, or the store reports the
         prefix is gone. A failed wait or delete returns False so the
-        replica can skip ``ClearCache``.
+        replica can skip ``ClearCache``. In-flight prefetches are drained
+        first: the lane may still be writing their Host pages.
         """
 
         l3_store = getattr(self, "l3_store", None)
         if l3_store is None:
-            self._l3_unread.clear()
             return True
         try:
             self._wait_l3_backups()
+            self._wait_l3_prefetches()
         except Exception:
-            logger.exception("L3 backup wait failed before namespace delete")
+            logger.exception("L3 backup/prefetch wait failed before namespace delete")
             return False
-        deleted = l3_store.rotate_namespace()
-        if deleted:
-            self._l3_unread.clear()
-        return deleted
+        return l3_store.rotate_namespace()
 
     def _start_writing(
         self,
@@ -1168,7 +1280,6 @@ class HostCacheExecutor:
                 kind=_AckKind.WRITE_BACK,
                 op_ids=op_ids,
                 backup_pages=backup_pages,
-                success=True,
             ),
         )
         return finish
@@ -1179,7 +1290,6 @@ class HostCacheExecutor:
         transfers: Sequence[tuple[int, int, int]],
         *,
         prerequisite_stream,
-        success: bool,
     ) -> int | None:
         if self._load_poisoned:
             raise RuntimeError(
@@ -1190,19 +1300,13 @@ class HostCacheExecutor:
         if get_is_capture_mode():
             raise RuntimeError("Host cache load must run outside CUDA Graph capture")
         op_ids = _ordered_unique(op_ids)
-        if not success:
-            if transfers:
-                raise ValueError("failed L3 prefetch must not launch transfers")
-            with self._ack_lock:
-                self._ready_load_acks.extend((op_id, success) for op_id in op_ids)
-            return None
         if not transfers:
             # Every row belongs to other KVP ranks: nothing to copy, no layer
             # fence to arm (the trackers see no load this round), and the op
             # is acknowledged from an empty copy -- the hooks' replica
             # intersection completes it once the owners have copied theirs.
             with self._ack_lock:
-                self._ready_load_acks.extend((op_id, True) for op_id in op_ids)
+                self._ready_load_acks.extend(op_ids)
             return None
         if self.attn_tp_rank == 0:
             logger.info(
@@ -1317,12 +1421,7 @@ class HostCacheExecutor:
                 raise RuntimeError("cache transfer layout has no layer consumers")
             self._completions.push(
                 finish,
-                _Ack(
-                    kind=_AckKind.LOAD_BACK,
-                    op_ids=op_ids,
-                    backup_pages=[],
-                    success=success,
-                ),
+                _Ack(kind=_AckKind.LOAD_BACK, op_ids=op_ids, backup_pages=[]),
             )
             return load_index
         except BaseException as original_error:
@@ -1363,23 +1462,24 @@ class HostCacheExecutor:
         """The completed ops' ACKs, both tiers; event queries only, never blocks."""
         results: list = []
         with self._ack_lock:
-            results.extend(
-                self._load_done(op_id, success)
-                for op_id, success in self._ready_load_acks
-            )
+            results.extend(self._load_done(op_id) for op_id in self._ready_load_acks)
             self._ready_load_acks.clear()
+            # Prefetches the hooks converged: one PrefetchDone each.
+            results.extend(
+                self._prefetch_done(op_id, landed)
+                for op_id, landed in self._prefetch_acks
+            )
+            self._prefetch_acks.clear()
         for ack in self._completions.pop_ready():
             if ack.kind is _AckKind.WRITE_BACK:
                 # An L2 write with L3 pages is acknowledged after its backup.
                 self._complete_or_queue_write(ack, results)
             elif ack.kind is _AckKind.LOAD_BACK:
-                results.extend(
-                    self._load_done(op_id, ack.success) for op_id in ack.op_ids
-                )
+                results.extend(self._load_done(op_id) for op_id in ack.op_ids)
             elif ack.kind is _AckKind.SNAPSHOT:
-                results.extend(SnapshotDoneEvent(op_id=op_id) for op_id in ack.op_ids)
+                results.extend(self._snapshot_done(op_id) for op_id in ack.op_ids)
             else:
-                results.extend(RestoreDoneEvent(op_id=op_id) for op_id in ack.op_ids)
+                results.extend(self._restore_done(op_id) for op_id in ack.op_ids)
         self._collect_finished_backups(results)
         return results
 
@@ -1443,27 +1543,13 @@ class HostCacheExecutor:
         l3_store = getattr(self, "l3_store", None)
         if not pages or l3_store is None:
             return
-        # The backend already handles create-only PUTs. A separate existence
-        # probe is needed only to decide whether a failed GET can be forgotten.
-        # Keys marked unread after this snapshot stay unread conservatively.
-        unread_pages = self._l3_unread.unread_pages(pages)
-        existed: list[bool] = []
-        if unread_pages:
-            try:
-                existed = list(l3_store.exists(unread_pages))
-            except Exception:
-                logger.exception(
-                    "L3 existence probe before backup failed; leaving unread keys "
-                    "in place so an unreadable object cannot be re-admitted"
-                )
-                existed = [True] * len(unread_pages)
+        # The backend handles create-only PUTs itself.
         results = l3_store.backup(pages)
         if len(results) != len(pages) or not all(results):
             ok = sum(1 for flag in results if flag)
             raise RuntimeError(
                 f"L3 backup failed for Host page(s): ok={ok}/{len(pages)}"
             )
-        self._l3_unread.forget_pages(l3_pages_newly_published(unread_pages, existed))
 
     @staticmethod
     def _write_done(op_id: int):
@@ -1472,8 +1558,24 @@ class HostCacheExecutor:
         return event
 
     @staticmethod
-    def _load_done(op_id: int, success: bool):
-        return Cache.LoadBackDoneEvent(op_id, success)
+    def _load_done(op_id: int):
+        return Cache.LoadBackDoneEvent(op_id)
+
+    @staticmethod
+    def _prefetch_done(op_id: int, landed_pages: int):
+        return Cache.PrefetchDoneEvent(op_id, landed_pages)
+
+    @staticmethod
+    def _snapshot_done(op_id: int):
+        event = Cache.SnapshotDoneEvent()
+        event.op_id = op_id
+        return event
+
+    @staticmethod
+    def _restore_done(op_id: int):
+        event = Cache.RestoreDoneEvent()
+        event.op_id = op_id
+        return event
 
     def shutdown(self) -> None:
         # The fences and start events live on streams the callers named per
@@ -1495,6 +1597,15 @@ class HostCacheExecutor:
         if workers is not None:
             workers.shutdown(wait=True)
             self._l3_workers = None
+        lane = getattr(self, "_l3_prefetch_lane", None)
+        if lane is not None:
+            # In-flight prefetches finish (or time out) before the store closes
+            # under them; their outcomes are dropped with the queue.
+            lane.shutdown(wait=True)
+            self._l3_prefetch_lane = None
+        with self._ack_lock:
+            self._prefetch_jobs.clear()
+            self._prefetch_acks.clear()
         if getattr(self, "l3_store", None) is not None:
             self.l3_store.close()
 
@@ -1503,7 +1614,5 @@ class HostCacheExecutor:
         self.shutdown()
         with self._ack_lock:
             self._ready_load_acks.clear()
-        self._l3_prefetch_ok.clear()
-        self._l3_unread.clear()
         for tracker, _ in self._load_trackers:
             tracker.reset()

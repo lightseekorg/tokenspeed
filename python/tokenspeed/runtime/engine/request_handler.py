@@ -82,7 +82,6 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import (
-    RETRACTION_SAFE_STEPS,
     UNBOUNDED_CACHED_PREFIX_TOKENS,
     make_spec,
 )
@@ -302,15 +301,6 @@ class RequestHandler:
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
-        # Head TP over attention-DP ranks serves decode rows only, so that
-        # engine cannot run the local recovery prefill a capacity retraction
-        # would need; it admits only requests the scheduler never retracts
-        # (generation budget within one safe-step window,
-        # docs/design/scheduler.md section 4). Head TP over the query shards
-        # of a prefill engine serves its extend rows and keeps no budget.
-        self.max_new_tokens_budget: int | None = (
-            RETRACTION_SAFE_STEPS if mapping.attn.head_tp_serves_decode_only else None
-        )
         # LM-head TP under attention DP exchanges the logits rows with the
         # group once per forward (LogitsProcessor._lm_head_tp_row_counts); the
         # prompt-logprob chunk loop would run that exchange a per-rank number
@@ -669,10 +659,15 @@ class RequestHandler:
             )
             return
         if _weight_op_wants_flush(recv_req) and not flush_success:
+            # The scheduler refuses ClearCache while Host cache ops (write-backs,
+            # retraction image stores and restores) are in flight or a request
+            # is suspended with a retraction image, whose pinned Host entries
+            # the flush would invalidate under it.
             ok = False
             msg = (
-                "cache flush failed; retry the update after in-flight "
-                "Host writebacks drain"
+                "cache flush failed; retry the update after in-flight Host "
+                "cache ops drain and no request is suspended with a retraction "
+                "image (retracted or restoring)"
             )
         else:
             local_ok, msg = self._device.update_weights(recv_req)
@@ -860,10 +855,10 @@ class RequestHandler:
             )
 
     def _apply_generation_budget(self, req_spec, req_state) -> None:
-        """Clamp ``max_new_tokens`` to the context; refuse what exceeds this
-        engine's per-request budget (``max_new_tokens_budget``), finishing the
-        request with an abort instead of admitting work the engine cannot
-        complete."""
+        """Clamp ``max_new_tokens`` to the context and declare it to the
+        scheduler, which sizes the request's admission reserve from it. No
+        layout caps it: a retracted request resumes by restore, never by a
+        recovery prefill, so a decode-only attention layout admits any budget."""
         req_state.sampling_params.max_new_tokens = min(
             (
                 req_state.sampling_params.max_new_tokens
@@ -873,15 +868,6 @@ class RequestHandler:
             self.max_req_len - len(req_state.prompt_input_ids) - 1,
         )
         req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
-        if (
-            self.max_new_tokens_budget is not None
-            and req_spec.max_new_tokens > self.max_new_tokens_budget
-        ):
-            req_state.finished_reason = FINISH_ABORT(
-                "Invalid request: this decode engine (--attn-head-tp-size) serves "
-                f"at most {self.max_new_tokens_budget} new tokens per request; "
-                f"got max_new_tokens={req_spec.max_new_tokens}"
-            )
 
     # ------------------------------------------------------------------
     # Profiling: torch / cuda / viztracer / mem-snapshot / proton, driven

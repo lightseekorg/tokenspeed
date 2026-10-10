@@ -117,17 +117,13 @@ see below), and the decode engine keeps every extend-shaped forward off its
 path:
 
 - startup tunes on a decode step instead of the usual extend-shaped dummy
-  forward, and the engine turns off the prefill CUDA graph, which records
-  extend forwards (it sets `--disable-prefill-graph`, with a log line);
-- the scheduler's own rule keeps the one prefill a decode node otherwise runs
-  -- the local recovery after a capacity retraction
-  (`docs/design/scheduler.md`, sections 2 and 4) -- out of reach: when a
-  request's declared generation fits one retraction safe-step window (4096
-  new tokens), the scheduler reserves its whole generation at admission and
-  never makes it a retraction victim. A head-TP decode engine therefore
-  admits only requests with `max_new_tokens <= 4096` (declared explicitly;
-  an undeclared budget is the context remainder) and finishes any other with
-  an abort error.
+  forward, and the prefill CUDA graph (which records extend forwards) is
+  turned off (`--disable-prefill-graph` is set, with a log line);
+- a decode node runs no prefill of its own in any case: a request a capacity
+  retraction suspends is imaged to Host and copied back by a restore
+  (`docs/design/scheduler.md`, sections 2 and 4), never recomputed, so the
+  layout needs no admission rule and no generation cap -- any
+  `max_new_tokens` is admitted, as on every other engine.
 
 A prefill row reaching the attention is then an invariant violation and
 raises, not a configuration the operator can hit.
@@ -651,8 +647,11 @@ DSA-family attention backend (GPU DSA) with a bf16 KV cache, `--dense-tp-size`
 and the MoE TP×EP group each 1 or `N` (attention returns complete rows, so
 the drafter's replicated decode rows are never scattered and a narrower group
 would have nothing to gather), and `--decode-context-parallel-size` 1 or `N`
-(with `--disable-kvstore`, as DCP requires). QCP shards the drafter's extend
-step like the target's. Its decode steps run every row on every rank.
+(a KV-page-sharded engine may keep the Host KVStore and the retraction
+snapshot pool -- every Host block sits in its Device block's residue class and
+each rank copies the blocks it owns -- but not L3 storage, whose keys have no
+owner-stable form under sharding). The drafter's extend step is sharded like
+the target's; its decode steps run every row on every rank.
 
 **Head TP over the query shards.** Without `--attn-head-tp-size` the shard
 group's ranks hold different rows and every rank holds every head of
@@ -676,9 +675,9 @@ nothing, attend this rank's head slice (the DCP arm over the KVP pages --
 the page-sharded KV of `--decode-context-parallel-size` -- as attention TP
 runs it) and all-reduce the `o_proj` partials (all-gather the
 hidden shards under `--tp-batch-invariant attn`). The expanded (dense MLA)
-prefill still refuses head TP. The layout serves the absorbed sparse prefill
-only. The decode-only rules of the DP layout (role, decode-shaped autotune,
-the generation budget) do not apply: the prefill role's rules above and
+prefill still refuses head TP; the layout serves the absorbed sparse prefill
+only. The decode-only rules of the DP layout (role, decode-shaped autotune)
+do not apply: the prefill role's rules above and
 `--attn-head-tp-size == --prefill-context-parallel-size` gate it.
 
 Memory: the head-shardable weights of one attention instance go from the

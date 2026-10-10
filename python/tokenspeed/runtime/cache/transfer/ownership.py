@@ -177,6 +177,54 @@ class BlockOwnerTranslation:
             )
         return owned
 
+    def owned_host_positions(
+        self, rows: Sequence[tuple[int, int]]
+    ) -> list[tuple[int, tuple[int, int]]]:
+        """This rank's rows of ``(group_index, host_block)`` as ``(position,
+        (group_index, local_host_block))`` pairs.
+
+        The Host-only form of :meth:`owned_positions`, for a copy with no
+        Device end: an L3 prefetch fills Host pages before any Device page
+        exists for the request. Same ownership rule, same local ids.
+
+        Raises:
+            IndexError: A group index or block id is out of range.
+            ValueError: A null block.
+        """
+        positions: list[list[int]] = [[] for _ in self.shard_counts]
+        host_ids: list[list[int]] = [[] for _ in self.shard_counts]
+        for position, (group, host_block) in enumerate(rows):
+            group = int(group)
+            if not 0 <= group < self.num_groups:
+                raise IndexError(f"cache transfer names unknown group {group}")
+            host_block = int(host_block)
+            if host_block <= 0:
+                raise ValueError("a cache transfer cannot name the null block 0")
+            positions[group].append(position)
+            host_ids[group].append(host_block)
+        owned: list[tuple[int, tuple[int, int]]] = []
+        for group, shard in enumerate(self.shard_counts):
+            if not host_ids[group]:
+                continue
+            host_owned, host_local = owned_local_pages(
+                host_ids[group],
+                shard_count=shard,
+                rank=self.rank,
+                virtual_block_count=self.host_virtual_counts[group],
+            )
+            # ``host_local`` lists the owned pages only, in input order.
+            owned_positions = [
+                position
+                for position, is_owned in zip(positions[group], host_owned.tolist())
+                if is_owned
+            ]
+            owned.extend(
+                (position, (group, int(local)))
+                for position, local in zip(owned_positions, host_local.tolist())
+            )
+        owned.sort(key=lambda item: item[0])
+        return owned
+
     def owned_rows(
         self, rows: Sequence[tuple[int, int, int]]
     ) -> list[tuple[int, int, int]]:

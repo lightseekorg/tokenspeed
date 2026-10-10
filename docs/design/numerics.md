@@ -436,6 +436,37 @@ afterwards, so chunked prefill and prefix-cache hits do not change a prompt
 logprob either -- the admission probe is capped at `logprob_start_len`
 (`scheduler.md` §1) so every scored position is actually recomputed.
 
+## Retraction is a byte copy: the bitwise continuation oracle
+
+A capacity retraction suspends a request with its image -- every cache
+group's data blocks, the unaligned tail page included, and the slot-state
+blob: the next step's inputs and draft candidates, the verifier's recorded
+draft distributions `q`, the drafter's stash, the sampling backend's
+per-request state (`docs/design/cache-concepts.md`, "Retraction image") --
+and the restore copies those bytes back into fresh Device pages and a fresh
+request-pool slot. Nothing is recomputed and no forward runs in between for
+that request; its continuation reads only the restored bytes, its tokens and
+its `(seed, position)`-keyed sampler. Under rl-bitwise, where the kernels are
+batch-invariant, a forced retraction followed by a restore therefore yields
+exactly the tokens and output logprobs of an unretracted run, whatever batch
+the restored request lands in; without batch invariance the restored run
+differs only by the batch-dependent rounding any other batch composition
+would produce. The only request-keyed Device rows not in the image are
+token-derived (the committed-token history, the n-gram tail) and are reseeded
+from the control plane's token list, as on any slot handoff.
+
+This is the test oracle for the suspend/resume path on both retracting
+roles: run a fixed prompt set under rl-bitwise twice, once plainly and once
+with `--debug-force-retraction-interval N` so every request is retracted at
+least once (several times for the longest), and assert `output_ids` and
+`output_token_logprobs` equal element-wise. The set includes a
+prompt-logprob request, an MTP configuration with
+`--enable-speculative-sampling` at temperature 1 (so the stash and the `q`
+path are exercised), a `Prefilling` victim through a negative interval, and
+on PD the decode node forced. An L3 prefetch that lands short is outside
+this oracle and needs none: it happens before the request is admitted, and
+the pages it did not land are computed by the ordinary prefill.
+
 ## Expert placement and online rebalancing
 
 An expert placement (`--ep-num-redundant-experts`, `--init-expert-location`)

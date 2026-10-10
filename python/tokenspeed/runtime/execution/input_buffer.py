@@ -433,9 +433,9 @@ class InputBuffers:
             runtime_states.future_input_map[decode_req_pool_indices, :1] = torch.where(
                 mask, ids, first_slot
             )
-            # Cols 1.. are real candidates only when the local drafter or the
-            # remote P-side path populated them. Bootstrap/recovery rows with
-            # no candidate source still feed a full-width target forward, so
+            # Cols 1.. are real candidates only when the local drafter, the
+            # remote P-side path or a restored image populated them. Bootstrap
+            # rows with no candidate source still feed a full-width target forward, so
             # use a valid dummy token in model inputs and force the verifier to
             # consume only the first target token for those rows.
             width = runtime_states.future_input_map.shape[1]

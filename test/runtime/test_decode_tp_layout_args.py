@@ -133,22 +133,21 @@ class TestServerArgs:
         plain = ServerArgs(**DP8)
         plain.validate_tp_batch_invariant_weights("fp8", ())
 
-    def test_head_tp_decode_engine_caps_the_generation_budget(self):
-        """The D-role scheduler never retracts a request whose generation
-        fits one safe-step window, so the engine, which cannot run a recovery
-        prefill under head TP, admits only those."""
+    def test_head_tp_decode_engine_admits_any_generation_budget(self):
+        """A retracted request resumes by restore, never by a recovery
+        prefill, so the decode-only head-TP layout needs no admission cap:
+        the budget only clamps to the context, as on every engine."""
+        import inspect
+
+        from tokenspeed.runtime.engine import request_handler
         from tokenspeed.runtime.engine.request_handler import RequestHandler
-        from tokenspeed.runtime.engine.scheduler_utils import RETRACTION_SAFE_STEPS
 
         args = ServerArgs(**DP8, attn_head_tp_size=8, disaggregation_mode="decode")
-        args.mapping.rank = 0
+        assert args.mapping.attn.head_tp_serves_decode_only
 
-        def admit(server_args, max_new_tokens):
+        def admit(max_new_tokens):
             handler = RequestHandler.__new__(RequestHandler)
             handler.max_req_len = 65536
-            handler.max_new_tokens_budget = (
-                RETRACTION_SAFE_STEPS if server_args.mapping.attn.has_head_tp else None
-            )
             spec = SimpleNamespace(max_new_tokens=0)
             state = SimpleNamespace(
                 sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
@@ -158,19 +157,13 @@ class TestServerArgs:
             RequestHandler._apply_generation_budget(handler, spec, state)
             return spec, state
 
-        spec, state = admit(args, RETRACTION_SAFE_STEPS)
-        assert spec.max_new_tokens == RETRACTION_SAFE_STEPS
-        assert state.finished_reason is None
-        spec, state = admit(args, RETRACTION_SAFE_STEPS + 1)
-        assert state.finished_reason is not None
-        assert "attn-head-tp-size" in state.finished_reason.message
-        # Undeclared budgets clamp to the context and exceed the window too.
-        _, state = admit(args, None)
-        assert state.finished_reason is not None
-        plain = ServerArgs(**DP8, disaggregation_mode="decode")
-        plain.mapping.rank = 0
-        _, state = admit(plain, None)
-        assert state.finished_reason is None
+        spec, state = admit(4096 + 1)
+        assert spec.max_new_tokens == 4097 and state.finished_reason is None
+        # An undeclared budget is the context remainder, admitted too.
+        spec, state = admit(None)
+        assert spec.max_new_tokens == 65536 - 3 - 1 and state.finished_reason is None
+        # No layout-keyed budget survives anywhere in the handler.
+        assert "max_new_tokens_budget" not in inspect.getsource(request_handler)
 
     def test_lm_head_tp_under_dp_refuses_prompt_logprobs(self):
         """The LM-head TP group exchanges its logits rows once per forward;

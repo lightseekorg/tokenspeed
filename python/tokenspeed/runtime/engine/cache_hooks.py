@@ -21,8 +21,9 @@
 """Cache-op accounting and rank-synchronized completion tracking.
 
 Owns everything between an execution plan's cache ops -- the Host L2 tier's
-write-backs and load-backs, the retraction snapshot's stores and restores --
-and the scheduler events their completions eventually produce: count what
+write-backs and load-backs, the L3 prefetches, the retraction snapshot's
+stores and restores -- and the scheduler events their completions eventually
+produce: count what
 the plan puts in flight (``DeviceHandle.execute`` submits the transfers
 themselves, on the data plane, from the same plan), poll completions
 (control-side event queries), and agree across every cache-owning rank in
@@ -53,40 +54,34 @@ from collections import OrderedDict
 
 import torch
 import torch.distributed as dist
-from tokenspeed_scheduler import Cache
 
-from tokenspeed.runtime.cache.transfer.ops import RestoreOp, SnapshotOp
+from tokenspeed.runtime.cache.transfer.ops import PrefetchOp, RestoreOp, SnapshotOp
 from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_from_payload,
     cache_event_key,
     cache_event_to_payload,
+    cache_ops_from_plan,
     cache_sync_debug_enabled,
     pop_common_cache_event_payloads,
 )
 
 logger = logging.getLogger(__name__)
 
-#: PHASE-4 SWITCH. Armed hooks poll completions and run a gloo all-reduce on
-#: every round, so they are armed only for an engine that can emit cache ops.
-#: Today that is the Host L2 tier. The retraction snapshot pool is reserved
-#: by this phase but nothing emits ``SnapshotOp`` / ``RestoreOp`` until the
-#: scheduler does; the runtime consumption phase of the retraction-snapshot
-#: design flips this to True, with the scheduler pin, so a pool without L2
-#: arms the hooks too. One switch, flipped once; nothing else gates it.
-SNAPSHOT_POOL_EMITS_CACHE_OPS = False
-
 
 def cache_hooks_armed(*, enable_kvstore: bool, max_retracted_requests: int) -> bool:
     """Whether the engine can emit cache ops, so the hooks must poll for them.
+
+    Armed hooks poll completions and run a gloo all-reduce on every round, so
+    they are armed only for an engine that can emit cache ops: one with the
+    Host L2 tier (write-backs, load-backs) or with a retraction snapshot pool
+    (the scheduler retracts by snapshot store and resumes by restore).
 
     Args:
         enable_kvstore: The Host L2 tier is configured.
         max_retracted_requests: The retraction snapshot pool's slot-state
             rows; positive when a pool is configured.
     """
-    return bool(enable_kvstore) or (
-        SNAPSHOT_POOL_EMITS_CACHE_OPS and max_retracted_requests > 0
-    )
+    return bool(enable_kvstore) or max_retracted_requests > 0
 
 
 class CacheOpHooks:
@@ -130,21 +125,24 @@ class CacheOpHooks:
         """Count the cache ops this plan will put in flight.
 
         ``DeviceHandle.execute`` submits them, from the same plan (write-backs
-        and snapshot stores ahead of the page zeroing, load-backs and
-        restores behind it). An L2 batch carries one ticket per ``op_ids``
-        entry; a snapshot store or restore is one ticket each. Call this with
-        the SAME plan and only when ``execute`` will run: a plan counted but
-        never submitted leaves ops in flight forever.
+        and snapshot stores ahead of the page zeroing, L3 prefetches on their
+        own lane, load-backs and restores behind the zeroing), through the
+        same adapter (``scheduler_utils.cache_ops_from_plan``). An L2 batch
+        carries one ticket per ``op_ids`` entry; each request of a snapshot
+        store, restore or prefetch batch is one ticket, acknowledged on its
+        own. Call this with the SAME plan and only when ``execute`` will run:
+        a plan counted but never submitted leaves ops in flight forever.
+
+        Raises:
+            TypeError: The plan carries a cache op kind the runtime cannot run.
         """
         if self._device is None:
             return
-        for op in execution_plan.cache:
-            if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
-                self._num_inflight += len(op.op_ids)
-            elif isinstance(op, (SnapshotOp, RestoreOp)):
+        for op in cache_ops_from_plan(execution_plan):
+            if isinstance(op, (SnapshotOp, RestoreOp, PrefetchOp)):
                 self._num_inflight += 1
             else:
-                raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
+                self._num_inflight += len(op.op_ids)
 
     def poll_ready_events(self) -> list:
         """Poll completed cache ops and return their rank-synchronized

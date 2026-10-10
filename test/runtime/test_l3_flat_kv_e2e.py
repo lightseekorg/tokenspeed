@@ -131,6 +131,9 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             key_prefix="e2e",
             rank=0,
             prefix_for_weight_version=lambda version: f"e2e-{version}",
+            prefetch_timeout_base_s=10.0,
+            prefetch_timeout_per_page_s=0.0,
+            prefetch_batch_pages=128,
         )
         self.addCleanup(executor.shutdown)
 
@@ -191,15 +194,12 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertFalse(bool(executor.host_storage.host_buffer.any().item()))
 
-        executor._prefetch_from_storage(
-            backup_pages
-        )  # pylint: disable=protected-access
+        self.assertEqual(executor.l3_store.prefetch(backup_pages), [True, True, True])
         self.assertTrue(bool(executor.host_storage.host_buffer.any().item()))
 
         load_index = executor._start_loading(  # pylint: disable=protected-access
             [9],
             [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
-            success=True,
             prerequisite_stream=torch.cuda.current_stream(),
         )
         self.assertIsNotNone(load_index)

@@ -1673,8 +1673,9 @@ alternative to this fork — sharding the drafter's decode rows by a plan too,
 so every forward exchanges — needs a sharded DSA decode arm (history gathers
 for decode rows) that does not exist; the fork is the contained form until
 it does. The decode-only gates of the attention-DP
-layout (`disaggregation_mode == "decode"`, the decode-shaped autotune, the
-retraction-window generation budget) key on
+layout (`disaggregation_mode == "decode"`, the decode-shaped autotune; a
+retracted request restores rather than recomputes, so no admission rule is
+needed) key on
 `mapping.attn.head_tp_serves_decode_only`, which is False over the query
 shards; the prefill role's own rules (`validate_qcp`) and the mapping (`head
 TP == qcp`) gate this layout.

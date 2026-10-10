@@ -519,9 +519,11 @@ Host tier holds one translation (same Device bound, its own Host bound,
 `1 + host_lcm_blocks × packing × shard_count`). An op whose every row belongs
 to other ranks is still acknowledged by this rank from an empty copy; the
 hooks' replica intersection completes the op only once every owner has. The
-scheduler side (residue-class allocation, the Host L2 pool's sharded virtual
-count) is what makes the translation exact; until it lands every group is
-replicated and the filter is the identity.
+scheduler side (residue-class allocation for every tier transfer, the Host
+pools registered with each group's `shard_count`) is what makes the
+translation exact, so both Host tiers serve a KV-page-sharded engine; L3
+storage does not (`scheduler.md`), because an L3 key names content and
+position while ownership is decided at allocation.
 
 ## block vs. page
 
@@ -754,7 +756,8 @@ Its responsibilities:
   The snapshot pool is a third `BlockPool` the coordinator owns beside Device
   and Host L2: never prefix-indexed, never evicted, its blocks held only by
   the `Retracted`/`Restoring` state that imaged them, and `Validate` requires
-  it to be stated on every role (the null page alone means "never retract").
+  it to be stated on every role (the null page alone means no image ever
+  fits, so every capacity block aborts its victim — `scheduler.md` §2).
   The way back is one `SnapshotRestoreOperation` whose rows name their Host
   tier; its L2-tier destinations are republished at the ACK
   (`CompleteSnapshotRestore`) exactly as a prefix load-back's are.
@@ -899,13 +902,14 @@ Its responsibilities:
   objects under that stable prefix rather than minting a process-local
   generation, so a restarted rank still probes the same keys. Independent
   TokenSpeed jobs that share a tenant are not in the TP/PP/DP MIN: a
-  fleet-wide wipe is an operator flush of every instance. A later
-  `batch_exists` miss is not a lease; vanished-L3 prefetch recovers if
-  another client republishes or this delete races a peer PUT.
+  fleet-wide wipe is an operator flush of every instance. A
+  `batch_exists` hit is not a lease: the prefetch that follows lands what
+  is still there.
   Cross-instance reuse probes `batch_exists` before `submit_requests`, then
   MIN-reduces existence across every cache-owning rank in the DP replica
   (attention TP, then CP, then PP; not across DP) and
-  `register_storage_keys` / `unregister_storage_keys`. The
+  `register_storage_keys` (the hits only; the prefetch's ACK forgets what did
+  not land). The
   scheduler's L3 key shadow is bounded to Host page capacity. A single
   registration keeps the earliest contiguous prefix keys so prefix-closed
   matchers still hit, even when sequential write-backs already filled the
@@ -918,7 +922,7 @@ Its responsibilities:
   and the fetch. So the fetch happens before admission, where a miss costs
   nothing but the fetch: when a `Submitted` request's probe shows registered
   keys beyond its Host hit (at least `l3_prefetch_min_pages` whole prefix
-  pages; fewer are simply computed), the scheduler acquires Host blocks for
+  pages; fewer are computed), the scheduler acquires Host blocks for
   them, emits one `Cache.PrefetchOp` (rows in prefix-page order with their
   `page_indices`) and parks the request in `Prefetching` — no Device pages,
   no request-pool row, no head of line, never a victim, abortable. The

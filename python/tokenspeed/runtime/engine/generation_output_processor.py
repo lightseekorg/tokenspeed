@@ -135,8 +135,7 @@ class RequestState:
         # (-1 -> last prompt token, the default that needs no logits; the
         # ingress rejected out-of-range values). ``input_token_logprobs`` is
         # the position-indexed accumulator for the prompt positions that need
-        # logits, ``[start, input_length - 1)``, filled across prefill chunks
-        # (a re-prefill after retraction overwrites with equal values);
+        # logits, ``[start, input_length - 1)``, filled across prefill chunks;
         # ``_val``/``_idx`` are the finalized lists, None until the prompt's
         # final chunk commits. A decode-role request never finalizes -- the
         # prefill node returns them -- so it ships [] like a request that did
@@ -277,8 +276,8 @@ class RequestState:
     def finalize_input_token_logprobs(self) -> None:
         """Assemble the SGLang lists once the prompt's final chunk committed.
 
-        Idempotent: a retracted request re-prefills its prompt but keeps the
-        lists it already built. Element 0 is ``(None, ids[start])``; element
+        Idempotent: a second call keeps the lists already built. Element 0 is
+        ``(None, ids[start])``; element
         ``k`` is the logprob of ``ids[start + k]`` given its prefix. The ids are
         the tokenizer-valid prompt (multimodal pad hashes are not tokens).
         """
@@ -311,24 +310,6 @@ class RequestState:
 
     def add_computed_length(self, incr: int):
         self.computed_length += incr
-
-    def maybe_extend_multimodal_mrope_positions(self) -> None:
-        mm = self.multimodal_inputs
-        if mm is None or mm.mrope_positions is None:
-            return
-
-        target_len = self.input_length + self.output_length
-        current_len = mm.mrope_positions.shape[-1]
-        if current_len >= target_len:
-            return
-
-        from tokenspeed.runtime.multimodal.mrope import (
-            extend_mrope_positions_for_retracted_request,
-        )
-
-        mm.mrope_positions = extend_mrope_positions_for_retracted_request(
-            mm.mrope_positions, target_len - current_len
-        )
 
     def has_pending_multimodal_features(self) -> bool:
         mm = self.multimodal_inputs
@@ -801,10 +782,11 @@ class OutputProcesser:
         output_lengths_list = model_execution_results.output_lengths.tolist()
         output_tokens_list = model_execution_results.output_tokens.tolist()
         self._record_input_token_logprobs(forward_op, model_execution_results)
-        # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
-        # After a retract the victim's generated tokens are rebased into the
-        # prefill window (RebasePrefill), so this can exceed the original prompt
-        # length that RequestState.prefill_finished compares against.
+        # Per-slot total prefill length as the OP sees it (C++
+        # Request::PrefillSize()): the prompt length. A capacity retraction
+        # restores the request's image and re-prefills nothing, and an L3 hit
+        # is prefetched before admission, so no path extends the window past
+        # the prompt.
         prefill_lengths = forward_op.prefill_lengths
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
@@ -828,9 +810,8 @@ class OutputProcesser:
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
-            # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
-            # retract; C++ owes no token and the sampled one is garbage).
-            # Fresh requests: prefill_length == prompt length, same as the gate below.
+            # Mid-chunk extend slot by the op's own prefill_lengths: C++ owes
+            # no token and the sampled one is garbage.
             if (
                 not is_decode_slot
                 and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
@@ -838,10 +819,10 @@ class OutputProcesser:
             ):
                 # It owes no token, but the chunk's KV has landed -- report
                 # that much, so the scheduler stops counting a forward
-                # against these pages and may retract the request if the
-                # next round needs them. A NaN flag on this chunk (its prompt
-                # logprobs, or its last row's logits) terminates the request
-                # when the prompt completes.
+                # against these pages and may retract the request (imaging
+                # the landed chunk) if the next round needs them. A NaN flag
+                # on this chunk (its prompt logprobs, or its last row's
+                # logits) terminates the request when the prompt completes.
                 if nan_flags_list is not None and nan_flags_list[i]:
                     request_state.numerical_error_detected = True
                 request_changes.append(make_extend_result_event(rid))
@@ -1042,8 +1023,7 @@ class OutputProcesser:
 
         The flat result follows the plan's extend-slot order; each slot's
         rows start at the prompt position the plan recorded, so a chunk lands
-        at its own positions whatever earlier chunks (or a re-prefill after
-        retraction) delivered.
+        at its own positions whatever earlier chunks delivered.
         """
         plan = model_execution_results.input_logprob_plan
         logprobs = model_execution_results.input_token_logprobs
@@ -1133,6 +1113,46 @@ class OutputProcesser:
         if state.grammar is not None:
             state.grammar.accept_token(bootstrap_token)
         state.check_finished()
+
+    def finish_scheduler_aborted_requests(self, aborts) -> None:
+        """Finish the requests the scheduler aborted while building a plan.
+
+        The last resort of a capacity retraction whose victim could not be
+        imaged (``ExecutionPlan.aborts``, ``docs/configuration/server.md``,
+        "Retraction snapshot pool"): the scheduler released the request's
+        pages and slot in that very round and emits nothing further for it,
+        so this is the request's whole finish -- the client gets an
+        ``ABORT_CODE.CapacityAbort`` finish carrying the scheduler's detail
+        (the shortfall and the knobs to raise), which a caller that can
+        resubmit retries on. Returns no scheduler event: the request is
+        already ``Finished`` there. A victim is quiescent when chosen, so no
+        in-flight forward names it; an id already gone (a client abort that
+        crossed the same round) is skipped.
+
+        Args:
+            aborts: The plan's ``SchedulerAbort`` entries (``request_id``,
+                ``reason``, ``detail``).
+        """
+        for abort in aborts:
+            rid = str(abort.request_id)
+            state = self.rid_to_state.get(rid)
+            if state is None:
+                continue
+            detail = str(abort.detail)
+            if not state.finished:
+                state.finished_reason = FINISH_ABORT(
+                    message=f"Request aborted by the scheduler: {detail}",
+                    err_type=ABORT_CODE.CapacityAbort,
+                )
+            self.metrics.record_capacity_abort()
+            if self.attn_tp_rank == 0:
+                logger.warning(
+                    f"Req {rid!s} aborted by the scheduler ({abort.reason!s}): {detail}"
+                )
+            self._log_request_stats(rid, state, time.time())
+            self.stream_output([rid], [state])
+            self._release_multimodal_features(state)
+            self.rid_to_state.pop(rid)
 
     def finish_remote_prefill_only_request(self, req_id: str) -> list:
         """Finish after remote prefill when no decode step is needed.

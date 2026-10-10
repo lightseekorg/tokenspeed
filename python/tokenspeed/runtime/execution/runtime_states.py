@@ -29,6 +29,7 @@ from tokenspeed.runtime.execution.request_token_history import RequestTokenHisto
 from tokenspeed.runtime.execution.slot_state import (
     pack_slot_rows,
     slot_state_image_bytes,
+    stream_scope,
     unpack_slot_rows,
 )
 from tokenspeed.runtime.execution.types import RequestHistorySeeds
@@ -152,8 +153,10 @@ class RuntimeStates:
 
         ``context_len`` is zero without Engram, three for V4.1. This executor
         state follows valid_cache_lengths, not sampled output or model KV. It
-        is reseeded from host snapshots on admission/recovery, never transferred
-        or prefix-matched as a backend cache. Returns None.
+        is reseeded from the control plane's token list on admission and on a
+        slot handoff (it is token-derived, so a retraction image leaves it
+        out), never transferred or prefix-matched as a backend cache. Returns
+        None.
         """
         if context_len == 0:
             return
@@ -346,6 +349,18 @@ class RuntimeStates:
     ) -> None:
         del request_id
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+        # The restored row is the request's next-step input in full: its
+        # verified token in column 0 and, with a drafter, the candidates its
+        # last forward drafted (the victim was quiescent when imaged). The
+        # scheduler hands a restored request its first decode with an
+        # explicit ``decode_input_id`` -- no forward of its own is in flight
+        # to capture it from -- and the prologue takes an explicit id on a
+        # row whose candidates are not marked ready for a bootstrap row,
+        # verifying it single-token; the imaged candidates are real, so mark
+        # them ready and the first verify after the restore consumes them as
+        # the unretracted step would have. The prologue clears the mark.
+        with stream_scope(stream):
+            self.remote_spec_candidate_ready[slot] = True
 
     def reset_states(
         self,
