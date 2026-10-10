@@ -759,10 +759,11 @@ pages:
 - The request moves to **`fsm::Restoring`**: it holds the rebuilt tables (a
   `ForwardResources` bundle, so it occupies capacity like any resident), the
   image and the op id, is never scheduled, never a victim and never a
-  readmission candidate. Both ends of every row stay pinned by the transfer
-  manager until the ACK, so an abort while restoring cannot re-grant a page
-  the copy is still writing. A restore takes no token budget and no batch
-  slot; it is a cache op beside the batch, like a remote admission.
+  readmission candidate. Both ends of every row, the blob slot and the new
+  request-pool row stay pinned by the transfer manager until the ACK, so an
+  abort while restoring cannot re-grant a page, slot or row the copy is still
+  writing. A restore takes no token budget and no batch slot; it is a cache
+  op beside the batch, like a remote admission.
 - `cache::RestoreDone` republishes the L2-tier destinations into the Device
   prefix index (as a prefix load-back does), drops the image — the L2 pins go,
   the entries stay published and evictable; the pool blocks return — and
@@ -783,8 +784,17 @@ pinned Host entries become ordinary evictable entries at once and the pool
 blocks return when the copies still writing them land (the tickets hold the
 refs); from `Restoring`, the rebuilt tables are freed and the restore's ACK
 only drops its pins — it republishes nothing, because the token descriptors
-the KV-event feed needs for a publication died with the request. A late ACK
-for a dropped image is harmless.
+the KV-event feed needs for a publication died with the request. The two
+non-page resources an image op uses follow the same rule: the **blob slot**
+is a `shared_ptr<SnapshotSlotIndex>` held by the state and by the store
+(`InFlightSnapshotStore`) or restore (`InFlightSnapshotRestore`) ticket that
+exports into or imports from it, so it returns only when the last of them
+lets go; the **request-pool row** a restore imports into is owned by the
+restore ticket until its ACK (`Restoring::resources.req_pool_index` is empty
+meanwhile) and handed to the resumed state by `RestoreDoneEvent` — or dropped
+with the ticket when the request is gone. Neither can be re-granted to another
+request while a copy still writes it. A late ACK for a dropped image is
+harmless.
 
 **KV-event descriptors.** With `enable_kv_cache_events`, every Device
 publication is a mutation of a boundary that must already have its token

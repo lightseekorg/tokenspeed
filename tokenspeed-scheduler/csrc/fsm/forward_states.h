@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <concepts>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <utility>
@@ -276,8 +277,12 @@ struct Retracted {
     std::int32_t prefix_granularity{};
     CacheProgress cache_progress;
     RetractionImage image;
-    // The slot-state blob's slot in the runtime's arena (RAII).
-    SnapshotSlotIndex blob_slot;
+    // The slot-state blob's slot in the runtime's arena. Shared with the
+    // store that exports into it and, later, the restore that imports from
+    // it: whichever of the state and the in-flight op lives longer keeps the
+    // slot, so an abort while either copy runs cannot hand the slot to a
+    // new victim before the ACK.
+    std::shared_ptr<SnapshotSlotIndex> blob_slot;
     ResumeShape shape;
     // Monotonic stamp from the retraction that produced this state. The plan
     // builder derives the readmission order off the states themselves -- no
@@ -310,13 +315,17 @@ struct Retracted {
 };
 
 // The image is being copied back into freshly allocated Device pages: the
-// request holds pages and a request pool slot again (so the pages count as
-// active and are never granted away), but nothing is schedulable until the
-// restore's ACK. The image stays alive here because the copy reads it.
+// request holds pages again (so they count as active and are never granted
+// away), but nothing is schedulable until the restore's ACK. The image stays
+// alive here because the copy reads it. The request-pool row the copy imports
+// the slot-state blob into is NOT in `resources` yet: the restore op owns it
+// until its ACK (an abort meanwhile must not re-grant a row still being
+// written), and RestoreDoneEvent installs it; `resources.req_pool_index` is
+// empty here.
 struct Restoring {
     ForwardResources resources;
     RetractionImage image;
-    SnapshotSlotIndex blob_slot;
+    std::shared_ptr<SnapshotSlotIndex> blob_slot;
     ResumeShape shape;
     std::uint32_t restore_op{0};
 };

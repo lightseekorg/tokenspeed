@@ -97,7 +97,7 @@ void RetractForTest(Request& request, CacheCoordinator& coordinator, SnapshotSlo
     ASSERT_TRUE(taken) << "the test's snapshot pool must hold the image";
     taken->store_pairs.clear();
     request.Apply(fsm::SnapshotRetractEvent{&coordinator, epoch, request.HasGeneratedOutput(), std::move(taken->image),
-                                            slots.Allocate(),
+                                            std::make_shared<SnapshotSlotIndex>(slots.Allocate()),
                                             /*pending_store_ops=*/{}});
 }
 
@@ -2926,6 +2926,96 @@ TEST_F(RetractSuite, AbortWhileRestoringFreesPagesOnceTheCopyIsAcknowledged) {
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
 }
 
+// The slot-state blob slot and the request-pool row an image op uses belong
+// to the op until its ACK, whatever the request does meanwhile: one blob
+// slot and two request rows, so a held slot or row is observable.
+class SlotPinSuite : public RetractSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = RetractSuite::MakeConfig();
+        cfg.max_batch_size = 2;
+        cfg.max_retracted_requests = 1;
+        return cfg;
+    }
+};
+
+TEST_F(SlotPinSuite, AnAbortWhileRestoringKeepsTheRowAndSlotUntilTheAck) {
+    DriveToRetractOfA();
+    AckImageStores(retract_round_);
+    SendFinish("b");
+    const ExecutionPlan readmit = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    const std::int32_t restored_row = restore->request_pool_indices.at(0);
+    ASSERT_EQ(restore->snapshot_slots.at(0), 1) << "the one blob slot";
+
+    // The client gives up while the import is still writing row and slot:
+    // both stay with the op. A newcomer takes the other row; a second one
+    // finds none until the ACK.
+    SendAbortEvent("a");
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    Submit(MakeRequestSpec("c", /*num_pages=*/1, /*start=*/201));
+    const ExecutionPlan admit_c = PlanOnce();
+    const ForwardBatch* c_op = FindForwardBatch(admit_c);
+    ASSERT_NE(c_op, nullptr);
+    ASSERT_EQ(c_op->request_ids, std::vector<std::string>{"c"});
+    EXPECT_NE(c_op->request_pool_indices.at(0), restored_row) << "the row being imported into is not re-granted";
+    SendForwardDone("c", {207});
+    Submit(MakeRequestSpec("d", /*num_pages=*/1, /*start=*/301));
+    const ExecutionPlan no_row = PlanOnce();
+    EXPECT_EQ(FindForwardBatch(no_row)->request_ids, std::vector<std::string>{"c"}) << "d waits for a row";
+    SendForwardDone("c", {208});
+
+    AckRestores(readmit);
+    const ExecutionPlan admit_d = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(admit_d);
+    ASSERT_NE(batch, nullptr);
+    const auto d_row = std::ranges::find(batch->request_ids, "d");
+    ASSERT_NE(d_row, batch->request_ids.end()) << "the ACK returned the row";
+    EXPECT_EQ(
+        batch->request_pool_indices.at(static_cast<std::size_t>(std::distance(batch->request_ids.begin(), d_row))),
+        restored_row);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14) << "the image is gone with the ACK";
+}
+
+class SlotPinKnobSuite : public SlotPinSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SlotPinSuite::MakeConfig();
+        cfg.debug_force_retraction_interval = 5;  // plan 5 strikes right after DriveToRetractOfA's plan 4
+        return cfg;
+    }
+};
+
+TEST_F(SlotPinKnobSuite, AnAbortWhileRetractedKeepsTheBlobSlotUntilTheStoreAck) {
+    DriveToRetractOfA();  // a is Retracted on the one blob slot; its tail store is in flight
+    SendAbortEvent("a");
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+
+    // Plan 5: the knob arms b, but the slot is still the in-flight store's,
+    // so the forced retraction is refused and b decodes on.
+    const ExecutionPlan p5 = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u) << "no blob slot: the export into it has not been acknowledged";
+    EXPECT_EQ(FindSnapshotStore(p5), nullptr);
+    EXPECT_TRUE(p5.aborts.empty()) << "the knob never aborts";
+    ASSERT_EQ(FindForwardBatch(p5)->request_ids, std::vector<std::string>{"b"});
+    SendForwardDone("b", {146});
+
+    // The ACK returns the slot; the knob's next strike retracts b onto it.
+    AckImageStores(retract_round_);
+    for (int plan = 6; plan < 10; ++plan) {
+        const ExecutionPlan decode = PlanOnce();
+        ASSERT_EQ(FindForwardBatch(decode)->request_ids, std::vector<std::string>{"b"});
+        SendForwardDone("b", {140 + plan});
+    }
+    const ExecutionPlan p10 = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    const SnapshotStoreBatch* store = FindSnapshotStore(p10);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{"b"});
+    EXPECT_EQ(store->snapshot_slots.at(0), 1) << "the slot the aborted image held";
+}
+
 // The host side is finite: when no candidate's image fits the snapshot pool
 // (or no blob slot is free), the capacity retraction aborts the newest
 // retractable resident instead of imaging anyone -- its pages free in the
@@ -3483,11 +3573,11 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
     std::vector<BlockTable> restored(coordinator.NumGroups());
     std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
     ASSERT_TRUE(coordinator.Restore(request.GetIf<fsm::Retracted>()->image, demands, /*request_access_epoch=*/1));
-    request.Apply(fsm::ScheduleRestoreEvent{&coordinator, req_pool.Allocate(), std::move(restored), /*restore_op=*/7});
+    request.Apply(fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*restore_op=*/7});
     ASSERT_TRUE(request.Is<fsm::Restoring>());
     EXPECT_EQ(request.RemainingNewTokensAtAdmission(), 5000) << "what the readmission saw as open";
     EXPECT_TRUE(request.ReserveCoversGeneration(kSafeSteps)) << "two windows cover it: the readmission is exempt";
-    request.Apply(fsm::RestoreDoneEvent{});
+    request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate()});
     EXPECT_TRUE(request.Is<fsm::Decoding>());
     EXPECT_EQ(request.TokenSize(), 1004) << "the same tokens, resumed where they stopped";
 }
@@ -4223,14 +4313,14 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
     const auto restore = coordinator.Restore(retracted->image, demands, admission->access_epoch);
     ASSERT_TRUE(restore);
     ASSERT_EQ(restore->snapshot_pairs.size(), 2u) << "the 4 computed prompt tokens; the decode input has no KV yet";
-    request.Apply(fsm::ScheduleRestoreEvent{&coordinator, req_pool.Allocate(), std::move(restored), /*restore_op=*/3});
+    request.Apply(fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*restore_op=*/3});
     ASSERT_TRUE(request.Is<fsm::Restoring>());
     EXPECT_TRUE(request.HoldsPages());
     EXPECT_EQ(request.ResultsInFlight(), 0);
     EXPECT_EQ(request.GetIf<fsm::Restoring>()->restore_op, 3u);
     EXPECT_EQ(snapshot_pool.NumEmptyLcmBlocks(), 12 - 2) << "the image lives until the ACK";
 
-    request.Apply(fsm::RestoreDoneEvent{});
+    request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate()});
     ASSERT_TRUE(request.Is<fsm::Decoding>());
     EXPECT_EQ(request.TokenSize(), 5);
     EXPECT_EQ(request.NumComputedTokens(), 4);
@@ -4302,8 +4392,8 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
         GroupDemand{.table = &restored[1], .extent = DenseGrowth{0}, .reserve_tokens = 1},
     };
     ASSERT_TRUE(coordinator.Restore(retracted->image, demands, admission->access_epoch));
-    request.Apply(fsm::ScheduleRestoreEvent{&coordinator, req_pool.Allocate(), std::move(restored), /*restore_op=*/1});
-    request.Apply(fsm::RestoreDoneEvent{});
+    request.Apply(fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*restore_op=*/1});
+    request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate()});
     ASSERT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.NumComputedTokens(), 4);
     EXPECT_EQ(request.LastToken(), 42) << "the bootstrap token for its first decode is still there";

@@ -221,7 +221,6 @@ Retracted SnapshotRetractEvent::operator()(Decoding&& state) {
 Restoring ScheduleRestoreEvent::operator()(Retracted&& state) {
     _assert(coordinator_ != nullptr, "ScheduleRestoreEvent requires a cache coordinator");
     _assert(state.ImageLanded(), "a restore is issued only after the image landed");
-    _assert(req_pool_index_.valid(), "ScheduleRestoreEvent requires a request pool slot");
     _assert(block_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
             "ScheduleRestoreEvent requires one rebuilt table per cache group");
     return Restoring{
@@ -229,7 +228,7 @@ Restoring ScheduleRestoreEvent::operator()(Retracted&& state) {
             ForwardResources{
                 .token_container = state.token_container,
                 .prefix_granularity = state.prefix_granularity,
-                .req_pool_index = std::move(req_pool_index_),
+                .req_pool_index = ReqPoolIndex{},  // the restore op holds the row until its ACK
                 .block_tables = std::move(block_tables_),
                 .cache_progress = std::move(state.cache_progress),
                 .results_in_flight = 0,
@@ -242,6 +241,9 @@ Restoring ScheduleRestoreEvent::operator()(Retracted&& state) {
 }
 
 std::variant<Prefilling, PrefillDone, Decoding> RestoreDoneEvent::operator()(Restoring&& state) {
+    _assert(req_pool_index_.valid(), "RestoreDoneEvent hands over the row the restore imported into");
+    _assert(!state.resources.req_pool_index.valid(), "a Restoring request holds no row of its own");
+    state.resources.req_pool_index = std::move(req_pool_index_);
     // A resumed prefill chunk carries its input ids like any chunk; a resumed
     // decode is marked so its first step carries the token explicitly (the
     // device has no in-flight capture for the new slot).

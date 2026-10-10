@@ -226,10 +226,12 @@ void Scheduler::handleEvent(const cache::RestoreDone& event) {
         // again first, as a first chunk does for the load-backs it issues.
         registerKvEventPrefixPages(*request, restoring->resources.cache_progress.prefix_hashes, 0);
     }
-    tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
+    ReqPoolIndex request_pool_index = tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
     if (resumes) {
-        request->Apply(fsm::RestoreDoneEvent{});
+        request->Apply(fsm::RestoreDoneEvent{std::move(request_pool_index)});
     }
+    // Otherwise the row and the blob slot return with the ticket: the request
+    // that would have used them is gone.
 }
 
 }  // namespace tokenspeed

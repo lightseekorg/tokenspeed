@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -692,9 +693,12 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
     }
     cache_progress.DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());
 
-    SnapshotSlotIndex blob_slot = snapshot_slots_.Allocate();
+    // The blob slot is shared with the store that exports into it (and later
+    // the restore that imports from it): an abort before either ACK leaves
+    // the slot with the op until the copy is done.
+    auto blob_slot = std::make_shared<SnapshotSlotIndex>(snapshot_slots_.Allocate());
     std::optional<TierTransferManager::RetractionStores> stores = tier_transfers_.StartRetractionStores(
-        victim.Id(), victim.RequestPoolIndex(), blob_slot.slot_, victim.BlockTablesRef(), num_computed_tokens);
+        victim.Id(), victim.RequestPoolIndex(), blob_slot, victim.BlockTablesRef(), num_computed_tokens);
     if (!stores) {
         // The publication stands; the victim keeps running with it recorded.
         victim.CacheProgressRef() = std::move(cache_progress);
@@ -1019,13 +1023,15 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
         auto& pending = build.plan.pages_to_zero[cache_group_ids_[i]];
         pending.insert(pending.end(), result->new_page_ids[i].begin(), result->new_page_ids[i].end());
     }
-    ReqPoolIndex pool_index = req_pool_allocator_.Allocate();
+    // The restore op owns the request-pool row it imports the blob into until
+    // its ACK hands it to the resumed state (an abort meanwhile must not
+    // re-grant a row still being written), and shares the blob slot.
     SnapshotRestoreOperation op =
-        tier_transfers_.StartSnapshotRestore(request->Id(), pool_index.slot_, retracted->blob_slot.slot_,
+        tier_transfers_.StartSnapshotRestore(request->Id(), req_pool_allocator_.Allocate(), retracted->blob_slot,
                                              std::move(result->load_pairs), std::move(result->snapshot_pairs));
     const std::uint32_t restore_op = op.op_id;
     build.snapshot_restores.push_back(std::move(op));
-    request->Apply(fsm::ScheduleRestoreEvent{&coordinator_, std::move(pool_index), std::move(tables), restore_op});
+    request->Apply(fsm::ScheduleRestoreEvent{&coordinator_, std::move(tables), restore_op});
     build.scheduled.insert(request);
     spdlog::info("[Scheduler] restore: request {} ({} tokens) copies its image back", request->Id(),
                  request->TokenSize());

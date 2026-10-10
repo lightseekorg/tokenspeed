@@ -22,6 +22,7 @@
 
 #include <concepts>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -178,7 +179,7 @@ struct SnapshotRetractEvent : InvalidTransitionHandler<SnapshotRetractEvent> {
     using InvalidTransitionHandler<SnapshotRetractEvent>::operator();
 
     SnapshotRetractEvent(CacheCoordinator* coordinator, std::int64_t epoch, bool resumes_generation,
-                         RetractionImage image, SnapshotSlotIndex blob_slot,
+                         RetractionImage image, std::shared_ptr<SnapshotSlotIndex> blob_slot,
                          std::vector<std::uint32_t> pending_store_ops)
         : coordinator_{coordinator},
           epoch_{epoch},
@@ -199,7 +200,7 @@ private:
     std::int64_t epoch_{0};
     bool resumes_generation_{false};
     RetractionImage image_;
-    SnapshotSlotIndex blob_slot_;
+    std::shared_ptr<SnapshotSlotIndex> blob_slot_;
     std::vector<std::uint32_t> pending_store_ops_;
 };
 
@@ -258,36 +259,39 @@ private:
 };
 
 // The restore was admitted: fresh Device pages for the whole image (the
-// scheduler ran CacheCoordinator::Restore) and a request pool slot. Mirrors
+// scheduler ran CacheCoordinator::Restore). Mirrors
 // SchedulePrefillFirstChunkEvent but returns no forward operation: the plan
 // carries a SnapshotRestore cache op, and nothing is schedulable until its
-// ACK. Nothing is out against the pages yet.
+// ACK. The request-pool row stays with that op until then (see Restoring).
+// Nothing is out against the pages yet.
 struct ScheduleRestoreEvent : InvalidTransitionHandler<ScheduleRestoreEvent> {
     using InvalidTransitionHandler<ScheduleRestoreEvent>::operator();
 
-    ScheduleRestoreEvent(CacheCoordinator* coordinator, ReqPoolIndex req_pool_index,
-                         std::vector<BlockTable> block_tables, std::uint32_t restore_op)
-        : coordinator_{coordinator},
-          req_pool_index_{std::move(req_pool_index)},
-          block_tables_{std::move(block_tables)},
-          restore_op_{restore_op} {}
+    ScheduleRestoreEvent(CacheCoordinator* coordinator, std::vector<BlockTable> block_tables, std::uint32_t restore_op)
+        : coordinator_{coordinator}, block_tables_{std::move(block_tables)}, restore_op_{restore_op} {}
 
     Restoring operator()(Retracted&& state);
 
 private:
     CacheCoordinator* coordinator_{};
-    ReqPoolIndex req_pool_index_;
     std::vector<BlockTable> block_tables_;
     std::uint32_t restore_op_{0};
 };
 
 // The restore's copies landed: the request continues in the state it left,
-// with the same token count, window and reserve. The image dies here -- Host
-// L2 pins drop, snapshot-pool blocks and the blob slot return.
+// with the same token count, window and reserve, in the request-pool row the
+// op imported its slot-state blob into (handed over from the op's ticket).
+// The image dies here -- Host L2 pins drop, snapshot-pool blocks and the blob
+// slot return.
 struct RestoreDoneEvent : InvalidTransitionHandler<RestoreDoneEvent> {
     using InvalidTransitionHandler<RestoreDoneEvent>::operator();
 
+    explicit RestoreDoneEvent(ReqPoolIndex req_pool_index) : req_pool_index_{std::move(req_pool_index)} {}
+
     std::variant<Prefilling, PrefillDone, Decoding> operator()(Restoring&& state);
+
+private:
+    ReqPoolIndex req_pool_index_;
 };
 
 struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTokensEvent> {

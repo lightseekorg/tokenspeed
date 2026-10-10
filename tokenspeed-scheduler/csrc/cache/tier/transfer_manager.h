@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -30,6 +31,7 @@
 
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/tier/transfer.h"
+#include "resource/allocator/req_pool_allocator.h"
 
 namespace tokenspeed {
 
@@ -86,15 +88,22 @@ public:
     // the retraction is refused only when the pool cannot hold tail plus
     // fallback -- then nothing is kept, though unpinned Host entries evicted
     // for the attempt stay evicted.
+    // blob_slot is the slot-state blob's arena slot the tail leg exports into;
+    // the store shares it with the Retracted state so an abort before the ACK
+    // cannot hand the slot to a new victim while the export still writes it.
     std::optional<RetractionStores> StartRetractionStores(const std::string& request_id,
-                                                          std::int32_t request_pool_index, std::int32_t snapshot_slot,
+                                                          std::int32_t request_pool_index,
+                                                          std::shared_ptr<SnapshotSlotIndex> blob_slot,
                                                           std::span<const BlockTable> tables, std::int32_t num_tokens);
     // One restore op for both legs: load_pairs are the Host L2 rows (keyed),
-    // snapshot_pairs the snapshot-pool rows. Both ends of every pair stay
-    // pinned until the ACK, so an abort while Restoring cannot re-grant a
-    // page the copy is still writing.
-    SnapshotRestoreOperation StartSnapshotRestore(const std::string& request_id, std::int32_t request_pool_index,
-                                                  std::int32_t snapshot_slot, std::vector<BlockTransfer> load_pairs,
+    // snapshot_pairs the snapshot-pool rows. Both ends of every pair, the blob
+    // slot (shared) and the request-pool row the blob is imported into
+    // (owned here until the ACK, then handed back by CompleteSnapshotRestore)
+    // stay pinned until the ACK, so an abort while Restoring cannot re-grant a
+    // page, slot or row the copy is still writing.
+    SnapshotRestoreOperation StartSnapshotRestore(const std::string& request_id, ReqPoolIndex request_pool_index,
+                                                  std::shared_ptr<SnapshotSlotIndex> blob_slot,
+                                                  std::vector<BlockTransfer> load_pairs,
                                                   std::vector<BlockTransfer> snapshot_pairs);
 
     // Publishes every ticket's Host entry and drops the op's pins. Returns
@@ -113,12 +122,14 @@ public:
     // scheduler can register the KV-event descriptors the republication
     // mutates and decide whether the request is still there to resume.
     std::optional<std::string> SnapshotRestoreRequest(std::uint32_t op_id) const;
-    // Drops the restore's pins. With publish, the L2-tier destinations are
-    // republished into the Device prefix index first, as CompleteLoadBack
-    // does for a prefix load; the caller passes false when the request was
-    // finished or aborted while restoring (its token descriptors are gone
+    // Drops the restore's pins and returns the request-pool row the op
+    // imported into (invalid for an unknown or duplicate op id): the caller
+    // installs it in the resumed state, or lets it drop when the request was
+    // finished or aborted while restoring. With publish, the L2-tier
+    // destinations are republished into the Device prefix index first; the
+    // caller passes false for a dead request (its token descriptors are gone
     // with it, and the pages return to the pool with the pins).
-    void CompleteSnapshotRestore(std::uint32_t op_id, bool publish);
+    ReqPoolIndex CompleteSnapshotRestore(std::uint32_t op_id, bool publish);
 
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
     // Pinned stores hold Device capacity that returns by itself at the ACK;
@@ -147,15 +158,20 @@ private:
         std::vector<StoreTicket> tickets;
     };
 
-    // A tail store pins its snapshot-pool destinations until the ACK (the
-    // image pins them too, for longer); a restore pins both ends of every row.
+    // A tail store pins its snapshot-pool destinations and the blob slot it
+    // exports into until the ACK (the image pins them too, for longer); a
+    // restore pins both ends of every row, the blob slot it imports from and
+    // the request-pool row it imports into.
     struct InFlightSnapshotStore {
         std::string request_id;
         std::vector<CacheBlockRef> destinations;
+        std::shared_ptr<SnapshotSlotIndex> blob_slot;
     };
     struct InFlightSnapshotRestore {
         std::string request_id;
         std::vector<BlockTransfer> transfers;
+        std::shared_ptr<SnapshotSlotIndex> blob_slot;
+        ReqPoolIndex request_pool_index;
     };
     // A prefetch pins its Host destinations until the ACK, which publishes
     // the landed prefix (page_row_ends maps a landed page count to a row
