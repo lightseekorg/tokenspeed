@@ -359,6 +359,7 @@ def test_the_dense_delegate_is_refused_under_a_shard():
             seq_lens=None,
             batch_size=1,
             causal=True,
+            window_left=-1,
         )
 
 

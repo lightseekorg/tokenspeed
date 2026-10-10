@@ -95,7 +95,8 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 }
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
-    const std::vector<std::span<const std::int32_t>> stable_prefix_pages = request.FullPrefixPages(true);
+    const std::vector<std::span<const std::int32_t>> stable_prefix_pages =
+        request.FullPrefixPages(true, config_.prefix_hash_lookahead_tokens);
     fsm::CacheProgress progress = request.CacheProgress();
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(progress.prefix_hashes.size());
     const std::int32_t num_stable_prefix_pages = static_cast<std::int32_t>(stable_prefix_pages.size());
@@ -104,7 +105,8 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         const std::string previous_hash =
             progress.prefix_hashes.empty() ? std::string{} : progress.prefix_hashes.back();
         std::vector<std::string> new_hashes =
-            AdvancePrefixHashes(stable_prefix_pages, first_new_prefix_page, previous_hash, num_stable_prefix_pages);
+            AdvancePrefixHashes(stable_prefix_pages, first_new_prefix_page, previous_hash, num_stable_prefix_pages,
+                                config_.prefix_hash_lookahead_tokens);
         progress.prefix_hashes.insert(progress.prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
                                       std::make_move_iterator(new_hashes.end()));
 

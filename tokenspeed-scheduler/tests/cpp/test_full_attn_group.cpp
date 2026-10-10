@@ -37,7 +37,7 @@ using token_span = std::span<const std::int32_t>;
 // A real key from prefix_hasher.h, not a synthetic placeholder.
 CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
-    std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
+    std::vector<std::string> hashes = ComputePrefixHashes(pages, "", 0);
     return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
 }
 
@@ -422,11 +422,11 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
     std::vector<token_span> pages_a = {token_span(p_a.data(), p_a.size()), token_span(q.data(), q.size())};
     std::vector<token_span> pages_b = {token_span(p_b.data(), p_b.size()), token_span(q.data(), q.size())};
     std::vector<CacheKey> keys_a;
-    for (std::string& hash : ComputePrefixHashes(pages_a, "")) {
+    for (std::string& hash : ComputePrefixHashes(pages_a, "", 0)) {
         keys_a.push_back(CacheKey{.group_id = 0, .content_hash = std::move(hash)});
     }
     std::vector<CacheKey> keys_b;
-    for (std::string& hash : ComputePrefixHashes(pages_b, "")) {
+    for (std::string& hash : ComputePrefixHashes(pages_b, "", 0)) {
         keys_b.push_back(CacheKey{.group_id = 0, .content_hash = std::move(hash)});
     }
     ASSERT_EQ(keys_a.size(), 2u);

@@ -57,6 +57,7 @@ def make_config(
     num_device_pages: int = 1024,
 ) -> SchedulerConfig:
     cfg = SchedulerConfig()
+    cfg.prefix_hash_lookahead_tokens = 0
     cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size

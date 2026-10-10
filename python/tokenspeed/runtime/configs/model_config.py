@@ -32,6 +32,7 @@ import torch
 import yaml
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.dots3_note import Dots3NoteConfig
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
@@ -286,12 +287,41 @@ def configure_mla_attention(model_config, server_args: ServerArgs) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
+def configure_dots3_note_draft_attention(model_config, server_args: ServerArgs) -> None:
+    """Derive the native MTP SWA geometry without rewriting the source config."""
+    del server_args  # the geometry follows the checkpoint alone
+    hf = model_config.hf_text_config
+    model_config.attention_arch = AttentionArch.MLA
+    model_config.head_dim = hf.swa_qk_nope_head_dim + hf.swa_qk_rope_head_dim
+    model_config.kv_lora_rank = hf.swa_kv_lora_rank
+    model_config.qk_nope_head_dim = hf.swa_qk_nope_head_dim
+    model_config.qk_rope_head_dim = hf.swa_qk_rope_head_dim
+    model_config.v_head_dim = hf.swa_v_head_dim
+    model_config.scaling = model_config.head_dim**-0.5
+
+
 def configure_minimax_m3_attention(model_config, server_args: ServerArgs) -> None:
     del server_args  # the geometry follows the checkpoint alone
     model_config.attention_arch = AttentionArch.MSA
 
 
 _ATTENTION_FAMILY_SPECS = (
+    _AttentionFamilySpec(
+        name="Dots3-note",
+        architectures=frozenset({"Dot3NoteForCausalLM", "Dots3NoteForCausalLM"}),
+        # Model-wide dimensions describe Full DSA; the composite attention
+        # config supplies SWA geometry separately for each cache group.
+        configure=configure_dsa_attention,
+        default_backend="dots3_note",
+    ),
+    _AttentionFamilySpec(
+        name="Dots3-note MTP",
+        architectures=frozenset(
+            {"Dot3NoteForCausalLMNextN", "Dots3NoteForCausalLMNextN"}
+        ),
+        configure=configure_dots3_note_draft_attention,
+        default_backend="dots3_note",
+    ),
     _AttentionFamilySpec(
         name="DeepSeek V4.1",
         architectures=frozenset(
@@ -454,6 +484,11 @@ def _derive_num_attention_layers(
         return num_hidden_layers * model_profile.attention_instances_per_layer
     architectures = getattr(hf_config, "architectures", None) or []
     num_attention_layers = num_hidden_layers
+    if any(
+        arch in ("Dot3NoteForCausalLMNextN", "Dots3NoteForCausalLMNextN")
+        for arch in architectures
+    ):
+        num_attention_layers = 1
     if is_deepseek_v4_nextn(hf_config):
         num_attention_layers = int(getattr(hf_config, "num_nextn_predict_layers", 1))
     if any(arch in _DOUBLE_ATTENTION_LAYER_ARCHITECTURES for arch in architectures):
@@ -631,6 +666,11 @@ class ModelConfig:
             )
         # ``is_multimodal`` is the architectural fact; this is the runtime gate.
         self.is_multimodal_active = self.is_multimodal and not apply_language_model_only
+        if isinstance(self.hf_config, Dots3NoteConfig) and self.is_multimodal_active:
+            raise ValueError(
+                "dots3_note vision/audio encoders are not supported; "
+                "use --language-model-only for text inference."
+            )
         if (
             not is_draft_worker
             and getattr(server_args, "mm_encoder_tp_mode", "weights") == "data"
@@ -753,6 +793,11 @@ class ModelConfig:
                 self.hf_config.attn_config, "kv_n_heads", None
             )
 
+        if attention_family is not None and (
+            attention_family.configure is configure_dots3_note_draft_attention
+        ):
+            self.num_attention_heads = self.hf_text_config.swa_num_attention_heads
+            self.num_key_value_heads = self.hf_text_config.swa_num_key_value_heads
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
@@ -767,7 +812,12 @@ class ModelConfig:
         if is_draft_worker:
             dspark_layers = getattr(self.hf_text_config, "dspark_num_stages", None)
             mtp_layers = getattr(self.hf_text_config, "mtp_num_hidden_layers", None)
-            if dspark_layers is not None:
+            if attention_family is not None and (
+                attention_family.configure is configure_dots3_note_draft_attention
+            ):
+                # The source config has 46 target blocks; NextN owns only block 46.
+                self.num_attention_layers = 1
+            elif dspark_layers is not None:
                 self.num_attention_layers = int(dspark_layers)
             elif mtp_layers is not None:
                 self.num_attention_layers = mtp_layers
@@ -914,6 +964,18 @@ class ModelConfig:
                 )
 
     def get_hf_eos_token_id(self) -> set[int] | None:
+        if self.hf_config.model_type == "dots3_note":
+            # The model config's legacy im_end conflicts with the assistant
+            # terminator in the generation assets. Do not union the two policies.
+            generation = self.hf_generation_config
+            ids = None if generation is None else generation.eos_token_id
+            eos_ids = {ids} if isinstance(ids, int) else set(ids or ())
+            if not eos_ids:
+                raise ValueError(
+                    "dots3_note requires non-empty eos_token_id in generation_config.json"
+                )
+            return eos_ids
+
         eos_ids = getattr(self.hf_config, "eos_token_id", None)
         if eos_ids:
             # it can be either int or list of int
@@ -1026,6 +1088,8 @@ def is_generation_model(model_architectures: list[str]):
 def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
         "DeepseekV41ForCausalLM",
+        "Dot3NoteForCausalLM",
+        "Dots3NoteForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen4ExpForConditionalGeneration",

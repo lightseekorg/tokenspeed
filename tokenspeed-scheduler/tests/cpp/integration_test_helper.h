@@ -42,7 +42,7 @@ class SchedulerTestSuite : public ::testing::Test {
 protected:
     // Subclasses can override this to customize the config.
     virtual SchedulerConfig MakeConfig() {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.host_allocator.total_pages = 32;
@@ -216,7 +216,7 @@ protected:
     }
 
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 33;
         cfg.host_allocator.total_pages = 0;

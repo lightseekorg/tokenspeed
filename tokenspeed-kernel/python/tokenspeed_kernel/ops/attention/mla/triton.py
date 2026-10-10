@@ -45,6 +45,7 @@ _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}
     signatures=format_signatures(("q", "k", "v"), "dense", _PORTABLE_DTYPES),
     priority=Priority.PORTABLE,
     traits={
+        "sliding_window": frozenset({False, True}),
         "is_causal": frozenset({False, True}),
         "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
@@ -60,6 +61,7 @@ def triton_mla_prefill(
     max_seqlen_kv: int,
     softmax_scale: float,
     *,
+    window_left: int,
     is_causal: bool = True,
     logit_cap: float = 0.0,
     return_lse: bool = False,
@@ -76,6 +78,7 @@ def triton_mla_prefill(
         max_seqlen_kv=max_seqlen_kv,
         softmax_scale=softmax_scale,
         is_causal=is_causal,
+        window_left=window_left,
         logit_cap=logit_cap,
         return_lse=return_lse,
         out=out,

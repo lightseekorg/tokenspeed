@@ -70,7 +70,7 @@ CacheGroupConfig State(const std::string& id, std::int32_t block_granularity, st
 SchedulerConfig SizingConfig(Role role, std::int32_t prefix_granularity, std::int32_t chunk_tokens,
                              std::int32_t decode_width, std::int32_t overlap_depth, bool disable_prefix_cache,
                              std::vector<CacheGroupConfig> groups) {
-    SchedulerConfig cfg{};
+    SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
     cfg.role = role;
     cfg.prefix_granularity = prefix_granularity;
     cfg.max_scheduled_tokens = chunk_tokens;
@@ -201,6 +201,38 @@ TEST(CapacityModelTest, ConcurrentDemandByRetention) {
     const std::vector<std::int64_t> prefill_pages = CapacityModel{prefill}.ConcurrentGroupPages(65536, 4096);
     EXPECT_EQ(prefill_pages[0], 1024 + 16 * 1);
     EXPECT_EQ(prefill_pages[1], 16 * (1 + 1 + 1));
+}
+
+TEST(CapacityModelTest, DecodeSlidingCapacityCoversLocalRecovery) {
+    for (const bool disable_prefix_cache : {false, true}) {
+        for (const std::int32_t overlap : {0, 1}) {
+            SCOPED_TRACE(::testing::Message() << "prefix_cache_off=" << disable_prefix_cache << " overlap=" << overlap);
+            SchedulerConfig cfg = SizingConfig(Role::kD, 64, 1024, 1, overlap, disable_prefix_cache,
+                                               {Full("full", 64, 1), Sliding("swa0", 32, 513, 1),
+                                                Sliding("swa1", 32, 513, 1), Sliding("swa2", 32, 513, 5)});
+            const CapacityModel model{cfg};
+            // Recovery holds 16 lookback pages plus a 1024-token chunk and
+            // decode reserve (33 pages), not just the remote landing window.
+            const auto single = model.SingleRequestGroupPages(6208);
+            EXPECT_EQ(single, (std::vector<std::int64_t>{97 + overlap, 49, 49, 49}));
+            EXPECT_EQ(model.LcmBlocksNeededFor(single), 205 + overlap);
+            EXPECT_EQ(model.MaxSingleRequestTokens(170), 3968 - overlap);
+            EXPECT_EQ(model.SingleRequestGroupPages(128),
+                      (std::vector<std::int64_t>{2 + overlap, 4 + overlap, 4 + overlap, 4 + overlap}));
+            EXPECT_EQ(model.SingleRequestGroupPages(0),
+                      (std::vector<std::int64_t>{overlap, overlap, overlap, overlap}));
+
+            cfg.max_batch_size = 3;
+            // Only one request recovers at a time; the other two keep their
+            // remote landing bounds, including any cached lookback islands.
+            EXPECT_EQ(CapacityModel{cfg}.ConcurrentGroupPages(3 * 6208, 6208),
+                      (std::vector<std::int64_t>{294, 115 + 2 * overlap, 115 + 2 * overlap, 115 + 2 * overlap}));
+            EXPECT_EQ(CapacityModel{cfg}.ConcurrentGroupPages(128, 128), (std::vector<std::int64_t>{5, 7, 7, 7}));
+            cfg.max_batch_size = 0;
+            EXPECT_EQ(CapacityModel{cfg}.ConcurrentGroupPages(6208, 6208), (std::vector<std::int64_t>{97, 0, 0, 0}));
+            EXPECT_EQ(CapacityModel{cfg}.ConcurrentGroupPages(0, 0), (std::vector<std::int64_t>{0, 0, 0, 0}));
+        }
+    }
 }
 
 TEST(CapacityModelTest, FoldsGroupPagesIntoLcmBlocksByPacking) {

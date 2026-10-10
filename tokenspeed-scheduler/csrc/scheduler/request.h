@@ -165,8 +165,9 @@ public:
                    state_);
     }
 
-    std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
-        return token_container_.FullPrefixPages(prefix_granularity_, except_last);
+    std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last,
+                                                               std::int32_t prefix_hash_lookahead_tokens) const {
+        return token_container_.FullPrefixPages(prefix_granularity_, except_last, prefix_hash_lookahead_tokens);
     }
 
     std::int32_t TokenSize() const { return token_container_.Size(); }

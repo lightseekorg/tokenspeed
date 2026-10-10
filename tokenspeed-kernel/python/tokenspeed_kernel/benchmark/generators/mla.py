@@ -800,6 +800,7 @@ def prepare_mla_prefill(
         platform,
         signature_roles={"q": dtype, "k": dtype, "v": dtype},
         traits=mla_ops.mla_prefill_traits(
+            window_left=-1,
             batch_size=batch,
             total_kv=total_kv,
             head_dim=config.qk_head_dim,
@@ -836,6 +837,7 @@ def prepare_mla_prefill(
 
     def invoke() -> object:
         return mla_ops.mla_prefill(
+            window_left=-1,
             q=q,
             k=k,
             v=v,

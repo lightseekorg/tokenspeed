@@ -88,13 +88,20 @@ def _share_target_embed_and_head(model_runner: ModelRunner, draft_model) -> None
     lives on the first stage), so it shares the head alone and the draft must
     keep the embedding its checkpoint ships -- checked after the call, since a
     draft that aliases ``None`` into its embedding fails only at the first
-    forward.
+    forward. A draft with ``set_head`` keeps its dedicated embedding even off
+    the pipeline and shares only the vocabulary projection.
     """
     mapping = model_runner.mapping
     if mapping.has_pp and not mapping.is_last_pp_rank:
         return
     _check_shared_head_layout(model_runner.model, draft_model)
     embed, head = model_runner.model.get_embed_and_head()
+    head_setter = getattr(type(draft_model), "set_head", None)
+    if head_setter is not None:
+        if head is None:
+            raise ValueError("Draft model requires the target's lm_head weight.")
+        head_setter(draft_model, head)
+        return
     if embed is None and not mapping.has_pp:
         raise ValueError("Draft model requires the target's embedding weight.")
     module_setter = getattr(type(draft_model), "set_embed_and_head_module", None)

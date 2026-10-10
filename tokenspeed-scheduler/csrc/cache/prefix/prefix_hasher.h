@@ -119,10 +119,14 @@ inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const st
 
 inline std::vector<std::string> ComputePrefixHashes(
     std::span<const std::span<const std::int32_t>> prefix_pages, const std::string& prior,
-    std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
+    std::int32_t prefix_hash_lookahead_tokens, std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
+    _assert(prefix_hash_lookahead_tokens == 0 || prefix_hash_lookahead_tokens == 1,
+            "prefix_hash_lookahead_tokens must be 0 or 1");
     std::vector<std::string> hashes;
     hashes.reserve(prefix_pages.size());
-    std::string current_prior = prior;
+    // A one-byte root distinguishes shifted grain G from ordinary grain G+1,
+    // even though their first hash spans can be identical. Zero keeps the old root.
+    std::string current_prior = prior.empty() && prefix_hash_lookahead_tokens == 1 ? "01" : prior;
     for (std::size_t i = 0; i < prefix_pages.size(); ++i) {
         std::span<const std::string> extra =
             (i < extra_keys_per_page.size()) ? extra_keys_per_page[i] : std::span<const std::string>{};
@@ -136,14 +140,15 @@ inline std::vector<std::string> ComputePrefixHashes(
 // Continues an existing hash chain and returns only [first_page, past_end_page).
 inline std::vector<std::string> AdvancePrefixHashes(std::span<const std::span<const std::int32_t>> prefix_pages,
                                                     std::int32_t first_page, const std::string& prior,
-                                                    std::int32_t past_end_page) {
+                                                    std::int32_t past_end_page,
+                                                    std::int32_t prefix_hash_lookahead_tokens) {
     _assert(first_page >= 0, "first_page must be >= 0");
     _assert(past_end_page > first_page, "hash range must be non-empty");
     _assert(past_end_page <= static_cast<std::int32_t>(prefix_pages.size()),
             "hash range exceeds the available full pages");
     return ComputePrefixHashes(prefix_pages.subspan(static_cast<std::size_t>(first_page),
                                                     static_cast<std::size_t>(past_end_page - first_page)),
-                               prior);
+                               prior, prefix_hash_lookahead_tokens);
 }
 
 }  // namespace tokenspeed

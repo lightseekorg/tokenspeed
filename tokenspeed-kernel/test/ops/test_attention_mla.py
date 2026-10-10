@@ -88,6 +88,7 @@ def test_mla_prefill(
         cu_seqlens_kv=cu_seqlens_kv,
         max_seqlen_q=max(q_lens),
         max_seqlen_kv=max(kv_lens),
+        window_left=-1,
         softmax_scale=softmax_scale,
         is_causal=is_causal,
         return_lse=True,

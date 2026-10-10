@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include "integration_test_helper.h"
+#include "scheduler/capacity_model.h"
 
 namespace tokenspeed::test {
 
@@ -227,7 +228,7 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDone_Success_PrefixLenChangesInForward) {
 class DisaggDecodeAdmissionTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
-        SchedulerConfig cfg{};
+        SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
         cfg.prefix_granularity = 2;
         // Cache block 0 is the null page, leaving three usable pages.
         cfg.device_allocator.total_pages = 4;
@@ -811,12 +812,121 @@ protected:
     }
 };
 
+class PdSlidingRecoveryTestSuite : public DisaggDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
+        cfg.prefix_granularity = 64;
+        cfg.max_scheduled_tokens = 1024;
+        cfg.max_batch_size = 2;
+        cfg.overlap_schedule_depth = 0;
+        cfg.disable_l2_cache = true;
+        cfg.host_allocator.total_pages = 0;
+        cfg.cache_groups.front().block_granularity = 64;
+        for (std::int32_t i = 0; i < 3; ++i) {
+            CacheGroupConfig sliding = cfg.cache_groups.front();
+            sliding.group_id = "swa" + std::to_string(i);
+            sliding.block_granularity = 32;
+            sliding.cache_blocks_per_lcm_block = i == 2 ? 5 : 1;
+            sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
+            sliding.sliding_window_tokens = 513;
+            cfg.cache_groups.push_back(sliding);
+        }
+        const CapacityModel model{cfg};
+        const auto usable = model.LcmBlocksNeededFor(model.SingleRequestGroupPages(6208));
+        cfg.device_allocator.total_pages = 1 + usable;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = 1 + usable * group.cache_blocks_per_lcm_block;
+        }
+        return cfg;
+    }
+};
+
+TEST_F(PdSlidingRecoveryTestSuite, CapacityRetractionCompletesEveryRecoveryChunkAndResumesDecode) {
+    ASSERT_EQ(scheduler_->MaxSingleRequestTokens(), 6208);
+    RequestSpec running = MakeRequestSpec("running", /*num_pages=*/32);
+    running.max_new_tokens = 4100;
+    Submit(running);
+    SendBootstrapped("running");
+    const ExecutionPlan admission = PlanOnce();
+    ASSERT_NE(FindRemoteAdmission(admission), nullptr);
+
+    // This remote transfer holds the remaining 71 parents while the running
+    // request consumes its initial 4096-token decode reserve. The packed
+    // sliding group shares one parent between the two requests.
+    RequestSpec other = MakeRequestSpec("other", /*num_pages=*/33, /*start=*/10001);
+    other.max_new_tokens = 1;
+    Submit(other);
+    SendBootstrapped("other");
+    const ExecutionPlan other_admission = PlanOnce();
+    ASSERT_NE(FindRemoteAdmission(other_admission), nullptr);
+    ASSERT_EQ(FindRemoteAdmission(other_admission)->request_ids, (std::vector<std::string>{"other"}));
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    while (scheduler_->RequestTokenSize("running") < 6145) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(plan);
+        ASSERT_NE(decode, nullptr);
+        ASSERT_EQ(decode->request_ids, (std::vector<std::string>{"running"}));
+        ASSERT_EQ(decode->NumExtends(), 0u);
+        SendForwardDone("running", {43});
+    }
+
+    const ExecutionPlan retract = PlanOnce();
+    EXPECT_EQ(FindRequestIndex(FindForwardBatch(retract), "running"), -1);
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+    ASSERT_TRUE(scheduler_->PdTransferPinned("other"));
+    SendRemotePrefillDone("other", /*bootstrap_token=*/142);
+    SendFinish("other");
+
+    // Check every chunk, not just the first admission: the second chunk
+    // must hold the sliding lookback and the new chunk together. A cached
+    // promotion boundary can shorten a chunk even when recovery starts at 0.
+    std::int32_t prefix = 0;
+    std::int32_t chunks = 0;
+    for (; prefix < 6145 && chunks < 8; ++chunks) {
+        SCOPED_TRACE(prefix);
+        const ExecutionPlan recovery = PlanOnce();
+        const ForwardBatch* forward = FindForwardBatch(recovery);
+        ASSERT_NE(forward, nullptr);
+        ASSERT_EQ(forward->request_ids, (std::vector<std::string>{"running"}));
+        ASSERT_EQ(forward->NumExtends(), 1u);
+        EXPECT_EQ(forward->extend_prefix_lens, (std::vector<std::int32_t>{prefix}));
+        ASSERT_EQ(forward->input_lengths.size(), 1u);
+        ASSERT_GT(forward->input_lengths.front(), 0);
+        ASSERT_LE(forward->input_lengths.front(), 1024);
+        prefix += forward->input_lengths.front();
+        ASSERT_LE(prefix, 6145);
+        EXPECT_EQ(FindRemoteAdmission(recovery), nullptr);
+        EXPECT_TRUE(ExtractCacheOps(recovery).empty());
+        EXPECT_FALSE(scheduler_->PdTransferPinned("running"));
+        SendForwardDone("running", prefix == 6145 ? std::vector<std::int32_t>{44} : std::vector<std::int32_t>{});
+    }
+    EXPECT_EQ(chunks, 7);
+    ASSERT_EQ(prefix, 6145);
+    ASSERT_EQ(scheduler_->RequestTokenSize("running"), 6146);
+    for (std::int32_t token = 6146; token < 6148; ++token) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(plan);
+        ASSERT_NE(decode, nullptr);
+        ASSERT_EQ(decode->request_ids, (std::vector<std::string>{"running"}));
+        ASSERT_EQ(decode->NumExtends(), 0u);
+        SendForwardDone("running", {45});
+    }
+    EXPECT_EQ(scheduler_->RequestTokenSize("running"), 6148);
+    SendFinish("running");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0u);
+}
+
 class PdSlidingSparseDecodeAdmissionTestSuite : public DisaggDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.prefix_granularity = 4;
-        cfg.device_allocator.total_pages = 8;
+        cfg.device_allocator.total_pages = 10;  // null parent + nine pages for local recovery
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 16;
         cfg.disable_prefix_cache = false;

@@ -416,6 +416,7 @@ def test_mla_prefill_selection_matches_operation_api(
     expected = _capture_operation_selection(
         monkeypatch,
         lambda ops: ops.mla_prefill(
+            window_left=-1,
             q=torch.zeros((batch * 256, 12, 192), dtype=fp8),
             k=torch.zeros((batch * kv_len, 12, 192), dtype=fp8),
             v=torch.zeros((batch * kv_len, 12, 128), dtype=fp8),

@@ -63,7 +63,7 @@ std::vector<std::string> ContentHashes(const std::vector<std::vector<std::int32_
     for (const auto& p : pages) {
         spans.emplace_back(p.data(), p.size());
     }
-    return ComputePrefixHashes(spans, "");
+    return ComputePrefixHashes(spans, "", 0);
 }
 
 std::uint64_t NextTestAccessEpoch() {

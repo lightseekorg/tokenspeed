@@ -25,6 +25,7 @@ from tokenspeed.runtime.configs.deepseek_v41_config import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
 )
+from tokenspeed.runtime.configs.dots3_note import Dots3NoteConfig
 from tokenspeed.runtime.configs.inkling_config import (
     InklingAudioConfig,
     InklingMMConfig,
@@ -63,6 +64,7 @@ __all__ = [
     "DeepseekV4Config",
     "DeepseekV41Config",
     "DeepseekV41TextConfig",
+    "Dots3NoteConfig",
     "Qwen2Config",
     "Qwen3Config",
     "Qwen3MoeConfig",

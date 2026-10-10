@@ -155,6 +155,36 @@ def test_reset_states_does_not_synchronize_cuda():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [2, 4])
+def test_remote_spec_candidates_land_without_cuda_synchronization(width):
+    states = RuntimeStates(4, 32, width, "cuda")
+    states.future_input_map.fill_(-1)
+    candidates = list(range(width))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        with torch.cuda.stream(stream):
+            states.write_remote_spec_candidate_ids(1, candidates)
+            with pytest.raises(RuntimeError, match="width mismatch"):
+                states.write_remote_spec_candidate_ids(2, candidates[:-1])
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    torch.cuda.current_stream().wait_stream(stream)
+    assert states.future_input_map.tolist() == [
+        candidates if i == 1 else [-1] * width for i in range(5)
+    ]
+    assert states.remote_spec_candidate_ready.tolist() == [
+        False,
+        True,
+        False,
+        False,
+        False,
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_reset_states_graph_replay_uses_current_inputs():
     states = RuntimeStates(4, 32, 2, "cuda")
     indices = torch.tensor([1, 3], dtype=torch.int64, device="cuda")

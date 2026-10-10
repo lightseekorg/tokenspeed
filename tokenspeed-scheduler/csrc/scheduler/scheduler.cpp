@@ -229,7 +229,8 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
     }
     _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
             "KV event page range is invalid");
-    const std::vector<std::span<const std::int32_t>> token_pages = request.FullPrefixPages(false);
+    const std::vector<std::span<const std::int32_t>> token_pages =
+        request.FullPrefixPages(false, config_.prefix_hash_lookahead_tokens);
     _assert(prefix_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
 
     KvEventHashProgress& progress = kv_event_hash_progress_[request.Id()];
@@ -243,10 +244,12 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
         CacheKey key{.content_hash = prefix_hashes[i]};
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[i - 1]};
+        // Event identity includes lookahead, but its payload still covers one logical page.
+        const auto logical_tokens = token_pages[i].first(config_.prefix_granularity);
         KvBlockStoredEvent event{
             .block_hashes = {progress.block_hashes[i]},
             .parent_block_hash = parent_hash,
-            .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
+            .token_ids = std::vector<std::int32_t>(logical_tokens.begin(), logical_tokens.end()),
             .block_size = config_.prefix_granularity,
         };
         const auto [it, inserted] = kv_event_boundaries_.try_emplace(
@@ -363,13 +366,13 @@ std::int32_t Scheduler::CacheGroupAvailablePages(const std::string& group_id) co
 std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const {
     TokenContainer container(tokens);
     std::vector<std::span<const std::int32_t>> prefix_pages =
-        container.FullPrefixPages(config_.prefix_granularity, false);
+        container.FullPrefixPages(config_.prefix_granularity, false, config_.prefix_hash_lookahead_tokens);
     // The last prompt token is always recomputed. Admission probes the same
     // (n - 1) / prefix_granularity candidate pages.
     const std::int32_t candidate_prefix_pages =
         std::max((static_cast<std::int32_t>(tokens.size()) - 1) / config_.prefix_granularity, 0);
     prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-    return ComputePrefixHashes(prefix_pages, "");
+    return ComputePrefixHashes(prefix_pages, "", config_.prefix_hash_lookahead_tokens);
 }
 
 std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
@@ -397,11 +400,12 @@ std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
     std::vector<std::string> hashes;
     std::unordered_set<std::string> seen;
     const auto append_hashes = [&](const Request& request) {
-        std::vector<std::span<const std::int32_t>> prefix_pages = request.FullPrefixPages(/*except_last=*/false);
+        std::vector<std::span<const std::int32_t>> prefix_pages =
+            request.FullPrefixPages(/*except_last=*/false, config_.prefix_hash_lookahead_tokens);
         const std::int32_t candidate_prefix_pages =
             std::max((request.PrefillSize() - 1) / config_.prefix_granularity, 0);
         prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-        for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
+        for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "", config_.prefix_hash_lookahead_tokens)) {
             if (seen.insert(content_hash).second) {
                 hashes.push_back(std::move(content_hash));
             }

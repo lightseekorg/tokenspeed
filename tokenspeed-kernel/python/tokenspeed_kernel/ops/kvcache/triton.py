@@ -977,14 +977,35 @@ def store_sf_interleaved(
 # -----------------------------------------------------------------------------
 
 
-@triton.jit
+def _mla_cache_strides(kv_buffer: torch.Tensor) -> tuple[int, int, int]:
+    """Return page size, page stride and row stride without flattening storage."""
+    if kv_buffer.stride(-1) != 1:
+        raise ValueError("MLA cache must have contiguous channels")
+    if kv_buffer.ndim == 2:
+        return 1, kv_buffer.stride(0), kv_buffer.stride(0)
+    if kv_buffer.ndim == 3:
+        return kv_buffer.shape[1], kv_buffer.stride(0), kv_buffer.stride(1)
+    if kv_buffer.ndim == 4:
+        if kv_buffer.shape[2] == 1:
+            return kv_buffer.shape[1], kv_buffer.stride(0), kv_buffer.stride(1)
+        if kv_buffer.shape[1] == 1:
+            return kv_buffer.shape[2], kv_buffer.stride(0), kv_buffer.stride(2)
+    raise ValueError(f"Unsupported MLA cache shape: {tuple(kv_buffer.shape)}")
+
+
+@triton.jit(
+    do_not_specialize=["buffer_stride", "page_stride"],
+    do_not_specialize_on_alignment=["buffer_stride", "page_stride"],
+)
 def _set_mla_kv_buffer_kernel(
     kv_buffer_ptr,
     cache_k_nope_ptr,
     cache_k_rope_ptr,
     loc_ptr,
     write_mask_ptr,
-    buffer_stride: tl.constexpr,
+    buffer_stride,
+    page_stride,
+    page_size: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
@@ -1008,7 +1029,8 @@ def _set_mla_kv_buffer_kernel(
         mask &= tl.load(write_mask_ptr + pid_loc)
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
+    row_offset = (loc // page_size) * page_stride + (loc % page_size) * buffer_stride
+    dst_ptr = kv_buffer_ptr + row_offset + offs
 
     if base + BLOCK <= nope_dim:
         src = tl.load(
@@ -1043,8 +1065,8 @@ def _set_mla_kv_buffer_kernel(
 
 
 @triton.jit(
-    do_not_specialize=["n_loc"],
-    do_not_specialize_on_alignment=["n_loc"],
+    do_not_specialize=["n_loc", "buffer_stride", "page_stride"],
+    do_not_specialize_on_alignment=["n_loc", "buffer_stride", "page_stride"],
 )
 def _set_mla_kv_buffer_per_loc_kernel(
     kv_buffer_ptr,
@@ -1053,7 +1075,9 @@ def _set_mla_kv_buffer_per_loc_kernel(
     loc_ptr,
     write_mask_ptr,
     n_loc,
-    buffer_stride: tl.constexpr,
+    buffer_stride,
+    page_stride,
+    page_size: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
@@ -1075,6 +1099,7 @@ def _set_mla_kv_buffer_per_loc_kernel(
         loc_mask &= tl.load(write_mask_ptr + loc_indices, mask=loc_mask, other=False)
 
     nope_offs = tl.arange(0, nope_dim)
+    row_offsets = (locs // page_size) * page_stride + (locs % page_size) * buffer_stride
     src_nope = tl.load(
         cache_k_nope_ptr + loc_indices[:, None] * nope_stride + nope_offs[None, :],
         mask=loc_mask[:, None],
@@ -1085,7 +1110,7 @@ def _set_mla_kv_buffer_per_loc_kernel(
         src_nope = tl.where(src_nope == float("inf"), MAX_FINITE, src_nope)
         src_nope = tl.where(src_nope == -float("inf"), -MAX_FINITE, src_nope)
     tl.store(
-        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_offs[None, :],
+        kv_buffer_ptr + row_offsets[:, None] + nope_offs[None, :],
         src_nope,
         mask=loc_mask[:, None],
     )
@@ -1102,10 +1127,7 @@ def _set_mla_kv_buffer_per_loc_kernel(
             src_rope = tl.where(src_rope == float("inf"), MAX_FINITE, src_rope)
             src_rope = tl.where(src_rope == -float("inf"), -MAX_FINITE, src_rope)
         tl.store(
-            kv_buffer_ptr
-            + locs[:, None] * buffer_stride
-            + nope_dim
-            + rope_offs[None, :],
+            kv_buffer_ptr + row_offsets[:, None] + nope_dim + rope_offs[None, :],
             src_rope,
             mask=loc_mask[:, None],
         )
@@ -1127,8 +1149,9 @@ def set_mla_kv_buffer_triton(
     """Scatter split MLA keys into a latent KV cache.
 
     Args:
-        kv_buffer: Destination cache with one combined latent and RoPE row per
-            cache slot.
+        kv_buffer: Destination cache, flat ``[slots, D]`` / ``[slots, 1, D]``
+            or paged ``[pages, P, 1, D]`` with contiguous channels. Page and
+            row strides are taken from the tensor; no cache copy is made.
         loc: Destination cache slot for each input row.
         cache_k_nope: Input latent key rows.
         cache_k_rope: Input RoPE key rows.
@@ -1158,6 +1181,7 @@ def set_mla_kv_buffer_triton(
         return
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
+    page_size, page_stride, row_stride = _mla_cache_strides(kv_buffer)
     # Clamp to a value representable by both source and destination. Bitwise
     # viewed pools copy raw words, so no clamp applies to non-floating tensors.
     float_maxes = [
@@ -1184,7 +1208,9 @@ def set_mla_kv_buffer_triton(
             loc,
             write_mask,
             n_loc,
-            kv_buffer.stride(0),
+            row_stride,
+            page_stride,
+            page_size,
             cache_k_nope.stride(0),
             cache_k_rope.stride(0),
             nope_dim,
@@ -1210,7 +1236,9 @@ def set_mla_kv_buffer_triton(
             cache_k_rope,
             loc,
             write_mask,
-            kv_buffer.stride(0),
+            row_stride,
+            page_stride,
+            page_size,
             cache_k_nope.stride(0),
             cache_k_rope.stride(0),
             nope_dim,
@@ -1408,6 +1436,8 @@ def _get_mla_kv_buffer_kernel(
     cache_k_rope_ptr,
     loc_ptr,
     buffer_stride: tl.constexpr,
+    page_stride: tl.constexpr,
+    page_size: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
@@ -1428,7 +1458,8 @@ def _get_mla_kv_buffer_kernel(
     mask = offs < total_dim
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    src = tl.load(kv_buffer_ptr + loc * buffer_stride + offs, mask=mask)
+    row_offset = (loc // page_size) * page_stride + (loc % page_size) * buffer_stride
+    src = tl.load(kv_buffer_ptr + row_offset + offs, mask=mask)
 
     if base + BLOCK <= nope_dim:
         tl.store(cache_k_nope_ptr + pid_loc * nope_stride + offs, src, mask=mask)
@@ -1448,6 +1479,8 @@ def _get_mla_kv_buffer_per_loc_kernel(
     loc_ptr,
     n_loc,
     buffer_stride: tl.constexpr,
+    page_stride: tl.constexpr,
+    page_size: tl.constexpr,
     nope_stride: tl.constexpr,
     rope_stride: tl.constexpr,
     nope_dim: tl.constexpr,
@@ -1465,8 +1498,9 @@ def _get_mla_kv_buffer_per_loc_kernel(
     locs = tl.load(loc_ptr + loc_indices, mask=loc_mask, other=0).to(tl.int64)
 
     nope_offs = tl.arange(0, nope_dim)
+    row_offsets = (locs // page_size) * page_stride + (locs % page_size) * buffer_stride
     src_nope = tl.load(
-        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_offs[None, :],
+        kv_buffer_ptr + row_offsets[:, None] + nope_offs[None, :],
         mask=loc_mask[:, None],
     )
     tl.store(
@@ -1477,7 +1511,7 @@ def _get_mla_kv_buffer_per_loc_kernel(
 
     rope_offs = tl.arange(0, rope_dim)
     src_rope = tl.load(
-        kv_buffer_ptr + locs[:, None] * buffer_stride + nope_dim + rope_offs[None, :],
+        kv_buffer_ptr + row_offsets[:, None] + nope_dim + rope_offs[None, :],
         mask=loc_mask[:, None],
     )
     tl.store(
@@ -1500,7 +1534,9 @@ def get_mla_kv_buffer_triton(
     """Gather split MLA keys from a latent KV cache.
 
     Args:
-        kv_buffer: Source cache with one combined latent and RoPE row per slot.
+        kv_buffer: Source cache, flat ``[slots, D]`` / ``[slots, 1, D]``
+            or paged ``[pages, P, 1, D]`` with contiguous channels. Page and
+            row strides are taken from the tensor; no cache copy is made.
         loc: Source cache slot for each output row.
         cache_k_nope: Destination for latent key rows.
         cache_k_rope: Destination for RoPE key rows.
@@ -1514,6 +1550,7 @@ def get_mla_kv_buffer_triton(
     n_loc = loc.numel()
     nope_dim = cache_k_nope.size(-1)
     rope_dim = cache_k_rope.size(-1)
+    page_size, page_stride, row_stride = _mla_cache_strides(kv_buffer)
     use_pdl = _use_pdl(enable_pdl)
     extra_kwargs = {"launch_pdl": True} if use_pdl else {}
 
@@ -1531,7 +1568,9 @@ def get_mla_kv_buffer_triton(
             cache_k_rope,
             loc,
             n_loc,
-            kv_buffer.stride(0),
+            row_stride,
+            page_stride,
+            page_size,
             cache_k_nope.stride(0),
             cache_k_rope.stride(0),
             nope_dim,
@@ -1554,7 +1593,9 @@ def get_mla_kv_buffer_triton(
             cache_k_nope,
             cache_k_rope,
             loc,
-            kv_buffer.stride(0),
+            row_stride,
+            page_stride,
+            page_size,
             cache_k_nope.stride(0),
             cache_k_rope.stride(0),
             nope_dim,
@@ -2807,8 +2848,8 @@ def _index_k_scatter_kernel(
     loc_ptr,  # int [tokens] local slot index
     write_mask_ptr,
     HAS_WRITE_MASK: tl.constexpr,
-    page_bytes,  # fp8 elements per page
-    scale_page_off,  # float32 elements per page (page_bytes // 4)
+    page_stride_bytes,
+    scale_page_stride,  # page_stride_bytes // 4
     scale_base_off,  # float32 offset of the scale region ((ps*hd)//4)
     PAGE_SIZE: tl.constexpr,
     HD: tl.constexpr,
@@ -2827,7 +2868,7 @@ def _index_k_scatter_kernel(
     if HAS_WRITE_MASK:
         owned = tl.load(write_mask_ptr + t)
     hd_mask = (d < HD) & owned
-    fp8_dst = page * page_bytes + slot * HD + d
+    fp8_dst = page * page_stride_bytes + slot * HD + d
     tl.store(
         fp8_buf_ptr + fp8_dst,
         tl.load(k_fp8_ptr + t * HD + d, mask=hd_mask),
@@ -2836,7 +2877,7 @@ def _index_k_scatter_kernel(
 
     g = tl.arange(0, BLOCK_NG)
     ng_mask = (g < NG) & owned
-    sc_dst = scale_base_off + page * scale_page_off + slot * NG + g
+    sc_dst = scale_base_off + page * scale_page_stride + slot * NG + g
     tl.store(
         scale_buf_ptr + sc_dst,
         tl.load(k_scale_ptr + t * NG + g, mask=ng_mask),
@@ -2864,7 +2905,10 @@ def index_k_block_split_scatter(
     the kernel, so callers pass raw cache locations.
 
     Args:
-        buf: uint8 ``[num_slots, head_dim + num_groups*4]`` packed buffer.
+        buf: uint8 packed buffer, contiguous ``[num_slots, row_bytes]`` or
+            paged ``[pages, page_size, row_bytes]`` / ``[pages, page_bytes]``.
+            Pages may have gaps; bytes within each page must be contiguous.
+            Each page stores all FP8 values followed by all FP32 scale rows.
         index_k_fp8: ``[tokens, head_dim]`` FP8 values.
         index_k_scale: ``[tokens, num_groups]`` float32 scales.
         loc: ``[tokens]`` non-negative int global slot indices (any integer
@@ -2889,9 +2933,23 @@ def index_k_block_split_scatter(
     ng = head_dim // group_size
     row_bytes = head_dim + ng * 4
     page_bytes = page_size * row_bytes
+    if buf.dtype != torch.uint8 or buf.stride(-1) != 1:
+        raise ValueError("Index cache must be uint8 with contiguous page bytes")
+    if buf.ndim == 3 and buf.shape[1:] == (page_size, row_bytes):
+        if buf.stride(1) != row_bytes:
+            raise ValueError("Index cache bytes within each page must be contiguous")
+        page_stride = buf.stride(0)
+    elif buf.ndim == 2 and buf.shape[1] == page_bytes:
+        page_stride = buf.stride(0)
+    elif buf.ndim == 2 and buf.shape[1] == row_bytes and buf.is_contiguous():
+        page_stride = page_bytes
+    else:
+        raise ValueError(f"Unsupported index cache layout: {tuple(buf.shape)}")
+    if page_stride % 4 or buf.storage_offset() % 4 or (page_size * head_dim) % 4:
+        raise ValueError("Index cache pages and scale region must be FP32-aligned")
 
-    fp8_buf = buf.reshape(-1)  # uint8
-    scale_buf = fp8_buf.view(torch.float32)  # aliases the same storage
+    fp8_buf = buf
+    scale_buf = buf.view(torch.float32)  # metadata-only; retains the page stride
     k_fp8 = index_k_fp8.reshape(-1, head_dim).contiguous().view(torch.uint8)
     k_scale = index_k_scale.reshape(-1, ng).contiguous()
 
@@ -2903,8 +2961,8 @@ def index_k_block_split_scatter(
         loc.reshape(-1),
         write_mask,
         write_mask is not None,
-        page_bytes,
-        page_bytes // 4,
+        page_stride,
+        page_stride // 4,
         (page_size * head_dim) // 4,
         PAGE_SIZE=page_size,
         HD=head_dim,

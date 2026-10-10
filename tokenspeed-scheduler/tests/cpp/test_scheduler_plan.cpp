@@ -583,7 +583,7 @@ TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) 
 }
 
 TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
-    SchedulerConfig cfg{};
+    SchedulerConfig cfg{.prefix_hash_lookahead_tokens = 0};
     cfg.prefix_granularity = 2;
     cfg.max_scheduled_tokens = 64;
     cfg.max_batch_size = 8;

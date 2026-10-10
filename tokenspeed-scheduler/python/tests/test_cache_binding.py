@@ -29,6 +29,7 @@ def test_removed_storage_cache_api_is_not_exported():
     assert not hasattr(ts, "PrefixCacheAdjunctSpec")
 
     config = ts.SchedulerConfig()
+    config.prefix_hash_lookahead_tokens = 0
     assert not hasattr(config, "prefix_cache_adjunct")
     assert not hasattr(config, "prefetch_threshold")
 

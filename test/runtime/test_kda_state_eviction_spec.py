@@ -254,6 +254,7 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
     actual = _KDA(width=_WIDTH, replay=replay)
     reference = _KDA(width=1, replay=False)
     config = ts.SchedulerConfig()
+    config.prefix_hash_lookahead_tokens = 0
     config.prefix_granularity = _P
     config.num_device_pages = _USABLE + 1
     config.num_host_pages = 0
