@@ -650,14 +650,17 @@ class DeviceHandle:
         """Queue a remote-prefill stream: pull its rows' KV from the peer.
 
         Slot preparation and the cache-length reset touch the execution
-        stream; the RDMA trigger is CPU-issued but writes the same device
-        pages, so it must follow them and the zeroing fence (Mooncake and
-        GPUDirect writes are not ordered by the zeroing stream, so the
-        destination pages must be published from sanitized memory). The same
-        fence covers a retraction's stream-ordered write-back reading pages
-        this admission was granted: the zero event is recorded on the forward
-        thread's stream AFTER that stream waited on the write-back's
-        completion, so waiting on it waits on the copy too. One ordered
+        stream, each behind the default stream (the store fence: the slot
+        may be a victim's this plan imaged, and its slot-state export reads
+        it on the write stream); the RDMA trigger is CPU-issued but writes
+        the same device pages, so it must follow them and the zeroing fence
+        (Mooncake and GPUDirect writes are not ordered by the zeroing
+        stream, so the destination pages must be published from sanitized
+        memory). The same fence covers a retraction's stream-ordered
+        write-back reading pages this admission was granted: the zero event
+        is recorded on the forward thread's stream AFTER that stream waited
+        on the write-back's completion, so waiting on it waits on the copy
+        too. One ordered
         unit, so one submission — asynchronous like every other: completion
         arrives through the transfer events, and a submission failure
         surfaces from the settle at the next round's execute.

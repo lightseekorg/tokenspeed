@@ -2473,8 +2473,16 @@ class ModelExecutor:
             step_counter.record_cache()
 
     def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
-        """Clear backend restore state before publishing RDMA destinations."""
+        """Clear backend restore state before publishing RDMA destinations.
+
+        A slot granted to a remote admission may be a victim's the same
+        plan retracted: the snapshot store reads the victim's slot state on
+        the write stream and fences the default stream, so this write
+        orders behind the default stream like ``_write_valid_cache_lengths``
+        does -- or it could race the export.
+        """
         slots = [int(slot) for slot in req_pool_indices]
+        self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             self.attn_backend.prepare_remote_cache_slots(slots)
 
