@@ -563,6 +563,25 @@ def v41_hc_post(
     return mhc_post(x, residual, post.unsqueeze(-1), comb, override=None, solution=None)
 
 
+def _v41_hc_post_input(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    pre: torch.Tensor,
+    norm: RMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """HC post, then the next sublayer's normed input from the new residual."""
+    if not x.is_cuda:
+        residual = v41_hc_post(x, residual, post, comb)
+        return residual, _v41_hc_input(residual, pre, norm)
+    from tokenspeed_kernel.ops.residual.triton import mhc_post_pre_layer_norm_hc4
+
+    return mhc_post_pre_layer_norm_hc4(
+        x, residual, post, comb, pre, norm.weight, norm.variance_epsilon
+    )
+
+
 def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     if not x.is_cuda:
         return _norm(v41_hc_pre(x, pre), norm)
@@ -1154,8 +1173,10 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        hidden_states = v41_hc_post(x, residual, post, comb)
-        residual = hidden_states
+        # One launch: attention HC post and the FFN's normed input.
+        residual, x = _v41_hc_post_input(
+            x, residual, post, comb, attn_pre, self.ffn_norm
+        )
         if overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
         with self.hc_stream_fork.scope(enable=overlap, overlap=True) as fork:
@@ -1172,7 +1193,6 @@ class DeepseekV41DecoderLayer(nn.Module):
             if overlap:
                 for tensor in (ffn_pre, post, comb):
                     tensor.record_stream(consumer)
-            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
             x = self._forward_ffn(x, image_mask, ctx)
         return v41_hc_post(x, residual, post, comb), ffn_pre
 
