@@ -267,9 +267,9 @@ progress: `TokenContainer::Window{begin, size, replay}` keeps `begin`/`size`
 as the tokens this chunk computes (`replay` is non-zero only on a hit's first
 chunk), and `MakePrefillInfo` derives the model input
 `[begin − replay, begin + size)`. The runtime sees the pair
-`extend_prefix_len = begin − replay` and `extend_replay_len = replay` on the
-`ForwardBatch`; positions `[extend_prefix_len, extend_prefix_len +
-extend_replay_len)` regenerate the replayable groups only and must not be
+`extend_prefix_lens[i] = begin − replay` and `extend_replay_lens[i] = replay` on the
+`ForwardBatch`; positions `[extend_prefix_lens[i], extend_prefix_lens[i] +
+extend_replay_lens[i])` regenerate the replayable groups only and must not be
 written into any other group, whose rows already sit in the shared cached
 pages the hit claimed.
 

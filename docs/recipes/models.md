@@ -35,7 +35,7 @@ ts serve \
     --moe-backend flashinfer_trtllm \
     --enable-prefix-caching \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -54,7 +54,7 @@ ts serve \
     --trust-remote-code \
     --enable-prefix-caching \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -86,7 +86,7 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -115,7 +115,7 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 9 \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -130,9 +130,9 @@ Notes:
   startup, so a mismatched launch fails fast instead of drafting a wrong-width
   block. See [Speculative Decoding](../configuration/server.md#speculative-decoding)
   for the DSpark and DFlash conventions.
-- `--block-size 128` is the target's MSA page size. The draft writes its KV at
+- `--prefix-granularity 128` matches the target's MSA cache granularity. The draft writes its KV at
   the target's cache locations and shares the target's page table, so it
-  inherits that page size; do not set a separate draft block size.
+  inherits that granularity; do not set a separate draft granularity.
 - The draft's 1024-token sliding window is an attention mask its own layers
   apply. It is deliberately not a cache-retention policy, because the draft's
   pages are the target's pages.
@@ -835,8 +835,8 @@ This backend supports at most 1024 prefill or decode tokens per rank.
 
 DeepSeek V4 uses FP8 KV cache.
 `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
-and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass
-`--block-size N` with `N != 64` to override).
+and `--tool-call-parser deepseek_v4`, and auto-sets `prefix_granularity=256`
+(pass `--prefix-granularity N` with `N != 64` to override).
 
 ### NVIDIA
 
@@ -948,10 +948,8 @@ flags above and add:
 ```
 
 With `--speculative-draft-model-path` omitted, V4 uses the same checkpoint as the
-draft source (`DeepseekV4ForCausalLMNextN`). MTP runs on the non-overlap
-scheduler — the runtime disables overlap scheduling automatically when
-speculative decoding and cache groups are both active — and prefix caching
-stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
+draft source (`DeepseekV4ForCausalLMNextN`), and prefix caching stays on by
+default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
 speculative accept rate from the run summary.
 
 ### DSpark speculative decoding with Prefix Replay

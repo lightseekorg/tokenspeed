@@ -501,7 +501,8 @@ for a compiled kernel; the number of rows is supplied by the launch grid.
 
 ### Argmax
 
-`tokenspeed_kernel.argmax` returns row-wise indices for `(M, N)` logits. AMD
+`tokenspeed_kernel.ops.sampling.argmax` returns row-wise indices for `(M, N)`
+logits. AMD
 Gluon kernels are selected automatically on gfx950 and gfx1250 when the optional
 `tokenspeed-kernel-amd` package provides both implementations. If either import
 is unavailable, the public API falls back to PyTorch.

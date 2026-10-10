@@ -190,5 +190,5 @@ missing a merged KDA configuration does not by itself disable graphs for the
 rest of the model. Capture failures and invalid metadata are reported as errors,
 not silently treated as unsupported batches.
 
-See [the execution invariants](unified_path.md#experimental-kda-prefill-subgraphs)
+See [the execution invariants](unified_path.md#recurrent-prefill-subgraphs-kda-mamba2-gdn)
 for the metadata, padding and graph-pool lifetime contracts.

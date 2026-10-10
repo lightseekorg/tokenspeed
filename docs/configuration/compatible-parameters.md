@@ -30,7 +30,7 @@ TokenSpeed-specific behavior explicitly.
 | `--chat-template` | Chat template name or path. |
 | `--gpu-memory-utilization` | GPU memory fraction used for weights and KV cache. |
 | `--max-num-seqs` | Maximum concurrent sequences. |
-| `--block-size` | KV cache block size. |
+| `--block-size` | KV cache block size (deprecated alias of `--prefix-granularity`). |
 | `--enable-prefix-caching` | Enable prefix cache reuse. |
 | `--disable-prefix-caching` | Disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |

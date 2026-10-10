@@ -1160,8 +1160,8 @@ MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
 Before allocating the arena, hybrid DCP validates these declared group shard
 counts rather than the recipe name or its inheritance. Plugin recipes follow
 the same storage contract as built-in recipes. Both pure MLA and MLA/KDA hybrids
-require the full-attention backend to declare `supports_mla_dcp`; only FlashMLA
-currently declares this capability.
+require the full-attention backend to declare `supports_mla_dcp`; FlashMLA and
+TokenSpeed MLA (CuTe MLA) both declare this capability.
 Decode gathers query heads, computes attention over owned history, and merges
 partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
@@ -1471,7 +1471,7 @@ and never touches packing. No refactor needed here.
 ### Principle 5 — Python perceives the logical quantities minimally: fixed; one conversion point, one slot invariant
 
 Compliant: the recipes/planner layer *owns* the vocabulary rather than
-leaking it; the router's `GroupTableStacks` fill (`backends/group_tables.py`)
+leaking it; the router's `GroupTableStacks` fill (`backends/paged/group_tables.py`)
 is the single expansion primitive; state attention and KV share one
 plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 
@@ -1507,12 +1507,12 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   through untouched; a table for a group the bound pool never published
   fails loudly.
 * The logical→physical conversion has ONE home per pool view:
-  `CacheGroupRouter` (`backends/router.py`) learns each group's
+  `CacheGroupRouter` (`backends/paged/router.py`) learns each group's
   `block_granularity` and each leaf's `kernel_page_size` into one
   `CacheGroupGeometry`, expands the bridge's raw block tables into
   kernel-page stacks, and derives every KV write location — extend spans,
   the decode/verify window, and the drafters' published step windows — from
-  those same tables (`backends/write_locations.py`, pure functions). Paged
+  those same tables (`backends/paged/write_locations.py`, pure functions). Paged
   leaves see kernel vocabulary only. The bridge's per-group table views
   (`CacheBatchMetadata`) are the router's input — block vocabulary in,
   kernel pages out, one expand launch per group. Models and the runner never
@@ -1526,7 +1526,7 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 * The slot *arithmetic* itself lives in the mapping layer in exactly two
   spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
   is page-size invariant): the router's stacked window/span math
-  (`backends/write_locations.py`, failing to slot 0 — the reserved dummy
+  (`backends/paged/write_locations.py`, failing to slot 0 — the reserved dummy
   page) and the token-shaped resolve
   (`attention/page_table.py::group_slot_mapping_from_raw` +
   `safe_page_ids` / `mask_invalid_graph_tokens`, failing closed to the
@@ -1604,7 +1604,7 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   layers apply: the full-history group for drafts with their own attention
   layers (`check_block_drafter_storage`), the SWA group's extra fields for
   V4.1's same-checkpoint DSpark. ✓
-* Capacity has two shapes and no more, and one place to read the scheduler's
+* Capacity has three shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte
   formulas, cache layout and group-id vocabulary sit in

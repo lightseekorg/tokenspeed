@@ -131,8 +131,9 @@ block-sparse wrapper options therefore fails explicitly.
 
 External runtime requirements are `tokenspeed-fa4`, PyTorch with CUDA, CUDA
 Python, NVIDIA CuTe/CUTLASS DSL, and the `quack` namespace provided by
-`tokenspeed-quack` through `tokenspeed-fa4`. This copy was verified with
-`tokenspeed-fa4==4.0.0.post20260510`. A Blackwell SM100/SM110 GPU is required
+`tokenspeed-quack` through `tokenspeed-fa4`. This copy tracks the in-tree
+`tokenspeed-fa4` pin in `requirements/cuda-thirdparty.txt` (currently
+`4.0.0.post20260923`). A Blackwell SM100/SM110 GPU is required
 for execution.
 
 ## Decode-specialized kernel

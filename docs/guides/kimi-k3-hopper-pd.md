@@ -28,7 +28,7 @@ Install this checkout with the standard recipe
 [getting-started guide](getting-started.md)); it rebuilds the checkout's
 kernel and scheduler packages and does not start the P, D, or SMG services.
 
-This runtime requires `tokenspeed-scheduler>=0.1.18` for the prefill role's
+This runtime requires `tokenspeed-scheduler>=0.1.27` for the prefill role's
 decode-slot reserve and the PD lifecycle counters. Rebuild the scheduler from
 this checkout when testing before the matching wheel is published.
 

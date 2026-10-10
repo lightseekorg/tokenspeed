@@ -69,7 +69,7 @@ link the same pure-Python TokenSpeed wheel. Do not configure both the CUDA and
 ROCm nightly indexes at once: kernel wheels have the same version but different
 backend dependencies. Preinstalling ROCm PyTorch matters because pip's extra
 index does not take priority over PyPI when selecting dependencies. You can
-pin `tokenspeed==0.1.0.postYYYYMMDD` once that date is present in both ROCm
+pin `tokenspeed==0.1.1.postYYYYMMDD` once that date is present in both ROCm
 nightly package indexes; avoid accidentally choosing a newer CUDA-only PyPI
 release when upgrading.
 

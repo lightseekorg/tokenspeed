@@ -43,9 +43,9 @@ root with the same Python interpreter used to launch TokenSpeed:
 source /usr/local/Ascend/cann-9.0.0/set_env.sh
 
 python -m pip install \
-    "tokenspeed-smg==1.9.0.post20260823" \
-    "tokenspeed-smg-grpc-proto==0.4.14.post20260823" \
-    "tokenspeed-smg-grpc-servicer==0.8.0.post20260823" \
+    "tokenspeed-smg==1.11.0.post20261007" \
+    "tokenspeed-smg-grpc-proto==0.4.22.post20261007" \
+    "tokenspeed-smg-grpc-servicer==0.13.0.post20261007" \
     "grpcio==1.81.1" \
     "grpcio-health-checking==1.81.1" \
     "grpcio-reflection==1.81.1" \

@@ -379,7 +379,7 @@ A new backend implements `refresh_decode_metadata` and inherits both
 `block_decode_expansion`; extend it for extra persistent state) and
 capture; a new override must name its kernel-imposed asymmetry here. Leaf
 capture/refresh signatures are pinned by
-`test_unified_decode_path.py::CaptureSignatureConformanceTest`.
+`test_unified_decode_path.py::LeafSignatureConformanceTest`.
 
 ### Graded CUDA-graph support
 
@@ -643,7 +643,7 @@ and never write a slot.
 ### PD decode nodes
 
 A PD decode-only node never runs an extend forward, so latches set on the
-extend path (`_cache_groups_bound`) stay False there. Refresh must therefore
+extend path (the pre-unification `_cache_groups_bound`) stay False there. Refresh must therefore
 bind the group tables whenever they are delivered — never gate on an
 extend-latched flag — otherwise the kernels read the null page instead of
 the transferred KV. This rule predates unification and now protects eager
@@ -1771,6 +1771,8 @@ mapping remains a separate consumer of the shared mapping helpers
   binds the runner call shape against every runner-facing node and every
   leaf). Metadata dataclasses may still hold `None` for fields a decode
   batch does not carry; the contract is about the call, not the record.
+  The one permitted match is the private `QSAIndexerBackend._metadata`
+  helper, which is not an `init_forward_metadata`.
 * `grep -rn "select_out_cache_loc\|DraftPageStaging\|tables_self_padding\|
   cache_active_pages_must_be_real\|engine_owned_group_ids" python/` must
   stay empty — write locations have one accessor (`write_locations`), and

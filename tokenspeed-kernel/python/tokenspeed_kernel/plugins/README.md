@@ -61,7 +61,8 @@ def register() -> None:
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(9, 0),
         ),
-        # Built-in FlashInfer decode is priority 18; pick 19 to win selection.
+        # Built-in FlashInfer decode is priority 12 (SPECIALIZED); pick 19
+        # (PLUGIN band) to win selection.
         priority=19,
     )
     def my_custom_attn_decode(q, kv_cache, page_table, seq_lens, **kwargs):
@@ -165,7 +166,8 @@ for info in list_plugins():
 
 - Priority is an integer in `[0, 20)`. Higher wins. The reference
   implementation lives at `0`. Built-in optimized kernels typically sit at
-  `10`–`18`. Plugin authors who want to override a built-in should choose
+  `8`–`15`; `16`–`19` is the PLUGIN band, reserved for out-of-tree plugins.
+  Plugin authors who want to override a built-in should choose
   a value strictly higher than the built-in they replace.
 - `discover_plugins()` walks entry points in alphabetical order by
   entry-point name. When two registrations land at the same priority for

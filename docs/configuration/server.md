@@ -166,7 +166,7 @@ prompts are refused too (their media positions carry content-hash ids, not
 tokens), as is a prompt whose client-supplied `input_ids` fall outside the
 vocabulary. `logprob_start_len=-1` is always accepted.
 
-Under pipeline parallelism (`--pp-size > 1`) the last stage scores the prompt
+Under pipeline parallelism (`--pipeline-parallel-size > 1`) the last stage scores the prompt
 rows and the commit path carries both logprob vectors to the other stages
 with the sampled tokens. Under query context parallelism
 (`--prefill-context-parallel-size N`) the prompt rows of a chunk live on the
@@ -353,7 +353,7 @@ are not advertised as control URLs; use a concrete address for gateway discovery
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
-| `--block-size` | KV cache block size. |
+| `--prefix-granularity` | Scheduler prefix granularity in tokens — the identity boundary of cache reuse (`--block-size` is a deprecated alias). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
@@ -622,7 +622,7 @@ they finalize layerwise; a drafter class without that guarantee is still
 rejected at startup there).
 
 A block drafter writes its KV at the target's cache locations, so it shares the
-target's page table: `--block-size` is a target-side choice and the draft
+target's page table: `--prefix-granularity` is a target-side choice and the draft
 follows it. Any sliding window the draft checkpoint declares is an attention
 mask applied by the draft's own layers, never a cache-retention policy of its
 own. Only the backends that forward that mask to their kernels can serve such a

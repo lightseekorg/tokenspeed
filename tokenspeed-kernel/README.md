@@ -100,7 +100,7 @@ tokenspeed_kernel/
   ops/
     attention/   { mha/, mla/, dsa/, ... }
     gemm/        { triton.py, trtllm.py, ... }
-    moe/         { triton.py, deepep.py, triton_kernels.py, ... }
+    moe/         { triton/, flashinfer/, marlin/, ... }
     ...
 
   numerics/              # Reference impls + tolerance + comparison + CLI
@@ -154,7 +154,7 @@ iteration.
   Each scheduler process — the process where
   kernels actually launch — runs its own Proton session and finalizes it on
   `/stop_profile`, writing
-  `<output_dir>/<profile_id>[-DP<rank>][-CP<rank>]-TP<rank>.proton.<fmt>`
+  `<output_dir>/<profile_id>[-DP<rank>]-TP<rank>.proton.<fmt>`
   per rank. `PROTON` composes only with host-side activities (`CPU`, `MEM`,
   `VIZTRACER`). To see Python activity and Proton's kernel lanes on one
   Perfetto timeline, profile with `VIZTRACER` + `PROTON`
@@ -205,7 +205,7 @@ serving take a GEMM that never compiles (cuBLAS through torch on NVIDIA).
 
 ### Plugins
 
-`python -m tokenspeed_kernel.plugins` lists discovered out-of-tree backends.
+`python -m tokenspeed_kernel.plugins list` lists discovered out-of-tree backends.
 Plugins register via the same `@register_kernel` decorator from their own
 package, set their own priority, and participate in selection like in-tree
 backends. See `tokenspeed_kernel/plugins/README.md`.
@@ -213,13 +213,10 @@ backends. See `tokenspeed_kernel/plugins/README.md`.
 ## Public API
 
 ```python
-from tokenspeed_kernel import (
-    gated_residual_mix, gated_residual_combine, grouped_gemma_rmsnorm,
-    mm,
-    moe_topk,
-    moe_route, moe_dispatch, moe_experts, moe_combine, moe_fused,
-    ...
-)
+from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.layernorm import grouped_gemma_rmsnorm
+from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights, moe_topk
+from tokenspeed_kernel.ops.residual import gated_residual_combine, gated_residual_mix
 from tokenspeed_kernel.ops.attention.gdn import gdn_chunk_prefill
 from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_with_kvcache,
