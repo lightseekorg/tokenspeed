@@ -2,9 +2,9 @@
 
 `--numerics` names, at launch level, the numerical contract a deployment
 promises. Every capability under it exists as an individual switch; the
-envelope's whole job is to keep the set coherent, because RL rollout brought
-us a class of deployment where one missing switch silently invalidates the
-training signal.
+envelope's whole job is to keep the set coherent, because RL rollout
+introduced a class of deployment where one missing switch silently
+invalidates the training signal.
 
 ## The contract
 
@@ -340,7 +340,7 @@ group takes the NVLS in-switch reduction through a fixed issuer, whose
 association order is a property of the GPU set and has been measured to
 differ between sets (`comm_backend/self_check.py`). So **QCP with head TP
 is bitwise the TP8 engine only when both engines sum `o_proj` in the same
-order** — both on the fold, i.e. the TP8 engine launched with
+order** — both on the fold — the TP8 engine launched with
 `--force-deterministic-rsag` (or pinned there by its self-check); that is
 also what makes the comparison hold across machines, which the in-switch
 order does not promise. Within the QCP engine itself the two forward forms

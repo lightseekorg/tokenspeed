@@ -2143,7 +2143,7 @@ def _iris_wait_lamport_peers(
     for _ in gl.static_range(1, WORLD_SIZE):
         values += (gl.full([64, 8], 0, gl.bfloat16, LAYOUT),)
     active = valid
-    while gl.max(active.to(gl.int32), 0) != 0:
+    while gl.any(active, 0):
         loaded = ()
         # A lane reloads every peer until all seven packs are ready. Issue the
         # independent reads before checking them; retired lanes keep their data.

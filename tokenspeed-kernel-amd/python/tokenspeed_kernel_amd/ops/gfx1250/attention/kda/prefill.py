@@ -292,11 +292,6 @@ def gluon_kda_paged_prefill_solve_merge_gfx1250(
 
 
 @gluon.jit
-def _add(a, b):
-    return a + b
-
-
-@gluon.jit
 def gluon_kda_paged_prefill_preprocess_gfx1250(
     q,
     k,
@@ -399,7 +394,7 @@ def gluon_kda_paged_prefill_preprocess_gfx1250(
     scan_mask = (scan_tokens[:, None] < length) & (scan_keys[None, :] < K)
     scan_offsets = ((begin + scan_tokens[:, None]) * H + head) * K + scan_keys[None, :]
     gate_scan = bg_smem.load(scan_layout)
-    cumulative_gate = gl.associative_scan(gate_scan, 0, _add)
+    cumulative_gate = gl.cumsum(gate_scan, 0)
     gl.store(bg + scan_offsets, cumulative_gate, mask=scan_mask)
     gated_query = q_smem.load(scan_layout).to(gl.float32)
     gated_query *= gl.exp(cumulative_gate) * SCALE

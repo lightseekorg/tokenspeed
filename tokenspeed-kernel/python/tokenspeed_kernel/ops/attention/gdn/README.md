@@ -6,7 +6,7 @@ in-memory compilation caches live in private namespaces.
 
 Decode and prefill explicitly select FlashInfer's CuTe backend. FlashInfer
 0.7.0's automatic backend selection can use Cake GDN for supported shapes,
-which would bypass the PDL-wrapped device bodies. Regression tests cover both
+which bypasses the PDL-wrapped device bodies. Regression tests cover both
 power-of-two and other head groupings and reject calls into that alternate path.
 
 FlashInfer 0.7.0 also persists CuTe-DSL kernels to disk. PDL artifacts use a

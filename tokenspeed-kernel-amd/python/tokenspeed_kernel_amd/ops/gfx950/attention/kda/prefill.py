@@ -286,11 +286,6 @@ def gluon_kda_paged_prefill_solve_merge_gfx950(
 
 
 @gluon.jit
-def _add(a, b):
-    return a + b
-
-
-@gluon.jit
 def gluon_kda_paged_prefill_preprocess_gfx950(
     q,
     k,
@@ -356,7 +351,7 @@ def gluon_kda_paged_prefill_preprocess_gfx950(
         )
         gate_value = -a * softplus
     gate_value = gl.where(mask, gate_value, 0.0)
-    cumulative_gate = gl.associative_scan(gate_value, 0, _add)
+    cumulative_gate = gl.cumsum(gate_value, 0)
     gl.store(bg + offsets, cumulative_gate, mask=mask)
     gated_query = normalized_q.to(gl.float32)
     gated_query *= gl.exp(cumulative_gate) * SCALE

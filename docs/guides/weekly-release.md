@@ -2,8 +2,8 @@
 
 The **Biweekly release** workflow starts every two weeks on Sunday at 20:00 in
 `America/Los_Angeles`, including daylight saving changes. The weekly cron checks
-the calendar-date distance from Sunday, January 2, 2000; alternate weeks finish
-successfully without publishing. It can also be started
+the calendar-date distance from Sunday, January 2, 2000. Alternate weeks finish
+successfully without publishing. You can also start it
 manually from `main`, with an optional stable TokenSpeed version. Otherwise,
 the greater of the version on `main` and the published version advances by one
 patch. A manually specified version must be greater than both. This ensures
@@ -15,11 +15,11 @@ The workflow completes these stages in order:
    versions. Wait for running jobs and retry failed jobs once. A failed second
    attempt stops the release, including retries already requested by another
    workflow. For path-filtered CI, require the push run for the latest first-parent
-   commit affecting that workflow's declared inputs. An older success is reused
-   only when those inputs are unchanged; a documentation-only head cannot hide
-   an earlier failed GPU test. Disabled workflows and package publishers are
-   excluded. Missing source runs, including commits inside a multi-commit push,
-   require manual intervention. A change to `main` stops this release.
+   commit affecting that workflow's declared inputs. Reuse an older success
+   only when those inputs are unchanged. A documentation-only head cannot hide
+   an earlier failed GPU test. Exclude disabled workflows and package
+   publishers. Missing source runs, including commits inside a multi-commit
+   push, require manual intervention. A change to `main` stops this release.
    Check that the latest stable MLA and scheduler releases contain all current
    changes in their component directories, using PyPI's published source
    provenance and Git history. Their versions on `main` and the MLA pin in the
@@ -28,7 +28,7 @@ The workflow completes these stages in order:
 2. Create a version PR for `tokenspeed-kernel-amd`, verify its exact metadata diff, merge it,
    and publish its immutable `release/<version>` source to PyPI and the wheelhouse.
 3. Update the kernel's AMD dependency and version in one PR, then publish CUDA
-   12.9/13.0 variant wheels and ROCm 7.2 wheels. CUDA 13.0 supplies PyPI; all
+   12.9/13.0 variant wheels and ROCm 7.2 wheels. CUDA 13.0 supplies PyPI. All
    variants go to the wheelhouse.
 4. Update TokenSpeed's kernel requirement and both version declarations in one
    PR. Keep the kernel's `.dev0` floor so CI retains matching in-tree builds.
@@ -41,11 +41,11 @@ The workflow completes these stages in order:
 7. Create `v<version>` at the TokenSpeed release commit with generated release
    notes, a component version table and links to PyPI, wheelhouse releases,
    stable pip indexes, Docker and the publication runs. Notes use the previous
-   stable release tag and stay below the page size limit; the full changelog
-   link is always retained.
+   stable release tag and stay below the page size limit. The notes always
+   retain the full changelog link.
 8. Verify the published sources and release page, then delete this run's three
    release branches with their expected commit leases. Tags, published assets
-   and unrelated branches remain available. Cleanup is safe to retry; a moved
+   and unrelated branches remain available. Cleanup is safe to retry. A moved
    branch stops cleanup for inspection.
 
 Configure `LIGHTSEEK_BOT_TOKEN` for the `lightseek-bot` account with repository
@@ -75,7 +75,7 @@ Any failed main CI retry, publication or wait stops downstream stages and fails 
 weekly run. The summary and `weekly-state-<stage>` artifacts retain the reserved
 versions, PRs, source commits and child run IDs. Each stage allows up to 340
 minutes for checks, approvals, queueing and publication before requiring manual
-intervention. No release page is created for an incomplete run.
+intervention. The workflow creates no release page for an incomplete run.
 
 Fix the first failed stage. If a child workflow failed, inspect and repair it,
 then rerun the appropriate child jobs before rerunning **failed jobs** in the
@@ -85,59 +85,62 @@ published PyPI version. Do not start a new weekly run to resume an interrupted
 release. An ambiguous dispatch, conflicting source, edited version PR or expired
 recovery artifact requires inspection rather than guessing a new version.
 
-If a controller fix is needed after all publications succeeded, merge the fix
+If you need a controller fix after all publications succeeded, merge the fix
 and start **Biweekly release** from `main` with **resume_run_id** set to the
 original run ID and **version** empty. This uses the corrected controller and
-runs only release notes and branch cleanup. Version planning, version PRs,
-package uploads, index publication and Docker builds are skipped. The source
-run must be completed, belong to this workflow on `main`, and have successful
-stages through Docker. Its saved state must match the original run ID, and all
-recorded publishers must still match their exact source and successful result.
-Recovery and normal releases use the same concurrency group.
+runs only release notes and branch cleanup. The resumed run skips version
+planning, version PRs, package uploads, index publication and Docker builds.
+The source run must be complete, belong to this workflow on `main`, and have
+successful stages through Docker. Its saved state must match the original run
+ID, and all recorded publishers must still match their exact source and
+successful result. Recovery and normal releases use the same concurrency
+group.
 
 **Re-run failed jobs** uses the controller from the original run's commit. Use
-that for repaired child publications; use **resume_run_id** when the controller
-itself changed. Recovery state artifacts are retained for 90 days.
+that for repaired child publications. Use **resume_run_id** when the controller
+itself changed. Recovery state artifacts remain available for 90 days.
 
 Stable pip indexes use ordinary pushes and reapply their changes on the latest
 branch after a rejected push, preserving concurrent nightly updates. Three
 rejected attempts stop the stage for manual recovery. Docker currently follows
-the existing NVIDIA release workflow; AMD kernel wheels are published in the
-ROCm index.
+the existing NVIDIA release workflow. The release publishes AMD kernel wheels
+in the ROCm index.
 
 ## Scheduler releases
 
 Run **Scheduler release pipeline** manually from `main`. Its optional `version`
-must be a stable version greater than both the scheduler source and PyPI versions;
-leave it empty to increment the greater version's patch. The three stages are:
+must be a stable version greater than both the scheduler source and PyPI
+versions. Leave it empty to increment the greater version's patch. The three
+stages are:
 
 1. Bump `tokenspeed-scheduler/pyproject.toml` through a signed metadata PR.
 2. Run the existing scheduler publisher at that exact commit on a pinned branch.
    Wait for wheel builds, GitHub release and PyPI publication. Check PyPI source
    provenance, matching distribution hashes and availability in the pip index.
 3. Update only `tokenspeed-scheduler>=<version>` in `python/pyproject.toml` through
-   a second signed metadata PR; TokenSpeed's own version remains unchanged.
+   a second signed metadata PR. TokenSpeed's own version remains unchanged.
 
 Both metadata PRs merge immediately using the same bot exemption and exact-diff
 lease as biweekly releases, without waiting for main or PR CI. Publication checks
 remain mandatory. Source changes in the scheduler before the dependency merge
-stop the pipeline; unrelated changes can be included in the dependency PR's base.
+stop the pipeline. The dependency PR's base can include unrelated changes.
 The two pipelines share a concurrency group and the existing token and publisher.
 
 If publication fails, repair its recorded child run and **re-run failed jobs** here.
 The `weekly-state-scheduler-*` artifacts retain the reserved version, PRs, pinned
-source and publisher run; a rerun never dispatches the publisher again. Until the
+source and publisher run. A rerun never dispatches the publisher again. Until the
 dependency stage succeeds, biweekly preflight can stop on the scheduler version
 mismatch. Start a new pipeline only for a new release, not to recover a partial
 one. Pinned scheduler release branches remain available for recovery. If `main`
-moves after a metadata PR's base is recorded, or the PR is edited, manual
-resolution is required; a rerun does not rebase or overwrite the recorded PR.
+moves after the pipeline records a metadata PR's base, or someone edits the
+PR, manual resolution is required. A rerun does not rebase or overwrite the
+recorded PR.
 
 ## MLA releases
 
 Run **MLA release pipeline** manually from `main`. Like the scheduler pipeline,
-its optional stable `version` must exceed both the source and PyPI versions;
-leaving it empty increments the greater version's patch. Its three stages are:
+its optional stable `version` must exceed both the source and PyPI versions.
+Leaving it empty increments the greater version's patch. Its three stages are:
 
 1. Bump `tokenspeed-mla/pyproject.toml` through a signed metadata PR.
 2. Run the existing MLA publisher at that exact merged commit on a pinned branch.
@@ -145,12 +148,12 @@ leaving it empty increments the greater version's patch. Its three stages are:
    against the build artifact, and wait for the wheel to appear in the pip index.
 3. Update only `tokenspeed-mla==<version>` in
    `tokenspeed-kernel/python/requirements/cuda-thirdparty.txt` through a second
-   signed metadata PR; kernel and runtime versions remain unchanged.
+   signed metadata PR. Kernel and runtime versions remain unchanged.
 
 Both metadata PRs merge without waiting for main or PR CI, using the same bot
 exemption and exact-diff lease as the scheduler. The pipelines share the release
 lock, token and recovery mechanism. Source changes or a changed dependency pin
 stop the MLA pipeline. Recover failures with **re-run failed jobs**, using the
-recorded child run and `weekly-state-mla-*` artifacts; do not start a new release
+recorded child run and `weekly-state-mla-*` artifacts. Do not start a new release
 to retry publication. An interrupted MLA release can block biweekly preflight
 until the dependency stage completes. Pinned release branches remain for recovery.

@@ -1,4 +1,4 @@
-# Model Recipes
+# Model recipes
 
 These recipes start from a known model family, pick the hardware topology, then
 set only the parameters that change runtime behavior.
@@ -35,7 +35,7 @@ ts serve \
     --moe-backend flashinfer_trtllm \
     --enable-prefix-caching \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -54,7 +54,7 @@ ts serve \
     --trust-remote-code \
     --enable-prefix-caching \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3 \
     --speculative-eagle-topk 1 \
@@ -64,7 +64,7 @@ ts serve \
 ## MiniMax M3
 
 MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
-attention layers automatically; select the dense backend with
+attention layers automatically. Select the dense backend with
 `--attention-backend` and run with `--disable-kvstore`.
 
 ### EAGLE3 draft
@@ -86,7 +86,7 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 4 \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -115,7 +115,7 @@ tokenspeed serve nvidia/MiniMax-M3-NVFP4 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 9 \
     --disable-kvstore \
-    --block-size 128 \
+    --prefix-granularity 128 \
     --trust-remote-code \
     --host 0.0.0.0 \
     --port 8000
@@ -126,22 +126,23 @@ Notes:
 - This checkpoint's `block_size` is 8, and a DSpark `block_size` is the drafted
   token count, so launch it with `--speculative-num-steps 8` and
   `--speculative-num-draft-tokens 9`: the verify window is one anchor row plus
-  eight draft queries. Both widths are checked against the checkpoint at
-  startup, so a mismatched launch fails fast instead of drafting a wrong-width
-  block. See [Speculative Decoding](../configuration/server.md#speculative-decoding)
+  eight draft queries. Startup checks both widths against the checkpoint, so a
+  mismatched launch fails fast instead of drafting a wrong-width block. See
+  [Speculative decoding](../configuration/server.md#speculative-decoding)
   for the DSpark and DFlash conventions.
-- `--block-size 128` is the target's MSA page size. The draft writes its KV at
+- `--prefix-granularity 128` matches the target's MSA cache granularity. The draft writes its KV at
   the target's cache locations and shares the target's page table, so it
-  inherits that page size; do not set a separate draft block size.
+  inherits that granularity. Do not set a separate draft granularity.
 - The draft's 1024-token sliding window is an attention mask its own layers
   apply. It is deliberately not a cache-retention policy, because the draft's
   pages are the target's pages.
-- Target features are captured from the residual stream after each layer in
-  `dflash_config.target_layer_ids` (`[1, 12, 23, 35, 46, 57]` of M3's 60
-  layers) and concatenated in ascending layer order to feed the draft's `fc`.
-- The draft checkpoint stores fp32 master weights. It is loaded in the target's
-  dtype rather than the standalone fp32-to-fp16 default, because the two
-  exchange hidden states and share the target's embedding and LM head.
+- The target model captures features from the residual stream after each
+  layer in `dflash_config.target_layer_ids` (`[1, 12, 23, 35, 46, 57]` of M3's
+  60 layers); the draft concatenates them in ascending layer order to feed its
+  `fc`.
+- The draft checkpoint stores fp32 master weights. TokenSpeed loads it in the
+  target's dtype rather than the standalone fp32-to-fp16 default, because the
+  two exchange hidden states and share the target's embedding and LM head.
 - Measured on 4x GB300 with the launch above: gsm8k `mean_acc` 0.9719 versus
   0.9704 without speculative decoding (paired disagreement 10 vs 8, McNemar
   p ~ 0.81 -- within run-to-run noise), so the draft does not move accuracy.
@@ -202,11 +203,12 @@ tokenspeed serve nvidia/Kimi-K2.6-NVFP4 \
 
 
 Official DFlash2 checkpoints that declare `DFlash2DraftModel` use the same
-`--speculative-algorithm DFLASH` launch. Their grouped dynamic convolutions and
-candidate selector are enabled automatically from the draft architecture. On
-GPU each convolution runs as a single fused Triton kernel; the torch node graph
-stays as the CPU reference. An MLA DFlash2 draft also writes its context KV
-through one stacked projection plus one fused norm/RoPE/scatter launch, which
+`--speculative-algorithm DFLASH` launch. TokenSpeed enables their grouped
+dynamic convolutions and candidate selector automatically from the draft
+architecture. On GPU each convolution runs as a single fused Triton kernel.
+The torch node graph stays as the CPU reference. An MLA DFlash2 draft also
+writes its context KV through one stacked projection plus one fused
+norm/RoPE/scatter launch, which
 lets that write overlap the draft forward and accumulate as the target
 produces each captured layer. The server logs at INFO which of those paths it
 took, and why when it declined one.
@@ -214,9 +216,9 @@ Draft proposals greedily follow the selector's transition-conditioned path.
 Candidate selection takes each vocabulary shard's local top-k and gathers only
 those, instead of gathering whole logits rows, whenever the head's shards carry
 no padding or added tokens.
-A request's `temperature`, `top_k` and `top_p` are applied by the target's
-verification step, never by the proposal, so the served distribution is the
-target's whatever the drafter proposed.
+The target's verification step applies a request's `temperature`, `top_k` and
+`top_p`, never the proposal, so the served distribution is the target's
+whatever the drafter proposed.
 
 ## Kimi K3
 
@@ -246,12 +248,12 @@ Notes:
   the existing backend selection. This shared option applies across models
   to standard 128x128 block-FP8 dense linears. BF16/NVFP4 linears, MXFP8,
   per-tensor FP8, specialized grouped projections, and routed experts are
-  unchanged; it does not change tensor-parallel mapping.
+  unchanged. It does not change tensor-parallel mapping.
 - This backend preserves checkpoint FP8 values and their FP32 128x128 block
-  scales; it does not requantize weights or convert scales to E8M0.
+  scales. It does not requantize weights or convert scales to E8M0.
   Activations use the existing 1x128 FP8 quantization path. The kernel uses
-  FP32 accumulation and BF16 output. Validate model accuracy on your workload;
-  preserving the quantization contract does not guarantee bitwise equality
+  FP32 accumulation and BF16 output. Validate model accuracy on your workload.
+  Preserving the quantization contract does not guarantee bitwise equality
   across GEMM implementations.
 - It requires Blackwell, CuTe-DSL with TVM-FFI support, BF16 outputs, and aligned
   local weight dimensions. Kernel variants compile during preparation before
@@ -266,9 +268,9 @@ Notes:
   or `mla` with `--kv-cache-dtype bfloat16`. AMD uses the `mla` backend.
 - `tokenspeed serve` auto-selects the `kimi_k3` reasoning and tool-call
   parsers. Explicit parser flags override these defaults.
-- The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly;
-  a flattened local checkpoint and separately staged remote-code cache are no
-  longer required.
+- The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly.
+  You no longer need a flattened local checkpoint and a separately staged
+  remote-code cache.
 - The checkpoint carries no FP8 KV scaling factors. When the target K3 uses an
   FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
   BF16 so context injection and draft attention match the reference precision.
@@ -286,33 +288,34 @@ Notes:
   to the portable Triton kernel anywhere its shape gate does not hold. The
   draft's full-attention layer is unaffected either way.
 - For Kimi K3, an eight-token verify window uses seven DSpark draft queries.
-  The anchor query directly predicts the first draft through the Markov head;
-  it must not be padded with an eighth, unused mask row.
-- Target features are captured from K3's completed-layer prefix stream before
-  the model-level AttnRes mix and final norm, matching the DSpark checkpoint's
-  vLLM training and inference contract. A draft trained instead against the
-  pre-norm AttnRes mixture declares `"aux_hidden_stream": "attn_res"` in its
-  config and is served that stream. Feeding a draft the other stream raises nothing
-  and shows up only as a lower acceptance rate, so the choice is logged next to
-  the tap ids at startup.
+  The anchor query directly predicts the first draft through the Markov head.
+  Do not pad it with an eighth, unused mask row.
+- The target model captures features from K3's completed-layer prefix stream
+  before the model-level AttnRes mix and final norm, matching the DSpark
+  checkpoint's vLLM training and inference contract. A draft trained instead
+  against the pre-norm AttnRes mixture declares
+  `"aux_hidden_stream": "attn_res"` in its config, and TokenSpeed serves it
+  that stream. Feeding a draft the other stream raises nothing and shows up
+  only as a lower acceptance rate, so the server logs the choice next to the
+  tap ids at startup.
 - A draft whose config sets `"fc_norm": true` normalizes each target tap on its
-  own before the taps are concatenated and projected, and ships one
+  own before it concatenates and projects the taps, and ships one
   `fc_norm.N.weight` per tap. Declaring it without the weights (or shipping the
   weights without declaring it) fails the load rather than serving an
   identity-weight norm.
-- Under tensor parallelism, the draft's final row-parallel MLP output is reduced
-  across TP ranks before `final_norm` and shared target-head sampling.
+- Under tensor parallelism, the TP ranks reduce the draft's final row-parallel
+  MLP output before `final_norm` and shared target-head sampling.
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,
   use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
   on a different whole image.
 - The pinned SMG frontend registers Kimi-K3's chat renderer and multimodal
   processor. Preserve the checkpoint's
-  `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
+  `media_proc_cfg.in_patch_limit=65536`. Silently falling back to K2.5's
   16384-patch default reduces OCR resolution.
 - KDA recurrent-state pages register for prefix-cache reuse only when a
   prefill chunk ends exactly on a logical cache-page boundary. The engine floors
   `--chunked-prefill-size` to the plan's page grain automatically (logged as
-  a warning when it adjusts); the page grain is budget-dependent (e.g. 1472
+  a warning when it adjusts). The page grain is budget-dependent (such as 1472
   at 32k context, 1536 at 1M), so do not hand-tune the chunk size against a
   hard-coded page value. Prefix hits are page-granular.
 
@@ -337,7 +340,7 @@ tokenspeed serve moonshotai/Kimi-K3 \
 ```
 
 Plain TP8 (drop `--ep-size 8`) works too. The fused MoE path needs a
-Blackwell GPU (B200/B300); on other NVIDIA platforms use
+Blackwell GPU (B200/B300). On other NVIDIA platforms, use
 `--moe-backend triton`.
 
 ### AMD
@@ -401,11 +404,12 @@ TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
 
 GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
 cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
-`zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`;
-pass an explicit parser flag to override it. GLM5 DSA prefill planning reuses the
-host-side request lengths and the packed page/row plan across full-indexer layers;
-keep the scheduler-provided CPU length mirrors populated when integrating a custom
-attention backend to avoid device synchronization in this path.
+`zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`.
+Pass an explicit parser flag to override it. GLM5 DSA prefill planning reuses
+the host-side request lengths and the packed page/row plan across full-indexer
+layers. When integrating a custom attention backend, keep the
+scheduler-provided CPU length mirrors populated to avoid device
+synchronization in this path.
 
 ```bash
 tokenspeed serve zai-org/GLM-5.2-FP8 \
@@ -484,8 +488,8 @@ For Qwen3 30B-A3B, the Hugging Face config advertises `qwen3_moe` and
 
 The Ascend path supports unquantized Qwen3-0.6B on one or more NPUs. It uses
 the normal TokenSpeed scheduler and paged KV cache: prefill runs eagerly, while
-fixed-shape decode batches are captured as ACL Graphs. Aggregate serving can
-schedule prefill and decode work in the same deployment.
+the runtime captures fixed-shape decode batches as ACL Graphs. Aggregate
+serving can schedule prefill and decode work in the same deployment.
 
 The validated environment is CANN 9.0.0, PyTorch 2.9.0, `torch_npu`
 2.9.0.post2, Transformers 5.12.0, Triton 3.2.0, and Triton-Ascend 3.2.1.
@@ -539,17 +543,18 @@ graph flags retain their CUDA-oriented names for CLI compatibility, they control
 ACL Graph capture on an NPU. The command above captures decode batches 1, 2,
 and 4 and was validated with a 16,384-token KV pool. Increase
 `--max-model-len`, `--max-num-seqs`, `--max-total-tokens`, and the capture sizes
-together when scaling the deployment. `--disable-autotune` shortens bring-up;
-remove it after validation when startup tuning is desired.
+together when scaling the deployment. `--disable-autotune` shortens bring-up.
+Remove it after validation when you want startup tuning.
 
-The current Ascend sampling path is validated with greedy decoding. Because
-`--sampling-backend greedy` always performs argmax, send `temperature=0` and do
-not expect request-level `top_p` or `top_k` to take effect.
+The current Ascend sampling path is validated with greedy decoding.
+Because `--sampling-backend greedy` always performs argmax, send
+`temperature=0` and do not expect request-level `top_p` or `top_k` to take
+effect.
 
-Multi-card deployments use tensor parallelism; the world size must satisfy the
-model's standard divisibility constraints. Context, pipeline, and data parallel
-sizes must remain 1. Set `--world-size N` and expose `N` NPUs, for example
-`ASCEND_RT_VISIBLE_DEVICES=0,1` with `--world-size 2`.
+Multi-card deployments use tensor parallelism. The world size must satisfy
+the model's standard divisibility constraints. Context, pipeline, and data
+parallel sizes must remain 1. Set `--world-size N` and expose `N` NPUs, for
+example `ASCEND_RT_VISIBLE_DEVICES=0,1` with `--world-size 2`.
 
 Verify the OpenAI-compatible endpoint with the served model name rather than
 the checkpoint path:
@@ -587,9 +592,9 @@ pattern with Qwen3.5.
 
 Qwen3.8-max needs 16 GPUs, so it runs on two 8-GPU nodes. Launch
 `tokenspeed serve` on every node with the same command, changing only
-`--node-rank`; every node points `--dist-init-addr` at node 0, which is the only
-rank that serves the HTTP API. See [Parallelism](../serving/parallelism.md) for
-the multi-node rules.
+`--node-rank`. Every node points `--dist-init-addr` at node 0, which is the
+only rank that serves the HTTP API. See [Parallelism](../serving/parallelism.md)
+for the multi-node rules.
 
 This family has no parser auto-selection, so set `--reasoning-parser` and
 `--tool-call-parser` explicitly. `--speculative-algorithm MTP` without
@@ -683,10 +688,11 @@ tokenspeed serve Qwen/Qwen3.8-2.4T-A95B \
 
 Notes:
 - `--low-latency-max-num-tokens-per-gpu` sizes DeepEP's NVSHMEM heap (roughly
-  2.0 GB at 64, 8.1 GB at 256), and that heap is claimed after the KV pool is
-  profiled. An oversized value therefore fails late, when the first dispatch
-  runs out of fabric memory. Size it to the real per-rank decode token bound
-  and no lower: a batch above the capacity is rejected, not truncated.
+  2.0 GB at 64, 8.1 GB at 256), and startup claims that heap after profiling
+  the KV pool. An oversized value therefore fails late, when the first
+  dispatch runs out of fabric memory. Size it to the real per-rank decode
+  token bound and no lower: the runtime rejects a batch above the capacity
+  rather than truncating it.
 - Internode DeepEP rides NVSHMEM IBGDA. On a RoCE fabric, mirror the NCCL
   values into `NVSHMEM_IB_GID_INDEX`, `NVSHMEM_IB_TRAFFIC_CLASS`, and
   `NVSHMEM_IB_SL`, and point `NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME` at the same
@@ -747,8 +753,8 @@ use the FlashInfer FA2 fallback.
 The decoder passes ordinary sublayer-output tensors and residual tuples between
 layers. At adjacent HC boundaries, it explicitly calls the consuming mixer's
 `combine_norm()` to fuse residual injection with that mixer's grouped RMSNorm.
-PLE, deepstack updates and row-gather boundaries combine the residual first;
-the updated, unnormalized HC state remains available for MTP.
+PLE, deepstack updates and row-gather boundaries combine the residual first.
+The updated, unnormalized HC state remains available for MTP.
 
 ```bash
 ts serve \
@@ -775,8 +781,8 @@ object:
   FP8 to save memory. Omit it to store the table in the model's compute
   dtype.
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
-  or GPU memory when `false`. When omitted, offloading is enabled on NVIDIA CUDA
-  and disabled on other platforms.
+  or GPU memory when `false`. When omitted, TokenSpeed enables offloading on
+  NVIDIA CUDA and disables it on other platforms.
 - `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
@@ -835,8 +841,8 @@ This backend supports at most 1024 prefill or decode tokens per rank.
 
 DeepSeek V4 uses FP8 KV cache.
 `tokenspeed serve` auto-selects `--reasoning-parser deepseek_v31`
-and `--tool-call-parser deepseek_v4`, and auto-sets `block_size=256` (pass
-`--block-size N` with `N != 64` to override).
+and `--tool-call-parser deepseek_v4`, and auto-sets `prefix_granularity=256`
+(pass `--prefix-granularity N` with `N != 64` to override).
 
 ### NVIDIA
 
@@ -890,7 +896,7 @@ For the expert-parallel topology, swap `--tensor-parallel-size 8` for
 On eight gfx950 GPUs, DeepSeek V4 with serialized MXFP4 weights can use the
 topology and backend flags in the [Gluon Petit recipe](#gluon-petit-megamoe-on-amd-cdna4),
 alongside the V4 KV cache and indexer options. Petit ignores checkpoint
-activation clamps, which may affect accuracy; select it explicitly with
+activation clamps, which may affect accuracy. Select it explicitly with
 `--moe-backend gluon_petit`.
 
 **V4-Flash** — 2× MI350-series (gfx950), tensor-parallel + MTP:
@@ -935,7 +941,7 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --port 8000
 ```
 
-MTP is not yet validated on MI450.
+TokenSpeed has not yet validated MTP on MI450.
 
 ### MTP speculative decoding
 
@@ -948,10 +954,8 @@ flags above and add:
 ```
 
 With `--speculative-draft-model-path` omitted, V4 uses the same checkpoint as the
-draft source (`DeepseekV4ForCausalLMNextN`). MTP runs on the non-overlap
-scheduler — the runtime disables overlap scheduling automatically when
-speculative decoding and cache groups are both active — and prefix caching
-stays on by default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
+draft source (`DeepseekV4ForCausalLMNextN`), and prefix caching stays on by
+default. Add `--enable-metrics` to read `Decoded Tok/Iter` and the
 speculative accept rate from the run summary.
 
 ### DSpark speculative decoding with Prefix Replay
@@ -986,7 +990,7 @@ tokenspeed serve deepseek-ai/DeepSeek-V4-Flash \
   --port 8000
 ```
 
-The replay window comes from the checkpoint's DSpark configuration; there is
+The replay window comes from the checkpoint's DSpark configuration. There is
 no user-tuned replay-length flag. Startup fails closed when same-checkpoint
 DSpark weights are incomplete, the replay capability is missing, KVStore is
 enabled, or the draft checkpoint contains only MTP/NextN weights. External
@@ -996,16 +1000,17 @@ scheduler behavior.
 Same-checkpoint DSpark computes its public FP32 base logits straight from the
 target's BF16 LM-head shard: BF16 products are exact in FP32, so a BF16 GEMM
 with an FP32 accumulator reproduces the reference's FP32 head math up to
-summation order without an FP32 copy of the shard. The head is read in place
-under CUDA Graph replay, so in-place target weight updates need no refresh.
+summation order without an FP32 copy of the shard. The draft path reads the
+head in place under CUDA Graph replay, so in-place target weight updates need
+no refresh.
 
 The greedy block sampler runs one Triton kernel per block step on each
 tensor-parallel rank: it gathers the previous token's BF16 Markov bigram row
 from a replicated table, adds the bigram bias (a BF16 tensor-core dot against
-the rank's Markov projection shard, which is sharded like the LM head) to the
+the rank's Markov projection shard, sharded like the LM head) to the
 rank's base logits, and packs the best `(logit, token)` of every vocabulary
-tile into one int64 candidate. One all-gather per step shares the candidates;
-the next step's kernel (or the final resolve) reduces them to the
+tile into one int64 candidate. One all-gather per step shares the candidates.
+The next step's kernel (or the final resolve) reduces them to the
 `torch.argmax` winner over the whole vocabulary, ties broken toward the lowest
 token id. A five-token block is therefore six kernels and five all-gathers
 instead of a per-step chain of masked embedding lookups, GEMMs, reductions and
@@ -1017,13 +1022,13 @@ pinned upload carries every request's history snapshot, and two launches
 input row's previous-three tokens and validity mask, blanking the graph
 padding rows. Inside the forward, `engram_hash` maps the current token and its
 three predecessors, applies the per-layer multipliers, rolling XOR and prime
-buckets, and emits the table rows for all Engram layers in one launch; its
+buckets, and emits the table rows for all Engram layers in one launch. Its
 output is bit-identical to the eager reference, which remains the CPU path.
 
 The CUDA draft path also preserves the checkpoint's UE8M0-scaled FP8 activation
 round-trip with a fused `tokenspeed-kernel` operation. It computes the same
-per-group power-of-two scale and returns dequantized values in the input dtype;
-the fusion removes intermediate reduction and elementwise launches but does not
+per-group power-of-two scale and returns dequantized values in the input dtype.
+The fusion removes intermediate reduction and elementwise launches but does not
 change the model's quantization contract.
 
 DSpark attention RMSNorm uses the platform kernel on CUDA while retaining its
@@ -1032,7 +1037,7 @@ path preserves the existing output dtype and is safe to capture and replay in
 the target CUDA Graph.
 
 For a two-node TP8 deployment, run one process per node with four local workers
-and the same command on both nodes. See [Multi-Node](../serving/parallelism.md#multi-node)
+and the same command on both nodes. See [Multi-node](../serving/parallelism.md#multi-node)
 for explicit topology flags and launcher-derived settings. Before applying
 production load, confirm that every rank reports a nonzero Prefix Replay window,
 then check completion, speculative acceptance, and cache-hit metrics with fixed
@@ -1040,24 +1045,25 @@ prompts and package/model revisions.
 
 ## DeepSeek V4.1-Flash
 
-DeepSeek V4.1 (`deepseek_v41`) is served by its own FlatKV attention backend
+DeepSeek V4.1 (`deepseek_v41`) runs on its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows and the
 compressor tails. The recipe declares the last two **replayable**: they
 never enter the prefix cache, and a prefix
 hit re-feeds the cached prefix's last 128 tokens so the model regenerates
 them into the request's own pages (SWA bounded replay,
 [`docs/design/scheduler.md` §1.3](../design/scheduler.md#13-bounded-replay)).
-The global KV and index rows those replayed tokens recompute are masked, so
-the shared rows stay exactly what the first computation produced. The CED
-decoder (layers 20–39) runs only on each prompt's last 128 positions
-(one row per chunk that does not complete its prompt), so the prefill row
+The backend masks the global KV and index rows those replayed tokens
+recompute, so the shared rows stay exactly what the first computation
+produced. The CED decoder (layers 20–39) runs only on each prompt's
+last 128 positions (one row per chunk that does not complete its
+prompt), so the prefill row
 count changes at layer 20. The prefill CUDA graph therefore captures the
 model in two halves around that layer, which runs eager: encoder graphs per
 token bucket and decoder graphs per decoder-row bucket, the latter shared by
 every token bucket and capped at 128 rows per request
 (`--max-num-seqs` × 128, see
 [`docs/design/unified_path.md`](../design/unified_path.md#prefill-graphs-around-a-row-narrowing)).
-`--prefill-graph-capture-sizes` sets both ladders; `--disable-prefill-graph`
+`--prefill-graph-capture-sizes` sets both ladders. `--disable-prefill-graph`
 turns both off. Decode CUDA graphs are unaffected.
 
 ```bash
@@ -1080,7 +1086,7 @@ tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
 On Hopper the routed MXFP4 experts run on FlashInfer's CUTLASS mixed-input
 grouped GEMM (`flashinfer_cutlass_mxfp4_w4a16_moe_apply`), which `auto`
 selects over Marlin. Marlin dequantizes in registers and scales linearly with
-the token count; the CUTLASS kernel stays weight-bandwidth bound. Measured per
+the token count. The CUTLASS kernel stays weight-bandwidth bound. Measured per
 MoE layer on one EP8 rank of an H20 (µs, CUDA-graph replay): 502 vs 656 at 96
 tokens, 621 vs 1552 at 192, 671 vs 2855 at 576, 4517 vs 7999 at an 8192-token
 prefill chunk. Two consequences:
@@ -1088,14 +1094,14 @@ prefill chunk. Two consequences:
 - Startup runs FlashInfer's tactic autotuner inside the kernel tuning window
   (about five minutes for this kernel on H20), including each distinct draft
   expert geometry. Decode-capable roles also traverse the shared speculative
-  path once to discover the draft model's other operators; prefill-only roles
+  path once to discover the draft model's other operators. Prefill-only roles
   skip that traversal because they do not allocate decode/verify scratch.
   `--disable-autotune` loads a matching persistent cache and uses heuristic
   tactics for uncovered shapes, which is fine for bring-up. Pipeline-parallel
   launches skip tuning but can reuse a cache from a full-model run with the
   same engine role, tensor/expert parallel layout and environment. Independent
-  prefill and decode roles keep separate caches. Cache directories are
-  created on the first successful save.
+  prefill and decode roles keep separate caches. The tuner creates cache
+  directories on the first successful save.
 - `--moe-mxfp4-fp8-activation` switches to the W4A8 variant (FP8 activations,
   Humming residual scales): 282/338/380/2195 µs at the same token counts,
   another 1.8x, at a few percent of relative error on the expert outputs
@@ -1106,23 +1112,23 @@ prefill chunk. Two consequences:
 DeepEP all-to-all layouts and for Kimi-K3's SiTU experts, which the CUTLASS
 epilogue does not implement.
 
-Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding;
-the draft seeds its context windows from the decoder's kept rows, and each
+Add `--speculative-algorithm DSPARK` for same-checkpoint DSpark decoding.
+The draft seeds its context windows from the decoder's kept rows, and each
 draft stage attends its 128-row window plus the non-causal proposal block
 through the same `selected_attention` workspace kernel as the target's
-prefill (FlashMLA on sm90+, Triton elsewhere); the fp32 arithmetic remains
+prefill (FlashMLA on sm90+, Triton elsewhere). The fp32 arithmetic remains
 the CPU reference. A hit
 re-feeds the groups' whole retention window, which is exactly the 128-token
 attention window (the compressor-tail group retains its unfinished pair the
-same way); the scheduler requires
+same way). The scheduler requires
 `--chunked-prefill-size` of at least that window plus one prefix page and
 never leaves a prompt's final chunk shorter than it. The replayed rows attend
 SWA keys from the replay start only, the truncation the model is trained
-for; the cached global KV is never recomputed from them.
+for. The runtime never recomputes the cached global KV from them.
 `usage.prompt_tokens_details.cached_tokens` reports the hit through the end
 of the replayed window, so it stays a multiple of the prefix granularity.
 Under prefill/decode disaggregation the prefill node replays on its own
-prefix hits exactly as above and ships each group's retained tail; the
+prefix hits exactly as above and ships each group's retained tail. The
 decode node lands the tail and never re-feeds. Even on one machine, let
 Mooncake pick an RDMA transport rather than forcing the intra-node NVLink one.
 
@@ -1134,9 +1140,9 @@ Node 0 also hosts the SMG gateway and the Slurm evaluation client, which
 connects to `127.0.0.1:8000`. Both engines use same-checkpoint DSpark,
 `mega_moe` with expert parallelism on Blackwell, host-resident Engram tables,
 and Mooncake transfer after the completed prompt (`layerwise-interval=0`).
-Decode prefix caching is disabled; the gateway uses `deepseek_v31` reasoning
-parsing. The 262144-token cache budget limits admission independently of the
-32768-token per-request context and 16-sequence cap.
+The YAML disables decode prefix caching. The gateway uses `deepseek_v31`
+reasoning parsing. The 262144-token cache budget limits admission
+independently of the 32768-token per-request context and 16-sequence cap.
 
 The gate checks GSM8K accuracy of at least 0.90 on 100 samples with EvalScope
 1.11.1, greedy decoding, concurrency 8, and up to 30000 generated tokens.
@@ -1145,13 +1151,15 @@ select its YAML in **Slurm Dispatch**, choose cluster `gb300`, and optionally
 provide a pull request number.
 
 The launcher uses `PD_SLURM=1` to assign one role per node and clears Slurm
-topology discovery only inside each worker process. Its job-and-step-scoped
-artifact directory must be shared between nodes. It publishes role readiness
-atomically and verifies cross-node gRPC health before starting the gateway.
+topology discovery only inside each worker process. Share the launcher's
+job-and-step-scoped artifact directory between nodes. It publishes role
+readiness atomically and verifies cross-node gRPC health before starting the
+gateway.
 Worker logs remain separate as `prefill.log`, `decode.log`, and `lb.log`.
-Set `DISAGGREGATION_IB_DEVICE` when an explicit RDMA device selection is needed;
-the GB300 task selects `mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the
-InfiniBand fabric. Automatic discovery also includes Ethernet RNICs, which can
+When you need an explicit RDMA device selection, set
+`DISAGGREGATION_IB_DEVICE`. The GB300 task selects
+`mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the InfiniBand fabric.
+Automatic discovery also includes Ethernet RNICs, which can
 cause incompatible RoCE/InfiniBand endpoint pairings during the RDMA handshake.
 Without `PD_SLURM=1`, the same launcher retains the single-node smoke topology.
 
@@ -1196,7 +1204,7 @@ tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
   --speculative-num-draft-tokens 4
 ```
 
-## Tuning Order
+## Tuning order
 
 1. Set model ID, trust policy, tokenizer mode, and served model name.
 2. Set context length and KV cache dtype.

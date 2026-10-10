@@ -27,23 +27,23 @@ features:
     details: Parallelism and configuration guidance stay close to the serving paths operators actually use.
 ---
 
-## Start Here
+## Start here
 
-- [Getting Started](./guides/getting-started.md)
-- [Launching a Server](./guides/launching.md)
+- [Getting started](./guides/getting-started.md)
+- [Launching a server](./guides/launching.md)
 - [Model Recipes](./recipes/models.md)
 - [Server Parameters](./configuration/server.md)
 - [Compatible Parameters](./configuration/compatible-parameters.md)
 - [Parallelism](./serving/parallelism.md)
 
-## Common Workflow
+## Common workflow
 
 1. Install the runtime and kernel packages.
 2. Pick a launch recipe close to your model family and hardware.
 3. Set model loading, memory, scheduler, and parallelism parameters explicitly.
 4. Validate correctness and throughput together before changing more than one tuning dimension.
 
-## Minimal Server
+## Minimal server
 
 ```bash
 tokenspeed serve openai/gpt-oss-20b \
@@ -54,7 +54,7 @@ tokenspeed serve openai/gpt-oss-20b \
 
 The server exposes an OpenAI-compatible API under `/v1`.
 
-## High-Performance Shape
+## High-performance shape
 
 Large MoE deployments usually make the same decisions:
 
@@ -68,4 +68,4 @@ Large MoE deployments usually make the same decisions:
 See [Model Recipes](./recipes/models.md) for concrete examples and
 [Server Parameters](./configuration/server.md) for the parameter reference.
 
-See [Biweekly Releases](./guides/weekly-release.md) for the release sequence and recovery.
+See [Biweekly releases](./guides/weekly-release.md) for the release sequence and recovery.

@@ -26,11 +26,6 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 
-@gluon.jit
-def _add(a, b):
-    return a + b
-
-
 @gluon.jit(do_not_specialize=("SIZE",))
 def _clear_mesh(mesh, SIZE):
     x = gl.arange(0, 4096, layout=gl.BlockedLayout([4], [64], [16], [0]))
@@ -170,7 +165,7 @@ def _scatter_mesh(
         expert = gl.arange(0, E_PAD, layout=layout)
         count = gl.load(counts + expert, mask=expert < E, other=0)
         padded = gl.cdiv(count, BM) * BM
-        prefix = gl.associative_scan(padded, 0, _add)
+        prefix = gl.cumsum(padded, 0)
         start_slot = gl.sum(gl.where(expert == pid, prefix - padded, 0), 0)
         total = gl.sum(padded, 0)
         own_count = gl.sum(gl.where(expert == pid, count, 0), 0)
@@ -191,7 +186,7 @@ def _scatter_mesh(
                     other=0,
                 )
                 routes = gl.extra.libdevice.popc(bits.to(gl.int32))
-                ranks = gl.associative_scan(routes, 0, _add) - routes
+                ranks = gl.cumsum(routes, 0) - routes
                 for repeat in range(gl.max(routes, 0)):
                     bit = gl.inline_asm_elementwise(
                         "v_ffbl_b32 $0, $1",

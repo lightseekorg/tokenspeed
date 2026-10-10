@@ -7,7 +7,7 @@ The instrumentation adds no device synchronization or distributed collectives.
 Each span emits `start` and `end` records with a PID, caller-supplied rank and
 role, span ID, parent ID, and wall-clock timestamp (`wall_time_ns`). An end
 record includes inclusive host wall time (`duration_s`) and success/error
-status. Errors propagate unchanged. IDs are local to a process; group records
+status. Errors propagate unchanged. IDs are local to a process. Group records
 by host and PID before matching spans. Cross-host timestamps require clock
 synchronization. Nested spans overlap: do not sum them to calculate startup.
 Host timing includes existing waits but does not wait for newly enqueued GPU
@@ -35,19 +35,20 @@ The scheduler records these phases:
 
 Detailed weight phases currently cover the default loader. Other loaders still
 have the enclosing target/draft span. `weights.read_copy` includes any lazy
-checkpoint resolution and model-specific transforms performed by `load_weights`;
-it does not isolate disk I/O from H2D. Optional phases may be near-zero no-ops.
-These spans do not cover launcher imports, process spawning, frontend tokenizer
-initialization, the encode-only loop, the final DP barrier, or HTTP readiness.
+checkpoint resolution and model-specific transforms that `load_weights`
+performs. It does not isolate disk I/O from H2D. Optional phases may be
+near-zero no-ops. These spans do not cover launcher imports, process
+spawning, frontend tokenizer initialization, the encode-only loop, the
+final DP barrier, or HTTP readiness.
 Measure process launch to readiness and to the first successful generation
-separately; `scheduler.init` is not an end-to-end server startup metric.
+separately. `scheduler.init` is not an end-to-end server startup metric.
 
 With the existing Triton compile monitor enabled, end records also contain
 `triton_compiles` and `triton_compile_s`: changes in its startup counters over
 the span. A disabled monitor produces `null`, not zero. These are process-wide,
 inclusive observations, not a cache-hit ratio or total backend compilation time.
-In particular, zero Triton compilations does not establish that a FlashInfer,
-CuTeDSL or DeepGEMM cache was hit. Keep the serving JIT checks enabled.
+In particular, zero Triton compilations does not establish a FlashInfer,
+CuTeDSL or DeepGEMM cache hit. Keep the serving JIT checks enabled.
 
 For an initial audit, hold source, model revision, image, hardware, parallelism
 and serving parameters fixed. Compare compile-cache-cold and compile-cache-warm

@@ -6,9 +6,9 @@ TokenSpeed-Kernel-AMD is a standalone collection of performance-oriented AMD GPU
 - MoE: BF16, MXFP4 weights
 - GEMM
 
-## Performance Numbers
+## Performance numbers
 
-The following measurements use GPT-OSS 120B workloads on one AMD Instinct MI355X GPU. They were collected at TokenSpeed commit [`1492030`](https://github.com/lightseekorg/tokenspeed/commit/1492030a2a02d32bc7011645a74d2d691e99c2e6), with AITER 0.1.13 and ROCm 7.2.1. See the [TokenSpeed-Kernel PyTorch blog](https://pytorch.org/blog/lightseek-tokenspeed-kernel/) for the complete methodology and analysis.
+These measurements use GPT-OSS 120B workloads on one AMD Instinct MI355X GPU. They come from TokenSpeed commit [`1492030`](https://github.com/lightseekorg/tokenspeed/commit/1492030a2a02d32bc7011645a74d2d691e99c2e6), with AITER 0.1.13 and ROCm 7.2.1. See the [TokenSpeed-Kernel PyTorch blog](https://pytorch.org/blog/lightseek-tokenspeed-kernel/) for the complete methodology and analysis.
 
 ### Attention
 
@@ -22,9 +22,9 @@ The benchmark uses BF16 Q/K/V, head dimension 64, 64 query heads, 8 KV heads, fu
 
 This benchmark measures full-MoE latency, including routing, both GEMMs, clamped SwiGLU, and combine, for GPT-OSS 120B with 128 experts, top-4 routing, MXFP4 weights, FP8 activations, and `D = I = 2880`. For small decode batches (`M = 1-4`), Gluon is 1.7-2.1x faster than Triton and 1.1-1.6x faster than AITER. At `M = 8-16`, Gluon remains 1.3-1.4x faster than Triton. The prefill results show Gluon substantially ahead of Triton and competitive with AITER across `M = 512-8192`.
 
-## Package Organization
+## Package organization
 
-Kernels are organized by AMD architecture and operator family. This keeps architecture-specific tuning local while giving each family a consistent place for its implementations and supporting utilities.
+The package organizes kernels by AMD architecture and operator family. This keeps architecture-specific tuning local while giving each family a consistent place for its implementations and supporting utilities.
 
 ```text
 tokenspeed-kernel-amd/

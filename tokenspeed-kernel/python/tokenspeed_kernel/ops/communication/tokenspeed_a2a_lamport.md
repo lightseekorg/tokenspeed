@@ -13,17 +13,18 @@ TRT-LLM one-shot AllGather/ReduceScatter, but does not copy their sentinel
 protocol. Each aligned 64-bit packet holds 32 payload bits and a 32-bit
 generation. The receiver polls local packets until their generation matches,
 then writes the unmodified payload to its output. Signed zero, infinities,
-subnormals and NaN payloads are preserved. No separate cross-GPU barrier kernel
-is needed; waiting is still present inside the packet-polling loop.
+subnormals and NaN payloads are preserved. The protocol needs no separate
+cross-GPU barrier kernel; waiting still happens inside the packet-polling loop.
 
 Three scratch generations prevent a fast sender from overwriting a slow
 receiver. Finishing an exchange requires data from every peer, so a sender
 cannot advance three exchanges ahead of a reader. A local CTA-entry counter
 ensures every CTA reads the current generation before it advances. The grid
-must not exceed the SM count. Multiple independent packet reads are pipelined
-for larger messages; one read per thread avoids that overhead for small ones.
+must not exceed the SM count. The kernel pipelines multiple independent
+packet reads for larger messages; one read per thread avoids that overhead
+for small ones.
 
-CUDA C++ is used for this initial protocol experiment to express the exact
+This initial protocol experiment uses CUDA C++ to express the exact
 aligned volatile 64-bit transactions explicitly. FlashInfer provides the
 optional JIT build/FFI utilities, not the A2A algorithm. The implementation is
 independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
@@ -34,13 +35,13 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
   lives under `_cuda/`. Both packet and chunk exchange require **2, 4 or 8
   peer-accessible GPUs per process group on one host**, independently of the
   total job size. Peer indexing specializes for `P`; token counts and channel
-  widths remain runtime arguments. Other group sizes are rejected.
+  widths remain runtime arguments. The entry point rejects other group sizes.
 - Prepare `TokenSpeedA2ALamportState(group, max_rows, channels, device, blocks)` on all
   peers before capture. This creates symmetric scratch and compiles the
   kernel. All peers must agree on the physical shape and direction of each call.
 - Inputs are contiguous, 16-byte-aligned BF16 matrices; each channel shard
   contains a multiple of two BF16 values (`K % (2*P) == 0`).
-  Uneven/empty logical owners must be padded to the same positive physical `M`.
+  Pad uneven/empty logical owners to the same positive physical `M`.
 - Serialize this communicator and its consumers on one CUDA stream. Pass
   `out=None` to borrow persistent **local output**, valid until the next call.
   Alternatively, supply a contiguous BF16 output with the exact result shape,
@@ -57,8 +58,9 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 - Packet storage is twice the payload size; three generations cost `6*S`
   scratch plus `S` output bytes per GPU, excluding metadata. Payload expansion
   also increases link traffic. This is a **low-latency**, not a large-message
-  bandwidth optimization. Launch tuning was measured on four NVLink-connected
-  GB300 GPUs; it does not establish performance for other group sizes.
+  bandwidth optimization. Launch tuning numbers come from four
+  NVLink-connected GB300 GPUs; they do not establish performance for other
+  group sizes.
 - The kernel itself has no implicit NCCL fallback. Its runtime caller owns
   admission, padding and fallback selection.
 
@@ -93,8 +95,8 @@ Packet and chunk exchange have **separate scratch and generation counters**.
 Sharing raw chunk payload with packet scratch could make arbitrary data appear
 to be a valid packet tag after a size transition. Preparation adds `3*S`
 payload scratch and `3*P*blocks*8` flag bytes per GPU to the original workspace,
-so combined scratch plus output is approximately `10*S`. No allocation or
-host synchronization is performed by the forward call or graph replay.
+so combined scratch plus output is approximately `10*S`. The forward call and
+graph replay perform no allocation or host synchronization.
 
 The recommended threshold keeps exactly 8 MiB on the tuned packet kernel and
 uses chunk exchange above it. An explicitly supplied threshold still takes
@@ -125,10 +127,10 @@ Call `state.prepare_fp8_quantization()` before capture, then
 Input width must be divisible by `128*P`: each channel shard contains whole
 128-element quantization groups. With `R = round_up(P*M, 4)`, the kernel returns
 borrowed E4M3 values `[R,K/P]` and contiguous MN-major FP32 scales `[K/(128*P),R]`.
-Padding is determined by `P*M != R`, which also selects the prepared quantizer's
-rounding behavior. For supported TP sizes, TP2 with odd `M` needs two padding
-rows. The same kernel writes zero values and unit scales for those rows;
-the consumer GEMM receives the valid count `P*M`.
+Padding rows follow from `P*M != R`, which also selects the prepared
+quantizer's rounding behavior. For supported TP sizes, TP2 with odd `M` needs
+two padding rows. The same kernel writes zero values and unit scales for
+those rows; the consumer GEMM receives the valid count `P*M`.
 
 Packet polling or chunk acquire fences establish readiness before quantization.
 Both variants share their existing rings and generations with ordinary BF16
@@ -154,7 +156,7 @@ python -m pytest -q \
 
 The test spawns its own workers; do not launch pytest with torchrun. TP2, TP4
 and TP8 cases skip when the required GPU count is unavailable. Use a host with
-full peer access and the CUDA/FlashInfer dependencies above. At `K=16384`, the
+full peer access and the optional CUDA/FlashInfer dependencies. At `K=16384`, the
 test checks exact BF16 payloads in both directions and fused FP8 values/scales
 against independently gathered inputs followed by the prepared quantizer.
 Rows 1, 128 and 257 cover small packets, the medium packet launch, chunk
@@ -169,7 +171,7 @@ python -m pytest -q test/runtime/distributed/test_dp_parallel_linear.py
 
 Benchmark timings exclude startup/JIT. After 20 warmups, each sample times
 10 replays of a graph containing 100 exchanges using CUDA events, takes the
-maximum rank time, and reports the median of five samples. Output restoration
-is included. The benchmark is communication-only: it does not establish a
+maximum rank time, and reports the median of five samples. The timing includes
+output restoration. The benchmark is communication-only: it does not establish a
 projection or model speedup. AG/RS are latency references, not interchangeable
 A2A algorithms; compare their message-size definitions explicitly.

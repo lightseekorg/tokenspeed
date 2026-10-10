@@ -1,9 +1,9 @@
-# Launching a Server
+# Launching a server
 
 `tokenspeed serve` starts an OpenAI-compatible HTTP server. Put the model path
 directly after the command.
 
-## Minimal Launch
+## Minimal launch
 
 ```bash
 tokenspeed serve openai/gpt-oss-20b \
@@ -12,7 +12,7 @@ tokenspeed serve openai/gpt-oss-20b \
   --tensor-parallel-size 1
 ```
 
-## Production Launch Skeleton
+## Production launch skeleton
 
 Use explicit parameters in scripts so a deployment is reproducible.
 
@@ -35,7 +35,7 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
   --tool-call-parser kimik2
 ```
 
-## Launch Checklist
+## Launch checklist
 
 - Put the model path directly after `tokenspeed serve`.
 - Set `--host`, `--port`, and `--served-model-name` for the API surface.
@@ -44,7 +44,7 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
 - Set model-family parsers such as `--reasoning-parser` and `--tool-call-parser` when the chat format needs them.
 - Set backend choices explicitly for benchmark or production runs.
 
-## OpenAI-Compatible Client
+## OpenAI-compatible client
 
 ```python
 from openai import OpenAI

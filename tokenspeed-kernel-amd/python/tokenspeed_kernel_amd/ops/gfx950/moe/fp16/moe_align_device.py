@@ -61,11 +61,6 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 
 @gluon.jit
-def _add(a, b):
-    return a + b
-
-
-@gluon.jit
 def _init_kernel(
     sti_ptr, sw_ptr, EM_max, sentinel, BLOCK: gl.constexpr, NW: gl.constexpr
 ):
@@ -134,8 +129,8 @@ def _offsets_kernel(
 
     blocks_pe = (counts + block_m - 1) // block_m
     padded = blocks_pe * block_m
-    row_off = gl.associative_scan(padded, 0, _add) - padded  # exclusive rows
-    blocks_incl = gl.associative_scan(blocks_pe, 0, _add)  # inclusive blocks
+    row_off = gl.cumsum(padded, 0) - padded  # exclusive rows
+    blocks_incl = gl.cumsum(blocks_pe, 0)  # inclusive blocks
     EM = gl.sum(padded, 0)
     num_blocks = gl.sum(blocks_pe, 0)
 
@@ -224,8 +219,8 @@ def _prepare_small_kernel(
     valid_e = e_ids < num_experts
     blocks_pe = (counts + block_m - 1) // block_m
     padded = blocks_pe * block_m
-    row_off = gl.associative_scan(padded, 0, _add) - padded
-    blocks_incl = gl.associative_scan(blocks_pe, 0, _add)
+    row_off = gl.cumsum(padded, 0) - padded
+    blocks_incl = gl.cumsum(blocks_pe, 0)
     block_start = blocks_incl - blocks_pe
     num_valid = gl.sum(padded, 0)
     num_blocks = gl.sum(blocks_pe, 0)

@@ -4,9 +4,9 @@ These kernels ship inside `tokenspeed_kernel` as
 `tokenspeed_kernel.ops.attention.rmha.cute_dsl` (formerly the standalone
 `tokenspeed-mha` package): the two device kernels, their prepass helpers,
 the FA4 compatibility layer, and the runtime-facing `rel_*` operator
-modules. The local validation harnesses referenced below
+modules. The local validation harnesses referenced later in this document
 (`test_*_local.py`, `compare_prefill_decode_swa.py`) live in the original
-standalone repository, not in this tree; the in-tree coverage is
+standalone repository, not in this tree. The in-tree coverage is
 `tokenspeed-kernel/test/nvidia/ops/test_attention_tsmha_*.py` and
 `test_mxfp8_attention.py`.
 
@@ -37,8 +37,8 @@ python -m tokenspeed_kernel.ops.attention.rmha._cute_dsl.flash_fwd_sm100_bias --
 
 `flash_fwd_sm100_bias.py` now exposes source-shaped `flash_attn_func` and
 `flash_attn_varlen_func` entry points. Their names, argument order, and defaults
-match the checked-out `flash_attn.cute.interface`; features that need unavailable
-standalone helpers are accepted by name and fail with a focused
+match the checked-out `flash_attn.cute.interface`; the entry points accept
+features that need unavailable standalone helpers by name and raise a focused
 `NotImplementedError`.
 The supported storage contracts are:
 
@@ -84,15 +84,16 @@ timeout 120 python flash_fwd_sm100_bias.py \
   --varlen-storage packed
 ```
 
-Relative bias is sheared independently for each logical `(Sq, Sk)` pair, so
-different Q/K lengths in one launch use the same bottom-right causal semantics
-as separate fixed-length calls. The runner verifies only active rows against a
-compiled CUDA PyTorch reference; inactive padded-Q rows are zero-filled by
-default, matching the source wrapper behavior.
+The wrapper shears relative bias independently for each logical `(Sq, Sk)`
+pair, so different Q/K lengths in one launch use the same bottom-right
+causal semantics as separate fixed-length calls. The runner verifies only
+active rows against a compiled CUDA PyTorch reference; the wrapper
+zero-fills inactive padded-Q rows by default, matching the source wrapper
+behavior.
 
-`window_size` is canonicalized like the source interface: causal attention
-forces a right window of zero, `(None,0)` means full causal attention, and
-`(-1,-1)` disables a noncausal window. The simplified standalone host shear
+The wrapper canonicalizes `window_size` like the source interface: causal
+attention forces a right window of zero, `(None,0)` means full causal attention,
+and `(-1,-1)` disables a noncausal window. The simplified standalone host shear
 supports compact relative bias with full causal attention only; combining
 relative bias with any finite local window fails explicitly rather than
 returning a misaligned bias result. Local attention without relative bias
@@ -131,18 +132,18 @@ block-sparse wrapper options therefore fails explicitly.
 
 External runtime requirements are `tokenspeed-fa4`, PyTorch with CUDA, CUDA
 Python, NVIDIA CuTe/CUTLASS DSL, and the `quack` namespace provided by
-`tokenspeed-quack` through `tokenspeed-fa4`. This copy was verified with
-`tokenspeed-fa4==4.0.0.post20260510`. A Blackwell SM100/SM110 GPU is required
-for execution.
+`tokenspeed-quack` through `tokenspeed-fa4`. This copy tracks the in-tree
+`tokenspeed-fa4` pin in `requirements/cuda-thirdparty.txt` (currently
+`4.0.0.post20260923`). Execution requires a Blackwell SM100/SM110 GPU.
 
 ## Decode-specialized kernel
 
 `flash_fwd_sm100_bias_decode.py` is a separate dense/paged-KV decode implementation;
 it does not modify or reuse the prefill device kernel. Its first GEMM is `K @ Q`,
-so the long KV dimension occupies the UMMA M mode while the small query length
-is packed with grouped-query heads in N. KV tiles are distributed cyclically
-over a split grid, and the deterministic reduction combines partial
-max/sum/output values with the online-softmax formula.
+so the long KV dimension occupies the UMMA M mode while the kernel packs the
+small query length with grouped-query heads in N. The kernel distributes KV
+tiles cyclically over a split grid, and the deterministic reduction combines
+partial max/sum/output values with the online-softmax formula.
 
 The decode file supports:
 
@@ -187,14 +188,14 @@ Useful controls include `--p` (query length), `--s` (KV length), `--h_q`,
 `--window_size_left L` keeps `L + 1` keys
 per query before sequence-start clipping; omitting it retains full causal
 attention. The kernel culls KV tiles outside the window before distributing the
-remaining tiles over splits. Atomic mode requires a power-of-two split count,
-and its output must be zeroed before every independent invocation; the direct
+remaining tiles over splits. Atomic mode requires a power-of-two split count;
+zero its output before every independent invocation. The direct
 correctness run does this during allocation, and the runner rejects multi-iteration atomic
 timing to prevent accumulated-output measurements. MXFP8 Q/K currently supports
 `D=128` and one packed query tile (`Sq * grouped_heads <= 32`), which covers the
 intended small-Q decode path. Dense BF16/FP16 supports head dimensions that are
-positive multiples of 64. Validation tensors and references are generated and
-evaluated directly on CUDA.
+positive multiples of 64. The runner generates and evaluates validation tensors
+and references directly on CUDA.
 
 ### FP8 V storage and dequantization
 
@@ -211,8 +212,8 @@ In the enabled path, TMA loads raw FP8 V and SFV into separate shared-memory
 buffers. The MMA-VP warp converts each V element through FP32 to
 `v_mma_dtype` (BF16 or FP16), converts and applies its UE8M0 scale, and writes
 a third shared-memory buffer consumed by PV. GEMM2 therefore remains
-BF16/FP16 x BF16/FP16 with FP32 accumulation; FP8 V is never passed directly
-to the PV MMA.
+BF16/FP16 x BF16/FP16 with FP32 accumulation; the kernel never passes FP8 V
+directly to the PV MMA.
 
 Dense V keeps shape `(batch, seqlen_k, kv_heads, head_dim)`. Its SFV uses the
 SM100 blocked rank-6 representation corresponding to logical scale axes
@@ -229,12 +230,12 @@ timeout 120 python flash_fwd_sm100_bias_decode.py \
   --qk_mode MXFP8 --v_dequant --pv_dtype BFloat16
 ```
 
-This combined Q/K MXFP8 plus V MXFP8-storage path is included in the dense GPU
-validation.
+The dense GPU validation includes this combined Q/K MXFP8 plus V
+MXFP8-storage path.
 
 ### Paged KV and compact SFV
 
-Paged mode is selected with the constructor's static `page_size` argument. K
+Select paged mode with the constructor's static `page_size` argument. K
 and V then use `(physical_pages, page_size, kv_heads, head_dim)` storage;
 `mPageTable` is a flattened CUDA `int32` logical-to-physical mapping,
 `mPageTableOffsets[b]` starts batch `b`'s mapping, and `mSeqUsedK[b]` is its
@@ -292,8 +293,8 @@ requires
 
 The comparison harness also supports full causal attention, zero/structured/
 impulse relative bias, deterministic non-uniform UE8M0 factors, atomic Decode
-reduction, and padded `seqused` varlen Prefill. Low-amplitude forensic inputs
-can be selected with `--qk-bound 2 --softmax-scale 0.0078125`; this avoids a
+reduction, and padded `seqused` varlen Prefill. Select low-amplitude forensic
+inputs with `--qk-bound 2 --softmax-scale 0.0078125`; this avoids a
 near-one-hot softmax hiding bias or scale-layout errors. For example:
 
 ```bash
@@ -310,7 +311,7 @@ python compare_prefill_decode_swa.py --mode MXFP8 --varlen \
 `--varlen` performs one padded/seqused Prefill call for lengths
 `Sq=[1,3,7]`, `Sk=[33,257,513]` and compares its valid rows with three
 fixed-length Decode calls. It remains a useful legacy semantic comparison; the
-native Decode varlen test described below uses one packed launch instead. In
+native Decode varlen test described later uses one packed launch instead. In
 the current source/runtime combination, packed `cu_seqlens` MXFP8 Prefill fails
 while constructing its rank-3 K scale layout, and varlen Prefill split-KV fails
 because the ragged TMA helper rejects the rank-5 partial output. The explicit
@@ -375,6 +376,6 @@ is not a true packed-K `cu_seqlens_k` path and uses additional K/V storage. The
 test rejects imports of kernels from the sibling source tree and directly
 instantiates only this directory's Prefill implementation. `--compare-decode`
 also runs this directory's Decode kernel once per logical sequence and compares
-the concatenated Decode output with the single Prefill fallback call. Prefer
-`test_decode_native_varlen_local.py` when validating the new single-launch
-Decode path.
+the concatenated Decode output with the single Prefill fallback call. When
+validating the new single-launch Decode path, prefer
+`test_decode_native_varlen_local.py`.

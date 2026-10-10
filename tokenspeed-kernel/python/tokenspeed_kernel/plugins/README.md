@@ -1,9 +1,9 @@
-# Tokenspeed-kernel Plugin System
+# TokenSpeed-kernel plugin system
 
 > **Status: experimental.** The plugin contract — entry-point group name,
 > `register()` signature, `KernelSpec` fields, selection priority semantics,
 > and the `tokenspeed_kernel.plugins` Python API — may change without
-> backwards-compatibility guarantees while we shake the design out. Pin to
+> backwards-compatibility guarantees while the design settles. Pin to
 > an exact `tokenspeed-kernel` version in your plugin's dependencies.
 
 This subpackage lets third-party packages register kernel implementations
@@ -17,9 +17,9 @@ itself.
    `KernelRegistry.get().register(...)`) for each kernel it provides.
 2. Your `pyproject.toml` advertises that function under the
    `tokenspeed_kernel.plugins` entry-point group.
-3. The host application (engine, benchmark, notebook, etc.) calls
+3. The host application (such as an engine, benchmark, or notebook) calls
    `tokenspeed_kernel.plugins.discover_plugins()` once at startup, after
-   built-in kernels have been imported. Discovery walks the entry-point
+   importing the built-in kernels. Discovery walks the entry-point
    group and invokes each `register()`.
 
 Loading is **fully explicit** — importing `tokenspeed_kernel` or
@@ -61,7 +61,8 @@ def register() -> None:
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(9, 0),
         ),
-        # Built-in FlashInfer decode is priority 18; pick 19 to win selection.
+        # Built-in FlashInfer decode is priority 12 (SPECIALIZED); pick 19
+        # (PLUGIN band) to win selection.
         priority=19,
     )
     def my_custom_attn_decode(q, kv_cache, page_table, seq_lens, **kwargs):
@@ -98,7 +99,7 @@ print(list_plugins())  # -> [PluginInfo(name='my_plugin', ...)]
 ## Host-application integration
 
 Engines and other long-running hosts should call `discover_plugins()`
-exactly once at startup, after built-in kernel modules have been imported
+exactly once at startup, after importing the built-in kernel modules
 (so plugins can override built-ins by registering at a higher priority).
 
 ```python
@@ -108,7 +109,7 @@ from tokenspeed_kernel.plugins import discover_plugins
 discover_plugins()
 ```
 
-For ad-hoc use (notebooks, scripts, tests), there is no need to use entry
+For ad-hoc use (notebooks, scripts, tests), you don't need entry
 points at all — call `register_kernel(...)` directly:
 
 ```python
@@ -130,7 +131,7 @@ def my_experimental_gemm(a, b, **kwargs):
 
 ## Disabling plugins
 
-Plugins can be skipped without uninstalling them:
+You can skip plugins without uninstalling them:
 
 ```bash
 TOKENSPEED_KERNEL_DISABLE_PLUGINS="my_plugin,other_plugin" python ...
@@ -165,14 +166,15 @@ for info in list_plugins():
 
 - Priority is an integer in `[0, 20)`. Higher wins. The reference
   implementation lives at `0`. Built-in optimized kernels typically sit at
-  `10`–`18`. Plugin authors who want to override a built-in should choose
+  `8`–`15`; `16`–`19` is the PLUGIN band, reserved for out-of-tree plugins.
+  Plugin authors who want to override a built-in should choose
   a value strictly higher than the built-in they replace.
 - `discover_plugins()` walks entry points in alphabetical order by
   entry-point name. When two registrations land at the same priority for
-  the same `(family, mode)`, the warning is emitted and selection becomes
+  the same `(family, mode)`, discovery emits the warning and selection becomes
   load-order-dependent — set explicit, distinct priorities to avoid this.
-- A plugin whose `register()` raises does not crash discovery; a
-  `UserWarning` is emitted and other plugins continue loading.
+- A plugin whose `register()` raises does not crash discovery; discovery
+  emits a `UserWarning` and other plugins continue loading.
 
 ## Failure modes worth knowing
 
@@ -180,10 +182,10 @@ for info in list_plugins():
   `discover_plugins()` is silent.
 - **Plugin loaded before built-ins.** If you call `discover_plugins()`
   before `import tokenspeed_kernel`, plugins that intend to override
-  built-ins will appear to win, but the built-in modules will be imported
-  later and may overwrite the plugin's slot. Always import
+  built-ins appear to win, but the built-in modules import later and may
+  overwrite the plugin's slot. Always import
   `tokenspeed_kernel` first.
 - **Stale registry.** Calling `KernelRegistry.reset()` clears registered
-  kernels but leaves `_loaded_plugins` populated; re-discovery will skip
+  kernels but leaves `_loaded_plugins` populated; re-discovery skips
   already-loaded plugins. Use `discover_plugins(force=True)` after a
   reset.

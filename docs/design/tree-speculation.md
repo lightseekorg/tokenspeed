@@ -6,12 +6,12 @@ bug unless this document is updated in the same change.
 
 ## The problem this solves
 
-A chain drafter proposes one token per depth; a draft tree keeps the best
+A chain drafter proposes one token per depth. A draft tree keeps the best
 `K` candidates per step and verifies up to `N` nodes (`N <= 64`) in one target
 forward, so a request accepts whichever root path the target agrees with. The
 rest of the runtime — commit (`vc += accept_len`), the output processor, draft
-step 0, KV and hidden-state bookkeeping — is written for a chain. Trees must
-not grow a second copy of any of it.
+step 0, KV and hidden-state bookkeeping — assumes a chain. Trees must not
+grow a second copy of any of it.
 
 ## Invariants
 
@@ -20,7 +20,7 @@ not grow a second copy of any of it.
 The sampling backend verifies the step's trees (`TreeVerifyBatch`: parents and
 depths) with the `verify_tree` kernel, packing `predict` along the accepted
 path. The TP-agreed path has one owner, the backend's packed verify output
-(`SamplingBackend.accepted_path`); every consumer receives it explicitly:
+(`SamplingBackend.accepted_path`). Every consumer receives it explicitly:
 
 * the attention backend moves the path's target KV (every layer) to the
   window's leading slots (`compact_verify_window`; the cache-group router owns
@@ -35,7 +35,7 @@ Everything downstream sees a chain.
 
 A chain is the tree `parent[i] = i - 1`. With `topk == 1` no tree state exists
 and the chain path runs unchanged. With `topk > 1` the output processor and the
-draft step-0 forward are the chain's; the named tree-only pieces are candidate
+draft step-0 forward are the chain's. The named tree-only pieces are candidate
 selection after step 0 (`Eagle._seed_tree_lanes`) and, in a stateful backend's
 commit, the steps that read `accepted_path` (the GDN source row and replay
 payload packing).
@@ -61,8 +61,9 @@ long context, so it runs on trtllm-gen's own decode kernel: a causal
 which covers row `r`'s keys `[0, P - R + 1 + r)` (no head folding, so no limit
 on `R x group`). `tree_window_attention` attends the rest of each row (the
 prefix tail it missed and its masked window) and merges both in one Triton
-kernel. Verify runs it with `R = W = N`; draft lanes with `R = K` over the
-`(S - 1) * K`-key lane window (below). There is no size-dependent second path.
+kernel. Verify runs it with `R = W = N`. Draft lanes run it with `R = K`
+over the `(S - 1) * K`-key lane window (below). There is no size-dependent
+second path.
 
 An FP8 KV cache (E4M3, unscaled like every FP8 KV cache here) changes no
 structure: trtllm-gen takes the query cast to FP8 as it does for any decode,
@@ -75,7 +76,7 @@ own MLA decode with its base-2 log-sum-exp: trtllm-gen's MLA decode for
 kernel reads each token's latent row once: its `kv_lora_rank` leading channels
 are both the key's latent part and the value, and the rotary channels after
 them add a second score product (`ROPE_DIM`; zero for GQA). The absorbed query
-the prologue returns is FP8 under an FP8 cache; the window kernel takes it
+the prologue returns is FP8 under an FP8 cache. The window kernel takes it
 widened back to the model dtype, which is exact.
 
 ### Recurrent state follows the parent
@@ -85,8 +86,9 @@ state per verify node in the backend's verify scratch. Node `t` starts from the
 state after its parent, not after node `t - 1`: `mamba2_verify_scan` takes
 `parent_indices` and `gdn_decode_mtp` the tree's ancestor mask (the one tree
 attention reads), and both reload the parent's state at branch points (a chain
-never reloads); `causal_conv1d_update` with `parent_indices` rebuilds each node's
-window from its ancestors' inputs and the initial window. The commit copies the scratch row of the
+never reloads). `causal_conv1d_update` with `parent_indices` rebuilds each
+node's window from its ancestors' inputs and the initial window. The commit
+copies the scratch row of the
 last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
 familiar `accept_len`. The fused KDA verify kernel follows a chain and refuses
 trees.
@@ -94,10 +96,10 @@ trees.
 Draft trees use ReplaySSM like chains (on by default; staging a recurrent
 state per node and per layer grows with the tree, Qwen3.8: 3 MiB x 48 layers
 per node). Under ReplaySSM the verify
-never writes the state pool. A GDN tree of 8 to 16 nodes
-(`GDN_TREE_VERIFY_CHUNKED_MIN_NODES`, `GDN_TREE_VERIFY_CHUNKED_MAX_NODES`) is
-verified in the chunked form of the delta rule, every node at once with the
-ancestor mask in place of the causal one, and keeps no node states. In other
+never writes the state pool. The verify runs a GDN tree of 8 to 16 nodes
+(`GDN_TREE_VERIFY_CHUNKED_MIN_NODES`, `GDN_TREE_VERIFY_CHUNKED_MAX_NODES`) in
+the chunked form of the delta rule, every node at once with the ancestor mask
+in place of the causal one, and keeps no node states. In other
 trees the state of every branch point (a node with a child other than the next
 node) goes to one workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),
@@ -119,16 +121,16 @@ Drafting steps `1 .. S-1` run `K` lane rows per request. Step `s` lane `r`
 writes draft-cache slot `frontier + (s - 1) * K + r` through the attention
 prologue (`publish_draft_step_locations` with `K` tokens per request), like the
 chain's draft steps (`(S - 1) * K <= N`, checked in `server_args`). Their K/V
-are only valid while the round's tree is drafted; the target's verify
-overwrites the window.
+are valid only while the round drafts its tree. The target's verify overwrites
+the window.
 
 Known limitation, shared with the chain drafter: the decode reservation
 guarantees pages only through the verify window (`vc + N`), and draft writes
 reach past it (lanes up to `frontier + (S - 1) * K - 1`, chain steps up to
 `frontier + S - 2`). A position past the allocated extent resolves to the
 dummy slot, and attention reads it through page 0. This costs draft acceptance
-only; target KV is rewritten by the next verify. The fix is a draft headroom
-in the scheduler's decode reservation.
+only. The next verify rewrites target KV. The fix is a draft headroom in the
+scheduler's decode reservation.
 
 Lane attention is the same cascade with `R = K` over the draft paged cache:
 every lane row sees the accepted frontier and, inside the window, only its
@@ -137,31 +139,32 @@ window lengths `frontier + (S - 1) * K`, the lanes' ancestor masks, and
 `active`, a Python flag set around each lane forward), which the drafter owns
 and writes within the round: lengths once per round, masks by
 `draft_tree_expand` for the next step. This is the one exception to the
-refresh-only draft metadata contract of `unified_path.md`; it is graph-safe
-because the buffers are bound once at fixed addresses and written by in-graph
-ops before the lane forward reads them.
+refresh-only draft metadata contract of `unified_path.md`. It is graph-safe
+because the runtime binds the buffers once at fixed addresses and in-graph ops
+write them before the lane forward reads them.
 
 ### The drafter scores, the tree selects
 
-`Eagle._score_candidates` is the one place a drafter decides how candidates are
-scored (today `logprob_topk` over the full draft vocabulary); `DraftTree` only
-records `(scores, tokens)` and selects. A child's score is at most its parent's
-(`draft_tree_expand` clamps child log-probabilities at 0). A new drafter changes
-the scorer, not the tree machinery.
+`Eagle._score_candidates` is the one place a drafter decides how to score
+candidates (today `logprob_topk` over the full draft vocabulary). `DraftTree`
+only records `(scores, tokens)` and selects. A child's score is at most its
+parent's (`draft_tree_expand` clamps child log-probabilities at 0). A new
+drafter changes the scorer, not the tree machinery.
 
 ### Next round's tree rides with next round's tokens
 
 The drafter's parents for a pool slot live in `RuntimeStates.future_parent_map`
-next to its candidate tokens in `future_input_map`; rows reset to dummy tokens
+next to its candidate tokens in `future_input_map`. Rows reset to dummy tokens
 (bootstrap, recovery) reset to the chain.
 
 ### Tree construction is deterministic
 
-`DraftTree` keeps the best `N - 1` of the `K + (S - 1) K^2` scored candidates;
-a child's cumulative log-probability never exceeds its parent's and ties go to
-the lower candidate id (the parent's), so the kept set is a tree. Nodes are numbered depth first with each node's best child
-first, so the most likely path is `0, 1, 2, ...`. NaN scores (padded requests)
-rank last, so lanes and nodes are always fully written.
+`DraftTree` keeps the best `N - 1` of the `K + (S - 1) K^2` scored candidates.
+A child's cumulative log-probability never exceeds its parent's and ties go to
+the lower candidate id (the parent's), so the kept set is a tree. `DraftTree`
+numbers nodes depth first with each node's best child first, so the most
+likely path is `0, 1, 2, ...`. NaN scores (padded requests) rank last, so
+lanes and nodes are always fully written.
 
 ### Sampled verify keys noise by position
 
@@ -170,7 +173,7 @@ keyed by `(seed, position)`. For a tree the key is the node's position
 `vc + depth`, never its row: each node row samples with its request's
 parameters and its offset advanced by its depth, so the token accepted at every
 position is the one plain decoding samples there. Acceptance is the greedy tree
-walk over those draws (a child is accepted when it equals its parent's draw).
+walk over those draws, accepting a child when it equals its parent's draw.
 Backends that cannot do this keep `supports_tree_verify = False` and the
 executor refuses tree drafting with them at startup.
 
@@ -187,7 +190,7 @@ or draft layers, no target or draft that reads request token history or
 n-gram (Engram) input history, and separate target and draft attention backends.
 
 Each attention backend node declares its own part through `tree_support()`
-(verify and lanes, each supported or refused with a reason);
+(verify and lanes, each supported or refused with a reason).
 `resolve_tree_support` composes it over the target and draft backend trees
 through `child_backends()` once at startup, before any bind, and reports every
 blocker together. Composites never forward the question, so a new composite

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
@@ -373,6 +374,24 @@ def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
         GDN_TREE_VERIFY_CHUNKED_MIN_NODES
         <= num_nodes
         <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+    )
+
+
+# A ReplaySSM chain verifies faster in the chunked form from these sizes on, measured on Blackwell.
+GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS = 13
+GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES = 24
+
+
+def gdn_chain_verify_is_chunked(num_tokens: int, num_states: int) -> bool:
+    """Whether a ReplaySSM chain ``gdn_decode_mtp`` of ``num_tokens`` tokens over
+    ``num_states`` (request, value head) states verifies in the chunked form, as
+    a one-path tree, rather than step by step: only where that is faster."""
+    return (
+        current_platform().is_blackwell
+        and GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS
+        <= num_tokens
+        <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+        and num_states >= GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES
     )
 
 
@@ -776,6 +795,7 @@ __all__ = [
     "GDN_TREE_VERIFY_CHUNKED_MAX_NODES",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
+    "gdn_chain_verify_is_chunked",
     "gdn_chunk_prefill",
     "gdn_chunk_prefill_capturable",
     "gdn_decode_step",

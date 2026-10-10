@@ -28,9 +28,9 @@ without a matching native registration.
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
 plane off its dtype and pass it to selection as the `index_k_format` and
-`index_k_layout` traits; a top-k leaf declares the planes it scores and is
-never handed another one. One layout per dtype, and the facades never
-convert a plane:
+`index_k_layout` traits; a top-k leaf declares the planes it scores and
+selection never hands it another one. One layout per dtype, and the facades
+never convert a plane:
 
 | dtype | `index_k_format` | `index_k_layout` | row |
 | --- | --- | --- | --- |
@@ -61,7 +61,7 @@ facade hands the keywords to declaring leaves only, and a leaf that only
 reads planes -- the portable Triton leaf, the Gluon wrappers -- is never
 selected for rows, not by ranking and not by a kernel override (an override
 skips traits but not required features). The failure is a
-`NoKernelFoundError` at selection; a host whose sharded prefill will hand
+`NoKernelFoundError` at selection; a host whose sharded prefill hands
 rows probes that selection at construction with
 `dsa.select_dsa_prefill_topk_for_rows(index_k_format=, ...)`, which makes a
 platform without a declaring leaf a startup error.
@@ -123,11 +123,11 @@ Contract:
   of the SMs for 4- and 8-CTA clusters, 80% for pairs). Every configuration
   a call may pick must be compiled with `warmup` before CUDA-graph capture.
 
-Algorithm per CTA: the first 8192 entries (the row's in-order tail of up to
-4096 entries plus the first pseudo-randomly ordered 512-entry segments) are
-selected exactly with an 8-bit radix select over order-preserving keys and
-set the running threshold; the remaining segments stream through a three
-stage `cp.async.bulk` ring and only entries above the threshold are appended
+Algorithm per CTA: an 8-bit radix select over order-preserving keys selects
+the first 8192 entries (the row's in-order tail of up to 4096 entries plus
+the first pseudo-randomly ordered 512-entry segments) exactly and sets the
+running threshold; the remaining segments stream through a three-stage
+`cp.async.bulk` ring, and the CTA appends only entries above the threshold
 as `(index, value)` pairs; once 4032 candidates accumulate, and once more at
 the end, a radix select over survivors plus candidates re-selects `k` pairs
 and raises the threshold. Per-pass histograms send non-matching keys to a
@@ -142,10 +142,10 @@ context-partitioned sparse attention. Supplying `out` preserves the supplied
 output buffer even when returning LSE. Omitting `topk_lens` uses the full padded
 slot width, with negative slots still excluded.
 
-DeepGEMM index scoring is registered for 16, 32, or 64 index heads. The
+DeepGEMM index scoring registers for 16, 32, or 64 index heads. The
 16-head case pads queries and weights to its native 32-head ABI with zeros;
 caller-provided scoring scales and forced initial/local candidate policies
-remain unchanged. Other head counts are excluded by kernel traits.
+remain unchanged. Kernel traits exclude other head counts.
 
 FlashMLA sparse prefill (regular BF16 KV) and sparse decode (packed FP8 KV)
 also support `return_lse=True`. Both return natural-log LSE `[tokens, heads]`

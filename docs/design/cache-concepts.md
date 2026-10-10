@@ -1,4 +1,4 @@
-# Cache Concepts: Prefix Matching vs. Storage
+# Cache concepts: prefix matching vs. storage
 
 This document defines the conceptual layering of the cache subsystem: which
 concepts are *logical* (token-based, storage-agnostic) and which are *physical*
@@ -121,12 +121,12 @@ tables, and cache-only residency is the remainder `total - empty - active`.
 
 ### C++ scheduler: schedules in logical units
 
-Scheduling decisions — admission, prefix matching, chunk alignment, capacity —
-are made in **exactly two token-based quantities**: `prefix_granularity` and
-the per-group `block_granularity` (`CacheGroupSpec.block_granularity`,
-wrapped by the coordinator's `GroupGeometry`; both declaration shapes fold
-to it at the bridge — see below). Physical geometry (LCM packing, storage
-counts, bytes) is confined
+The scheduler makes its decisions — admission, prefix matching, chunk
+alignment, capacity — in **exactly two token-based quantities**:
+`prefix_granularity` and the per-group `block_granularity`
+(`CacheGroupSpec.block_granularity`, wrapped by the coordinator's
+`GroupGeometry`; both declaration shapes fold to it at the bridge — see
+below). Physical geometry (LCM packing, storage counts, bytes) is confined
 to the scheduler's cache/allocator layer; scheduling, FSM, and
 config-consuming code must not reason about it.
 
@@ -411,7 +411,7 @@ On submission failure, retirement fences protect reuse without publishing a
 successful load ACK. If neither event publication nor stream synchronization
 can establish retirement, the executor must reject further loads.
 
-An op is acknowledged only by its copy's completion event, so every op on the
+Only an op's copy completion event acknowledges it, so every op on the
 wire carries at least one transfer, and no (group, source, destination)
 repeats within one plan: a store skips keys already in flight, a load targets
 freshly acquired pages. The scheduler asserts both when batching a plan's ops
@@ -545,9 +545,9 @@ The two names are distinct concepts, not synonyms:
 * **`page_table`** — exists *only* for KV-cache-based (paged) attention. It
   maps logical token pages to cache pages. State-based attention has no pages
   and therefore no page table.
-* **`block_table`** — the table used by state-based attention (e.g. Mamba /
-  linear attention state slots), and the generic name for the container that
-  carries per-group tables between scheduler and runtime.
+* **`block_table`** — the table used by state-based attention (such as
+  Mamba / linear attention state slots), and the generic name for the
+  container that carries per-group tables between scheduler and runtime.
 
 Use `page_table` when **(and only when)** the consumer is paged KV-cache
 attention; use `block_table` otherwise.
@@ -1138,7 +1138,7 @@ fit inside the group's retention window (`window_left + 1 <=
 sliding_window_tokens`, matching `GroupGeometry::ExpiredBlocksAt`). Everything
 off the diagonal is therefore legal by construction rather than by special
 case: a sliding-masked layer on a full-history group (a block drafter, DSA's
-sparse compute over a fully retained cache) simply retains more than it reads.
+sparse compute over a fully retained cache) retains more than it reads.
 
 A third contract appears when a group leaves prefix caching. DeepSeek V4.1
 declares its SWA rows and compressor tails **replayable**
@@ -1214,7 +1214,7 @@ sets both sides: the arena holds at least that many parent blocks (more when
 admitting one token per group needs more), and the concurrency is that many
 rows, capped at the scheduler's `max_bs`.
 
-The runtime's global `max_num_seqs` is divided across attention DP ranks to
+The runtime divides its global `max_num_seqs` across attention DP ranks to
 produce each scheduler's rank-local `max_batch_size`. These values limit
 simultaneous sequence slots; they do **not** reserve enough history cache for
 that many maximum-length requests. Aggregate prompt and decode growth must
@@ -1224,10 +1224,10 @@ sequence slot.
 
 When admission fails for capacity and no prefill can progress, the scheduler
 retracts a resident victim and grants the freed pages to the blocked request
-within the same plan build; what stops an overcommitted workload from
-repeatedly rebuilding, briefly decoding and re-retracting the same prompt is
-the escalating admission headroom each retraction adds to the victim's next
-admission. The protocol — victim choice, readmission order, why the release
+within the same plan build. The escalating admission headroom that each
+retraction adds to the victim's next admission is what stops an overcommitted
+workload from repeatedly rebuilding, briefly decoding and re-retracting the
+same prompt. The protocol — victim choice, readmission order, why the release
 is safe before the L2 snapshot copies — is `scheduler.md` §2 and §4.
 
 ## Virtual block placement within a shared physical plan
@@ -1255,8 +1255,8 @@ MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
 Before allocating the arena, hybrid DCP validates these declared group shard
 counts rather than the recipe name or its inheritance. Plugin recipes follow
 the same storage contract as built-in recipes. Both pure MLA and MLA/KDA hybrids
-require the full-attention backend to declare `supports_mla_dcp`; only FlashMLA
-currently declares this capability.
+require the full-attention backend to declare `supports_mla_dcp`; FlashMLA and
+TokenSpeed MLA (CuTe MLA) both declare this capability.
 Decode gathers query heads, computes attention over owned history, and merges
 partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
@@ -1553,8 +1553,8 @@ and never touches packing. No refactor needed here.
 
 * C++ keeps its single generic `BlockTable` container — per this doc's
   vocabulary that is the correct name for the scheduler-side container; the
-  `page_table` concept exists only where paged-KV kernel tables exist, i.e.
-  in Python.
+  `page_table` concept exists only where paged-KV kernel tables exist — that
+  is, in Python.
 * The Python residues are cleaned: `FlashMLADecodeMetadata.page_table`, the
   TRT-LLM MLA chunked-prefill metadata's `page_table`, inkling's
   `col_block_table` (conv state), and the base-class group routing
@@ -1562,15 +1562,15 @@ and never touches packing. No refactor needed here.
   (`flash_mla`'s `block_table=`, TRT-LLM's `block_tables=`) are an external
   boundary and stay as the kernels spell them.
 * The state backend's replay hook names no `page_table` parameter — state
-  attention has no page table, so the shared call's keyword is absorbed unused
-  via `**kwargs`. `input_buffer.py` carries no table at all anymore: KV write
-  locations are backend-owned (`write_locations`), so the runner's input prep
-  writes positions and seq_lens only.
+  attention has no page table, so the shared call's keyword is absorbed
+  unused through `**kwargs`. `input_buffer.py` carries no table at all
+  anymore: KV write locations are backend-owned (`write_locations`), so the
+  runner's input prep writes positions and seq_lens only.
 
 ### Principle 5 — Python perceives the logical quantities minimally: fixed; one conversion point, one slot invariant
 
 Compliant: the recipes/planner layer *owns* the vocabulary rather than
-leaking it; the router's `GroupTableStacks` fill (`backends/group_tables.py`)
+leaking it; the router's `GroupTableStacks` fill (`backends/paged/group_tables.py`)
 is the single expansion primitive; state attention and KV share one
 plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 
@@ -1585,12 +1585,12 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   `spec.checkpoint_granularity`, which snapshot-state groups declare directly
   — asking such a group for `page_size` is a `TypeError`, since it has no
   rows.
-* Spec geometry is shape-checked at construction: row geometry and
-  `checkpoint_granularity` are mutually exclusive, both positive, and each
-  family is held to its shape and retention — `state` declares
-  `checkpoint_granularity` and `full_history`, `history` declares rows
-  (`CacheGroupSpec.__post_init__`; the C++ `CacheGroupConfig::Validate`
-  refuses a sliding `State` group at the bridge).
+* `CacheGroupSpec.__post_init__` shape-checks spec geometry at construction:
+  row geometry and `checkpoint_granularity` are mutually exclusive, both
+  positive, and each family is held to its shape and retention — `state`
+  declares `checkpoint_granularity` and `full_history`, `history` declares
+  rows. The C++ `CacheGroupConfig::Validate` refuses a sliding `State` group
+  at the bridge.
 * Group consumption is claimed positively, from one declaration: each
   consumer takes exactly the delivered `block_tables` entries for the
   groups it serves. The router builds a leaf for each claimed attention
@@ -1606,12 +1606,12 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   through untouched; a table for a group the bound pool never published
   fails loudly.
 * The logical→physical conversion has ONE home per pool view:
-  `CacheGroupRouter` (`backends/router.py`) learns each group's
+  `CacheGroupRouter` (`backends/paged/router.py`) learns each group's
   `block_granularity` and each leaf's `kernel_page_size` into one
   `CacheGroupGeometry`, expands the bridge's raw block tables into
   kernel-page stacks, and derives every KV write location — extend spans,
   the decode/verify window, and the drafters' published step windows — from
-  those same tables (`backends/write_locations.py`, pure functions). Paged
+  those same tables (`backends/paged/write_locations.py`, pure functions). Paged
   leaves see kernel vocabulary only. The bridge's per-group table views
   (`CacheBatchMetadata`) are the router's input — block vocabulary in,
   kernel pages out, one expand launch per group. Models and the runner never
@@ -1625,7 +1625,7 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 * The slot *arithmetic* itself lives in the mapping layer in exactly two
   spellings of one invariant (`table[req, pos // P] * P + pos % P`, which
   is page-size invariant): the router's stacked window/span math
-  (`backends/write_locations.py`, failing to slot 0 — the reserved dummy
+  (`backends/paged/write_locations.py`, failing to slot 0 — the reserved dummy
   page) and the token-shaped resolve
   (`attention/page_table.py::group_slot_mapping_from_raw` +
   `safe_page_ids` / `mask_invalid_graph_tokens`, failing closed to the
@@ -1645,11 +1645,11 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   carry `dtype` (a name; `plan.py` stays torch-free because the plan travels
   the PD wire) and `element_size` derives from it, so byte geometry and dtype
   cannot disagree. Recipes name each field's dtype where they already know it,
-  via `cache_dtype_name` or `scatter_stored_dtype_name`; the latter holds the
-  one substitution rule — fp8 collapses to `uint8` for fields written by
-  elementwise scatter, because `index_put` has no fp8 kernel, while fields
-  written through dtype-aware kernels (MXFP8) keep their fp8 view. The
-  contract carries no parallel `field_dtypes` tuple. ✓
+  through `cache_dtype_name` or `scatter_stored_dtype_name`; the latter
+  holds the one substitution rule — fp8 collapses to `uint8` for fields
+  written by elementwise scatter, because `index_put` has no fp8 kernel,
+  while fields written through dtype-aware kernels (MXFP8) keep their fp8
+  view. The contract carries no parallel `field_dtypes` tuple. ✓
 * The arena owns the allocation and materializes every planned field view in
   its constructor, so `field(field_id)` is a lookup with no dtype argument and
   no lazy-bind state. `CachePool.store_dtype` means one thing: how a pool
@@ -1703,7 +1703,7 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   layers apply: the full-history group for drafts with their own attention
   layers (`check_block_drafter_storage`), the SWA group's extra fields for
   V4.1's same-checkpoint DSpark. ✓
-* Capacity has two shapes and no more, and one place to read the scheduler's
+* Capacity has three shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4's byte
   formulas, cache layout and group-id vocabulary sit in

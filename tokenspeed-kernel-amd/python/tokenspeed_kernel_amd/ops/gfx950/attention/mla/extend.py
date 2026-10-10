@@ -46,8 +46,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._scheduling import (
-    sched_barrier,
-    sched_barrier_compile_options,
+    sched_compile_options,
     sched_group,
     wave_uniform_i32,
 )
@@ -563,7 +562,7 @@ class ExtendProgram:
         cfg = self.cfg
         qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], gl.float32, layout=cfg.mma_layout)
         k = self.load_k(kv_smem, pe_smem, stage, 0)
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         for j in gl.static_range(cfg.NUM_K_PIECES):
             if j + 1 < cfg.NUM_K_PIECES:
                 k_next = self.load_k(kv_smem, pe_smem, stage, j + 1)
@@ -625,7 +624,7 @@ class ExtendProgram:
         # P @ V over the four latent chunks; `v` is chunk 0, already read.
         # Each chunk's V operand is read before the previous chunk's MFMAs.
         v_next = self.load_v(kv_smem, stage, 1)
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         acc0 = self.dot(p, v, acc0)
         if ISSUE:
             # Spread the next copy's buffer_load...lds over the chunk-0 MFMAs
@@ -635,15 +634,15 @@ class ExtendProgram:
             for _i in gl.static_range(4):
                 sched_group("mfma", 1)
                 sched_group("vmem", 3)
-            sched_barrier()
+            gl.amd.hint.sched_barrier()
         v = self.load_v(kv_smem, stage, 2)
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         acc1 = self.dot(p, v_next, acc1)
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         v_next = self.load_v(kv_smem, stage, 3)
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         acc2 = self.dot(p, v, acc2)
-        sched_barrier()
+        gl.amd.hint.sched_barrier()
         acc3 = self.dot(p, v_next, acc3)
         return acc0, acc1, acc2, acc3
 
@@ -743,7 +742,6 @@ def gluon_mla_extend_gfx950(
     NUM_WARPS: gl.constexpr,
     IS_CAUSAL: gl.constexpr,
     SPLIT: gl.constexpr,
-    SCHED_LIBRARY_HASH: gl.constexpr,  # Cache dependency; not a device operand.
 ):
     # Grid: (q-blocks, N_HEADS // HEAD_GROUP, KV splits). With SPLIT, each
     # program streams its slice of the visible KV and writes a normalized fp32
@@ -857,7 +855,7 @@ def gluon_mla_extend_gfx950(
             async_copy.wait_group(cfg.NUM_STAGES - 3)
             page = next_page
             next_page = program.load_page(tile + cfg.NUM_STAGES, tile_end)
-            sched_barrier()
+            gl.amd.hint.sched_barrier()
             qk_next = program.qk(q, kv_smem, pe_smem, next_stage)
             v = program.load_v(kv_smem, stage, 0)
             p, alpha, m_i, l_i = program.softmax(qk, m_i, l_i)
@@ -866,7 +864,7 @@ def gluon_mla_extend_gfx950(
             for _i in gl.static_range(16):
                 sched_group("mfma", 1)
                 sched_group("trans", 2)
-            sched_barrier()
+            gl.amd.hint.sched_barrier()
             acc0 = _rescale(acc0, alpha)
             acc1 = _rescale(acc1, alpha)
             acc2 = _rescale(acc2, alpha)
@@ -1186,7 +1184,7 @@ def launch_gluon_mla_extend_gfx950(
         IS_CAUSAL=is_causal,
         SPLIT=split,
         num_warps=_NUM_WARPS,
-        **sched_barrier_compile_options(),
+        **sched_compile_options(),
     )
     if split:
         gluon_mla_extend_reduce_gfx950[(total_q, num_heads)](

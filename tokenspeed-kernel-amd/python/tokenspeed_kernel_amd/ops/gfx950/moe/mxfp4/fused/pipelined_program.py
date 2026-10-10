@@ -1036,10 +1036,6 @@ class MoEPipelinedProgram:
         gl.assume(main_iters >= 0)
 
         for _ in range(0, main_iters):
-            # async_wait makes LDS data ready for MFMA, but a fast wave can
-            # refill a slot while a slower wave is still reading its old data.
-            # TODO: Drop these barriers once Triton a772561 is in TokenSpeed.
-            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=0)
             self.async_wait(cfg.NUM_BUFFERS - 1)
 
@@ -1054,9 +1050,6 @@ class MoEPipelinedProgram:
 
         if not EVEN_K:
             # Masked tail iter (one more iter still has W to prefetch).
-            # Same slot reuse hazard as above.
-            # TODO: Drop these barriers once Triton a772561 is in TokenSpeed.
-            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=1)
             self.async_wait(cfg.NUM_BUFFERS - 1)
             if W_PREFETCH:
@@ -1124,16 +1117,12 @@ class MoEPipelinedProgram:
         odd_main = main_iters - unroll_pairs * 2
 
         for _ in range(0, unroll_pairs):
-            # All waves must finish reading the previous contents before any
-            # wave overwrites this LDS slot with the future async copy.
-            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             accumulator = self.mfma(x0, scale_x0, w0, scale_w0, accumulator)
             self.async_wait(cfg.NUM_BUFFERS - 1)
             x1, w1, scale_x1, scale_w1 = self.issue_local_loads(mfma_idx)
             mfma_idx += 1
 
-            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             accumulator = self.mfma(x1, scale_x1, w1, scale_w1, accumulator)
             self.async_wait(cfg.NUM_BUFFERS - 1)
@@ -1141,7 +1130,6 @@ class MoEPipelinedProgram:
             mfma_idx += 1
 
         if odd_main:
-            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             accumulator = self.mfma(x0, scale_x0, w0, scale_w0, accumulator)
             self.async_wait(cfg.NUM_BUFFERS - 1)
@@ -2002,7 +1990,6 @@ class MoESliceNProgram:
         odd_main = main_iters - unroll_pairs * 2
 
         for _ in range(0, unroll_pairs):
-            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
@@ -2010,7 +1997,6 @@ class MoESliceNProgram:
             x1, sx1 = self.issue_local_load_x(mfma_idx)
             mfma_idx += 1
 
-            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
             gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
@@ -2019,7 +2005,6 @@ class MoESliceNProgram:
             mfma_idx += 1
 
         if odd_main:
-            gl.barrier()
             load_idx = self.issue_global_loads(load_idx, USE_MASK=-1)
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
             gl.amd.cdna4.async_copy.wait_group(2 * NB - 1)
@@ -2081,10 +2066,7 @@ class MoESliceNProgram:
         odd_main = main_iters - unroll_pairs * 2
 
         for _ in range(0, unroll_pairs):
-            # The future copy reuses the slot just local-loaded into VGPRs.
-            # Synchronize the CTA before any producer wave overwrites it.
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
-            gl.barrier()
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
             gl.amd.cdna4.async_copy.wait_group(2 * (NB - 1))
             x1, sx1 = self.issue_local_load_x(mfma_idx)
@@ -2096,7 +2078,6 @@ class MoESliceNProgram:
             mfma_idx += 1
 
             c0 = self.mfma(x1, sx1, w10, sw10, c0)
-            gl.barrier()
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
             gl.amd.cdna4.async_copy.wait_group(2 * (NB - 1))
             x0, sx0 = self.issue_local_load_x(mfma_idx)
@@ -2109,7 +2090,6 @@ class MoESliceNProgram:
 
         if odd_main:
             c0 = self.mfma(x0, sx0, w00, sw00, c0)
-            gl.barrier()
             load_idx = self.issue_global_load_top(load_idx, USE_MASK=-1)
             gl.amd.cdna4.async_copy.wait_group(2 * (NB - 1))
             x1, sx1 = self.issue_local_load_x(mfma_idx)

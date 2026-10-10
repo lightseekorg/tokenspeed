@@ -793,7 +793,7 @@ def process_single_attention_tile(program: AttentionProgram):
         valid &= mask_offs_m[:, None] <= mask_offs_n[None, :] + cfg.WINDOW_LEFT
 
     qk = gl.where(valid, qk, -1.0e20)
-    row_has_valid = gl.sum(valid.to(gl.int32), axis=1) > 0
+    row_has_valid = gl.any(valid, axis=1)
     row_max = max(qk, 1)
     m_i = gl.where(row_has_valid, row_max, 0.0)
     m_i_scaled = m_i * cfg.SM_SCALE

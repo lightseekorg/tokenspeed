@@ -1,4 +1,4 @@
-# Agentic Benchmark — TokenSpeed
+# Agentic benchmark — TokenSpeed
 
 Sweep `ts serve` against an agentic, multi-turn workload (SWE-Smith) at a
 fixed set of attention/MoE parallelism layouts and report per-config throughput,
@@ -58,5 +58,5 @@ python3 collect_outputs.py outputs/<sweep_ts> -o sweep.csv
 Emits one row per (config, concurrency) with `Conc.`, `Latency (tps/user)`,
 `Throughput (tps/gpu)`, `Approx Cache Hit`, `Decoded Tok/Iter`. `tps/gpu` divides
 the system-wide `Total Throughput (tok/s)` by the GPU count inferred from the
-config name; the other metrics come straight from `benchmark_summary.json`
+config name. The other metrics come straight from `benchmark_summary.json`
 (same numbers as evalscope's `performance_summary.txt` Request Metrics table).
