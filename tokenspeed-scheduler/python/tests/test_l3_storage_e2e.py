@@ -47,6 +47,7 @@ def _l3_config(
     cfg.prefix_granularity = 2
     cfg.num_device_pages = num_device_pages
     cfg.num_host_pages = num_host_pages
+    cfg.num_snapshot_pages = 1  # never retracts for capacity
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
     cfg.enable_l3_storage = True
@@ -105,8 +106,8 @@ def _ack_load_back(scheduler, op_id: int, success: bool) -> None:
     scheduler.advance(execution_event)
 
 
-def _retract(scheduler, request_id: str) -> None:
-    event = ts.ForwardEvent.Retract()
+def _recompute_retract(scheduler, request_id: str) -> None:
+    event = ts.ForwardEvent.RecomputeRetract()
     event.request_id = request_id
     execution_event = ts.ExecutionEvent()
     execution_event.add_event(event)
@@ -198,6 +199,7 @@ def test_l3_host_shortage_rounds_down_to_prefix_grain() -> None:
     cfg.prefix_granularity = 4
     cfg.num_device_pages = 32
     cfg.num_host_pages = 2
+    cfg.num_snapshot_pages = 1  # never retracts for capacity
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
     cfg.enable_l3_storage = True
@@ -362,7 +364,8 @@ def test_l3_host_eviction_still_prefetches_registered_prefix() -> None:
 
 
 def test_vanished_l3_prefetch_retracts_then_readmits_as_cold_miss() -> None:
-    """A missed batch_get_into retracts snapshot-less; the next admit recomputes."""
+    """A missed batch_get_into drops the request back to Submitted without an
+    image; the next admission recomputes from the tokens."""
 
     scheduler = ts.Scheduler(
         _l3_config(num_device_pages=32, num_host_pages=32, with_swa=False)
@@ -386,7 +389,9 @@ def test_vanished_l3_prefetch_retracts_then_readmits_as_cold_miss() -> None:
     assert first.extend_prefix_lens[0] > 0
 
     scheduler.unregister_storage_keys(group_ids, expanded, offsets)
-    _retract(scheduler, "r1")
+    _recompute_retract(scheduler, "r1")
+    assert scheduler.retracted_size() == 0, "a recompute holds no image"
+    assert scheduler.waiting_size() == 1
     _ack_load_back(scheduler, load.op_ids[0], success=False)
 
     retry = scheduler.next_execution_plan()

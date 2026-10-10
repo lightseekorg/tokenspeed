@@ -25,6 +25,7 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.prefix_granularity = PAGE
     cfg.num_device_pages = 33  # page 0 = null sentinel, 32 usable
     cfg.num_host_pages = 0
+    cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
     cfg.enable_l3_storage = False

@@ -44,9 +44,9 @@
 Writable types:
 1. SchedulerConfig
 2. RequestSpec
-3. ForwardEvent
-4. AbortEvent
-5. cache::*DoneEvent
+3. ForwardEvent (ExtendResult, Finish, Abort, RecomputeRetract, UpdateReserveNumTokens)
+4. PD::*Event
+5. cache::*DoneEvent (WriteBack, LoadBack, Snapshot, Restore)
 
 All other types are produced by the scheduler and consumed by Python, so they do
 not need writable properties.
@@ -153,6 +153,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_rw(
             "num_host_pages", [](const tokenspeed::SchedulerConfig& c) { return c.host_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.host_allocator.total_pages = v; })
+        // The request-private snapshot pool (virtual block count including
+        // the null page): 1 means the engine never retracts.
+        .def_prop_rw(
+            "num_snapshot_pages", [](const tokenspeed::SchedulerConfig& c) { return c.snapshot_allocator.total_pages; },
+            [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.snapshot_allocator.total_pages = v; })
+        .def_rw("max_retracted_requests", &tokenspeed::SchedulerConfig::max_retracted_requests)
+        .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
@@ -202,9 +209,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::forward::Abort::request_id);
 
-    nb::class_<tokenspeed::forward::Retract>(forward_event, "Retract")
+    nb::class_<tokenspeed::forward::RecomputeRetract>(forward_event, "RecomputeRetract")
         .def(nb::init<>())
-        .def_rw("request_id", &tokenspeed::forward::Retract::request_id);
+        .def_rw("request_id", &tokenspeed::forward::RecomputeRetract::request_id);
 
     nb::class_<tokenspeed::forward::UpdateReserveNumTokens>(forward_event, "UpdateReserveNumTokens")
         .def(nb::init<>())
@@ -225,6 +232,19 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<std::uint32_t, bool>(), nb::arg("op_id"), nb::arg("success"))
         .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id)
         .def_rw("success", &tokenspeed::cache::LoadBackDone::success);
+
+    nb::class_<tokenspeed::cache::SnapshotDone>(cache, "SnapshotDoneEvent")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::cache::SnapshotDone::op_id);
+
+    nb::class_<tokenspeed::cache::RestoreDone>(cache, "RestoreDoneEvent")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::cache::RestoreDone::op_id);
+
+    // RestoreOp.source_tiers carries these as plain integers per row.
+    nb::enum_<tokenspeed::HostTier>(cache, "HostTier", nb::is_arithmetic())
+        .value("L2", tokenspeed::HostTier::kL2)
+        .value("SnapshotPool", tokenspeed::HostTier::kSnapshotPool);
 
     nb::class_<tokenspeed::pd::BootstrappedEvent>(pd, "BootstrappedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
@@ -308,6 +328,34 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("page_offsets", &tokenspeed::WriteBackBatch::page_offsets)
         .def_ro("source_pinned", &tokenspeed::WriteBackBatch::source_pinned);
 
+    // A retraction image's tail leg: DEVICE -> snapshot pool rows (possibly
+    // none) plus the slot-state blob of request_pool_indices[i], exported
+    // into snapshot_slots[i]. Stream-ordered like an unpinned write-back.
+    nb::class_<tokenspeed::SnapshotStoreBatch>(cache, "SnapshotOp")
+        .def_ro("op_ids", &tokenspeed::SnapshotStoreBatch::op_ids)
+        .def_ro("request_ids", &tokenspeed::SnapshotStoreBatch::request_ids)
+        .def_ro("request_pool_indices", &tokenspeed::SnapshotStoreBatch::request_pool_indices)
+        .def_ro("snapshot_slots", &tokenspeed::SnapshotStoreBatch::snapshot_slots)
+        .def_ro("group_ids", &tokenspeed::SnapshotStoreBatch::group_ids)
+        .def_ro("src_pages", &tokenspeed::SnapshotStoreBatch::src_pages)
+        .def_ro("dst_pages", &tokenspeed::SnapshotStoreBatch::dst_pages);
+
+    // The way back: Host -> DEVICE rows, each naming its source tier
+    // (HostTier as an integer: 0 = L2, 1 = snapshot pool; L2 rows carry their
+    // key), plus the blob of snapshot_slots[i] imported into
+    // request_pool_indices[i]. Runs after the plan's zeroing.
+    nb::class_<tokenspeed::SnapshotRestoreBatch>(cache, "RestoreOp")
+        .def_ro("op_ids", &tokenspeed::SnapshotRestoreBatch::op_ids)
+        .def_ro("request_ids", &tokenspeed::SnapshotRestoreBatch::request_ids)
+        .def_ro("request_pool_indices", &tokenspeed::SnapshotRestoreBatch::request_pool_indices)
+        .def_ro("snapshot_slots", &tokenspeed::SnapshotRestoreBatch::snapshot_slots)
+        .def_ro("group_ids", &tokenspeed::SnapshotRestoreBatch::group_ids)
+        .def_ro("src_pages", &tokenspeed::SnapshotRestoreBatch::src_pages)
+        .def_ro("dst_pages", &tokenspeed::SnapshotRestoreBatch::dst_pages)
+        .def_ro("content_hashes", &tokenspeed::SnapshotRestoreBatch::content_hashes)
+        .def_ro("page_offsets", &tokenspeed::SnapshotRestoreBatch::page_offsets)
+        .def_ro("source_tiers", &tokenspeed::SnapshotRestoreBatch::source_tiers);
+
     auto collect_forward = [](const tokenspeed::ExecutionPlan& plan) -> nb::list {
         nb::list result;
         for (const auto& op : plan.Operations()) {
@@ -382,7 +430,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("bootstrapping_size", &tokenspeed::Scheduler::BootstrappingSize,
              "Count requests waiting for their PD bootstrap handshake.")
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize,
-             "Count Submitted and Retracted requests awaiting admission or readmission.")
+             "Count Submitted, Retracted and Restoring requests awaiting admission or their restore.")
+        .def("retracted_size", &tokenspeed::Scheduler::RetractedSize,
+             "Count requests suspended with an image (Retracted or Restoring); a weight update must not flush "
+             "while this is non-zero.")
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize, "Count requests in the Decoding FSM state.")
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
              "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
@@ -394,6 +445,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
         .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)
+        .def("snapshot_pool_free_blocks", &tokenspeed::Scheduler::SnapshotPoolFreeBlocks,
+             "Empty parents of the request-private snapshot pool (a leak check: every block belongs to some "
+             "suspended request's image).")
+        .def("host_pool_pinned_blocks", &tokenspeed::Scheduler::HostPoolPinnedBlocks,
+             "Host L2 entries pinned by a request -- a suspended request's image, or an in-flight transfer.")
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)
