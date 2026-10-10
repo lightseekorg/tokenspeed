@@ -239,7 +239,8 @@ sink applied once.
 - The gfx950 prefill kernel accepts contiguous BF16 queries shaped
   `(tokens, heads, 512)`, a dense BF16 KV workspace, contiguous int32 selected
   indices and lengths, and a contiguous BF16 or FP32 sink. Registered selected
-  widths are 384, 512, 640, 768, 1024, and 1152.
+  widths are 128, 384, 512, 640, 768, 1024, and 1152. `q` and the workspace
+  must each be smaller than 2 GiB (32-bit buffer offsets).
 - The gfx950 decode kernel specializes for one to six tokens, 16 or 32 heads,
   128 SWA slots, 1024 compressed-cache slots, and 64-row pages. Both cache
   segments are required.
@@ -260,9 +261,23 @@ sink applied once.
 #### Algorithm
 
 On gfx950, the indexer scores 256-candidate chunks with CDNA4 scaled MFMA and
-reuses the DSA radix top-k reduction. Selected prefill uses CDNA4 asynchronous
-buffer-to-LDS copies and double-buffered KV tiles; 64- and 128-head cases use a
-64-head sparse kernel with a shape-selected 32- or 64-row tile. Selected decode
+reuses the DSA radix top-k reduction. Selected prefill gives each
+(token, 16-head group) one four-wave workgroup; the 16 heads are the MFMA M
+dimension, so every gathered 1 KiB KV row feeds all of them. Selected rows are
+sanitized once per token (invalid, padded, and out-of-length slots become an
+out-of-range row that buffer loads read as zeros) and 32-row tiles are
+double-buffered with asynchronous buffer-to-LDS copies. Wave w computes the
+QK^T partial over channels `[128w, 128w + 128)`, the partials are summed
+through LDS, wave w runs the online softmax for heads `[4w, 4w + 4)`, and P
+and the rescale factors return through LDS for the PV MFMA, whose output
+channels the waves split. Full-rate 16x16x32 MFMAs serve both products; the
+transposed score layout already is the PV A operand. The kernel stays under
+80 KiB of LDS so two workgroups share a CU, and each XCD processes a
+contiguous token range so neighbouring tokens' overlapping rows hit in its L2.
+The prefill gathers `tokens x width` KV rows into LDS once per 16 heads; that
+on-CU traffic (LDS writes plus K and V reads), not HBM or MFMA, bounds it.
+64- and 128-head cases with widths above 128 use a 64-head sparse kernel with
+a shape-selected 32- or 64-row tile. Selected decode
 uses 16-head by 32-row tiles, four wave64s, and 18 fixed KV partitions. Its
 second kernel combines the partial outputs and log-sum-exp values before
 applying the sink.
