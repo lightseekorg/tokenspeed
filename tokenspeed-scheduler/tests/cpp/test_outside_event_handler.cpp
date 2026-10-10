@@ -328,16 +328,69 @@ TEST_F(DisaggDecodePriorityTestSuite, PrefillDoneDoesNotMixWithAnotherSubmittedR
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
+// D-role retraction: two request slots, six usable Device parents. "running"
+// (2-page prompt, 3 blocks) decodes beside "other" (2-page prompt, 3 blocks)
+// whose remote prefill never completes until the test says so -- a
+// RemotePrefilling request is PD-pinned, never a victim, and holds its pages
+// without growing. A third prompt, "blocked", then finds no room.
 class DecodeRetractionL2TestSuite : public DisaggDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = false;
-        cfg.device_allocator.total_pages = 5;  // null parent + one four-page recovery working set
+        cfg.device_allocator.total_pages = 7;
+        cfg.host_allocator.total_pages = 7;
+        cfg.max_batch_size = 2;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
+    }
+
+    // Admits "running" and "other" remotely, lands "running" and lets it
+    // decode until it needs a fourth page while "blocked" waits: that round
+    // retracts "running" (the blocker itself; its pages serve the waiting
+    // prompt) and admits "blocked" on them. Returns the retraction round.
+    // Post: running is Retracted at 7 tokens (6 computed, 3 pages), other is
+    // RemotePrefilling, blocked is RemotePrefilling, the Device pool is full.
+    void DriveRunningToRetraction(ExecutionPlan& retract) {
+        Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1),
+                MakeRequestSpec("other", /*num_pages=*/2, /*start=*/201)});
+        SendBootstrapped("running");
+        SendBootstrapped("other");
+        ExecutionPlan first = PlanOnce();
+        ASSERT_NE(FindRemoteAdmission(first), nullptr);
+        ASSERT_EQ(FindRemoteAdmission(first)->request_ids, (std::vector<std::string>{"running"}));
+        ExecutionPlan second = PlanOnce();
+        ASSERT_NE(FindRemoteAdmission(second), nullptr);
+        ASSERT_EQ(FindRemoteAdmission(second)->request_ids, (std::vector<std::string>{"other"}));
+        SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+
+        Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
+        SendBootstrapped("blocked");
+        // Two decodes fit the reserve (tokens 5 and 6); the third needs a page.
+        for (const std::int32_t token : {43, 44}) {
+            ExecutionPlan decode = PlanOnce();
+            const ForwardBatch* forward = FindForwardBatch(decode.Operations());
+            ASSERT_NE(forward, nullptr);
+            ASSERT_EQ(forward->request_ids, (std::vector<std::string>{"running"}));
+            ASSERT_EQ(FindRemoteAdmission(decode), nullptr) << "blocked does not fit";
+            ASSERT_EQ(scheduler_->RetractedSize(), 0u) << "a request with a forward out is never retracted";
+            SendForwardDone("running", {token});
+        }
+        retract = PlanOnce();
+        ASSERT_EQ(scheduler_->RetractedSize(), 1u) << "running gave way";
+        ASSERT_TRUE(FindForwardBatch(retract.Operations())->request_ids.empty());
+        ASSERT_NE(FindRemoteAdmission(retract), nullptr);
+        ASSERT_EQ(FindRemoteAdmission(retract)->request_ids, (std::vector<std::string>{"blocked"}))
+            << "the freed pages serve the waiting prompt in the same round";
+        ASSERT_EQ(scheduler_->RequestTokenSize("running"), 7);
+    }
+
+    void FinishRemote(const std::string& request_id, std::int32_t bootstrap_token) {
+        SendRemotePrefillDone(request_id, bootstrap_token);
+        SendAbortEvent(request_id);
     }
 };
 
@@ -354,13 +407,16 @@ protected:
     }
 };
 
-class DecodeRetractionMixedPrefillTestSuite : public DecodeRetractionL2TestSuite {
+// Eight usable parents and three slots: room for a restore beside a decoding
+// request and a remote admission in the same round once a large pinned
+// neighbour leaves.
+class DecodeRetractionMixedTestSuite : public DecodeRetractionL2TestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
-        cfg.device_allocator.total_pages = 6;
+        cfg.device_allocator.total_pages = 9;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
-        cfg.max_batch_size = 2;
+        cfg.max_batch_size = 3;
         SetTestSnapshotPool(cfg);
         return cfg;
     }
@@ -434,160 +490,128 @@ TEST_F(DecodeRetractionL2TestSuite, InitialAdmissionAndDecodeDoNotUsePrefixL2) {
 TEST_F(DecodeRetractionL2TestSuite, AnAbortedVictimStopsQualifyingForReadmission) {
     // Readmission order is read off the Retracted states themselves, so a
     // victim that dies while retracted simply stops qualifying -- there is no
-    // separate queue that could still name it.
-    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
-    SendBootstrapped("running");
-    PlanOnce();
-    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
-    PlanOnce();
-    SendForwardDone("running", {43});
-
-    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
-    SendBootstrapped("blocked");
+    // separate queue that could still name it -- and its image dies with it.
     ExecutionPlan retract;
-    std::vector<CacheOperation> write_back_ops;
-    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
-        retract = PlanOnce();
-        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(retract);
-        if (FindRequestIndex(FindForwardBatch(retract.Operations()), "running") >= 0) {
-            SendForwardDone("running", {token});
-        }
-    }
-    ASSERT_EQ(write_back_ops.size(), 1u);
-    SendWriteBackDone(std::get<WriteBackBatch>(write_back_ops.front()).op_ids.front());
-    // The retraction round granted the freed capacity to the blocked request
-    // within the same plan; only the victim is left waiting.
-    ASSERT_NE(FindRemoteAdmission(retract), nullptr);
-    ASSERT_EQ(FindRemoteAdmission(retract)->request_ids, (std::vector<std::string>{"blocked"}));
+    DriveRunningToRetraction(retract);
+    ASSERT_NE(FindSnapshotStore(retract), nullptr);
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 6) << "6 computed tokens end on a page boundary: no tail page";
+    AckImageStores(retract);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 3) << "the image pins its three published pages on Host";
 
-    // The victim dies before it is ever readmitted.
+    // The victim dies before it is ever restored.
     SendAbortEvent("running");
     EXPECT_EQ(scheduler_->WaitingSize(), 0u) << "the aborted victim leaves the waiting set";
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 6) << "its image is released";
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "and its Host L2 pins; the entries stay cached";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
 
+    FinishRemote("blocked", /*bootstrap_token=*/142);
+    FinishRemote("other", /*bootstrap_token=*/242);
     const ExecutionPlan after_abort = PlanOnce();
-    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(after_abort).empty())
-        << "an aborted victim must not be readmitted";
+    EXPECT_EQ(FindRestore(after_abort), nullptr) << "an aborted victim must not be restored";
 }
 
-TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRun) {
-    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
-    SendBootstrapped("running");
-    PlanOnce();
-    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
-    PlanOnce();
-    SendForwardDone("running", {43});
-
-    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
-    SendBootstrapped("blocked");
+TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestoresTheVictimLater) {
     ExecutionPlan retract;
-    std::vector<CacheOperation> write_back_ops;
-    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
-        retract = PlanOnce();
-        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(retract);
-        const ForwardBatch* forward = FindForwardBatch(retract.Operations());
-        if (write_back_ops.empty() && forward != nullptr && !forward->request_ids.empty()) {
-            ASSERT_EQ(forward->request_ids, (std::vector<std::string>{"running"}));
-            SendForwardDone("running", {token});
-        }
-    }
+    DriveRunningToRetraction(retract);
+
+    // The image's L2 leg is today's stream-ordered store of the published
+    // pages; its tail leg -- here only the slot-state blob, since 6 computed
+    // tokens end on a page boundary -- is the snapshot store.
+    const auto write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(retract);
     ASSERT_EQ(write_back_ops.size(), 1u);
     const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
     ASSERT_EQ(write_back.op_ids.size(), 1u);
     EXPECT_EQ(write_back.source_pinned, std::vector<bool>{false})
         << "the victim's pages are granted away this round; the runtime must order the copy ahead of reuse";
-
-    // The retraction round grants the freed capacity to the blocked request
-    // in the same plan: its remote admission rides plan.remote_prefill.
-    const ForwardBatch* blocked = FindRemoteAdmission(retract);
-    ASSERT_NE(blocked, nullptr);
-    EXPECT_EQ(blocked->request_ids, (std::vector<std::string>{"blocked"}));
-    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(retract).empty())
-        << "recovering immediately would consume the capacity retraction just released";
+    EXPECT_EQ(write_back.src_pages.at(0).size(), 3u);
+    const SnapshotStoreBatch* store = FindSnapshotStore(retract);
+    ASSERT_NE(store, nullptr) << "the tail leg always rides the plan: it carries the slot-state blob";
+    EXPECT_EQ(store->request_ids, (std::vector<std::string>{"running"}));
+    EXPECT_TRUE(store->src_pages.at(0).empty());
+    EXPECT_EQ(store->snapshot_slots.at(0), 1) << "one blob slot, numbered from 1";
+    EXPECT_GE(store->request_pool_indices.at(0), 1) << "the victim's slot, to export from";
+    EXPECT_EQ(FindRestore(retract), nullptr) << "nothing is restored while its image is still in flight";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "the Retracted request remains visible as scheduler pressure";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0) << "other and blocked hold the pool";
 
     SendWriteBackDone(write_back.op_ids.front());
     SendWriteBackDone(write_back.op_ids.front());  // Duplicate ACK is ignored.
-    EXPECT_GT(scheduler_->HostPoolCachedBlocks(), 0)
-        << "retraction ACK must publish completed Host boundaries for future reuse";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3) << "the L2 leg's ACK publishes the Host entries";
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 3) << "and the suspended request pins every one of them";
+    SendSnapshotDone(store->op_ids.front());
+    SendSnapshotDone(store->op_ids.front());  // Duplicate ACK is ignored.
 
-    SendRemotePrefillDone("blocked", /*bootstrap_token=*/142);
-    SendAbortEvent("blocked");
+    // The restore (3 imaged pages + a decode slot) does not fit while other
+    // and blocked hold the pool: it waits and retracts nobody.
+    FinishRemote("blocked", /*bootstrap_token=*/142);
+    const ExecutionPlan waiting = PlanOnce();
+    EXPECT_EQ(FindRestore(waiting), nullptr);
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_TRUE(scheduler_->PdTransferPinned("other")) << "other is never a victim";
+    FinishRemote("other", /*bootstrap_token=*/242);
 
+    // The restore rides beside an empty decode batch: no local prefill, no
+    // load-back, and the request is schedulable only after the ACK.
     const ExecutionPlan recovery = PlanOnce();
-    const ForwardBatch* recovered = FindForwardBatch(recovery.Operations());
-    ASSERT_NE(recovered, nullptr);
-    EXPECT_EQ(recovered->request_ids, (std::vector<std::string>{"running"}));
-    EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty());
-    EXPECT_EQ(scheduler_->DecodingSize(), 0u)
-        << "a retracted request returns to Decode only after local prefill completes";
+    ASSERT_TRUE(FindForwardBatch(recovery.Operations())->request_ids.empty());
+    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty());
+    const SnapshotRestoreBatch* restore = FindRestore(recovery);
+    ASSERT_NE(restore, nullptr);
+    EXPECT_EQ(restore->request_ids, (std::vector<std::string>{"running"}));
+    EXPECT_EQ(restore->snapshot_slots.at(0), 1);
+    EXPECT_GE(restore->request_pool_indices.at(0), 1) << "the new slot, to import into";
+    EXPECT_EQ(restore->src_pages.at(0).size(), 3u) << "the published pages come back from L2";
+    for (const std::uint8_t tier : restore->source_tiers.at(0)) {
+        EXPECT_EQ(tier, static_cast<std::uint8_t>(HostTier::kL2));
+    }
+    EXPECT_EQ(scheduler_->DecodingSize(), 0u) << "a retracted request returns to Decode only after the ACK";
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    SendRestoreDone(restore->op_ids.front());
+    SendRestoreDone(restore->op_ids.front());  // Duplicate ACK is ignored.
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the restore released the pins";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3) << "the entries stay cached";
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 6);
+    EXPECT_EQ(scheduler_->RequestTokenSize("running"), 7) << "the same tokens, nothing rebased";
+
+    const ExecutionPlan decode = PlanOnce();
+    const ForwardBatch* resumed = FindForwardBatch(decode.Operations());
+    ASSERT_NE(resumed, nullptr);
+    EXPECT_EQ(resumed->request_ids, (std::vector<std::string>{"running"}));
+    EXPECT_EQ(resumed->NumExtends(), 0u) << "the D role runs no prefill of any kind";
+    EXPECT_EQ(resumed->decode_input_ids.front(), -1) << "a decoding victim resumes an ordinary decode";
+    EXPECT_EQ(resumed->block_tables.at("full").at(0).size(), 4u) << "3 restored pages and the decode slot";
 }
 
-TEST_F(DecodeRetractionNoPrefixCacheTestSuite, RecoveryLoadsItsRetractionSnapshot) {
-    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
-    SendBootstrapped("running");
-    PlanOnce();
-    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
-    PlanOnce();
-    SendForwardDone("running", {43});
-
-    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
-    SendBootstrapped("blocked");
+TEST_F(DecodeRetractionNoPrefixCacheTestSuite, RestoreUsesItsOwnImageWithPrefixCachingDisabled) {
     ExecutionPlan retract;
-    std::vector<CacheOperation> write_back_ops;
-    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
-        retract = PlanOnce();
-        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(retract);
-        const ForwardBatch* forward = FindForwardBatch(retract.Operations());
-        if (write_back_ops.empty() && forward != nullptr && !forward->request_ids.empty()) {
-            SendForwardDone("running", {token});
-        }
-    }
-    ASSERT_EQ(write_back_ops.size(), 1u);
-    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
-    ASSERT_EQ(write_back.op_ids.size(), 1u);
-    SendWriteBackDone(write_back.op_ids.front());
-
-    // The blocked admission was granted in the retraction round itself.
-    ASSERT_NE(FindRemoteAdmission(retract), nullptr);
-    ASSERT_EQ(FindRemoteAdmission(retract)->request_ids, (std::vector<std::string>{"blocked"}));
-    SendRemotePrefillDone("blocked", /*bootstrap_token=*/142);
-    SendAbortEvent("blocked");
+    DriveRunningToRetraction(retract);
+    // The victim's own pages are published for its image whatever the prefix
+    // cache setting: disabling ordinary request-to-request reuse only stops
+    // the admission probe.
+    EXPECT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(retract).empty())
+        << "disabling ordinary prefix caching must not hide a request's own image";
+    AckImageStores(retract);
+    FinishRemote("blocked", /*bootstrap_token=*/142);
+    FinishRemote("other", /*bootstrap_token=*/242);
 
     const ExecutionPlan recovery = PlanOnce();
-    EXPECT_FALSE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty())
-        << "disabling ordinary prefix caching must not hide a request's own retraction snapshot";
+    const SnapshotRestoreBatch* restore = FindRestore(recovery);
+    ASSERT_NE(restore, nullptr);
+    EXPECT_EQ(restore->src_pages.at(0).size(), 3u) << "the image comes back by copy";
+    AckRestores(recovery);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
 TEST_F(DecodeRetractionL2TestSuite, RemotePrefillInFlightStallsAdditionalAdmission) {
-    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
-    SendBootstrapped("running");
-    PlanOnce();
-    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
-    PlanOnce();
-    SendForwardDone("running", {43});
-
-    Submit({MakeRequestSpec("blocked-a", /*num_pages=*/2, /*start=*/101),
-            MakeRequestSpec("blocked-b", /*num_pages=*/2, /*start=*/201)});
-    SendBootstrapped("blocked-a");
-    SendBootstrapped("blocked-b");
     ExecutionPlan retract;
-    std::vector<CacheOperation> write_back_ops;
-    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
-        retract = PlanOnce();
-        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(retract);
-        if (FindRequestIndex(FindForwardBatch(retract.Operations()), "running") >= 0) {
-            SendForwardDone("running", {token});
-        }
-    }
-    ASSERT_EQ(write_back_ops.size(), 1u);
-    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
-    ASSERT_EQ(write_back.op_ids.size(), 1u);
-    SendWriteBackDone(write_back.op_ids.front());
-
-    // The retraction round granted exactly ONE remote admission.
-    ASSERT_NE(FindRemoteAdmission(retract), nullptr);
-    ASSERT_EQ(FindRemoteAdmission(retract)->request_ids, (std::vector<std::string>{"blocked-a"}));
+    DriveRunningToRetraction(retract);
+    AckImageStores(retract);
+    Submit({MakeRequestSpec("blocked-b", /*num_pages=*/2, /*start=*/301)});
+    SendBootstrapped("blocked-b");
 
     const ExecutionPlan stalled = PlanOnce();
     EXPECT_EQ(FindRemoteAdmission(stalled), nullptr)
@@ -595,151 +619,117 @@ TEST_F(DecodeRetractionL2TestSuite, RemotePrefillInFlightStallsAdditionalAdmissi
     const ForwardBatch* forward = FindForwardBatch(stalled.Operations());
     ASSERT_NE(forward, nullptr);
     EXPECT_TRUE(forward->request_ids.empty());
+    EXPECT_EQ(FindRestore(stalled), nullptr) << "the restore waits for capacity and a request slot";
 }
 
 TEST_F(DecodeRetractionL2TestSuite, PrefillDoneRunsBeforeRetractedRecovery) {
-    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
-    SendBootstrapped("running");
-    PlanOnce();
-    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
-    PlanOnce();
-    SendForwardDone("running", {43});
-
-    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
-    SendBootstrapped("blocked");
-    std::vector<CacheOperation> write_back_ops;
-    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
-        const ExecutionPlan plan = PlanOnce();
-        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
-        if (FindRequestIndex(FindForwardBatch(plan.Operations()), "running") >= 0) {
-            SendForwardDone("running", {token});
-        }
-    }
-    ASSERT_EQ(write_back_ops.size(), 1u);
-    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
-    ASSERT_EQ(write_back.op_ids.size(), 1u);
-    SendWriteBackDone(write_back.op_ids.front());
-
+    ExecutionPlan retract;
+    DriveRunningToRetraction(retract);
+    AckImageStores(retract);
     SendRemotePrefillDone("blocked", /*bootstrap_token=*/142);
 
+    // Both request slots are taken (other, blocked): the ready decode runs
+    // and the restore waits for a slot without stalling it.
     const ExecutionPlan next = PlanOnce();
     const ForwardBatch* forward = FindForwardBatch(next.Operations());
     ASSERT_NE(forward, nullptr);
     ASSERT_FALSE(forward->request_ids.empty());
     EXPECT_EQ(forward->request_ids.front(), "blocked")
         << "a ready Decode request must run before recovery can consume its capacity";
+    EXPECT_EQ(forward->decode_input_ids.front(), 142);
+    EXPECT_EQ(FindRestore(next), nullptr);
 }
 
-TEST_F(DecodeRetractionMixedPrefillTestSuite, LocalRecoveryDoesNotBatchWithRemotePrefill) {
-    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
+TEST_F(DecodeRetractionMixedTestSuite, ARestoreRidesBesideTheDecodeBatchAndARemoteAdmission) {
+    // Eight usable parents: running (3) and other (a 4-page prompt, 5) fill
+    // the pool; "blocked-a" (a 1-page prompt, 2 blocks) does not fit, and
+    // running gives way at its third decode.
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1),
+            MakeRequestSpec("other", /*num_pages=*/4, /*start=*/201)});
     SendBootstrapped("running");
+    SendBootstrapped("other");
     PlanOnce();
+    PlanOnce();
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
     SendRemotePrefillDone("running", /*bootstrap_token=*/42);
-    PlanOnce();
-    SendForwardDone("running", {43});
-
-    Submit({MakeRequestSpec("blocked-a", /*num_pages=*/2, /*start=*/101)});
+    Submit({MakeRequestSpec("blocked-a", /*num_pages=*/1, /*start=*/101)});
     SendBootstrapped("blocked-a");
     ExecutionPlan retract;
-    std::vector<CacheOperation> write_back_ops;
-    for (std::int32_t token = 44; token < 60 && write_back_ops.empty(); ++token) {
+    for (std::int32_t token = 43; token < 60 && scheduler_->RetractedSize() == 0u; ++token) {
         retract = PlanOnce();
-        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(retract);
         if (FindRequestIndex(FindForwardBatch(retract.Operations()), "running") >= 0) {
             SendForwardDone("running", {token});
         }
     }
-    ASSERT_EQ(write_back_ops.size(), 1u);
-    const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
-    ASSERT_EQ(write_back.op_ids.size(), 1u);
-    SendWriteBackDone(write_back.op_ids.front());
-
-    // The blocked admission was granted in the retraction round itself.
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
     ASSERT_NE(FindRemoteAdmission(retract), nullptr);
     ASSERT_EQ(FindRemoteAdmission(retract)->request_ids, (std::vector<std::string>{"blocked-a"}));
+    ASSERT_EQ(scheduler_->RequestTokenSize("running"), 7);
+    AckImageStores(retract);
     SendRemotePrefillDone("blocked-a", /*bootstrap_token=*/142);
-    SendAbortEvent("blocked-a");
-    Submit({MakeRequestSpec("blocked-b", /*num_pages=*/2, /*start=*/201)});
+    FinishRemote("other", /*bootstrap_token=*/242);
+    Submit({MakeRequestSpec("blocked-b", /*num_pages=*/1, /*start=*/301)});
     SendBootstrapped("blocked-b");
 
-    int local_recovery_chunks = 0;
-    for (int chunk = 0; chunk < 8; ++chunk) {
-        const ExecutionPlan recovery = PlanOnce();
-        for (const CacheOperation& operation : ExtractCacheOpsOfKind<LoadBackBatch>(recovery)) {
-            const auto& load = std::get<LoadBackBatch>(operation);
-            for (std::uint32_t op_id : load.op_ids) {
-                SendLoadBackDone(op_id, /*success=*/true);
-            }
-        }
-        const ForwardBatch* forward = FindForwardBatch(recovery.Operations());
-        ASSERT_NE(forward, nullptr);
-        if (forward->request_ids.empty()) {
-            continue;
-        }
-        EXPECT_EQ(forward->request_ids, (std::vector<std::string>{"running"}));
-        EXPECT_EQ(FindRemoteAdmission(recovery), nullptr)
-            << "a local recovery chunk seals its round against remote admissions";
-        EXPECT_FALSE(scheduler_->PdTransferPinned("running"))
-            << "Decode-side local recovery must not wait for a nonexistent PD transfer completion";
-        if (++local_recovery_chunks == 2) {
-            break;
-        }
-    }
-    EXPECT_EQ(local_recovery_chunks, 2);
+    // One round: running's restore (a cache op: 3 pages + a decode slot),
+    // blocked-a's first decode (the batch) and blocked-b's remote admission
+    // (the remote stream) all ride together; nothing claims the round.
+    const ExecutionPlan together = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(together);
+    ASSERT_NE(restore, nullptr);
+    EXPECT_EQ(restore->request_ids, (std::vector<std::string>{"running"}));
+    const ForwardBatch* forward = FindForwardBatch(together.Operations());
+    ASSERT_NE(forward, nullptr);
+    EXPECT_EQ(forward->request_ids, (std::vector<std::string>{"blocked-a"}));
+    EXPECT_EQ(forward->decode_input_ids.front(), 142);
+    ASSERT_NE(FindRemoteAdmission(together), nullptr);
+    EXPECT_EQ(FindRemoteAdmission(together)->request_ids, (std::vector<std::string>{"blocked-b"}));
+    EXPECT_FALSE(scheduler_->PdTransferPinned("running"))
+        << "a restore is no PD transfer: nothing waits for a nonexistent completion";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    AckRestores(together);
+    SendForwardDone("blocked-a", {143});
+
+    const ExecutionPlan both = PlanOnce();
+    const ForwardBatch* decodes = FindForwardBatch(both.Operations());
+    ASSERT_NE(decodes, nullptr);
+    EXPECT_EQ(decodes->request_ids, (std::vector<std::string>{"running", "blocked-a"}));
+    EXPECT_EQ(decodes->NumExtends(), 0u);
 }
 
-TEST_F(DecodeRetractionWithoutL2TestSuite, RetractionRecoversByLocalPrefillWithoutHostCache) {
-    Submit({MakeRequestSpec("running", /*num_pages=*/1, /*start=*/1)});
-    SendBootstrapped("running");
-    PlanOnce();
-    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
-    PlanOnce();
-    SendForwardDone("running", {43});
+TEST_F(DecodeRetractionWithoutL2TestSuite, WithoutHostCacheTheWholeImageRidesTheSnapshotPool) {
+    ExecutionPlan retract;
+    DriveRunningToRetraction(retract);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(retract).empty()) << "no Host cache, no L2 leg";
+    const SnapshotStoreBatch* store = FindSnapshotStore(retract);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->src_pages.at(0).size(), 3u) << "every data page goes to the snapshot pool";
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 6 - 3);
+    AckImageStores(retract);
+    FinishRemote("blocked", /*bootstrap_token=*/142);
+    FinishRemote("other", /*bootstrap_token=*/242);
 
-    Submit({MakeRequestSpec("blocked", /*num_pages=*/1, /*start=*/101)});
-    SendBootstrapped("blocked");
-    bool blocked_admitted = false;
-    for (std::int32_t token = 44; !blocked_admitted && token < 60; ++token) {
-        const ExecutionPlan plan = PlanOnce();
-        EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(plan).empty());
-        const ForwardBatch* forward = FindForwardBatch(plan.Operations());
-        blocked_admitted = FindRequestIndex(FindRemoteAdmission(plan), "blocked") >= 0;
-        if (FindRequestIndex(forward, "running") >= 0) {
-            SendForwardDone("running", {token});
-        }
-    }
-
-    ASSERT_TRUE(blocked_admitted);
-    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
-    SendRemotePrefillDone("blocked", /*bootstrap_token=*/142);
-    SendAbortEvent("blocked");
     const ExecutionPlan recovery = PlanOnce();
-    const ForwardBatch* recovered = FindForwardBatch(recovery.Operations());
-    ASSERT_NE(recovered, nullptr);
-    EXPECT_EQ(recovered->request_ids, (std::vector<std::string>{"running"}));
-    EXPECT_GT(recovered->input_lengths.front(), 0) << "without Host L2, any missing suffix must be recomputed locally";
-    EXPECT_TRUE(ExtractCacheOpsOfKind<LoadBackBatch>(recovery).empty());
+    const SnapshotRestoreBatch* restore = FindRestore(recovery);
+    ASSERT_NE(restore, nullptr);
+    EXPECT_EQ(restore->src_pages.at(0).size(), 3u);
+    for (const std::uint8_t tier : restore->source_tiers.at(0)) {
+        EXPECT_EQ(tier, static_cast<std::uint8_t>(HostTier::kSnapshotPool));
+    }
+    for (const std::string& hash : restore->content_hashes.at(0)) {
+        EXPECT_TRUE(hash.empty()) << "pool rows carry no key";
+    }
+    EXPECT_TRUE(FindForwardBatch(recovery.Operations())->request_ids.empty()) << "no recompute of any suffix";
+    AckRestores(recovery);
+    EXPECT_EQ(scheduler_->RequestTokenSize("running"), 7);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 6);
 }
 
-TEST_F(DecodeRetractionL2TestSuite, WriteBackAckPublishesBestEffortHostEntries) {
-    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1)});
-    SendBootstrapped("running");
-    PlanOnce();
-    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
-    PlanOnce();
-    SendForwardDone("running", {43});
-
-    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
-    SendBootstrapped("blocked");
-    std::vector<CacheOperation> write_back_ops;
-    for (std::int32_t token = 44; token < 48 && write_back_ops.empty(); ++token) {
-        const ExecutionPlan plan = PlanOnce();
-        write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
-        const ForwardBatch* forward = FindForwardBatch(plan.Operations());
-        if (write_back_ops.empty() && forward != nullptr && !forward->request_ids.empty()) {
-            SendForwardDone("running", {token});
-        }
-    }
+TEST_F(DecodeRetractionL2TestSuite, WriteBackAckPublishesTheImagesHostEntries) {
+    ExecutionPlan retract;
+    DriveRunningToRetraction(retract);
+    const auto write_back_ops = ExtractCacheOpsOfKind<WriteBackBatch>(retract);
     ASSERT_EQ(write_back_ops.size(), 1u);
     const auto& write_back = std::get<WriteBackBatch>(write_back_ops.front());
     ASSERT_EQ(write_back.op_ids.size(), 1u);
@@ -747,14 +737,15 @@ TEST_F(DecodeRetractionL2TestSuite, WriteBackAckPublishesBestEffortHostEntries) 
     // The victim's pages were freed and immediately granted to the blocked
     // admission in the same round -- no D2H source pin holds them (the
     // execution stream orders the copy ahead of the granted request's use).
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 1);
-    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 6 - 3)
         << "the in-flight D2H operation must keep its Host destinations pinned";
 
     SendWriteBackDone(write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 1);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
-    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 3) << "published AND pinned by the suspended request";
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 6 - 3);
 }
 
 class PdSparseDecodeAdmissionTestSuite : public DisaggDecodeAdmissionTestSuite {
@@ -811,7 +802,7 @@ protected:
     }
 };
 
-class PdLocalRecoveryCapacityTestSuite : public PdSparseDecodeAdmissionTestSuite {
+class PdDecodeCapacityTestSuite : public PdSparseDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = PdSparseDecodeAdmissionTestSuite::MakeConfig();
@@ -848,12 +839,14 @@ protected:
     }
 };
 
-TEST_F(PdLocalRecoveryCapacityTestSuite, SingleRequestCapacityIncludesLocalRecoveryWorkingSet) {
-    // Full KV uses ceil(tokens / 4) parents. Non-overlap sparse local recovery
-    // of a chunked prompt needs four State parents: input checkpoint, aligned
-    // checkpoint, final output and the banked growth block. Eight usable parents
-    // therefore admit at most 16 total tokens.
-    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 16);
+TEST_F(PdDecodeCapacityTestSuite, SingleRequestCapacityChargesTheLandingShapeOnly) {
+    // Full KV uses one 2-token page per two tokens, two pages per parent. A
+    // State group lands its endpoint snapshot and banks one growth block: two
+    // parents, whatever the prompt length, since the D role never prefills
+    // locally -- a retracted request comes back by restoring that same shape.
+    // Eight usable parents therefore admit 24 total tokens: 12 pages = 6
+    // full-KV parents plus 2 state parents, where 25 would need a seventh.
+    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 24);
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, MaterializesHistoryAndLatestStateSnapshotAtomically) {

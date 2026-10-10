@@ -196,7 +196,7 @@ public:
     // references keep the Host blocks for as long as the request may be
     // restored.
     struct ImageTaken {
-        RetractionImage snapshot;
+        RetractionImage image;
         std::vector<BlockTransfer> store_pairs;
     };
     // Images every data slot not already served by Host L2 (host_cached_slots,
@@ -220,6 +220,7 @@ public:
     // epoch, carried on.
     std::optional<AdmissionResult> Restore(const RetractionImage& snapshot, std::span<const GroupDemand> demands,
                                            std::uint64_t request_access_epoch);
+    bool HasHostPool() const { return host_pool_ != nullptr; }
     bool HasSnapshotPool() const { return snapshot_pool_ != nullptr; }
     std::int32_t NumFreeSnapshotLcmBlocks() const {
         return snapshot_pool_ == nullptr ? 0 : snapshot_pool_->NumEmptyLcmBlocks();

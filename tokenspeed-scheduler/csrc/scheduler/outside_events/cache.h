@@ -40,7 +40,19 @@ struct LoadBackDone {
     LoadBackDone(std::uint32_t op_id, bool success) : op_id(op_id), success(success) {}
 };
 
+// A retraction image's tail leg (SnapshotStoreOperation) completed its D2H
+// copies and the slot-state export.
+struct SnapshotDone {
+    std::uint32_t op_id{};
+};
+
+// A SnapshotRestoreOperation completed every H2D row and the slot-state
+// import: the restored request is schedulable again.
+struct RestoreDone {
+    std::uint32_t op_id{};
+};
+
 };  // namespace cache
 
-using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone>;
+using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::SnapshotDone, cache::RestoreDone>;
 }  // namespace tokenspeed

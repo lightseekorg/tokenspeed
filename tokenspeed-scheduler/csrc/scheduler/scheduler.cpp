@@ -322,13 +322,14 @@ std::size_t Scheduler::BootstrappingSize() const {
 
 std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Submitted, fsm::Retracted>();
+        return request->IsAnyOf<fsm::Submitted, fsm::Retracted, fsm::Restoring>();
     }));
 }
 
 std::size_t Scheduler::RetractedSize() const {
-    return static_cast<std::size_t>(std::ranges::count_if(
-        requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Retracted>(); }));
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Retracted, fsm::Restoring>();
+    }));
 }
 
 std::size_t Scheduler::DecodingSize() const {
@@ -385,67 +386,41 @@ std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std:
 }
 
 std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
-    std::vector<Request*> candidates;
-    candidates.reserve(requests_.size());
-    for (const auto& request : requests_) {
-        candidates.push_back(request.get());
-    }
-    Request* readmission = nextReadmission(candidates);
-
     bool hol_blocks_new_prompts = false;
     for (const auto& request : requests_) {
-        const auto* prefilling = request->GetIf<fsm::Prefilling>();
-        if (prefilling != nullptr) {
+        if (request->Is<fsm::Prefilling>()) {
             hol_blocks_new_prompts = true;
             break;
         }
     }
-    const std::int32_t occupied = static_cast<std::int32_t>(PrefillSize() + DecodingSize());
+    // A restore takes a request slot too, so a suspended request counts as
+    // occupying one.
+    const std::int32_t occupied = static_cast<std::int32_t>(PrefillSize() + DecodingSize() + RetractedSize());
     const std::int32_t free_slots = config_.max_batch_size - occupied;
-    if (free_slots <= 0 && readmission == nullptr) {
+    if (free_slots <= 0 || hol_blocks_new_prompts || AvailableLcmBlocks() <= 0) {
         return {};
     }
 
     std::vector<std::string> hashes;
     std::unordered_set<std::string> seen;
-    const auto append_hashes = [&](const Request& request) {
-        std::vector<std::span<const std::int32_t>> prefix_pages = request.FullPrefixPages(/*except_last=*/false);
+    std::int32_t remaining = free_slots;
+    for (const auto& request : requests_) {
+        if (remaining <= 0) {
+            break;
+        }
+        if (!request->Is<fsm::Submitted>()) {
+            continue;
+        }
+        std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(/*except_last=*/false);
         const std::int32_t candidate_prefix_pages =
-            std::max((request.PrefillSize() - 1) / config_.prefix_granularity, 0);
+            std::max((request->PrefillSize() - 1) / config_.prefix_granularity, 0);
         prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
         for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
             if (seen.insert(content_hash).second) {
                 hashes.push_back(std::move(content_hash));
             }
         }
-    };
-    if (readmission != nullptr) {
-        append_hashes(*readmission);
-    }
-    if (free_slots <= 0 || hol_blocks_new_prompts || AvailableLcmBlocks() <= 0) {
-        return hashes;
-    }
-    std::int32_t remaining = free_slots;
-    if (readmission != nullptr) {
-        remaining = std::max(remaining - 1, 0);
-    }
-    for (Request* request : candidates) {
-        if (remaining <= 0) {
-            break;
-        }
-        if (request == readmission) {
-            continue;
-        }
-        if (request->Is<fsm::Submitted>()) {
-            append_hashes(*request);
-            --remaining;
-            continue;
-        }
-        const auto* retracted = request->GetIf<fsm::Retracted>();
-        if (retracted != nullptr && !retracted->HasRecoverableSnapshot()) {
-            append_hashes(*request);
-            --remaining;
-        }
+        --remaining;
     }
     return hashes;
 }
@@ -474,11 +449,11 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             candidates.push_back(request.get());
         }
     }
+    ++plan_calls_;
     ExecutionPlan plan;
-    auto [forward_operations, load_back_operations] =
-        buildForwardOperations(plan, std::move(candidates), write_back_operations);
+    BuiltOperations built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
 
-    plan.With(ForwardBatch{std::move(forward_operations)});
+    plan.With(ForwardBatch{std::move(built.forward)});
 
     if (config_.StreamsDeviceCacheToHost()) {
         // Boundary publications of live requests: their owners hold the pages,
@@ -489,11 +464,19 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         }
     }
 
+    // Store legs first (the runtime fences the forward thread's stream on the
+    // stream-ordered ones before the plan's page reuse), then the loads.
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
-    if (!load_back_operations.empty()) {
-        plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
+    if (!built.snapshot_stores.empty()) {
+        plan.With(CacheOperation{SnapshotStoreBatch{built.snapshot_stores}});
+    }
+    if (!built.load_backs.empty()) {
+        plan.With(CacheOperation{LoadBackBatch{built.load_backs}});
+    }
+    if (!built.snapshot_restores.empty()) {
+        plan.With(CacheOperation{SnapshotRestoreBatch{built.snapshot_restores}});
     }
     return plan;
 }

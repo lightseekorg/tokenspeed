@@ -46,9 +46,6 @@ namespace {
 static_assert(
     std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(std::declval<fsm::Submitted&&>())),
                    std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling, fsm::RemotePrefilling>>);
-static_assert(
-    std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(std::declval<fsm::Retracted&&>())),
-                   std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling, fsm::RemotePrefilling>>);
 static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillEvent&>()(std::declval<fsm::Prefilling&&>())),
                              std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling>>);
 
@@ -78,6 +75,29 @@ CacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_granularity
         g.sliding_window_tokens = sliding_window_tokens;
     }
     return g;
+}
+
+// Drives a request's FSM through a capacity retraction the way the scheduler
+// does: image the data slots into `snapshot_pool` (no Host L2 here), take a
+// blob slot, and suspend. The store pairs are dropped as the transfer manager
+// would after resolving them into the wire op.
+void RetractForTest(Request& request, CacheCoordinator& coordinator, SnapshotSlotAllocator& slots, std::int64_t epoch) {
+    // These FSM-level tests extend tokens without admitting pages for them,
+    // so image what the tables actually hold.
+    std::int32_t num_tokens = request.NumComputedTokens();
+    for (std::int32_t g = 0; g < coordinator.NumGroups(); ++g) {
+        const BlockTable& table = request.BlockTablesRef()[static_cast<std::size_t>(g)];
+        num_tokens =
+            std::min(num_tokens, table.NumBlocks() * coordinator.GroupBlockGranularity(g) - table.AvailableTokens());
+    }
+    std::optional<CacheCoordinator::ImageTaken> taken =
+        coordinator.TakeImage(request.BlockTablesRef(), num_tokens,
+                              std::vector<std::vector<ImageSlot>>(static_cast<std::size_t>(coordinator.NumGroups())));
+    ASSERT_TRUE(taken) << "the test's snapshot pool must hold the image";
+    taken->store_pairs.clear();
+    request.Apply(fsm::SnapshotRetractEvent{&coordinator, epoch, request.HasGeneratedOutput(), std::move(taken->image),
+                                            slots.Allocate(),
+                                            /*pending_store_ops=*/{}});
 }
 
 // Collect every real (>0) physical page id across all rows of a group.
@@ -1862,40 +1882,61 @@ TEST_F(CapacityBlockSuite, RetractsLargestRunningRequestImmediately) {
     EXPECT_TRUE(quiet_op->request_ids.empty());
 
     // Nothing is in flight now, so this blocked round retracts immediately.
+    // r1 and r2 tie at 2 generated tokens; deterministic candidate order
+    // picks r1, and r1 being the blocker itself, its pages serve the other
+    // blocked decode, r2, in the same round.
     SendForwardDone("r2", {144});
     ExecutionPlan retract_round = PlanOnce();
     const ForwardBatch* retract_op = FindForwardBatch(retract_round);
     ASSERT_NE(retract_op, nullptr);
-    EXPECT_TRUE(retract_op->request_ids.empty());
-    // r1 and r2 tie at 7 tokens; deterministic candidate order picks r1.
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6) << "r1's 3 pages x 2 groups return to the pool";
-    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "r1 requeues as a fresh prefill";
+    EXPECT_EQ(retract_op->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6 - 2) << "r1's 3 pages x 2 groups return; r2 takes a page pair";
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "r1 is suspended with its image";
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    // No Host cache: the whole image (6 computed tokens = 3 pages x 2 groups)
+    // goes to the snapshot pool; the store rides beside the empty batch.
+    const SnapshotStoreBatch* store = FindSnapshotStore(retract_round);
+    ASSERT_NE(store, nullptr);
+    ASSERT_EQ(store->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(store->src_pages.at(0).size(), 6u);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(retract_round).empty());
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 12 - 6);
 
-    // The remaining request can decode on the released pages.
+    // The remaining request keeps decoding on the released pages. r1's image
+    // has not been acknowledged, so no restore is attempted yet.
+    SendForwardDone("r2", {145});
     ExecutionPlan resumed = PlanOnce();
     const ForwardBatch* resumed_op = FindForwardBatch(resumed);
     ASSERT_NE(resumed_op, nullptr);
-    ASSERT_EQ(resumed_op->request_ids.size(), 1u);
-    EXPECT_EQ(resumed_op->request_ids.at(0), "r2");
-    SendForwardDone("r2", {145});
+    ASSERT_EQ(resumed_op->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(FindRestore(resumed), nullptr);
+    AckImageStores(retract_round);
+    SendForwardDone("r2", {146});
     SendFinish("r2");
 
-    // With r2 reaped, r1 re-admits: its prefill covers prompt + generated.
+    // With r2 reaped, r1 is restored: a cache op beside an empty batch, no
+    // prefill of any kind, and the prompt window untouched.
     ExecutionPlan readmit = PlanOnce();
-    const ForwardBatch* readmit_op = FindForwardBatch(readmit);
-    ASSERT_NE(readmit_op, nullptr);
-    ASSERT_EQ(readmit_op->request_ids.size(), 1u);
-    EXPECT_EQ(readmit_op->request_ids.at(0), "r1");
-    // Rebased to prompt + generated; whatever prefix survived is matched
-    // back and only the rest is re-computed.
-    EXPECT_EQ(readmit_op->prefill_lengths.at(0), 7);
-    EXPECT_EQ(readmit_op->extend_prefix_lens.at(0) + readmit_op->input_lengths.at(0), 7);
-    EXPECT_EQ(readmit_op->prefill_lengths.at(0), 7);
+    ASSERT_TRUE(FindForwardBatch(readmit)->request_ids.empty());
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(restore->src_pages.at(0).size(), 6u);
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "Restoring until the ACK";
+    EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+    AckRestores(readmit);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u) << "a decoding victim resumes Decoding";
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 12) << "the image is released once copied back";
+    EXPECT_EQ(scheduler_->RequestTokenSize("r1"), 7);
 
+    ExecutionPlan decode = PlanOnce();
+    const ForwardBatch* decode_op = FindForwardBatch(decode);
+    ASSERT_NE(decode_op, nullptr);
+    ASSERT_EQ(decode_op->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(decode_op->NumExtends(), 0u) << "no recovery prefill: the next step is an ordinary decode";
+    EXPECT_EQ(decode_op->prefill_lengths.at(0), 4) << "nothing was rebased";
     SendForwardDone("r1", {45});
-    PlanOnce();  // decode transition
-    SendForwardDone("r1", {46});
     SendFinish("r1");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 12);
@@ -1957,17 +1998,28 @@ TEST_F(ConsumedHeadroomRetractionSuite, ConsumedPartialHeadroomDoesNotDisableRet
     const ExecutionPlan blocked_plan = PlanOnce();
     const ForwardBatch* blocked = FindForwardBatch(blocked_plan);
     ASSERT_NE(blocked, nullptr);
-    EXPECT_TRUE(blocked->request_ids.empty());
+    EXPECT_EQ(blocked->request_ids, std::vector<std::string>{"b"}) << "a's pages serve b's blocked decode";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 1) << "a's two blocks freed, b took one";
 
+    AckImageStores(blocked_plan);
+    SendForwardDone("b", decode_result);
     SendFinish("b");
+    // "a" is restored -- its 4097 computed tokens come back by copy, not by a
+    // 4097-token prefill -- and resumes decoding.
     const ExecutionPlan readmit_plan = PlanOnce();
-    const ForwardBatch* readmit = FindForwardBatch(readmit_plan);
-    ASSERT_NE(readmit, nullptr);
-    ASSERT_EQ(readmit->request_ids, std::vector<std::string>{"a"});
-    EXPECT_EQ(readmit->input_lengths, std::vector<std::int32_t>{4097});
+    ASSERT_TRUE(FindForwardBatch(readmit_plan)->request_ids.empty());
+    const SnapshotRestoreBatch* restore = FindRestore(readmit_plan);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"a"});
+    EXPECT_EQ(restore->src_pages.at(0).size(), 2u) << "two 4096-token pages hold the computed tokens";
+    AckRestores(readmit_plan);
+    const ExecutionPlan decode_plan = PlanOnce();
+    const ForwardBatch* decode = FindForwardBatch(decode_plan);
+    ASSERT_NE(decode, nullptr);
+    ASSERT_EQ(decode->request_ids, std::vector<std::string>{"a"});
+    EXPECT_EQ(decode->NumExtends(), 0u);
     SendForwardDone("a", {44});
     SendFinish("a");
     PlanOnce();
@@ -2027,13 +2079,7 @@ protected:
         return cfg;
     }
 
-    void CompleteStores(const ExecutionPlan& plan) {
-        for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
-            for (std::uint32_t op_id : std::get<WriteBackBatch>(operation).op_ids) {
-                SendWriteBackDone(op_id);
-            }
-        }
-    }
+    void CompleteStores(const ExecutionPlan& plan) { AckImageStores(plan); }
 };
 
 TEST_F(FusedRetractionL2TestSuite, RetractionStoresTheLatestCompletedBoundary) {
@@ -2056,8 +2102,28 @@ TEST_F(FusedRetractionL2TestSuite, RetractionStoresTheLatestCompletedBoundary) {
     SendForwardDone("r2", {144});
 
     const ExecutionPlan retraction = PlanOnce();
-    EXPECT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(retraction).empty())
-        << "fused retraction must store the completed boundary before releasing request ownership";
+    // r1 = [1 2 3 4 42 43 44]: pages [1 2] [3 4] [42 43] are published and
+    // ride Host L2. The prompt pages were streamed to Host at prefill already
+    // (so were r2's), so the image pins those entries and the stream-ordered
+    // store copies only [42 43]; 6 computed tokens end on a page boundary, so
+    // no tail page rides the snapshot pool.
+    const auto write_backs = ExtractCacheOpsOfKind<WriteBackBatch>(retraction);
+    ASSERT_EQ(write_backs.size(), 1u) << "the image's L2 leg is a stream-ordered store";
+    const auto& write_back = std::get<WriteBackBatch>(write_backs.front());
+    ASSERT_EQ(write_back.op_ids.size(), 1u);
+    EXPECT_EQ(write_back.source_pinned, std::vector<bool>{false})
+        << "the victim's pages are granted away this round; the runtime fences the copy ahead of reuse";
+    EXPECT_EQ(write_back.src_pages.at(0).size(), 2u) << "the one page not yet on Host, in both groups";
+    const SnapshotStoreBatch* store = FindSnapshotStore(retraction);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_TRUE(store->src_pages.at(0).empty()) << "no tail page; the op still carries the slot-state blob";
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 4) << "the image pins the Host entries that already exist";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 8) << "r1's and r2's prompt pages";
+    CompleteStores(retraction);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 10) << "the ACK publishes the new entries";
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6) << "the suspended request pins every Host entry of its image";
+    EXPECT_FALSE(scheduler_->CanClearCache()) << "pinned entries refuse a flush";
 }
 
 TEST_F(FusedRetractionL2TestSuite, AReadmissionThatDoesNotFitWaitsWithoutRetracting) {
@@ -2096,10 +2162,10 @@ TEST_F(FusedRetractionL2TestSuite, AReadmissionThatDoesNotFitWaitsWithoutRetract
     }
 }
 
-// RequestSpec::max_cached_prefix_tokens bounds the probe at the positions a
-// request still needs logits for. A decoding victim had produced them all, so
-// its readmission matches its whole snapshot back despite the bound.
-TEST_F(FusedRetractionL2TestSuite, ADecodingVictimReadmitsPastItsProbeBound) {
+// A decoding victim resumes decoding with the same tokens: nothing is rebased
+// and nothing is recomputed, whatever RequestSpec::max_cached_prefix_tokens
+// bounded its first admission to.
+TEST_F(FusedRetractionL2TestSuite, ADecodingVictimResumesDecodingWithoutRecomputing) {
     // r1 returns prompt logprobs from position 0: nothing may be matched at
     // its first admission. r2 shares the pool and keeps decoding.
     RequestSpec capped = MakeRequestSpec("r1", /*num_pages=*/2);
@@ -2121,15 +2187,16 @@ TEST_F(FusedRetractionL2TestSuite, ADecodingVictimReadmitsPastItsProbeBound) {
     CompleteStores(PlanOnce());
     SendForwardDone("r1", {44});
     SendForwardDone("r2", {144});
-    // r1 = [1 2 3 4 42 43 44]: the blocked round retracts it and snapshots
-    // its completed pages [1 2] [3 4] [42 43] to the host tier.
+    // r1 = [1 2 3 4 42 43 44]: the blocked round retracts it; its published
+    // pages [1 2] [3 4] [42 43] ride Host L2.
     const ExecutionPlan retraction = PlanOnce();
     CompleteStores(retraction);
     ASSERT_EQ(scheduler_->WaitingSize(), 1u);
     ASSERT_EQ(scheduler_->DecodingSize(), 1u);
 
-    // r2 leaves; r1 readmits. The bound of 0 would recompute all 7 tokens;
-    // the readmission instead matches its three snapshot pages back.
+    // r2 leaves; r1 is restored. The bound of 0 would have recomputed all 7
+    // tokens on a fresh admission; the restore copies the image back instead
+    // and the next round is an ordinary decode step.
     const ExecutionPlan resumed = PlanOnce();
     const ForwardBatch* r2_only = FindForwardBatch(resumed);
     ASSERT_NE(r2_only, nullptr);
@@ -2138,18 +2205,282 @@ TEST_F(FusedRetractionL2TestSuite, ADecodingVictimReadmitsPastItsProbeBound) {
     SendForwardDone("r2", {145});
     SendFinish("r2");
     const ExecutionPlan readmit = PlanOnce();
-    const ForwardBatch* op = FindForwardBatch(readmit);
+    ASSERT_TRUE(FindForwardBatch(readmit)->request_ids.empty());
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"r1"});
+    // r2's decode grant evicted some of r1's published Device blocks; those
+    // come back from L2 (keyed rows), the ones still Device-cached are
+    // claimed without a copy. Nothing rides the snapshot pool: 6 computed
+    // tokens end on a page boundary.
+    const auto& tiers = restore->source_tiers.at(0);
+    EXPECT_EQ(std::ranges::count(tiers, static_cast<std::uint8_t>(HostTier::kSnapshotPool)), 0);
+    EXPECT_EQ(std::ranges::count(tiers, static_cast<std::uint8_t>(HostTier::kL2)), 2)
+        << "r2 took two of the six freed blocks; the other four stayed Device-cached and are claimed";
+    for (const std::string& hash : restore->content_hashes.at(0)) {
+        EXPECT_FALSE(hash.empty()) << "L2 rows carry their key so the ACK republishes them";
+    }
+    AckRestores(readmit);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the restore released the pins";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 10) << "the entries stay cached for ordinary reuse";
+
+    const ExecutionPlan decode = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(decode);
     ASSERT_NE(op, nullptr);
     ASSERT_EQ(op->request_ids, std::vector<std::string>{"r1"});
-    EXPECT_EQ(op->prefill_lengths.at(0), 7);
-    EXPECT_EQ(op->extend_prefix_lens.at(0), 6) << "the readmission must match the snapshot back";
-    EXPECT_EQ(op->input_lengths.at(0), 1);
+    EXPECT_EQ(op->NumExtends(), 0u);
+    EXPECT_EQ(op->prefill_lengths.at(0), 4) << "the prompt window is untouched";
+    EXPECT_EQ(scheduler_->RequestTokenSize("r1"), 7);
+
+    // The restored pages are published again: a prompt sharing r1's first
+    // six tokens hits all three.
+    SendForwardDone("r1", {45});
+    SendFinish("r1");
+    PlanOnce();
+    Submit(RequestSpec{.request_id = "r3", .tokens = {1, 2, 3, 4, 42, 43, 7, 8}});
+    const ExecutionPlan hit = PlanOnce();
+    const ForwardBatch* hit_op = FindForwardBatch(hit);
+    ASSERT_NE(hit_op, nullptr);
+    ASSERT_EQ(hit_op->request_ids, std::vector<std::string>{"r3"});
+    EXPECT_EQ(hit_op->extend_prefix_lens.at(0), 6);
+}
+
+TEST_F(FusedRetractionL2TestSuite, TheImageWaitsForAnEarlierStoreThatCarriesOneOfItsKeys) {
+    // r1's prompt pages are streamed to Host at its first decode (a pinned
+    // store). That store is NOT acknowledged before r1 is retracted: the
+    // image pins the in-flight ticket's Host block instead of copying the
+    // page again, and waits for that older op as well as its own two legs.
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
+    ExecutionPlan prefill = PlanOnce();
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(prefill).empty());
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    ExecutionPlan first_decode = PlanOnce();
+    const auto pinned_stores = ExtractCacheOpsOfKind<WriteBackBatch>(first_decode);
+    ASSERT_EQ(pinned_stores.size(), 1u) << "the first decode streams both prompts' pages";
+    const auto& pinned = std::get<WriteBackBatch>(pinned_stores.front());
+    ASSERT_EQ(pinned.op_ids.size(), 1u);
+    EXPECT_EQ(pinned.source_pinned, std::vector<bool>{true});
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    // A pinned store in flight defers retraction: the blocked round stays
+    // quiet until it is acknowledged... so acknowledge nothing yet and let
+    // the next step fit its tail page first.
+    ExecutionPlan tail = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(tail)->request_ids.size(), 2u);
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {144});
+    ExecutionPlan deferred = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u) << "an in-flight pinned store defers retraction";
+    EXPECT_TRUE(FindForwardBatch(deferred)->request_ids.empty());
+
+    // Acknowledging the pinned store lets the retraction happen; its own L2
+    // leg copies only the page the pinned store did not carry.
+    SendWriteBackDone(pinned.op_ids.front());
+    ExecutionPlan retraction = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    const auto image_stores = ExtractCacheOpsOfKind<WriteBackBatch>(retraction);
+    ASSERT_EQ(image_stores.size(), 1u);
+    const auto& image_store = std::get<WriteBackBatch>(image_stores.front());
+    EXPECT_EQ(image_store.src_pages.at(0).size(), 2u) << "[42 43] in both groups; the prompt pages are Host-warm";
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 4) << "the image pins the Host-warm prompt pages";
+    const SnapshotStoreBatch* tail_store = FindSnapshotStore(retraction);
+    ASSERT_NE(tail_store, nullptr);
+    SendForwardDone("r2", {145});
+    SendFinish("r2");
+
+    // Neither leg acknowledged: no restore. One leg: still none. Both: the
+    // restore is issued.
+    EXPECT_EQ(FindRestore(PlanOnce()), nullptr) << "no store ACK yet";
+    SendWriteBackDone(image_store.op_ids.front());
+    EXPECT_EQ(FindRestore(PlanOnce()), nullptr) << "the tail leg is still in flight";
+    SendSnapshotDone(tail_store->op_ids.front());
+    ExecutionPlan readmit = PlanOnce();
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    EXPECT_EQ(FindRestore(readmit)->request_ids, std::vector<std::string>{"r1"});
+}
+
+TEST_F(FusedRetractionL2TestSuite, FinishWhileRetractedReleasesTheImage) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
+    ExecutionPlan prefill = PlanOnce();
+    CompleteStores(prefill);
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+    CompleteStores(PlanOnce());
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {144});
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    CompleteStores(retraction);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6);
+
+    // The client gave up on the suspended request: its Host pins drop (the
+    // entries stay cached) and its blob slot returns; the Device pool never
+    // held anything of it.
+    SendFinish("r1");
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 10);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 12);
+    EXPECT_EQ(FindRestore(PlanOnce()), nullptr);
+}
+
+// Two victims whose images share pages carried by one earlier, still
+// unacknowledged store: neither copies them again, and both wait for it.
+class SharedImagePagesSuite : public FusedRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FusedRetractionL2TestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 33;
+        for (auto& g : cfg.cache_groups) {
+            g.total_pages = cfg.device_allocator.total_pages;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.debug_force_retraction_interval = 3;  // plans 3 and 6 retract the oldest quiescent decode
+        return cfg;
+    }
+};
+
+TEST_F(SharedImagePagesSuite, VictimsPinAnInFlightStoresBlocksAndWaitForItsAck) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    PlanOnce();  // plan 1: r1 prefills
+    SendForwardDone("r1", {42});
+    const ExecutionPlan first_decode = PlanOnce();  // plan 2: r1's first decode streams its prompt pages (pinned)
+    const auto pinned_stores = ExtractCacheOpsOfKind<WriteBackBatch>(first_decode);
+    ASSERT_EQ(pinned_stores.size(), 1u);
+    const auto& pinned = std::get<WriteBackBatch>(pinned_stores.front());
+    ASSERT_EQ(pinned.src_pages.at(0).size(), 4u) << "two prompt pages in two groups";
+    SendForwardDone("r1", {43});
+
+    // Plan 3 retracts r1 (quiescent). Its prompt pages are travelling on the
+    // pinned store, so the image pins that store's Host blocks and its own
+    // L2 leg carries nothing; the unaligned tail page rides the snapshot pool.
+    // r2, sharing r1's prompt, hits those pages on Device.
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2));
+    const ExecutionPlan p3 = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(p3).empty()) << "nothing to copy that is not already on its way";
+    const SnapshotStoreBatch* r1_tail = FindSnapshotStore(p3);
+    ASSERT_NE(r1_tail, nullptr);
+    EXPECT_EQ(r1_tail->src_pages.at(0).size(), 2u) << "the tail page with token 5, in both groups";
+    const ForwardBatch* r2_prefill = FindForwardBatch(p3);
+    ASSERT_EQ(r2_prefill->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(r2_prefill->extend_prefix_lens.at(0), 2) << "r2 hits r1's first page (the second is the replay tail)";
+    SendForwardDone("r2", {42});
+    const ExecutionPlan p4 = PlanOnce();  // r2's first decode
+    ASSERT_EQ(FindForwardBatch(p4)->request_ids, std::vector<std::string>{"r2"});
+    SendForwardDone("r2", {43});
+    const ExecutionPlan p5 = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(p5)->request_ids, std::vector<std::string>{"r2"});
+    SendForwardDone("r2", {44});
+
+    // Plan 6 retracts r2: the shared page is still on the pinned store, so
+    // r2 pins the same ticket block and waits for the same op.
+    const ExecutionPlan p6 = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 2u);
+    const SnapshotStoreBatch* r2_tail = FindSnapshotStore(p6);
+    ASSERT_NE(r2_tail, nullptr);
+    AckImageStores(p3);
+    AckImageStores(p4);
+    AckImageStores(p5);
+    AckImageStores(p6);
+    EXPECT_EQ(FindRestore(PlanOnce()), nullptr) << "both images wait for the pinned store they share";
+    EXPECT_EQ(scheduler_->RetractedSize(), 2u);
+
+    SendWriteBackDone(pinned.op_ids.front());
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), scheduler_->HostPoolCachedBlocks())
+        << "every published Host entry is pinned by an image";
+    const ExecutionPlan restore_r1 = PlanOnce();
+    ASSERT_NE(FindRestore(restore_r1), nullptr);
+    EXPECT_EQ(FindRestore(restore_r1)->request_ids, std::vector<std::string>{"r1"}) << "the older victim first";
+    AckRestores(restore_r1);
+    const ExecutionPlan restore_r2 = PlanOnce();  // plan 9: the knob also strikes the restored r1 again
+    ASSERT_NE(FindRestore(restore_r2), nullptr);
+    EXPECT_EQ(FindRestore(restore_r2)->request_ids, std::vector<std::string>{"r2"});
+    AckRestores(restore_r2);
+    AckImageStores(restore_r2);
+    EXPECT_EQ(scheduler_->RequestTokenSize("r2"), 7) << "resumed with the same tokens";
+    SendAbortEvent("r1");
+    SendAbortEvent("r2");
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 32);
+}
+
+// The debug knob retracts a decoding request on schedule, exemption or not,
+// so a test oracle can force a retract/restore cycle on any request.
+class ForcedRetractionSuite : public CapacityBlockSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = CapacityBlockSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 33;  // ample: nothing is ever blocked for capacity
+        for (auto& g : cfg.cache_groups) {
+            g.total_pages = cfg.device_allocator.total_pages;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.debug_force_retraction_interval = 3;
+        return cfg;
+    }
+};
+
+TEST_F(ForcedRetractionSuite, EveryThirdPlanRetractsTheOldestQuiescentDecodingRequest) {
+    RequestSpec exempt = MakeRequestSpec("r1", /*num_pages=*/2);
+    exempt.max_new_tokens = 4;  // ReserveCoversGeneration would exempt it from the victim policy
+    Submit(exempt);
+    Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/101));
+    ExecutionPlan p1 = PlanOnce();  // plan 1: both prefill
+    ASSERT_EQ(FindForwardBatch(p1)->request_ids.size(), 2u);
+    SendForwardDone("r1", {42});
+    SendForwardDone("r2", {142});
+    ExecutionPlan p2 = PlanOnce();  // plan 2: both decode
+    ASSERT_EQ(FindForwardBatch(p2)->request_ids.size(), 2u);
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    SendForwardDone("r1", {43});
+    SendForwardDone("r2", {143});
+
+    // Plan 3 arms the oldest Decoding request, r1 -- quiescent, so it is
+    // retracted at once, exemption notwithstanding -- while r2 decodes on.
+    ExecutionPlan p3 = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    EXPECT_EQ(FindForwardBatch(p3)->request_ids, std::vector<std::string>{"r2"});
+    ASSERT_NE(FindSnapshotStore(p3), nullptr);
+    EXPECT_EQ(FindSnapshotStore(p3)->request_ids, std::vector<std::string>{"r1"});
+    AckImageStores(p3);
+    const std::int32_t r1_tokens = scheduler_->RequestTokenSize("r1");
+
+    // Plan 4 restores it (nothing blocks the restore); plan 5 decodes both.
+    ExecutionPlan p4 = PlanOnce();
+    ASSERT_NE(FindRestore(p4), nullptr);
+    EXPECT_EQ(FindRestore(p4)->request_ids, std::vector<std::string>{"r1"});
+    AckRestores(p4);
+    SendForwardDone("r2", {144});
+    ExecutionPlan p5 = PlanOnce();
+    EXPECT_EQ(FindForwardBatch(p5)->request_ids, (std::vector<std::string>{"r1", "r2"}));
+    EXPECT_EQ(scheduler_->RequestTokenSize("r1"), r1_tokens);
+    // Both are in flight at plan 6: the armed victim (r1 again, the oldest)
+    // sits the round out and is retracted at plan 7 once its result landed.
+    SendForwardDone("r2", {145});
+    ExecutionPlan p6 = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(FindForwardBatch(p6)->request_ids, std::vector<std::string>{"r2"}) << "the armed victim sits out";
+    SendForwardDone("r1", {44});
+    SendForwardDone("r2", {146});
+    ExecutionPlan p7 = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    ASSERT_NE(FindSnapshotStore(p7), nullptr);
+    EXPECT_EQ(FindSnapshotStore(p7)->request_ids, std::vector<std::string>{"r1"});
 }
 
 // ---------------------------------------------------------------------------
-// Cache retract: a blocked round picks the largest Decoding/PrefillDone
-// request, releases every page and requeues it as a fresh prefill. Accepted
-// request lengths must obey Scheduler::MaxSingleRequestTokens().
+// Cache retract: a blocked round picks the decoding request that frees the
+// most and has streamed least, releases every page and suspends it with its
+// image; the restore continues it where it stopped. Accepted request lengths
+// must obey Scheduler::MaxSingleRequestTokens().
 // ---------------------------------------------------------------------------
 class RetractSuite : public SchedulerTestSuite {
 protected:
@@ -2178,7 +2509,8 @@ protected:
 
     // Drives "a" (6-token prompt) and "b" (4-token prompt) into the exact-fit
     // capacity block that retracts "a".
-    // Post: "a" Submitted with 9 tokens, "b" Decoding with 7 tokens, free = 8.
+    // Post: "a" Retracted with 9 tokens (8 computed), "b" Decoding with 7
+    // tokens, free = 8; a's image store rides retract_round_.
     void DriveToRetractOfA() {
         ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14);
         Submit(MakeRequestSpec("a", /*num_pages=*/3));
@@ -2209,199 +2541,194 @@ protected:
         SendForwardDone("a", {44});   // 9 tokens: past capacity
         SendForwardDone("b", {144});  // 7 tokens: past capacity
 
-        // The first fully blocked round retracts "a" (9 tokens > b's 7).
-        ExecutionPlan retract_round = PlanOnce();
-        const ForwardBatch* retract_op = FindForwardBatch(retract_round);
+        // The first fully blocked round retracts "a" (4 pages x 2 groups free
+        // 8 blocks against b's 6) and, a being the blocker itself, grants a
+        // page pair to the other blocked decode, b, in the same round.
+        retract_round_ = PlanOnce();
+        const ForwardBatch* retract_op = FindForwardBatch(retract_round_);
         ASSERT_NE(retract_op, nullptr);
-        ASSERT_TRUE(retract_op->request_ids.empty());
-        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 8) << "a's 4 pages x 2 groups return to the pool";
-        ASSERT_EQ(scheduler_->WaitingSize(), 1u) << "a requeues as a fresh prefill";
+        ASSERT_EQ(retract_op->request_ids, std::vector<std::string>{"b"});
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 8 - 2) << "a's 4 pages x 2 groups return; b takes a pair";
+        ASSERT_EQ(scheduler_->WaitingSize(), 1u) << "a is suspended with its image";
         ASSERT_EQ(scheduler_->DecodingSize(), 1u);
+        ASSERT_NE(FindSnapshotStore(retract_round_), nullptr);
+        SendForwardDone("b", {145});  // 8 tokens; b is quiescent again
     }
+
+    ExecutionPlan retract_round_;
 };
 
-TEST_F(RetractSuite, DecodingRequestReleasesPagesAndRequeues) {
+TEST_F(RetractSuite, DecodingVictimResumesDecodingWithTheSameTokens) {
     DriveToRetractOfA();
+    EXPECT_EQ(scheduler_->RequestTokenSize("a"), 9);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14 - 8) << "8 computed tokens = 4 pages x 2 groups imaged";
 
-    // The survivor proceeds on the freed pages while a waits for re-admission.
+    // The survivor proceeds on the freed pages while a waits; its image is
+    // acknowledged meanwhile.
     ExecutionPlan resumed = PlanOnce();
     const ForwardBatch* resumed_op = FindForwardBatch(resumed);
     ASSERT_NE(resumed_op, nullptr);
-    ASSERT_EQ(resumed_op->request_ids.size(), 1u);
-    EXPECT_EQ(resumed_op->request_ids.at(0), "b");
-    SendForwardDone("b", {145});
+    ASSERT_EQ(resumed_op->request_ids, std::vector<std::string>{"b"});
+    AckImageStores(retract_round_);
+    SendForwardDone("b", {146});
     SendFinish("b");
 
-    // b reaped -> a re-admits with its FULL length and completes.
+    // b reaped -> a is restored: no forward, one restore op for its 8 pages
+    // plus the decode slot it needs next.
     ExecutionPlan readmit = PlanOnce();
-    const ForwardBatch* readmit_op = FindForwardBatch(readmit);
-    ASSERT_NE(readmit_op, nullptr);
-    ASSERT_EQ(readmit_op->request_ids.size(), 1u);
-    EXPECT_EQ(readmit_op->request_ids.at(0), "a");
-    // The readmission matches back whatever prefix survived and re-computes
-    // the rest; together they cover the rebased prompt+generated length.
-    EXPECT_EQ(readmit_op->extend_prefix_lens.at(0) + readmit_op->input_lengths.at(0),
-              readmit_op->prefill_lengths.at(0));
-    EXPECT_GT(readmit_op->input_lengths.at(0), 0);
+    ASSERT_TRUE(FindForwardBatch(readmit)->request_ids.empty());
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"a"});
+    EXPECT_EQ(restore->src_pages.at(0).size(), 8u);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14 - 10) << "4 imaged pages + 1 decode slot, per group";
+    AckRestores(readmit);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14);
+
+    ExecutionPlan decode = PlanOnce();
+    const ForwardBatch* decode_op = FindForwardBatch(decode);
+    ASSERT_NE(decode_op, nullptr);
+    ASSERT_EQ(decode_op->request_ids, std::vector<std::string>{"a"});
+    EXPECT_EQ(decode_op->NumExtends(), 0u) << "a decoding victim resumes with a decode step";
+    EXPECT_EQ(decode_op->prefill_lengths.at(0), 6) << "the prompt window is not rebased";
+    EXPECT_EQ(decode_op->input_lengths.at(0), 1);
     SendForwardDone("a", {45});
-    PlanOnce();  // decode transition
-    SendForwardDone("a", {46});
     SendFinish("a");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "pool balances after the full retract cycle";
 }
 
-TEST_F(RetractSuite, RetractedRequestPrefillCoversOldTokens) {
+TEST_F(RetractSuite, ARestoreWaitsForBothStoreAcksAndNeverRunsAPrefill) {
     DriveToRetractOfA();
-    EXPECT_EQ(scheduler_->RequestTokenSize("a"), 9);
-
-    // Free the running request so the retracted request re-admits immediately.
     SendFinish("b");
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14);
+
+    // The pool is free, but a's image has not landed: no restore yet, and no
+    // prefill of a's tokens either.
+    for (int round = 0; round < 3; ++round) {
+        ExecutionPlan waiting = PlanOnce();
+        EXPECT_TRUE(FindForwardBatch(waiting)->request_ids.empty());
+        EXPECT_EQ(FindRestore(waiting), nullptr) << "round " << round;
+        EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    }
+    AckImageStores(retract_round_);
     ExecutionPlan readmit = PlanOnce();
-    const ForwardBatch* op = FindForwardBatch(readmit);
-    ASSERT_NE(op, nullptr);
-    ASSERT_EQ(op->request_ids.size(), 1u);
-    ASSERT_EQ(op->request_ids.at(0), "a");
-    EXPECT_EQ(op->prefill_lengths.at(0), 9) << "PrefillSize rebased to the full token count";
-    // Whatever prefix survived is matched back; the rest is re-computed.
-    EXPECT_EQ(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), 9)
-        << "RebasePrefill: the new prefill covers prompt + generated";
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    EXPECT_TRUE(FindForwardBatch(readmit)->request_ids.empty());
 }
 
-// Chunked re-admission after a retract: with max_scheduled_tokens = 4 the
-// the retracted request's 9-token rebased prefill (prompt + generated) takes
-// three chunks. EVERY chunk reports back; an intermediate one carries no
-// token (the FSM stays Prefilling), and the op exposes the rebased
-// prefill_lengths so the runtime can tell which kind it is.
-class RetractChunkedReadmitSuite : public RetractSuite {
+TEST_F(RetractSuite, AbortWhileRetractedReleasesTheImage) {
+    DriveToRetractOfA();
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14 - 8);
+    SendAbortEvent("a");
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14 - 8) << "the in-flight store still pins its destinations";
+    AckImageStores(retract_round_);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14) << "the ACK of an aborted victim's store frees the pool";
+    EXPECT_EQ(FindRestore(PlanOnce()), nullptr) << "an aborted victim is never restored";
+}
+
+TEST_F(RetractSuite, AbortWhileRestoringFreesPagesOnceTheCopyIsAcknowledged) {
+    DriveToRetractOfA();
+    AckImageStores(retract_round_);
+    SendFinish("b");
+    ExecutionPlan readmit = PlanOnce();
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14 - 10);
+
+    SendAbortEvent("a");
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    // The copy may still be writing the pages: the op pins both ends until
+    // its ACK, so the pages are not re-granted meanwhile.
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14 - 8) << "the decode slot freed; the 8 copy destinations are pinned";
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14 - 8);
+    AckRestores(readmit);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 14);
+    PlanOnce();
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+}
+
+// A mid-prefill victim resumes its next chunk: with max_scheduled_tokens = 4
+// the 6-token prompt of "a" takes two chunks, and "a" is retracted between
+// them.
+class RetractMidPrefillSuite : public RetractSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.max_scheduled_tokens = 4;
+        // 11 physical pages -> 10 usable: "holder" (2-page prompt) charges 6
+        // and the first 4-token chunk of "half" (no declared budget, so no
+        // headroom) 4 = the pool.
+        cfg.device_allocator.total_pages = 11;
+        for (auto& g : cfg.cache_groups) {
+            g.total_pages = cfg.device_allocator.total_pages;
+        }
         SetTestSnapshotPool(cfg);
         return cfg;
     }
-
-    // Chunked-prefill twin of DriveToRetractOfA: same capacity block and retract of "a"
-    // (9 tokens > b's 7), but "a"'s 6-token prompt prefills in two chunks.
-    // Post: "a" requeued with 9 rebased tokens, "b" finished, pool fully free.
-    void DriveToRetractOfAChunkedAndFreePool() {
-        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14);
-        Submit(MakeRequestSpec("a", /*num_pages=*/3));
-        Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
-
-        // Chunk 1 of "a" (4 of 6 prompt tokens) exhausts the round's budget;
-        // an intermediate chunk reports back with no token.
-        ExecutionPlan p1 = PlanOnce();
-        const ForwardBatch* op1 = FindForwardBatch(p1);
-        ASSERT_NE(op1, nullptr);
-        ASSERT_EQ(op1->request_ids.size(), 1u);
-        ASSERT_EQ(op1->request_ids.at(0), "a");
-        ASSERT_LT(op1->input_lengths.at(0), op1->prefill_lengths.at(0)) << "mid-chunk";
-        SendForwardDone("a");
-
-        // Chunk 2 completes "a" (owes a result); leftover budget starts "b".
-        ExecutionPlan p2 = PlanOnce();
-        const ForwardBatch* op2 = FindForwardBatch(p2);
-        ASSERT_NE(op2, nullptr);
-        ASSERT_EQ(op2->request_ids.size(), 2u);
-        SendForwardDone("a", {42});  // 7 tokens
-        SendForwardDone("b");        // b's first chunk is intermediate: KV only
-
-        // "b"'s completing chunk; "a" (PrefillDone) waits behind the prefill.
-        ExecutionPlan p3 = PlanOnce();
-        const ForwardBatch* op3 = FindForwardBatch(p3);
-        ASSERT_NE(op3, nullptr);
-        ASSERT_EQ(op3->request_ids.size(), 1u);
-        ASSERT_EQ(op3->request_ids.at(0), "b");
-        SendForwardDone("b", {142});  // 5 tokens
-
-        // Both decode transitions consume their reservations: free 0.
-        ExecutionPlan p4 = PlanOnce();
-        const ForwardBatch* op4 = FindForwardBatch(p4);
-        ASSERT_NE(op4, nullptr);
-        ASSERT_EQ(op4->request_ids.size(), 2u);
-        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
-        SendForwardDone("a", {43});   // 8 tokens = a's capacity
-        SendForwardDone("b", {143});  // 6 tokens = b's capacity
-
-        // Tail-page decodes (0 fresh blocks).
-        ExecutionPlan p5 = PlanOnce();
-        const ForwardBatch* op5 = FindForwardBatch(p5);
-        ASSERT_NE(op5, nullptr);
-        ASSERT_EQ(op5->request_ids.size(), 2u);
-        SendForwardDone("a", {44});   // 9 tokens: past capacity
-        SendForwardDone("b", {144});  // 7 tokens: past capacity
-
-        // The first fully blocked round retracts "a" (9 tokens > b's 7).
-        ExecutionPlan retract_round = PlanOnce();
-        ASSERT_TRUE(FindForwardBatch(retract_round)->request_ids.empty());
-        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 8);
-        ASSERT_EQ(scheduler_->WaitingSize(), 1u);
-        ASSERT_EQ(scheduler_->RequestTokenSize("a"), 9);
-
-        // Free the survivor so a re-admits alone.
-        SendFinish("b");
-        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14);
-    }
 };
 
-TEST_F(RetractChunkedReadmitSuite, MidChunkReadmitOwesNoToken) {
-    DriveToRetractOfAChunkedAndFreePool();
+TEST_F(RetractMidPrefillSuite, MidPrefillVictimResumesItsNextChunk) {
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 10);
+    // "holder" takes 6 blocks and decodes; "half" gets its first chunk (4
+    // blocks) -- exactly the pool.
+    Submit(MakeRequestSpec("holder", /*num_pages=*/2, /*start=*/201));
+    ExecutionPlan h1 = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(h1)->request_ids, std::vector<std::string>{"holder"});
+    SendForwardDone("holder", {242});
+    Submit(MakeRequestSpec("half", /*num_pages=*/3, /*start=*/301));
+    ExecutionPlan c1 = PlanOnce();
+    const ForwardBatch* chunk = FindForwardBatch(c1);
+    ASSERT_NE(chunk, nullptr);
+    const auto half_row = std::ranges::find(chunk->request_ids, "half");
+    ASSERT_NE(half_row, chunk->request_ids.end());
+    const auto index = static_cast<std::size_t>(std::distance(chunk->request_ids.begin(), half_row));
+    ASSERT_EQ(chunk->input_lengths.at(index), 4) << "the first chunk";
+    ASSERT_EQ(chunk->request_ids.size(), 1u) << "outside mixed mode a prefill round carries no decode";
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    SendForwardDone("half");
 
-    // The readmission exposes the REBASED prompt+generated length, and the
-    // runtime decides "does this op produce a token" from the op alone:
-    // prefix + input < prefill means mid-chunk, so the result is empty.
-    ExecutionPlan readmit = PlanOnce();
-    const ForwardBatch* op = FindForwardBatch(readmit);
-    ASSERT_NE(op, nullptr);
-    ASSERT_EQ(op->request_ids.size(), 1u);
-    ASSERT_EQ(op->request_ids.at(0), "a");
-    EXPECT_EQ(op->prefill_lengths.at(0), 9) << "rebased prompt+generated length exposed on the op";
-    EXPECT_GT(op->input_lengths.at(0), 0);
-    EXPECT_LE(op->extend_prefix_lens.at(0) + op->input_lengths.at(0), op->prefill_lengths.at(0));
-}
-
-// Regression pin for the crash: a forward-done ExtendResult for a mid-chunk
-// re-prefill slot must land (it clears the in-flight count that protects the
-// chunk's pages), but it must not smuggle a token into a prompt that is
-// still being prefilled.
-TEST_F(RetractChunkedReadmitSuite, MidChunkReadmitTakesEmptyResultOnly) {
-    DriveToRetractOfAChunkedAndFreePool();
-
-    ExecutionPlan readmit = PlanOnce();
-    const ForwardBatch* op = FindForwardBatch(readmit);
-    ASSERT_NE(op, nullptr);
-    ASSERT_EQ(op->request_ids.at(0), "a");
-    if (op->extend_prefix_lens.at(0) + op->input_lengths.at(0) < op->prefill_lengths.at(0)) {
-        EXPECT_THROW(SendForwardDone("a", {45}), std::logic_error)
-            << "the FSM is still Prefilling; a mid-chunk result carries no token";
-        EXPECT_NO_THROW(SendForwardDone("a"));
-    } else {
-        // This readmission completed in one round, so a token IS owed.
-        EXPECT_NO_THROW(SendForwardDone("a", {45}));
+    // half's second chunk needs a page it cannot get, but nobody else does:
+    // retracting it would serve no one, so it waits while holder spends its
+    // decode reserve (two steps).
+    for (const std::int32_t token : {243, 244}) {
+        ExecutionPlan decode = PlanOnce();
+        ASSERT_EQ(FindForwardBatch(decode)->request_ids, std::vector<std::string>{"holder"});
+        EXPECT_EQ(scheduler_->RetractedSize(), 0u) << "a stalled prefill with nobody to serve is not retracted";
+        SendForwardDone("holder", {token});
     }
-}
 
-TEST_F(RetractChunkedReadmitSuite, ChunkedReadmitCompletes) {
-    DriveToRetractOfAChunkedAndFreePool();
+    // holder's next decode needs a page too: the blocked round retracts the
+    // incomplete prefill (tier 1) and grants the page to holder.
+    ExecutionPlan retract_round = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(retract_round)->request_ids, std::vector<std::string>{"holder"});
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u) << "half is suspended";
+    const SnapshotStoreBatch* store = FindSnapshotStore(retract_round);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->src_pages.at(0).size(), 4u) << "only the 4 computed tokens (2 pages x 2 groups) are imaged";
+    AckImageStores(retract_round);
+    SendForwardDone("holder", {245});
+    SendFinish("holder");
 
-    // Drive the readmission to completion, whatever number of chunks it
-    // takes: every chunk reports, only the completing one carries a token.
-    for (int round = 0; round < 8; ++round) {
-        ExecutionPlan plan = PlanOnce();
-        const ForwardBatch* op = FindForwardBatch(plan);
-        ASSERT_NE(op, nullptr);
-        ASSERT_EQ(op->request_ids.size(), 1u);
-        ASSERT_EQ(op->request_ids.at(0), "a");
-        if (op->extend_prefix_lens.at(0) + op->input_lengths.at(0) == op->prefill_lengths.at(0)) {
-            SendForwardDone("a", {45});
-            SUCCEED();
-            return;
-        }
-        SendForwardDone("a");
-    }
-    FAIL() << "the readmission never reached its completing chunk";
+    // Restored, "half" runs its SECOND chunk: positions [4, 6), no recompute
+    // of the first.
+    ExecutionPlan readmit = PlanOnce();
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    ASSERT_TRUE(FindForwardBatch(readmit)->request_ids.empty());
+    AckRestores(readmit);
+    ExecutionPlan next_chunk = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(next_chunk);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"half"});
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 4) << "the computed chunk is not redone";
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+    EXPECT_EQ(op->prefill_lengths.at(0), 6);
+    SendForwardDone("half", {345});
+    SendFinish("half");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 10);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 10);
 }
 
 class PrefillHeadOfLineSuite : public RetractSuite {
@@ -2421,10 +2748,11 @@ protected:
     }
 };
 
-TEST_F(PrefillHeadOfLineSuite, RetractingAnIncompletePrefillPublishesOnlyComputedPages) {
+TEST_F(PrefillHeadOfLineSuite, RetractingAnIncompletePrefillPublishesOnlyComputedPagesAndResumesAfterThem) {
     // The victim is a prefill that has been through some chunks but not all.
     // Only those chunks may reach the prefix cache: publishing the whole
-    // prompt would hand later requests pages that were never computed.
+    // prompt would hand later requests pages that were never computed. And
+    // the restore continues exactly after them.
     Submit(MakeRequestSpec("done", /*num_pages=*/2));
     ExecutionPlan p1 = PlanOnce();
     ASSERT_EQ(FindForwardBatch(p1)->request_ids, std::vector<std::string>{"done"});
@@ -2438,27 +2766,47 @@ TEST_F(PrefillHeadOfLineSuite, RetractingAnIncompletePrefillPublishesOnlyCompute
     ASSERT_LT(computed, chunk->prefill_lengths.at(0)) << "the victim is mid-prefill";
     SendForwardDone("half");  // the chunk landed, so the victim is retractable
 
-    // Force the retraction, then re-submit the SAME prompt: it may only match
-    // back the pages the victim actually computed.
+    // "waiting" cannot be admitted beside the stalled prefill (head of line),
+    // so the incomplete prefill gives way for it; outside mixed mode the
+    // grant itself waits for the next prefill round.
     Submit(MakeRequestSpec("waiting", /*num_pages=*/1, /*start=*/201));
-    PlanOnce();
-    ASSERT_GT(scheduler_->WaitingSize(), 1u) << "the incomplete prefill gave way";
+    ExecutionPlan retract_round = PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 2u) << "the incomplete prefill gave way; waiting is not admitted yet";
+    ASSERT_EQ(FindForwardBatch(retract_round)->request_ids, std::vector<std::string>{"done"});
+    const SnapshotStoreBatch* store = FindSnapshotStore(retract_round);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->src_pages.at(0).size(), static_cast<std::size_t>(computed / PrefixGranularity() * 2))
+        << "only the computed pages are imaged, two groups each";
+    AckImageStores(retract_round);
+    SendForwardDone("done", {43});
 
-    for (int round = 0; round < 6; ++round) {
-        ExecutionPlan plan = PlanOnce();
-        const ForwardBatch* op = FindForwardBatch(plan);
-        if (op == nullptr) {
-            continue;
-        }
-        const auto row = std::ranges::find(op->request_ids, "half");
-        if (row == op->request_ids.end()) {
-            continue;
-        }
-        const auto index = static_cast<std::size_t>(std::distance(op->request_ids.begin(), row));
-        EXPECT_LE(op->extend_prefix_lens.at(index), computed)
-            << "the readmission cannot match back pages the victim never computed";
-        return;
+    // The restore comes first and takes the computed pages back; "waiting"
+    // is admitted beside it. half's next chunk then does not fit while both
+    // residents hold the pool -- and since nobody else waits for capacity,
+    // nothing is retracted for it: it waits.
+    ExecutionPlan readmit = PlanOnce();
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    ASSERT_EQ(FindRestore(readmit)->request_ids, std::vector<std::string>{"half"});
+    ASSERT_EQ(FindForwardBatch(readmit)->request_ids, std::vector<std::string>{"waiting"});
+    AckRestores(readmit);
+    SendForwardDone("waiting", {207});
+    ExecutionPlan blocked = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u) << "a stalled prefill with nobody to serve is not re-retracted";
+    for (const std::string& id : FindForwardBatch(blocked)->request_ids) {
+        EXPECT_NE(id, "half");
+        SendForwardDone(id, {7});
     }
+    SendFinish("done");
+    SendFinish("waiting");
+
+    // With the pool free, half runs its NEXT chunk: positions from the
+    // computed ones on, never redoing them.
+    ExecutionPlan resumed = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(resumed);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"half"});
+    EXPECT_EQ(op->extend_prefix_lens.at(0), computed) << "the next chunk starts after the computed ones";
+    EXPECT_EQ(op->input_lengths.at(0), 8);
 }
 
 TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
@@ -2543,20 +2891,22 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
     EXPECT_EQ(request.ResultsInFlight(), 0);
 }
 
-TEST(RetractEvent, StampsResumePriorityFromGeneratedOutput) {
+TEST(SnapshotRetractEvent, StampsResumePriorityAndKeepsTheResumePoint) {
     // The readmission order is derived off the Retracted states: a victim
     // with generated output a client is reading resumes ahead of one that
     // had produced nothing, whatever their retraction epochs say
-    // (nextReadmission reads resumes_generation first, then the epoch).
+    // (nextReadmission reads resumes_generation first, then the epoch). The
+    // state also records exactly where the victim stopped.
     BlockPool pool(/*num_lcm_blocks=*/8, {1});
+    BlockPool snapshot_pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false);
+                                                   &snapshot_pool, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
+    SnapshotSlotAllocator slots{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kFused};
@@ -2568,12 +2918,23 @@ TEST(RetractEvent, StampsResumePriorityFromGeneratedOutput) {
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
+    request.TrackScheduledForward();
+    request.NoteResultLanded();
+    request.Apply(fsm::ExtendResultEvent{{}});  // the first chunk landed
 
-    request.Apply(
-        fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/true, request.HasGeneratedOutput()});
+    RetractForTest(request, coordinator, slots, /*epoch=*/1);
     const auto* retracted = request.GetIf<fsm::Retracted>();
     ASSERT_NE(retracted, nullptr);
     EXPECT_FALSE(retracted->ResumesGeneration()) << "no output yet: it resumes behind decode-origin victims";
+    EXPECT_TRUE(retracted->ImageLanded()) << "no store op is pending in this test";
+    const auto* shape = std::get_if<fsm::ResumePrefilling>(&retracted->shape);
+    ASSERT_NE(shape, nullptr) << "a mid-prefill victim resumes its next chunk";
+    EXPECT_EQ(shape->window.begin, 0);
+    EXPECT_EQ(shape->window.size, 2);
+    EXPECT_EQ(request.PrefillSize(), 4) << "nothing is rebased";
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8) << "the Device pages are released";
+    EXPECT_EQ(snapshot_pool.NumEmptyLcmBlocks(), 7) << "one computed page is imaged";
+    EXPECT_EQ(slots.AvailableSlots(), 3) << "the blob slot is taken";
 }
 
 TEST(RetractionHeadroom, EscalatesPerRetractionAndStopsAtTheGenerationBudget) {
@@ -2599,20 +2960,21 @@ TEST(RetractionHeadroom, EscalatesPerRetractionAndStopsAtTheGenerationBudget) {
 }
 
 TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
-    // Retraction rebases generated tokens into the prompt. A readmission
-    // that still reserved the full declared budget on top of them would
-    // demand prompt + generated + max_new -- more than the request can ever
-    // write, and near the single-request limit more than the pool holds,
-    // leaving it Retracted forever.
+    // A restore re-reserves on top of the tokens already generated. A
+    // readmission that still reserved the full declared budget would demand
+    // prompt + generated + max_new -- more than the request can ever write,
+    // and near the single-request limit more than the pool holds, leaving it
+    // Retracted forever.
     BlockPool pool(/*num_lcm_blocks=*/16, {1});
+    BlockPool snapshot_pool(/*num_lcm_blocks=*/16, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false);
+                                                   &snapshot_pool, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
+    SnapshotSlotAllocator slots{4};
 
     RequestSpec spec{.request_id = "r", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
     spec.max_new_tokens = 6000;
@@ -2636,14 +2998,24 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
     EXPECT_FALSE(request.ReserveCoversGeneration(kSafeSteps)) << "one window did not cover the 6000 open then";
     request.NoteRetracted();
     EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 5000)
-        << "capped by the REMAINING budget: the generated 1000 are part of the rebased prompt now";
+        << "capped by the REMAINING budget: the generated 1000 are already held";
 
-    request.Apply(
-        fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/true, request.HasGeneratedOutput()});
-    EXPECT_EQ(request.PrefillSize(), 1004) << "rebase folded prompt + generated into the prefill window";
-    EXPECT_EQ(request.RemainingNewTokens(), 5000) << "rebasing does not change the remaining budget";
-    EXPECT_EQ(request.RemainingNewTokensAtAdmission(), 5000) << "and is what the readmission will see as open";
+    // Retract and restore: the prefill window is untouched, and the restore
+    // is the admission that records the budget open at that point.
+    RetractForTest(request, coordinator, slots, /*epoch=*/1);
+    EXPECT_EQ(request.PrefillSize(), 4) << "a snapshot retraction never rebases";
+    EXPECT_EQ(request.RemainingNewTokens(), 5000);
+    EXPECT_EQ(request.RemainingNewTokensAtAdmission(), 6000) << "the suspended request still carries its admission";
+    std::vector<BlockTable> restored(coordinator.NumGroups());
+    std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
+    ASSERT_TRUE(coordinator.Restore(request.GetIf<fsm::Retracted>()->image, demands, /*request_access_epoch=*/1));
+    request.Apply(fsm::ScheduleRestoreEvent{&coordinator, req_pool.Allocate(), std::move(restored), /*restore_op=*/7});
+    ASSERT_TRUE(request.Is<fsm::Restoring>());
+    EXPECT_EQ(request.RemainingNewTokensAtAdmission(), 5000) << "what the readmission saw as open";
     EXPECT_TRUE(request.ReserveCoversGeneration(kSafeSteps)) << "two windows cover it: the readmission is exempt";
+    request.Apply(fsm::RestoreDoneEvent{});
+    EXPECT_TRUE(request.Is<fsm::Decoding>());
+    EXPECT_EQ(request.TokenSize(), 1004) << "the same tokens, resumed where they stopped";
 }
 
 TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
@@ -2924,33 +3296,38 @@ TEST_F(RetractExactFitSuite, ReserveRefundBalances) {
     PlanOnce();                  // tail-page decode (0 fresh blocks)
     SendForwardDone("a", {44});  // 9 tokens: past capacity
 
-    ExecutionPlan retract_round = PlanOnce();  // first blocked round retracts "a"
-    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 8);
-    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
-
     // "d" needs EXACTLY the released capacity: a leaked reservation from a
-    // would make this admission fail. (The round right after a retraction
-    // withholds new prompts, so this is the round after that one.)
+    // would make this admission fail. The blocked round retracts a for d and
+    // grants d its pages in the same round.
     Submit(MakeRequestSpec("d", /*num_pages=*/3, /*start=*/201));
-    PlanOnce();
-    ExecutionPlan admitted = PlanOnce();
-    const ForwardBatch* op = FindForwardBatch(admitted);
+    ExecutionPlan retract_round = PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u) << "a is suspended";
+    const ForwardBatch* op = FindForwardBatch(retract_round);
     ASSERT_NE(op, nullptr);
-    ASSERT_EQ(op->request_ids.size(), 1u);
-    EXPECT_EQ(op->request_ids.at(0), "d") << "exact-fit admission proves the full budget was refunded";
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"d"})
+        << "exact-fit admission proves the full budget was refunded";
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 
+    // Once a's image lands, its restore does not fit beside d and WAITS: d
+    // keeps decoding and is never retracted for a readmission.
+    AckImageStores(retract_round);
     SendForwardDone("d", {99});
-    PlanOnce();
+    ExecutionPlan d_decodes = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(d_decodes)->request_ids, std::vector<std::string>{"d"});
+    EXPECT_EQ(FindRestore(d_decodes), nullptr);
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
     SendForwardDone("d", {100});
     SendFinish("d");
     SendAbort(*scheduler_, "a");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 8);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 8);
 }
 
 // Two capacity-block cycles on one pool: each cycle retracts a different
-// largest running request; the smallest request rides both frees to completion.
+// request, and a suspended request's restore waits for capacity rather than
+// retracting a resident for it.
 class RetractTrioSuite : public RetractSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -2966,7 +3343,7 @@ protected:
     }
 };
 
-TEST_F(RetractTrioSuite, TwoCapacityBlocksRetractDifferentRequests) {
+TEST_F(RetractTrioSuite, TwoCapacityBlocksRetractDifferentRequestsAndTheRestoreWaits) {
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 24);
     Submit(MakeRequestSpec("r1", /*num_pages=*/4));
     Submit(MakeRequestSpec("r2", /*num_pages=*/3, /*start=*/101));
@@ -2989,56 +3366,74 @@ TEST_F(RetractTrioSuite, TwoCapacityBlocksRetractDifferentRequests) {
     SendForwardDone("r2", {144});  // 9: past capacity
     SendForwardDone("r3", {244});  // 7: past capacity
 
-    // Cycle 1 immediately retracts r1 (11 tokens, the largest).
+    // Cycle 1 retracts r1 -- all three tie at two generated tokens and r1
+    // frees the most (5 pages x 2 groups) -- and, r1 being the blocker
+    // itself, grants the freed pages to the next blocked decode, r2, in the
+    // same round.
     ExecutionPlan first_retract = PlanOnce();
-    ASSERT_TRUE(FindForwardBatch(first_retract)->request_ids.empty());
-    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 10) << "r1's 5 pages x 2 groups return";
+    EXPECT_EQ(FindForwardBatch(first_retract)->request_ids, std::vector<std::string>{"r2"});
     ASSERT_EQ(scheduler_->WaitingSize(), 1u);
-
-    // r2 and r3 ride the freed pages until capacity blocks again with r2 the
-    // largest running request (r1's 12-block re-admission charge never fits meanwhile).
-    ExecutionPlan p6 = PlanOnce();  // both acquire a page pair: free 6
-    ASSERT_EQ(FindForwardBatch(p6)->request_ids.size(), 2u);
+    ASSERT_EQ(scheduler_->RequestTokenSize("r1"), 11);
+    AckImageStores(first_retract);
     SendForwardDone("r2", {145});
-    SendForwardDone("r3", {245});
-    PlanOnce();  // tail-page decodes
-    SendForwardDone("r2", {146});
-    SendForwardDone("r3", {246});
-    PlanOnce();  // both acquire a page pair: free 2
-    SendForwardDone("r2", {147});
-    SendForwardDone("r3", {247});
-    PlanOnce();  // tail-page decodes
-    SendForwardDone("r2", {148});
-    SendForwardDone("r3", {248});
-    ExecutionPlan p10 = PlanOnce();  // r2 takes the last pair; r3 defers
-    ASSERT_EQ(FindForwardBatch(p10)->request_ids.size(), 1u);
-    ASSERT_EQ(FindForwardBatch(p10)->request_ids.at(0), "r2");
-    SendForwardDone("r2", {149});
-    ExecutionPlan p11 = PlanOnce();  // r2 tail-page decode
-    ASSERT_EQ(FindForwardBatch(p11)->request_ids.size(), 1u);
-    SendForwardDone("r2", {150});  // 15 tokens: past capacity
 
-    // Cycle 2 retracts a second, DIFFERENT request -- the cycles must not
-    // keep picking the same victim -- and grants the freed capacity to the
-    // blocked r1 readmission within the same round.
-    ExecutionPlan second_retract = PlanOnce();
-    const ForwardBatch* second_op = FindForwardBatch(second_retract);
-    ASSERT_NE(second_op, nullptr);
-    EXPECT_EQ(second_op->request_ids, std::vector<std::string>{"r1"})
-        << "the freed capacity reaches the blocked readmission in the same round";
-    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "only the fresh victim waits";
-    SendForwardDone("r1");  // the granted chunk's KV lands; r1 is abortable
+    // r2 and r3 ride the freed pages until capacity blocks again. r1's
+    // restore (10 imaged blocks + 2 for its decode slot) never fits
+    // meanwhile and waits without retracting anyone, until a second victim
+    // is taken for the residents' own growth.
+    std::int32_t next_r2 = 146;
+    std::int32_t next_r3 = 245;
+    bool second_retraction = false;
+    for (int round = 0; round < 32 && !second_retraction; ++round) {
+        ExecutionPlan plan = PlanOnce();
+        EXPECT_EQ(FindRestore(plan), nullptr) << "r1's restore must wait for capacity, round " << round;
+        AckImageStores(plan);
+        second_retraction = scheduler_->WaitingSize() == 2u;
+        for (const std::string& id : FindForwardBatch(plan)->request_ids) {
+            SendForwardDone(id, {id == "r2" ? next_r2++ : next_r3++});
+        }
+    }
+    ASSERT_TRUE(second_retraction) << "a second capacity block retracts a second request";
+    // The second victim is a DIFFERENT request -- the cycles must not keep
+    // picking the same one -- and the first is still suspended.
+    EXPECT_EQ(scheduler_->RetractedSize(), 2u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 
-    // Third proceeds: drop the two waiting requests and let r3 finish.
-    SendAbort(*scheduler_, "r1");
-    SendAbort(*scheduler_, "r2");
-    ExecutionPlan survivor = PlanOnce();
-    const ForwardBatch* op = FindForwardBatch(survivor);
-    ASSERT_NE(op, nullptr);
-    ASSERT_EQ(op->request_ids.size(), 1u);
-    EXPECT_EQ(op->request_ids.at(0), "r3");
-    SendForwardDone("r3", {249});
+    // The second victim is r2: it holds more pages than r3 and frees the
+    // most. Its pages serve r1's restore -- the older victim first -- beside
+    // r3's decode in the next round; r2's own restore waits for r3 to finish.
+    const std::int32_t r1_tokens_before = scheduler_->RequestTokenSize("r1");
+    const std::int32_t r2_tokens_before = scheduler_->RequestTokenSize("r2");
+    ExecutionPlan restore_r1 = PlanOnce();
+    ASSERT_NE(FindRestore(restore_r1), nullptr);
+    EXPECT_EQ(FindRestore(restore_r1)->request_ids, std::vector<std::string>{"r1"}) << "the older victim first";
+    EXPECT_EQ(FindForwardBatch(restore_r1)->request_ids, std::vector<std::string>{"r3"}) << "r3 is the survivor";
+    AckRestores(restore_r1);
+    SendForwardDone("r3", {next_r3++});
+    ExecutionPlan waiting = PlanOnce();
+    EXPECT_EQ(FindRestore(waiting), nullptr) << "r2's restore does not fit beside r1 and r3";
+    for (const std::string& id : FindForwardBatch(waiting)->request_ids) {
+        SendForwardDone(id, {7});
+    }
     SendFinish("r3");
+    EXPECT_EQ(scheduler_->RequestTokenSize("r1"), r1_tokens_before + 1) << "r1 resumed decoding where it stopped";
+    // r2's 16-block restore (7 imaged pages + a decode slot, two groups) does
+    // not fit beside r1 either: it keeps waiting until r1 is gone.
+    ExecutionPlan still_waiting = PlanOnce();
+    EXPECT_EQ(FindRestore(still_waiting), nullptr);
+    EXPECT_EQ(FindForwardBatch(still_waiting)->request_ids, std::vector<std::string>{"r1"});
+    SendForwardDone("r1", {45});
+    SendAbort(*scheduler_, "r1");
+    ExecutionPlan restore_r2 = PlanOnce();
+    ASSERT_NE(FindRestore(restore_r2), nullptr);
+    EXPECT_EQ(FindRestore(restore_r2)->request_ids, std::vector<std::string>{"r2"});
+    AckRestores(restore_r2);
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+    EXPECT_EQ(scheduler_->RequestTokenSize("r2"), r2_tokens_before) << "resumed with the same tokens";
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 24);
+
+    SendAbort(*scheduler_, "r2");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 24);
 }
@@ -3072,27 +3467,38 @@ TEST_F(RetractStateGroupSuite, StateGroupRequestRetractsCleanly) {
     ASSERT_EQ(prefill_op->block_tables.count("state"), 1u);
     SendForwardDone("a", {1000});
 
-    // The lone grower decodes until capacity blocks, then retracts immediately.
+    // A prompt that does not fit beside a waits for it. a keeps decoding
+    // (a request with a forward out is never retracted) until its own next
+    // page is refused as well; that round retracts it for b -- every one of
+    // its pages, full-history AND state, returns to the pool and its image
+    // goes to the snapshot pool -- and b is admitted on them.
+    Submit(MakeRequestSpec("b", /*num_pages=*/4, /*start=*/101));
     std::int32_t tok = 1001;
+    ExecutionPlan retract_round;
     bool retracted = false;
     for (int round = 0; round < 64 && !retracted; ++round) {
-        ExecutionPlan p = PlanOnce();
-        const ForwardBatch* op = FindForwardBatch(p);
-        ASSERT_NE(op, nullptr);
-        if (!op->request_ids.empty()) {
+        retract_round = PlanOnce();
+        retracted = scheduler_->RetractedSize() == 1u;
+        if (!retracted) {
+            ASSERT_EQ(FindForwardBatch(retract_round)->request_ids, std::vector<std::string>{"a"}) << "round " << round;
             SendForwardDone("a", {tok++});
-        } else if (scheduler_->WaitingSize() == 1u) {
-            retracted = true;
         }
     }
-    ASSERT_TRUE(retracted) << "the lone grower must exhaust capacity and retract";
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
-        << "retract must return full-history AND state pages to the pool";
+    ASSERT_TRUE(retracted) << "the grower must exhaust capacity and give way";
+    ASSERT_EQ(FindForwardBatch(retract_round)->request_ids, std::vector<std::string>{"b"}) << "b admits on a's pages";
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+    EXPECT_LT(scheduler_->SnapshotPoolFreeBlocks(), free_at_start) << "history pages and the live state are imaged";
+    const SnapshotStoreBatch* store = FindSnapshotStore(retract_round);
+    ASSERT_NE(store, nullptr);
+    EXPECT_GE(std::ranges::count(store->group_ids.at(0), 1u), 1) << "the state group's live checkpoint is imaged";
 
+    SendForwardDone("b", {2000});
     SendAbort(*scheduler_, "a");
+    SendAbort(*scheduler_, "b");
+    AckImageStores(retract_round);
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), free_at_start) << "the aborted victim's image is released";
 }
 
 TEST(CacheProgressTest, PrefillBoundariesSurviveFeedbackAndFailedAdmission) {
@@ -3288,16 +3694,18 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     EXPECT_EQ(request.ReserveNumTokensInNextScheduleEvent(), 3);
 }
 
-TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) {
+TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSameTokens) {
     BlockPool device_pool(/*num_lcm_blocks=*/12, {1});
+    BlockPool snapshot_pool(/*num_lcm_blocks=*/12, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false,
+                                                   /*host_pool=*/nullptr, &snapshot_pool,
+                                                   /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
+    SnapshotSlotAllocator slots{4};
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
@@ -3318,37 +3726,52 @@ TEST(RetractionStateFsmTest, RetractionTransitionsImmediatelyAndRebasesPrefill) 
     });
     request.Apply(fsm::RemotePrefillDoneEvent{/*token=*/42});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
+    coordinator.ConsumeReservedTokens(request.BlockTablesRef(), 1);
     ASSERT_TRUE(request.Is<fsm::Decoding>());
+    ASSERT_EQ(request.TokenSize(), 5);
 
-    request.Apply(
-        fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/true, request.HasGeneratedOutput()});
-
+    RetractForTest(request, coordinator, slots, /*epoch=*/1);
     ASSERT_TRUE(request.Is<fsm::Retracted>());
-    EXPECT_EQ(request.PrefillSize(), request.TokenSize());
+    EXPECT_EQ(request.PrefillSize(), 4) << "no rebase: the prompt window is intact";
+    EXPECT_EQ(request.TokenSize(), 5);
+    EXPECT_FALSE(request.HoldsPages());
     EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), device_pool.NumLcmBlocks());
+    EXPECT_EQ(req_pool.AvailableSlots(), 4) << "the request pool slot is released";
+    const auto* retracted = request.GetIf<fsm::Retracted>();
+    ASSERT_TRUE(std::holds_alternative<fsm::ResumeDecoding>(retracted->shape));
+    EXPECT_TRUE(retracted->ResumesGeneration());
+    EXPECT_EQ(retracted->cache_progress.access_epoch, admission->access_epoch) << "the progress survives";
 
-    std::vector<BlockTable> recovery_tables(coordinator.NumGroups());
-    auto recovery_admission = AdmitForTest(
-        coordinator, recovery_tables, GroupDemand{.extent = DenseGrowth{request.PrefillSize()}, .reserve_tokens = 1});
-    ASSERT_TRUE(recovery_admission);
-    request.Apply(fsm::SchedulePrefillFirstChunkEvent{
-        request.PrefillSize(),
-        /*reserve_num_tokens_in_next_schedule_event=*/1,
-        &req_pool,
-        fsm::PrefillSource::kLocal,
-        &coordinator,
-        std::move(recovery_tables),
-        /*hit_tokens=*/0,
-        fsm::CacheProgress{.access_epoch = recovery_admission->access_epoch},
-        /*load_pairs=*/{},
-        /*awaits_result=*/false,
-    });
-    EXPECT_TRUE(request.Is<fsm::PrefillDone>());
+    // The restore rebuilds the tables and takes a request pool slot again;
+    // the request is not schedulable until the copy's ACK.
+    std::vector<BlockTable> restored(coordinator.NumGroups());
+    std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
+    const auto restore = coordinator.Restore(retracted->image, demands, admission->access_epoch);
+    ASSERT_TRUE(restore);
+    ASSERT_EQ(restore->snapshot_pairs.size(), 2u) << "the 4 computed prompt tokens; the decode input has no KV yet";
+    request.Apply(fsm::ScheduleRestoreEvent{&coordinator, req_pool.Allocate(), std::move(restored), /*restore_op=*/3});
+    ASSERT_TRUE(request.Is<fsm::Restoring>());
+    EXPECT_TRUE(request.HoldsPages());
+    EXPECT_EQ(request.ResultsInFlight(), 0);
+    EXPECT_EQ(request.GetIf<fsm::Restoring>()->restore_op, 3u);
+    EXPECT_EQ(snapshot_pool.NumEmptyLcmBlocks(), 12 - 2) << "the image lives until the ACK";
+
+    request.Apply(fsm::RestoreDoneEvent{});
+    ASSERT_TRUE(request.Is<fsm::Decoding>());
+    EXPECT_EQ(request.TokenSize(), 5);
+    EXPECT_EQ(request.NumComputedTokens(), 4);
+    EXPECT_EQ(request.ReserveNumTokensInNextScheduleEvent(), 1);
+    EXPECT_EQ(request.BlockTablesRef()[0].NumBlocks(), 3) << "the imaged pages plus the re-reserved decode slot";
+    EXPECT_EQ(slots.AvailableSlots(), 4) << "the blob slot returns with the image";
+    // The restore op's pairs (held by the transfer manager in production) are
+    // the last owners of the image blocks.
+    EXPECT_EQ(snapshot_pool.NumEmptyLcmBlocks(), 12 - 2);
 }
 
 // Drive the FSM directly to pin the PrefillDone retract overload.
-TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
+TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     BlockPool pool(/*num_lcm_blocks=*/8, {1, 1});
+    BlockPool snapshot_pool(/*num_lcm_blocks=*/8, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -3358,9 +3781,9 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
                        .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false);
+                                                   &snapshot_pool, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
+    SnapshotSlotAllocator slots{4};
 
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kFused};
@@ -3383,54 +3806,73 @@ TEST(RetractEvent, PrefillDoneVictimReleasesPagesAndRequeues) {
     // The last chunk's ExtendResult lands while still PrefillDone.
     request.Apply(fsm::ExtendResultEvent{{42}});
 
-    request.Apply(
-        fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/false, request.HasGeneratedOutput()});
-    // Retracted, not Submitted: "was retracted" and "never ran" are
-    // different situations even when there is no snapshot to recover.
+    RetractForTest(request, coordinator, slots, /*epoch=*/1);
     EXPECT_TRUE(request.Is<fsm::Retracted>());
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8) << "the retract must release every page";
     EXPECT_EQ(request.TokenSize(), 5);
-    EXPECT_EQ(request.PrefillSize(), 5) << "prompt + generated rebase into the prefill window";
+    EXPECT_EQ(request.PrefillSize(), 4) << "the sampled token is not folded into the prompt";
+    const auto* retracted = request.GetIf<fsm::Retracted>();
+    const auto* shape = std::get_if<fsm::ResumePrefillDone>(&retracted->shape);
+    ASSERT_NE(shape, nullptr);
+    EXPECT_EQ(shape->window.begin + shape->window.size, 4);
+    EXPECT_EQ(retracted->image.tables.size(), 2u) << "every group is imaged";
+    EXPECT_EQ(retracted->image.tables[0].slots.size(), 2u);
+    EXPECT_EQ(retracted->image.tables[1].slots.size(), 2u);
+
+    std::vector<BlockTable> restored(coordinator.NumGroups());
+    std::vector<GroupDemand> demands{
+        GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1},
+        GroupDemand{.table = &restored[1], .extent = DenseGrowth{0}, .reserve_tokens = 1},
+    };
+    ASSERT_TRUE(coordinator.Restore(retracted->image, demands, admission->access_epoch));
+    request.Apply(fsm::ScheduleRestoreEvent{&coordinator, req_pool.Allocate(), std::move(restored), /*restore_op=*/1});
+    request.Apply(fsm::RestoreDoneEvent{});
+    ASSERT_TRUE(request.Is<fsm::PrefillDone>());
+    EXPECT_EQ(request.NumComputedTokens(), 4);
+    EXPECT_EQ(request.LastToken(), 42) << "the bootstrap token for its first decode is still there";
 }
 
-// Drive the FSM directly to pin the PrefillAwaitingResult retract overload.
-TEST(RetractEvent, PrefillAwaitingResultVictimReleasesPagesAndRequeues) {
+// The recompute path keeps every overload a forward state has: the runtime
+// skipped the forward, so the request re-prefills prompt + generated like a
+// newcomer and lands in Submitted.
+TEST(RecomputeRetractEvent, EveryForwardStateLandsInSubmittedWithARebasedPrompt) {
     BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false);
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     ReqPoolAllocator req_pool{4};
 
+    const auto admit = [&](Request& request, bool awaits_result) {
+        std::vector<BlockTable> tables(coordinator.NumGroups());
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+        request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
+                                                          /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
+                                                          fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
+                                                          /*hit_tokens=*/0, fsm::CacheProgress{},
+                                                          /*load_pairs=*/{}, awaits_result});
+    };
+
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
-    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
-    std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
-    ASSERT_TRUE(admission);
+    Request awaiting{spec, /*prefix_granularity=*/2, Role::kFused};
+    admit(awaiting, /*awaits_result=*/true);
+    ASSERT_TRUE(awaiting.Is<fsm::PrefillAwaitingResult>());
+    awaiting.Apply(fsm::RecomputeRetractEvent{&coordinator});
+    EXPECT_TRUE(awaiting.Is<fsm::Submitted>());
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8) << "every page is released";
+    EXPECT_EQ(awaiting.PrefillSize(), 4) << "no generated token has landed yet";
 
-    request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
-                                                      /*reserve_num_tokens_in_next_schedule_event=*/1, &req_pool,
-                                                      fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
-                                                      /*hit_tokens=*/0,
-                                                      fsm::CacheProgress{.access_epoch = admission->access_epoch},
-                                                      /*load_pairs=*/{},
-                                                      /*awaits_result=*/true});
-    ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
-    ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
-
-    request.Apply(
-        fsm::RetractEvent{&coordinator, /*epoch=*/1, /*has_recoverable_snapshot=*/false, request.HasGeneratedOutput()});
-    EXPECT_TRUE(request.Is<fsm::Retracted>());
-    const auto* retracted = request.GetIf<fsm::Retracted>();
-    ASSERT_NE(retracted, nullptr);
-    EXPECT_FALSE(retracted->HasRecoverableSnapshot());
-    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8) << "the retract must release every page";
-    EXPECT_EQ(request.TokenSize(), 4);
-    EXPECT_EQ(request.PrefillSize(), 4) << "no generated token has landed yet";
+    Request decoding{spec, /*prefix_granularity=*/2, Role::kFused};
+    admit(decoding, /*awaits_result=*/false);
+    decoding.Apply(fsm::ExtendResultEvent{{42}});
+    decoding.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
+    ASSERT_TRUE(decoding.Is<fsm::Decoding>());
+    decoding.Apply(fsm::RecomputeRetractEvent{&coordinator});
+    EXPECT_TRUE(decoding.Is<fsm::Submitted>());
+    EXPECT_EQ(decoding.PrefillSize(), 5) << "prompt + generated re-prefill as one fresh extend";
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 8);
 }
 
 // ---------------------------------------------------------------------------
@@ -4216,32 +4658,50 @@ protected:
     std::vector<std::int32_t> prompt_;
 };
 
-// A victim retracted mid-prefill may match back exactly the chunks it had
-// computed -- their logits exist -- and no further, even though the twin's
-// equal pages reach the whole prompt: a hit there would stand in for logits
-// the request never produced.
-TEST_F(ProbeBoundReadmissionSuite, APrefillVictimReadmitsNoDeeperThanItsLandedChunks) {
+// A victim retracted mid-prefill never probes: its restore copies the chunks
+// it computed back and the next chunk follows them, whatever the twin's equal
+// pages would have offered.
+TEST_F(ProbeBoundReadmissionSuite, APrefillVictimResumesAfterItsComputedChunksWithoutProbing) {
     RunTwinToDecoding();
     SubmitCappedFirstChunk();
     SendForwardDone("capped");  // the chunk landed: positions [0, 8) have logits
 
-    // The second chunk does not fit; the blocked round retracts the
-    // incomplete prefill (no host tier: it readmits like a new prompt).
-    PlanOnce();
-    SendForwardDone("twin", {44});
-    ASSERT_EQ(scheduler_->WaitingSize(), 1u) << "the incomplete prefill gave way";
+    // The second chunk does not fit. Nobody else needs pages while the twin
+    // decodes inside its reserve, so nothing is retracted; once the twin
+    // needs a page too, the blocked round retracts the incomplete prefill for
+    // it and images its 8 computed tokens.
+    ExecutionPlan retract_round;
+    std::int32_t next_twin = 44;
+    for (int round = 0; round < 8 && scheduler_->RetractedSize() == 0u; ++round) {
+        retract_round = PlanOnce();
+        for (const std::string& id : FindForwardBatch(retract_round)->request_ids) {
+            ASSERT_EQ(id, "twin");
+            SendForwardDone(id, {next_twin++});
+        }
+    }
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u) << "the incomplete prefill gave way";
+    ASSERT_NE(FindSnapshotStore(retract_round), nullptr);
+    AckImageStores(retract_round);
+    SendFinish("twin");
 
+    const ExecutionPlan readmit = PlanOnce();
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    ASSERT_TRUE(FindForwardBatch(readmit)->request_ids.empty()) << "no prefill before the restore lands";
+    AckRestores(readmit);
     const auto [prefix_len, input_len] = ReadmitCapped();
-    EXPECT_EQ(prefix_len, 8) << "match back what had landed, not the twin's deeper pages";
+    EXPECT_EQ(prefix_len, 8) << "the next chunk starts after the computed ones";
     EXPECT_EQ(input_len, 8);
 }
 
 // A chunk whose forward was skipped (the runtime retracts after a failed
-// cache load) landed nothing: the readmission keeps the request's own bound.
-TEST_F(ProbeBoundReadmissionSuite, ASkippedChunkDoesNotRelaxTheProbeBound) {
+// cache load) landed nothing: the request re-prefills like a newcomer, and
+// its own bound of 0 keeps the twin's equal pages out of its probe.
+TEST_F(ProbeBoundReadmissionSuite, ASkippedChunkRecomputesLikeANewcomerWithItsOwnBound) {
     RunTwinToDecoding();
     SubmitCappedFirstChunk();
-    SendRetractEvent("capped");  // before the chunk landed: nothing computed
+    SendRecomputeRetractEvent("capped");  // before the chunk landed: nothing computed
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u) << "a recompute retract lands in Submitted, not Retracted";
 
     const auto [prefix_len, input_len] = ReadmitCapped();
     EXPECT_EQ(prefix_len, 0) << "nothing landed, so the bound of 0 stands";
@@ -5576,7 +6036,7 @@ TEST_F(L3PrefetchRetractSuite, VanishedKeysRetractThenReadmitAsColdMiss) {
     EXPECT_GT(first->extend_prefix_lens.at(0), 0);
 
     scheduler_->UnregisterStorageKeys(keys);
-    SendRetractEvent("r1");
+    SendRecomputeRetractEvent("r1");
     SendLoadBackDone(load.op_ids.at(0), /*success=*/false);
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);

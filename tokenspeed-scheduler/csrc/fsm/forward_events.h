@@ -63,13 +63,9 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           awaits_result_{awaits_result} {}
 
     std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling> operator()(Submitted&& state);
-    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling> operator()(Retracted&& state);
     std::vector<BlockTransfer> TakeLoadPairs() { return std::exchange(load_pairs_, {}); }
 
 private:
-    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling> scheduleFirstChunk(
-        TokenContainer* token_container, std::int32_t prefix_granularity);
-
     std::int32_t tokens_this_round_{};
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
     ReqPoolAllocator* req_pool_allocator_{};
@@ -123,7 +119,11 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     Finished operator()(PrefillDone&& state);
     Finished operator()(PrefillAwaitingResult&& state);
     Finished operator()(Decoding&& state);
+    // A suspended request's image dies with the state: its Host L2 pins drop
+    // (the entries stay published, now evictable), its snapshot-pool blocks
+    // and blob slot return.
     Finished operator()(Retracted&& state);
+    Finished operator()(Restoring&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -146,6 +146,7 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(PrefillAwaitingResult&& state);
     Finished operator()(Decoding&& state);
     Finished operator()(Retracted&& state);
+    Finished operator()(Restoring&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -155,42 +156,121 @@ private:
     CacheCoordinator* coordinator_{};
 };
 
-// Capacity retraction: release every request-owned page and requeue all
-// accepted tokens as prefill. With a host cache the caller stores the KV
-// first (`has_recoverable_snapshot`) and the readmission loads it back;
-// without one the readmission recomputes from whatever the prefix cache
-// still holds. Either way the request lands in Retracted, not Submitted:
-// "was retracted" and "never ran" are different situations, and only the
-// first escalates its readmission headroom (Request::AdmissionHeadroom).
+// Capacity retraction: the victim's Device pages are released -- and granted
+// away in this very round -- while its KV lives on in the image the caller
+// took first (Host L2 pins for the published pages, snapshot-pool blocks for
+// the rest). The state records exactly where the request stopped, so the
+// restore continues it there: nothing is recomputed and the prefill window is
+// not rebased. "Was retracted" and "never ran" stay different situations, and
+// only the first escalates the readmission headroom (Request::NoteRetracted,
+// called by the scheduler beside this event).
 //
-// `resumes_generation` is Request::HasGeneratedOutput() at retraction time:
-// a victim with generated tokens a client is reading resumes ahead of one
-// that had produced nothing -- including a victim taken mid-RECOVERY, whose
-// generated tokens were rebased into its prefill by an earlier retraction.
-struct RetractEvent : InvalidTransitionHandler<RetractEvent> {
-    using InvalidTransitionHandler<RetractEvent>::operator();
+// `resumes_generation` is Request::HasGeneratedOutput() at retraction time: a
+// victim with generated tokens a client is reading resumes ahead of one that
+// had produced nothing. `pending_store_ops` are the store ops whose ACKs make
+// the image landed. PrefillAwaitingResult exists only on the P role, which
+// never retracts, and RemotePrefilling is PD-pinned: neither overload exists.
+struct SnapshotRetractEvent : InvalidTransitionHandler<SnapshotRetractEvent> {
+    using InvalidTransitionHandler<SnapshotRetractEvent>::operator();
 
-    RetractEvent(CacheCoordinator* coordinator, std::int64_t epoch, bool has_recoverable_snapshot,
-                 bool resumes_generation)
+    SnapshotRetractEvent(CacheCoordinator* coordinator, std::int64_t epoch, bool resumes_generation,
+                         RetractionImage image, SnapshotSlotIndex blob_slot,
+                         std::vector<std::uint32_t> pending_store_ops)
         : coordinator_{coordinator},
           epoch_{epoch},
-          has_recoverable_snapshot_{has_recoverable_snapshot},
-          resumes_generation_{resumes_generation} {}
+          resumes_generation_{resumes_generation},
+          image_{std::move(image)},
+          blob_slot_{std::move(blob_slot)},
+          pending_store_ops_{std::move(pending_store_ops)} {}
 
     Retracted operator()(Prefilling&& state);
     Retracted operator()(PrefillDone&& state);
-    Retracted operator()(PrefillAwaitingResult&& state);
-    Retracted operator()(RemotePrefilling&& state);
     Retracted operator()(Decoding&& state);
 
 private:
     template <typename State>
-    Retracted retract(State&& state);
+    Retracted retract(State&& state, ResumeShape shape);
 
     CacheCoordinator* coordinator_{};
     std::int64_t epoch_{0};
-    bool has_recoverable_snapshot_{true};
     bool resumes_generation_{false};
+    RetractionImage image_;
+    SnapshotSlotIndex blob_slot_;
+    std::vector<std::uint32_t> pending_store_ops_;
+};
+
+// The runtime skipped a forward whose L3 prefetch missed after admission: the
+// destination pages were never filled, so there is nothing to image. Every
+// request-owned page is released, the generated tokens are folded into the
+// prefill window (RebasePrefill), and the request re-prefills like a newcomer
+// through the ordinary admission path: it lands in Submitted. Not a snapshot
+// retraction -- no image, no blob slot, no readmission order.
+struct RecomputeRetractEvent : InvalidTransitionHandler<RecomputeRetractEvent> {
+    using InvalidTransitionHandler<RecomputeRetractEvent>::operator();
+
+    explicit RecomputeRetractEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
+
+    Submitted operator()(Prefilling&& state);
+    Submitted operator()(PrefillDone&& state);
+    Submitted operator()(PrefillAwaitingResult&& state);
+    Submitted operator()(RemotePrefilling&& state);
+    Submitted operator()(Decoding&& state);
+
+private:
+    template <typename State>
+    Submitted recompute(State&& state);
+
+    CacheCoordinator* coordinator_{};
+};
+
+// One of the image's store ops was acknowledged (WriteBackDone for the L2
+// leg, SnapshotDone for the tail leg); once none is pending the image has
+// landed and the request may be restored.
+struct StoreLandedEvent : InvalidTransitionHandler<StoreLandedEvent> {
+    using InvalidTransitionHandler<StoreLandedEvent>::operator();
+
+    explicit StoreLandedEvent(std::uint32_t op_id) : op_id_{op_id} {}
+
+    Retracted operator()(Retracted&& state) {
+        state.NoteStoreLanded(op_id_);
+        return std::move(state);
+    }
+
+private:
+    std::uint32_t op_id_{0};
+};
+
+// The restore was admitted: fresh Device pages for the whole image (the
+// scheduler ran CacheCoordinator::Restore) and a request pool slot. Mirrors
+// SchedulePrefillFirstChunkEvent but returns no forward operation: the plan
+// carries a SnapshotRestore cache op, and nothing is schedulable until its
+// ACK. Nothing is out against the pages yet.
+struct ScheduleRestoreEvent : InvalidTransitionHandler<ScheduleRestoreEvent> {
+    using InvalidTransitionHandler<ScheduleRestoreEvent>::operator();
+
+    ScheduleRestoreEvent(CacheCoordinator* coordinator, ReqPoolIndex req_pool_index,
+                         std::vector<BlockTable> block_tables, std::uint32_t restore_op)
+        : coordinator_{coordinator},
+          req_pool_index_{std::move(req_pool_index)},
+          block_tables_{std::move(block_tables)},
+          restore_op_{restore_op} {}
+
+    Restoring operator()(Retracted&& state);
+
+private:
+    CacheCoordinator* coordinator_{};
+    ReqPoolIndex req_pool_index_;
+    std::vector<BlockTable> block_tables_;
+    std::uint32_t restore_op_{0};
+};
+
+// The restore's copies landed: the request continues in the state it left,
+// with the same token count, window and reserve. The image dies here -- Host
+// L2 pins drop, snapshot-pool blocks and the blob slot return.
+struct RestoreDoneEvent : InvalidTransitionHandler<RestoreDoneEvent> {
+    using InvalidTransitionHandler<RestoreDoneEvent>::operator();
+
+    std::variant<Prefilling, PrefillDone, Decoding> operator()(Restoring&& state);
 };
 
 struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTokensEvent> {

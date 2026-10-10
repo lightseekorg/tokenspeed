@@ -26,6 +26,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "cache/core/cache_types.h"
@@ -204,34 +205,69 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
 };
 
+// Where a retracted request resumes once its image is back on Device: the
+// state it left, with what that state carried beyond its ForwardResources.
+struct ResumePrefilling {
+    TokenContainer::Window window{};
+    std::int32_t reserve_num_tokens_in_next_schedule_event{};
+};
+struct ResumePrefillDone {
+    TokenContainer::Window window{};
+    std::int32_t reserve_num_tokens_in_next_schedule_event{};
+};
+struct ResumeDecoding {
+    std::int32_t reserve_num_tokens_in_next_schedule_event{};
+};
+using ResumeShape = std::variant<ResumePrefilling, ResumePrefillDone, ResumeDecoding>;
+
+// Suspended with its image: the request holds no Device pages and no request
+// pool slot, but its KV lives on -- the published pages as pinned Host L2
+// entries, everything else in the snapshot pool -- together with its cache
+// progress and the exact point it stopped at, so the restore continues it
+// where it was (a decoding victim decodes, a mid-prefill victim runs its next
+// chunk). Nothing is recomputed and nothing is rebased.
 struct Retracted {
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
+    CacheProgress cache_progress;
+    RetractionImage image;
+    // The slot-state blob's slot in the runtime's arena (RAII).
+    SnapshotSlotIndex blob_slot;
+    ResumeShape shape;
     // Monotonic stamp from the retraction that produced this state. The plan
     // builder derives the readmission order off the states themselves -- no
     // separate queue to keep in step with the FSM.
     std::int64_t retraction_epoch{0};
-    // False when the retraction had nowhere to store the KV (no host cache):
-    // there is no snapshot to recover, so the request re-prefills like any
-    // newcomer and does not queue behind other readmissions.
-    bool has_recoverable_snapshot{true};
     // A victim with generated output a client is reading resumes ahead of
     // one that had produced nothing, whatever their retraction epochs say.
     bool resumes_generation{false};
-    // Positions [0, landed_tokens) had their forward results land before the
-    // retraction, so their logits exist. The readmission probe may match this
-    // far whatever RequestSpec::max_cached_prefix_tokens says -- the request
-    // loses nothing it still needs -- but no further: beyond it a hit page
-    // (another request's, or a chunk skipped before it landed) would stand in
-    // for logits that were never produced.
-    std::int32_t landed_tokens{0};
+    // The store ops the image waits for: the L2 leg's write-back(s) -- its
+    // own and any earlier in-flight store carrying one of its keys -- and
+    // the tail leg's snapshot store. A restore is issued only once every one
+    // has been acknowledged.
+    std::vector<std::uint32_t> pending_store_ops;
 
     TokenContainer* TokenContainerPtr() const { return token_container; }
     std::int32_t PrefixGranularity() const { return prefix_granularity; }
     std::int64_t RetractionEpoch() const { return retraction_epoch; }
-    bool HasRecoverableSnapshot() const { return has_recoverable_snapshot; }
     bool ResumesGeneration() const { return resumes_generation; }
-    std::int32_t LandedTokens() const { return landed_tokens; }
+    bool ImageLanded() const { return pending_store_ops.empty(); }
+    bool WaitsForStore(std::uint32_t op_id) const {
+        return std::find(pending_store_ops.begin(), pending_store_ops.end(), op_id) != pending_store_ops.end();
+    }
+    void NoteStoreLanded(std::uint32_t op_id) { std::erase(pending_store_ops, op_id); }
+};
+
+// The image is being copied back into freshly allocated Device pages: the
+// request holds pages and a request pool slot again (so the pages count as
+// active and are never granted away), but nothing is schedulable until the
+// restore's ACK. The image stays alive here because the copy reads it.
+struct Restoring {
+    ForwardResources resources;
+    RetractionImage image;
+    SnapshotSlotIndex blob_slot;
+    ResumeShape shape;
+    std::uint32_t restore_op{0};
 };
 
 struct Finished {};

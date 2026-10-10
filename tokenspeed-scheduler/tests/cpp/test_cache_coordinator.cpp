@@ -4720,10 +4720,10 @@ TEST(RetractionImageTest, RestoreRebuildsDenseSlidingAndSparseShapes) {
     // {6}; the reserve slot beyond each is not imaged.
     auto image = coordinator.TakeImage(tables, /*num_tokens=*/14, NoHostSlots(3));
     ASSERT_TRUE(image);
-    ASSERT_EQ(image->snapshot.tables.size(), 3u);
-    EXPECT_EQ(image->snapshot.tables[0].slots.size(), 4u);
-    EXPECT_EQ(image->snapshot.tables[1].slots.size(), 3u);
-    EXPECT_EQ(image->snapshot.tables[2].slots.size(), 1u);
+    ASSERT_EQ(image->image.tables.size(), 3u);
+    EXPECT_EQ(image->image.tables[0].slots.size(), 4u);
+    EXPECT_EQ(image->image.tables[1].slots.size(), 3u);
+    EXPECT_EQ(image->image.tables[2].slots.size(), 1u);
     EXPECT_EQ(image->store_pairs.size(), 8u);
     EXPECT_EQ(snapshot_pool.NumEmptyLcmBlocks(), 32 - 8);
     for (const BlockTransfer& pair : image->store_pairs) {
@@ -4732,12 +4732,12 @@ TEST(RetractionImageTest, RestoreRebuildsDenseSlidingAndSparseShapes) {
         EXPECT_TRUE(pair.key.content_hash.empty());
     }
     // The shape truncates at the data slots; the restore re-reserves beyond.
-    EXPECT_EQ(image->snapshot.tables[0].num_blocks, 4);
-    EXPECT_EQ(image->snapshot.tables[0].available_tokens, 2);
-    EXPECT_EQ(image->snapshot.tables[1].num_blocks, 7);
-    EXPECT_EQ(image->snapshot.tables[1].reclaimed_prefix_blocks, 4);
-    EXPECT_EQ(image->snapshot.tables[2].num_blocks, 7);
-    EXPECT_EQ(image->snapshot.tables[2].reclaimed_prefix_blocks, 6);
+    EXPECT_EQ(image->image.tables[0].num_blocks, 4);
+    EXPECT_EQ(image->image.tables[0].available_tokens, 2);
+    EXPECT_EQ(image->image.tables[1].num_blocks, 7);
+    EXPECT_EQ(image->image.tables[1].reclaimed_prefix_blocks, 4);
+    EXPECT_EQ(image->image.tables[2].num_blocks, 7);
+    EXPECT_EQ(image->image.tables[2].reclaimed_prefix_blocks, 6);
 
     // The store pairs pin the Device sources only until the transfer manager
     // resolves them into a wire op; the image itself holds no Device block.
@@ -4753,7 +4753,7 @@ TEST(RetractionImageTest, RestoreRebuildsDenseSlidingAndSparseShapes) {
         GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1},
         GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 2},
     };
-    auto restore = RestoreDemands(coordinator, image->snapshot, restored, restore_demands, admission->access_epoch);
+    auto restore = RestoreDemands(coordinator, image->image, restored, restore_demands, admission->access_epoch);
     ASSERT_TRUE(restore);
     EXPECT_EQ(ShapeOf(restored[0]), before[0]);
     EXPECT_EQ(ShapeOf(restored[1]), before[1]);
@@ -4817,15 +4817,15 @@ TEST(RetractionImageTest, PublishedSlotsRideHostCacheAndRestoreAsKeyedLoads) {
 
     auto image = coordinator.TakeImage(tables, /*num_tokens=*/5, host_slots);
     ASSERT_TRUE(image);
-    ASSERT_EQ(image->snapshot.tables[0].slots.size(), 3u);
-    EXPECT_TRUE(image->snapshot.tables[0].slots[0].InHostCache());
-    EXPECT_TRUE(image->snapshot.tables[0].slots[1].InHostCache());
-    EXPECT_FALSE(image->snapshot.tables[0].slots[2].InHostCache());
-    EXPECT_EQ(image->snapshot.tables[0].slots[2].slot_index, 2);
+    ASSERT_EQ(image->image.tables[0].slots.size(), 3u);
+    EXPECT_TRUE(image->image.tables[0].slots[0].InHostCache());
+    EXPECT_TRUE(image->image.tables[0].slots[1].InHostCache());
+    EXPECT_FALSE(image->image.tables[0].slots[2].InHostCache());
+    EXPECT_EQ(image->image.tables[0].slots[2].slot_index, 2);
     ASSERT_EQ(image->store_pairs.size(), 1u) << "only the tail page is copied to the snapshot pool";
     EXPECT_EQ(image->store_pairs[0].source, tables[0].Blocks()[2]);
     EXPECT_EQ(snapshot_pool.NumEmptyLcmBlocks(), 7);
-    EXPECT_EQ(image->snapshot.tables[0].available_tokens, 1);
+    EXPECT_EQ(image->image.tables[0].available_tokens, 1);
 
     // Publish the store's destination as its ACK would, then free the victim
     // (the store pairs and the published-slot listing hold Device refs only
@@ -4843,7 +4843,7 @@ TEST(RetractionImageTest, PublishedSlotsRideHostCacheAndRestoreAsKeyedLoads) {
 
     std::vector<BlockTable> restored(1);
     std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
-    auto restore = RestoreDemands(coordinator, image->snapshot, restored, demands, /*access_epoch=*/1);
+    auto restore = RestoreDemands(coordinator, image->image, restored, demands, /*access_epoch=*/1);
     ASSERT_TRUE(restore);
     EXPECT_EQ(restored[0].NumBlocks(), 3);
     EXPECT_EQ(restored[0].AvailableTokens(), 1);
@@ -4934,14 +4934,14 @@ TEST(RetractionImageTest, RestoreEvictsCacheOnlyBlocksAndFailsCleanlyWhenPinned)
 
     std::vector<BlockTable> restored(1);
     std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
-    EXPECT_FALSE(RestoreDemands(coordinator, image->snapshot, restored, demands, /*access_epoch=*/1))
+    EXPECT_FALSE(RestoreDemands(coordinator, image->image, restored, demands, /*access_epoch=*/1))
         << "one pinned entry leaves only three evictable parents for four blocks";
     EXPECT_EQ(restored[0].NumBlocks(), 0) << "a failed restore leaves nothing allocated";
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0) << "and evicts nothing";
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 4);
 
     pin.reset();
-    const auto restore = RestoreDemands(coordinator, image->snapshot, restored, demands, /*access_epoch=*/1);
+    const auto restore = RestoreDemands(coordinator, image->image, restored, demands, /*access_epoch=*/1);
     ASSERT_TRUE(restore);
     EXPECT_EQ(restored[0].NumBlocks(), 4);
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0) << "the restore evicted the cache-only blocks";
@@ -4988,7 +4988,7 @@ TEST(RetractionImageTest, RestoreClaimsStillCachedDeviceBlocksInsteadOfCopying) 
     ASSERT_EQ(others.size(), 4u);
     std::vector<BlockTable> restored(1);
     std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
-    auto restore = RestoreDemands(coordinator, image->snapshot, restored, demands, /*access_epoch=*/1);
+    auto restore = RestoreDemands(coordinator, image->image, restored, demands, /*access_epoch=*/1);
     ASSERT_TRUE(restore);
     EXPECT_EQ(restored[0].Blocks()[0], original[0]) << "slot 0 is the still-cached canonical block";
     EXPECT_EQ(restored[0].Blocks()[1], original[1]);
@@ -5040,7 +5040,7 @@ TEST(RetractionImageTest, ShardedImageKeepsEveryCopyInItsBucket) {
     for (const BlockTransfer& pair : image->store_pairs) {
         EXPECT_EQ(allocator.BucketOf(pair.source->Location()), allocator.BucketOf(pair.destination->Location()));
     }
-    for (const ImageSlot& slot : image->snapshot.tables[0].slots) {
+    for (const ImageSlot& slot : image->image.tables[0].slots) {
         EXPECT_EQ(allocator.BucketOf(slot.block->Location()),
                   device_buckets[static_cast<std::size_t>(slot.slot_index)]);
     }
@@ -5049,7 +5049,7 @@ TEST(RetractionImageTest, ShardedImageKeepsEveryCopyInItsBucket) {
 
     std::vector<BlockTable> restored(1);
     std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
-    const auto restore = RestoreDemands(coordinator, image->snapshot, restored, demands, /*access_epoch=*/1);
+    const auto restore = RestoreDemands(coordinator, image->image, restored, demands, /*access_epoch=*/1);
     ASSERT_TRUE(restore);
     for (const BlockTransfer& pair : restore->load_pairs) {
         EXPECT_EQ(allocator.BucketOf(pair.source->Location()), allocator.BucketOf(pair.destination->Location()));
@@ -5091,15 +5091,15 @@ TEST(RetractionImageTest, BucketConstrainedRestoreFailsCleanlyWhileOtherBucketsH
 
     std::vector<BlockTable> restored(1);
     std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 0}};
-    EXPECT_FALSE(RestoreDemands(coordinator, image->snapshot, restored, demands, /*access_epoch=*/1))
+    EXPECT_FALSE(RestoreDemands(coordinator, image->image, restored, demands, /*access_epoch=*/1))
         << "the bucket-1 slot has no home although two holes are free";
     EXPECT_EQ(restored[0].NumBlocks(), 0);
     EXPECT_EQ(pool.NumFreeSlots(0), 2) << "nothing was allocated";
 
     resident_too.clear();
-    const auto restore = RestoreDemands(coordinator, image->snapshot, restored, demands, /*access_epoch=*/1);
+    const auto restore = RestoreDemands(coordinator, image->image, restored, demands, /*access_epoch=*/1);
     ASSERT_TRUE(restore);
-    for (const ImageSlot& slot : image->snapshot.tables[0].slots) {
+    for (const ImageSlot& slot : image->image.tables[0].slots) {
         EXPECT_EQ(allocator.BucketOf(restored[0].Blocks()[static_cast<std::size_t>(slot.slot_index)]->Location()),
                   allocator.BucketOf(slot.block->Location()));
     }

@@ -1096,7 +1096,7 @@ std::optional<CacheCoordinator::ImageTaken> CacheCoordinator::TakeImage(
     }
 
     ImageTaken image;
-    image.snapshot.tables.reserve(groups_.size());
+    image.image.tables.reserve(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         ImageTable shape{
             .num_blocks = spans[i].blocks,
@@ -1117,7 +1117,7 @@ std::optional<CacheCoordinator::ImageTaken> CacheCoordinator::TakeImage(
             shape.slots.push_back(ImageSlot{.slot_index = private_slots[i][j], .block = std::move(snapshot_blocks[j])});
         }
         std::ranges::sort(shape.slots, {}, &ImageSlot::slot_index);
-        image.snapshot.tables.push_back(std::move(shape));
+        image.image.tables.push_back(std::move(shape));
     }
     return image;
 }

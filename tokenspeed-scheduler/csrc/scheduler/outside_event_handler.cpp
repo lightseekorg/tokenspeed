@@ -159,23 +159,59 @@ void Scheduler::handleEvent(const forward::Abort& event) {
     }
 }
 
-void Scheduler::handleEvent(const forward::Retract& event) {
+void Scheduler::handleEvent(const forward::RecomputeRetract& event) {
     Request* request = findRequest(event.request_id);
-    if (request == nullptr || request->Is<fsm::Finished>() || request->Is<fsm::Retracted>()) {
+    // Only a request with a forward out against its pages can have had that
+    // forward skipped; a suspended or finished one has nothing to recompute.
+    if (request == nullptr || !request->HoldsPages() || request->Is<fsm::Restoring>()) {
         return;
     }
-    // Snapshot-less: dest pages were not filled. Publishing would cache empty
-    // KV. The request re-prefills through ordinary admission.
-    request->Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, /*has_recoverable_snapshot=*/false,
-                                     request->HasGeneratedOutput()});
+    // The skipped forward's destination pages were never filled: publishing
+    // would cache empty KV, so the request re-prefills through ordinary
+    // admission like a newcomer.
+    request->Apply(fsm::RecomputeRetractEvent{&coordinator_});
 }
 
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
     tier_transfers_.CompleteWriteBack(event.op_id);
+    // A retraction image's L2 leg: every suspended request waiting for this
+    // store (its own, or an earlier one carrying one of its keys) notes it.
+    for (const std::unique_ptr<Request>& request : requests_) {
+        const auto* retracted = request->GetIf<fsm::Retracted>();
+        if (retracted != nullptr && retracted->WaitsForStore(event.op_id)) {
+            request->Apply(fsm::StoreLandedEvent{event.op_id});
+        }
+    }
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
     tier_transfers_.CompleteLoadBack(event.op_id, event.success);
+}
+
+void Scheduler::handleEvent(const cache::SnapshotDone& event) {
+    const std::optional<std::string> request_id = tier_transfers_.CompleteSnapshotStore(event.op_id);
+    if (!request_id) {
+        return;  // unknown or duplicate ACK
+    }
+    Request* request = findRequest(*request_id);
+    if (request != nullptr && request->Is<fsm::Retracted>()) {
+        request->Apply(fsm::StoreLandedEvent{event.op_id});
+    }
+}
+
+void Scheduler::handleEvent(const cache::RestoreDone& event) {
+    const std::optional<std::string> request_id = tier_transfers_.CompleteSnapshotRestore(event.op_id);
+    if (!request_id) {
+        return;  // unknown or duplicate ACK
+    }
+    Request* request = findRequest(*request_id);
+    if (request == nullptr) {
+        return;  // finished or aborted while restoring; the ACK only dropped the pins
+    }
+    const auto* restoring = request->GetIf<fsm::Restoring>();
+    if (restoring != nullptr && restoring->restore_op == event.op_id) {
+        request->Apply(fsm::RestoreDoneEvent{});
+    }
 }
 
 }  // namespace tokenspeed

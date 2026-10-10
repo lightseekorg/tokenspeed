@@ -52,15 +52,18 @@ struct Abort {
     std::string request_id;
 };
 
-// Snapshot-less retract: release request-owned pages and requeue as prefill.
-// Used when an admitted L3 prefetch missed; dest pages were not filled, so
-// the next admit recomputes those tokens instead of finishing the client.
-struct Retract {
+// Recompute retract: release request-owned pages and requeue as a fresh
+// prefill (prompt + generated). Used when an admitted L3 prefetch missed and
+// the forward was skipped; the destination pages were never filled, so there
+// is nothing to image and the next admit recomputes those tokens instead of
+// finishing the client. Not a capacity retraction: that one images the KV
+// and restores it (fsm::Retracted).
+struct RecomputeRetract {
     std::string request_id;
 };
 }  // namespace forward
 
-using ForwardEvent = std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::Retract,
+using ForwardEvent = std::variant<forward::ExtendResult, forward::Finish, forward::Abort, forward::RecomputeRetract,
                                   forward::UpdateReserveNumTokens>;
 
 }  // namespace tokenspeed

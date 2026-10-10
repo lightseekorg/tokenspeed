@@ -78,6 +78,97 @@ TEST(CacheOperationTest, OpWithoutTransfersIsASchedulerBug) {
     EXPECT_THROW(LoadBackBatch{{load}}, std::runtime_error);
 }
 
+TEST(CacheOperationTest, SnapshotStoreMayCarryNoPageRowsButNeverADuplicate) {
+    // The tail leg always rides the plan for its slot-state blob, so an op
+    // with no page row is legal; a repeated (group, source, destination) is a
+    // scheduler bug, within and across ops.
+    SnapshotStoreOperation blob_only{.op_id = 3, .request_id = "r", .request_pool_index = 2, .snapshot_slot = 1};
+    SnapshotStoreOperation pages{.op_id = 4,
+                                 .request_id = "s",
+                                 .request_pool_index = 3,
+                                 .snapshot_slot = 2,
+                                 .transfers = {CacheTransfer{0, 5, 7}, CacheTransfer{1, 5, 7}}};
+    SnapshotStoreBatch batch({blob_only, pages});
+    ASSERT_EQ(batch.op_ids, std::vector<std::uint32_t>({3, 4}));
+    EXPECT_EQ(batch.request_ids, std::vector<std::string>({"r", "s"}));
+    EXPECT_EQ(batch.request_pool_indices, std::vector<std::int32_t>({2, 3}));
+    EXPECT_EQ(batch.snapshot_slots, std::vector<std::int32_t>({1, 2}));
+    EXPECT_TRUE(batch.src_pages[0].empty());
+    EXPECT_EQ(batch.group_ids[1], std::vector<std::uint32_t>({0, 1}));
+    EXPECT_EQ(batch.src_pages[1], std::vector<std::int32_t>({5, 5}));
+    EXPECT_EQ(batch.dst_pages[1], std::vector<std::int32_t>({7, 7}));
+
+    SnapshotStoreOperation repeated = pages;
+    repeated.op_id = 5;
+    EXPECT_THROW(SnapshotStoreBatch({pages, repeated}), std::runtime_error);
+    SnapshotStoreOperation unslotted = blob_only;
+    unslotted.snapshot_slot = -1;
+    EXPECT_THROW(SnapshotStoreBatch({unslotted}), std::runtime_error);
+}
+
+TEST(CacheOperationTest, SnapshotRestoreRowsNameTheirSourceTierAndCarryL2Keys) {
+    SnapshotRestoreOperation op{
+        .op_id = 9,
+        .request_id = "r",
+        .request_pool_index = 4,
+        .snapshot_slot = 1,
+        .transfers = {CacheTransfer{.group_id = 0, .source_page = 10, .destination_page = 20, .content_hash = "h0"},
+                      CacheTransfer{.group_id = 0, .source_page = 11, .destination_page = 21}},
+        .source_tier = {HostTier::kL2, HostTier::kSnapshotPool},
+    };
+    SnapshotRestoreBatch batch({op});
+    ASSERT_EQ(batch.op_ids, std::vector<std::uint32_t>({9}));
+    EXPECT_EQ(batch.request_pool_indices, std::vector<std::int32_t>({4}));
+    EXPECT_EQ(batch.src_pages[0], std::vector<std::int32_t>({10, 11}));
+    EXPECT_EQ(batch.dst_pages[0], std::vector<std::int32_t>({20, 21}));
+    EXPECT_EQ(batch.content_hashes[0], std::vector<std::string>({"h0", ""}));
+    EXPECT_EQ(batch.source_tiers[0], std::vector<std::uint8_t>({0, 1}));
+
+    SnapshotRestoreOperation untiered = op;
+    untiered.source_tier.pop_back();
+    EXPECT_THROW(SnapshotRestoreBatch({untiered}), std::runtime_error) << "every row names its source tier";
+    SnapshotRestoreOperation repeated = op;
+    repeated.op_id = 10;
+    EXPECT_THROW(SnapshotRestoreBatch({op, repeated}), std::runtime_error);
+}
+
+TEST(CacheOperationTest, EveryTierTransferPairsBlocksOfEqualResidue) {
+    // Under page-cyclic sharding the rank that owns one end of a copy must own
+    // the other: a Host block in another bucket than its Device source is
+    // refused when the op is built.
+    BlockPool device_pool{2, {2}};
+    BlockPool host_pool{2, {2}};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 2,
+        .block_granularity = 2,
+        .shard_count = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+    TierTransferManager transfers{coordinator};
+    std::vector<CacheBlockRef> device = device_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
+    std::vector<CacheBlockRef> same_bucket = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
+    std::vector<CacheBlockRef> other_bucket = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{1});
+    ASSERT_EQ(device.size() + same_bucket.size() + other_bucket.size(), 3u);
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    coordinator.CacheHostBlock(same_bucket.front(), key);
+    coordinator.CacheHostBlock(other_bucket.front(), CacheKey{.group_id = 0, .content_hash = "h1"});
+
+    std::vector<BlockTransfer> ok;
+    ok.push_back(
+        BlockTransfer{.group_id = 0, .source = same_bucket.front(), .destination = device.front(), .key = key});
+    EXPECT_NO_THROW(transfers.StartPrefixLoad(std::move(ok)));
+
+    std::vector<BlockTransfer> crossed;
+    crossed.push_back(BlockTransfer{.group_id = 0,
+                                    .source = other_bucket.front(),
+                                    .destination = device.front(),
+                                    .key = CacheKey{.group_id = 0, .content_hash = "h1"}});
+    EXPECT_THROW(transfers.StartPrefixLoad(std::move(crossed)), std::runtime_error);
+}
+
 TEST(CacheOperationTest, SamePagesInDifferentGroupsAreDistinctTransfers) {
     WriteBackOperation op;
     op.op_id = 10;

@@ -29,7 +29,9 @@
 namespace tokenspeed::fsm {
 
 std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling>
-SchedulePrefillFirstChunkEvent::scheduleFirstChunk(TokenContainer* token_container, std::int32_t prefix_granularity) {
+SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
+    TokenContainer* token_container = state.TokenContainerPtr();
+    const std::int32_t prefix_granularity = state.PrefixGranularity();
     _assert(coordinator_ != nullptr, "SchedulePrefillFirstChunkEvent requires a cache coordinator");
     _assert(block_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
             "SchedulePrefillFirstChunkEvent requires one admitted table per cache group");
@@ -64,16 +66,6 @@ SchedulePrefillFirstChunkEvent::scheduleFirstChunk(TokenContainer* token_contain
         return PrefillDone{std::move(resources), window, reserve_num_tokens_in_next_schedule_event_};
     }
     return Prefilling{std::move(resources), window, reserve_num_tokens_in_next_schedule_event_};
-}
-
-std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling>
-SchedulePrefillFirstChunkEvent::operator()(Submitted&& state) {
-    return scheduleFirstChunk(state.TokenContainerPtr(), state.PrefixGranularity());
-}
-
-std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling>
-SchedulePrefillFirstChunkEvent::operator()(Retracted&& state) {
-    return scheduleFirstChunk(state.TokenContainerPtr(), state.PrefixGranularity());
 }
 
 std::variant<PrefillDone, PrefillAwaitingResult, Prefilling> SchedulePrefillEvent::operator()(Prefilling&& state) {
@@ -128,7 +120,11 @@ Finished FinishEvent::operator()(Decoding&& state) {
 }
 
 Finished FinishEvent::operator()(Retracted&&) {
-    return Finished{};
+    return Finished{};  // the image dies with the state
+}
+
+Finished FinishEvent::operator()(Restoring&& state) {
+    return finish(std::move(state));
 }
 
 Finished AbortEvent::operator()(Bootstrapping&&) {
@@ -167,67 +163,127 @@ Finished AbortEvent::operator()(Decoding&& state) {
 }
 
 Finished AbortEvent::operator()(Retracted&&) {
-    return Finished{};
+    return Finished{};  // the image dies with the state
 }
 
-namespace {
-
-// Positions whose forward results had landed when the retraction struck. A
-// prefill state's window is its latest scheduled chunk: computed when nothing
-// is in flight (a capacity victim is retracted only when quiescent), still
-// owed otherwise (a chunk whose forward was skipped after a failed cache
-// load). A decoding request has computed every token but the last landed
-// one, which is the next step's input.
-template <typename State>
-std::int32_t landedTokens(const State& state) {
-    const TokenContainer::Window& window = state.window;
-    return state.resources.results_in_flight == 0 ? window.begin + window.size : window.begin;
+Finished AbortEvent::operator()(Restoring&& state) {
+    // The restore's copies may still be in flight: the transfer manager keeps
+    // both ends of every pair pinned until the ACK, so freeing the tables
+    // here only drops the request's own references.
+    return abortForward(std::move(state));
 }
-
-std::int32_t landedTokens(const RemotePrefilling&) {
-    // The peer computes the prompt; no forward of it has landed here.
-    return 0;
-}
-
-std::int32_t landedTokens(const Decoding& state) {
-    return state.resources.token_container->Size() - 1;
-}
-
-}  // namespace
 
 template <typename State>
-Retracted RetractEvent::retract(State&& state) {
-    _assert(coordinator_ != nullptr, "RetractEvent requires a cache coordinator");
-    const std::int32_t landed_tokens = landedTokens(state);
+Retracted SnapshotRetractEvent::retract(State&& state, ResumeShape shape) {
+    _assert(coordinator_ != nullptr, "SnapshotRetractEvent requires a cache coordinator");
+    _assert(state.resources.results_in_flight == 0, "a retraction victim must be quiescent");
     ForwardResources& resources = state.resources;
+    // The pages are released -- and may be granted away in this very round --
+    // because the store reads them ahead of any reuse (stream-ordered).
+    FreeRequest(*coordinator_, resources.block_tables);
+    return Retracted{
+        .token_container = resources.token_container,
+        .prefix_granularity = resources.prefix_granularity,
+        .cache_progress = std::move(resources.cache_progress),
+        .image = std::move(image_),
+        .blob_slot = std::move(blob_slot_),
+        .shape = std::move(shape),
+        .retraction_epoch = epoch_,
+        .resumes_generation = resumes_generation_,
+        .pending_store_ops = std::move(pending_store_ops_),
+    };
+}
+
+Retracted SnapshotRetractEvent::operator()(Prefilling&& state) {
+    const ResumePrefilling shape{
+        .window = state.window,
+        .reserve_num_tokens_in_next_schedule_event = state.ReserveNumTokensInNextScheduleEvent()};
+    return retract(std::move(state), shape);
+}
+
+Retracted SnapshotRetractEvent::operator()(PrefillDone&& state) {
+    const ResumePrefillDone shape{
+        .window = state.window,
+        .reserve_num_tokens_in_next_schedule_event = state.ReserveNumTokensInNextScheduleEvent()};
+    return retract(std::move(state), shape);
+}
+
+Retracted SnapshotRetractEvent::operator()(Decoding&& state) {
+    const ResumeDecoding shape{.reserve_num_tokens_in_next_schedule_event =
+                                   state.ReserveNumTokensInNextScheduleEvent()};
+    return retract(std::move(state), shape);
+}
+
+template <typename State>
+Submitted RecomputeRetractEvent::recompute(State&& state) {
+    _assert(coordinator_ != nullptr, "RecomputeRetractEvent requires a cache coordinator");
+    ForwardResources& resources = state.resources;
+    // Prompt + generated become one fresh prefill: the skipped forward wrote
+    // nothing, so there is no checkpoint to continue from.
     resources.token_container->RebasePrefill();
     FreeRequest(*coordinator_, resources.block_tables);
-    return Retracted{.token_container = resources.token_container,
-                     .prefix_granularity = resources.prefix_granularity,
-                     .retraction_epoch = epoch_,
-                     .has_recoverable_snapshot = has_recoverable_snapshot_,
-                     .resumes_generation = resumes_generation_,
-                     .landed_tokens = landed_tokens};
+    return Submitted{resources.token_container, resources.prefix_granularity};
 }
 
-Retracted RetractEvent::operator()(Prefilling&& state) {
-    return retract(std::move(state));
+Submitted RecomputeRetractEvent::operator()(Prefilling&& state) {
+    return recompute(std::move(state));
 }
 
-Retracted RetractEvent::operator()(PrefillDone&& state) {
-    return retract(std::move(state));
+Submitted RecomputeRetractEvent::operator()(PrefillDone&& state) {
+    return recompute(std::move(state));
 }
 
-Retracted RetractEvent::operator()(PrefillAwaitingResult&& state) {
-    return retract(std::move(state));
+Submitted RecomputeRetractEvent::operator()(PrefillAwaitingResult&& state) {
+    return recompute(std::move(state));
 }
 
-Retracted RetractEvent::operator()(RemotePrefilling&& state) {
-    return retract(std::move(state));
+Submitted RecomputeRetractEvent::operator()(RemotePrefilling&& state) {
+    return recompute(std::move(state));
 }
 
-Retracted RetractEvent::operator()(Decoding&& state) {
-    return retract(std::move(state));
+Submitted RecomputeRetractEvent::operator()(Decoding&& state) {
+    return recompute(std::move(state));
+}
+
+Restoring ScheduleRestoreEvent::operator()(Retracted&& state) {
+    _assert(coordinator_ != nullptr, "ScheduleRestoreEvent requires a cache coordinator");
+    _assert(state.ImageLanded(), "a restore is issued only after the image landed");
+    _assert(req_pool_index_.valid(), "ScheduleRestoreEvent requires a request pool slot");
+    _assert(block_tables_.size() == static_cast<std::size_t>(coordinator_->NumGroups()),
+            "ScheduleRestoreEvent requires one rebuilt table per cache group");
+    return Restoring{
+        .resources =
+            ForwardResources{
+                .token_container = state.token_container,
+                .prefix_granularity = state.prefix_granularity,
+                .req_pool_index = std::move(req_pool_index_),
+                .block_tables = std::move(block_tables_),
+                .cache_progress = std::move(state.cache_progress),
+                .results_in_flight = 0,
+            },
+        .image = std::move(state.image),
+        .blob_slot = std::move(state.blob_slot),
+        .shape = std::move(state.shape),
+        .restore_op = restore_op_,
+    };
+}
+
+std::variant<Prefilling, PrefillDone, Decoding> RestoreDoneEvent::operator()(Restoring&& state) {
+    return std::visit(Overloaded{
+                          [&](const ResumePrefilling& shape) -> std::variant<Prefilling, PrefillDone, Decoding> {
+                              return Prefilling{std::move(state.resources), shape.window,
+                                                shape.reserve_num_tokens_in_next_schedule_event};
+                          },
+                          [&](const ResumePrefillDone& shape) -> std::variant<Prefilling, PrefillDone, Decoding> {
+                              return PrefillDone{std::move(state.resources), shape.window,
+                                                 shape.reserve_num_tokens_in_next_schedule_event};
+                          },
+                          [&](const ResumeDecoding& shape) -> std::variant<Prefilling, PrefillDone, Decoding> {
+                              return Decoding{std::move(state.resources),
+                                              shape.reserve_num_tokens_in_next_schedule_event};
+                          },
+                      },
+                      state.shape);
 }
 
 }  // namespace tokenspeed::fsm

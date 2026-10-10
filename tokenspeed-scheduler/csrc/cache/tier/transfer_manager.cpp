@@ -21,6 +21,7 @@
 #include "cache/tier/transfer_manager.h"
 
 #include <algorithm>
+#include <iterator>
 #include <unordered_set>
 #include <utility>
 
@@ -79,6 +80,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             continue;
         }
         const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(group_ids[i]));
+        _assert(manager.BucketOf(device_block_refs[i]->Location()) == manager.BucketOf(host_block_ref->Location()),
+                "Host store pairs blocks of different owners");
         transfers.push_back(CacheTransfer{
             .group_id = group_ids[i],
             .source_page = manager.ResolveCacheBlockId(device_block_refs[i]->Location()),
@@ -172,6 +175,199 @@ void TierTransferManager::CompleteLoadBack(std::uint32_t op_id, bool success) {
     load_backs_.erase(it);
 }
 
+std::pair<CacheBlockRef, std::uint32_t> TierTransferManager::inFlightHostBlock(const CacheKey& key) const {
+    for (const auto& [op_id, write_back] : write_backs_) {
+        for (const StoreTicket& ticket : write_back.tickets) {
+            if (ticket.key == key) {
+                return {ticket.host_block_ref, op_id};
+            }
+        }
+    }
+    return {CacheBlockRef{}, 0};
+}
+
+std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartRetractionStores(
+    const std::string& request_id, std::int32_t request_pool_index, std::int32_t snapshot_slot,
+    std::span<const BlockTable> tables, std::int32_t num_tokens) {
+    const std::int32_t num_groups = coordinator_.NumGroups();
+    std::vector<std::vector<ImageSlot>> published = coordinator_.PublishedDataSlots(tables, num_tokens);
+    std::vector<std::vector<ImageSlot>> host_slots(static_cast<std::size_t>(num_groups));
+    std::vector<std::uint32_t> pending_store_ops;
+    const auto wait_for = [&pending_store_ops](std::uint32_t op_id) {
+        if (std::find(pending_store_ops.begin(), pending_store_ops.end(), op_id) == pending_store_ops.end()) {
+            pending_store_ops.push_back(op_id);
+        }
+    };
+
+    // The L2 leg. A published slot rides Host L2 as its prefix entry: the
+    // existing entry when the key is already Host-cached, the in-flight
+    // ticket's block when an earlier store carries it (the image then waits
+    // for that store too), else a Host block acquired in the Device block's
+    // bucket and copied by this retraction's own write-back.
+    struct Pending {
+        std::uint32_t group_id;
+        ImageSlot slot;
+    };
+    std::vector<Pending> to_allocate;
+    std::vector<std::uint32_t> allocate_groups;
+    std::vector<std::int32_t> allocate_buckets;
+    if (coordinator_.HasHostPool()) {
+        for (std::int32_t g = 0; g < num_groups; ++g) {
+            const GroupAllocator& allocator = coordinator_.Allocator(g);
+            for (ImageSlot& slot : published[static_cast<std::size_t>(g)]) {
+                if (CacheBlockRef cached = coordinator_.FindHostCachedBlock(slot.key)) {
+                    slot.block = std::move(cached);
+                    host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
+                    continue;
+                }
+                if (auto [in_flight, op_id] = inFlightHostBlock(slot.key); in_flight) {
+                    wait_for(op_id);
+                    slot.block = std::move(in_flight);
+                    host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
+                    continue;
+                }
+                allocate_groups.push_back(static_cast<std::uint32_t>(g));
+                allocate_buckets.push_back(allocator.BucketOf(slot.block->Location()));
+                to_allocate.push_back(Pending{.group_id = static_cast<std::uint32_t>(g), .slot = std::move(slot)});
+            }
+        }
+    }
+    std::vector<StoreTicket> tickets;
+    std::vector<BlockTransfer> host_store_pairs;
+    if (!to_allocate.empty()) {
+        CacheCoordinator::HostAllocationBatch host_blocks =
+            coordinator_.AcquireHostBlocks(allocate_groups, allocate_buckets);
+        for (std::size_t i = 0; i < to_allocate.size(); ++i) {
+            CacheBlockRef& host_block = host_blocks.blocks[i];
+            if (!host_block) {
+                continue;  // L2 is full of pinned entries: this slot rides the snapshot pool instead
+            }
+            ImageSlot& slot = to_allocate[i].slot;
+            host_store_pairs.push_back(BlockTransfer{
+                .group_id = to_allocate[i].group_id,
+                .source = slot.block,
+                .destination = host_block,
+                .key = slot.key,
+            });
+            // The ticket's Host pin is dropped at the ACK, which publishes the
+            // entry; the image's own pin on the same block outlives it.
+            tickets.push_back(StoreTicket{slot.key, CacheBlockRef{}, host_block});
+            slot.block = std::move(host_block);
+            host_slots[to_allocate[i].group_id].push_back(std::move(slot));
+        }
+        for (std::vector<ImageSlot>& slots : host_slots) {
+            std::ranges::sort(slots, {}, &ImageSlot::slot_index);
+        }
+    }
+
+    // The tail leg: every other data slot, in the snapshot pool.
+    std::optional<CacheCoordinator::ImageTaken> taken = coordinator_.TakeImage(tables, num_tokens, host_slots);
+    if (!taken) {
+        return std::nullopt;  // the acquired Host blocks and tickets die here, unused
+    }
+
+    RetractionStores stores{.image = std::move(taken->image)};
+    if (!tickets.empty()) {
+        const std::uint32_t op_id = nextOpId();
+        std::vector<CacheTransfer> transfers = resolveTransfers(host_store_pairs);
+        for (std::size_t i = 0; i < transfers.size(); ++i) {
+            transfers[i].content_hash = host_store_pairs[i].key.content_hash;
+            transfers[i].page_offset = host_store_pairs[i].key.page_offset;
+        }
+        const bool inserted =
+            write_backs_.emplace(op_id, InFlightWriteBack{StoreSourceGuard::kStreamOrdered, std::move(tickets)}).second;
+        _assert(inserted, "duplicate store op id");
+        stores.host_store = WriteBackOperation{
+            .op_id = op_id,
+            .transfers = std::move(transfers),
+            .source_pinned = false,
+        };
+        wait_for(op_id);
+    }
+    {
+        const std::uint32_t op_id = nextOpId();
+        std::vector<CacheBlockRef> destinations;
+        destinations.reserve(taken->store_pairs.size());
+        for (const BlockTransfer& pair : taken->store_pairs) {
+            destinations.push_back(pair.destination);
+        }
+        stores.snapshot_store = SnapshotStoreOperation{
+            .op_id = op_id,
+            .request_id = request_id,
+            .request_pool_index = request_pool_index,
+            .snapshot_slot = snapshot_slot,
+            .transfers = resolveTransfers(taken->store_pairs),
+        };
+        const bool inserted = snapshot_stores_
+                                  .emplace(op_id, InFlightSnapshotStore{.request_id = request_id,
+                                                                        .destinations = std::move(destinations)})
+                                  .second;
+        _assert(inserted, "duplicate snapshot store op id");
+        wait_for(op_id);
+    }
+    stores.pending_store_ops = std::move(pending_store_ops);
+    return stores;
+}
+
+SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(const std::string& request_id,
+                                                                   std::int32_t request_pool_index,
+                                                                   std::int32_t snapshot_slot,
+                                                                   std::vector<BlockTransfer> load_pairs,
+                                                                   std::vector<BlockTransfer> snapshot_pairs) {
+    for (const BlockTransfer& pair : load_pairs) {
+        _assert(!pair.key.content_hash.empty() && coordinator_.IsHostCachedBlock(pair.source->Location()),
+                "a restore's Host L2 row must come from a published Host entry");
+    }
+    SnapshotRestoreOperation op{
+        .op_id = nextOpId(),
+        .request_id = request_id,
+        .request_pool_index = request_pool_index,
+        .snapshot_slot = snapshot_slot,
+        .transfers = resolveTransfers(load_pairs),
+        .source_tier = std::vector<HostTier>(load_pairs.size(), HostTier::kL2),
+    };
+    std::vector<CacheTransfer> pool_rows = resolveTransfers(snapshot_pairs);
+    op.transfers.insert(op.transfers.end(), std::make_move_iterator(pool_rows.begin()),
+                        std::make_move_iterator(pool_rows.end()));
+    op.source_tier.insert(op.source_tier.end(), snapshot_pairs.size(), HostTier::kSnapshotPool);
+    std::vector<BlockTransfer> transfers = std::move(load_pairs);
+    transfers.insert(transfers.end(), std::make_move_iterator(snapshot_pairs.begin()),
+                     std::make_move_iterator(snapshot_pairs.end()));
+    const bool inserted =
+        snapshot_restores_
+            .emplace(op.op_id, InFlightSnapshotRestore{.request_id = request_id, .transfers = std::move(transfers)})
+            .second;
+    _assert(inserted, "duplicate snapshot restore op id");
+    return op;
+}
+
+std::optional<std::string> TierTransferManager::CompleteSnapshotStore(std::uint32_t op_id) {
+    auto it = snapshot_stores_.find(op_id);
+    if (it == snapshot_stores_.end()) {
+        return std::nullopt;
+    }
+    std::string request_id = std::move(it->second.request_id);
+    snapshot_stores_.erase(it);
+    return request_id;
+}
+
+std::optional<std::string> TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id) {
+    auto it = snapshot_restores_.find(op_id);
+    if (it == snapshot_restores_.end()) {
+        return std::nullopt;
+    }
+    // The L2-tier rows are the request's own prefix pages, copied back whole:
+    // publish them like an ordinary load-back's destinations.
+    for (BlockTransfer& transfer : it->second.transfers) {
+        if (transfer.destination && !transfer.key.content_hash.empty()) {
+            coordinator_.CacheDeviceBlock(transfer.destination, transfer.key);
+        }
+    }
+    std::string request_id = std::move(it->second.request_id);
+    snapshot_restores_.erase(it);
+    return request_id;
+}
+
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
     std::vector<CacheTransfer> transfers;
     transfers.reserve(block_transfers.size());
@@ -179,6 +375,11 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
         _assert(block_transfer.source && block_transfer.destination,
                 "cache transfer requires pinned source and destination blocks");
         const GroupAllocator& manager = coordinator_.Allocator(static_cast<std::int32_t>(block_transfer.group_id));
+        // Every tier transfer pairs blocks of equal residue: under page-cyclic
+        // sharding the rank that owns one end owns the other.
+        _assert(manager.BucketOf(block_transfer.source->Location()) ==
+                    manager.BucketOf(block_transfer.destination->Location()),
+                "cache transfer pairs blocks of different owners");
         transfers.push_back(CacheTransfer{
             .group_id = block_transfer.group_id,
             .source_page = manager.ResolveCacheBlockId(block_transfer.source->Location()),

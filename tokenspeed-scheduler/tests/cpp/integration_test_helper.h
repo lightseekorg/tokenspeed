@@ -173,10 +173,65 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
-    void SendRetractEvent(const std::string& request_id) {
+    // The runtime skipped this request's forward after a failed L3 prefetch:
+    // it re-prefills like a newcomer.
+    void SendRecomputeRetractEvent(const std::string& request_id) {
         ExecutionEvent event;
-        event.With(forward::Retract{.request_id = request_id});
+        event.With(forward::RecomputeRetract{.request_id = request_id});
         scheduler_->Advance(std::move(event));
+    }
+
+    void SendSnapshotDone(std::uint32_t op_id) {
+        ExecutionEvent event;
+        event.With(cache::SnapshotDone{.op_id = op_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendRestoreDone(std::uint32_t op_id) {
+        ExecutionEvent event;
+        event.With(cache::RestoreDone{.op_id = op_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    // Acknowledges both legs of every retraction image the plan stores: the
+    // L2 write-backs and the snapshot stores.
+    void AckImageStores(const ExecutionPlan& plan) {
+        AckWriteBacks(plan);
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<SnapshotStoreBatch>(plan)) {
+            for (std::uint32_t id : std::get<SnapshotStoreBatch>(op).op_ids) {
+                SendSnapshotDone(id);
+            }
+        }
+    }
+
+    void AckRestores(const ExecutionPlan& plan) {
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<SnapshotRestoreBatch>(plan)) {
+            for (std::uint32_t id : std::get<SnapshotRestoreBatch>(op).op_ids) {
+                SendRestoreDone(id);
+            }
+        }
+    }
+
+    static const SnapshotStoreBatch* FindSnapshotStore(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (const auto* store = std::get_if<SnapshotStoreBatch>(cache_op)) {
+                    return store;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    static const SnapshotRestoreBatch* FindRestore(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (const auto* restore = std::get_if<SnapshotRestoreBatch>(cache_op)) {
+                    return restore;
+                }
+            }
+        }
+        return nullptr;
     }
 
     SchedulerConfig config_{};

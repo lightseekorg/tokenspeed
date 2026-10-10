@@ -68,7 +68,9 @@ public:
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
-    // Submitted plus Retracted requests waiting for admission/readmission.
+    // Requests waiting for an admission: Submitted, plus the suspended ones --
+    // Retracted (waiting to be restored) and Restoring (their copy back is in
+    // flight) -- which hold no schedulable work until they resume.
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
@@ -113,13 +115,13 @@ public:
     // backend for existing objects, then registers the matching CacheKeys so
     // ProbePrefix can treat them as Host hits that require prefetch.
     std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
-    // Prefix hashes of Submitted/Retracted requests the scheduler can admit
-    // this round. The event loop revalidates these against L3 immediately
-    // before NextExecutionPlan so a queued hit cannot survive deletion.
-    // Requests that cannot take a batch slot (full decode batch, HOL
-    // incomplete prefill) or cannot obtain Device pages (pool exhausted)
-    // are skipped so a long waiter is not rehashed and remotely probed on
-    // every decode step.
+    // Prefix hashes of Submitted requests the scheduler can admit this round
+    // (a restore copies the request's own image back and probes nothing). The
+    // event loop revalidates these against L3 immediately before
+    // NextExecutionPlan so a queued hit cannot survive deletion. Requests
+    // that cannot take a batch slot (full decode batch, HOL incomplete
+    // prefill) or cannot obtain Device pages (pool exhausted) are skipped so
+    // a long waiter is not rehashed and remotely probed on every decode step.
     std::vector<std::string> WaitingPrefixHashes() const;
     std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
         return coordinator_.ExpandPrefixKeys(content_hashes);
@@ -156,10 +158,28 @@ private:
         // never recorded here: when it needs a victim, the two simply do not
         // fit together, and swapping them is pure thrash.
         Request* capacity_blocker{nullptr};
+        // Every candidate whose admission failed for capacity this round, in
+        // phase order (the blocker first). When the victim turns out to be
+        // the blocker itself, the next of these is who its pages serve.
+        std::vector<Request*> capacity_blocked;
+
+        void NoteCapacityBlocked(Request* request) {
+            if (capacity_blocker == nullptr) {
+                capacity_blocker = request;
+            }
+            capacity_blocked.push_back(request);
+        }
     };
 
-    std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
-        ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations);
+    // What one plan-building pass emits beside the ExecutionPlan's own fields.
+    struct BuiltOperations {
+        std::vector<ForwardOperation> forward;
+        std::vector<LoadBackOperation> load_backs;
+        std::vector<SnapshotStoreOperation> snapshot_stores;
+        std::vector<SnapshotRestoreOperation> snapshot_restores;
+    };
+    BuiltOperations buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
+                                           std::vector<WriteBackOperation>& write_back_operations);
     std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(ExecutionPlan& plan,
                                                                                  AdmissionFeedback& feedback,
                                                                                  Request* request,
@@ -202,13 +222,15 @@ private:
 
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
+    void handleEvent(const cache::SnapshotDone& event);
+    void handleEvent(const cache::RestoreDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
     void handleEvent(const forward::ExtendResult& event);
     void handleEvent(const forward::Abort& event);
-    void handleEvent(const forward::Retract& event);
+    void handleEvent(const forward::RecomputeRetract& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
@@ -226,6 +248,10 @@ private:
         std::vector<ForwardOperation> remote_decode;
         std::vector<ForwardOperation> remote_prefill;
         std::vector<LoadBackOperation> load_backs;
+        // A retraction's tail-leg store (its L2 leg joins the write-backs) and
+        // a readmission's restore: cache ops riding beside the batch.
+        std::vector<SnapshotStoreOperation> snapshot_stores;
+        std::vector<SnapshotRestoreOperation> snapshot_restores;
         // A round schedules each request at most once, whatever states it
         // moves through while the phases run (a prompt completed by the
         // prefill phase is PrefillDone by the time the decode phase walks
@@ -279,14 +305,18 @@ private:
                                                              std::int32_t decode_reserve,
                                                              std::vector<LoadBackOperation>& load_backs);
 
-    // The readmission this round may schedule, or nullptr: among the
-    // retracted requests holding a recoverable snapshot, decode-origin
-    // victims first, then oldest retraction epoch. Derived from the states
-    // themselves, so a request that finishes or aborts while retracted
-    // simply stops qualifying. A snapshot-less retraction is not in this
-    // ordering at all -- it re-prefills through the ordinary admission path
-    // (admitsLikeNewPrompt).
+    // The readmission this round may restore, or nullptr: among the
+    // retracted requests whose image has landed, victims with generated
+    // output first (they resume a generation a client is reading), then
+    // oldest retraction epoch. Derived from the states themselves, so a
+    // request that finishes or aborts while retracted simply stops qualifying.
     static Request* nextReadmission(std::span<Request* const> candidates);
+    // Allocates fresh Device pages for the whole image plus the reserve the
+    // resumed state needs, issues the restore op beside the batch and moves
+    // the request to Restoring. False when it does not fit (feedback says
+    // whether capacity was the reason): the readmission waits and is never
+    // recorded as the capacity blocker.
+    bool scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, Request* request);
 
     // The capacity-retraction entry shared by the D and fused grammars:
     // fires only when no prefill progressed and admission failed. Retracts
@@ -296,7 +326,16 @@ private:
     void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
     Request* chooseVictim(std::span<Request* const> candidates) const;
-    void retractVictim(Request& victim, std::vector<WriteBackOperation>& write_back_operations);
+    // Images the victim (Host L2 for its published pages, the snapshot pool
+    // for the rest), issues both store legs and suspends it. False, with
+    // nothing changed but Host entries evicted for the attempt, when the
+    // image cannot be held or no blob slot is free: the caller waits.
+    bool retractVictim(Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations);
+    // The debug_force_retraction_interval knob: arms the oldest Decoding
+    // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
+    // the batch until it is quiescent, then retracts it.
+    void maybeForceRetraction(PlanBuild& build, std::span<Request* const> candidates,
+                              std::vector<WriteBackOperation>& write_back_operations);
 
     // One plan-building grammar per engine role: the roles share the
     // scheduling mechanism (schedulePrefill / scheduleDecode / admission)
@@ -311,7 +350,7 @@ private:
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                         std::vector<WriteBackOperation>& write_back_operations);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                                  Request* readmission, std::int32_t decode_reserve);
+                                  bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
@@ -333,6 +372,11 @@ private:
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (nextReadmission).
     std::int64_t next_retraction_epoch_{1};
+    // The forced-retraction knob's clock and the request it has armed (empty
+    // when none): kept out of every batch until it is quiescent, then
+    // retracted.
+    std::int64_t plan_calls_{0};
+    std::string forced_victim_id_;
 
     // Submission order -- the FIFO every scheduling phase walks, identical
     // on every rank because the mirrored schedulers receive identical
