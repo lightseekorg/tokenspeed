@@ -254,6 +254,96 @@ def main() -> None:
         output, ref_out[:, rank * 2 : (rank + 1) * 2], rtol=0.01, atol=0.005
     )
     print(f"rank {rank}: distributed attention/LSE merge matched unsharded", flush=True)
+    # Verify three consecutive tokens, then advance/re-anchor across a page
+    # boundary. Use the actual DSA backend and production collectives.
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
+
+    backend = object.__new__(DSABackend)
+    backend.kernel_page_size = 64
+    backend.kernel_solution = "triton"
+    backend.data_type = torch.bfloat16
+    backend.kv_lora_rank = 128
+    backend.qk_nope_head_dim = 128
+    backend.qk_rope_head_dim = 0
+    backend.index_topk = topk
+    backend.max_context_len = 1024
+    backend.dcp_group = group
+    backend.dcp_rank = rank
+    backend.dcp_block_granularity = 64
+    backend.dcp_virtual_block_count = pages
+    end_length = torch.tensor([129], device="cuda", dtype=torch.int32)
+    backend._dense_backend = SimpleNamespace(
+        forward_decode_metadata=SimpleNamespace(
+            num_extends=0,
+            seq_lens_k=end_length,
+            max_seq_len_k=1024,
+        )
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        head_dim=128,
+        v_head_dim=128,
+        scaling=0.1,
+        logit_cap=0.0,
+    )
+    pool = SimpleNamespace(quant_method=None, get_key_buffer=lambda _: local_latent)
+    for end in (129, 132, 128):
+        end_length.fill_(end)
+        lengths.copy_(
+            end_length + torch.arange(-2, 1, device="cuda", dtype=torch.int32)
+        )
+        reference, ref_lens = select_dsa_topk(
+            q,
+            w,
+            full,
+            table,
+            requests,
+            lengths,
+            placement=CachePlacement(64, pages, (rank,), 0),
+            **kw,
+        )
+        result, lens = select_dsa_topk(
+            q,
+            w,
+            local,
+            table,
+            requests,
+            lengths,
+            placement=CachePlacement(64, pages, group, rank),
+            **kw,
+        )
+        torch.testing.assert_close(result.sort(-1).values, reference.sort(-1).values)
+        torch.testing.assert_close(lens, ref_lens)
+        virtual_slots = torch.where(
+            result >= 0,
+            table[0, result.clamp_min(0).long() // 64] * 64 + result % 64,
+            -1,
+        )
+        ref_out, _ = dsa_decode(
+            q=all_q,
+            kv_cache=latent,
+            topk_slots=virtual_slots,
+            **{**kwargs, "topk_lens": lens, "q_len_per_req": 3, "kv_seq_lens": lengths},
+        )
+        output = backend.forward_sparse_decode(
+            q=all_q[:, rank * 2 : (rank + 1) * 2].contiguous(),
+            k=None,
+            v=None,
+            layer=layer,
+            out_cache_loc=torch.empty(0, device="cuda", dtype=torch.int64),
+            token_to_kv_pool=pool,
+            bs=1,
+            save_kv_cache=False,
+            topk_indices=virtual_slots,
+            topk_lens=lens,
+        ).reshape(3, 2, 128)
+        torch.testing.assert_close(
+            output, ref_out[:, rank * 2 : (rank + 1) * 2], rtol=0.01, atol=0.005
+        )
+    print(f"rank {rank}: DSA verify and re-anchor matched unsharded", flush=True)
     dist.destroy_process_group()
 
 

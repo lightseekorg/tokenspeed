@@ -101,6 +101,10 @@ class CacheTransferContract:
     def __post_init__(self) -> None:
         self.transfer_schema.validate(self.plan)
 
+    def shard_count(self, group_id: str) -> int:
+        """Return the cache group's cyclic owner count; one means replicated."""
+        return self.group_spec(group_id).shard_count
+
     def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:
         return tuple(
             sorted(

@@ -420,6 +420,8 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         positions: torch.Tensor,
         cache_locs: torch.Tensor,
         token_to_kv_pool,
+        *,
+        attn_backend,
     ) -> None:
         for layer in self.layers:
             attn = layer.self_attn

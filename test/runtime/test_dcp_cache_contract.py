@@ -645,13 +645,13 @@ class ConfigurationTest(unittest.TestCase):
         args._handle_kvstore()
         args.validate_cache_options()
 
-    def test_dcp_allows_aggregated_and_prefill_roles_only(self):
-        for mode in ("null", "prefill"):
+    def test_dcp_allows_roles_with_cache(self):
+        for mode in ("null", "prefill", "decode"):
             validate_dcp_disaggregation_role(has_dcp=True, disaggregation_mode=mode)
         for mode in ("null", "prefill", "decode", "encode"):
             validate_dcp_disaggregation_role(has_dcp=False, disaggregation_mode=mode)
-        for mode in ("decode", "encode"):
-            with self.assertRaisesRegex(ValueError, "only the prefill side"):
+        for mode in ("encode",):
+            with self.assertRaisesRegex(ValueError, "null, prefill or decode"):
                 validate_dcp_disaggregation_role(has_dcp=True, disaggregation_mode=mode)
 
 

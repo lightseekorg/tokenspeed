@@ -217,6 +217,7 @@ def select_dspark_context_producer(
     pp_size: int,
     draft_model: torch.nn.Module | None,
     draft_token_to_kv_pool,
+    draft_attn_backend,
 ):
     """Return the stage's DSpark context producer, or None when nothing is produced.
 
@@ -258,7 +259,9 @@ def select_dspark_context_producer(
     )
 
     if isinstance(draft_model, DSparkContextModel):
-        return DSparkContextProducer(draft_model, draft_token_to_kv_pool)
+        return DSparkContextProducer(
+            draft_model, draft_token_to_kv_pool, attn_backend=draft_attn_backend
+        )
     if is_block_drafter(spec_algo, is_draft=True):
         raise TypeError(
             f"{type(draft_model).__name__} cannot produce DSpark context across "
@@ -564,6 +567,7 @@ class ModelExecutor:
                 draft_model_runner.model if draft_model_runner is not None else None
             ),
             draft_token_to_kv_pool=draft_token_to_kv_pool,
+            draft_attn_backend=draft_attn_backend,
         )
         if self.config.spec_algo is not None and self._pp_is_last_stage:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
