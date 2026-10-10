@@ -375,6 +375,17 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         // rather than a capacity one. The P role is exempt: it never decodes
         // locally and never retracts, so there is no decode room to prepay.
         const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
+        // Sliding-window prepay (docs/design/scheduler.md §1). A remote landing
+        // has no later local chunk: the peer fills the whole prompt.
+        const std::int32_t later_chunk_tokens =
+            source == fsm::PrefillSource::kLocal ? unscheduled - tokens_this_round : 0;
+        // Only beside another page holder, so a request alone asks for what
+        // max_single_request_tokens counts. Any holder, not only one sharing the
+        // hit: hit pages may become shared after this admission.
+        const bool others_hold_pages = (hit_tokens > 0 || later_chunk_tokens > 0) &&
+                                       std::ranges::any_of(requests_, [request](const std::unique_ptr<Request>& other) {
+                                           return other.get() != request && other->HoldsPages();
+                                       });
         const PrefillReserve reserve{
             .decode_input_tokens = decode_input_tokens,
             .completes_prefill = completes_prefill,
@@ -382,6 +393,9 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             // A remote landing always finishes shaping; the P role needs no local decode growth.
             .reserve_snapshot_state_growth =
                 config_.role != Role::kP && (source == fsm::PrefillSource::kRemote || completes_prefill),
+            .swa_hit_tokens = others_hold_pages ? hit_tokens : 0,
+            .swa_later_chunk_tokens = others_hold_pages ? later_chunk_tokens : 0,
+            .swa_prompt_after_hit_tokens = unscheduled,
         };
         tables = std::vector<BlockTable>(static_cast<std::size_t>(coordinator_.NumGroups()));
         std::vector<GroupDemand> demands =
@@ -629,14 +643,15 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 //
 // Exempt: a request whose reserve already covers its whole generation --
 // retracting it frees exactly what its readmission must take back, pure
-// thrash. Transient obstacles (a forward still out, a PD transfer pin) do
-// NOT redirect the choice; the caller waits for the chosen victim to
-// quiesce rather than sacrificing a worse-ranked request.
-Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
+// thrash -- unless `ignore_exemption` is set (the last resort of
+// maybeRetractForCapacity). Transient obstacles (a forward still out, a PD
+// transfer pin) do NOT redirect the choice; the caller waits for the chosen
+// victim to quiesce rather than sacrificing a worse-ranked request.
+Request* Scheduler::chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const {
     Request* victim = nullptr;
     for (Request* request : candidates) {
         const auto* prefilling = request->GetIf<fsm::Prefilling>();
-        if (prefilling != nullptr && !request->ReserveCoversGeneration(kRetractionSafeSteps) &&
+        if (prefilling != nullptr && (ignore_exemption || !request->ReserveCoversGeneration(kRetractionSafeSteps)) &&
             (victim == nullptr || request->TokenSize() > victim->TokenSize())) {
             victim = request;
         }
@@ -648,7 +663,7 @@ Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
     std::optional<std::tuple<std::int32_t, std::int32_t, std::string>> victim_rank;
     for (Request* request : candidates) {
         if ((!request->Is<fsm::Decoding>() && !request->Is<fsm::PrefillDone>()) ||
-            request->ReserveCoversGeneration(kRetractionSafeSteps)) {
+            (!ignore_exemption && request->ReserveCoversGeneration(kRetractionSafeSteps))) {
             continue;
         }
         auto rank = std::tuple{-coordinator_.NumNewlyReleasableLcmBlocks(request->BlockTablesRef()),
@@ -712,7 +727,9 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
 // in the same plan build: the freed capacity reaches the request it was
 // freed for within this very round, so there is never a free page waiting
 // for whoever asks first next round -- which is what used to require a
-// cross-round capacity barrier.
+// cross-round capacity barrier. The one exception is the last resort, when
+// the round runs nothing: its freed pages go first to the round's decodes,
+// none of which got a page, and to the blocker only when none fits.
 //
 // The victim's own device blocks return to the pool immediately; the L2
 // snapshot copy is ordered on the forward thread's stream BEFORE anything
@@ -748,9 +765,16 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     }
 
     while (true) {
-        Request* victim = chooseVictim(candidates);
+        Request* victim = chooseVictim(candidates, /*ignore_exemption=*/false);
+        const bool last_resort = victim == nullptr && build.operations.empty() && build.remote_prefill.empty() &&
+                                 build.remote_decode.empty();
+        if (last_resort) {
+            // Nothing is retractable under the exemption and the round runs
+            // nothing: the last resort (docs/design/scheduler.md §2).
+            victim = chooseVictim(candidates, /*ignore_exemption=*/true);
+        }
         if (victim == nullptr) {
-            return;  // everything resident is exempt; only a completion can free capacity
+            return;  // nothing to retract, or this round's work will free capacity when it completes
         }
         if (victim->ResultsInFlight() > 0 || pdTransferInFlight(*victim)) {
             // The victim is chosen but not quiescent: a forward's KV write or
@@ -759,6 +783,15 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             return;
         }
         retractVictim(*victim, write_back_operations);
+
+        if (last_resort) {
+            // The round's decodes, none of which got a page, take the freed
+            // pages before the blocker (docs/design/scheduler.md §2).
+            scheduleDecodeBatch(feedback, build, candidates);
+            if (build.pushed_decode) {
+                return;
+            }
+        }
 
         if (blocker == victim) {
             // The victim blocked on its own next page; it comes back through

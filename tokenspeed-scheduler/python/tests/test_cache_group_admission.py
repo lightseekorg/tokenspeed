@@ -306,8 +306,9 @@ def test_first_chunk_prepays_prompt_headroom_only_in_full_history_groups():
     # A 32-token prompt with max_new_tokens=8 admits its first 8-token chunk on
     # a decoding role with 24 unscheduled prompt tokens + 8 tokens of decode
     # headroom prepaid. The full-history group must hold that: 8 + 32 tokens
-    # -> 10 pages. The sliding-window group recycles slid-out pages, so the
-    # rest of the prompt costs it nothing: it holds only the chunk, 2 pages.
+    # -> 10 pages. The sliding-window group recycles slid-out pages, so with no
+    # other request holding pages the rest of the prompt costs it nothing: it
+    # holds only the chunk, 2 pages.
     # 12 pages fit a 16-page pool; had the headroom been broadcast to both
     # groups (20 pages) the request would have sat in the waiting queue.
     scheduler = _hybrid_chunked_scheduler(num_usable_pages=16)
