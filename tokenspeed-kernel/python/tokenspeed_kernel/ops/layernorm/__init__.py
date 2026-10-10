@@ -47,6 +47,9 @@ if _platform.is_npu:
 elif _platform.is_amd:
     from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm as _qk_rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
+    from tokenspeed_kernel.ops.layernorm.triton import (
+        rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
+    )
 else:
     from tokenspeed_kernel.ops.layernorm.flashinfer import (
         fused_add_rmsnorm as _fused_add_rmsnorm,
@@ -96,6 +99,26 @@ def rmsnorm(
             raise ValueError("rmsnorm does not support residual and out together")
         return _rmsnorm(x, weight, eps, residual=residual)
     return _rmsnorm(x, weight, eps, out=out)
+
+
+def rmsnorm_pair(
+    x1: torch.Tensor,
+    weight1: torch.Tensor,
+    x2: torch.Tensor,
+    weight2: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """RMSNorm two row-aligned 2D inputs (e.g. splits of one projection).
+
+    Equals ``rmsnorm(x1, weight1, eps), rmsnorm(x2, weight2, eps)``; on AMD
+    both run in one launch with the same arithmetic.
+    """
+    if _platform.is_amd and x1.ndim == 2 and x2.ndim == 2 and x1.shape[0]:
+        out1 = torch.empty(x1.shape, dtype=x1.dtype, device=x1.device)
+        out2 = torch.empty(x2.shape, dtype=x2.dtype, device=x2.device)
+        triton_rmsnorm_fused_parallel(x1, weight1, out1, x2, weight2, out2, eps)
+        return out1, out2
+    return rmsnorm(x1, weight1, eps), rmsnorm(x2, weight2, eps)
 
 
 def qk_rmsnorm(

@@ -81,6 +81,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     rope_pad_query,
 )
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32, grouped_bf16_projection
+from tokenspeed_kernel.ops.layernorm import rmsnorm_pair
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -377,6 +378,13 @@ def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
 
 def _attention_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     return norm(x, residual=None, out=None) if x.is_cuda else _norm(x, norm)
+
+
+def _attention_norms(qr, swa, q_norm: RMSNorm, kv_norm: RMSNorm):
+    """Normalize the query and SWA splits of one projection in one call."""
+    if not qr.is_cuda or qr.shape[0] == 0:
+        return _attention_norm(qr, q_norm), _attention_norm(swa, kv_norm)
+    return rmsnorm_pair(qr, q_norm.weight, swa, kv_norm.weight, q_norm.variance_epsilon)
 
 
 def _merged(input_size, output_sizes, dtype, quant_config, prefix):
@@ -881,7 +889,7 @@ class DeepseekV41Attention(nn.Module):
             return hidden_states[:0]
         qkv, _ = self.wq_a_wkv(hidden_states, block_scale=None, output_dtype=None)
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
-        qr = _attention_norm(qr, self.q_norm)
+        qr, swa = _attention_norms(qr, swa, self.q_norm, self.kv_norm)
         if hidden_states.is_cuda:
             # Lazy shared constants are produced before the fork event, so both
             # branches observe them even on the first eager decode after loading.
@@ -896,7 +904,7 @@ class DeepseekV41Attention(nn.Module):
         )
         consumer = torch.cuda.current_stream() if overlap else None
         if overlap:
-            for tensor in (hidden_states, qr, positions, requests):
+            for tensor in (hidden_states, qr, swa, positions, requests):
                 tensor.record_stream(self.stream_fork.aux_stream)
         index_q, index_weights, index_group, prepared = None, None, None, None
         with self.stream_fork.scope(enable=overlap, overlap=True) as fork:
@@ -936,7 +944,6 @@ class DeepseekV41Attention(nn.Module):
                 q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
             else:
                 q = self.rotary_emb.apply_owned(q, positions, False)
-            swa = _attention_norm(swa, self.kv_norm)
             swa_rope_cache = None
             if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
                 self.rotary_emb._prepare_cache(swa.device)
