@@ -277,8 +277,10 @@ def test_kpool_prefill_logits_match_weighted_relu_and_local_window(
 
 
 @pytest.mark.parametrize("weight_dtype", (torch.bfloat16, torch.float32))
+@pytest.mark.parametrize("ordered_head_fold", (False, True))
 def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
     weight_dtype: torch.dtype,
+    ordered_head_fold: bool,
 ) -> None:
     generator = _generator(911)
     requests = 2
@@ -341,6 +343,7 @@ def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
         softmax_scale=_SOFTMAX_SCALE,
         out=out,
         row_ends_out=local_ends,
+        ordered_head_fold=ordered_head_fold,
     )
     expected, expected_ends = _reference(
         q,
@@ -364,7 +367,10 @@ def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
         assert actual[row, end:].isnan().all()
 
 
-def test_kpool_ordered_head_fold_matches_sequential_signed_reference() -> None:
+@pytest.mark.parametrize("planned", (False, True))
+def test_kpool_ordered_head_fold_matches_sequential_signed_reference(
+    planned: bool,
+) -> None:
     q = torch.zeros((1, _HEADS, _HEAD_DIM), device=_DEVICE, dtype=torch.bfloat16)
     q[:, :, 0] = 1.0
     weights = torch.zeros((1, _HEADS), device=_DEVICE, dtype=torch.float32)
@@ -387,13 +393,21 @@ def test_kpool_ordered_head_fold_matches_sequential_signed_reference() -> None:
     req_ids = torch.zeros((1,), device=_DEVICE, dtype=torch.int32)
     block_table = torch.zeros((1, 1), device=_DEVICE, dtype=torch.int32)
 
-    actual, row_ends = _kpool_prefill_logits(
+    if planned:
+        metadata = (
+            torch.arange(_PAGE_SIZE, device=_DEVICE, dtype=torch.int64),
+            torch.zeros((1,), device=_DEVICE, dtype=torch.int32),
+            causal_lens // _POOL_SIZE,
+        )
+        launcher = _kpool_prefill_plan_logits
+    else:
+        metadata = (causal_lens, req_ids, block_table)
+        launcher = _kpool_prefill_logits
+    actual, row_ends = launcher(
         q,
         cache,
         weights,
-        causal_lens,
-        req_ids,
-        block_table,
+        *metadata,
         pool_size=_POOL_SIZE,
         page_size=_PAGE_SIZE,
         pool_offset=0,
@@ -481,3 +495,92 @@ def test_kpool_prefill_logits_preserve_nonfinite_visible_scores(
         assert actual.isnan().all()
     else:
         assert torch.isposinf(actual).all()
+
+
+@pytest.mark.parametrize("planned", (False, True))
+@pytest.mark.parametrize("ordered_head_fold", (False, True))
+def test_kpool_head_fold_graph_refreshes_keys_and_bounds(
+    planned: bool, ordered_head_fold: bool
+) -> None:
+    generator = _generator(2201)
+    pages, tokens, width, pool_offset = 14, 4, 173, 13
+    cache, keys = _packed_cache(
+        pages, padding_bytes=192, as_rows=False, generator=generator
+    )
+    q, weights = _strided_inputs(tokens, torch.float32, generator)
+    table = torch.arange(pages - 1, -1, -1, device=_DEVICE, dtype=torch.int32)[None]
+    ids = torch.zeros(tokens, device=_DEVICE, dtype=torch.int32)
+    causal = torch.tensor((0, 65, 160, 200), device=_DEVICE, dtype=torch.int32) * 4
+    logical = torch.arange(pages * _PAGE_SIZE, device=_DEVICE)
+    slots = table[0, logical // _PAGE_SIZE].long() * _PAGE_SIZE + logical % _PAGE_SIZE
+    starts = torch.zeros_like(ids)
+    ends = causal // _POOL_SIZE
+    out = torch.empty((tokens, width), device=_DEVICE)
+    local_ends = torch.empty_like(ids)
+
+    def invoke() -> None:
+        launcher = _kpool_prefill_plan_logits if planned else _kpool_prefill_logits
+        metadata = (slots, starts, ends) if planned else (causal, ids, table)
+        launcher(
+            q,
+            cache,
+            weights,
+            *metadata,
+            pool_size=_POOL_SIZE,
+            page_size=_PAGE_SIZE,
+            pool_offset=pool_offset,
+            window_cols=width,
+            softmax_scale=_SOFTMAX_SCALE,
+            ordered_head_fold=ordered_head_fold,
+            out=out,
+            row_ends_out=local_ends,
+        )
+
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        invoke()
+    for changed in (False, True):
+        if changed:
+            replacement_q, replacement_weights = _strided_inputs(
+                tokens, torch.float32, _generator(2202)
+            )
+            q.copy_(replacement_q)
+            weights.copy_(replacement_weights)
+            replacement_cache, keys = _packed_cache(
+                pages, padding_bytes=192, as_rows=False, generator=_generator(2203)
+            )
+            cache.copy_(replacement_cache)
+            causal.sub_(8).clamp_min_(0)
+            ends.copy_(causal // _POOL_SIZE)
+            table.copy_(table.flip(1))
+            slots.copy_(
+                table[0, logical // _PAGE_SIZE].long() * _PAGE_SIZE
+                + logical % _PAGE_SIZE
+            )
+        out.fill_(float("nan"))
+        local_ends.fill_(-1)
+        graph.replay()
+        observed = out.clone()
+        observed_ends = local_ends.clone()
+        invoke()
+        expected, expected_ends = _reference(
+            q,
+            keys,
+            weights,
+            causal,
+            ids,
+            table,
+            pool_offset=pool_offset,
+            window_cols=width,
+        )
+        torch.testing.assert_close(observed_ends, expected_ends, atol=0, rtol=0)
+        for row, end_tensor in enumerate(expected_ends):
+            end = int(end_tensor)
+            torch.testing.assert_close(
+                observed[row, :end], out[row, :end], atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                observed[row, :end], expected[row], atol=0.02, rtol=0.02
+            )
+            assert observed[row, end:].isnan().all()

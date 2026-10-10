@@ -626,3 +626,102 @@ def test_standard_cache_decode_cuda_graph_replays_changed_inputs(q_len: int) -> 
     )
 
     _assert_topk(out, lens_out, expected, expected_lens)
+
+
+@pytest.mark.skipif(not is_cdna5(), reason="GFX1250 memory layouts")
+@pytest.mark.parametrize("heads", (32, 64))
+@pytest.mark.parametrize("q_dtype", (torch.bfloat16, torch.float8_e4m3fn))
+@pytest.mark.parametrize("use_buffer", (False, True))
+def test_standard_prefill_logits_graph_refresh_and_memory_paths(
+    heads: int, q_dtype: torch.dtype, use_buffer: bool
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (
+        gluon_dsa_prefill_topk_standard_gfx1250,
+    )
+
+    generator = _generator(821 + heads)
+    rows, width = 4, 641
+    keys = torch.randn((704, _HEAD_DIM), device=_DEVICE, generator=generator) * 0.15
+    cache, key_reference, _, _ = _pack_standard_cache(keys)
+    query, scales, _ = _prepared_query(rows, heads, q_dtype, generator)
+    weights = _noncompact_weights(rows, heads, torch.float32, generator)
+    slots = ((torch.arange(width, device=_DEVICE) * 37 + 41) % 704).long()
+    starts = torch.tensor((0, 7, 63, 64), device=_DEVICE, dtype=torch.int32)
+    ends = torch.tensor((641, 529, 64, 64), device=_DEVICE, dtype=torch.int32)
+    logits = torch.empty((rows, width), device=_DEVICE, dtype=torch.float32)
+    scale_arg = scales if scales is not None else weights
+
+    def invoke() -> None:
+        gluon_dsa_prefill_topk_standard_gfx1250[(rows, 1)](
+            query,
+            scale_arg,
+            cache.view(torch.float8_e4m3fn),
+            cache.view(torch.float32),
+            weights,
+            slots,
+            starts,
+            ends,
+            starts,
+            logits,
+            *query.stride(),
+            *scale_arg.stride(),
+            *weights.stride(),
+            logits.stride(0),
+            _SOFTMAX_SCALE,
+            width,
+            PAGE_SIZE=_PAGE_SIZE,
+            PAGE_STRIDE_BYTES=_PAGE_SIZE * cache.stride(0),
+            NUM_HEADS=heads,
+            HEAD_DIM=_HEAD_DIM,
+            BLOCK_N=128,
+            NUM_WARPS=8,
+            Q_IS_FP8=scales is not None,
+            USE_BUFFER_LOAD=use_buffer,
+            USE_BUFFER_STORE=use_buffer,
+            num_warps=8,
+            waves_per_eu=1,
+        )
+
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        invoke()
+    for changed in (False, True):
+        if changed:
+            replacement, replacement_scales, _ = _prepared_query(
+                rows, heads, q_dtype, _generator(1921 + heads)
+            )
+            query.copy_(replacement)
+            if scales is not None:
+                scales.copy_(replacement_scales)
+            weights.mul_(-0.75)
+            slots.copy_(slots.flip(0))
+            ends.copy_(torch.maximum(starts, ends - 13))
+            replacement_keys = (
+                torch.randn((704, _HEAD_DIM), device=_DEVICE, generator=generator)
+                * 0.15
+            )
+            replacement_cache, key_reference, _, _ = _pack_standard_cache(
+                replacement_keys
+            )
+            cache.copy_(replacement_cache)
+        logits.fill_(float("nan"))
+        graph.replay()
+        observed = logits.clone()
+        invoke()
+        query_reference = query.float()
+        if scales is not None:
+            query_reference = query_reference * scales[..., None]
+        for row in range(rows):
+            start, end = int(starts[row]), int(ends[row])
+            expected = _weighted_relu_scores(
+                query_reference[row], weights[row], key_reference[slots[start:end]]
+            )
+            torch.testing.assert_close(
+                observed[row, start:end], logits[row, start:end], atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                observed[row, start:end], expected, atol=0.02, rtol=0.02
+            )
+            assert observed[row, :start].isnan().all()
+            assert observed[row, end:].isnan().all()

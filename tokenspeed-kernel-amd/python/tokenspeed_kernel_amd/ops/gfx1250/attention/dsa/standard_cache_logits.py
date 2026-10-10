@@ -153,21 +153,25 @@ def _score_head_tile(
     if not ORDERED_HEAD_FOLD:
         return gl.sum(contributions, axis=0)
 
-    output_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
-    gather_indices = gl.zeros(
-        [BLOCK_N],
-        dtype=gl.int32,
-        layout=output_layout,
-    )[None, :]
-    scores = gl.zeros([BLOCK_N], dtype=gl.float32, layout=output_layout)
-    for head in gl.static_range(0, 32):
-        contribution = gl.gather(contributions, gather_indices + head, axis=0)
-        contribution = gl.convert_layout(
-            gl.reshape(contribution, [BLOCK_N]),
-            output_layout,
+    else:
+        # Keep all heads of each output column in one lane. The ordered sum
+        # then uses registers instead of repeating a cross-lane gather per head.
+        fold_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 32], [1, gl.num_warps()], [1, 0]
         )
-        scores += contribution
-    return scores
+        contributions = gl.convert_layout(contributions, fold_layout)
+        fold_output_layout: gl.constexpr = gl.SliceLayout(0, fold_layout)
+        gather_indices = gl.zeros(
+            [BLOCK_N],
+            dtype=gl.int32,
+            layout=fold_output_layout,
+        )[None, :]
+        scores = gl.zeros([BLOCK_N], dtype=gl.float32, layout=fold_output_layout)
+        for head in gl.static_range(0, 32):
+            contribution = gl.gather(contributions, gather_indices + head, axis=0)
+            contribution = gl.reshape(contribution, [BLOCK_N])
+            scores += contribution
+        return scores
 
 
 @gluon.jit
@@ -187,6 +191,7 @@ def _score_key_tile(
     model_scale,
     wmma_layout: gl.constexpr,
     k_dot_layout: gl.constexpr,
+    key_memory_layout: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     HEAD_DIM: gl.constexpr,
@@ -197,8 +202,10 @@ def _score_key_tile(
     ORDERED_HEAD_FOLD: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
 ):
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, k_dot_layout))[:, None]
-    columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, k_dot_layout))[None, :]
+    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, key_memory_layout))[:, None]
+    columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, key_memory_layout))[
+        None, :
+    ]
     positions = candidate_start + columns
     valid = positions < candidate_end
     slots = _candidate_slots(
@@ -227,6 +234,7 @@ def _score_key_tile(
             mask=valid,
             other=0.0,
         )
+    raw_key = gl.convert_layout(raw_key, k_dot_layout)
     key = raw_key if Q_IS_FP8 else raw_key.to(gl.bfloat16)
     scores = _score_head_tile(
         query_0,
@@ -246,7 +254,13 @@ def _score_key_tile(
             ORDERED_HEAD_FOLD,
         )
 
-    output_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
+    if ORDERED_HEAD_FOLD:
+        fold_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 32], [1, gl.num_warps()], [1, 0]
+        )
+        output_layout: gl.constexpr = gl.SliceLayout(0, fold_layout)
+    else:
+        output_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
     scale_positions = candidate_start + gl.arange(0, BLOCK_N, layout=output_layout)
     scale_valid = scale_positions < candidate_end
     scale_slots = _candidate_slots(
@@ -372,6 +386,19 @@ def _standard_cache_logits_body(
         wmma_layout,
         k_width=k_width,
     )
+    # Load adjacent key bytes together, then restore the WMMA operand layout.
+    # Planned KPool with parallel head reduction keeps its original layout:
+    # the conversion costs more than it saves on that path.
+    if IS_KPOOL and (not IS_PREFILL or ORDERED_HEAD_FOLD):
+        key_memory_layout: gl.constexpr = gl.BlockedLayout(
+            [16, 1], [8, 4], [1, NUM_WARPS], [0, 1]
+        )
+    elif IS_PREFILL and not IS_KPOOL:
+        key_memory_layout: gl.constexpr = gl.BlockedLayout(
+            [8, 1], [16, 2], [1, NUM_WARPS], [0, 1]
+        )
+    else:
+        key_memory_layout: gl.constexpr = k_dot_layout
     q_load_layout: gl.constexpr = gl.BlockedLayout(
         [1, k_width],
         [4, 8],
@@ -440,6 +467,7 @@ def _standard_cache_logits_body(
             model_scale,
             wmma_layout,
             k_dot_layout,
+            key_memory_layout,
             PAGE_SIZE,
             PAGE_STRIDE_BYTES,
             HEAD_DIM,

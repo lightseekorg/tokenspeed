@@ -236,6 +236,27 @@ until the first call in an unwarmed range.
 
 ## Attention
 
+### gfx1250 standard-cache DSA and KPool scoring
+
+Standard-cache DSA prefill loads eight adjacent FP8 key bytes per lane.
+KPool uses sixteen bytes for unplanned scoring and planned scoring with
+ordered head reduction. Both convert the loaded keys to the existing WMMA
+operand layout before arithmetic. The mode flags already select these paths;
+this adds no request-size specialization. Standard decode and planned KPool
+with parallel head reduction keep their original key layouts, since the
+conversion did not improve those paths.
+
+Ordered KPool head reduction redistributes the contributions once so that
+each lane owns all 32 heads of its output columns. It accumulates in the
+original head order and keeps that layout through key scaling and output
+stores, avoiding repeated LDS gathers and a conversion back to the WMMA
+layout. Parallel head reduction is unchanged.
+
+The cache format, query scaling, weighted ReLU, reduction order, row bounds,
+and top-k contracts are unchanged. Tests cover BF16/FP8 queries, both head
+counts, buffer/global memory paths, ragged windows, padded KPool pages, and
+CUDA graph replay after changing inputs.
+
 ### DeepSeek V4 attention
 
 The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
