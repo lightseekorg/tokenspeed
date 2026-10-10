@@ -34,9 +34,10 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import nullcontext
 from dataclasses import fields
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
@@ -47,11 +48,15 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 import tokenspeed.runtime.cache.l2.executor as executor_module  # noqa: E402
+import tokenspeed.runtime.cache.transfer.lanes as lanes_module  # noqa: E402
 from tokenspeed.runtime.cache.l2.executor import (  # noqa: E402
     HostCacheExecutor,
     num_snapshot_lcm_blocks,
 )
-from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue  # noqa: E402
+from tokenspeed.runtime.cache.transfer.lanes import (  # noqa: E402
+    CompletionQueue,
+    HostTransferLane,
+)
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
     CacheGroupLayout,
@@ -710,6 +715,69 @@ def test_kvp_ranks_store_their_owned_subsets_on_both_legs():
         executor.submit_write_backs(
             SimpleNamespace(cache=[bad]), prerequisite_stream="s", fence_stream=Mock()
         )
+
+
+@pytest.mark.parametrize("backend", ["dma", "auto"])
+def test_a_lane_completes_a_zero_row_copy_without_touching_the_transport(backend):
+    """An op whose every row belongs to other KVP ranks is an empty copy on
+    this rank: both directions record the completion event behind the
+    prerequisite stream and never stage or launch a zero-row transfer (the
+    kernel backend's table upload refuses one), under either io backend."""
+
+    def fake_load(transfers, *, geometry):
+        assert transfers, "the workspace was asked to stage zero rows"
+        return len(transfers), (0, len(transfers))
+
+    def fake_commit(num_blocks, device, non_blocking):
+        assert num_blocks > 0, "the Device table upload was asked for zero rows"
+
+    def fake_transfer(direction, *args, num_blocks, **kwargs):
+        assert num_blocks > 0, "the transport was asked for a zero-row transfer"
+
+    with patch.object(lanes_module, "HostTransferWorkspace", Mock):
+        lane = HostTransferLane()
+    lane.workspace.load_block_transfers.side_effect = fake_load
+    lane.workspace.commit_block_transfers.side_effect = fake_commit
+    lane.workspace.prepare_backend.return_value = SimpleNamespace(
+        uses_device_tables=backend == "auto"
+    )
+    stream = Mock(name="stream")
+    events = []
+    launch = dict(
+        device_buffers=(SimpleNamespace(device="cuda"),),
+        host_buffer="host",
+        geometry=SimpleNamespace(num_field_rows=3),
+        stream=stream,
+        prerequisite_stream="prerequisite",
+        backend=backend,
+    )
+    with (
+        patch.object(
+            lanes_module, "transfer_cache_blocks", side_effect=fake_transfer
+        ) as transfer,
+        patch.object(lanes_module.device_module, "stream", return_value=nullcontext()),
+        patch.object(
+            lanes_module.device_module,
+            "Event",
+            side_effect=lambda: events.append(Mock(name="event")) or events[-1],
+        ),
+    ):
+        d2h = lane.start_d2h([], **launch)
+        h2d = lane.start_h2d([], **launch)
+        # A non-empty copy still goes through the transport.
+        lane.start_d2h([(0, 1, 1)], **launch)
+    assert (d2h, h2d) == (events[0], events[1])
+    for finish in (d2h, h2d):
+        finish.record.assert_called_once_with(stream)
+    assert stream.wait_stream.call_args_list == [call("prerequisite")] * 3
+    assert transfer.call_count == 1
+    assert transfer.call_args.args[0] == "d2h"
+    assert transfer.call_args.kwargs["num_blocks"] == 1
+    assert lane.workspace.load_block_transfers.call_count == 1
+    assert lane.workspace.commit_block_transfers.call_count == (
+        1 if backend == "auto" else 0
+    )
+    assert lane.metadata_done is (events[2] if backend == "auto" else None)
 
 
 def test_completion_queue_releases_in_order_and_drops_on_reset():

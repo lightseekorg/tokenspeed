@@ -242,8 +242,9 @@ class HostTransferLane:
                     self.metadata_done.record(stream)
         return num_blocks
 
-    def start_d2h(
+    def _start(
         self,
+        direction: str,
         transfers: Sequence[tuple[int, int, int]],
         *,
         device_buffers,
@@ -253,99 +254,75 @@ class HostTransferLane:
         prerequisite_stream,
         backend: str,
     ):
-        """Launch one Device-to-Host batch on ``stream``; return its completion event.
+        """Launch one whole-geometry batch on ``stream``; return its completion event.
+
+        No layer-ready flags in either direction: a D2H's sources are read by
+        nobody until the ACK, and an H2D's destinations are read by nothing in
+        flight (the snapshot restore's request is not schedulable until the
+        ACK). L2's layerwise loads keep their own path.
 
         Args:
+            direction: ``"d2h"`` or ``"h2d"``.
             transfers: ``(group_index, device_block_id, host_block_id)`` rows,
-                1-based local block ids.
+                1-based local block ids. Empty when every row of the op
+                belongs to other KVP ranks: the op then completes as an empty
+                copy -- nothing is staged and the transport is never asked for
+                a zero-row transfer (the kernel backend's table upload refuses
+                one) -- and the event alone acknowledges it once ``stream``
+                reaches it.
             device_buffers: The layout's Device buffers.
             host_buffer: The compact pinned Host buffer.
             geometry: The executor's static geometry.
             stream: The transfer stream the copy runs on.
             prerequisite_stream: The stream whose completed work the copy must
-                observe -- the one the forwards wrote the source pages on -- or
-                None when the caller already ordered ``stream`` behind it.
+                observe -- for a D2H the one the forwards wrote the source
+                pages on, for an H2D the one that zeroed the destination
+                pages -- or None when the caller already ordered ``stream``
+                behind it.
             backend: The ``transfer_cache_blocks`` transport.
 
         Returns:
             The event recorded on ``stream`` after the copy.
         """
         if prerequisite_stream is not None:
-            # Behind the forwards that wrote the source pages: that is what
-            # lets the copy read their final bytes.
+            # Behind the forwards that wrote the source pages (D2H) or the
+            # zeroing of the destinations (H2D): that is what lets the copy
+            # read, or land on, their final bytes.
             stream.wait_stream(prerequisite_stream)
-        num_blocks = self._stage(
-            transfers,
-            device_buffers=device_buffers,
-            host_buffer=host_buffer,
-            geometry=geometry,
-            stream=stream,
-            backend=backend,
-        )
-        transfer_cache_blocks(
-            "d2h",
-            device_buffers,
-            host_buffer,
-            geometry,
-            self.workspace,
-            stream,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=geometry.num_field_rows,
-            backend=backend,
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
+        if transfers:
+            num_blocks = self._stage(
+                transfers,
+                device_buffers=device_buffers,
+                host_buffer=host_buffer,
+                geometry=geometry,
+                stream=stream,
+                backend=backend,
+            )
+            transfer_cache_blocks(
+                direction,
+                device_buffers,
+                host_buffer,
+                geometry,
+                self.workspace,
+                stream,
+                num_blocks=num_blocks,
+                geometry_offset=0,
+                num_geometry_rows=geometry.num_field_rows,
+                backend=backend,
+                grid_cap=None,
+                layer_ready_flags=None,
+            )
         finish = device_module.Event()
         finish.record(stream)
         return finish
 
-    def start_h2d(
-        self,
-        transfers: Sequence[tuple[int, int, int]],
-        *,
-        device_buffers,
-        host_buffer,
-        geometry: HostTransferGeometry,
-        stream,
-        prerequisite_stream,
-        backend: str,
-    ):
-        """Launch one whole-geometry Host-to-Device batch on ``stream``.
+    def start_d2h(self, transfers: Sequence[tuple[int, int, int]], **launch):
+        """Launch one Device-to-Host batch; arguments as for :meth:`_start`."""
+        return self._start("d2h", transfers, **launch)
 
-        No layer-ready flags: the destinations are not read by anything in
-        flight (the snapshot restore's request is not schedulable until the
-        ACK). L2's layerwise loads keep their own path. Arguments as for
-        :meth:`start_d2h`, with ``prerequisite_stream`` the one that zeroed
-        the destination pages. Returns the completion event.
-        """
-        if prerequisite_stream is not None:
-            stream.wait_stream(prerequisite_stream)
-        num_blocks = self._stage(
-            transfers,
-            device_buffers=device_buffers,
-            host_buffer=host_buffer,
-            geometry=geometry,
-            stream=stream,
-            backend=backend,
-        )
-        transfer_cache_blocks(
-            "h2d",
-            device_buffers,
-            host_buffer,
-            geometry,
-            self.workspace,
-            stream,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=geometry.num_field_rows,
-            backend=backend,
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
-        finish = device_module.Event()
-        finish.record(stream)
-        return finish
+    def start_h2d(self, transfers: Sequence[tuple[int, int, int]], **launch):
+        """Launch one Host-to-Device batch; arguments as for :meth:`_start`."""
+        return self._start("h2d", transfers, **launch)
 
 
 class CompletionQueue:

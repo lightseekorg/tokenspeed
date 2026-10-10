@@ -1107,6 +1107,14 @@ class HostCacheExecutor:
             with self._ack_lock:
                 self._ready_load_acks.extend((op_id, success) for op_id in op_ids)
             return None
+        if not transfers:
+            # Every row belongs to other KVP ranks: nothing to copy, no layer
+            # fence to arm (the trackers see no load this round), and the op
+            # is acknowledged from an empty copy -- the hooks' replica
+            # intersection completes it once the owners have copied theirs.
+            with self._ack_lock:
+                self._ready_load_acks.extend((op_id, True) for op_id in op_ids)
+            return None
         if self.attn_tp_rank == 0:
             logger.info(
                 f"[L2] load started: operations={len(op_ids):d} blocks="

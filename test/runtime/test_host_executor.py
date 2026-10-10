@@ -1780,6 +1780,33 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         self.assertEqual(int(events[0].op_id), 9)
         self.assertFalse(events[0].success)
 
+    def test_load_with_every_row_owned_elsewhere_acks_without_h2d(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        # A KVP rank that owns none of a load's rows copies nothing, arms no
+        # layer fence and still acknowledges the op (the hooks' replica
+        # intersection waits for the owners).
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._ready_load_acks = []
+        executor._load_poisoned = False
+        executor._write_acks = []
+        executor._load_acks = []
+        executor._backup_futures = []
+        executor._snapshot_acks = CompletionQueue()
+        executor._load_trackers = [(Mock(), 1)]
+        executor.l3_store = None
+        self.assertIsNone(
+            executor._start_loading([9], [], success=True, prerequisite_stream=object())
+        )
+        executor._load_trackers[0][0].begin_load.assert_not_called()
+        events = executor.poll_results()
+        self.assertEqual([(int(e.op_id), e.success) for e in events], [(9, True)])
+
     def test_shutdown_persists_completed_d2h_before_closing_l3(self):
         try:
             import tokenspeed.runtime.cache.l2.executor as executor_module
