@@ -605,10 +605,10 @@ phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
 **Phases:**
 
 0. Forced retraction, if the debug knob is set (§2).
-1. The one restore this round may start (§4) — a `Retracted` request whose
-   image has landed, resuming a streaming client, so it takes capacity ahead
-   of fresh work. It rides **beside** the batch as a cache op: no token
-   budget, no batch slot, no forward.
+1. The one restore this round may start (§4) — the first of the ranked
+   `Retracted` requests whose landed image fits, resuming a streaming client,
+   so it takes capacity ahead of fresh work. It rides **beside** the batch as
+   a cache op: no token budget, no batch slot, no forward.
 2. The decode batch (`scheduleDecodeBatch`) — every PrefillDone first decode
    and Decoding step; decodes consume no token budget on this role.
 3. At most **one** remote admission — the whole prompt at once (the peer
@@ -695,16 +695,26 @@ ops and any earlier in-flight store carrying one of its keys. The image is
 not a readmission candidate, because a restore started earlier would copy
 bytes that have not arrived.
 
-**Readmission order** (`nextReadmission`) is derived, not stored: among this
-round's candidates whose image landed, victims with generated output first
-(they resume a generation a client is already reading), then oldest epoch. The
-flag is `Request::HasGeneratedOutput()` — token count above the submitted
-prompt size — rather than "was the victim decoding": a victim taken
-mid-prefill may still own generated tokens (an earlier retraction rebased them
-into its prefill window), and its standing survives.
+**Readmission order** (`rankedReadmissions`) is derived, not stored: among
+this round's candidates whose image landed, victims with generated output
+first (they resume a generation a client is already reading), then oldest
+epoch. The flag is `Request::HasGeneratedOutput()` — token count above the
+submitted prompt size — rather than "was the victim decoding": a victim taken
+mid-prefill may still own generated tokens, and its standing survives.
 
-**The restore** (`scheduleRestore`, one per round, phase 1 of both grammars)
-rebuilds the request on fresh Device pages:
+**The restore phase** (`scheduleReadmission`, phase 1 of both grammars) tries
+the ranked readmissions in turn until one restores — one restore per round —
+scanning at most `kMaxRestoreAttemptsPerRound` (4) of them, because each
+failed attempt is an admission-planner pass. So a 60K-token image that does
+not fit the free Device pages does not hold a 2K image behind it hostage; it
+does still **seal** new-prompt admission for the round (any landed image that
+waited seals, whether or not a later one restored: a newcomer must not take
+the pages it waits for). A readmission that found no request-pool slot stops
+the scan without sealing — nothing later would get a slot, and neither would a
+newcomer.
+
+**The restore** (`scheduleRestore`) rebuilds the request on fresh Device
+pages:
 
 - `CacheCoordinator::Restore` gives every group a table of identical shape —
   same `num_blocks`, same null holes (a state group's absolute slots, a
@@ -922,9 +932,10 @@ lands in the same change as the pin, never a release apart.
 - A `Retracted` request holds no Device pages; its image is held by that state
   alone (Host pins and pool refs) and dropped with it. It becomes a
   readmission candidate only once every store it waits for has landed, at
-  most one restore starts per round, and a `Restoring` request is never
-  scheduled, never a victim and never re-probed (4). A readmission that fails
-  admission waits and never triggers retraction (4).
+  most one restore starts per round (after a bounded scan of the ranked
+  candidates), and a `Restoring` request is never scheduled, never a victim
+  and never re-probed (4). A readmission that fails admission waits, seals
+  new prompts for the round, and never triggers retraction (4).
 - A request whose admission prepaid the generation budget open at that
   admission is never a victim (2); with the fresh-admission prepay this bounds
   retraction to requests whose `max_new_tokens` exceeds one safe-step window

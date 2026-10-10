@@ -2923,6 +2923,89 @@ TEST_F(NoImageFitsSuite, TheDebugKnobNeverAborts) {
     EXPECT_EQ(scheduler_->DecodingSize(), 1u) << "a keeps its pages and runs";
 }
 
+// Head-of-line among readmissions: a 60K-token image that does not fit must
+// not seal the queue while a 2K image behind it would. 1024-token pages, 64
+// usable Device blocks, one full-attention group; the debug knob retracts
+// the oldest quiescent decode every third plan.
+class ReadmissionScanSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 1024;
+        cfg.device_allocator.total_pages = 65;
+        cfg.host_allocator.total_pages = 0;
+        cfg.max_scheduled_tokens = 65536;  // every prompt is one chunk
+        cfg.max_batch_size = 8;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+        cfg.cache_groups = {MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
+                                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History)};
+        SetTestSnapshotPool(cfg);
+        cfg.debug_force_retraction_interval = 3;
+        return cfg;
+    }
+};
+
+TEST_F(ReadmissionScanSuite, ASmallerLandedImageRestoresBehindALargeOneThatDoesNotFit) {
+    // big: 60 pages (61440 tokens) -> 61 blocks with its decode slot; small:
+    // 2 pages -> 3 blocks. Together exactly the pool.
+    Submit(MakeRequestSpec("big", /*num_pages=*/60));
+    Submit(MakeRequestSpec("small", /*num_pages=*/2, /*start=*/70001));
+    const ExecutionPlan p1 = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(p1)->request_ids, (std::vector<std::string>{"big", "small"}));
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    SendForwardDone("big", {7});
+    SendForwardDone("small", {8});
+    const ExecutionPlan p2 = PlanOnce();  // first decodes
+    ASSERT_EQ(FindForwardBatch(p2)->request_ids.size(), 2u);
+    SendForwardDone("big", {7});
+    SendForwardDone("small", {8});
+
+    // Plan 3: the knob retracts big (the oldest decode); small decodes on.
+    const ExecutionPlan p3 = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    ASSERT_NE(FindSnapshotStore(p3), nullptr);
+    ASSERT_EQ(FindSnapshotStore(p3)->request_ids, std::vector<std::string>{"big"});
+    ASSERT_EQ(FindForwardBatch(p3)->request_ids, std::vector<std::string>{"small"});
+    SendForwardDone("small", {8});
+    for (const ExecutionPlan& plan : {PlanOnce(), PlanOnce()}) {  // plans 4 and 5
+        ASSERT_EQ(FindForwardBatch(plan)->request_ids, std::vector<std::string>{"small"});
+        SendForwardDone("small", {8});
+    }
+
+    // Plan 6: the knob retracts small too; filler (58 pages -> 59 blocks) is
+    // admitted on the freed pool while neither image has landed. Five blocks
+    // stay free: room for small's 3-block image, not for big's 61.
+    Submit(MakeRequestSpec("filler", /*num_pages=*/58, /*start=*/80001));
+    const ExecutionPlan p6 = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 2u);
+    ASSERT_NE(FindSnapshotStore(p6), nullptr);
+    ASSERT_EQ(FindSnapshotStore(p6)->request_ids, std::vector<std::string>{"small"});
+    ASSERT_EQ(FindForwardBatch(p6)->request_ids, std::vector<std::string>{"filler"});
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 5);
+    AckImageStores(p3);
+    AckImageStores(p6);
+    SendForwardDone("filler", {9});
+
+    // Plan 7: big ranks first (oldest epoch) and does not fit; the scan goes
+    // on to small, which does. big's wait still seals new prompts: the
+    // 1-page newcomer, which would fit the two remaining blocks, is not
+    // admitted beside filler's first decode.
+    Submit(MakeRequestSpec("newcomer", /*num_pages=*/1, /*start=*/90001));
+    const ExecutionPlan p7 = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(p7);
+    ASSERT_NE(restore, nullptr);
+    EXPECT_EQ(restore->request_ids, std::vector<std::string>{"small"}) << "the image that fits restores";
+    EXPECT_EQ(restore->src_pages.at(0).size(), 3u);
+    EXPECT_EQ(FindForwardBatch(p7)->request_ids, std::vector<std::string>{"filler"})
+        << "the newcomer is sealed out while big waits";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
+    EXPECT_EQ(scheduler_->WaitingSize(), 3u) << "big (Retracted), small (Restoring), newcomer (Submitted)";
+    AckRestores(p7);
+    EXPECT_EQ(scheduler_->RequestTokenSize("small"), 2048 + 5);
+    EXPECT_EQ(scheduler_->DecodingSize(), 2u) << "small resumed beside filler";
+}
+
 // A mid-prefill victim resumes its next chunk: with max_scheduled_tokens = 4
 // the 6-token prompt of "a" takes two chunks, and "a" is retracted between
 // them.

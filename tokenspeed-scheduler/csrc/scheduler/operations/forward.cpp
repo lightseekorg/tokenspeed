@@ -58,6 +58,12 @@ namespace {
 // within a couple of rounds rather than inching toward safety.
 constexpr std::int32_t kRetractionSafeSteps = 4096;
 
+// Landed images the restore phase tries per round before giving up: a large
+// image that does not fit must not seal the queue while a smaller one behind
+// it would, but every failed attempt is an admission-planner pass, so the
+// scan is bounded.
+constexpr std::int32_t kMaxRestoreAttemptsPerRound = 4;
+
 // An incomplete prefill keeps the head of line: admission reserved only this
 // chunk, and a later candidate could strand it by consuming the capacity it
 // needs to finish.
@@ -958,23 +964,49 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
     }
 }
 
-Request* Scheduler::nextReadmission(std::span<Request* const> candidates) {
-    const auto rank = [](const fsm::Retracted& retracted) {
+std::vector<Request*> Scheduler::rankedReadmissions(std::span<Request* const> candidates) {
+    const auto rank = [](const Request* request) {
+        const fsm::Retracted& retracted = *request->GetIf<fsm::Retracted>();
         return std::pair{!retracted.ResumesGeneration(), retracted.RetractionEpoch()};
     };
-    Request* next = nullptr;
-    const fsm::Retracted* next_state = nullptr;
+    std::vector<Request*> landed;
     for (Request* request : candidates) {
         const auto* retracted = request->GetIf<fsm::Retracted>();
-        if (retracted == nullptr || !retracted->ImageLanded()) {
-            continue;
-        }
-        if (next_state == nullptr || rank(*retracted) < rank(*next_state)) {
-            next = request;
-            next_state = retracted;
+        if (retracted != nullptr && retracted->ImageLanded()) {
+            landed.push_back(request);
         }
     }
-    return next;
+    std::ranges::stable_sort(landed, [&rank](const Request* a, const Request* b) { return rank(a) < rank(b); });
+    return landed;
+}
+
+// Head-of-line among readmissions: the first-ranked image may need more Device
+// pages than are free while a smaller one behind it fits, so the ranked
+// candidates are tried in turn (bounded) until one restores. Any landed image
+// that waited for capacity seals new-prompt admission for the round, whether
+// or not a later one restored: the pages it waits for must not go to a
+// newcomer. A readmission that found no request-pool slot stops the scan
+// without sealing -- nothing later would get a slot either, and neither would
+// a newcomer.
+bool Scheduler::scheduleReadmission(AdmissionFeedback& feedback, PlanBuild& build,
+                                    std::span<Request* const> candidates) {
+    bool new_prompts_sealed = false;
+    std::int32_t attempts = 0;
+    for (Request* readmission : rankedReadmissions(candidates)) {
+        if (attempts == kMaxRestoreAttemptsPerRound) {
+            break;
+        }
+        ++attempts;
+        feedback.admission_failed = false;
+        if (scheduleRestore(feedback, build, readmission)) {
+            break;
+        }
+        if (!feedback.admission_failed) {
+            break;
+        }
+        new_prompts_sealed = true;
+    }
+    return new_prompts_sealed;
 }
 
 // The readmission: fresh Device pages for the whole image, in the imaged
@@ -1153,13 +1185,7 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
     // (swapping it with a victim is pure thrash) and never stalls the decodes
     // below -- but it seals the remote admission: a newcomer taking the pages
     // it waits for would starve it.
-    bool new_prompts_sealed = false;
-    if (Request* readmission = nextReadmission(candidates)) {
-        feedback.admission_failed = false;
-        if (!scheduleRestore(feedback, build, readmission)) {
-            new_prompts_sealed = feedback.admission_failed;
-        }
-    }
+    const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
 
     // Phase 2: the decode batch. Completed prefills' first decodes go ahead
     // of the running ones; neither consumes token budget on this role.
@@ -1205,13 +1231,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
                                std::vector<WriteBackOperation>& write_back_operations) {
     maybeForceRetraction(build, candidates, write_back_operations);
 
-    bool new_prompts_sealed = false;
-    if (Request* readmission = nextReadmission(candidates)) {
-        feedback.admission_failed = false;
-        if (!scheduleRestore(feedback, build, readmission)) {
-            new_prompts_sealed = feedback.admission_failed;
-        }
-    }
+    const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
     if (config_.enable_mixed_prefill_decode) {
         const bool has_local_prefill = std::ranges::any_of(candidates, [](const Request* request) {
             return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();

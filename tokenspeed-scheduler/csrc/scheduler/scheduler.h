@@ -309,18 +309,24 @@ private:
                                                              std::int32_t decode_reserve,
                                                              std::vector<LoadBackOperation>& load_backs);
 
-    // The readmission this round may restore, or nullptr: among the
+    // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated
     // output first (they resume a generation a client is reading), then
     // oldest retraction epoch. Derived from the states themselves, so a
     // request that finishes or aborts while retracted simply stops qualifying.
-    static Request* nextReadmission(std::span<Request* const> candidates);
+    static std::vector<Request*> rankedReadmissions(std::span<Request* const> candidates);
     // Allocates fresh Device pages for the whole image plus the reserve the
     // resumed state needs, issues the restore op beside the batch and moves
     // the request to Restoring. False when it does not fit (feedback says
     // whether capacity was the reason): the readmission waits and is never
     // recorded as the capacity blocker.
     bool scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, Request* request);
+    // The restore phase of the D and fused grammars: tries the ranked
+    // readmissions in order, a bounded number of them, until one restores
+    // (one per round). Returns whether new-prompt admission is sealed this
+    // round: true once any landed image waited for Device pages, so a
+    // newcomer cannot take the pages it is waiting for.
+    bool scheduleReadmission(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     // The capacity-retraction entry shared by the D and fused grammars:
     // fires only when no prefill progressed and admission failed. Retracts
