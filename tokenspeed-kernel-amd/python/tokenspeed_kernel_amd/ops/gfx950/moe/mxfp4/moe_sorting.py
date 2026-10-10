@@ -94,11 +94,6 @@ def _max_padded_route_capacity(
     return upper_bound // block_size * block_size
 
 
-@gluon.jit
-def _add(a, b):
-    return a + b
-
-
 @gluon.jit(do_not_specialize=("numel", "tokens_per_program"))
 def _moe_sorting_stage1_kernel(
     topk_ids_ptr,  # (numel,) int32, row-major (M, TOPK)
@@ -204,7 +199,7 @@ def _moe_sorting_small_histogram_prefix_kernel(
     )
     padded = ((histogram + block_size - 1) // block_size) * block_size
     padded = gl.where(expert_valid, padded, 0)
-    inclusive = gl.associative_scan(padded, 0, _add)
+    inclusive = gl.cumsum(padded, 0)
     gl.store(cumsum_ptr, 0)
     gl.store(cumsum_ptr + 1 + expert, inclusive, mask=expert_valid)
     gl.store(num_valid_ids_ptr, gl.sum(padded))
@@ -232,7 +227,7 @@ def _moe_sorting_stage2_kernel(
     mask = rows < num_programs
     offs = (rows + 1) * num_experts + pid
     cnt = gl.load(tokens_cnts_ptr + offs, mask=mask, other=0)
-    inclusive = gl.associative_scan(cnt, 0, _add)
+    inclusive = gl.cumsum(cnt, 0)
     gl.store(tokens_cnts_ptr + offs, inclusive, mask=mask)
 
 
@@ -262,7 +257,7 @@ def _moe_sorting_stage3_kernel(
     off_last = num_programs * num_experts
     cnt = gl.load(tokens_cnts_ptr + off_last + e, mask=mask, other=0)
     padded = ((cnt + block_size - 1) // block_size) * block_size
-    inclusive = gl.associative_scan(padded, 0, _add)
+    inclusive = gl.cumsum(padded, 0)
     gl.store(cumsum_ptr, 0)
     gl.store(cumsum_ptr + 1 + e, inclusive, mask=mask)
     gl.store(num_valid_ids_ptr + 0, gl.sum(padded))

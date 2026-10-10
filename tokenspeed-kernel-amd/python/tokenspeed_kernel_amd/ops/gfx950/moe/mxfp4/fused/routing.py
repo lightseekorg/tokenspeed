@@ -342,11 +342,6 @@ _ROUTE_GL_DTYPE = {
 
 
 @gluon.jit
-def _route_add(a, b):
-    return a + b
-
-
-@gluon.jit
 def _fused_topk(
     Logits,  # [M, E]   X_DTYPE   (raw routing logits)
     stride_lm,  # logits row stride
@@ -630,7 +625,7 @@ def _fused_route_small_m(
     # Store exclusive prefixes at 0..E-1; index E (the total) is the only entry
     # the inclusive scan uniquely supplies, so write just that one element
     # rather than re-writing 1..E-1 with identical values.
-    incl = gl.associative_scan(hist, 0, _route_add)
+    incl = gl.cumsum(hist, 0)
     col_offs = incl - hist
     last = e == (E - 1)
     gl.store(SliceOffs + e, col_offs, mask=emask)
@@ -641,7 +636,7 @@ def _fused_route_small_m(
     # block, while the separate G=M*TOPK bound keeps the rank tile small. All
     # NB rows are identical, and the packed block value is just the expert id.
     n_blk = (hist > 0).to(gl.int32)
-    blk_incl = gl.associative_scan(n_blk, 0, _route_add)
+    blk_incl = gl.cumsum(n_blk, 0)
     blk_excl = blk_incl - n_blk
     n_total = gl.sum(n_blk, 0)
     jb = gl.arange(0, MAXBLKP, layout=LB)
@@ -757,14 +752,14 @@ def _fused_biased_grouped_route_small_m(
     hist = gl.histogram(idx, EP, mask=gmask, layout=LE)
     gl.store(SliceSizes + e, hist, mask=emask)
 
-    incl = gl.associative_scan(hist, 0, _route_add)
+    incl = gl.cumsum(hist, 0)
     col_offs = incl - hist
     last = e == (E - 1)
     gl.store(SliceOffs + e, col_offs, mask=emask)
     gl.store(SliceOffs + e + 1, incl, mask=emask & last)
 
     n_blk = (hist > 0).to(gl.int32)
-    blk_incl = gl.associative_scan(n_blk, 0, _route_add)
+    blk_incl = gl.cumsum(n_blk, 0)
     blk_excl = blk_incl - n_blk
     n_total = gl.sum(n_blk, 0)
     jb = gl.arange(0, MAXBLKP, layout=LB)
@@ -1107,14 +1102,14 @@ def _fused_precomputed_topk_route_small_m(
     hist = gl.histogram(safe_idx, EP, mask=valid, layout=LE)
     gl.store(SliceSizes + e, hist, mask=emask)
 
-    incl = gl.associative_scan(hist, 0, _route_add)
+    incl = gl.cumsum(hist, 0)
     col_offs = incl - hist
     last = e == (E - 1)
     gl.store(SliceOffs + e, col_offs, mask=emask)
     gl.store(SliceOffs + e + 1, incl, mask=emask & last)
 
     n_blk = (hist > 0).to(gl.int32)
-    blk_incl = gl.associative_scan(n_blk, 0, _route_add)
+    blk_incl = gl.cumsum(n_blk, 0)
     blk_excl = blk_incl - n_blk
     n_total = gl.sum(n_blk, 0)
     jb = gl.arange(0, MAXBLKP, layout=LB)

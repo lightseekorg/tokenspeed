@@ -86,11 +86,6 @@ def _fp32_to_topk_key(x):
 
 
 @gluon.jit
-def _topk_add(a, b):
-    return a + b
-
-
-@gluon.jit
 def _accumulate_histogram_tile(
     candidate_logits,
     tile_start,
@@ -324,7 +319,7 @@ def _dsa_wave32_radix_topk_kernel(
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
         group_counts = count_low + count_high
-        cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+        cumulative = gl.cumsum(group_counts, 0)
         before_group = cumulative - group_counts
         selected_group = (before_group < remaining) & (cumulative >= remaining)
 

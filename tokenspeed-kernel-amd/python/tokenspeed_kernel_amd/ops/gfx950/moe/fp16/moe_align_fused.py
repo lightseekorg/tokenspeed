@@ -51,11 +51,6 @@ def _next_pow2(x: int) -> int:
 
 
 @gluon.jit
-def _add(a, b):
-    return a + b
-
-
-@gluon.jit
 def _fused_align_kernel(
     ids_ptr,  # [G] int32  flat topk_ids
     wts_ptr,  # [G] fp32   flat topk_weights
@@ -110,7 +105,7 @@ def _fused_align_kernel(
     # single-block collapse: 1 block per hit expert (count<=M<=block_m)
     hit = valid_e & (counts > 0)
     blocks_pe = hit.to(gl.int32)
-    block_off = gl.associative_scan(blocks_pe, 0, _add) - blocks_pe  # exclusive
+    block_off = gl.cumsum(blocks_pe, 0) - blocks_pe  # exclusive
     num_blocks = gl.sum(blocks_pe, 0)
     gl.store(nv_ptr, num_blocks * block_m)  # EM
 

@@ -1134,13 +1134,6 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                     # intermediate (K=3072 for Kimi-K3), while retaining the
                     # same two-buffer schedule used by the short TP shard.
                     for pair_k in range(2, NUM_K_ITERS - NUM_K_ITERS % 2, 2):
-                        if USE_ASYNC_A:
-                            # Every MFMA wave reads all M rows. Finish those
-                            # cross-wave reads before any wave reuses either
-                            # shared slot as the next async-copy destination.
-                            # load_shared_relaxed opts out of the compiler's
-                            # async-copy hazard tracking, so this stays explicit.
-                            gl.barrier()
                         _load_a_to_shared(
                             smem_a.index(0),
                             a_base_ptr,
@@ -1368,11 +1361,8 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                         # The pipeline consumes BK128 tiles in pairs. For odd
                         # multiples of 128, handle the final tile alone instead
                         # of computing a padding tile. This branch is compile-time;
-                        # even tile counts omit it. Keep physical storage padded
-                        # and finish prior LDS reads before reusing their slot.
+                        # even tile counts omit it. Keep physical storage padded.
                         tail_k: gl.constexpr = NUM_K_ITERS - 1
-                        if USE_ASYNC_A:
-                            gl.barrier()
                         _load_a_to_shared(
                             smem_a.index(0),
                             a_base_ptr,
