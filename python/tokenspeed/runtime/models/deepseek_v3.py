@@ -658,12 +658,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             rope_scaling["rope_type"] = "deepseek_yarn"
 
         if self.q_lora_rank is not None:
-            self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
-                self.hidden_size,
-                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
-                bias=False,
+            self.fused_qkv_a_proj_with_mqa = self._make_qkv_a_projection(
                 quant_config=quant_config,
-                prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+                prefix=prefix,
             )
 
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
@@ -712,35 +709,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             tp_size=self.head_tp_size,
             tp_group=self.head_tp_group,
         )
-        # O projection.
-        if self.o_proj_batch_invariant:
-            # Full K (every head's values, all-gathered) on every rank; the
-            # output is this rank's hidden shard of every gathered token.
-            self.o_proj = ColumnParallelLinear(
-                self.num_heads * self.v_head_dim,
-                self.hidden_size,
-                bias=False,
-                quant_config=None,
-                prefix=add_prefix("o_proj", prefix),
-                tp_rank=self.head_tp_rank,
-                tp_size=self.head_tp_size,
-                tp_group=self.head_tp_group,
-            )
-        else:
-            self.o_proj = RowParallelLinear(
-                self.num_heads * self.v_head_dim,
-                self.hidden_size,
-                bias=False,
-                # Under head TP the attention's own tail (project_output)
-                # reduces the partials: a reduce-scatter to each rank's rows,
-                # or an all-reduce on a replicated-row forward.
-                reduce_results=reduce_attn_results and not self.has_head_tp,
-                quant_config=quant_config,
-                prefix=add_prefix("o_proj", prefix),
-                tp_rank=self.head_tp_rank,
-                tp_size=self.head_tp_size,
-                tp_group=self.head_tp_group,
-            )
+        self.o_proj = self._make_output_projection(
+            quant_config=quant_config,
+            prefix=prefix,
+            reduce_attn_results=reduce_attn_results,
+        )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         # Fusion layer
@@ -800,6 +773,51 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         self.w_kc = None
         self.w_vc = None
+
+    def _make_qkv_a_projection(
+        self, *, quant_config: QuantizationConfig | None, prefix: str
+    ) -> nn.Module:
+        """Build fused_qkv_a_proj_with_mqa; default to the DeepSeek layout."""
+        return DeepseekV3FusedQkvAProjWithMqa(
+            self.hidden_size,
+            self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
+        )
+
+    def _make_output_projection(
+        self,
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        reduce_attn_results: bool,
+    ) -> nn.Module:
+        """Build o_proj, retaining the DeepSeek reduction and padding contract."""
+        if self.o_proj_batch_invariant:
+            # Full K on every rank; each produces a hidden-channel shard.
+            return ColumnParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("o_proj", prefix),
+                tp_rank=self.head_tp_rank,
+                tp_size=self.head_tp_size,
+                tp_group=self.head_tp_group,
+            )
+        # Head TP reduces in project_output: RS for owned rows, AR otherwise.
+        return RowParallelLinear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            reduce_results=reduce_attn_results and not self.has_head_tp,
+            quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
+            tp_rank=self.head_tp_rank,
+            tp_size=self.head_tp_size,
+            tp_group=self.head_tp_group,
+        )
 
     @property
     def supports_head_tp(self) -> bool:

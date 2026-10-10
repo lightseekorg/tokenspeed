@@ -23,8 +23,8 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.compile_monitor as compile_monitor
 from prometheus_client import CollectorRegistry
-from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel.compile_monitor import CompileStats
 
 from tokenspeed.runtime.metrics.collector import EngineMetrics

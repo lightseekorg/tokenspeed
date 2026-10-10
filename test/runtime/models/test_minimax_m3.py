@@ -231,7 +231,9 @@ def test_minimax_m3_tp4_meta_layout_and_loader(monkeypatch: pytest.MonkeyPatch) 
         }
 
     # Parameter layout and checkpoint loading do not require an executable kernel.
-    monkeypatch.setattr("tokenspeed_kernel.moe_plan", meta_moe_plan)
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.moe.expert.kernel_moe_plan", meta_moe_plan
+    )
     model = _build_model(monkeypatch, quant_config=_mxfp8_config())
 
     assert isinstance(model.model.layers[0].mlp, MiniMaxM3MLP)

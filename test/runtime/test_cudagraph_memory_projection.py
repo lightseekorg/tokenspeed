@@ -318,7 +318,7 @@ def test_the_projection_refuses_samples_the_capture_cannot_produce(
         estimate_cudagraph_memory(samples, ladders)
 
 
-def _probe(samples, ladders, *, world_size=1, gpu_id=0, hungriest=None):
+def _probe(samples, ladders, *, world_size=1, gpu_id=0, hungriest=None, startup=0):
     """Run the probe with a fabricated observer; returns (reserve, seen)."""
     seen = {"gpu_ids": []}
 
@@ -359,7 +359,12 @@ def _probe(samples, ladders, *, world_size=1, gpu_id=0, hungriest=None):
             stack.enter_context(
                 mock.patch.object(cudagraph_memory, "_hungriest_rank", hungriest)
             )
-        return probe_cudagraph_memory(executor, server_args, gpu_id), seen
+        return (
+            probe_cudagraph_memory(
+                executor, server_args, gpu_id, startup_resident_bytes=startup
+            ),
+            seen,
+        )
 
 
 def test_the_probe_samples_its_own_device_and_reserves_every_ladder() -> None:
@@ -384,6 +389,29 @@ def test_the_probe_reserves_what_the_reduction_returned() -> None:
         hungriest=lambda _args, total: total + 777,
     )
     assert reserve == MIB * 318 + 4 * _rate(18, 3) + 777
+
+
+def test_startup_residue_joins_the_reserve_before_the_reduction() -> None:
+    totals = []
+    samples = {"decode:default": [MIB * s for s in (300, 6, 6, 6)]}
+    graphs = MIB * 318 + 4 * _rate(18, 3)
+
+    def hungriest(_args, total):
+        totals.append(total)
+        return total
+
+    for startup, charged in ((64 * MIB, 64 * MIB), (-64 * MIB, 0)):
+        with mock.patch.object(cudagraph_memory.logger, "info") as info:
+            reserve, _ = _probe(
+                samples,
+                {"decode:default": _top(8, 4)},
+                world_size=8,
+                hungriest=hungriest,
+                startup=startup,
+            )
+        # One reduction over the sum; a release in the window credits nothing.
+        assert totals[-1] == reserve == graphs + charged
+        assert f"startup residue reserved {charged}," in info.call_args.args[0]
 
 
 def test_a_ladder_the_probe_could_not_price_warns_the_operator() -> None:
@@ -437,7 +465,10 @@ def test_memory_taken_between_captures_is_not_reserved() -> None:
         device="cuda", mapping=SimpleNamespace(world_size=1, world_group=None)
     )
     with mock.patch.object(torch, "get_device_module", lambda _d: device):
-        assert probe_cudagraph_memory(executor, server_args, 0) == 100 * MIB
+        reserve = probe_cudagraph_memory(
+            executor, server_args, 0, startup_resident_bytes=0
+        )
+        assert reserve == 100 * MIB
 
 
 def test_the_hungriest_rank_is_the_float64_max_and_one_rank_skips_it(
@@ -515,15 +546,23 @@ def test_the_boot_step_measures_releases_rebuilds_then_publishes() -> None:
     with mock.patch.object(
         cudagraph_memory,
         "probe_cudagraph_memory",
-        lambda *args: order.append(("probe", *args[1:])) or 4096,
+        lambda *args, startup_resident_bytes: order.append(
+            ("probe", *args[1:], startup_resident_bytes)
+        )
+        or 4096,
     ):
         rebuilt = reserve_and_rebind(
-            executor, build_components, "args", 3, profiled_cache_bytes=9000
+            executor,
+            build_components,
+            "args",
+            3,
+            profiled_cache_bytes=9000,
+            startup_resident_bytes=500,
         )
     assert rebuilt is built
 
     assert order == [
-        ("probe", "args", 3),
+        ("probe", "args", 3, 500),
         ("release",),
         (
             "build",

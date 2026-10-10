@@ -22,6 +22,31 @@ For a compact compatibility table, see
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
 
+### Checkpoint Prefetch And TP Shards
+
+Safetensors loading prefetches checkpoints into the OS page cache. Ranks on
+the same node divide background reads in sorted shard order; every node
+prefetches its own copy. Each reader keeps the full consumption order within
+the existing window of min(40 GiB, 25% of available host memory), including
+shards assigned to peers. Reads remain asynchronous: a consumer does not
+wait for another rank and can demand-page an unfinished peer shard. Models
+with rank-dependent weight-name filters prefetch independently. Use
+`--disable-weight-loader-prefetch-checkpoints` to disable prefetch or
+`--weight-loader-prefetch-num-threads` to set reader concurrency per rank.
+
+The programmatic `LoadConfig(load_format="sharded_state")` loader reads only
+the current global rank's files,
+named `model-rank-{rank}-part-{part}.safetensors` by default. These are
+post-processed runtime state dictionaries, not ordinary Hugging Face shards.
+Reload with the same model configuration, parallel mapping, quantization,
+and runtime weight layout. The loader constructs and post-processes the
+model before copying the saved state into it; compatibility must be checked
+for the model and quantization in use. Keep model configuration/tokenizer
+files with the checkpoint. A custom filename pattern can be supplied through
+`LoadConfig.model_loader_extra_config`, for example
+`{"pattern": "model-rank-{rank}-part-{part}.safetensors"}`. The serving CLI does
+not expose this loader or its extra configuration.
+
 ## Precision And Quantization
 
 | Parameter | Purpose |
@@ -365,7 +390,7 @@ are not advertised as control URLs; use a concrete address for gateway discovery
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
-| `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost. |
+| `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
@@ -508,7 +533,7 @@ must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 
 they draft a tree instead, and `--speculative-num-draft-tokens` is its node
 budget (root included) and must be given explicitly: topk 1..16, steps 1..10,
 `(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
-attention backends and the `greedy` or `triton` sampling backend; see
+attention backends (`trtllm_mla` or `tokenspeed_mla` for MLA models) and the `greedy` or `triton` sampling backend; see
 [draft-tree speculation](../design/tree-speculation.md) for the full scope.
 
 `MTP` serves two head shapes under one flag. An Eagle-like head (one MTP
@@ -580,8 +605,9 @@ Memory: the recorded distributions take
 (`--speculative-num-draft-tokens` fp32 rows per request-pool slot), plus a
 batch-ordered gather buffer of `max_num_seqs x num_draft_tokens x vocab_size x
 4` bytes on the verifier; 80 requests at 4 draft tokens over a 129K vocabulary
-cost about 330 MB in total. Both come out of the `--gpu-memory-utilization`
-headroom, not the KV-cache budget.
+cost about 330 MB in total. On CUDA, when the CUDA-graph memory reserve is on,
+both are charged to it as startup residue, out of the KV-cache budget;
+otherwise they come out of the `--gpu-memory-utilization` headroom.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.

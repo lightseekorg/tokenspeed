@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_mtp,
     gdn_decode_step,
     gdn_replay_commit,
+    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CAUSAL_CONV1D_BLOCK_M,
@@ -765,7 +766,11 @@ class MambaAttnBackend(AttentionBackend):
                     ),
                     state_dtype=ssm.dtype,
                 )
-            if self.draft_tree and self._tree_node_state_workspace:
+            if (
+                self.draft_tree
+                and self._tree_node_state_workspace
+                and gdn_tree_verify_needs_node_states(draft_token_num)
+            ):
                 self._tree_node_states = torch.zeros(
                     (max_bs, draft_token_num, *ssm.shape[1:]),
                     dtype=ssm.dtype,
@@ -919,6 +924,11 @@ class MambaAttnBackend(AttentionBackend):
 
     def _tree_parents(self, bs: int) -> torch.Tensor | None:
         return None if self.tree_verify is None else self.tree_verify.parent[:bs]
+
+    def _tree_ancestors(self, bs: int) -> torch.Tensor | None:
+        if self.tree_verify is None:
+            return None
+        return self.tree_verify.mask.view(-1, self.tree_verify.num_nodes)[:bs]
 
     def _verify_scratch_grid(self, bs: int, draft_token_num: int) -> torch.Tensor:
         """Scratch row grid ``[bs, draft_token_num]``: row ``req*(T+1)`` is
@@ -2541,7 +2551,7 @@ class MambaAttnBackend(AttentionBackend):
             initial_state = ssm_comp
             initial_indices = state_in_blocks[:batch_size]
             output_state_indices = None
-            if self.tree_verify is not None:
+            if self._tree_node_states is not None:
                 intermediate_states = self._tree_node_states[:batch_size]
         else:
             initial_state = ssm_scratch
@@ -2571,7 +2581,7 @@ class MambaAttnBackend(AttentionBackend):
             use_qk_l2norm=True,
             output_state_indices=mtp_output_indices,
             intermediate_states_buffer=intermediate_states,
-            parent_indices=self._tree_parents(batch_size),
+            tree_ancestors=self._tree_ancestors(batch_size),
             disable_state_update=self.replay_ssm,
             solution=mtp_solution,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)

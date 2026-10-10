@@ -27,10 +27,26 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 
-from pr_ci_plan import CoverageError, context, task_key, validate_test_coverage
+from pr_ci_common import (
+    manifest_task_result,
+    published_matches,
+    require_bot,
+    require_public_repo,
+    result_status,
+    run_command,
+    screen_public_output,
+    upsert_comment,
+)
+from pr_ci_plan import (
+    CoverageError,
+    context,
+    task_key,
+    validate_test_coverage,
+)
 from pr_ci_state import BOT, BOT_ID, COMMAND, NATIVE_CHECKS, REPO, SHA, marker, record
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,9 +55,7 @@ FINISHED_PHASES = {"done", "manual", "stale", "promoted"}
 
 
 def command(*args: str, cwd: Path = ROOT) -> str:
-    return subprocess.run(
-        args, cwd=cwd, check=True, capture_output=True, text=True
-    ).stdout.strip()
+    return run_command(args, cwd=cwd, strip=True, failure=None)
 
 
 def api(path: str):
@@ -84,12 +98,21 @@ def pull(number: int) -> dict:
 
 def permitted(comment: dict) -> str | None:
     match = COMMAND.fullmatch(comment["body"] or "")
-    if not match:
+    if not match or (match["job"] and match[1].lower() != "fix"):
         return None
     permission = api(f"collaborators/{comment['user']['login']}/permission")[
         "permission"
     ]
     return match[1].lower() if permission in {"admin", "maintain", "write"} else None
+
+
+def command_target(comment: dict, number: int) -> dict | None:
+    match = COMMAND.fullmatch(comment["body"] or "")
+    if not match or not match["job"]:
+        return None
+    if match["pr"] and int(match["pr"]) != number:
+        raise ValueError("Job link names another PR.")
+    return {k: int(match[k]) for k in ("run", "job")}
 
 
 def latest_command(comments: list[dict]) -> dict | None:
@@ -203,19 +226,17 @@ def plan_source():
 
 
 def public_gate():
-    command("gh", "auth", "status")
-    if json.loads(command("gh", "api", "user"))["login"] != BOT:
-        raise ValueError("Bot authentication required.")
-    if (
-        command(
-            "gh", "repo", "view", REPO, "--json", "visibility", "--jq", ".visibility"
-        )
-        != "PUBLIC"
-    ):
-        raise ValueError("Public destination verification failed.")
+    require_bot(command, error=ValueError, message="Bot authentication required.")
+    require_public_repo(
+        command,
+        REPO,
+        error=ValueError,
+        message="Public destination verification failed.",
+    )
 
 
 def publish(state: dict, message: str):
+    """Save every state update; notify only the first record and final outcomes."""
     public_gate()
     if (
         record(
@@ -225,10 +246,28 @@ def publish(state: dict, message: str):
         != state
     ):
         raise ValueError("Invalid outbound state.")
+    previous = latest_state_comment(
+        pages(f"issues/{state['pr']}/comments", None), state["pr"]
+    )
+    prior = record(previous, "assist") if previous else None
+    # New comments notify subscribers; edits do not. Notify only for the first
+    # record and when a phase crosses into or out of a finished state, so new
+    # pushes, new commands and progress counts update in place instead.
+    notify = not prior or (
+        prior["phase"] != state["phase"]
+        and (prior["phase"] in FINISHED_PHASES or state["phase"] in FINISHED_PHASES)
+    )
+    finished = state["phase"] in FINISHED_PHASES
+    if not finished:
+        message = (
+            "Monitoring the selected checks. Results or blockers will be reported here."
+            if state["action"] == "watch"
+            else "Repair and validation are in progress. Results or blockers will be reported here."
+        )
     # All editable text here is fixed, identifiers were validated against the
     # public catalog; do not copy API errors, task logs or model prose.
     body = f"**CI {state['action']}** · `{state['head'][:8]}`\n\n{message}\n"
-    if state.get("native_checks") or state["statuses"]:
+    if finished and (state.get("native_checks") or state["statuses"]):
         body += "\n| Check | Source | Result |\n|---|---|---|\n"
         for check in state.get("native_checks", []):
             label = NATIVE_CHECKS[check["workflow"]]["label"]
@@ -237,7 +276,8 @@ def publish(state: dict, message: str):
                 result = (
                     f"[{result}](https://github.com/{REPO}/actions/runs/{check['run']})"
                 )
-            body += f"| {label} | PR `{state['head'][:8]}` | {result} |\n"
+            sha = state.get("candidate", {}).get("validation", state["head"])
+            body += f"| {label} | `{sha[:8]}` | {result} |\n"
         sha = state.get("candidate", {}).get("validation", state["head"])
         for task, status in zip(state["tasks"], state["statuses"]):
             link = f"https://github.com/{REPO}/blob/{sha}/{quote(task['config'], safe='/')}"
@@ -251,42 +291,89 @@ def publish(state: dict, message: str):
                 f"| [{Path(task['config']).stem}]({link}) | `{sha[:8]}` | {result} |\n"
             )
     body += marker("assist", state)
-    scanned = re.sub(
-        rf"https://github\.com/{REPO}/(?:blob/[0-9a-f]{{40}}/[A-Za-z0-9_./%-]+|actions/runs/[0-9]+)",
-        "PUBLIC_SOURCE",
+    if screen_public_output(
         body,
-    )
-    if re.search(
-        r"https?://|\bwww\.|(?:sk-|ghp_|github_pat_)|/(?:home|tmp|root)/", scanned
+        substitute=[
+            (
+                rf"https://github\.com/{REPO}/(?:blob/[0-9a-f]{{40}}/[A-Za-z0-9_./%-]+|actions/runs/[0-9]+)",
+                "PUBLIC_SOURCE",
+            )
+        ],
+        url_indicators=r"https?://|\bwww\.",
+        secret_indicators=r"(?:sk-|ghp_|github_pat_)|/(?:home|tmp|root)/",
+        max_length=None,
     ):
         raise ValueError("Public output rejected.")
-    WORK.mkdir(parents=True, exist_ok=True)
-    file = WORK / "comment.md"
-    file.write_text(body)
-    url = command(
-        "gh",
-        "pr",
-        "comment",
-        str(state["pr"]),
-        "--repo",
-        REPO,
-        "--body-file",
-        str(file),
+    live = upsert_comment(
+        command, api, REPO, str(state["pr"]), body, None if notify else previous["id"]
     )
-    live = api(f"issues/comments/{url.rsplit('issuecomment-', 1)[-1]}")
-    if live["body"].rstrip() != body.rstrip() or record(live, "assist") != state:
+    if not published_matches(live["body"], body) or record(live, "assist") != state:
         raise ValueError("Published state differs from reviewed content.")
 
 
-def checkout(head: str, base: str) -> Path:
-    WORK.mkdir(parents=True, exist_ok=True)
-    target = WORK / "source"
+def checkout(head: str, base: str, *, work: Path | None = None) -> Path:
+    work = WORK if work is None else work
+    work.mkdir(parents=True, exist_ok=True)
+    target = work / "source"
     for sha in (head, base):
         if not SHA.fullmatch(sha):
             raise ValueError("Invalid source SHA.")
         command("git", "fetch", "origin", sha)
     command("git", "worktree", "add", "--detach", str(target), head)
     return target
+
+
+def fetch_commits(source: Path, *refs: str):
+    for ref in refs:
+        if not SHA.fullmatch(ref):
+            raise ValueError("Invalid source SHA.")
+        present = subprocess.run(
+            ["git", "cat-file", "-e", f"{ref}^{{commit}}"],
+            cwd=source,
+            capture_output=True,
+            check=False,
+        )
+        if present.returncode:
+            command("git", "fetch", "origin", ref, cwd=source)
+
+
+def ancestor(source: Path, before: str, after: str) -> bool:
+    return (
+        subprocess.run(
+            ["git", "merge-base", "--is-ancestor", before, after],
+            cwd=source,
+            capture_output=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def pr_source_matches(state: dict, pr: dict, *, source: Path) -> bool:
+    if state["head"] != pr["head"]["sha"]:
+        return False
+    base = pr["base"]["sha"]
+    if state["base"] == base:
+        return True
+    if "validation_base" not in state:
+        return False
+    main = api("git/ref/heads/main")["object"]["sha"]
+    fetch_commits(source, state["base"], base, main)
+    return ancestor(source, state["base"], base) and ancestor(source, base, main)
+
+
+def main_merge_clean(treeish: str, main: str, *, source: Path) -> bool:
+    """Trial-merge treeish onto main; True when the merge is clean."""
+    fetch_commits(source, treeish, main)
+    result = subprocess.run(
+        ["git", "merge-tree", "--write-tree", treeish, main],
+        cwd=source,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise ValueError("Trial merge could not run.")
+    return result.returncode == 0
 
 
 def validate_plan(plan: dict, data: dict) -> list[dict]:
@@ -311,7 +398,13 @@ def validate_plan(plan: dict, data: dict) -> list[dict]:
         if runner not in runners or (
             cluster == ""
             and (
-                not runner.startswith("amd-")
+                (
+                    not runner.startswith("amd-")
+                    and (
+                        selected != data.get("target_task")
+                        or not runner.startswith(("b200v2-", "gb200-", "b300-"))
+                    )
+                )
                 or not re.search(r"(?:^|-)[1-9][0-9]*gpu(?:-|$)", runner)
             )
         ):
@@ -338,6 +431,58 @@ def validate_plan(plan: dict, data: dict) -> list[dict]:
     return tasks
 
 
+def targeted_plan(plan: dict, data: dict, state: dict) -> dict:
+    """Bind the requested failed job to existing, source-bound validation."""
+    target = state.get("target")
+    if not target:
+        return plan
+    job = api(f"actions/jobs/{target['job']}")
+    run = api(f"actions/runs/{job['run_id']}")
+    if (
+        job["id"] != target["job"]
+        or job["run_id"] != target["run"]
+        or job["run_attempt"] != run["run_attempt"]
+        or job["status"] != "completed"
+        or job["conclusion"] not in {"failure", "timed_out"}
+        or run["event"] != "pull_request"
+        or run["head_repository"]["full_name"] != REPO
+        or run["head_sha"] != state["head"]
+        or job["head_sha"] != state["head"]
+        or not any(
+            p["number"] == state["pr"] and p["head"]["sha"] == state["head"]
+            for p in run["pull_requests"]
+        )
+    ):
+        raise ValueError("Target must be a failed job on the current PR commit.")
+    # Native jobs already have trusted verification entry points.
+    for workflow, check in NATIVE_CHECKS.items():
+        if (
+            run["path"] == f".github/workflows/{workflow}"
+            and job["name"] == check["job"]
+        ):
+            checks = data.setdefault("native_checks", [])
+            if not any(c["workflow"] == workflow for c in checks):
+                checks.append({"workflow": workflow, **check})
+            return plan
+    if run["path"] == ".github/workflows/lint.yml" and job["name"] == "lint":
+        return plan
+    choices = [
+        {"config": task["config"], "runner": runner, "cluster": ""}
+        for task in data["catalog"]
+        for runner in task["runners"]
+        if job["name"].endswith(f"{task['name']} ({runner})")
+    ]
+    if len(choices) != 1:
+        raise ValueError("Target job has no unique supported validation task.")
+    data["target_task"] = choices[0]
+    tasks = list(plan["tasks"])
+    if choices[0] not in tasks:
+        tasks.append(choices[0])
+    plan = {**plan, "tasks": tasks}
+    validate_plan(plan, data)
+    return plan
+
+
 def effective_runner(task: dict, cluster: str) -> str:
     runner = task["runner"]
     if cluster != "gb300":
@@ -354,18 +499,20 @@ def run_title(task: dict, sha: str, cluster: str) -> str:
 
 def dispatch(task: dict, sha: str, cluster: str):
     public_gate()
-    fields = dict(
-        commit=sha,
-        yaml="off" if cluster else "all",
-        match=task["config"],
-        task_types=task["type"],
-        trigger="all",
-        include_mmlu="true",
-    )
+    fields = {
+        "commit": sha,
+        "yaml": "off" if cluster else "all",
+        "match": task["config"],
+        "task_types": task["type"],
+        "trigger": "all",
+        "include_mmlu": "true",
+    }
     if cluster:
         fields.update(cluster=cluster, runners=task["runner"], require_idle="true")
     else:
-        fields.update(runner_pool="amd", runner=task["runner"])
+        fields.update(
+            runner_pool=task["runner"].split("-", 1)[0], runner=task["runner"]
+        )
     args = [
         "gh",
         "workflow",
@@ -384,7 +531,7 @@ def dispatch(task: dict, sha: str, cluster: str):
 def runs_for(state: dict) -> list[dict]:
     since = api(f"issues/comments/{state['since']}")["created_at"]
     runs = pages(f"actions/runs?head_sha={state['head']}", "workflow_runs")
-    for workflow in ("slurm-dispatch.yml", "k8s-dispatch.yml"):
+    for workflow in ("slurm-dispatch.yml", "k8s-dispatch.yml", *NATIVE_CHECKS):
         runs += pages(
             f"actions/workflows/{workflow}/runs?event=workflow_dispatch&created=>={since}",
             "workflow_runs",
@@ -395,20 +542,35 @@ def runs_for(state: dict) -> list[dict]:
 
 
 def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
-    result = dict(workflow=check["workflow"], status="waiting", run=0)
+    result = {"workflow": check["workflow"], "status": "waiting", "run": 0}
+    candidate = state.get("candidate")
     for run in runs:
-        if (
-            run["event"] != "pull_request"
-            or run["head_sha"] != state["head"]
-            or run["path"] != f".github/workflows/{check['workflow']}"
-            or not any(
-                p["number"] == state["pr"]
-                and p["head"]["sha"] == state["head"]
-                and p["base"]["sha"] == state["base"]
-                and p["base"]["ref"] == "main"
-                for p in run["pull_requests"]
+        if run["path"] != f".github/workflows/{check['workflow']}":
+            continue
+        if candidate:
+            matches = (
+                run["event"] == "workflow_dispatch"
+                and run["head_sha"] == candidate["validation"]
+                and run["head_branch"] == candidate["branch"]
+                and run["actor"]["login"] == BOT
             )
-        ):
+        else:
+            matches = (
+                run["event"] == "pull_request"
+                and run["head_sha"] == state["head"]
+                and any(
+                    p["number"] == state["pr"] and p["head"]["sha"] == state["head"]
+                    # An older base failure can diagnose this unchanged head;
+                    # only the candidate's own run can validate its repair.
+                    and (
+                        p["base"]["sha"] == state["base"]
+                        or (state["action"] == "fix" and run["conclusion"] == "failure")
+                    )
+                    and p["base"]["ref"] == "main"
+                    for p in run["pull_requests"]
+                )
+            )
+        if not matches:
             continue
         result["run"] = run["id"]
         if run["status"] != "completed":
@@ -435,9 +597,85 @@ def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
                 for step in jobs[0]["steps"]
             )
         ):
+            if candidate and "artifact" in check:
+                return {
+                    **result,
+                    "status": native_artifact(run, check, candidate["validation"]),
+                }
             return {**result, "status": "passed"}
         return {**result, "status": "missing"}
     return result
+
+
+def native_artifact(run: dict, check: dict, sha: str) -> str:
+    with tempfile.TemporaryDirectory(dir=WORK) as directory:
+        target = Path(directory)
+        artifacts = pages(f"actions/runs/{run['id']}/artifacts", "artifacts")
+        if not any(
+            a["name"] == check["artifact"] and not a["expired"] for a in artifacts
+        ):
+            return "missing"
+        download(run, check["artifact"], target)
+        if json.loads((target / "source.json").read_text()).get("source_sha") != sha:
+            return "missing"
+        rows = json.loads((target / "manifest.json").read_text())
+        if len(rows) != 1:
+            return "missing"
+        row = rows[0]
+        if (
+            row["task"]["config"] != check["config"]
+            or row["task"]["runner"] != check["runner"]
+            or not re.fullmatch(r"[0-9]+", row["job_id"])
+        ):
+            return "missing"
+        proof = json.loads(target.joinpath(f"{row['job_id']}-result.json").read_text())
+        if (
+            proof.get("source_sha") == sha
+            and proof.get("config") == check["config"]
+            and proof.get("runner") == check["runner"]
+            and proof.get("ok") is True
+            and "ut" in proof.get("executed_stages", [])
+            and row["state"] == "COMPLETED"
+            and row["exit_code"] == "0:0"
+        ):
+            return "passed"
+        return "missing"
+
+
+def dispatch_native_checks(state: dict):
+    """Reserve each candidate workflow before requesting its existing native run."""
+    candidate = state["candidate"]
+    pending = [
+        c
+        for c in state["native_checks"]
+        if not c["run"] and c["workflow"] not in state.get("native_submitted", [])
+    ]
+    if not pending:
+        return
+    from pr_ci_repair import guard_native_dispatch
+
+    guard_native_dispatch(state)
+    for check in pending:
+        state.setdefault("native_submitted", []).append(check["workflow"])
+        publish(
+            state, "Candidate native validation requested; existing runs are reused."
+        )
+        public_gate()
+        if (
+            api(f"git/ref/heads/{candidate['branch']}")["object"]["sha"]
+            != candidate["validation"]
+        ):
+            raise ValueError("Validation branch moved before native dispatch.")
+        command(
+            "gh",
+            "workflow",
+            "run",
+            check["workflow"],
+            "--repo",
+            REPO,
+            "--ref",
+            candidate["branch"],
+        )
 
 
 def download(run: dict, name: str, target: Path):
@@ -453,22 +691,6 @@ def download(run: dict, name: str, target: Path):
         "--dir",
         str(target),
     )
-
-
-def result_status(result: dict, task: dict, sha: str, runner: str) -> str:
-    if (
-        result.get("source_sha") != sha
-        or result.get("config") != task["config"]
-        or result.get("task") != task["name"]
-        or result.get("runner") != runner
-    ):
-        return "missing"
-    stages = result.get("executed_stages", [])
-    if result.get("ok") is True and any(
-        stage not in {"install", "server", "cleanup"} for stage in stages
-    ):
-        return "passed"
-    return "failed" if result.get("ok") is False else "missing"
 
 
 def report(run: dict, task: dict, sha: str, cluster: str) -> str:
@@ -499,29 +721,9 @@ def report(run: dict, task: dict, sha: str, cluster: str) -> str:
                 "availability": "unavailable",
             }:
                 return "unavailable"
-            manifest = json.loads((target / "manifest.json").read_text())
-            rows = [
-                r
-                for r in manifest
-                if r["task"]["config"] == task["config"]
-                and r["task"]["runner"] == effective_runner(task, cluster)
-            ]
-            if len(rows) != 1 or not re.fullmatch(r"[0-9]+", rows[0]["job_id"]):
-                return "missing"
-            row = rows[0]
-            result = {
-                "source_sha": sha,
-                "config": task["config"],
-                **json.loads((target / f"{row['job_id']}-result.json").read_text()),
-            }
-            status = result_status(result, task, sha, effective_runner(task, cluster))
-            if (
-                status == "passed"
-                and row["state"] == "COMPLETED"
-                and row["exit_code"] == "0:0"
-            ):
-                return "passed"
-            return "failed" if status == "failed" else "missing"
+            return manifest_task_result(
+                target, task, sha, runner=effective_runner(task, cluster)
+            )
         name = (
             f"pr-test-{task['name']}-{task['runner']}-{run['id']}-{run['run_attempt']}"
         )
@@ -574,27 +776,11 @@ def native_result(run: dict, task: dict, state: dict, job: dict) -> str:
             if not any(a["name"] == name and not a["expired"] for a in artifacts):
                 return "missing"
             download(run, name, target)
-            manifest = json.loads((target / "manifest.json").read_text())
             source = json.loads((target / "source.json").read_text())["source_sha"]
             if not source_matches(source, state):
                 return "missing"
-            rows = [r for r in manifest if r["task"]["config"] == task["config"]]
-            if len(rows) != 1 or not re.fullmatch(r"[0-9]+", rows[0]["job_id"]):
-                return "missing"
-            row = rows[0]
-            result = {
-                "source_sha": source,
-                "config": task["config"],
-                **json.loads((target / f"{row['job_id']}-result.json").read_text()),
-            }
-            status = result_status(result, task, source, row["task"]["runner"])
-            return (
-                "passed"
-                if status == "passed"
-                and row["state"] == "COMPLETED"
-                and row["exit_code"] == "0:0"
-                else "missing"
-            )
+            status = manifest_task_result(target, task, source, runner=None)
+            return "passed" if status == "passed" else "missing"
         for artifact in artifacts:
             runner = names.get(artifact["name"])
             if (
@@ -749,18 +935,27 @@ def task_status(task: dict, state: dict, runs: list[dict], *, submit: bool) -> s
     return "blocked"
 
 
-def load_state(comments: list[dict], pr: dict) -> dict | None:
+def latest_state_comment(comments: list[dict], number: int) -> dict | None:
     for comment in reversed(comments):
         state = record(comment, "assist")
-        if state and state["pr"] == pr["number"]:
-            command_comment = api(f"issues/comments/{state['command']}")
-            if (
-                command_comment["issue_url"].rsplit("/", 1)[-1] != str(pr["number"])
-                or permitted(command_comment) != state["action"]
-            ):
-                raise ValueError("Command is no longer authorized.")
-            return state
+        if state and state["pr"] == number:
+            return comment
     return None
+
+
+def load_state(comments: list[dict], pr: dict) -> dict | None:
+    comment = latest_state_comment(comments, pr["number"])
+    if not comment:
+        return None
+    state = record(comment, "assist")
+    command_comment = api(f"issues/comments/{state['command']}")
+    if (
+        command_comment["issue_url"].rsplit("/", 1)[-1] != str(pr["number"])
+        or permitted(command_comment) != state["action"]
+        or command_target(command_comment, pr["number"]) != state.get("target")
+    ):
+        raise ValueError("Command is no longer authorized.")
+    return state
 
 
 def refresh_plan(state: dict, message: str):
@@ -784,6 +979,50 @@ def refresh_plan(state: dict, message: str):
     )
 
 
+def run_deadline(run: int, budget: int) -> int:
+    started = api(f"actions/runs/{run}")["run_started_at"]
+    return (
+        int(datetime.datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp())
+        + budget
+    )
+
+
+def repair_deadline(state: dict) -> int:
+    return run_deadline(state["repair_run"], 3600)
+
+
+def repair_plan(state: dict) -> dict:
+    """Recover the plan that produced this candidate, not a later plan comment."""
+    run = api(f"actions/runs/{state['repair_run']}")
+    workflows = {".github/workflows/pr-ci-assist.yml"}
+    if run["event"] == "workflow_run":
+        workflows.add(".github/workflows/pr-ci-assist-dispatch.yml")
+    if run["path"] not in workflows or run["event"] not in {
+        "issue_comment",
+        "workflow_dispatch",
+        "workflow_run",
+    }:
+        raise ValueError("Unexpected repair workflow.")
+    with tempfile.TemporaryDirectory() as directory:
+        target = Path(directory)
+        download(run, "repair-request", target)
+        request = json.loads(target.joinpath("request.json").read_text())
+    if any(
+        request["state"].get(key) != state.get(key)
+        for key in (
+            "repository",
+            "pr",
+            "head",
+            "base",
+            "command",
+            "repair_run",
+            "target",
+        )
+    ):
+        raise ValueError("Repair plan belongs to another authorized source.")
+    return request["plan"]
+
+
 def control(number: int):
     public_gate()
     pr = pull(number)
@@ -791,25 +1030,50 @@ def control(number: int):
     state = load_state(comments, pr)
     comment = latest_command(comments)
     initial = bool(comment and (not state or comment["id"] > state["command"]))
+    # A manual rerun of the workflow retries the authorized fix in place: a
+    # retained candidate returns to validation, otherwise the repair restarts.
+    retry = bool(
+        os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and state
+        and comment
+        and state["command"] == comment["id"]
+        and state["action"] == "fix"
+        and state["phase"] in {"manual", "stale"}
+        and (state["head"], state["base"]) == (pr["head"]["sha"], pr["base"]["sha"])
+        and (
+            "repair_run" not in state
+            or api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
+        )
+    )
+    if retry:
+        if "candidate" in state:
+            # Harvest only: verify the retained candidate's existing checks
+            # within a short window; start no new repair or validation.
+            state["phase"] = "validating"
+        else:
+            initial = True
     if initial:
         action = permitted(comment)
         prior = state
-        state = dict(
-            version=1,
-            repository=REPO,
-            pr=number,
-            head=pr["head"]["sha"],
-            base=pr["base"]["sha"],
-            command=comment["id"],
-            action=action,
-            phase="watching",
-            tasks=[],
-            statuses=[],
-            run_ids={},
-            conflicts=pr["mergeable"] is False,
-            since=comment["id"],
-            submitted=[],
-        )
+        state = {
+            "version": 1,
+            "repository": REPO,
+            "pr": number,
+            "head": pr["head"]["sha"],
+            "base": pr["base"]["sha"],
+            "command": comment["id"],
+            "action": action,
+            "phase": "watching",
+            "tasks": [],
+            "statuses": [],
+            "run_ids": {},
+            "conflicts": pr["mergeable"] is False,
+            "since": comment["id"],
+            "submitted": [],
+        }
+        target = command_target(comment, number)
+        if target:
+            state["target"] = target
         if prior and (prior["head"], prior["base"]) == (state["head"], state["base"]):
             state["submitted"] = [
                 t
@@ -819,9 +1083,36 @@ def control(number: int):
             state["since"] = prior["since"]
     if not state or state["phase"] in FINISHED_PHASES:
         return
-    if state["head"] != pr["head"]["sha"] or state["base"] != pr["base"]["sha"]:
+    # A retained candidate stays valid while it merges cleanly onto main.
+    if not pr_source_matches(state, pr, source=ROOT) or (
+        "candidate" in state
+        and not main_merge_clean(
+            state["candidate"]["validation"],
+            api("git/ref/heads/main")["object"]["sha"],
+            source=ROOT,
+        )
+    ):
         state["phase"] = "stale"
-        publish(state, "PR or main changed. Request a new plan and command.")
+        publish(
+            state,
+            "PR source or relevant main inputs changed. Refresh the repair and validation.",
+        )
+        return
+    deadline = 0
+    if retry and "candidate" in state:
+        deadline = run_deadline(int(os.environ["GITHUB_RUN_ID"]), 15 * 60)
+    elif "repair_run" in state:
+        deadline = repair_deadline(state)
+    if (
+        state["phase"] in {"repairing", "validating"}
+        and "repair_run" in state
+        and time.time() >= deadline
+    ):
+        state["phase"] = "manual"
+        publish(
+            state,
+            "The one-hour repair and validation budget expired; PR unchanged.",
+        )
         return
     if "plan_refresh" in state and os.environ["GITHUB_EVENT_NAME"] == "workflow_run":
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
@@ -843,25 +1134,50 @@ def control(number: int):
                 state["phase"] = "manual"
                 publish(state, "CI plan refresh failed. Human intervention required.")
                 return
+    if state["phase"] == "repairing":
+        owner = api(f"actions/runs/{state['repair_run']}")
+        if owner["status"] == "completed":
+            state["phase"] = "manual"
+            publish(
+                state,
+                "Repair workflow ended before staging. Human intervention required; request a fresh fix.",
+            )
+        return
     source = checkout(state["head"], state["base"])
     os.environ.update(PR_NUMBER=str(number), GITHUB_REPOSITORY=REPO)
     data = context(source, state["head"], state["base"])
-    plans = [
-        p
-        for c in reversed(comments)
-        if (p := record(c, "plan"))
-        and p["pr"] == number
-        and p["head"] == state["head"]
-        and p["base"] == state["base"]
-    ]
-    if not plans:
-        if initial:
-            refresh_plan(
-                state,
-                "Refreshing the CI plan for this head and base; only its selected tasks will be watched.",
+    if "candidate" in state:
+        try:
+            plan = repair_plan(state)
+        except (
+            OSError,
+            ValueError,
+            KeyError,
+            TypeError,
+            subprocess.CalledProcessError,
+        ):
+            state["phase"] = "manual"
+            publish(
+                state, "The original repair plan could not be verified; PR unchanged."
             )
-        return
-    plan = plans[0]
+            return
+    else:
+        plans = [
+            p
+            for c in reversed(comments)
+            if (p := record(c, "plan"))
+            and p["pr"] == number
+            and p["head"] == state["head"]
+            and p["base"] == state["base"]
+        ]
+        if not plans:
+            if initial:
+                refresh_plan(
+                    state,
+                    "Refreshing the CI plan for this head and base; only its selected tasks will be watched.",
+                )
+            return
+        plan = plans[0]
     plan_run = api(f"actions/runs/{plan['run']}")
     if (
         plan_run["path"] != ".github/workflows/pr-ci-plan.yml"
@@ -874,6 +1190,7 @@ def control(number: int):
             publish(state, "Waiting for the current CI plan to finish.")
         return
     try:
+        plan = targeted_plan(plan, data, state)
         tasks = validate_plan(plan, data)
     except CoverageError:
         if "plan_refresh" not in state:
@@ -892,11 +1209,11 @@ def control(number: int):
         state["phase"] = "manual"
         publish(
             state,
-            "Some planned tasks have no supported GPU route. Human intervention required.",
+            "The requested job or selected tasks cannot be validated for this PR. Human intervention required.",
         )
         return
     replanned = state.pop("plan_refresh", None) is not None
-    if not tasks and (state["action"] != "watch" or not data.get("native_checks")):
+    if not tasks and not data.get("native_checks") and not state.get("target"):
         state["phase"] = "manual"
         publish(
             state,
@@ -916,41 +1233,70 @@ def control(number: int):
         )
     }
     state["submitted"] = [t for t in state["submitted"] if t in titles]
-    if state["phase"] == "repairing":
-        owner = api(f"actions/runs/{state['repair_run']}")
-        if owner["status"] == "completed":
-            state["phase"] = "manual"
-            publish(
-                state,
-                "Repair workflow ended before staging. Human intervention required; request a fresh fix.",
-            )
-        return
     runs = runs_for(state)
     previous_checks = state.get("native_checks", [])
+    # Preserve failed-check evidence while resolving merge conflicts.
     state["native_checks"] = [
-        native_check(check, state, runs)
-        for check in data.get("native_checks", [])
-        if state["action"] == "watch"
+        native_check(check, state, runs) for check in data.get("native_checks", [])
     ]
     native_statuses = [c["status"] for c in state["native_checks"]]
-    if any(s in {"failed", "missing", "blocked"} for s in native_statuses):
+    if "candidate" in state and not retry:
+        dispatch_native_checks(state)
+    requested_fix = state["action"] == "fix" and "candidate" not in state
+    lint = next(
+        (
+            r
+            for r in runs
+            if r.get("path") == ".github/workflows/lint.yml"
+            and r.get("event") == "pull_request"
+            and r.get("head_sha") == state["head"]
+            and any(
+                p["number"] == number and p["head"]["sha"] == state["head"]
+                for p in r.get("pull_requests", [])
+            )
+        ),
+        None,
+    )
+    lint_run = (
+        lint["id"]
+        if lint and lint["status"] == "completed" and lint["conclusion"] == "failure"
+        else None
+    )
+    if (
+        "blocked" in native_statuses
+        or (
+            "missing" in native_statuses
+            and not (requested_fix and (lint_run or state.get("target")))
+        )
+        or ("failed" in native_statuses and not requested_fix)
+    ):
         state["phase"] = "manual"
         publish(
             state,
             "Native checks need human intervention; no dispatch retry or PR update.",
         )
         return
-    requested_fix = state["action"] == "fix" and "candidate" not in state
-    if requested_fix and pr["mergeable"] is False:
-        state["conflicts"] = True
+    if requested_fix and (pr["mergeable"] is False or state.get("target")):
+        state["conflicts"] = pr["mergeable"] is False
         statuses = ["waiting"] * len(tasks)
     else:
-        statuses = [task_status(t, state, runs, submit=True) for t in tasks]
+        statuses = [
+            task_status(t, state, runs, submit=not (retry and "candidate" in state))
+            for t in tasks
+        ]
     previous = state["statuses"]
     state["statuses"] = statuses
-    if requested_fix and (pr["mergeable"] is False or "failed" in statuses):
+    if requested_fix and (
+        retry
+        or state.get("target")
+        or lint_run
+        or pr["mergeable"] is False
+        or "failed" in statuses
+        or "failed" in native_statuses
+    ):
         state["phase"] = "repairing"
         state["repair_run"] = int(os.environ["GITHUB_RUN_ID"])
+        state["validation_base"] = api("git/ref/heads/main")["object"]["sha"]
         publish(
             state,
             (
@@ -966,16 +1312,22 @@ def control(number: int):
                     "plan": plan,
                     "data": data,
                     "conflicts": pr["mergeable"] is False,
+                    "deadline": repair_deadline(state),
+                    "lint_run": lint_run,
                 }
             )
         )
         output("repair", "true")
         return
     combined = native_statuses + statuses
+    if retry and "candidate" in state and not all(s == "passed" for s in combined):
+        state["phase"] = "manual"
+        publish(state, "Validation has not fully passed; PR unchanged.")
+        return
     if "candidate" in state and all(s == "passed" for s in combined):
         from pr_ci_repair import promote
 
-        promote(state)
+        promote(state, deadline=deadline)
         state["phase"] = "promoted"
         publish(
             state,

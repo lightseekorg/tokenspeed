@@ -482,6 +482,13 @@ class CacheGroupRouter(AttentionBackend):
                 buffers_by_group.setdefault(gid, []).extend(pool.get_kv_buffer(layer))
         self._tree_window_rows = {}
         for gid, buffers in buffers_by_group.items():
+            # MLA's value is a view of its latent key row at the same address; the key row covers it.
+            widest: dict[int, torch.Tensor] = {}
+            for buf in buffers:
+                kept = widest.get(buf.data_ptr())
+                if kept is None or buf[0].numel() > kept[0].numel():
+                    widest[buf.data_ptr()] = buf
+            buffers = list(widest.values())
             row_bytes = {buf[0].numel() * buf.element_size() for buf in buffers}
             contiguous = all(buf.is_contiguous() for buf in buffers)
             if len(row_bytes) != 1 or not contiguous:
@@ -492,7 +499,7 @@ class CacheGroupRouter(AttentionBackend):
                 )
             # Layers may alias one region through the memory plan; move each region once.
             addresses = torch.tensor(
-                sorted({buf.data_ptr() for buf in buffers}),
+                sorted(widest),
                 dtype=torch.int64,
                 device=self.device,
             )

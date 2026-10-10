@@ -161,18 +161,65 @@ from one first bound to that pool:
   a reserve takes it -- minus the projection. The reserve covers the bytes
   inside the capture windows as projected -- what a boot without a probe
   captures there, one-time bytes the first captures take included; the
-  probe releases them and the serving capture pays them again. The
+  probe releases them and the serving capture pays them again. On CUDA, what
+  executor init and kernel tuning keep resident between the probe build and
+  the probe -- buffers, and on a cold tuning cache the kernels of every tactic
+  tried, though not the stack limit they raised, which is restored after
+  tuning -- is measured the same way, including the free space a kept block
+  pins in an allocator segment, and this startup residue joins each rank's
+  projection before the MAX; its net is floored at zero. Off CUDA it stays on
+  the headroom, as on a boot without a reserve; on ROCm, ROCr keeps the
+  scratch memory tuning grows assigned to its queues, and reclaims it when a
+  device allocation fails. The
   utilization headroom covers everything else: activations, fragmentation,
-  the warmups and workspaces a capture allocates around its windows, and any
-  shortfall of the projection, as it covers every graph on a boot without a
+  the warmups and workspaces a capture allocates around its windows, the
+  local memory a kept kernel reserves when it raises the stack limit again
+  after tuning (a driver allocation that first drains the device, and the
+  launch fails if it does not fit), and any shortfall of the projection, as
+  it covers every graph and all of startup on a boot without a
   reserve. Profiling again after the probe would charge the cache a second
-  time for what tuning and the probe left allocated. The deltas read the
+  time for what startup and the probe left allocated. The deltas read the
   whole device, so the probe assumes no other process allocates on it during
   startup. Not covered: a ladder every one of whose sampled marginals was
   served from slack, which is priced at nothing and says so in the
-  log. The EPD receive pool, which a multimodal prefill node allocates after
+  log; and what the probe build allocates after its profile, such as
+  attention backend workspaces, which the headroom funds.
+  The EPD receive pool, which a multimodal prefill node allocates after
   its cache is sized, is left out of the profile instead, by each rank before
   the cross-rank minimum.
+
+### DP projection communication
+
+`DPColumnParallelLinear` and `DPRowParallelLinear` accept full input channels
+for each rank's own tokens and return complete outputs in the same local token
+order. Their parallel mapping describes projection weight sharding, independently
+of attention's token ownership. For example, attention DP4 can use one TP4
+projection group with projection `dp_size=1`; this does not mean the attention
+inputs are replicated.
+
+Both eager and CUDA-graph execution require explicit physical row counts indexed
+by global rank in `ForwardContext`: `collective_global_num_tokens` from
+`report_collective_sizing` takes precedence over `global_num_tokens`. The counts
+include any graph padding and match the input rows on each owner. Empty owners
+participate when another rank in their subgroup has work. Missing counts are an
+error, not an instruction to assume equal counts across ranks. Ordinary TP with
+replicated token rows uses the existing `ColumnParallelLinear` and
+`RowParallelLinear` contracts instead.
+
+The model runner prepares fixed-capacity communication workspaces before
+cache-memory profiling and graph capture.
+Preparation binds each Linear and its workspace to the selected communication
+backend; forward operations dispatch through that same backend.
+Generic projection operations use the backend's ordinary collectives.
+`AutoBackend` composes the optimized projection dispatcher and reuses those
+generic operations for fallback.
+Sequential layers share model-private scratch on one stream, sized for the
+largest projection; matching configurations also share native resources.
+Concurrent streams or models use separate workspaces. Intermediate tensors
+borrow storage only for the current projection, so consumers finish before
+another projection reuses it. Final outputs belong to the caller and
+remain valid across later forwards. Graphs referencing a workspace are destroyed
+before it is released.
 
 ### Padding contract
 
@@ -740,10 +787,10 @@ model alone is not a reason to introduce a bespoke backend.
 the ordinary router, wrapped by the existing `HybridLinearAttnBackend` only
 when this view owns GDN layers. Forward dispatch and PD step recording stay
 with that child; the root broadcasts cache and metadata lifecycle calls.
-Registry construction selects the attention child first, then composes the
-Qwen4-Exp consumers once, regardless of whether this view has GDN layers.
-The factory reads the pool view to choose these consumers and leaves binding
-to the common validation and publication path after construction.
+Registry construction selects the attention child; the Qwen4-Exp composite
+selects its consumers from the pool view's local fields, regardless of whether
+this view has GDN layers. Binding stays with the common validation and
+publication path after construction.
 The root initializes the common `AttentionBackend` attributes from its own
 `AttnConfig`, including draft status, verify width, dtype and head geometry;
 these attributes do not depend on an attention child's wrapper shape.
@@ -832,9 +879,12 @@ of the persistent request caches.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
-before sizing the arena. The Qwen4-Exp root's `preallocate_verify_workspace`
-selects its GDN/PLE/QSA consumers, allocates each once and returns their total
-bytes; registry only invokes this operation and checks the recipe budget.
+before sizing the arena. `preallocate_verify_workspace` is called on the
+backend root and returns its verify buffers' bytes. The hybrid delegates to
+its recurrent child; Qwen4-Exp invokes its attention child, PLE and QSA.
+Registry retains the recipe's preparation conditions and budget check,
+without opening the recurrent child. Inkling ring accounting and QCP
+history-gather allocation and sharing remain separate from verify preparation.
 Draft roots allocate no target verify workspace. Qwen4-Exp reserves no
 verify workspace when the target width is one, even with a draft model
 attached; this includes the inherited GDN/PLE staging budget and PLE commit
@@ -1188,13 +1238,13 @@ extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
 
-## Recurrent prefill subgraphs (KDA, Mamba2)
+## Recurrent prefill subgraphs (KDA, Mamba2, GDN)
 
 ### Capturing recurrent layers in the outer graph
 
 `CapacityPrefillBackend` (`state/prefill_capacity.py`) owns this contract for
-KDA and Mamba2; each subclass only states which forwards it admits and whether
-uncaptured shapes also run the capacity layout. GDN does not capture its layers.
+KDA, Mamba2 and GDN; each subclass only states which forwards it admits and whether
+uncaptured shapes also run the capacity layout.
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture and replay. This consumer-stream seam builds or
 refreshes `CapacityPrefillMetadata` with the selected token and request capacities.
@@ -1216,6 +1266,13 @@ the preparation seam rewrites both in place, in one pinned upload, before each
 use. Mamba2 chunks align to the packed token axis, so when one-token dummy tails
 shift a later request's tail, a multi-request capture matches eager within
 rounding rather than bit for bit; a one-request capture matches exactly.
+
+GDN admits capacity prefills only when the selected chunk-prefill kernel sizes
+its launch from the sequence count and reads the bounds on device
+(`gdn_chunk_prefill_capturable`); otherwise its layers keep their breaks. Like
+Mamba2, uncaptured shapes keep the scheduler metadata. The scan chunks each
+sequence from its own start, so captures of any request count match eager bit
+for bit.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels and post-attention compute together.

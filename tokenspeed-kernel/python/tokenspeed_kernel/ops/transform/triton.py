@@ -70,6 +70,7 @@ def _hadamard_128_kernel(
     ),
     traits={
         "last_dim": frozenset({128}),
+        "contiguous": frozenset({False, True}),
     },
     priority=Priority.PORTABLE,
 )

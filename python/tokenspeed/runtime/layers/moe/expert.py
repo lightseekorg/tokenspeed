@@ -23,8 +23,10 @@ import logging
 from collections.abc import Callable
 from dataclasses import replace
 
-import tokenspeed_kernel
 import torch
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
     TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT,
@@ -368,7 +370,7 @@ class MoELayer(torch.nn.Module):
             # it is the fold's group whatever the plan's solution.
             mapping = global_server_args_dict["mapping"]
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
-        self.plan = tokenspeed_kernel.moe_plan(
+        self.plan = kernel_moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,
             activation=self.activation,
@@ -450,7 +452,7 @@ class MoELayer(torch.nn.Module):
         if self._weights_processed:
             return
 
-        tokenspeed_kernel.moe_process_weights(self.plan, module)
+        kernel_moe_process_weights(self.plan, module)
         self._weights_processed = True
 
     @property
@@ -540,7 +542,7 @@ class MoELayer(torch.nn.Module):
                 raise ValueError(
                     "selected MoE kernel does not support in-kernel routing"
                 )
-            output = tokenspeed_kernel.moe_apply(
+            output = kernel_moe_apply(
                 self.plan,
                 hidden_states,
                 self,
@@ -562,7 +564,7 @@ class MoELayer(torch.nn.Module):
             raise ValueError(
                 "selected MoE kernel does not support precomputed top-k routing"
             )
-        return tokenspeed_kernel.moe_apply(
+        return kernel_moe_apply(
             self.plan,
             hidden_states,
             self,

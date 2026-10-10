@@ -26,6 +26,7 @@ from collections.abc import Callable
 from typing import get_args
 
 import torch
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.tuning import is_autotuning
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -44,6 +45,15 @@ from tokenspeed_kernel.signature import (
 
 platform = current_platform()
 _fp8_dtype = torch.float8_e4m3fn
+_fp8_max = torch.finfo(_fp8_dtype).max
+_fp8_min = torch.finfo(_fp8_dtype).min
+
+_trtllm_per_token_group_quant_fp8 = error_fn
+
+if platform.is_nvidia:
+    from tokenspeed_kernel.ops.quantization.trtllm import (
+        _per_token_group_quant_8bit as _trtllm_per_token_group_quant_fp8,
+    )
 
 _fp4_dtypes: frozenset[torch.dtype] = frozenset({torch.uint8, torch.float4_e2m1fn_x2})
 _MXFP8_SCALE = ScaleFormat(
@@ -128,89 +138,8 @@ def has_flashinfer_fp8_blockscale() -> bool:
     return gemm_fp8_nt_groupwise is not error_fn and platform.is_blackwell
 
 
-# Past ~224 rows (GB300, K=7168) padding M costs more than the transpose it saves.
-_PREPACKED_PAD_TOKEN_LIMIT = 256
-
-
-def use_flashinfer_fp8_blockscale_prepacked(num_tokens: int) -> bool:
-    """Whether MN-major prepacked scales beat canonical scales for this M.
-
-    Args:
-        num_tokens: Row count ``M`` of the activation matrix.
-
-    Returns:
-        True when the prepared MN-major path avoids more work than it adds.
-        Row counts that are already a multiple of four need no padding at all,
-        so the quantizer's native output is used as-is.
-    """
-    return num_tokens % 4 == 0 or num_tokens <= _PREPACKED_PAD_TOKEN_LIMIT
-
-
-def prepare_flashinfer_fp8_blockscale_weight_scales(
-    scales: torch.Tensor,
-) -> torch.Tensor:
-    """Pack canonical weight scales into FlashInfer's MN-major layout.
-
-    Args:
-        scales: Contiguous canonical scales shaped ``[N / 128, K / 128]``.
-
-    Returns:
-        A contiguous tensor shaped ``[K / 128, N / 128]``. This conversion is
-        intended to run once after weight loading rather than in every GEMM.
-    """
-    if scales.ndim != 2:
-        raise ValueError(f"weight scales must be 2-D, got shape {tuple(scales.shape)}")
-    if scales.dtype != torch.float32:
-        raise ValueError(
-            "FlashInfer FP8 block-scale weight scales must use float32, "
-            f"got {scales.dtype}"
-        )
-    return scales.transpose(0, 1).contiguous()
-
-
-def _validate_flashinfer_fp8_blockscale_prepacked(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scales: torch.Tensor,
-    B_scales: torch.Tensor,
-    original_m: int,
-    block_size: list[int] | None,
-) -> None:
-    """Validate the prepared-layout contract without modifying its inputs."""
-    if block_size is not None and tuple(block_size) != (128, 128):
-        raise ValueError(
-            "prepacked FlashInfer scales require block_size=[128, 128], "
-            f"got {block_size}"
-        )
-    if not 0 < original_m <= A.shape[0]:
-        raise ValueError(f"original_m must be in [1, {A.shape[0]}], got {original_m}")
-    if A.shape[0] % 4:
-        raise ValueError(
-            "prepacked FlashInfer activations must have an M dimension "
-            f"divisible by four, got {A.shape[0]}"
-        )
-
-    expected_a_scales = (A.shape[1] // 128, A.shape[0])
-    expected_b_scales = (B.shape[1] // 128, B.shape[0] // 128)
-    if (
-        A_scales.dtype != torch.float32
-        or B_scales.dtype != torch.float32
-        or A_scales.device != A.device
-        or B_scales.device != B.device
-    ):
-        raise ValueError("Prepacked scales must be FP32 on their operand's device")
-    if tuple(A_scales.shape) != expected_a_scales or not A_scales.is_contiguous():
-        raise ValueError(
-            "prepacked activation scales must be contiguous with shape "
-            f"{expected_a_scales}, got shape={tuple(A_scales.shape)} "
-            f"stride={tuple(A_scales.stride())}"
-        )
-    if tuple(B_scales.shape) != expected_b_scales or not B_scales.is_contiguous():
-        raise ValueError(
-            "prepacked weight scales must be contiguous with shape "
-            f"{expected_b_scales}, got shape={tuple(B_scales.shape)} "
-            f"stride={tuple(B_scales.stride())}"
-        )
+def _supports_flashinfer_fp8_blockscale(m: int, _n: int, _k: int) -> bool:
+    return not 17 <= m <= 32
 
 
 if gemm_fp8_nt_groupwise is not error_fn:
@@ -228,9 +157,8 @@ if gemm_fp8_nt_groupwise is not error_fn:
         traits={
             "n_align": frozenset({128}),
             "k_align": frozenset({128}),
-            "block_scale_layout": frozenset(
-                {"canonical", "canonical_blackwell", "flashinfer_mn"}
-            ),
+            "mnk_problem_filter": frozenset({_supports_flashinfer_fp8_blockscale}),
+            "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
         },
         priority=Priority.SPECIALIZED + 3,
     )
@@ -244,53 +172,17 @@ if gemm_fp8_nt_groupwise is not error_fn:
         alpha: torch.Tensor | None = None,
         block_size: list[int] | None = None,
         out: torch.Tensor | None = None,
-        prepacked_scales: bool = False,
-        original_m: int | None = None,
     ) -> torch.Tensor:
-        """Run FlashInfer FP8 GEMM with canonical or prepared scales.
-
-        Set ``prepacked_scales`` only when ``A_scales`` and ``B_scales`` already
-        use FlashInfer's contiguous MN-major layout. The default canonical path
-        passes the native K-major layouts through without copies.
-        """
+        """Run FlashInfer FP8 GEMM with canonical scales."""
         assert (
             A_scales is not None
         ), "A_scales is required; online quantization should be done by the caller"
         assert B_scales is not None, "B_scales is required for FP8 blockscale GEMM"
-        orig_m = A.shape[0] if original_m is None else int(original_m)
-        if prepacked_scales:
-            _validate_flashinfer_fp8_blockscale_prepacked(
-                A,
-                B,
-                A_scales,
-                B_scales,
-                orig_m,
-                block_size,
+        orig_m = A.shape[0]
+        if not _supports_flashinfer_fp8_blockscale(orig_m, B.shape[0], A.shape[1]):
+            raise ValueError(
+                "FlashInfer FP8 block-scale GEMM does not support 17 <= M <= 32"
             )
-            # A padded GEMM must not write past the caller's unpadded output.
-            # Aligned projection batches can write straight into communication
-            # scratch; strided or padded destinations retain the copy fallback.
-            direct_out = (
-                out is not None
-                and out.is_contiguous()
-                and out.shape == (A.shape[0], B.shape[0])
-                and orig_m == A.shape[0]
-            )
-            output = gemm_fp8_nt_groupwise(
-                A,
-                B,
-                A_scales,
-                B_scales,
-                scale_major_mode="MN",
-                out=out if direct_out else None,
-                out_dtype=out_dtype,
-            )
-            output = output[:orig_m] if output.shape[0] != orig_m else output
-            if out is not None and not direct_out:
-                out.copy_(output)
-                return out
-            return output
-
         # K-major mode reads the quant kernel's native (m, k//128) activation
         # scales and the checkpoint's native (n//128, k//128) weight scales,
         # so no padding, transposes, or scale copies are needed per call.
@@ -362,8 +254,15 @@ def has_flashinfer_mxfp8() -> bool:
     return mm_mxfp8 is not error_fn
 
 
+def swizzle_mxfp8_scale(sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
+    m_tiles = (m + 127) // 128
+    k_tiles = (k + 127) // 128
+    padded = torch.zeros((m_tiles * 128, k_tiles * 4), dtype=sf.dtype, device=sf.device)
+    padded[:m, : k // 32] = sf
+    return padded.view(m_tiles, 4, 32, k_tiles, 4).transpose(1, 3).contiguous().view(-1)
+
+
 if mm_mxfp8 is not error_fn:
-    from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
 
     @register_kernel(
         "gemm",
@@ -1029,3 +928,159 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
         with torch.no_grad():
             sample = x.new_zeros((BF16_GEMM_MAX_M, weight.shape[1]))
             flashinfer_bf16_gemm(sample, weight, None)
+
+
+# ---- Prepacked FP8 block-scale layout helpers -----------------------------
+
+# Padding rows beyond this many tokens costs more than the prepacked path
+# saves; aligned token counts always take the prepacked path.
+_PREPACKED_PAD_THRESHOLD = 256
+
+
+def use_flashinfer_fp8_blockscale_prepacked(num_tokens: int) -> bool:
+    """Return whether the prepacked (MN-major scales) FP8 block-scale path
+    should be used for ``num_tokens`` tokens."""
+    return num_tokens <= _PREPACKED_PAD_THRESHOLD or num_tokens % 4 == 0
+
+
+def prepare_flashinfer_fp8_blockscale_weight_scales(
+    weight_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Convert canonical ``[N // 128, K // 128]`` weight scales to the
+    prepacked MN-major layout ``[K // 128, N // 128]`` consumed by
+    ``gemm_fp8_nt_groupwise`` with ``scale_major_mode="MN"``."""
+    return weight_scales.t().contiguous()
+
+
+@triton.jit
+def _fp8_blockscale_quantize_prepacked_kernel(
+    y_ptr,
+    y_q_ptr,
+    y_s_ptr,
+    group_size,
+    y_num_columns,
+    valid_rows,
+    padded_rows,
+    bit8_min,
+    bit8_max,
+    BLOCK: tl.constexpr,
+):
+    """Quantize valid rows and initialize the GEMM's M-padding in one launch."""
+    group_id = tl.program_id(0)
+    groups_per_row = y_num_columns // group_size
+    row = group_id // groups_per_row
+    scale_col = group_id % groups_per_row
+
+    cols = tl.arange(0, BLOCK)
+    col_mask = cols < group_size
+    row_offset = row.to(tl.int64) * y_num_columns
+    group_offset = scale_col.to(tl.int64) * group_size
+    offsets = row_offset + group_offset + cols
+
+    y = tl.load(y_ptr + offsets, mask=col_mask, other=0.0).to(tl.float32)
+    amax = tl.max(tl.abs(y))
+    # Match TRT-LLM's scale_1x128_kernel: an all-zero group uses a neutral
+    # scale of one, while every other group uses amax / FP8_MAX.
+    y_s_inv = tl.where(amax == 0.0, 1.0, bit8_max / amax)
+    y_s = 1.0 / y_s_inv
+    y_q = tl.clamp(y * y_s_inv, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
+
+    tl.store(y_q_ptr + offsets, y_q, mask=col_mask)
+    tl.store(
+        y_s_ptr + scale_col.to(tl.int64) * padded_rows + row,
+        y_s,
+    )
+
+    # Only the first valid row's programs initialize the at-most-three tail
+    # rows. Each program owns one 128-column group, so these stores do not race.
+    for pad_offset in tl.static_range(0, 3):
+        pad_row = valid_rows + pad_offset
+        pad_mask = (row == 0) & (pad_row < padded_rows)
+        pad_offsets = pad_row.to(tl.int64) * y_num_columns + group_offset + cols
+        tl.store(y_q_ptr + pad_offsets, 0.0, mask=pad_mask & col_mask)
+        tl.store(
+            y_s_ptr + scale_col.to(tl.int64) * padded_rows + pad_row,
+            1.0,
+            mask=pad_mask,
+        )
+
+
+def flashinfer_fp8_blockscale_quantize_prepacked(
+    x: torch.Tensor,
+    group_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize activations into FlashInfer's native MN-major scale layout.
+
+    For row counts already divisible by four, this exposes TRT-LLM's native
+    ``[K / 128, M]`` scale output directly. Otherwise a fused Triton kernel
+    writes the valid quantized rows plus zero/one padding directly into
+    ``[round_up(M, 4), K]`` values and ``[K / 128, round_up(M, 4)]`` scales.
+
+    Args:
+        x: Contiguous BF16/FP16 activation matrix shaped ``[M, K]``.
+        group_size: Number of K elements represented by one scale. FlashInfer's
+            FP8 block-scale GEMM currently requires 128.
+
+    Returns:
+        A tuple containing padded FP8 values and contiguous MN-major FP32
+        scales. The returned row count equals ``round_up(M, 4)``.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"x must be 2-D, got shape {tuple(x.shape)}")
+    if not x.is_contiguous():
+        raise ValueError("x must be contiguous")
+    if x.shape[0] <= 0:
+        raise ValueError(f"x must contain at least one row, got {x.shape[0]}")
+    if group_size != 128:
+        raise ValueError(
+            "FlashInfer FP8 block-scale prepacking requires group_size=128, "
+            f"got {group_size}"
+        )
+    if x.shape[1] % group_size:
+        raise ValueError(
+            f"x.shape[1] must be divisible by {group_size}, got {x.shape[1]}"
+        )
+
+    valid_rows, columns = x.shape
+    padded_rows = (valid_rows + 3) // 4 * 4
+    if (
+        padded_rows == valid_rows
+        and x.dtype == torch.bfloat16
+        and _trtllm_per_token_group_quant_fp8 is not error_fn
+    ):
+        x_q, x_s = _trtllm_per_token_group_quant_fp8(x, group_size, False)
+        expected_shape = (columns // group_size, valid_rows)
+        if tuple(x_s.shape) != expected_shape or not x_s.is_contiguous():
+            raise RuntimeError(
+                "TRT-LLM FP8 quantizer returned unexpected prepared scales: "
+                f"shape={tuple(x_s.shape)}, stride={tuple(x_s.stride())}, "
+                f"expected contiguous {expected_shape}"
+            )
+        return x_q, x_s
+
+    x_q = torch.empty(
+        (padded_rows, columns),
+        device=x.device,
+        dtype=_fp8_dtype,
+    )
+    x_s = torch.empty(
+        (columns // group_size, padded_rows),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    groups = valid_rows * (columns // group_size)
+    _fp8_blockscale_quantize_prepacked_kernel[(groups,)](
+        x,
+        x_q,
+        x_s,
+        group_size,
+        columns,
+        valid_rows,
+        padded_rows,
+        bit8_min=_fp8_min,
+        bit8_max=_fp8_max,
+        BLOCK=group_size,
+        num_warps=1,
+        num_stages=1,
+    )
+    return x_q, x_s

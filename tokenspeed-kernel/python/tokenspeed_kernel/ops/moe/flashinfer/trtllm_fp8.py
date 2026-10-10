@@ -50,7 +50,7 @@ if platform.is_nvidia:
         trtllm_fp8_block_scale_routed_moe,
     )
     from flashinfer.tllm_enums import WeightLayout
-    from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
 
     _FP8_BLOCK = 128
     # DeepSeek block-FP8 kernels use a 64-row epilogue tile when weights are
@@ -192,16 +192,15 @@ if platform.is_nvidia:
                 x.new_empty((0,), dtype=torch.int32),
             )
 
-        # Per-token group (block=128) FP8 quantization of activations. The
-        # TRT-LLM helper emits the group-major scale layout consumed by the
-        # fused MoE kernel.
-        x_fp8, x_scale = per_token_group_quant_fp8(
+        # Per-token group (block=128) FP8 quantization of activations.
+        # Convert canonical scales to the fused MoE kernel's group-major layout.
+        x_fp8, x_scale = quantize_fp8(
             x,
-            _FP8_BLOCK,
-            column_major_scales=False,
-            scale_tma_aligned=False,
+            granularity="token_group",
+            group_size=_FP8_BLOCK,
+            solution="trtllm",
         )
-        x_scale = x_scale.to(torch.float32).contiguous()
+        x_scale = x_scale.t().to(torch.float32).contiguous()
         hidden_blocks = hidden_size // _FP8_BLOCK
         if x_scale.shape != (hidden_blocks, x_fp8.shape[0]):
             raise RuntimeError(
