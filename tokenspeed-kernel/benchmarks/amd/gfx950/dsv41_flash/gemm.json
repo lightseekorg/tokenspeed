@@ -964,6 +964,174 @@
         "max_regression_absolute_us": 5.0,
         "max_relative_mad": 0.05
       }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/engram_wkv-m6-n25600-k6144-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 6,
+          "N": 25600,
+          "K": 6144,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5525
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/dspark_main_proj-m6-n5120-k15360-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 6,
+          "N": 5120,
+          "K": 15360,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.001,
+            "rtol": 0.01
+          }
+        },
+        "cold_cache": true,
+        "seed": 5526
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/dspark_context_wkv-m6-n1536-k5120-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 6,
+          "N": 1536,
+          "K": 5120,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5527
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/engram_wkv-m192-n25600-k6144-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 192,
+          "N": 25600,
+          "K": 6144,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5528
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/dspark_main_proj-m192-n5120-k15360-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 192,
+          "N": 5120,
+          "K": 15360,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.001,
+            "rtol": 0.01
+          }
+        },
+        "cold_cache": true,
+        "seed": 5529
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/dspark_context_wkv-m192-n1536-k5120-mxfp8-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": 192,
+          "N": 1536,
+          "K": 5120,
+          "quant": "mxfp8",
+          "block_size": [[1, 32]],
+          "out_dtype": "bfloat16",
+          "validation": {
+            "runs": 1,
+            "atol": 0.0,
+            "rtol": 0.0
+          }
+        },
+        "cold_cache": true,
+        "seed": 5530
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0,
+        "max_relative_mad": 0.05
+      }
     }
   ]
 }
