@@ -150,6 +150,13 @@ _ROUTE_OWNED_DECODE_MAX_M = 2
 # 62.4/190.4/301.6/447.9 us at M=4/16/32/64, and loses from M=96 (569 vs 544).
 _PRECOMPUTED_DIRECT_DECODE_MAX_M = 64
 
+# Routed decode with few rows per expert: 32-row tiles instead of the
+# autotuner's 64 (which only drops to 32 from 1024 rows). Identical outputs;
+# V4.1 TP4 (E=384, top-6) M=96: 569 -> 460 us uniform routing, 347 -> 307 us
+# with rows of a request sharing experts; equal from M=256.
+_PRECOMPUTED_DECODE_BLOCK_M = 32
+_PRECOMPUTED_DECODE_BLOCK_M_MAX_ROWS = 1024
+
 
 # Widest activation the precomputed-SiTU entry point serves with the
 # warp-decode kernels; anything wider goes to package prefill.
@@ -1862,6 +1869,11 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
         out=out,
+        block_m=(
+            _PRECOMPUTED_DECODE_BLOCK_M
+            if n_tokens * top_k < _PRECOMPUTED_DECODE_BLOCK_M_MAX_ROWS
+            else None
+        ),
     )
 
 
@@ -1884,8 +1896,10 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
     out: torch.Tensor | None = None,
+    block_m: int | None = None,
 ) -> torch.Tensor:
     n_tokens = hidden_states.shape[0]
+    tile = {} if block_m is None else {"block_m": block_m}
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit", "beta"), reduction_n=2),
@@ -1909,6 +1923,7 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
         fused_activation=act,
         out_quant_format="mxfp4",
         x_scale_ragged_padded=True,
+        **tile,
     )
     return gluon_mxfp_ragged_matmul(
         intermediate_cache,
@@ -1925,6 +1940,7 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
         n_expts_act=top_k,
         x_scale_ragged_padded=True,
         out=out,
+        **tile,
     )
 
 
