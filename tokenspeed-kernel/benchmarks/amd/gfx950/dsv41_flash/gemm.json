@@ -1092,6 +1092,28 @@
         "max_regression_relative": 0.05,
         "max_regression_absolute_us": 5.0
       }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/torch_mm/tp4-lm_head-n32320-k5120-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [6, 192],
+          "N": 32320,
+          "K": 5120,
+          "quant": "none",
+          "dtype": "bfloat16"
+        },
+        "registration": "torch_mm",
+        "cold_cache": true,
+        "seed": 5531
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0
+      }
     }
   ]
 }
