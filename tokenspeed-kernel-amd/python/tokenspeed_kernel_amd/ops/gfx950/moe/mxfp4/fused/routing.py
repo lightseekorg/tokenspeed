@@ -1108,7 +1108,6 @@ def _precomputed_topk_route(
     TOPK: gl.constexpr,
     EP: gl.constexpr,  # next_pow2(E + 1): bin E collects invalid ids
     CH: gl.constexpr,
-    NB_C: gl.constexpr,
     FIRST_BLOCK_LOG2: gl.constexpr,
     bo_stride: gl.constexpr,
     NUM_WARPS: gl.constexpr,
@@ -1145,7 +1144,9 @@ def _precomputed_topk_route(
         idx = gl.load(TopkIds + (g // TOPK) * stride_im + g % TOPK, mask=gmask)
         key = gl.where((idx >= 0) & (idx < E), idx, E)
         hist_smem.atomic_scatter_add(ones, key, axis=0, mask=gmask)
-        hist_pre_smem.atomic_scatter_add(ones, key, axis=0, mask=g < start)
+        # Metadata programs start past G, so bound by G as well: lanes past G
+        # hold undefined ids.
+        hist_pre_smem.atomic_scatter_add(ones, key, axis=0, mask=gmask & (g < start))
     hist = hist_smem.load(L1)
     hist_pre = hist_pre_smem.load(L1)
 
@@ -1184,7 +1185,7 @@ def _precomputed_topk_route(
         gl.store(ScatterIndx + pos, g, mask=gmask)
         gl.store(GateScal + pos, w.to(GateScal.dtype.element_ty), mask=gmask)
     else:
-        # Programs n_chunks .. n_chunks + NB_C - 1 each own one block size.
+        # The launch adds one trailing program per block size (_ROUTE_NB).
         k = pid - n_chunks
         if k == 0:
             gl.store(SliceSizes + e, hist, mask=emask)
@@ -1301,7 +1302,6 @@ def _launch_precomputed_topk_route(
         TOPK=topk,
         EP=_route_next_pow2(num_experts + 1),
         CH=chunk,
-        NB_C=_ROUTE_NB,
         FIRST_BLOCK_LOG2=RaggedTensorMetadata.block_sizes_log2()[0],
         bo_stride=block_offs_data.stride(0),
         NUM_WARPS=_PRECOMPUTED_ROUTE_WARPS,
