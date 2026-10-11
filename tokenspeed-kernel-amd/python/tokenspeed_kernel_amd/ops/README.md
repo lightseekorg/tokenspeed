@@ -406,7 +406,8 @@ portable torch selector.
   row selection reads just that prefix of the capacity-wide row (the
   per-query visible length, read on device).
 - Arena page strides are kept without copying the cache; a non-unit stride
-  between page bytes is normalized to contiguous storage before scoring.
+  between page bytes, or a page stride that is not a multiple of 16 bytes, is
+  normalized to contiguous storage before scoring.
 - Launch metadata reports score-capacity FLOPs and estimated tensor traffic,
   also without reading device lengths.
 
@@ -418,7 +419,11 @@ maps columns to pages through the candidate ids and page table, loads the
 MXFP4 key rows, and scores them with E2M1 scaled MFMA against the E8M0
 scales, then applies ReLU and the weighted head sum. A chunk bound that is
 not a multiple of 32 masks its last tile. The gfx1250 scorer dequantizes keys
-to BF16 and uses wave32 WMMA.
+to BF16 and uses wave32 WMMA. Its two warps split the heads, which would
+replicate the key operand in both. Instead each warp loads and decodes half of
+a key tile, one 16-byte load of a row's packed bytes per lane, and a layout
+conversion through LDS assembles the WMMA operand. These loads need page
+strides that are multiples of 16 bytes.
 
 The gfx950 selector runs one workgroup per query in a single launch,
 replacing `torch.topk`, a sort and about ten elementwise kernels. A
@@ -892,14 +897,6 @@ scans multiply probabilities by 256 before the E4M3 cast to preserve small
 weights, and divide out that factor at normalization. The projected-value API
 applies the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
-
-### gfx1250 DSV4.1 indexer key layout
-
-The CSA2 scorer loads and dequantizes packed keys with adjacent key dimensions
-assigned to each lane, then converts BF16 values to the existing WMMA layout.
-Full-history and candidate-block scans share this layout. Page checks, query
-preparation, head reductions and top-k selection are unchanged. Caller-owned
-logits must still be initialized to negative infinity for masked rows.
 
 ## Residual
 

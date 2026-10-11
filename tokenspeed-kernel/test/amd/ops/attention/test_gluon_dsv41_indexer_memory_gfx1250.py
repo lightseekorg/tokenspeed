@@ -48,7 +48,7 @@ def test_key_layout_logits_reference_and_graph(seed, reindex, score_chunk):
     g = torch.Generator(device="cuda").manual_seed(seed)
     keys = torch.randn(512, 128, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1
     _, key_reference = _reference_quantize(keys, "index")
-    storage = torch.zeros(8, 4352 + 13, device="cuda", dtype=torch.uint8)
+    storage = torch.zeros(8, 4352 + 16, device="cuda", dtype=torch.uint8)
     cache = storage[:, :4352].view(8, 64, 68)
     dsv41.cache_scatter(keys, cache, torch.arange(512, device="cuda"), "index")
     q = torch.randn(2, 32, 128, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1

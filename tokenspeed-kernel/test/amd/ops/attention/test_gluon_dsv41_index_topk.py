@@ -319,15 +319,22 @@ def test_index_topk_latest_block_outside_table(
     assert visible.item() == length
 
 
-@pytest.mark.parametrize("byte_stride", [1, 2])
+# A gap between arena pages leaves a page stride that is not a 16-byte multiple.
+@pytest.mark.parametrize(
+    ("byte_stride", "page_gap"),
+    [(1, 0), (2, 0), (1, 13)],
+    ids=["arena", "byte-strided", "unaligned-pages"],
+)
 @pytest.mark.parametrize("reindex", [False, True])
 def test_index_topk_preserves_arena_page_stride(
-    device, require, monkeypatch, reindex, byte_stride
+    device, require, monkeypatch, reindex, byte_stride, page_gap
 ):
     require("attention", "dsv41_index_topk", "gluon", torch.bfloat16, "x")
     q = torch.ones((1, 32, 128), dtype=torch.bfloat16, device=device)
     weights = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
-    arena = torch.zeros((4, 2, 64, 68 * byte_stride), dtype=torch.uint8, device=device)
+    page_bytes = 2 * 64 * 68 * byte_stride
+    storage = torch.zeros((4, page_bytes + page_gap), dtype=torch.uint8, device=device)
+    arena = storage[:, :page_bytes].view(4, 2, 64, 68 * byte_stride)
     cache = arena[:, 0, :, ::byte_stride]
     assert not cache.is_contiguous()
     dsv41.cache_scatter(
@@ -376,7 +383,7 @@ def test_index_topk_preserves_arena_page_stride(
         q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
     ):
         assert cache_2d.stride(1) == 1
-        if byte_stride == 1:
+        if byte_stride == 1 and not page_gap:
             assert cache_2d.data_ptr() == cache.data_ptr()
             assert cache_2d.stride(0) == cache.stride(0)
         else:
