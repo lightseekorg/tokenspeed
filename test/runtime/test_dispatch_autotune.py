@@ -414,7 +414,10 @@ def _moe_api(impl, routing_modes, deferred):
         pdl_enabled=lambda: False,
     )
     return _functions(
-        KERNEL / "ops/moe/__init__.py", None, ("moe_plan", "moe_apply"), namespace
+        KERNEL / "ops/moe/__init__.py",
+        None,
+        ("moe_plan", "_select_moe_apply", "moe_apply"),
+        namespace,
     )
 
 
