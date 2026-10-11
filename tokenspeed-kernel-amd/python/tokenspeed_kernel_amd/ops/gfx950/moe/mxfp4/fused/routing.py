@@ -28,7 +28,7 @@ top-k-only route kernels."""
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe._common import (
     RaggedTensorMetadata,
     make_ragged_tensor_metadata,
@@ -1144,6 +1144,144 @@ def _fused_precomputed_topk_route_small_m(
     gl.store(GatherIndx + pos, tok, mask=valid)
     gl.store(ScatterIndx + pos, g.to(gl.int32), mask=valid)
     gl.store(GateScal + pos, vals, mask=valid)
+
+
+@triton.jit(do_not_specialize=["M", "MAXBLK"])
+def _precomputed_topk_route_medium_m(
+    TopkWeights,
+    TopkIds,
+    SliceSizes,
+    SliceOffs,
+    BlockOffs,
+    BlockSched,
+    GatherIndx,
+    ScatterIndx,
+    GateScal,
+    stride_wm,
+    stride_im,
+    M,
+    MAXBLK,
+    bs_stride,
+    E: tl.constexpr,
+    TOPK: tl.constexpr,
+    GP: tl.constexpr,
+    EP: tl.constexpr,
+    MAXBLKP: tl.constexpr,
+    MAX_BLOCKS_PER_EXPERT: tl.constexpr,
+    NB_C: tl.constexpr,
+):
+    G = M * TOPK
+    g = tl.arange(0, GP)
+    gmask = g < G
+    tok = g // TOPK
+    idx = tl.load(TopkIds + tok * stride_im + g % TOPK, mask=gmask, other=-1)
+    valid = gmask & (idx >= 0) & (idx < E)
+
+    e = tl.arange(0, EP)
+    emask = e < E
+    hist = tl.histogram(tl.where(valid, idx, 0), EP, mask=valid)
+    incl = tl.cumsum(hist, 0)
+    tl.store(SliceSizes + e, hist, mask=emask)
+    tl.store(SliceOffs + e, incl - hist, mask=emask)
+    tl.store(SliceOffs + e + 1, incl, mask=emask & (e == E - 1))
+
+    jb = tl.arange(0, MAXBLKP)
+    for k in tl.static_range(NB_C):
+        # Block size 16 << k: per-expert block counts, offsets and schedule.
+        n_blk = (hist + (16 << k) - 1) >> (4 + k)
+        blk_incl = tl.cumsum(n_blk, 0)
+        blk_excl = blk_incl - n_blk
+        n_total = tl.sum(n_blk, 0)
+        tl.store(BlockOffs + k * (E + 1) + e, blk_excl, mask=emask)
+        tl.store(BlockOffs + k * (E + 1) + e + 1, blk_incl, mask=emask & (e == E - 1))
+        tl.store(
+            BlockSched + k * bs_stride + jb,
+            tl.full([MAXBLKP], -1, tl.int32),
+            mask=(jb < MAXBLK) & (jb >= n_total),
+        )
+        for j in tl.static_range(MAX_BLOCKS_PER_EXPERT >> k):
+            tl.store(
+                BlockSched + k * bs_stride + blk_excl + j,
+                (j << 16) + e,
+                mask=emask & (j < n_blk),
+            )
+
+    # Stable expert-major order: sort (expert, flat row) keys; invalid rows last.
+    key = tl.where(valid, idx, E) * 1024 + g
+    key = tl.sort(key)
+    row = key & 1023
+    pos = tl.arange(0, GP)
+    keep = (key >> 10) < E
+    tl.store(GatherIndx + pos, (row // TOPK).to(tl.int32), mask=keep)
+    tl.store(ScatterIndx + pos, row.to(tl.int32), mask=keep)
+    gate = tl.load(TopkWeights + (row // TOPK) * stride_wm + row % TOPK, mask=keep)
+    tl.store(GateScal + pos, gate.to(GateScal.dtype.element_ty), mask=keep)
+
+
+def precomputed_topk_route_medium_m_supported(
+    n_tokens: int, topk: int, num_experts: int
+) -> bool:
+    return (
+        n_tokens <= 256
+        and n_tokens * topk <= 1024
+        and 0 < topk <= num_experts <= GLUON_ROUTE_MAX_E
+    )
+
+
+def precomputed_topk_route_medium_m(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    dtype: torch.dtype,
+) -> tuple[
+    RaggedTensorMetadata,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    M, topk = topk_ids.shape
+    G = M * topk
+    device = topk_ids.device
+    slice_sizes = torch.empty(num_experts, dtype=torch.int32, device=device)
+    slice_offs = torch.empty(num_experts + 1, dtype=torch.int32, device=device)
+    block_offs_data = torch.empty(
+        _ROUTE_NB, num_experts + 1, dtype=torch.int32, device=device
+    )
+    maxblk = RaggedTensorMetadata.max_n_blocks(num_experts, G)
+    block_schedule_data = torch.empty(
+        _ROUTE_NB, maxblk, dtype=torch.int32, device=device
+    )
+    gather_indx = torch.empty(G, dtype=torch.int32, device=device)
+    scatter_indx = torch.empty(G, dtype=torch.int32, device=device)
+    gate_scal = torch.empty(G, dtype=dtype, device=device)
+    _precomputed_topk_route_medium_m[(1,)](
+        topk_weights,
+        topk_ids,
+        slice_sizes,
+        slice_offs,
+        block_offs_data,
+        block_schedule_data,
+        gather_indx,
+        scatter_indx,
+        gate_scal,
+        topk_weights.stride(0),
+        topk_ids.stride(0),
+        M,
+        maxblk,
+        block_schedule_data.stride(0),
+        E=num_experts,
+        TOPK=topk,
+        GP=_route_next_pow2(G),
+        EP=_route_next_pow2(num_experts),
+        MAXBLKP=_route_next_pow2(maxblk),
+        MAX_BLOCKS_PER_EXPERT=triton.cdiv(256, 16),
+        NB_C=_ROUTE_NB,
+        num_warps=8,
+    )
+    ragged = RaggedTensorMetadata(
+        slice_sizes, slice_offs, block_offs_data, block_schedule_data
+    )
+    return ragged, gather_indx, scatter_indx, gate_scal
 
 
 def gluon_precomputed_topk_fused_route(

@@ -79,6 +79,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
     gluon_precomputed_topk_fused_route,
     gluon_precomputed_topk_route_supported,
     gluon_route_supported,
+    precomputed_topk_route_medium_m,
+    precomputed_topk_route_medium_m_supported,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.warp_decode import (
     _gluon_mxfp4_fp8_warp_decode_moe,
@@ -1812,6 +1814,15 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             gluon_precomputed_topk_fused_route(
                 topk_weights,
                 topk_ids,
+                num_experts,
+                dtype=topk_weights.dtype,
+            )
+        )
+    elif precomputed_topk_route_medium_m_supported(n_tokens, top_k, num_experts):
+        ragged_metadata, gather_indx, scatter_indx, gate_scal = (
+            precomputed_topk_route_medium_m(
+                topk_weights,
+                topk_ids.to(torch.int32),
                 num_experts,
                 dtype=topk_weights.dtype,
             )
