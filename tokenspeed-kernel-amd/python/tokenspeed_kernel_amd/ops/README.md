@@ -169,6 +169,9 @@ rows on weights of at least 2**26 elements, use the prefill kernel above.
   unit inner stride and an explicit `[1, 32]` scale block.
 - Output is BF16 or FP16. A caller-owned output may have a padded row stride,
   but its inner stride must be one.
+- Products are exact and accumulate in FP32, meeting the FP8 GEMM tolerance
+  at any K. Scale codes 1..254 are exact; code 255 gives infinity (as
+  `exp2`) and code 0 gives 0 rather than 2^-127.
 - `M` is a runtime argument and is not specialized. The tile configuration
   comes from the smallest M bucket (16, 32, 64, 128, 256) covering `M`:
   measured per bucket for the V4.1 TP4 projection shapes, a heuristic
@@ -181,10 +184,18 @@ weight is streamed from HBM once while the small activation stays in L2.
 Small N tiles and an optional split-K fill the 256 CUs. The fully unrolled K
 loop keeps a `NUM_BUFFERS`-deep LDS ring in flight with direct-to-LDS 16-byte
 copies; their distributed layout follows the conflict-free padded LDS layout
-so each warp writes one contiguous KiB. Each K tile's scale bytes are loaded
-into registers just before its values, so the in-order wait for the values
-also covers the scales, and native `16 x 16 x 128` E4M3 scaled MFMAs consume
-them directly.
+so each warp writes one contiguous KiB. Each K tile's scales are loaded into
+registers just before its values, so the in-order wait for the values also
+covers the scales; dword-aligned scale rows load four groups per dword.
+
+gfx950 FP8 MFMAs sum their products at reduced internal precision, which
+misses the FP8 GEMM tolerance on small results of large cancelling terms.
+Instead, each 32-value scale group is read from LDS, upcast exactly to BF16
+(`v_cvt_scalef32_pk_bf16_fp8`), and fed to one `16 x 16 x 32` BF16 MFMA, so
+its products are exact and only the FP32 sum rounds. A tile issues all of
+its group MFMAs first, then multiplies each partial by the outer product of
+its power-of-two row and column scales, which is exact, and adds it to the
+FP32 accumulator.
 
 Activation rows past `M` are masked (no traffic), weight rows past `N` are
 clamped, a K tail is zero-filled, and stores are masked. Split-K uses the
