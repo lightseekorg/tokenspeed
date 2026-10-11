@@ -590,8 +590,12 @@ def test_kpool_head_fold_graph_refreshes_keys_and_bounds(
 
 
 @pytest.mark.skipif(not is_cdna5(), reason="GFX1250 column splits")
-def test_kpool_plan_column_splits_follow_tokens_without_recompiling() -> None:
+@pytest.mark.parametrize("planned", (False, True))
+def test_kpool_column_splits_follow_tokens_without_recompiling(
+    planned: bool,
+) -> None:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (
+        gluon_kpool_prefill_topk_fp8_gfx1250,
         gluon_kpool_prefill_topk_fp8_plan_gfx1250,
     )
 
@@ -601,20 +605,33 @@ def test_kpool_plan_column_splits_follow_tokens_without_recompiling() -> None:
         pages, padding_bytes=0, as_rows=False, generator=generator
     )
     q, weights = _strided_inputs(max_tokens, torch.float32, generator)
-    slots = torch.randperm(pages * _PAGE_SIZE, device=_DEVICE, generator=generator)
-    starts = torch.zeros((max_tokens,), device=_DEVICE, dtype=torch.int32)
+    # Both addressing modes read the same physical slots: the planned scorer
+    # takes them directly, the unplanned one through the page table.
+    table = torch.randperm(pages, device=_DEVICE, generator=generator).int()[None]
+    logical = torch.arange(pages * _PAGE_SIZE, device=_DEVICE)
+    slots = table[0, logical // _PAGE_SIZE].long() * _PAGE_SIZE + logical % _PAGE_SIZE
     ends = torch.randint(
         1, width + 1, (max_tokens,), device=_DEVICE, generator=generator
     ).int()
+    zeros = torch.zeros((max_tokens,), device=_DEVICE, dtype=torch.int32)
+    kernel = (
+        gluon_kpool_prefill_topk_fp8_plan_gfx1250
+        if planned
+        else gluon_kpool_prefill_topk_fp8_gfx1250
+    )
 
     def run(tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return _kpool_prefill_plan_logits(
+        if planned:
+            launcher = _kpool_prefill_plan_logits
+            metadata = (slots, zeros[:tokens], ends[:tokens])
+        else:
+            launcher = _kpool_prefill_logits
+            metadata = (ends[:tokens] * _POOL_SIZE, zeros[:tokens], table)
+        return launcher(
             q[:tokens],
             cache,
             weights[:tokens],
-            slots,
-            starts[:tokens],
-            ends[:tokens],
+            *metadata,
             pool_size=_POOL_SIZE,
             page_size=_PAGE_SIZE,
             pool_offset=0,
@@ -625,7 +642,7 @@ def test_kpool_plan_column_splits_follow_tokens_without_recompiling() -> None:
     run(1)
     # Few tokens split each window over more programs; the split span is a
     # runtime argument, so it must not add kernel specializations.
-    with assert_no_triton_compile(gluon_kpool_prefill_topk_fp8_plan_gfx1250):
+    with assert_no_triton_compile(kernel):
         for tokens in (3, 64, max_tokens):
             actual, row_ends = run(tokens)
     torch.testing.assert_close(row_ends, ends, atol=0, rtol=0)
