@@ -143,6 +143,22 @@ _PRECOMPUTED_MFMA_MIN_M = 4
 _ROUTE_OWNED_DECODE_MAX_M = 2
 
 
+# Widest batch the precomputed-top-k entry (DeepSeek V4/V4.1) sends to the
+# direct MFMA decode instead of the sorted package kernels. Both give
+# identical results. At V4.1 TP4 shapes (384 experts, H=5120, I=576, top-6)
+# with top-k ids recorded from serving, under CUDA graphs, the direct path
+# takes 70.4/97.4/135.1 us against 77.1/87.9/114.3 us for the package at
+# M=12/15/24.
+_PRECOMPUTED_DIRECT_DECODE_MAX_M = 12
+
+# Routed decode with few rows per expert: 32-row tiles instead of the
+# autotuner's 64 (which only drops to 32 from 1024 rows). Identical outputs;
+# V4.1 TP4 (E=384, top-6) M=96: 569 -> 460 us uniform routing, 347 -> 307 us
+# with rows of a request sharing experts; equal from M=256.
+_PRECOMPUTED_DECODE_BLOCK_M = 32
+_PRECOMPUTED_DECODE_BLOCK_M_MAX_ROWS = 1024
+
+
 # Widest activation the precomputed-SiTU entry point serves with the
 # warp-decode kernels; anything wider goes to package prefill.
 #
@@ -161,6 +177,15 @@ _ROUTE_OWNED_MIN_M = 1
 
 
 _DIRECT_STAGE2_BLOCK_N = 16
+# Direct decode programs are single waves that stream a few KB per K tile, so
+# memory latency, not bandwidth, bounds small batches. Stage 2 loads all K
+# tiles of a slot before its MFMAs (up to this many tiles); stage 1 keeps a
+# chunk of K tiles in flight for the smallest batches. Identical results; V4.1
+# TP4 with serving top-k ids, whole MoE under CUDA graphs: M=1 40.0 -> 22.8 us,
+# M=6 48.7 -> 39.9 us, M=12 71.2 -> 64.9 us.
+_DIRECT_STAGE2_LOAD_MAX_KT = 8
+_DIRECT_STAGE1_LOAD_CHUNK = 8
+_DIRECT_STAGE1_CHUNK_MAX_M = 3
 
 
 _SITU_INTERMEDIATE_SCALES: dict[tuple[torch.device, float], torch.Tensor] = {}
@@ -817,6 +842,7 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     swiglu_limit: float,
     swiglu_beta: float,
     out: torch.Tensor | None = None,
+    direct_max_m: int = _DIRECT_DECODE_MAX_M,
 ) -> torch.Tensor | None:
     """Direct top-k MXFP4xMXFP4 decode for tiny precomputed-routing batches.
 
@@ -827,7 +853,6 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
     the exact gdot128-shuffled runtime tensors.
     """
     n_tokens = int(hidden_states.shape[0])
-    direct_max_m = _DIRECT_DECODE_MAX_M
     if (
         precomputed_topk_weights is None
         or precomputed_topk_ids is None
@@ -926,10 +951,16 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         topk_ids,
         inter,
         top_k,
-        BLOCK_N=16 if n_tokens <= 2 else 32,
+        BLOCK_N=16 if n_tokens <= _DIRECT_STAGE1_CHUNK_MAX_M else 32,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
+        LOAD_CHUNK=(
+            _DIRECT_STAGE1_LOAD_CHUNK
+            if n_tokens <= _DIRECT_STAGE1_CHUNK_MAX_M
+            and triton.cdiv(int(q_hidden.shape[1]), 64) % _DIRECT_STAGE1_LOAD_CHUNK == 0
+            else 0
+        ),
     )
     q_inter, q_inter_scale = _quantize_mxfp4_activation(inter)
     if out is None:
@@ -946,6 +977,11 @@ def _maybe_precomputed_mxfp4_direct_mfma_decode(
         out,
         top_k,
         BLOCK_N=_DIRECT_STAGE2_BLOCK_N,
+        LOAD_SLOTS=(
+            1
+            if triton.cdiv(int(q_inter.shape[1]), 64) <= _DIRECT_STAGE2_LOAD_MAX_KT
+            else 0
+        ),
     )
     return out
 
@@ -1302,6 +1338,7 @@ def _maybe_gluon_package_mxfp4_prefill(
     out: torch.Tensor | None = None,
     force_reduce: bool | None = None,
     activation_format: str = "e2m1",
+    compact_route_programs: bool = False,
 ) -> torch.Tensor | None:
     """Dispatch into the dedicated gfx950 block-ragged prefill package.
 
@@ -1472,7 +1509,7 @@ def _maybe_gluon_package_mxfp4_prefill(
             hidden_dim,
             out_dtype,
             sort_block_m,
-            compact_route_programs=False,
+            compact_route_programs=compact_route_programs,
             expert_start=expert_start,
             out=out,
         )
@@ -1799,16 +1836,48 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         w13_bias=w13_bias,
         w2_bias=w2_bias,
         out_dtype=out_dtype,
-        max_m=_DECODE_MAX_M,
+        max_m=_PRECOMPUTED_DIRECT_DECODE_MAX_M,
         precomputed_topk_weights=topk_weights,
         precomputed_topk_ids=topk_ids,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
         out=out,
+        direct_max_m=_PRECOMPUTED_DIRECT_DECODE_MAX_M,
     )
     if direct_out is not None:
         return direct_out
+    if w13_bias is None and w2_bias is None:
+        # The sorted package kernels beat route + ragged GEMMs at every size
+        # past the direct decode; the scratch + FP32 reduce epilogue keeps the
+        # result identical to the ragged path's.
+        package_out = _maybe_gluon_package_mxfp4_prefill(
+            hidden_states,
+            hidden_states.new_empty((n_tokens, 0)),
+            w13_weight,
+            w2_weight,
+            w13_mx_scale=w13_mx_scale,
+            w2_mx_scale=w2_mx_scale,
+            top_k=int(top_k),
+            correction_bias=None,
+            n_group=0,
+            topk_group=0,
+            routed_scaling_factor=1.0,
+            normalize_topk_weights=False,
+            routing_method_type=0,
+            precomputed_topk_weights=topk_weights,
+            precomputed_topk_ids=topk_ids,
+            out_dtype=out_dtype,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
+            out=out,
+            force_reduce=True,
+            # Decode-sized batches sort in two launches instead of four.
+            compact_route_programs=n_tokens * top_k <= 1024,
+        )
+        if package_out is not None:
+            return package_out
     if n_tokens < SMALLM_MAX_M and n_tokens * top_k <= GLUON_ROUTE_MAX_G:
         ragged_metadata, gather_indx, scatter_indx, gate_scal = (
             gluon_precomputed_topk_fused_route(
@@ -1853,6 +1922,11 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         swiglu_limit=swiglu_limit,
         swiglu_beta=swiglu_beta,
         out=out,
+        block_m=(
+            _PRECOMPUTED_DECODE_BLOCK_M
+            if n_tokens * top_k < _PRECOMPUTED_DECODE_BLOCK_M_MAX_ROWS
+            else None
+        ),
     )
 
 
@@ -1875,8 +1949,10 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
     out: torch.Tensor | None = None,
+    block_m: int | None = None,
 ) -> torch.Tensor:
     n_tokens = hidden_states.shape[0]
+    tile = {} if block_m is None else {"block_m": block_m}
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit", "beta"), reduction_n=2),
@@ -1900,6 +1976,7 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
         fused_activation=act,
         out_quant_format="mxfp4",
         x_scale_ragged_padded=True,
+        **tile,
     )
     return gluon_mxfp_ragged_matmul(
         intermediate_cache,
@@ -1916,6 +1993,7 @@ def _gluon_mxfp_dynamic_mxfp4_fused_moe_from_route(
         n_expts_act=top_k,
         x_scale_ragged_padded=True,
         out=out,
+        **tile,
     )
 
 
