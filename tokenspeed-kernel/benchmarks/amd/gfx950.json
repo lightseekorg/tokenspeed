@@ -10,6 +10,7 @@
     "replay_warmup_iterations": 3,
     "measurement_blocks": 30
   },
+  "min_regression_absolute_us": 1.0,
   "case_files": [
     "gfx950/glm53_flash/kda.json",
     "gfx950/glm53_flash/dsa.json",
