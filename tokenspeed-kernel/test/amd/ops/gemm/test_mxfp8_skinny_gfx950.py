@@ -35,8 +35,6 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.gemm import mm as kernel_mm  # noqa: E402
-from tokenspeed_kernel.profiling import ShapeCapture  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import skinny  # noqa: E402
 
 
@@ -108,35 +106,6 @@ def test_skinny_mxfp8_gemm_accepts_padded_operands_and_strided_scales() -> None:
 
     assert actual is out
     _check(actual, _reference(a, b, a_scales, b_scales))
-
-
-@pytest.mark.parametrize(
-    "m,expected",
-    [
-        (1, "triton_mm_mxfp8_skinny_gfx950"),
-        (64, "triton_mm_mxfp8_skinny_gfx950"),
-        (65, "triton_mm_fp8_blockscale"),
-    ],
-)
-def test_mxfp8_public_api_selects_skinny_for_decode_rows(m: int, expected: str) -> None:
-    a, b, a_scales, b_scales = _inputs(m, 1792, 5120)
-    ShapeCapture.reset()
-    capture = ShapeCapture.get()
-    capture.enabled = True
-    try:
-        kernel_mm(
-            a,
-            b,
-            A_scales=a_scales,
-            B_scales=b_scales,
-            out_dtype=torch.bfloat16,
-            block_size=[1, 32],
-            quant="mxfp8",
-        )
-    finally:
-        capture.enabled = False
-
-    assert capture._records[-1].kernel_name == expected
 
 
 def test_skinny_mxfp8_gemm_does_not_recompile_across_batch_rows() -> None:

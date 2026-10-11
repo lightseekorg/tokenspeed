@@ -5924,9 +5924,10 @@ _CASES = [
         "triton_mm_fp8_blockscale",
         lambda: _mm_mxfp8(4),
     ),
-    # DeepSeek V4.1 MXFP8 projections on gfx950 above the 64-row skinny range:
-    # the weight-streaming decode kernel through 256 rows, the large-tile
-    # kernel beyond, and from 64 rows on for 2**26-element weights.
+    # DeepSeek V4.1 MXFP8 projections on gfx950: the weight-streaming decode
+    # kernel through 256 rows (ahead of the skinny kernel's 64-row range),
+    # the large-tile kernel beyond, and from 64 rows on for 2**26-element
+    # weights.
     *[
         _case(
             _is_cdna4,
@@ -5938,6 +5939,8 @@ _CASES = [
             id_suffix=f"mxfp8-ue8m0-m{m}-n{n}-k{k}",
         )
         for m, n, k, expected in (
+            (1, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
+            (64, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
             (65, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
             (192, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
             (256, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
