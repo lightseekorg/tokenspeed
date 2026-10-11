@@ -23,7 +23,7 @@
 ``load_weights`` consumes the generic CPU checkpoint iterator, rejects unknown,
 duplicate and missing local text tensors, and reports explicit vision/draft skips.
 Dense FP8 codes stay unchanged: 32x32 E8M0 scale rows expand losslessly to 1x32.
-On Hopper the dense projections load as BF16 weights instead -- codes widened on
+On Hopper and CDNA4 the dense projections load as BF16 weights instead -- codes widened on
 copy, scales folded in after loading, both exact -- and run the BF16 GEMM.
 Only grouped wo_a is dequantized to BF16, after selecting this TP rank's rows.
 Engram tables load local FP8/E8M0 rows in bounded chunks without table conversion.
@@ -228,10 +228,14 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         super().__init__(quant_config)
         # Hopper has no tensor-core kernel for 32-wide FP8 blocks; its FP8 GEMMs
         # rescale on CUDA cores every 32 K and trail the plain BF16 GEMM at
-        # every shape. So load the codes straight into a BF16 weight and fold
-        # the power-of-two scales in once -- both exact in BF16 -- and run the
-        # BF16 GEMM. Costs the FP8 weight size again.
-        self.load_as_bf16 = current_platform().is_hopper
+        # every shape. CDNA4's scaled FP8 MFMAs sum at reduced precision, and
+        # the exact path upcasts every weight on the vector ALUs, which also
+        # trails the BF16 GEMM at decode shapes. So load the codes straight
+        # into a BF16 weight and fold the power-of-two scales in once -- both
+        # exact in BF16 -- and run the BF16 GEMM. Costs the FP8 weight size
+        # again.
+        platform = current_platform()
+        self.load_as_bf16 = platform.is_hopper or platform.is_cdna4
 
     def create_weights(
         self,
