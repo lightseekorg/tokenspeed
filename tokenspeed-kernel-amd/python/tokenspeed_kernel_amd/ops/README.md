@@ -402,6 +402,9 @@ portable torch selector.
   to keep FP32 logits within 32 MiB (at most 256 queries at 32K rows, 64 at
   128K, and 8 at 1M). Score CTAs honor the caller's row-chunk bound up to the
   256-row tuned maximum.
+- Full selection writes finite logits only for each query's visible rows, so
+  row selection reads just that prefix of the capacity-wide row (the
+  per-query visible length, read on device).
 - Arena page strides are kept without copying the cache; a non-unit stride
   between page bytes is normalized to contiguous storage before scoring.
 - Launch metadata reports score-capacity FLOPs and estimated tensor traffic,

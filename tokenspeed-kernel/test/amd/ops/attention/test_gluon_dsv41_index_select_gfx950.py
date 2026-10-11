@@ -61,10 +61,10 @@ def _candidates(queries, width, ordered, generator):
     return blocks.to(torch.int32)
 
 
-def _select(fn, logits, candidates, topk):
+def _select(fn, logits, candidates, topk, live_widths=None):
     rows = torch.empty(logits.shape[0], topk, dtype=torch.int32, device=DEVICE)
     lens = torch.empty(logits.shape[0], dtype=torch.int32, device=DEVICE)
-    fn(logits, candidates, topk, rows, lens)
+    fn(logits, candidates, live_widths, topk, rows, lens)
     return rows, lens
 
 
@@ -95,6 +95,29 @@ def test_select_matches_torch(queries, width, topk, candidates):
     assert torch.equal(rows, ref_rows)
 
 
+def test_select_live_widths_skip_the_dead_tail_of_capacity_rows():
+    # Full selection scores a page-table-capacity row but only the visible
+    # prefix is finite; bounding the scan must not change the picks.
+    generator = torch.Generator(device=DEVICE).manual_seed(5)
+    queries, width, topk = 48, 65536, 512
+    logits = torch.full((queries, width), -torch.inf, device=DEVICE)
+    visible = torch.randint(0, 4097, (queries,), device=DEVICE, generator=generator)
+    visible[0], visible[1] = 0, 4096
+    for q in range(queries):
+        n = int(visible[q])
+        logits[q, :n] = torch.randn(n, device=DEVICE, generator=generator)
+    rows, lens = _select(
+        indexer.launch_gluon_dsv41_index_topk_select_gfx950,
+        logits,
+        None,
+        topk,
+        live_widths=visible.to(torch.int32),
+    )
+    ref_rows, ref_lens = _select(select_rows_torch, logits, None, topk)
+    assert torch.equal(lens, ref_lens)
+    assert torch.equal(rows, ref_rows)
+
+
 def test_select_boundary_ties_pick_an_equivalent_subset():
     generator = torch.Generator(device=DEVICE).manual_seed(1)
     queries, width, topk = 32, 4096, 512
@@ -119,10 +142,17 @@ def test_select_boundary_ties_pick_an_equivalent_subset():
 def test_select_batch_shapes_share_one_binary():
     generator = torch.Generator(device=DEVICE).manual_seed(2)
     select = indexer.launch_gluon_dsv41_index_topk_select_gfx950
+
+    def limits(queries, width):
+        return torch.full((queries,), width // 2, dtype=torch.int32, device=DEVICE)
+
     _select(select, _logits(3, 1000, generator), None, 512)
+    _select(select, _logits(3, 1000, generator), None, 512, limits(3, 1000))
     with assert_no_triton_compile(indexer.gluon_dsv41_index_topk_select_gfx950):
         for queries, width in ((2, 64), (32, 2048), (192, 4608), (7, 16384)):
-            _select(select, _logits(queries, width, generator), None, 512)
+            logits = _logits(queries, width, generator)
+            _select(select, logits, None, 512)
+            _select(select, logits, None, 512, limits(queries, width))
 
 
 def test_select_rejects_layouts_the_kernel_would_misaddress():
@@ -140,10 +170,12 @@ def test_select_rejects_layouts_the_kernel_would_misaddress():
         dict(candidates=candidates[:, : width // 8 - 1]),
         dict(row_out=rows[:, : topk - 1]),
         dict(row_lens=torch.empty(2 * queries, dtype=torch.int32, device=DEVICE)[::2]),
+        dict(live_widths=torch.empty(queries + 1, dtype=torch.int32, device=DEVICE)),
     ):
         args = dict(
             logits=logits,
             candidates=candidates[:, : width // 8],
+            live_widths=None,
             topk=topk,
             row_out=rows,
             row_lens=lens,

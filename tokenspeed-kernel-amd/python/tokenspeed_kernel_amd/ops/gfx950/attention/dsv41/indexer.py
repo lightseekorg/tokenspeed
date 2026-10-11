@@ -529,6 +529,7 @@ def _select_radix_pass(
 def gluon_dsv41_index_topk_select_gfx950(
     logits,  # [Q, width] fp32, -inf = unscored
     candidates,  # [Q, blocks] int32/int64 block ids, or logits when unused
+    row_limits,  # [Q] live widths, or logits when unused
     row_out,  # [Q, TOPK] int32
     row_lens,  # [Q] int32
     logits_stride,
@@ -539,6 +540,7 @@ def gluon_dsv41_index_topk_select_gfx950(
     take,  # min(topk, width)
     TOPK: gl.constexpr,  # power-of-two capacity >= topk, at least 256
     HAS_CANDIDATES: gl.constexpr,
+    HAS_LIMITS: gl.constexpr,
     RADIX_BITS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
@@ -559,6 +561,9 @@ def gluon_dsv41_index_topk_select_gfx950(
 
     q = gl.program_id(0).to(gl.int64)
     row = logits + q * logits_stride
+    if HAS_LIMITS:
+        # Columns at or past the row's live width are -inf: skip them.
+        width = gl.minimum(width, gl.maximum(gl.load(row_limits + q).to(gl.int32), 0))
     hist_smem = gl.allocate_shared_memory(gl.int32, [BINS], SL)
     ones = gl.full([BLOCK], 1, gl.int32, layout=L)
     d = gl.arange(0, BINS, layout=LBIN)
@@ -691,7 +696,7 @@ def gluon_dsv41_index_topk_select_gfx950(
 
 
 def launch_gluon_dsv41_index_topk_select_gfx950(
-    logits, candidates, topk, row_out, row_lens
+    logits, candidates, live_widths, topk, row_out, row_lens
 ):
     """Select CSA2 rows from scored logits, position-sorted.
 
@@ -700,6 +705,10 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         candidates: None, or int32/int64 [Q, blocks] block ids whose 8-row
             blocks map logits column c to logical row
             ``candidates[q, c // 8] * 8 + c % 8``.
+        live_widths: None, or int32/int64 [Q] counts of leading columns that
+            may be finite; row q's columns at or past ``live_widths[q]`` must be
+            -inf and are not read. Full selection passes the visible lengths, so
+            a page-table-capacity row costs its context, not its capacity.
         topk: Selection capacity in [1, 1024]; V4.1 uses 512.
         row_out: Int32 [Q, topk] destination. Row q receives the logical ids of
             its ``min(topk, width)`` largest finite logits in ascending order,
@@ -732,10 +741,17 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         candidates.shape[0] != queries or candidates.shape[1] * 8 < width
     ):
         raise ValueError(f"candidates must be [{queries}, >= {-(-width // 8)}]")
+    if live_widths is not None and (
+        live_widths.shape != (queries,)
+        or live_widths.stride(0) != 1
+        or live_widths.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(f"live_widths must be contiguous int32/int64 [{queries}]")
     cand = logits if candidates is None else candidates
     gluon_dsv41_index_topk_select_gfx950[(queries,)](
         logits,
         cand,
+        logits if live_widths is None else live_widths,
         row_out,
         row_lens,
         logits.stride(0),
@@ -746,6 +762,7 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         min(topk, width),
         TOPK=max(256, triton.next_power_of_2(topk)),
         HAS_CANDIDATES=candidates is not None,
+        HAS_LIMITS=live_widths is not None,
         RADIX_BITS=_SELECT_RADIX_BITS,
         NUM_WARPS=_SELECT_WARPS,
         num_warps=_SELECT_WARPS,

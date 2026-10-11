@@ -106,10 +106,12 @@ def _logical_from_scan(columns: torch.Tensor, candidate_blocks: torch.Tensor | N
     return torch.where(block >= 0, logical, torch.iinfo(torch.int64).max)
 
 
-def select_rows_torch(logits, candidates, topk, row_out, row_lens):
+def select_rows_torch(logits, candidates, live_widths, topk, row_out, row_lens):
     """Write each row's top-``topk`` finite logits as position-sorted ids.
 
     Column c maps to logical row c, or ``candidates[q, c // 8] * 8 + c % 8``.
+    ``live_widths`` (None or [Q]) bounds the columns that may be finite; the
+    rest are -inf, so this reference may scan whole rows and ignore it.
     Row q of ``row_out`` gets the ids ascending, then -1; ``row_lens`` the
     count. Equal-score boundary ties may pick any equivalent subset.
     """
@@ -241,6 +243,9 @@ def run_dsv41_csa2_index_topk(
             select_rows(
                 logits,
                 tile_candidates,
+                # Full selection scores only each query's visible rows; the
+                # rest of its page-table-capacity row stays -inf.
+                tile_visible if tile_candidates is None else None,
                 int(topk),
                 row_out[output_begin:output_end],
                 row_lens[output_begin:output_end],
@@ -312,11 +317,11 @@ def launch_gfx1250_logits(
     )
 
 
-def select_rows_gfx950(logits, candidates, topk, row_out, row_lens):
+def select_rows_gfx950(logits, candidates, live_widths, topk, row_out, row_lens):
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
         launch_gluon_dsv41_index_topk_select_gfx950,
     )
 
     launch_gluon_dsv41_index_topk_select_gfx950(
-        logits, candidates, topk, row_out, row_lens
+        logits, candidates, live_widths, topk, row_out, row_lens
     )
