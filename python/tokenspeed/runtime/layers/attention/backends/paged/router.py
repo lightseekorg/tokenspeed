@@ -199,6 +199,8 @@ class CacheGroupRouter(AttentionBackend):
         self.decode_write_locations: RouterDecodeWriteLocations | None = None
         self._extend_write_locations: dict[str, torch.Tensor] | None = None
         self._decode_request_offset = 0
+        # Groups whose pages are dealt over KVP owners (configure_runtime).
+        self._page_sharded_groups: frozenset[str] = frozenset()
 
     def _check_routable(
         self, geometry: CacheGroupGeometry, group_ids: tuple[str, ...]
@@ -269,6 +271,9 @@ class CacheGroupRouter(AttentionBackend):
         specs = {
             spec.group_id: spec for spec in self.cache_pool.arena.cache_group_specs
         }
+        self._page_sharded_groups = frozenset(
+            group_id for group_id in self.leaves if specs[group_id].shard_count > 1
+        )
         for group_id, leaf in self.leaves.items():
             leaf.configure_runtime(
                 block_granularity=self.geometry.granularity_of(group_id),
@@ -633,8 +638,10 @@ class CacheGroupRouter(AttentionBackend):
         extend rows of its kernel page table (``block_tables_cpu``, the
         runner's host mirror of ``block_tables``, expanded the way the stack
         expands the device tables), so a leaf that gathers history by page
-        owner can split the gather without a device sync; an unsharded
-        forward reads nothing from the mirror.
+        owner can split the gather without a device sync. A page-sharded
+        group's leaf gets the mirror for an extend with a prefix too, to split
+        its prefix-chunk gathers the same way; any other forward reads nothing
+        from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
@@ -680,6 +687,7 @@ class CacheGroupRouter(AttentionBackend):
                 page_table_cpu=(
                     self.stacks.host_table(gid, block_tables_cpu[gid], num_extends)
                     if sharded
+                    or (extend_with_prefix and gid in self._page_sharded_groups)
                     else None
                 ),
             )
@@ -1043,6 +1051,11 @@ class CacheGroupRouter(AttentionBackend):
 
     def forward_extend_chunked(self, *args, **kwargs):
         return self._sole_leaf("forward_extend_chunked").forward_extend_chunked(
+            *args, **kwargs
+        )
+
+    def read_prefix_history(self, *args, **kwargs):
+        return self._sole_leaf("read_prefix_history").read_prefix_history(
             *args, **kwargs
         )
 

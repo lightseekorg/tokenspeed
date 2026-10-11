@@ -319,7 +319,6 @@ class FlashMLABackend(PagedAttentionBackend):
         **kwargs,
     ):
         reject_query_shard(query_shard, "FlashMLABackend")
-        del page_table_cpu
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "FlashMLA decode metadata goes through refresh_decode_metadata; "
@@ -334,6 +333,7 @@ class FlashMLABackend(PagedAttentionBackend):
                 extend_seq_lens=extend_seq_lens[:num_extends],
                 extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
                 page_table=page_table[:num_extends],
+                page_table_cpu=page_table_cpu,
             )
         # Target mixed/idle batches carry decode rows whose metadata this
         # init must cover; the same in-place refresh serves them. A draft's
@@ -388,6 +388,8 @@ class FlashMLABackend(PagedAttentionBackend):
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         page_table: torch.Tensor,
+        *,
+        page_table_cpu: torch.Tensor | None,
     ):
         # EXTEND path — flashinfer ragged/paged prefill.
         seq_lens_cpu = seq_lens.cpu()
@@ -448,6 +450,11 @@ class FlashMLABackend(PagedAttentionBackend):
             extend_prefix_lens_cpu,
             page_table[: seq_lens.shape[0]],
             self.kernel_page_size,
+        )
+        self._prepare_prefix_history(
+            chunk_kv_indices_list,
+            page_table_cpu=page_table_cpu,
+            prefix_lens_cpu=extend_prefix_lens_cpu,
         )
         self.chunked_prefill_metadata = _ChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,

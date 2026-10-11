@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.communication import (
 
 from tokenspeed.runtime.distributed.comm_backend import (
     CommBackend,
+    CommWork,
     Group,
     get_global_backend,
 )
@@ -360,6 +361,22 @@ def all_gather_single(
     if backend is None:
         backend = get_global_backend()
     backend.all_gather_single(output, input, group)
+
+
+def all_gather_single_async(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> CommWork:
+    """Start :func:`all_gather_single` and return its work; ``wait()`` on it
+    orders the current stream after the collective. To overlap the shared
+    collectives over the same ranks, pass a backend on named process groups
+    (``CommBackend.for_named_groups``): collectives sharing a communicator
+    run in issue order."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.all_gather_single_async(output, input, group)
 
 
 def reduce_scatter(

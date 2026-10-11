@@ -21,7 +21,7 @@
 """Abstract base class for communication backends."""
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
@@ -35,12 +35,34 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
+class CommWork(Protocol):
+    """A collective started by an ``*_async`` op (``torch.distributed.Work``
+    is one)."""
+
+    def wait(self) -> object:
+        """Order the current stream after the collective; the host does not
+        block on a device collective."""
+
+
 class CommBackend(ABC):
     """Interface that all communication backends must implement.
 
     All group parameters are tuples of global ranks, e.g. (0, 1, 2, 3).
     Process groups are looked up from pg_manager, not created here.
     """
+
+    def for_named_groups(self, name: str) -> "CommBackend":
+        """A backend running its collectives on the process groups named
+        ``name`` (``ProcessGroupManager.init_process_group``) instead of the
+        shared ones.
+
+        A named group has communicators of its own, so these collectives never
+        queue behind the shared ones: a caller overlaps transfers with the
+        shared collectives by starting them with an ``*_async`` op here.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not run on named process groups"
+        )
 
     # ---- Collective ops ----
 
@@ -196,6 +218,22 @@ class CommBackend(ABC):
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None: ...
+
+    def all_gather_single_async(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> CommWork:
+        """Start ``all_gather_single`` without ordering the current stream
+        after it.
+
+        The collective reads ``input`` after the work queued on the current
+        stream so far. ``wait()`` on the returned work orders the stream it is
+        called on after the collective; ``output`` holds the gathered rows
+        from there on. The backend keeps both tensors' memory from reuse until
+        the collective completes.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} has no asynchronous all-gather"
+        )
 
     @abstractmethod
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor: ...

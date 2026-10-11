@@ -124,6 +124,8 @@ def test_one_process_world_backs_every_logical_group(emulated_manager):
     group = emulated_manager.get_process_group("gloo", TP8)
     assert group.size() == 1
     assert emulated_manager.get_process_group("gloo", (0, 2, 4, 6)) is group
+    emulated_manager.init_process_group(TP8, name="copy")
+    assert emulated_manager.get_process_group("gloo", TP8, name="copy") is group
 
     tensor = torch.ones(4)
     dist.all_reduce(tensor, group=group)

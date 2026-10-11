@@ -39,7 +39,9 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     _local_visible_lengths,
+    _split_slots_by_owner,
     kvp_local_visible_lengths,
+    split_slots_by_owner,
 )
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
@@ -80,6 +82,64 @@ def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         run(3, 63, 4, 0)
         run(2, 129, 3, 13)
         run(5, 1024, 4, 16)
+
+
+@pytest.mark.parametrize("degree", [1, 3, 4, 16])
+def test_split_slots_by_owner_matches_the_per_row_layout(
+    device: str, degree: int
+) -> None:
+    rows_per_block = 128
+
+    def run(rows, rank):
+        # Distinct shuffled blocks, every row owned: blocks 1.. of a virtual space.
+        blocks = torch.randperm(4 * rows // rows_per_block + 64)[: rows // 7 + 1] + 1
+        offsets = torch.randint(0, rows_per_block, (rows,))
+        slots = (
+            blocks[torch.randint(0, blocks.numel(), (rows,))] * rows_per_block + offsets
+        ).to(torch.int32)
+        owner = (slots.to(torch.int64) // rows_per_block - 1) % degree
+        counts = torch.bincount(owner, minlength=degree)
+        send_rows = int(counts.max()) + 5
+        # The per-row reference: each owner's rows in order.
+        expected_index = torch.empty(rows, dtype=torch.int64)
+        seen = [0] * degree
+        for i, o in enumerate(owner.tolist()):
+            expected_index[i] = o * send_rows + seen[o]
+            seen[o] += 1
+        mine = owner == rank
+        previous = slots.to(torch.int64) // rows_per_block - 1
+        expected_fetch = (
+            (previous // degree + 1) * rows_per_block + slots % rows_per_block
+        )[mine]
+        gathered = torch.full((rows,), -1, dtype=torch.int32, device=device)
+        fetch = torch.full((send_rows,), -7, dtype=torch.int32, device=device)
+        split_slots_by_owner(
+            slots.to(device),
+            block_granularity=rows_per_block,
+            degree=degree,
+            rank=rank,
+            send_rows=send_rows,
+            gathered_index=gathered,
+            fetch=fetch,
+        )
+        torch.testing.assert_close(
+            gathered.cpu().long(), expected_index, rtol=0, atol=0
+        )
+        own = int(counts[rank])
+        torch.testing.assert_close(
+            fetch.cpu()[:own].long(), expected_fetch, rtol=0, atol=0
+        )
+        assert (fetch.cpu()[own:] == -7).all()
+
+    # Several 1024-row blocks and a partial one carry each owner's count.
+    for rank in {0, degree // 2, degree - 1}:
+        run(3000, rank)
+    # A rank is fixed per process; row counts and send widths follow the
+    # history, and one binary serves them all.
+    with assert_no_triton_compile(_split_slots_by_owner):
+        run(5, degree - 1)
+        run(1024, degree - 1)
+        run(4099, degree - 1)
 
 
 @pytest.mark.parametrize("extra_ranges", [0, 60])

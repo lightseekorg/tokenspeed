@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import (
     CommBackend,
+    CommWork,
     Group,
 )
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
@@ -122,6 +123,11 @@ class AutoBackend(CommBackend):
 
     def configure(self, use_pynccl: bool = False) -> None:
         self._nccl.configure(use_pynccl=use_pynccl)
+
+    def for_named_groups(self, name: str) -> CommBackend:
+        # NCCL alone: the low-latency backends hold per-group state prepared
+        # for the shared groups.
+        return self._nccl.for_named_groups(name)
 
     @staticmethod
     def _force_deterministic_rsag() -> bool:
@@ -513,6 +519,11 @@ class AutoBackend(CommBackend):
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
         return self._nccl.all_gather_single(output, input, group)
+
+    def all_gather_single_async(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> CommWork:
+        return self._nccl.all_gather_single_async(output, input, group)
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         if self.route(Collective.REDUCE_SCATTER, tensor, group) is Route.ORDERED_FOLD:

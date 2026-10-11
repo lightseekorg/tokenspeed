@@ -1534,6 +1534,7 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
         router.init_cuda_graph_state(2)
         for leaf in router.leaves.values():
             leaf._decode_views_by_bs[1] = object()
+            leaf._prefix_history = object()
 
         router.set_cache_pool(_pool(*specs))
 
@@ -1541,6 +1542,7 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
             self.assertIsNone(leaf.page_table_buf)
             self.assertIsNone(leaf.seq_lens_buf)
             self.assertEqual(leaf._decode_views_by_bs, {})
+            self.assertIsNone(leaf._prefix_history)
 
 
 class PagedLeafRebindTest(unittest.TestCase):

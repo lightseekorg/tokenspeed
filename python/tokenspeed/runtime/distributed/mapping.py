@@ -23,6 +23,12 @@ from functools import cached_property
 
 Group = tuple[int, ...]
 
+# The named copy of the attention KVP group that page-sharded MLA prefill
+# all-gathers its cached history on (``ProcessGroupManager.init_process_group``):
+# its own communicators let the transfers overlap the attention TP collectives
+# over the same ranks instead of queueing with them.
+KVP_HISTORY_GROUP_NAME = "kvp_history"
+
 
 def _resolve_parallelism_sizes(world_size: int, *sizes: int | None) -> tuple[int, ...]:
     """Resolve the parallelism sizes given world_size.
