@@ -433,15 +433,15 @@
       }
     },
     {
-      "id": "dsv41_flash.attention.dsv41_index_topk/extend-full-candidates-csa1-p57344-t8192-bfloat16",
+      "id": "dsv41_flash.attention.dsv41_index_topk/extend-full-candidates-csa1-c65536-t128-bfloat16",
       "comparison_epoch": 1,
-      "measurement_blocks": 10,
+      "measurement_blocks": 20,
       "definition": {
         "family": "attention",
         "mode": "dsv41_index_topk",
         "parameters": {
           "batch": 1,
-          "q_len_per_req": 8192,
+          "q_len_per_req": 128,
           "context_length": 65536,
           "compress_ratio": 1,
           "selection": "full_candidates",
@@ -454,7 +454,32 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 50.0
+        "max_regression_absolute_us": 20.0
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/extend-full-candidates-csa1-c65536-t1-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 20,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 1,
+          "context_length": 65536,
+          "compress_ratio": 1,
+          "selection": "full_candidates",
+          "table_pages": 1024,
+          "query_chunk_size": 1024
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5213
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0
       }
     }
   ]
