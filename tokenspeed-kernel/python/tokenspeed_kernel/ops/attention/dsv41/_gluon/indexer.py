@@ -47,10 +47,16 @@ def _score_query_tile(queries: int, width: int) -> int:
 
 
 def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
+    """Pack queries to MXFP4 rows; values/scales are strided views of the rows.
+
+    Weights keep their dtype; the scorer widens them to FP32 on load.
+    """
     tokens, heads, _ = q.shape
-    packed = cache_pack(q.contiguous().reshape(tokens * heads, 128), "index", None)
-    values = packed[:, :64].reshape(tokens, heads, 64)
-    scales = packed[:, 64:68].contiguous().view(torch.int32).reshape(tokens, heads)
+    packed = cache_pack(
+        q.contiguous().reshape(tokens * heads, 128), "index", None
+    ).view(tokens, heads, 68)
+    values = packed[..., :64]
+    scales = packed[..., 64:68]
     pad = _MFMA_HEADS - heads
     if pad < 0:
         raise ValueError(
@@ -58,11 +64,9 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
         )
     if pad:
         values = torch.nn.functional.pad(values, (0, 0, 0, pad))
-        scales = torch.nn.functional.pad(scales, (0, pad))
+        scales = torch.nn.functional.pad(scales, (0, 0, 0, pad))
         weights = torch.nn.functional.pad(weights.float(), (0, pad))
-    else:
-        weights = weights.float()
-    return values.contiguous(), scales.contiguous(), weights.contiguous()
+    return values, scales, weights
 
 
 def _pad_query(q: torch.Tensor, weights: torch.Tensor):
@@ -122,8 +126,13 @@ def run_dsv41_csa2_index_topk(
     out,
     launch_logits,
     launch_select=None,
+    logits_written=False,
 ):
-    """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch."""
+    """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch.
+
+    ``logits_written``: ``launch_logits`` writes every logits element (scores or
+    -inf), so the logits scratch needs no -inf fill.
+    """
     out = _index_topk_outputs(
         index_q,
         weights,
@@ -152,11 +161,14 @@ def run_dsv41_csa2_index_topk(
 
     tokens = index_q.shape[0]
     row_out, row_lens, block_out, block_lens = out
-    row_out.fill_(-1)
-    row_lens.zero_()
-    block_out.fill_(-1)
-    block_lens.zero_()
-    if not tokens or not page_table.shape[1] or need < 1:
+    empty = not tokens or not page_table.shape[1] or need < 1
+    if launch_select is None or empty:
+        # A select kernel writes its rows' padding; other paths start filled.
+        row_out.fill_(-1)
+        row_lens.zero_()
+        block_out.fill_(-1)
+        block_lens.zero_()
+    if empty:
         return out
 
     # Arena pages have gaps between them but contiguous bytes within each page.
@@ -174,13 +186,14 @@ def run_dsv41_csa2_index_topk(
         q, w, _shards = _index_gather_heads(
             index_q[start:end], weights[start:end], process_group
         )
-        table = page_table[start:end].contiguous()
+        # Scorers take row strides; only a non-unit inner stride needs a copy.
+        table = page_table[start:end]
+        if table.stride(-1) != 1:
+            table = table.contiguous()
         visible = visible_lens[start:end].clamp(0, int(table.shape[1]) * _PAGE_SIZE)
-        candidates = (
-            None
-            if candidate_blocks is None
-            else candidate_blocks[start:end].contiguous()
-        )
+        candidates = None if candidate_blocks is None else candidate_blocks[start:end]
+        if candidates is not None and candidates.stride(-1) != 1:
+            candidates = candidates.contiguous()
         queries = end - start
         width = need
         score_query_tile = _score_query_tile(queries, width)
@@ -193,11 +206,15 @@ def run_dsv41_csa2_index_topk(
             )
             tile_visible = visible[query_begin:query_end]
             tile_queries = query_end - query_begin
-            logits = torch.full(
-                (tile_queries, width),
-                -float("inf"),
-                dtype=torch.float32,
-                device=q.device,
+            logits = (
+                torch.empty((tile_queries, width), dtype=torch.float32, device=q.device)
+                if logits_written
+                else torch.full(
+                    (tile_queries, width),
+                    -float("inf"),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
             )
             launch_logits(
                 q[query_begin:query_end],

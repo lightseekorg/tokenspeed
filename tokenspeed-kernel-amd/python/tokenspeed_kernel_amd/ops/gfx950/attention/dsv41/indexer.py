@@ -244,6 +244,7 @@ def gluon_dsv41_index_topk_gfx950(
     BLOCK_N: gl.constexpr,
     CHUNK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    LISTED: gl.constexpr,
 ):
     token = gl.program_id(0)
     split = gl.program_id(1)
@@ -258,10 +259,35 @@ def gluon_dsv41_index_topk_gfx950(
     candidate_start = split * SCORE_CHUNK
     candidate_end = gl.minimum(width, candidate_start + SCORE_CHUNK)
     candidate_end = gl.minimum(candidate_end, max_candidates)
+    if CANDIDATES >= 0:
+        # Padded candidate lists are mostly -1 at short contexts: a split
+        # with no listed block scores nothing.
+        list_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+        slots = candidate_start // 8 + gl.arange(0, LISTED, layout=list_layout)
+        listed = gl.load(
+            candidates + token * cand_stride + slots,
+            mask=slots < candidate_end // 8,
+            other=-1,
+        )
+        if gl.max(listed, axis=0) < 0:
+            candidate_end = candidate_start
+    # Every logits element of this split's chunk is written: scores where
+    # live, -inf elsewhere, so callers need not pre-fill the logits.
+    chunk_end = gl.minimum(candidate_start + SCORE_CHUNK, max_candidates)
+    layouts: gl.constexpr = _indexer_mfma_layouts(NUM_WARPS)
+    output_layout: gl.constexpr = gl.SliceLayout(0, layouts[0])
+    output_columns = gl.arange(0, BLOCK_N, layout=output_layout)
     if candidate_start >= candidate_end:
+        empty = gl.full([BLOCK_N], -float("inf"), gl.float32, layout=output_layout)
+        for tile_offset in range(0, CHUNK_N, BLOCK_N):
+            positions = candidate_start + tile_offset + output_columns
+            gl.store(
+                logits + token * logits_stride + positions,
+                empty,
+                mask=positions < chunk_end,
+            )
         return
 
-    layouts: gl.constexpr = _indexer_mfma_layouts(NUM_WARPS)
     mfma_layout: gl.constexpr = layouts[0]
     dot_a_layout: gl.constexpr = layouts[1]
     dot_b_layout: gl.constexpr = layouts[2]
@@ -299,8 +325,6 @@ def gluon_dsv41_index_topk_gfx950(
         dot_a_layout,
         a_scale_layout,
     )
-    output_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
-    output_columns = gl.arange(0, BLOCK_N, layout=output_layout)
     for tile_offset in range(0, CHUNK_N, BLOCK_N):
         tile_start = candidate_start + tile_offset
         scores = _score_csa2_group(
@@ -365,8 +389,8 @@ def gluon_dsv41_index_topk_gfx950(
         )
         gl.store(
             logits + token * logits_stride + positions,
-            scores,
-            mask=(positions < max_candidates) & live,
+            gl.where(live, scores, -float("inf")),
+            mask=positions < chunk_end,
         )
 
 
@@ -384,14 +408,15 @@ def dsv41_index_logits_gfx950(
     """Score prepared 32-head MXFP4 queries into caller-owned CSA2 logits.
 
     Args:
-        values: Packed E2M1 query values shaped [T, 32, 64].
-        scales: E8M0 query scales as int32 words shaped [T, 32].
+        values: Packed E2M1 query values shaped [T, 32, 64], unit inner stride.
+        scales: E8M0 query scale bytes shaped [T, 32, 4], unit inner stride.
         w: FP32 head weights shaped [T, 32].
         cache_2d: Page-planar MXFP4 bytes shaped [pages, 64 * 68].
         table: Physical page IDs shaped [T, logical_pages].
         visible: Visible logical row counts shaped [T].
         candidates: Optional candidate block IDs shaped [T, blocks].
-        logits: FP32 destination shaped [T, scored_rows], initialized to -inf.
+        logits: FP32 destination shaped [T, scored_rows]; every element is
+            written (scores, or -inf for unscored rows).
         score_chunk_size: Positive multiple-of-eight upper bound on rows per CTA.
 
     Returns:
@@ -404,10 +429,9 @@ def dsv41_index_logits_gfx950(
     chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
     queries, width = logits.shape
     cand = table if candidates is None else candidates
-    scale_dim = 4
     gluon_dsv41_index_topk_gfx950[(queries, triton.cdiv(width, score_chunk_size))](
         values,
-        scales.view(torch.uint8).reshape(queries, _MFMA_HEADS, scale_dim),
+        scales,
         w,
         cache_2d,
         visible,
@@ -416,8 +440,8 @@ def dsv41_index_logits_gfx950(
         logits,
         values.stride(0),
         values.stride(1),
-        scale_dim * _MFMA_HEADS,
-        scale_dim,
+        scales.stride(0),
+        scales.stride(1),
         w.stride(0),
         w.stride(1),
         table.stride(0),
@@ -434,6 +458,7 @@ def dsv41_index_logits_gfx950(
         BLOCK_N=32,
         CHUNK_N=chunk_n,
         NUM_WARPS=2,
+        LISTED=triton.next_power_of_2(score_chunk_size // 8),
         num_warps=2,
         waves_per_eu=2,
     )
