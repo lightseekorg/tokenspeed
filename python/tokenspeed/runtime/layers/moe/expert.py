@@ -217,8 +217,13 @@ class MoELayer(torch.nn.Module):
         internal_activation_dtype = "input"
         if self._quant_kind == "fp8":
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
+            # The loader slices each rank's block scales at ceil(ispp / block)
+            # rows, which follow its weight rows only for a block-aligned
+            # ispp, whatever kernel then runs the layer: pad for every backend.
             self._apply_trtllm_ispp_padding(
-                fp8_scale_block_shape[0], "FP8 block scales tile it"
+                fp8_scale_block_shape[0],
+                "FP8 block scales tile it",
+                every_backend=True,
             )
         if self._quant_kind == "unquant":
             # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
@@ -423,7 +428,9 @@ class MoELayer(torch.nn.Module):
             return "standard"
         return "generalized"
 
-    def _apply_trtllm_ispp_padding(self, alignment: int, reason: str) -> None:
+    def _apply_trtllm_ispp_padding(
+        self, alignment: int, reason: str, *, every_backend: bool = False
+    ) -> None:
         """Round the intermediate size up when the trtllm backend needs it.
 
         Args:
@@ -431,11 +438,13 @@ class MoELayer(torch.nn.Module):
                 (the FP8 scale block size, or the kernel's declared
                 ``ispp_alignment``).
             reason: Log fragment describing why the padding is required.
+            every_backend: Pad whatever ``--moe-backend`` is, for a layout
+                that every kernel needs aligned (FP8 block scales).
         """
         backend = get_moe_backend().value
         # Only the trtllm kernels run non-gated experts, so ``auto`` selects them.
         trtllm_only = backend == "auto" and not self._spec.gated
-        if backend != "flashinfer_trtllm" and not trtllm_only:
+        if not every_backend and backend != "flashinfer_trtllm" and not trtllm_only:
             return
         ispp = self.intermediate_size // self.tp_size
         if ispp % alignment == 0:
