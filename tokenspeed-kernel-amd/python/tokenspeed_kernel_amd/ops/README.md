@@ -229,6 +229,11 @@ path uses it and the scores are deterministic. The KPool `ordered_head_fold`
 argument therefore selects nothing on gfx1250; it remains for the stage
 interface shared with gfx950.
 
+Prefill and KPool launches split each row's columns over a second grid
+dimension so that short batches still give every compute unit about four
+programs; large batches keep one program per row. The split span is a runtime
+argument, so batch-size changes do not recompile the scorer.
+
 Standard-cache DSA prefill loads eight adjacent FP8 key bytes per lane and
 KPool loads sixteen. Both convert the keys to the WMMA operand layout before
 arithmetic. Standard decode keeps loading in the operand layout, since the

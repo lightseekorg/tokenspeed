@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from utils import is_cdna4, is_cdna5
+from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
     pytest.skip(
@@ -648,8 +648,11 @@ def _standard_prefill_logits_gfx1250(
     )
 
     scale_arg = scales if scales is not None else weights
+    rows, columns = logits.shape
+    block_n = sparse_mla._STANDARD_PREFILL_BLOCK_N
+    split_cols = sparse_mla._score_split_cols(rows, columns, block_n, query.device)
     num_warps = sparse_mla._STANDARD_PREFILL_NUM_WARPS
-    gluon_dsa_prefill_topk_standard_gfx1250[(query.shape[0], 1)](
+    gluon_dsa_prefill_topk_standard_gfx1250[(rows, -(-columns // split_cols))](
         query,
         scale_arg,
         cache.view(torch.float8_e4m3fn),
@@ -665,12 +668,13 @@ def _standard_prefill_logits_gfx1250(
         *weights.stride(),
         logits.stride(0),
         softmax_scale,
-        logits.shape[1],
+        columns,
+        split_cols,
         PAGE_SIZE=_PAGE_SIZE,
         PAGE_STRIDE_BYTES=_PAGE_SIZE * cache.stride(0),
         NUM_HEADS=query.shape[1],
         HEAD_DIM=_HEAD_DIM,
-        BLOCK_N=sparse_mla._STANDARD_PREFILL_BLOCK_N,
+        BLOCK_N=block_n,
         NUM_WARPS=num_warps,
         Q_IS_FP8=scales is not None,
         USE_BUFFER_LOAD=use_buffer,
@@ -796,3 +800,52 @@ def test_standard_prefill_logits_graph_refresh_and_memory_paths(
             )
             assert observed[row, :start].isnan().all()
             assert observed[row, end:].isnan().all()
+
+
+@pytest.mark.skipif(not is_cdna5(), reason="GFX1250 column splits")
+def test_standard_prefill_column_splits_follow_rows_without_recompiling() -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (
+        gluon_dsa_prefill_topk_standard_gfx1250,
+    )
+
+    generator = _generator(1301)
+    width, max_rows = 8192, 1024
+    keys = torch.randn((width, _HEAD_DIM), device=_DEVICE, generator=generator) * 0.15
+    cache, key_reference, _, _ = _pack_standard_cache(keys)
+    query, _, query_reference = _prepared_query(max_rows, 64, torch.bfloat16, generator)
+    weights = _noncompact_weights(max_rows, 64, torch.float32, generator)
+    slots = torch.randperm(width, device=_DEVICE, generator=generator)
+    starts = torch.randint(
+        0, width // 2, (max_rows,), device=_DEVICE, generator=generator
+    ).int()
+    ends = starts + width // 2
+
+    def run(rows: int) -> torch.Tensor:
+        return _prefill_topk(
+            query[:rows],
+            weights[:rows],
+            slots,
+            starts[:rows],
+            ends[:rows],
+            topk=_TOPK,
+            softmax_scale=_SOFTMAX_SCALE,
+            index_k_cache=cache,
+            page_size=_PAGE_SIZE,
+        )
+
+    run(1)
+    # Short batches split each row over more programs; the split span is a
+    # runtime argument, so it must not add kernel specializations.
+    with assert_no_triton_compile(gluon_dsa_prefill_topk_standard_gfx1250):
+        for rows in (3, 64, max_rows):
+            actual, lens = run(rows)
+    checked = slice(max_rows - 2, max_rows)
+    expected, expected_lens = _expected_prefill(
+        query_reference[checked],
+        weights[checked],
+        key_reference,
+        slots,
+        starts[checked],
+        ends[checked],
+    )
+    _assert_topk(actual[checked], lens[checked], expected, expected_lens)

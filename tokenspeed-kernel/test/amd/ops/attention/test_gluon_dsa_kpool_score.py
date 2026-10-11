@@ -26,7 +26,7 @@ from functools import partial
 
 import pytest
 import torch
-from utils import is_cdna4, is_cdna5
+from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
     pytest.skip(
@@ -587,3 +587,52 @@ def test_kpool_head_fold_graph_refreshes_keys_and_bounds(
                 observed[row, :end], expected[row], atol=0.02, rtol=0.02
             )
             assert observed[row, end:].isnan().all()
+
+
+@pytest.mark.skipif(not is_cdna5(), reason="GFX1250 column splits")
+def test_kpool_plan_column_splits_follow_tokens_without_recompiling() -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (
+        gluon_kpool_prefill_topk_fp8_plan_gfx1250,
+    )
+
+    generator = _generator(1409)
+    pages, width, max_tokens = 32, 512, 2048
+    cache, keys = _packed_cache(
+        pages, padding_bytes=0, as_rows=False, generator=generator
+    )
+    q, weights = _strided_inputs(max_tokens, torch.float32, generator)
+    slots = torch.randperm(pages * _PAGE_SIZE, device=_DEVICE, generator=generator)
+    starts = torch.zeros((max_tokens,), device=_DEVICE, dtype=torch.int32)
+    ends = torch.randint(
+        1, width + 1, (max_tokens,), device=_DEVICE, generator=generator
+    ).int()
+
+    def run(tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return _kpool_prefill_plan_logits(
+            q[:tokens],
+            cache,
+            weights[:tokens],
+            slots,
+            starts[:tokens],
+            ends[:tokens],
+            pool_size=_POOL_SIZE,
+            page_size=_PAGE_SIZE,
+            pool_offset=0,
+            window_cols=width,
+            softmax_scale=_SOFTMAX_SCALE,
+        )
+
+    run(1)
+    # Few tokens split each window over more programs; the split span is a
+    # runtime argument, so it must not add kernel specializations.
+    with assert_no_triton_compile(gluon_kpool_prefill_topk_fp8_plan_gfx1250):
+        for tokens in (3, 64, max_tokens):
+            actual, row_ends = run(tokens)
+    torch.testing.assert_close(row_ends, ends, atol=0, rtol=0)
+    for row in (0, max_tokens - 1):
+        end = int(ends[row])
+        selected_keys = keys.reshape(-1, _HEAD_DIM)[slots[:end]]
+        head_scores = q[row].float() @ selected_keys.T
+        expected = (head_scores.relu() * weights[row, :, None]).sum(dim=0)
+        expected = expected * _SOFTMAX_SCALE
+        torch.testing.assert_close(actual[row, :end], expected, atol=0.02, rtol=0.02)

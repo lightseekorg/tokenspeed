@@ -313,6 +313,7 @@ def _standard_cache_logits_body(
     max_candidates,
     q_len_per_req,
     pool_offset,
+    split_cols,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
@@ -329,27 +330,31 @@ def _standard_cache_logits_body(
 ):
     row_id = gl.program_id(0)
     split_id = gl.program_id(1)
+    # Prefill and KPool programs score the split_id-th split_cols-wide slice of
+    # their row's columns; decode programs score one CHUNK_N slice. KPool rows
+    # cover a CHUNK_N-wide window starting at output_base.
+    split_start = split_id * split_cols
     if IS_KPOOL:
         if IS_PREFILL:
             request_id = 0
             workspace_start = gl.maximum(gl.load(row_starts + row_id), 0)
             workspace_end = gl.minimum(gl.load(row_ends + row_id), max_candidates)
             output_base = workspace_start + pool_offset
-            candidate_start = gl.minimum(output_base, workspace_end)
-            candidate_end = gl.minimum(output_base + CHUNK_N, workspace_end)
+            window_end = gl.minimum(output_base + CHUNK_N, workspace_end)
         else:
             request_id = gl.load(req_ids + row_id).to(gl.int32)
             num_pools = (
                 gl.maximum(gl.load(seq_lens + row_id).to(gl.int32), 0) // POOL_SIZE
             )
             output_base = pool_offset
-            candidate_start = pool_offset
-            candidate_end = gl.minimum(num_pools, pool_offset + CHUNK_N)
-            candidate_end = gl.minimum(candidate_end, max_candidates)
+            window_end = gl.minimum(num_pools, pool_offset + CHUNK_N)
+            window_end = gl.minimum(window_end, max_candidates)
+        candidate_start = gl.minimum(output_base + split_start, window_end)
+        candidate_end = gl.minimum(candidate_start + split_cols, window_end)
     elif IS_PREFILL:
         request_id = row_id
         output_base = 0
-        candidate_start = gl.maximum(gl.load(row_starts + row_id), 0)
+        candidate_start = gl.maximum(gl.load(row_starts + row_id), split_start)
         candidate_end = gl.minimum(gl.load(row_ends + row_id), max_candidates)
     else:
         request_id = row_id // q_len_per_req
@@ -362,6 +367,11 @@ def _standard_cache_logits_body(
         candidate_end = gl.minimum(candidate_end, candidate_start + CHUNK_N)
         candidate_end = gl.minimum(candidate_end, max_candidates)
     candidate_start = gl.minimum(candidate_start, candidate_end)
+    if IS_PREFILL and not IS_KPOOL:
+        # Clamping the split end after the common bounds keeps LLVM's faster
+        # schedule for unsplit rows.
+        candidate_end = gl.minimum(candidate_end, split_start + split_cols)
+        candidate_end = gl.maximum(candidate_end, candidate_start)
 
     wmma_layout: gl.constexpr = _make_wmma_layout(NUM_WARPS, Q_IS_FP8)
     k_width: gl.constexpr = 16 if Q_IS_FP8 else 8
@@ -508,6 +518,7 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
     logits_stride,
     model_scale,
     workspace_rows,
+    split_cols,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     NUM_HEADS: gl.constexpr,
@@ -544,6 +555,7 @@ def gluon_dsa_prefill_topk_standard_gfx1250(
         workspace_rows,
         1,
         0,
+        split_cols,
         PAGE_SIZE,
         PAGE_STRIDE_BYTES,
         1,
@@ -584,6 +596,7 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
     model_scale,
     max_candidates,
     pool_offset,
+    split_cols,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
@@ -600,7 +613,7 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
     window_end = gl.minimum(num_pools, pool_offset + WINDOW_COLS)
     window_end = gl.minimum(window_end, max_candidates)
     local_end = gl.maximum(window_end - pool_offset, 0)
-    gl.store(row_ends + row_id, local_end)
+    gl.store(row_ends + row_id, local_end, mask=gl.program_id(1) == 0)
 
     _standard_cache_logits_body(
         q,
@@ -628,6 +641,7 @@ def gluon_kpool_prefill_topk_fp8_gfx1250(
         max_candidates,
         1,
         pool_offset,
+        split_cols,
         PAGE_SIZE,
         PAGE_STRIDE_BYTES,
         POOL_SIZE,
@@ -667,6 +681,7 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
     model_scale,
     workspace_rows,
     pool_offset,
+    split_cols,
     PAGE_SIZE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     POOL_SIZE: gl.constexpr,
@@ -683,7 +698,7 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
     workspace_end = gl.minimum(gl.load(row_ends + row_id), workspace_rows)
     row_pools = gl.maximum(workspace_end - workspace_start, 0)
     local_end = gl.minimum(gl.maximum(row_pools - pool_offset, 0), WINDOW_COLS)
-    gl.store(local_row_ends + row_id, local_end)
+    gl.store(local_row_ends + row_id, local_end, mask=gl.program_id(1) == 0)
 
     _standard_cache_logits_body(
         q,
@@ -711,6 +726,7 @@ def gluon_kpool_prefill_topk_fp8_plan_gfx1250(
         workspace_rows,
         1,
         pool_offset,
+        split_cols,
         PAGE_SIZE,
         PAGE_STRIDE_BYTES,
         POOL_SIZE,
@@ -786,6 +802,7 @@ def gluon_dsa_decode_topk_standard_gfx1250(
         max_candidates,
         q_len_per_req,
         0,
+        CHUNK_N,
         PAGE_SIZE,
         PAGE_STRIDE_BYTES,
         1,
