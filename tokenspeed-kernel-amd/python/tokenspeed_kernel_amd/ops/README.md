@@ -180,12 +180,17 @@ rows on weights of at least 2**26 elements, use the prefill kernel above.
 
 Each program owns a `BLOCK_M x BLOCK_N` output tile and one K slice, so the
 weight is streamed from HBM once while the small activation stays in L2.
-Small N tiles and an optional split-K fill the 256 CUs. The fully unrolled K
-loop keeps a `NUM_BUFFERS`-deep LDS ring in flight with direct-to-LDS 16-byte
-copies; their distributed layout follows the conflict-free padded LDS layout
-so each warp writes one contiguous KiB. Each K tile's scales are loaded into
+Small N tiles and an optional split-K fill the 256 CUs. The K loop keeps a
+`NUM_BUFFERS`-deep LDS ring in flight with direct-to-LDS 16-byte copies. Only
+the ring's fill and drain are unrolled; the steady state is a runtime loop,
+so code size and compile time do not grow with `K`. Each stage advances the
+scalar base pointers, leaving the per-lane copy offsets loop invariant. The
+copies' distributed layout follows the conflict-free padded LDS layout so
+each warp writes one contiguous KiB. Each K tile's scales are loaded into
 registers just before its values, so the in-order wait for the values also
 covers the scales; dword-aligned scale rows load four groups per dword.
+With a K tail, groups past `K` re-read the last real group's scale against
+zero-filled values instead of masking the scale loads.
 
 The math runs in BF16, one 32-value scale group per `16 x 16 x 32` BF16
 MFMA. Each group's E4M3 values are read from LDS in the BF16 operand layout

@@ -164,6 +164,7 @@ def _issue_stage(
     b_k_offs,
     a_row_mask,
     k0,
+    k_begin,
     K: gl.constexpr,
     K_TAIL: gl.constexpr,
     GROUPS_PER_TILE: gl.constexpr,
@@ -176,54 +177,83 @@ def _issue_stage(
     first: loads retire in issue order, so the wait for this tile's values
     also covers its scales.
     """
+    # Advance the scalar base pointers rather than the per-lane offsets, so a
+    # runtime K loop adds nothing per lane and keeps no extra offset vectors.
     kg = k0 // SCALE_GROUP
     a_s = ()
     b_s = ()
     if PACKED:
         # Four consecutive groups are one dword of a scale row.
         for w in gl.static_range(GROUPS_PER_TILE // 4):
-            a_s = a_s + (cdna4.buffer_load(a_scales_ptr, as_offsets + kg // 4 + w),)
-            b_s = b_s + (cdna4.buffer_load(b_scales_ptr, bs_offsets + kg // 4 + w),)
+            a_s = a_s + (cdna4.buffer_load(a_scales_ptr + kg // 4 + w, as_offsets),)
+            b_s = b_s + (cdna4.buffer_load(b_scales_ptr + kg // 4 + w, bs_offsets),)
     for g in gl.static_range(0 if PACKED else GROUPS_PER_TILE):
+        group = kg + g
         if K_TAIL:
-            # Groups past K read scale 2^0 and meet zero-filled values.
-            live = kg + g < K // SCALE_GROUP
-            a_s = a_s + (
-                cdna4.buffer_load(
-                    a_scales_ptr,
-                    as_offsets + kg + g,
-                    mask=(as_offsets >= 0) & live,
-                    other=127,
-                ),
-            )
-            b_s = b_s + (
-                cdna4.buffer_load(
-                    b_scales_ptr,
-                    bs_offsets + kg + g,
-                    mask=(bs_offsets >= 0) & live,
-                    other=127,
-                ),
-            )
-        else:
-            a_s = a_s + (cdna4.buffer_load(a_scales_ptr, as_offsets + kg + g),)
-            b_s = b_s + (cdna4.buffer_load(b_scales_ptr, bs_offsets + kg + g),)
+            # A group past K re-reads the last real group: its finite scale
+            # meets zero-filled values, so it adds exactly 0 without a mask.
+            group = gl.minimum(group, K // SCALE_GROUP - 1 - k_begin // SCALE_GROUP)
+        a_s = a_s + (cdna4.buffer_load(a_scales_ptr + group, as_offsets),)
+        b_s = b_s + (cdna4.buffer_load(b_scales_ptr + group, bs_offsets),)
     if K_TAIL:
         # Zero both operands past K: an unmasked B tail would read the next
         # row, and zero times a NaN code would poison the accumulator.
         async_copy.buffer_load_to_shared(
             smem_a,
-            a_ptr,
-            a_offsets + k0,
+            a_ptr + k0,
+            a_offsets,
             mask=a_row_mask & (a_k_offs + k0 < K)[None, :],
         )
         async_copy.buffer_load_to_shared(
-            smem_b, b_ptr, b_offsets + k0, mask=(b_k_offs + k0 < K)[:, None]
+            smem_b, b_ptr + k0, b_offsets, mask=(b_k_offs + k0 < K)[:, None]
         )
     else:
-        async_copy.buffer_load_to_shared(smem_a, a_ptr, a_offsets + k0, mask=a_row_mask)
-        async_copy.buffer_load_to_shared(smem_b, b_ptr, b_offsets + k0)
+        async_copy.buffer_load_to_shared(smem_a, a_ptr + k0, a_offsets, mask=a_row_mask)
+        async_copy.buffer_load_to_shared(smem_b, b_ptr + k0, b_offsets)
     async_copy.commit_group()
     return a_s, b_s
+
+
+@gluon.jit
+def _mma_tile(
+    buf_a,
+    buf_b,
+    a_s,
+    b_s,
+    acc,
+    dot_a: gl.constexpr,
+    dot_b: gl.constexpr,
+    mfma: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    GROUPS_PER_TILE: gl.constexpr,
+    PACKED: gl.constexpr,
+):
+    """Accumulate one K tile, one BF16 MFMA per 32-value scale group."""
+    # Issue every group's MFMA before scaling any partial, so MFMA latency
+    # overlaps instead of stalling each group's scaling.
+    parts = ()
+    for g in gl.static_range(GROUPS_PER_TILE):
+        # E4M3 values are exact in BF16, so the MFMA's products are exact and
+        # only its FP32 sum rounds.
+        a = buf_a.slice(g * SCALE_GROUP, SCALE_GROUP, dim=1).load(dot_a)
+        b = buf_b.slice(g * SCALE_GROUP, SCALE_GROUP, dim=0).load(dot_b)
+        parts = parts + (
+            cdna4.mfma(
+                a.to(gl.bfloat16),
+                b.to(gl.bfloat16),
+                gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma),
+            ),
+        )
+    for g in gl.static_range(GROUPS_PER_TILE):
+        # Power-of-two scales multiply exactly while the product stays a
+        # normal FP32 number, so only the accumulation rounds.
+        scale = (
+            _scale_value(a_s, g, PACKED)[:, None]
+            * _scale_value(b_s, g, PACKED)[None, :]
+        )
+        acc += parts[g] * scale
+    return acc
 
 
 # M follows the batch; without do_not_specialize its value-1 and
@@ -262,7 +292,8 @@ def gluon_mm_mxfp8_decode_gfx950(
     share one XCD's L2. Each program streams its K slice through a
     ``NUM_BUFFERS``-deep ring of LDS buffers filled by async copies; the
     scale bytes of each K tile are loaded into registers just ahead of its
-    values. ``K`` is a model constant, so the K loop is fully unrolled.
+    values. Only the ring's fill and drain are unrolled; the steady state is a
+    runtime loop, so code size and compile time do not grow with ``K``.
 
     With ``SPLIT_K > 1`` each split stores its FP32 partial tile and bumps the
     tile's arrival counter; the last arriving split sums all partials in split
@@ -346,8 +377,10 @@ def gluon_mm_mxfp8_decode_gfx950(
         as_offsets = as_rows * stride_asm + k_begin // SCALE_GROUP
         bs_offsets = bs_rows * stride_bsn + k_begin // SCALE_GROUP
 
-    # The K loop is unrolled at compile time (K is a model constant), so the
-    # stage scales are kept in a tuple indexed by the static tile number.
+    # Software pipeline over the K tiles: fill NUM_BUFFERS - 1 stages, run a
+    # runtime loop that consumes one stage and issues the next, then drain.
+    # Only the fill and drain are unrolled, so code size does not grow with K.
+    # The in-flight stages' scales ride in a tuple rotated every iteration.
     scales = ()
     for t in gl.static_range(NUM_BUFFERS - 1):
         scales = scales + (
@@ -366,6 +399,7 @@ def gluon_mm_mxfp8_decode_gfx950(
                 b_k_offs,
                 a_row_mask,
                 t * BLOCK_K,
+                k_begin,
                 K,
                 K_TAIL,
                 GROUPS_PER_TILE,
@@ -374,58 +408,65 @@ def gluon_mm_mxfp8_decode_gfx950(
         )
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma)
-    for t in gl.static_range(TILES_PER_SPLIT):
-        # Tiles t + 1 .. t + NUM_BUFFERS - 2 may stay in flight.
-        async_copy.wait_group(min(NUM_BUFFERS - 2, TILES_PER_SPLIT - 1 - t))
-        buf_a = smem_a.index(t % NUM_BUFFERS)
-        buf_b = smem_b.index(t % NUM_BUFFERS)
-        if t + NUM_BUFFERS - 1 < TILES_PER_SPLIT:
-            scales = scales + (
-                _issue_stage(
-                    smem_a.index((t + NUM_BUFFERS - 1) % NUM_BUFFERS),
-                    smem_b.index((t + NUM_BUFFERS - 1) % NUM_BUFFERS),
-                    a_ptr,
-                    b_ptr,
-                    a_scales_ptr,
-                    b_scales_ptr,
-                    a_offsets,
-                    b_offsets,
-                    as_offsets,
-                    bs_offsets,
-                    a_k_offs,
-                    b_k_offs,
-                    a_row_mask,
-                    (t + NUM_BUFFERS - 1) * BLOCK_K,
-                    K,
-                    K_TAIL,
-                    GROUPS_PER_TILE,
-                    PACKED_SCALES,
-                ),
-            )
-        a_s, b_s = scales[t]
-        # Issue every group's MFMA before scaling any partial, so MFMA latency
-        # overlaps instead of stalling each group's scaling.
-        parts = ()
-        for g in gl.static_range(GROUPS_PER_TILE):
-            # E4M3 values are exact in BF16, so the MFMA's products are exact
-            # and only its FP32 sum rounds.
-            a = buf_a.slice(g * SCALE_GROUP, SCALE_GROUP, dim=1).load(dot_a)
-            b = buf_b.slice(g * SCALE_GROUP, SCALE_GROUP, dim=0).load(dot_b)
-            parts = parts + (
-                cdna4.mfma(
-                    a.to(gl.bfloat16),
-                    b.to(gl.bfloat16),
-                    gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma),
-                ),
-            )
-        for g in gl.static_range(GROUPS_PER_TILE):
-            # Power-of-two scales multiply exactly while the product stays a
-            # normal FP32 number, so only the accumulation rounds.
-            scale = (
-                _scale_value(a_s, g, PACKED_SCALES)[:, None]
-                * _scale_value(b_s, g, PACKED_SCALES)[None, :]
-            )
-            acc += parts[g] * scale
+    for t in range(TILES_PER_SPLIT - (NUM_BUFFERS - 1)):
+        # Every iteration issues one stage, so NUM_BUFFERS - 2 stay in flight.
+        async_copy.wait_group(NUM_BUFFERS - 2)
+        a_s, b_s = scales[0]
+        issue = t + NUM_BUFFERS - 1
+        next_scales = _issue_stage(
+            smem_a.index(issue % NUM_BUFFERS),
+            smem_b.index(issue % NUM_BUFFERS),
+            a_ptr,
+            b_ptr,
+            a_scales_ptr,
+            b_scales_ptr,
+            a_offsets,
+            b_offsets,
+            as_offsets,
+            bs_offsets,
+            a_k_offs,
+            b_k_offs,
+            a_row_mask,
+            issue * BLOCK_K,
+            k_begin,
+            K,
+            K_TAIL,
+            GROUPS_PER_TILE,
+            PACKED_SCALES,
+        )
+        acc = _mma_tile(
+            smem_a.index(t % NUM_BUFFERS),
+            smem_b.index(t % NUM_BUFFERS),
+            a_s,
+            b_s,
+            acc,
+            dot_a,
+            dot_b,
+            mfma,
+            BLOCK_M,
+            BLOCK_N,
+            GROUPS_PER_TILE,
+            PACKED_SCALES,
+        )
+        scales = scales[1:] + (next_scales,)
+    for e in gl.static_range(NUM_BUFFERS - 1):
+        t = TILES_PER_SPLIT - (NUM_BUFFERS - 1) + e
+        async_copy.wait_group(NUM_BUFFERS - 2 - e)
+        a_s, b_s = scales[e]
+        acc = _mma_tile(
+            smem_a.index(t % NUM_BUFFERS),
+            smem_b.index(t % NUM_BUFFERS),
+            a_s,
+            b_s,
+            acc,
+            dot_a,
+            dot_b,
+            mfma,
+            BLOCK_M,
+            BLOCK_N,
+            GROUPS_PER_TILE,
+            PACKED_SCALES,
+        )
 
     offs_cm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, mfma))
     offs_cn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, mfma))
@@ -530,9 +571,8 @@ def _launch(A, B, A_scales, B_scales, C, config):
     else:
         partial = counters = C
     # Four-group scale words need 4-byte aligned rows and whole words per tile.
-    packed = (
-        K % (4 * MXFP8_SCALE_GROUP) == 0 and block_k % (4 * MXFP8_SCALE_GROUP) == 0
-    ) and all(
+    # A K tail would read the next row's scale bytes into the padded groups.
+    packed = (K % block_k == 0 and block_k % (4 * MXFP8_SCALE_GROUP) == 0) and all(
         scale.stride(0) % 4 == 0 and scale.data_ptr() % 4 == 0
         for scale in (A_scales, B_scales)
     )
@@ -578,24 +618,22 @@ _Config = tuple[int, int, int, int, int, int, int, int]
 
 # Sweeps on gfx950 at the DeepSeek V4.1 TP4 decode shapes (graph-replayed,
 # rotating buffers), keyed by (N, K) and then by M bucket (measured at
-# M = 6, 24, 48, 96, 192). Configs whose fully unrolled K loop took over three
-# minutes to compile were excluded. The 2**26-element weights (25600x6144,
-# 5120x15360) keep no 128/256 buckets: mm() routes them to the large-tile
-# kernel from 64 rows on, and their tuned configs there took 60-110 s each to
-# compile.
+# M = 6, 24, 48, 96, 192). The 2**26-element weights (25600x6144, 5120x15360)
+# keep no 128/256 buckets: mm() routes them to the large-tile kernel from 64
+# rows on.
 # Other shapes use _heuristic_config.
 _DECODE_CONFIGS: dict[tuple[int, int], dict[int, _Config]] = {
     (8192, 1280): {
-        16: (16, 32, 256, 1, 2, 4, 1, 8),
+        16: (16, 16, 256, 1, 1, 6, 1, 8),
         32: (32, 32, 256, 2, 2, 2, 1, 8),
         64: (32, 64, 256, 2, 4, 4, 1, 8),
-        128: (32, 16, 256, 2, 1, 2, 1, 8),
-        256: (64, 32, 128, 2, 1, 4, 1, 8),
+        128: (16, 64, 256, 1, 4, 3, 1, 8),
+        256: (64, 64, 128, 1, 4, 2, 2, 8),
     },
     (5120, 2048): {
         16: (16, 32, 256, 1, 2, 2, 1, 8),
-        32: (16, 16, 256, 1, 1, 2, 1, 8),
-        64: (16, 64, 128, 1, 2, 6, 1, 8),
+        32: (32, 32, 256, 2, 2, 6, 1, 8),
+        64: (16, 128, 128, 1, 4, 3, 2, 8),
         128: (16, 64, 256, 1, 4, 3, 1, 8),
         256: (64, 32, 256, 2, 2, 3, 1, 8),
     },
@@ -607,11 +645,11 @@ _DECODE_CONFIGS: dict[tuple[int, int], dict[int, _Config]] = {
         256: (64, 64, 128, 2, 4, 2, 4, 8),
     },
     (5120, 576): {
-        16: (16, 16, 256, 1, 1, 3, 1, 8),
-        32: (16, 16, 256, 1, 1, 3, 1, 8),
-        64: (16, 16, 256, 1, 1, 3, 1, 8),
-        128: (32, 32, 256, 2, 2, 4, 1, 8),
-        256: (64, 64, 128, 2, 2, 3, 1, 8),
+        16: (16, 32, 256, 1, 2, 2, 1, 8),
+        32: (32, 32, 128, 2, 2, 2, 1, 8),
+        64: (16, 16, 128, 1, 1, 6, 1, 8),
+        128: (32, 16, 128, 1, 1, 3, 1, 8),
+        256: (64, 16, 128, 2, 1, 2, 1, 8),
     },
     (1792, 5120): {
         16: (16, 16, 256, 1, 1, 2, 5, 8),
@@ -621,28 +659,28 @@ _DECODE_CONFIGS: dict[tuple[int, int], dict[int, _Config]] = {
         256: (64, 32, 256, 4, 2, 2, 4, 8),
     },
     (4096, 1280): {
-        16: (16, 16, 256, 1, 1, 2, 1, 8),
-        32: (16, 32, 256, 1, 2, 3, 1, 8),
+        16: (16, 16, 128, 1, 1, 6, 1, 8),
+        32: (32, 32, 256, 2, 2, 4, 1, 8),
         64: (16, 16, 128, 1, 1, 4, 1, 8),
-        128: (32, 32, 256, 2, 2, 2, 1, 8),
+        128: (64, 32, 256, 4, 1, 4, 1, 8),
         256: (64, 64, 128, 2, 4, 2, 1, 8),
     },
     (1536, 5120): {
         16: (16, 16, 256, 1, 1, 3, 4, 8),
         32: (16, 64, 256, 1, 4, 2, 5, 8),
-        64: (32, 32, 256, 1, 2, 2, 5, 8),
+        64: (64, 32, 256, 2, 2, 6, 4, 8),
         128: (64, 32, 128, 4, 1, 2, 5, 8),
-        256: (64, 32, 256, 1, 1, 2, 4, 8),
+        256: (32, 32, 128, 1, 1, 2, 5, 8),
     },
     (25600, 6144): {
         16: (16, 64, 256, 1, 4, 2, 1, 8),
-        32: (32, 32, 256, 2, 1, 2, 1, 8),
-        64: (64, 64, 128, 2, 2, 4, 1, 8),
+        32: (32, 64, 256, 1, 4, 2, 4, 8),
+        64: (64, 128, 128, 2, 2, 2, 2, 8),
     },
     (5120, 15360): {
-        16: (16, 32, 128, 1, 1, 3, 8, 8),
-        32: (32, 32, 256, 1, 2, 2, 4, 8),
-        64: (64, 128, 128, 1, 4, 2, 4, 8),
+        16: (16, 64, 128, 1, 2, 3, 8, 8),
+        32: (32, 32, 128, 1, 1, 3, 4, 8),
+        64: (64, 32, 128, 2, 2, 3, 5, 8),
     },
 }
 
