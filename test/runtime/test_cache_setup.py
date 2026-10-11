@@ -1225,11 +1225,11 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         ("tokenspeed_mla", None, None),
         (None, "tokenspeed_mla", None),
         ("trtllm_mla", None, "does not support MLA DCP"),
-        (None, "trtllm_mla", "DCP currently requires"),
+        (None, "trtllm_mla", r"\(DCP decode\) currently requires"),
         (None, "flashmla", "does not yet support speculation"),
     ],
 )
-def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
+def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
     monkeypatch, target_backend, draft_backend, error
 ):
     from test.runtime.conftest import kimi_recipe
@@ -1241,7 +1241,7 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
     args = SimpleNamespace(
         attention_backend=target_backend,
         drafter_attention_backend=draft_backend,
-        decode_context_parallel_size=2,
+        kv_parallel_size=2,
         disaggregation_mode="null",
         mapping=SimpleNamespace(world_size=8, world_group=tuple(range(8))),
         gpu_memory_utilization=0.9,
@@ -1269,8 +1269,8 @@ def test_kimi_dcp_resolves_target_and_draft_before_cache_allocation(
         config = replace(
             base,
             device="cuda",
-            dcp_size=2,
-            dcp_group=(0, 1),
+            kvp_size=2,
+            kvp_group=(0, 1),
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
             is_draft=is_draft,
@@ -1348,12 +1348,12 @@ def test_kimi_dspark_rejects_sharded_context_writes(degree):
     args = SimpleNamespace(
         attention_backend="tokenspeed_mla",
         drafter_attention_backend="tokenspeed_mla",
-        decode_context_parallel_size=degree,
+        kv_parallel_size=degree,
     )
     target = side("KimiK3ForConditionalGeneration")
     draft = side("K3DSparkModel")
     if degree > 1:
-        with pytest.raises(ValueError, match="K3 DSpark does not support DCP"):
+        with pytest.raises(ValueError, match="K3 DSpark does not support KVP"):
             registry._apply_backend_overrides(args, target, draft)
     else:
         registry._apply_backend_overrides(args, target, draft)
@@ -1390,7 +1390,7 @@ def _fake_around_the_budget(monkeypatch, free):
     monkeypatch.setattr(registry, "_check_pd_support", lambda *a, **k: None)
     monkeypatch.setattr(registry, "_apply_backend_overrides", lambda *a, **k: None)
     config = SimpleNamespace(
-        component=lambda cls: SimpleNamespace(), dcp_size=1, device="cuda"
+        component=lambda cls: SimpleNamespace(), kvp_size=1, device="cuda"
     )
     monkeypatch.setattr(registry, "_create_attn_config", lambda *a, **k: config)
     monkeypatch.setattr(registry, "_resolve_cache_family", lambda *a: "mha")

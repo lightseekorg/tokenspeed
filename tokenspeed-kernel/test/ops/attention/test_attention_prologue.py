@@ -1090,7 +1090,7 @@ def test_expanded_attention_leaves_its_inputs_untouched(fp8_cache, rope_style):
 @pytest.mark.parametrize("solution", ["triton", "composite"])
 @pytest.mark.parametrize("fp8_cache", [True, False])
 def test_a_write_mask_skips_the_rows_it_excludes(solution, fp8_cache):
-    """A DCP rank stores only the rows it owns: skipped rows keep the cache's
+    """A KVP rank stores only the rows it owns: skipped rows keep the cache's
     bytes, stored rows match the unmasked write, and the query is unaffected."""
     tokens, heads, rank, rope, total = 9, 16, 512, 64, 64
     cache_dtype = FP8 if fp8_cache else BF16

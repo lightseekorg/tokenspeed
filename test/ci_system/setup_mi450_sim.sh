@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-ROCM_SYSTEMS_REF=${ROCM_SYSTEMS_REF:-f9ba16bbe70e365b2f59b268e847bef19ad9db6e}
+ROCM_SYSTEMS_REF=${ROCM_SYSTEMS_REF:-d5c528019d0fcfbbc32d96b53ac2c61df6d0e67d}
 ROCM_NIGHTLY_INDEX=${ROCM_NIGHTLY_INDEX:-https://nightly.repo.amd.com/rocm/whl-next/}
-ROCM_SDK_VERSION=${ROCM_SDK_VERSION:-10.2.0a20260923}
+ROCM_SDK_VERSION=${ROCM_SDK_VERSION:-10.2.0a20261010}
 UV_VERSION=${UV_VERSION:-0.9.26}
 SIM_ROOT=${TOKENSPEED_MI450_SIM_ROOT:-${RUNNER_TEMP:-/tmp}/tokenspeed-mi450-sim}
 SOURCE_ROOT="${SIM_ROOT}/rocm-systems"
@@ -56,6 +56,12 @@ if ! git -C "${SOURCE_ROOT}" cat-file -e "${ROCM_SYSTEMS_REF}^{commit}"; then
         sleep 10
     done
 fi
+# Undo the config patch below from an earlier run, which would otherwise block
+# checking out a revision that changes the same config.
+config_path="${ROCJITSU_SOURCE_DIR}/configs/gfx1250_mi455x.json"
+if [ -f "${config_path}" ]; then
+    git -C "${SOURCE_ROOT}" checkout -- "${config_path}"
+fi
 git -C "${SOURCE_ROOT}" checkout --detach "${ROCM_SYSTEMS_REF}"
 
 # HIP initialization needs the KMD simulator to remain alive for the full
@@ -81,10 +87,19 @@ path.write_text(json.dumps(config, indent=2) + "\n")
 PY
 
 rocm_root="$(rocm-sdk path --root)"
+# A cached build (from the runner image or an earlier run) is reused only when
+# it was built from the same rocJITsu revision against the same ROCm SDK.
+# Otherwise the launcher would not match the SDK's rocJITsu runtime or the
+# configs checked out above.
+build_key="${ROCM_SYSTEMS_REF}:${ROCM_SDK_VERSION}"
+build_stamp="${ROCJITSU_BUILD_DIR}/.tokenspeed-build-key"
 if [ -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu" ] \
-    && [ -f "${ROCJITSU_BUILD_DIR}/librocjitsu.so" ]; then
+    && [ -f "${ROCJITSU_BUILD_DIR}/librocjitsu.so" ] \
+    && [ "$(cat "${build_stamp}" 2>/dev/null || true)" = "${build_key}" ]; then
     echo "Reusing cached rocJITsu launcher and runtime"
 else
+    echo "Building rocJITsu ${build_key}"
+    rm -rf "${ROCJITSU_BUILD_DIR}"
     ROCM_HOME="${rocm_root}" \
     ROCM_PATH="${rocm_root}" \
     LD_LIBRARY_PATH="${rocm_root}/lib:${LD_LIBRARY_PATH:-}" \
@@ -97,6 +112,7 @@ else
     cmake --build "${ROCJITSU_BUILD_DIR}" \
         --target rocjitsu_bin rocjitsu_shared \
         --parallel 4
+    printf '%s\n' "${build_key}" >"${build_stamp}"
 fi
 
 test -x "${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu"

@@ -20,7 +20,7 @@
 
 """KV-page sharding and the retraction image's ops, across ranks on gloo.
 
-Under ``--decode-context-parallel-size D`` a group's virtual block ``v > 0``
+Under ``--kv-parallel-size D`` a group's virtual block ``v > 0``
 belongs to rank ``(v - 1) % D`` on the Device and on every Host tier (the
 scheduler allocates the Host block in its Device block's residue class). Each
 rank adapts the same wire batch (``cache_ops_from_plan``) and keeps, through

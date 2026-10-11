@@ -164,12 +164,12 @@ def _run(rank: int, port: int) -> None:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     mapping = Mapping(
-        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_dcp_size=WORLD
+        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
     )
     pg_manager.init_distributed(
         mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
     )
-    group = mapping.attn.dcp_group
+    group = mapping.attn.kvp_group
     pg_manager.init_process_group(group, backend="gloo")
     pg_manager.register_process_group(
         "nccl", group, pg_manager.get_process_group("gloo", group)
@@ -317,10 +317,10 @@ def _dsa_leaf(rank: int, index_k_format: str, *, max_model_len: int):
     backend.kv_cache_dim = DIM
     backend.index_head_dim = INDEX_HEAD_DIM
     backend.index_k_format = index_k_format
-    backend.dcp_group = tuple(range(WORLD))
-    backend.dcp_rank = rank
-    backend.dcp_block_granularity = GRANULARITY
-    backend.dcp_virtual_block_count = VIRTUAL_BLOCKS
+    backend.kvp_group = tuple(range(WORLD))
+    backend.kvp_rank = rank
+    backend.kvp_block_granularity = GRANULARITY
+    backend.kvp_virtual_block_count = VIRTUAL_BLOCKS
     backend._history_workspace = None
     backend.preallocate_history_gather_workspace(max_model_len)
     return backend
@@ -345,12 +345,12 @@ def _run_index_k(
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     mapping = Mapping(
-        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_dcp_size=WORLD
+        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
     )
     pg_manager.init_distributed(
         mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
     )
-    group = mapping.attn.dcp_group
+    group = mapping.attn.kvp_group
     pg_manager.init_process_group(group, backend="gloo")
     pg_manager.register_process_group(
         "nccl", group, pg_manager.get_process_group("gloo", group)

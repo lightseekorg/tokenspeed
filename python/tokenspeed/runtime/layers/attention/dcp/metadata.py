@@ -27,8 +27,8 @@ from typing import overload
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
-    compact_dcp_pages,
-    dcp_local_visible_lengths,
+    compact_kvp_pages,
+    kvp_local_visible_lengths,
     virtual_slots_to_local,
 )
 
@@ -98,7 +98,7 @@ class CompactDCPMetadata(DCPPageTableMetadata):
         full table refresh must already have included the reserved pages.
         """
         assert self.page_prefix is not None and self.local_visible_lens is not None
-        dcp_local_visible_lengths(
+        kvp_local_visible_lengths(
             self.page_prefix,
             visible_lens,
             page_size=self.page_size,
@@ -258,7 +258,7 @@ def refresh_dcp_page_table_metadata(
     result = replace(previous, virtual_page_table=page_table)
     if isinstance(layout, CompactDCPLayout):
         assert isinstance(result, CompactDCPMetadata)
-        compact_dcp_pages(
+        compact_kvp_pages(
             page_table,
             layout.seq_lens,
             page_size=layout.page_size,

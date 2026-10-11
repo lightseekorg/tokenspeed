@@ -160,7 +160,7 @@ A pool describes its destination with `kv_write_target(layer_id, slots,
 write_mask)`: buffers, scale planes and whether the write sanitizes. Pools do
 not override the prologue's write.
 
-Under decode context parallelism the slots a backend publishes are virtual.
+Under KV parallelism the slots a backend publishes are virtual.
 Before asking the pool, `PagedAttention` resolves them through the backend's
 `cache_placement` (`resolve_cache_slots`), which yields this rank's local
 slots and an ownership mask. Rows another rank owns, and padding rows, resolve

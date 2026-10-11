@@ -18,9 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Decode context parallelism: the virtual-block contract on the CPU.
+"""KV parallelism: the virtual-block contract on the CPU.
 
-The scheduler addresses a sharded group by virtual block ID; each DCP rank
+The scheduler addresses a sharded group by virtual block ID; each KVP rank
 owns every D-th block and translates before it reads, writes or zeroes. These
 tests pin the contract's arithmetic, the translation at every layer that
 performs it, the recipe's group declarations, and the configuration checks --
@@ -69,7 +69,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
 )
 from tokenspeed.runtime.utils.server_args import (
     ServerArgs,
-    validate_dcp_disaggregation_role,
+    validate_kvp_disaggregation_role,
 )
 
 register_cuda_ci(
@@ -111,7 +111,7 @@ def _contract(*, parents: int, packing: int, shard_count: int) -> CacheRuntimeCo
     )
 
 
-def _recipe(*, dcp_size: int, fp4: bool, draft: bool) -> DeepseekV4Recipe:
+def _recipe(*, kvp_size: int, fp4: bool, draft: bool) -> DeepseekV4Recipe:
     # DeepSeek V4 Flash's layer ratios: 43 target layers plus one draft layer.
     hf = SimpleNamespace(
         compress_ratios=(0, 0) + (4, 128) * 20 + (4, 0),
@@ -134,12 +134,12 @@ def _recipe(*, dcp_size: int, fp4: bool, draft: bool) -> DeepseekV4Recipe:
             max_bs=16,
             context_len=4096,
             pd_disaggregation_enabled=False,
-            dcp_size=dcp_size,
+            kvp_size=kvp_size,
         ),
         draft_model_config=(
             SimpleNamespace(hf_config=hf, num_attention_layers=1) if draft else None
         ),
-        draft_attn_config=SimpleNamespace(dcp_size=dcp_size) if draft else None,
+        draft_attn_config=SimpleNamespace(kvp_size=kvp_size) if draft else None,
         cache_budget_bytes=8 << 30,
         probe_batch_rows=None,
         decode_input_tokens=4,
@@ -276,13 +276,13 @@ class LocalPagesTest(unittest.TestCase):
             local_pages_by_group({"replicated": [5]}, contract=contract, rank=0)
 
 
-def _metadata(*, dcp_size: int, dcp_rank: int, table: torch.Tensor):
+def _metadata(*, kvp_size: int, kvp_rank: int, table: torch.Tensor):
     group_id = v4_compressed_kv_group_id(4)
     specs = (
-        replace(_full_history_spec(group_id, shard_count=dcp_size)),
+        replace(_full_history_spec(group_id, shard_count=kvp_size)),
         _full_history_spec(V4_INDEXER_KV_GROUP_ID, shard_count=1),
     )
-    # Eight virtual blocks shared by the owners: 8 // dcp_size local pages each.
+    # Eight virtual blocks shared by the owners: 8 // kvp_size local pages each.
     contract = SimpleNamespace(
         group_specs=specs,
         virtual_block_counts={group_id: 9, V4_INDEXER_KV_GROUP_ID: 9},
@@ -291,8 +291,8 @@ def _metadata(*, dcp_size: int, dcp_rank: int, table: torch.Tensor):
         page_size=64,
         page_table=torch.zeros((table.shape[0], 1), dtype=torch.int32),
         block_tables={group_id: table, V4_INDEXER_KV_GROUP_ID: table.clone()},
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
+        kvp_size=kvp_size,
+        kvp_rank=kvp_rank,
         runtime_contract=contract,
     )
 
@@ -302,17 +302,17 @@ class CacheMetadataTranslationTest(unittest.TestCase):
         table = torch.tensor(
             [[1, 2, 3, 4], [5, 6, 7, 8], [0, 0, 0, 0]], dtype=torch.int32
         )
-        for dcp_size in (1, 2, 4):
-            for rank in range(dcp_size):
-                with self.subTest(dcp_size=dcp_size, rank=rank):
-                    metadata = _metadata(dcp_size=dcp_size, dcp_rank=rank, table=table)
+        for kvp_size in (1, 2, 4):
+            for rank in range(kvp_size):
+                with self.subTest(kvp_size=kvp_size, rank=rank):
+                    metadata = _metadata(kvp_size=kvp_size, kvp_rank=rank, table=table)
                     metadata.refresh_page_tables()
                     read = metadata.compressed_page_table(4)
                     virtual = table.long()
-                    owned = (virtual > 0) & ((virtual - 1) % dcp_size == rank)
+                    owned = (virtual > 0) & ((virtual - 1) % kvp_size == rank)
                     expected = torch.where(
                         owned,
-                        (virtual - 1) // dcp_size + 1,
+                        (virtual - 1) // kvp_size + 1,
                         torch.full_like(virtual, -1),
                     )
                     self.assertTrue(torch.equal(read.long(), expected))
@@ -331,22 +331,22 @@ class CacheMetadataTranslationTest(unittest.TestCase):
                     )
                     table[0, 0] = 1
 
-    def test_write_slots_translate_and_mask_for_every_dcp_size(self):
+    def test_write_slots_translate_and_mask_for_every_kvp_size(self):
         table = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
         slots = torch.tensor(
             [0, 63, 64, 128, 200, 256, 511, 576, -1], dtype=torch.int64
         )
-        for dcp_size in (1, 2, 4):
-            for rank in range(dcp_size):
-                with self.subTest(dcp_size=dcp_size, rank=rank):
-                    metadata = _metadata(dcp_size=dcp_size, dcp_rank=rank, table=table)
+        for kvp_size in (1, 2, 4):
+            for rank in range(kvp_size):
+                with self.subTest(kvp_size=kvp_size, rank=rank):
+                    metadata = _metadata(kvp_size=kvp_size, kvp_rank=rank, table=table)
                     local, owned = metadata.local_compressed_write_slots(slots, 4)
                     block = slots.clamp_min(0) // 64
                     expected_owned = (slots >= 64) & (block < 9)
-                    expected_owned &= (block - 1) % dcp_size == rank
+                    expected_owned &= (block - 1) % kvp_size == rank
                     self.assertTrue(torch.equal(owned, expected_owned))
                     expected_local = (
-                        (block - 1) // dcp_size + 1
+                        (block - 1) // kvp_size + 1
                     ) * 64 + slots.clamp_min(0) % 64
                     self.assertTrue(
                         torch.equal(local[owned], expected_local[expected_owned])
@@ -357,7 +357,7 @@ class CacheMetadataTranslationTest(unittest.TestCase):
         # Request 1's second compressed page is the null block: its tokens
         # write nothing instead of clobbering page 0.
         table = torch.tensor([[1, 2], [3, 0]], dtype=torch.int32)
-        metadata = _metadata(dcp_size=1, dcp_rank=0, table=table)
+        metadata = _metadata(kvp_size=1, kvp_rank=0, table=table)
         positions = torch.tensor([3, 255, 259, 3, 259], dtype=torch.int64)
         token_to_req = torch.tensor([0, 0, 0, 1, 1], dtype=torch.int32)
         for indexer in (False, True):
@@ -375,7 +375,7 @@ class CacheMetadataTranslationTest(unittest.TestCase):
 
     def test_indexer_table_is_its_own_sharded_group(self):
         table = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
-        metadata = _metadata(dcp_size=4, dcp_rank=3, table=table)
+        metadata = _metadata(kvp_size=4, kvp_rank=3, table=table)
         self.assertTrue(torch.equal(metadata.indexer_block_table(), table))
         metadata.refresh_page_tables()
         self.assertEqual(metadata.indexer_page_table().tolist(), [[-1, -1, -1, 1]])
@@ -386,14 +386,14 @@ class CacheMetadataTranslationTest(unittest.TestCase):
             [-1, -1, -1, 64, -1],
         )
         with self.assertRaisesRegex(RuntimeError, "missing cache-group block table"):
-            _metadata(dcp_size=4, dcp_rank=3, table=table).compressed_block_table(128)
+            _metadata(kvp_size=4, kvp_rank=3, table=table).compressed_block_table(128)
 
     def test_request_slices_keep_placement_and_read_views(self):
         table = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
-        metadata = _metadata(dcp_size=2, dcp_rank=1, table=table)
+        metadata = _metadata(kvp_size=2, kvp_rank=1, table=table)
         metadata.refresh_page_tables()
         sliced = metadata.slice_requests(1, 3)
-        self.assertEqual((sliced.dcp_size, sliced.dcp_rank), (2, 1))
+        self.assertEqual((sliced.kvp_size, sliced.kvp_rank), (2, 1))
         self.assertIs(sliced.runtime_contract, metadata.runtime_contract)
         self.assertTrue(
             torch.equal(
@@ -409,23 +409,23 @@ class CacheMetadataTranslationTest(unittest.TestCase):
 
 class RecipeDeclarationTest(unittest.TestCase):
     def test_compressed_and_indexer_groups_are_sharded_and_states_replicated(self):
-        for dcp_size in (1, 2, 4):
-            with self.subTest(dcp_size=dcp_size):
+        for kvp_size in (1, 2, 4):
+            with self.subTest(kvp_size=kvp_size):
                 specs = [
                     spec
                     for spec, _ in _recipe(
-                        dcp_size=dcp_size, fp4=True, draft=True
+                        kvp_size=kvp_size, fp4=True, draft=True
                     ).groups()
                 ]
                 by_id = {spec.group_id: spec for spec in specs}
                 self.assertIn(V4_INDEXER_KV_GROUP_ID, by_id)
-                self.assertEqual(by_id[V4_INDEXER_KV_GROUP_ID].shard_count, dcp_size)
+                self.assertEqual(by_id[V4_INDEXER_KV_GROUP_ID].shard_count, kvp_size)
                 self.assertEqual(
                     by_id[V4_INDEXER_KV_GROUP_ID].retention, "full_history"
                 )
                 for spec in specs:
                     expected = (
-                        dcp_size
+                        kvp_size
                         if (
                             parse_v4_compressed_kv_group_id(spec.group_id)
                             or spec.group_id == V4_INDEXER_KV_GROUP_ID
@@ -434,22 +434,22 @@ class RecipeDeclarationTest(unittest.TestCase):
                     )
                     self.assertEqual(spec.shard_count, expected, spec.group_id)
 
-    def test_group_set_does_not_depend_on_the_dcp_size(self):
+    def test_group_set_does_not_depend_on_the_kvp_size(self):
         ids = {
-            dcp_size: [
+            kvp_size: [
                 spec.group_id
                 for spec, _ in _recipe(
-                    dcp_size=dcp_size, fp4=False, draft=False
+                    kvp_size=kvp_size, fp4=False, draft=False
                 ).groups()
             ]
-            for dcp_size in (1, 4)
+            for kvp_size in (1, 4)
         }
         self.assertEqual(ids[1], ids[4])
 
     def test_capacity_is_bounded_by_the_replicated_groups(self):
         for fp4 in (False, True):
             with self.subTest(fp4=fp4):
-                recipe = _recipe(dcp_size=4, fp4=fp4, draft=True)
+                recipe = _recipe(kvp_size=4, fp4=fp4, draft=True)
                 groups = recipe.groups()
                 layout = pack(
                     groups,
@@ -469,13 +469,13 @@ class RecipeDeclarationTest(unittest.TestCase):
                     recipe.parents_needed(layout, capacity + 256), parents
                 )
 
-    def test_dcp_raises_capacity_without_growing_the_arena(self):
-        base = _recipe(dcp_size=1, fp4=True, draft=True).setup().spec
-        sharded = _recipe(dcp_size=4, fp4=True, draft=True).setup().spec
+    def test_kvp_raises_capacity_without_growing_the_arena(self):
+        base = _recipe(kvp_size=1, fp4=True, draft=True).setup().spec
+        sharded = _recipe(kvp_size=4, fp4=True, draft=True).setup().spec
         self.assertGreater(sharded.token_capacity, base.token_capacity)
         self.assertLessEqual(
             sharded.memory_plan.arena_bytes,
-            _recipe(dcp_size=4, fp4=True, draft=True).cache_budget_bytes,
+            _recipe(kvp_size=4, fp4=True, draft=True).cache_budget_bytes,
         )
         # Physical geometry is identical: every group packs the same physical
         # children into one parent, and only the scheduler's virtual view
@@ -508,7 +508,7 @@ class PrefillExchangePlanTest(unittest.TestCase):
         query_lens = torch.tensor([4, 64], dtype=torch.int32)
         for rank in range(degree):
             with self.subTest(rank=rank):
-                cache = _metadata(dcp_size=degree, dcp_rank=rank, table=table)
+                cache = _metadata(kvp_size=degree, kvp_rank=rank, table=table)
                 metadata = DeepseekV4ForwardMetadata(
                     seq_lens=seq_lens,
                     query_lens=query_lens,
@@ -524,7 +524,7 @@ class PrefillExchangePlanTest(unittest.TestCase):
                     num_prefill_reqs=2,
                     num_prefill_tokens=68,
                 )
-                chunks = DeepseekV4AttentionBackend._build_dcp_prefill_chunks(
+                chunks = DeepseekV4AttentionBackend._build_kvp_prefill_chunks(
                     metadata, 4, table, chunk_size=8, window_size=128
                 )
                 self.assertEqual(list(chunks), [(0, 2)])
@@ -550,31 +550,31 @@ class PrefillExchangePlanTest(unittest.TestCase):
 
 
 class MappingTest(unittest.TestCase):
-    def test_dcp_subgroups_are_consecutive_within_attention_tp(self):
+    def test_kvp_subgroups_are_consecutive_within_attention_tp(self):
         for rank in range(8):
             mapping = AttentionLayerMapping(
-                rank=rank, world_size=8, tp_size=8, dp_size=1, dcp_size=4
+                rank=rank, world_size=8, tp_size=8, dp_size=1, kvp_size=4
             )
-            self.assertTrue(mapping.has_dcp)
-            self.assertEqual(mapping.dcp_rank, rank % 4)
-            self.assertEqual(mapping.dcp_replica_rank, rank // 4)
+            self.assertTrue(mapping.has_kvp)
+            self.assertEqual(mapping.kvp_rank, rank % 4)
+            self.assertEqual(mapping.kvp_replica_rank, rank // 4)
             self.assertEqual(
-                mapping.dcp_group, tuple(range(rank - rank % 4, rank - rank % 4 + 4))
+                mapping.kvp_group, tuple(range(rank - rank % 4, rank - rank % 4 + 4))
             )
         plain = AttentionLayerMapping(
-            rank=3, world_size=8, tp_size=8, dp_size=1, dcp_size=1
+            rank=3, world_size=8, tp_size=8, dp_size=1, kvp_size=1
         )
-        self.assertFalse(plain.has_dcp)
-        self.assertEqual(plain.dcp_group, (3,))
+        self.assertFalse(plain.has_kvp)
+        self.assertEqual(plain.kvp_group, (3,))
 
-    def test_dcp_must_divide_attention_tp(self):
+    def test_kvp_must_divide_attention_tp(self):
         with self.assertRaisesRegex(ValueError, "divisible"):
             AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, dp_size=1, dcp_size=3
+                rank=0, world_size=8, tp_size=8, dp_size=1, kvp_size=3
             )
         with self.assertRaisesRegex(ValueError, "positive"):
             AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, dp_size=1, dcp_size=0
+                rank=0, world_size=8, tp_size=8, dp_size=1, kvp_size=0
             )
 
 
@@ -599,15 +599,15 @@ class ConfigurationTest(unittest.TestCase):
             kernel_page_size=64,
             context_len=4096,
             max_bs=4,
-            dcp_size=2,
-            dcp_rank=0,
-            dcp_group=(0, 1),
+            kvp_size=2,
+            kvp_rank=0,
+            kvp_group=(0, 1),
             components=(self._component("deepseek_v4"),),
         )
         fields.update(overrides)
         return AttnConfig(**fields)
 
-    def test_dcp_requires_the_deepseek_v4_backend(self):
+    def test_kvp_requires_a_dcp_capable_backend(self):
         with self.assertRaisesRegex(ValueError, "DeepSeek V4"):
             self._config(components=(self._component("mha"),))
 
@@ -620,22 +620,22 @@ class ConfigurationTest(unittest.TestCase):
         with patch.object(
             configs_base, "dsv4_decode_supports_partials", return_value=True
         ):
-            self.assertEqual(self._config().dcp_size, 2)
-        # A DCP size of one asks nothing of the kernel registry.
+            self.assertEqual(self._config().kvp_size, 2)
+        # A KVP size of one asks nothing of the kernel registry.
         with patch.object(
             configs_base,
             "dsv4_decode_supports_partials",
-            side_effect=AssertionError("queried for dcp_size=1"),
+            side_effect=AssertionError("queried for kvp_size=1"),
         ):
-            self._config(dcp_size=1, dcp_group=(0,))
+            self._config(kvp_size=1, kvp_group=(0,))
 
-    def test_dcp_keeps_the_host_kvstore_but_refuses_l3(self):
+    def test_kvp_keeps_the_host_kvstore_but_refuses_l3(self):
         # Host blocks are allocated in their Device block's residue class, so
         # the KVStore (and the retraction snapshot pool) serve a sharded
         # engine; an L3 key has no owner-stable form under sharding.
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "null"
-        args.decode_context_parallel_size = 2
+        args.kv_parallel_size = 2
         args.disable_kvstore = False
         args.enable_kvstore = False
         args.enable_prefix_caching = True
@@ -647,14 +647,14 @@ class ConfigurationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "L3"):
             args.validate_cache_options()
 
-    def test_dcp_allows_aggregated_and_prefill_roles_only(self):
+    def test_kvp_allows_aggregated_and_prefill_roles_only(self):
         for mode in ("null", "prefill"):
-            validate_dcp_disaggregation_role(has_dcp=True, disaggregation_mode=mode)
+            validate_kvp_disaggregation_role(has_kvp=True, disaggregation_mode=mode)
         for mode in ("null", "prefill", "decode", "encode"):
-            validate_dcp_disaggregation_role(has_dcp=False, disaggregation_mode=mode)
+            validate_kvp_disaggregation_role(has_kvp=False, disaggregation_mode=mode)
         for mode in ("decode", "encode"):
             with self.assertRaisesRegex(ValueError, "only the prefill side"):
-                validate_dcp_disaggregation_role(has_dcp=True, disaggregation_mode=mode)
+                validate_kvp_disaggregation_role(has_kvp=True, disaggregation_mode=mode)
 
 
 if __name__ == "__main__":

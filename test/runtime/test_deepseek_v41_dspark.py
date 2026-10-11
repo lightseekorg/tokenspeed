@@ -836,7 +836,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
 
     # Stop at the allocation boundary, after the real registry chooses both sides.
     config_builder = Mock(
-        return_value=SimpleNamespace(component=lambda cls: None, dcp_size=1)
+        return_value=SimpleNamespace(component=lambda cls: None, kvp_size=1)
     )
     monkeypatch.setattr(attention_registry, "_create_attn_config", config_builder)
     monkeypatch.setattr(

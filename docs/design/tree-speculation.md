@@ -182,7 +182,7 @@ executor refuses tree drafting with them at startup.
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
 drafter refuses trees at startup); `greedy` and `triton` sampling backends; the `trtllm`
 attention backend, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
-decode context parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
+KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
 no mixed batches, no pipeline parallelism, no prefill/decode disaggregation, no
 attention data parallelism, no sliding window or attention sinks in the target

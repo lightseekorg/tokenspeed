@@ -152,10 +152,10 @@ class FlashMLABackend(PagedAttentionBackend):
             )
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
 
-        self.dcp_group = tuple(config.dcp_group)
-        self.dcp_rank = config.dcp_rank
-        self.dcp_block_granularity: int | None = None
-        self.dcp_virtual_block_count: int | None = None
+        self.kvp_group = tuple(config.kvp_group)
+        self.kvp_rank = config.kvp_rank
+        self.kvp_block_granularity: int | None = None
+        self.kvp_virtual_block_count: int | None = None
         self.dcp_metadata: CompactDCPMetadata | None = None
         self.kv_cache_quant_method = config.kv_cache_quant_method
         self.cache_dtype = config.kv_cache_dtype
@@ -246,30 +246,30 @@ class FlashMLABackend(PagedAttentionBackend):
             raise ValueError(
                 "FlashMLA ownership blocks must contain whole kernel pages"
             )
-        if shard_count != len(self.dcp_group):
-            raise ValueError("FlashMLA cache and DCP topology disagree")
-        self.dcp_block_granularity = block_granularity
-        self.dcp_virtual_block_count = virtual_block_count
+        if shard_count != len(self.kvp_group):
+            raise ValueError("FlashMLA cache and KVP topology disagree")
+        self.kvp_block_granularity = block_granularity
+        self.kvp_virtual_block_count = virtual_block_count
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
-        if len(self.dcp_group) > 1:
+        if len(self.kvp_group) > 1:
             if (
-                self.dcp_block_granularity is None
-                or self.dcp_virtual_block_count is None
+                self.kvp_block_granularity is None
+                or self.kvp_virtual_block_count is None
             ):
                 raise RuntimeError(
-                    "FlashMLA DCP ownership geometry has not been configured"
+                    "FlashMLA KVP ownership geometry has not been configured"
                 )
             self.dcp_metadata = refresh_dcp_page_table_metadata(
                 page_table=self.page_table_buf,
-                virtual_block_count=self.dcp_virtual_block_count,
-                degree=len(self.dcp_group),
-                rank=self.dcp_rank,
+                virtual_block_count=self.kvp_virtual_block_count,
+                degree=len(self.kvp_group),
+                rank=self.kvp_rank,
                 layout=CompactDCPLayout(
                     seq_lens=self.seq_lens_buf,
                     page_size=self.kernel_page_size,
-                    block_granularity=self.dcp_block_granularity,
+                    block_granularity=self.kvp_block_granularity,
                 ),
                 previous=None,
             )
@@ -286,8 +286,8 @@ class FlashMLABackend(PagedAttentionBackend):
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         rebinding = self.cache_pool is not None
         super()._publish_cache_pool(cache_pool)
-        self.dcp_block_granularity = None
-        self.dcp_virtual_block_count = None
+        self.kvp_block_granularity = None
+        self.kvp_virtual_block_count = None
         self.dcp_metadata = None
         self.forward_decode_metadata = None
         self.forward_prefill_metadata = None
@@ -514,7 +514,7 @@ class FlashMLABackend(PagedAttentionBackend):
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
         # Copy the router-resolved kernel page table into the persistent buffer.
         self.page_table_buf[:bs, : page_table.shape[1]].copy_(page_table[:bs])
-        if len(self.dcp_group) > 1:
+        if len(self.kvp_group) > 1:
             if self.dcp_metadata is None:
                 raise RuntimeError("FlashMLA DCP metadata has not been initialized")
             placement = self.dcp_metadata.slice_requests(0, bs)
@@ -571,17 +571,17 @@ class FlashMLABackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
 
     def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
-        if len(self.dcp_group) == 1:
+        if len(self.kvp_group) == 1:
             return None
-        if self.dcp_block_granularity is None or self.dcp_virtual_block_count is None:
+        if self.kvp_block_granularity is None or self.kvp_virtual_block_count is None:
             raise RuntimeError(
-                "FlashMLA DCP ownership geometry has not been configured"
+                "FlashMLA KVP ownership geometry has not been configured"
             )
         return CachePlacement(
-            block_granularity=self.dcp_block_granularity,
-            virtual_block_count=self.dcp_virtual_block_count,
-            group=self.dcp_group,
-            rank=self.dcp_rank,
+            block_granularity=self.kvp_block_granularity,
+            virtual_block_count=self.kvp_virtual_block_count,
+            group=self.kvp_group,
+            rank=self.kvp_rank,
         )
 
     def forward_extend(
@@ -699,10 +699,11 @@ class FlashMLABackend(PagedAttentionBackend):
         layer: PagedAttention,
         token_to_kv_pool,
     ):
-        if len(self.dcp_group) > 1:
-            # The prefill wrapper plans on the virtual page table; DCP history comes from chunked prefill.
+        if len(self.kvp_group) > 1:
+            # The prefill wrapper plans on the virtual page table; the KVP-sharded
+            # history comes from chunked prefill.
             raise RuntimeError(
-                "FlashMLA's absorbed extend cannot attend a DCP-sharded cache"
+                "FlashMLA's absorbed extend cannot attend a KVP-sharded cache"
             )
         # flashinfer prefill_wrapper.run() takes q_nope / q_pe split: slice views.
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -734,9 +735,9 @@ class FlashMLABackend(PagedAttentionBackend):
             layer.tp_q_head_num == self.num_q_heads
         ), f"{layer.tp_q_head_num=} != {self.num_q_heads=}"
         q = q.view(-1, self.num_q_heads, layer.head_dim)
-        q = gather_query_heads(q, self.dcp_group)
+        q = gather_query_heads(q, self.kvp_group)
         reshape_q = q.view(
-            bs, -1, self.num_q_heads * len(self.dcp_group), layer.head_dim
+            bs, -1, self.num_q_heads * len(self.kvp_group), layer.head_dim
         )
 
         page_table = metadata.page_table[num_extends : num_extends + bs]
@@ -753,7 +754,7 @@ class FlashMLABackend(PagedAttentionBackend):
             page_table = page_table.repeat_interleave(width, dim=0)
             cache_seqlens = cache_seqlens.repeat_interleave(width)
 
-        if len(self.dcp_group) > 1:
+        if len(self.kvp_group) > 1:
             assert self.dcp_metadata is not None
             placement = self.dcp_metadata.slice_requests(num_extends, num_extends + bs)
             page_table = placement.local_page_table
@@ -771,7 +772,7 @@ class FlashMLABackend(PagedAttentionBackend):
             softmax_scale=layer.scaling,
             causal=True,
         )
-        if len(self.dcp_group) > 1:
+        if len(self.kvp_group) > 1:
             output, local_lse = normalize_dcp_partials(
                 output.squeeze(1),
                 lse.squeeze(-1),
@@ -781,8 +782,8 @@ class FlashMLABackend(PagedAttentionBackend):
             output = combine_attention_partials(
                 output,
                 local_lse,
-                group=self.dcp_group,
-                rank=self.dcp_rank,
+                group=self.kvp_group,
+                rank=self.kvp_rank,
                 sink=None,
                 keep_all_heads=False,
             ).unsqueeze(1)

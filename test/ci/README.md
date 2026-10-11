@@ -36,9 +36,9 @@ Every task declares one `workflow_stage`:
 - `kernel-benchmark` for registration-level kernel performance tests
 - `model-test` for model evaluation and performance tests
 
-The NVIDIA B200 Tests workflow runs unit tests before model tests. The normal AMD flow
-runs unit tests, then kernel benchmarks and model tests concurrently. The
-workflow still fails if either fails. Matrix entries within
+The NVIDIA B200 Tests and AMD Tests workflows run unit tests before model
+tests. AMD kernel benchmarks run in the separate AMD Kernel Benchmark workflow,
+concurrently with unit tests. Matrix entries within
 each stage run in parallel. The workflow treats a stage with no matching tasks
 as successfully satisfied.
 
@@ -50,8 +50,8 @@ two tasks cover the kernel suite once.
 PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
 Applying the label starts a new CI run immediately and cancels the older run
 through the workflow's concurrency policy. A unit-test failure does not cancel
-model tests that are already running in this mode. AMD kernel benchmarks retain
-their normal unit-test dependency.
+model tests that are already running in this mode. The label does not restart
+AMD kernel benchmarks.
 
 The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four GB200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
@@ -298,19 +298,20 @@ the top level rather than in either vendor subtree.
 ## Registration-level kernel benchmarks
 
 The `kernel-benchmark-amd-gfx950` performance task compares exact kernel
-registrations between two revisions. `AMD Tests` discovers it as a dedicated
-`kernel-benchmark` stage. In the normal flow, it runs after unit tests,
-concurrently with model tests. A benchmark failure still fails the workflow. The
-high-priority model path remains eager
-and does not wait for either stage. All stages contribute to the workflow's final
-status.
+registrations between two revisions. The `AMD Kernel Benchmark` workflow
+discovers it as a dedicated `kernel-benchmark` stage and runs it without
+waiting for `AMD Tests`, so the benchmark starts alongside unit tests. A
+benchmark failure fails `AMD Kernel Benchmark`, not `AMD Tests`. Like the other
+PR test workflows, its `finish` job reports the `finish` check that the default
+branch requires. A failed benchmark, or a failed scan that keeps the benchmark
+from running, therefore blocks merging.
 
 Pull request runs compare the pull request's merge base with its head commit.
-Main-branch pushes compare the previous and new commits. A manual `AMD Tests`
-run uses its selected commit for both sides as a runner smoke test. For a
-meaningful manual comparison, use `K8s Dispatch`: selecting a pull request uses
-its target and head revisions, while selecting a commit compares it with the
-latest `main`. Both revisions always execute serially in one task allocation.
+Main-branch pushes compare the previous and new commits. A manual
+`AMD Kernel Benchmark` run uses its selected commit for both sides as a runner
+smoke test. For a meaningful manual comparison, use `K8s Dispatch`: selecting a
+pull request uses its target and head revisions, while selecting a commit
+compares it with the latest `main`. Both revisions always execute serially in one task allocation.
 
 The task requests the ci-infra-managed `amd-mi350-1gpu-bench` runner pool and
 exposes logical device 0. Each allocation must provide one `gfx950` GPU,
@@ -330,8 +331,9 @@ infrastructure failures fail the task.
 
 The shared task executor uploads the task result and the benchmark's published
 comparison in one Actions artifact. A separate `AMD Kernel Benchmark PR
-Comment` workflow runs trusted code from the default branch after `AMD Tests`
-finishes. It validates the untrusted artifact and exact source revision before
+Comment` workflow runs trusted code from the default branch as soon as
+`AMD Kernel Benchmark` finishes, without waiting for unit or model tests. It
+validates the untrusted artifact and exact source revision before
 creating or replacing one bot-owned comment, including for fork runs whose
 completion event omits the pull request association and for runs that finish
 after the pull request merges. The comment workflow ignores closed, unmerged

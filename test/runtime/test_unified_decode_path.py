@@ -206,10 +206,10 @@ class FlashMLATileScheduleTest(_TorchCase):
         leaf.max_context_len = MAX_NUM_PAGES * flashmla.PAGE_SIZE
         leaf.kernel_page_size = flashmla.PAGE_SIZE
         leaf.device = "cpu"
-        leaf.dcp_group = (0,)
-        leaf.dcp_rank = 0
-        leaf.dcp_block_granularity = None
-        leaf.dcp_virtual_block_count = None
+        leaf.kvp_group = (0,)
+        leaf.kvp_rank = 0
+        leaf.kvp_block_granularity = None
+        leaf.kvp_virtual_block_count = None
         leaf.dcp_metadata = None
         leaf.forward_decode_metadata = None
         leaf._decode_tile_metadata = None

@@ -231,9 +231,9 @@ class DeepseekV4Recipe(CacheRecipe):
     # ---- geometry ----
 
     @property
-    def dcp_size(self) -> int:
+    def kvp_size(self) -> int:
         """Owners of each compressed-KV virtual block; 1 keeps them replicated."""
-        return int(self.attn_config.dcp_size)
+        return int(self.attn_config.kvp_size)
 
     @property
     @override
@@ -302,7 +302,7 @@ class DeepseekV4Recipe(CacheRecipe):
 
             compressed_spec = replace(
                 v4_compressed_kv_spec(ratio),
-                shard_count=self.dcp_size,
+                shard_count=self.kvp_size,
             )
             state_spec = v4_compressor_state_spec(ratio)
             compressed_slot = occurrences[compressed_spec.group_id]
@@ -336,10 +336,10 @@ class DeepseekV4Recipe(CacheRecipe):
             if ratio != 4:
                 continue
 
-            # Index-K shares the DCP topology, but owns an independent cache
+            # Index-K shares the KVP topology, but owns an independent cache
             # group: its virtual IDs need not match compressed attention KV.
             # Compressor state remains replicated.
-            indexer_spec = replace(v4_indexer_kv_spec(), shard_count=self.dcp_size)
+            indexer_spec = replace(v4_indexer_kv_spec(), shard_count=self.kvp_size)
             indexer_slot = occurrences[indexer_spec.group_id]
             occurrences[indexer_spec.group_id] += 1
             indexer_state_spec = v4_indexer_state_spec()

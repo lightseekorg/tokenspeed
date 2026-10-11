@@ -1256,7 +1256,7 @@ class GroupAwareWireTest(unittest.TestCase):
                 slot_state_exporters=None,
                 io_backend="kernel",
                 attn_tp_rank=0,
-                dcp_rank=0,
+                kvp_rank=0,
             )
 
         build_geometry.assert_called_once_with(
@@ -1354,7 +1354,7 @@ class GroupAwareWireTest(unittest.TestCase):
                         slot_state_exporters=None,
                         io_backend=io_backend,
                         attn_tp_rank=0,
-                        dcp_rank=0,
+                        kvp_rank=0,
                     )
                     self.assertIsNone(executor._transfer_geometry.device_rows)
                     executor._transfer_geometry.bind.assert_not_called()
@@ -1898,7 +1898,7 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 slot_state_exporters=None,
                 io_backend=io_backend,
                 attn_tp_rank=0,
-                dcp_rank=0,
+                kvp_rank=0,
             )
         self.addCleanup(executor.shutdown)
         return executor, pool, draft_pool

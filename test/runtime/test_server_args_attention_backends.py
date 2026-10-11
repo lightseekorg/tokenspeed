@@ -353,9 +353,9 @@ class TestAttentionBackendChoices(unittest.TestCase):
                 attn=SimpleNamespace(
                     tp_size=2,
                     dp_size=1,
-                    dcp_size=1,
-                    dcp_rank=0,
-                    dcp_group=(0,),
+                    kvp_size=1,
+                    kvp_rank=0,
+                    kvp_group=(0,),
                     qcp_size=1,
                     qcp_rank=0,
                     qcp_group=(0,),
@@ -501,7 +501,7 @@ class TestDecodeHostL2(unittest.TestCase):
     def test_decode_enables_host_l2_without_prefix_matching(self):
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "decode"
-        args.decode_context_parallel_size = 1
+        args.kv_parallel_size = 1
         args.disable_kvstore = False
         args.enable_kvstore = False
         args.enable_prefix_caching = False

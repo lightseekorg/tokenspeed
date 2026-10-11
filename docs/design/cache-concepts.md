@@ -194,7 +194,7 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 
-With DCP virtual-block placement, `CacheBatchMetadata` validates exported IDs
+With KVP virtual-block placement, `CacheBatchMetadata` validates exported IDs
 against each group's **virtual** block count. The physical page count bounds
 local arena storage only; applying it to the scheduler table would reject valid
 remote-owner IDs before the runtime can translate them.
@@ -1265,42 +1265,49 @@ is the pool-less engine, where every capacity block aborts.
 
 ## Virtual block placement within a shared physical plan
 
+KV parallelism (KVP, `--kv-parallel-size`) is a storage layout: a sharded
+group's pages are dealt page-cyclically to the ranks of the KVP subgroup by
+virtual block id, so each rank stores `1/N` of them. Decode context
+parallelism (DCP) is the decode compute over those pages -- every rank attends
+the pages it owns and the partials are merged by LSE -- and belongs to the
+attention backends. This section is about the storage side.
+
 A recipe declares each group as a `(CacheGroupSpec, fields)` tuple.
 `CacheGroupSpec.shard_count` defaults to 1 (replicated); a larger value assigns
-virtual blocks cyclically across that many owners. The memory plan continues
+virtual blocks cyclically across that many owners (the KVP size). The memory plan continues
 to own local shapes, strides, packing and byte counts. `CacheArena` is the sole
 publisher of `CacheRuntimeContract`, whose virtual counts and packing derive
 from these physical facts and each spec's `shard_count`. No separate placement
 or per-group address-space object is needed.
 
-A recipe's group set never depends on the DCP size. Only groups whose every
+A recipe's group set never depends on the KVP size. Only groups whose every
 reader can attend to a shard may be sharded; a group some consumer must read
-whole stays replicated and is declared as its own group at every DCP size, so
+whole stays replicated and is declared as its own group at every KVP size, so
 prefix matching, transfer and zeroing -- all keyed by group -- see one
 topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache
 and compressor states replicated. Index-K is sharded in its own full-history
 group; its virtual IDs are independent of the compressed attention chain.
-Backend binding validates the DCP shard count for both compressed KV and
+Backend binding validates the KVP shard count for both compressed KV and
 Index-K; SWA and compressor-state groups must remain replicated.
 
 Ordinary GPU MLA and DSA use the same ownership geometry for history storage.
 MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
-Before allocating the arena, hybrid DCP validates these declared group shard
+Before allocating the arena, the hybrid KVP check validates these declared group shard
 counts rather than the recipe name or its inheritance. Plugin recipes follow
 the same storage contract as built-in recipes. Both pure MLA and MLA/KDA hybrids
 require the full-attention backend to declare `supports_mla_dcp`; FlashMLA and
 TokenSpeed MLA (CuTe MLA) both declare this capability.
-Decode gathers query heads, computes attention over owned history, and merges
-partials using FP32 natural-log LSE before restoring TP-local heads. MLA
+Decode (DCP) gathers query heads, computes attention over owned history, and
+merges partials using FP32 natural-log LSE before restoring TP-local heads. MLA
 prefill reconstructs bounded history chunks with an owner-masked sum reduction;
 GPU DSA sparse prefill instead combines local sparse-attention partials.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
-DCP does not make unsupported kernels portable. DCP excludes speculative
+KVP does not make unsupported kernels portable. KVP excludes speculative
 decoding for every model on the ordinary MLA/DSA recipe, whichever dense
 kernel runs it: `OrdinaryRecipe.groups()` refuses to shard a cache that holds
 a draft group, so a CuTe MLA engine that would accept the draft kernels still
-cannot combine DCP with a draft; FlashMLA and GPU DSA `AttnConfig` additionally
-reject any speculative width, draft or target, under DCP. Only the recipes
+cannot combine KVP with a draft; FlashMLA and GPU DSA `AttnConfig` additionally
+reject any speculative width, draft or target, in their DCP decode. Only the recipes
 that declare their own groups shard with a draft present: DeepSeek V4 (its
 draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
 the sharded MLA history group), each subject to its backend's `AttnConfig`
@@ -1333,7 +1340,7 @@ role. Manifests carry scheduler (virtual) IDs on both sides and are bounded
 by each side's virtual count, `1 + (page_count - 1) * shard_count`, never by
 the physical page count. The route planner (`pd/transfer_plan.py`) reads
 `shard_count` from the wire `group_specs`: for a sharded group it fans a
-decode rank's replica out to the whole DCP subgroup (consecutive attention-TP
+decode rank's replica out to the whole KVP subgroup (consecutive attention-TP
 ranks), tagging every member with an owner filter `(owner_rank, owner_count)`;
 the sender keeps the manifest blocks with `(v - 1) % owner_count ==
 owner_rank`, translates them to local pages through the same
@@ -1355,7 +1362,7 @@ A sharded source leaves the equal-TP empty-fragment route (one predicate,
 `_uses_whole_copy_route`, decides it for routing and served-rank sets alike),
 but the sender folds every fragment with one contiguous span per page -- a
 whole field, or a head slice whose rows collapsed into one -- into its group's
-pages x fields grid, so DCP, pipeline stages and replicated fields across
+pages x fields grid, so KVP, pipeline stages and replicated fields across
 unequal TP all go through the page-gathered WRITE; only a fragment with
 several strided rows per page is emitted per page.
 
@@ -1380,11 +1387,11 @@ Translation from virtual to local IDs is one operation with `shard_count` as
 a parameter, never a mode: a replicated group translates to itself minus the
 null block, so batch metadata refreshes its local read tables, writers mask
 unowned rows, and zeroing filters foreign blocks through the same path at
-every DCP size. Virtual block 0 is the null block; no path writes to it, at
-any DCP size.
+every KVP size. Virtual block 0 is the null block; no path writes to it, at
+any KVP size.
 
 Query context parallelism (`--prefill-context-parallel-size`,
-`docs/design/unified_path.md`) is orthogonal to placement: DCP decides who
+`docs/design/unified_path.md`) is orthogonal to placement: KVP decides who
 stores a page, QCP decides who computes a row. Allocation, prefix matching,
 zeroing, publication and the P->D route never see the query shard. The
 sharded extend arm reads the placement through the same cyclic rule — the

@@ -129,7 +129,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 slot_state_exporters=None,
                 io_backend="direct",
                 attn_tp_rank=0,
-                dcp_rank=0,
+                kvp_rank=0,
             )
         store = self.MemoryKvStore()
         executor.attach_l3_storage(

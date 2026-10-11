@@ -861,6 +861,7 @@ def original_status(runs: list[dict], task: dict, state: dict) -> str:
                 "NVIDIA GB300 Tests",
                 "PR Test NVIDIA ARM",
                 "AMD Tests",
+                "AMD Kernel Benchmark",
             }
         ):
             continue

@@ -145,6 +145,8 @@ def gluon_dsv41_selected_attention_gfx950(
     global_lens,
     attn_sink,
     out,
+    partial_out,
+    partial_stats,
     stride_q_t: tl.int64,
     stride_q_h: tl.int64,
     swa_page_stride: tl.int64,
@@ -167,6 +169,8 @@ def gluon_dsv41_selected_attention_gfx950(
     BLOCK_H: gl.constexpr,
     TILE_K: gl.constexpr,
     HEAD_DIM: gl.constexpr,
+    NUM_SPLITS: gl.constexpr,
+    TILES_PER_SPLIT: gl.constexpr,
 ):
     mfma_score: gl.constexpr = gl.amd.cdna4.AMDMFMALayout(
         version=4,
@@ -230,6 +234,7 @@ def gluon_dsv41_selected_attention_gfx950(
 
     token_idx = gl.program_id(axis=0)
     head_group_idx = gl.program_id(axis=1)
+    split_idx = gl.program_id(axis=2)
     head_offset = head_group_idx * BLOCK_H
     swa_len = gl.minimum(
         gl.maximum(gl.load(swa_lens + token_idx).to(tl.int32), 0), SWA_WIDTH
@@ -244,6 +249,10 @@ def gluon_dsv41_selected_attention_gfx950(
     swa_tiles = gl.cdiv(swa_len, TILE_K)
     global_tiles = gl.cdiv(global_len, TILE_K)
     num_tiles = gl.maximum(swa_tiles + global_tiles, 1)
+    # Split programs own a contiguous tile range and leave the sink to the
+    # combine kernel.
+    tile_begin = split_idx * TILES_PER_SPLIT
+    tile_end = gl.minimum(num_tiles, tile_begin + TILES_PER_SPLIT)
 
     q_heads = head_offset + gl.arange(
         0,
@@ -277,15 +286,28 @@ def gluon_dsv41_selected_attention_gfx950(
         layout=gl.SliceLayout(1, mfma_score),
     )
     valid_heads = score_heads < num_heads
-    max_value = gl.load(attn_sink + score_heads, mask=valid_heads, other=0.0).to(
-        gl.float32
-    )
-    denominator = gl.full(
-        [BLOCK_H],
-        1.0,
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, mfma_score),
-    )
+    if NUM_SPLITS == 1:
+        max_value = gl.load(attn_sink + score_heads, mask=valid_heads, other=0.0).to(
+            gl.float32
+        )
+        denominator = gl.full(
+            [BLOCK_H],
+            1.0,
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, mfma_score),
+        )
+    else:
+        max_value = gl.full(
+            [BLOCK_H],
+            -float("inf"),
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, mfma_score),
+        )
+        denominator = gl.zeros(
+            [BLOCK_H],
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, mfma_score),
+        )
     accumulator = gl.zeros(
         [BLOCK_H, HEAD_DIM],
         dtype=gl.float32,
@@ -295,7 +317,7 @@ def gluon_dsv41_selected_attention_gfx950(
     local_k_load = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, kv_load_layout))
     kv_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, kv_load_layout))
 
-    for tile_idx in range(num_tiles):
+    for tile_idx in range(tile_begin, tile_end):
         if tile_idx < swa_tiles:
             positions = tile_idx * TILE_K + local_k_load
             slots_load, valid_load = _load_segment_slot(
@@ -381,17 +403,35 @@ def gluon_dsv41_selected_attention_gfx950(
         accumulator = gl.amd.cdna4.mfma(p_dot, v_dot, accumulator)
         max_value = next_max
 
-    denominator_value = gl.convert_layout(denominator, gl.SliceLayout(1, mfma_value))
-    safe_denominator = gl.where(denominator_value > 0.0, denominator_value, 1.0)
-    accumulator /= safe_denominator[:, None]
-    accumulator = gl.where(denominator_value[:, None] > 0.0, accumulator, 0.0)
-
     out_heads = head_offset + gl.arange(
         0,
         BLOCK_H,
         layout=gl.SliceLayout(1, out_layout),
     )
     out_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, out_layout))
+    if NUM_SPLITS > 1:
+        # Unnormalized partials: [tokens, heads, splits, dim] and
+        # [tokens, heads, splits, (max, denominator)].
+        row = (
+            token_idx.to(tl.int64) * num_heads + out_heads.to(tl.int64)
+        ) * NUM_SPLITS + split_idx
+        gl.store(
+            partial_out + row[:, None] * HEAD_DIM + out_dims[None, :],
+            gl.convert_layout(accumulator, out_layout),
+            mask=(out_heads < num_heads)[:, None],
+        )
+        stat_row = (
+            token_idx.to(tl.int64) * num_heads + score_heads.to(tl.int64)
+        ) * NUM_SPLITS + split_idx
+        gl.store(partial_stats + stat_row * 2, max_value, mask=valid_heads)
+        gl.store(partial_stats + stat_row * 2 + 1, denominator, mask=valid_heads)
+        return
+
+    denominator_value = gl.convert_layout(denominator, gl.SliceLayout(1, mfma_value))
+    safe_denominator = gl.where(denominator_value > 0.0, denominator_value, 1.0)
+    accumulator /= safe_denominator[:, None]
+    accumulator = gl.where(denominator_value[:, None] > 0.0, accumulator, 0.0)
+
     out_offsets = (
         token_idx.to(tl.int64) * stride_o_t
         + out_heads[:, None].to(tl.int64) * stride_o_h
@@ -399,6 +439,48 @@ def gluon_dsv41_selected_attention_gfx950(
     )
     output = gl.convert_layout(accumulator.to(out.dtype.element_ty), out_layout)
     gl.store(out + out_offsets, output, mask=(out_heads < num_heads)[:, None])
+
+
+@triton.jit
+def _dsv41_selected_combine_gfx950(
+    partial_out,
+    partial_stats,
+    attn_sink,
+    out,
+    stride_o_t: tl.int64,
+    stride_o_h: tl.int64,
+    num_heads: tl.int32,
+    NUM_SPLITS: tl.constexpr,
+    SPLITS_POW2: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head = tl.program_id(1)
+    row = (token_idx.to(tl.int64) * num_heads + head) * NUM_SPLITS
+    splits = tl.arange(0, SPLITS_POW2)
+    split_mask = splits < NUM_SPLITS
+    split_max = tl.load(
+        partial_stats + (row + splits) * 2, mask=split_mask, other=-float("inf")
+    )
+    split_den = tl.load(
+        partial_stats + (row + splits) * 2 + 1, mask=split_mask, other=0.0
+    )
+    sink = tl.load(attn_sink + head).to(tl.float32)
+    max_value = tl.maximum(tl.max(split_max, axis=0), sink)
+    weight = tl.exp(split_max - max_value)
+    denominator = tl.exp(sink - max_value) + tl.sum(weight * split_den, axis=0)
+    dims = tl.arange(0, HEAD_DIM)
+    acc = tl.load(
+        partial_out + (row + splits)[:, None] * HEAD_DIM + dims[None, :],
+        mask=split_mask[:, None],
+        other=0.0,
+    )
+    acc = tl.sum(acc * weight[:, None], axis=0)
+    acc = tl.where(denominator > 0.0, acc / denominator, 0.0)
+    tl.store(
+        out + token_idx.to(tl.int64) * stride_o_t + head * stride_o_h + dims,
+        acc.to(out.dtype.element_ty),
+    )
 
 
 def _tile_k() -> int:
@@ -552,7 +634,38 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         global_cr = _GLOBAL_ROW_BYTES
         global_cb = 1
 
-    grid = (q.shape[0], triton.cdiv(q.shape[1], 16))
+    tile_k = _tile_k()
+    head_groups = triton.cdiv(q.shape[1], 16)
+    max_tiles = triton.cdiv(swa_slots_i.shape[1], tile_k) + triton.cdiv(
+        global_width, tile_k
+    )
+    # Small grids (decode) split the KV tiles so about two waves of programs
+    # run; the combine kernel then merges the partials with the sink. A
+    # power-of-two tile count per split bounds the compiled variants.
+    programs = q.shape[0] * head_groups
+    cu_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+    tiles_per_split = max_tiles
+    if programs < cu_count:
+        tiles_per_split = triton.next_power_of_2(
+            triton.cdiv(
+                max_tiles,
+                max(1, min(max_tiles, triton.cdiv(2 * cu_count, programs))),
+            )
+        )
+    num_splits = triton.cdiv(max_tiles, max(tiles_per_split, 1))
+    partial_out = partial_stats = out
+    if num_splits > 1:
+        partial_out = torch.empty(
+            (q.shape[0], q.shape[1], num_splits, _HEAD_DIM),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        partial_stats = torch.empty(
+            (q.shape[0], q.shape[1], num_splits, 2),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    grid = (q.shape[0], head_groups, num_splits)
     gluon_dsv41_selected_attention_gfx950[grid](
         q,
         swa_cache,
@@ -563,6 +676,8 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         global_lens_i,
         sink,
         out,
+        partial_out,
+        partial_stats,
         q.stride(0),
         q.stride(1),
         swa_cache.stride(0),
@@ -583,9 +698,25 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         GLOBAL_CR=global_cr,
         GLOBAL_CB=global_cb,
         BLOCK_H=16,
-        TILE_K=_tile_k(),
+        TILE_K=tile_k,
         HEAD_DIM=_HEAD_DIM,
+        NUM_SPLITS=num_splits,
+        TILES_PER_SPLIT=tiles_per_split,
         num_warps=4,
         num_stages=1,
     )
+    if num_splits > 1:
+        _dsv41_selected_combine_gfx950[(q.shape[0], q.shape[1])](
+            partial_out,
+            partial_stats,
+            sink,
+            out,
+            out.stride(0),
+            out.stride(1),
+            q.shape[1],
+            NUM_SPLITS=num_splits,
+            SPLITS_POW2=triton.next_power_of_2(num_splits),
+            HEAD_DIM=_HEAD_DIM,
+            num_warps=4,
+        )
     return out

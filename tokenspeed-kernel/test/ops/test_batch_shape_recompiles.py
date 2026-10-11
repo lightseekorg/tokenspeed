@@ -1055,7 +1055,7 @@ def test_kpool_dense_scores_width():
             assert torch.all(got[:, num_pools:] == -float("inf"))
 
 
-def test_compact_dcp_pages_table_width():
+def test_compact_kvp_pages_table_width():
     from tokenspeed_kernel.ops.kvcache import triton_cache_placement as placement
 
     lengths = torch.tensor([300, 1, 129, 0], dtype=torch.int32)
@@ -1066,7 +1066,7 @@ def test_compact_dcp_pages_table_width():
         for device in ("cpu", DEVICE):
             out = torch.empty(4, cols, dtype=torch.int32, device=device)
             local = torch.empty(4, dtype=torch.int32, device=device)
-            placement.compact_dcp_pages(
+            placement.compact_kvp_pages(
                 table.to(device),
                 lengths.to(device),
                 page_size=64,

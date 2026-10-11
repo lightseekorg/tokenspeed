@@ -96,10 +96,10 @@ def _backend(
     backend.spec_num_tokens = 1
     backend.step_counter = None
     backend.kpool_runtime = None
-    backend.dcp_group = (rank,)
-    backend.dcp_rank = 0
-    backend.dcp_block_granularity = None
-    backend.dcp_virtual_block_count = None
+    backend.kvp_group = (rank,)
+    backend.kvp_rank = 0
+    backend.kvp_block_granularity = None
+    backend.kvp_virtual_block_count = None
     backend.qcp_group = tuple(range(WORLD)) if qcp else (0,)
     backend.qcp_rank = rank if qcp else 0
     backend.query_shard_metadata = None
@@ -171,7 +171,7 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
             min(max(lo, start), end) - start, min(max(hi, start), end) - start
         )
         assert group.local_query == expected
-    # One owner (no DCP): the gather is local and holds every history row.
+    # One owner (no KVP): the gather is local and holds every history row.
     for group in meta.groups:
         assert group.gather.group == (0,)
         assert group.gather.owned_rows_per_rank == (group.rows,)
@@ -465,10 +465,10 @@ def test_the_index_k_history_is_one_gather_per_group(monkeypatch, index_k_format
 def _decode_arm_backend(*, num_attention_heads: int, attn_tp_size: int):
     backend = _backend(1, workspace_rows=0, index_k_format="fp8_scaled")
     backend.kernel_page_size = 64
-    backend.dcp_group = (0, 1, 2, 3)
-    backend.dcp_rank = 1
-    backend.dcp_block_granularity = 64
-    backend.dcp_virtual_block_count = 5
+    backend.kvp_group = (0, 1, 2, 3)
+    backend.kvp_rank = 1
+    backend.kvp_block_granularity = 64
+    backend.kvp_virtual_block_count = 5
     backend.kv_lora_rank = 128
     backend.qk_nope_head_dim = 128
     backend.qk_rope_head_dim = 0
@@ -529,7 +529,7 @@ def test_the_dcp_combine_form_follows_the_querys_heads(
 
     def combine(out, lse, *, group, rank, sink, keep_all_heads=None):
         assert keep_all_heads is keep_all_heads_expected and sink is None
-        assert group == backend.dcp_group and rank == 1
+        assert group == backend.kvp_group and rank == 1
         return out if keep_all_heads else out[:, :layer_heads]
 
     keep_all_heads_expected = keep_all_heads
@@ -562,9 +562,9 @@ def test_a_query_with_neither_head_layout_is_refused():
         backend._query_heads(torch.zeros(1, 2, 64), layer)
     assert backend._query_holds_every_head(8) and not backend._query_holds_every_head(2)
     # Without DCP the form is moot and the arm never asks.
-    backend.dcp_group = (1,)
-    backend.dcp_rank = 0
-    assert not (len(backend.dcp_group) > 1)
+    backend.kvp_group = (1,)
+    backend.kvp_rank = 0
+    assert not (len(backend.kvp_group) > 1)
 
 
 @pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)

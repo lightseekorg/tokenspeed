@@ -522,8 +522,8 @@ class ModelExecutor:
             device=self.device,
         )
         # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
-        # rank's position in the DCP group selects the pages it owns.
-        self._cache_dcp_rank = model_runner.mapping.attn.dcp_rank
+        # rank's position in the KVP group selects the pages it owns.
+        self._cache_kvp_rank = model_runner.mapping.attn.kvp_rank
         ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
         if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
             raise NotImplementedError(
@@ -1853,7 +1853,7 @@ class ModelExecutor:
             pages = local_pages_by_group(
                 pages,
                 contract=self._cache_runtime_contract,
-                rank=self._cache_dcp_rank,
+                rank=self._cache_kvp_rank,
             )
 
         def sanitize(pool, pool_pages) -> bool:

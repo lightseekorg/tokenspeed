@@ -165,15 +165,15 @@ class DSABackend(PagedAttentionBackend):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         platform = current_platform()
         self._dense_backend = _make_dense_leaf(config, spec, platform, kernel_page_size)
-        self.dcp_group = tuple(config.dcp_group)
-        self.dcp_rank = config.dcp_rank
-        self.dcp_block_granularity: int | None = None
-        self.dcp_virtual_block_count: int | None = None
-        if len(self.dcp_group) > 1 and spec.index_kpool is not None:
-            raise ValueError("DSA DCP does not yet support KPool selection")
+        self.kvp_group = tuple(config.kvp_group)
+        self.kvp_rank = config.kvp_rank
+        self.kvp_block_granularity: int | None = None
+        self.kvp_virtual_block_count: int | None = None
+        if len(self.kvp_group) > 1 and spec.index_kpool is not None:
+            raise ValueError("DSA KVP does not yet support KPool selection")
         # Query context parallelism: the extend rows this rank computes are a
         # shard of the chunk and attend the gathered history of their
-        # requests; the gather splits by page owner (the DCP group, or this
+        # requests; the gather splits by page owner (the KVP group, or this
         # rank alone) and lands in a workspace sized for one whole history.
         self.qcp_group = tuple(config.qcp_group)
         self.qcp_rank = config.qcp_rank
@@ -268,12 +268,12 @@ class DSABackend(PagedAttentionBackend):
     ) -> None:
         super().configure_runtime(**kwargs)
         if (
-            shard_count != len(self.dcp_group)
+            shard_count != len(self.kvp_group)
             or block_granularity % self.kernel_page_size
         ):
-            raise ValueError("DSA cache geometry does not match DCP topology")
-        self.dcp_block_granularity = block_granularity
-        self.dcp_virtual_block_count = virtual_block_count
+            raise ValueError("DSA cache geometry does not match KVP topology")
+        self.kvp_block_granularity = block_granularity
+        self.kvp_virtual_block_count = virtual_block_count
 
     def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
         """Allocate the gathered-history workspace of the sharded extend arm.
@@ -331,15 +331,15 @@ class DSABackend(PagedAttentionBackend):
         self._history_workspace = workspace
 
     def cache_placement(self, layer) -> CachePlacement | None:
-        if len(self.dcp_group) == 1:
+        if len(self.kvp_group) == 1:
             return None
-        if self.dcp_block_granularity is None or self.dcp_virtual_block_count is None:
-            raise RuntimeError("DSA DCP cache geometry is not configured")
+        if self.kvp_block_granularity is None or self.kvp_virtual_block_count is None:
+            raise RuntimeError("DSA KVP cache geometry is not configured")
         return CachePlacement(
-            self.dcp_block_granularity,
-            self.dcp_virtual_block_count,
-            self.dcp_group,
-            self.dcp_rank,
+            self.kvp_block_granularity,
+            self.kvp_virtual_block_count,
+            self.kvp_group,
+            self.kvp_rank,
         )
 
     def set_request_slots(self, req_pool_indices: torch.Tensor) -> None:
@@ -438,8 +438,8 @@ class DSABackend(PagedAttentionBackend):
         super()._publish_cache_pool(cache_pool)
         self._prefill_page_table = None
         self.query_shard_metadata = None
-        self.dcp_block_granularity = None
-        self.dcp_virtual_block_count = None
+        self.kvp_block_granularity = None
+        self.kvp_virtual_block_count = None
         if self.kpool_runtime is not None:
             self.kpool_runtime.reset_forward(None)
 
@@ -943,7 +943,7 @@ class DSABackend(PagedAttentionBackend):
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
-        if len(self.dcp_group) > 1:
+        if len(self.kvp_group) > 1:
             raise ValueError("Sharded DSA decode requires global top-k selection")
         metadata = self.forward_decode_metadata
         if metadata is not None and metadata.seq_lens_k is not None:
@@ -1058,13 +1058,13 @@ class DSABackend(PagedAttentionBackend):
             q_view = q_view.to(self.data_type)
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        use_dcp = len(self.dcp_group) > 1
+        use_dcp = len(self.kvp_group) > 1
         keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         if use_dcp:
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
             topk_slots = torch.where(owned, slots, -1)
             if not keep_all_heads:
-                q_view = gather_query_heads(q_view, self.dcp_group)
+                q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
@@ -1093,8 +1093,8 @@ class DSABackend(PagedAttentionBackend):
             out = combine_attention_partials(
                 local_output,
                 local_lse,
-                group=self.dcp_group,
-                rank=self.dcp_rank,
+                group=self.kvp_group,
+                rank=self.kvp_rank,
                 sink=None,
                 keep_all_heads=keep_all_heads,
             )
@@ -1276,7 +1276,7 @@ class DSABackend(PagedAttentionBackend):
         max_seqlen_k = int(
             getattr(metadata, "max_seq_len_k", 0) or self.max_context_len
         )
-        use_dcp = len(self.dcp_group) > 1
+        use_dcp = len(self.kvp_group) > 1
         # The combine's form follows the query's heads: every head
         # (head-replicated attention weights, as the drafter's steps on a
         # query-sharding engine without head TP carry) keeps all heads -- no
@@ -1290,7 +1290,7 @@ class DSABackend(PagedAttentionBackend):
             slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
             topk_slots = torch.where(owned, slots, -1)
             if not keep_all_heads:
-                q_view = gather_query_heads(q_view, self.dcp_group)
+                q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,
@@ -1316,8 +1316,8 @@ class DSABackend(PagedAttentionBackend):
             out = combine_attention_partials(
                 local_output,
                 local_lse,
-                group=self.dcp_group,
-                rank=self.dcp_rank,
+                group=self.kvp_group,
+                rank=self.kvp_rank,
                 sink=None,
                 keep_all_heads=keep_all_heads,
             ).to(

@@ -366,7 +366,7 @@ reproduce the TP1 / decode-side batch-invariant form — the one the RL
 trainer alignment wants, and the same gap to TP8 as between the decode
 side's batch-invariant layout and a cross-rank sum. The drafter's decode
 steps on a sharded engine merge partials across the KVP page owners (the
-page-sharded KV of `--decode-context-parallel-size`;
+page-sharded KV of `--kv-parallel-size`;
 `combine_attention_partials`, every head under the head-replicated layout,
 the attention-TP slice under head TP), with the ordered fold under
 rl-bitwise.

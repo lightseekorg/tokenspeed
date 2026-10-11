@@ -160,7 +160,7 @@ def test_the_pool_is_independent_of_the_kvstore():
     assert not args.retraction_snapshot_pool_disabled
 
 
-def test_dcp_takes_both_host_tiers_but_not_l3():
+def test_kvp_takes_both_host_tiers_but_not_l3():
     # The scheduler allocates every Host block in its Device block's residue
     # class and the executor translates ownership on both ends of every row,
     # so a KV-page-sharded engine may run the Host KVStore and the snapshot
@@ -168,15 +168,15 @@ def test_dcp_takes_both_host_tiers_but_not_l3():
     args = ServerArgs(
         model="x",
         world_size=2,
-        decode_context_parallel_size=2,
+        kv_parallel_size=2,
         retraction_snapshot_host_gb=1.0,
     )
     assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
-    with pytest.raises(ValueError, match="L3.*decode-context-parallel-size"):
+    with pytest.raises(ValueError, match="L3.*kv-parallel-size"):
         ServerArgs(
             model="x",
             world_size=2,
-            decode_context_parallel_size=2,
+            kv_parallel_size=2,
             kvstore_storage_backend="mooncake",
             **PREFETCH,
         )

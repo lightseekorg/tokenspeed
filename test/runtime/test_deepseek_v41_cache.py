@@ -966,9 +966,9 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
             attn=SimpleNamespace(
                 tp_size=1,
                 dp_size=2,
-                dcp_size=1,
-                dcp_rank=0,
-                dcp_group=(0,),
+                kvp_size=1,
+                kvp_rank=0,
+                kvp_group=(0,),
                 qcp_size=1,
                 qcp_rank=0,
                 qcp_group=(0,),

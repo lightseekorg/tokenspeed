@@ -24,7 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
-    compact_dcp_pages,
+    compact_kvp_pages,
     virtual_slots_to_local,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
@@ -68,7 +68,7 @@ def test_noncontiguous_pages_and_partial_tail(degree, device):
     for rank in range(degree):
         out = torch.empty_like(table)
         local = torch.empty_like(lengths)
-        compact_dcp_pages(
+        compact_kvp_pages(
             table,
             lengths,
             page_size=64,
@@ -115,9 +115,9 @@ def test_flashmla_dcp_rejects_unsupported_execution(override, message):
             *config.components[1:],
         ),
         pd_disaggregation_enabled=False,
-        dcp_size=4,
-        dcp_rank=0,
-        dcp_group=(0, 1, 2, 3),
+        kvp_size=4,
+        kvp_rank=0,
+        kvp_group=(0, 1, 2, 3),
     )
     with pytest.raises(ValueError, match=message):
         replace(config, **override)
@@ -131,7 +131,7 @@ def test_flashmla_absorbed_extend_refuses_sharded_cache():
         "tokenspeed.runtime.layers.attention.backends.paged.flashmla"
     )
     leaf = flashmla.FlashMLABackend.__new__(flashmla.FlashMLABackend)
-    leaf.dcp_group = (0, 1)
+    leaf.kvp_group = (0, 1)
     with pytest.raises(RuntimeError, match="absorbed extend"):
         leaf._forward_absorbed_extend(torch.empty(0), layer=None, token_to_kv_pool=None)
 
@@ -156,9 +156,9 @@ def test_kimi_capacity_shards_only_mla():
                 *components[1:],
             ),
             pd_disaggregation_enabled=False,
-            dcp_size=degree,
-            dcp_rank=0,
-            dcp_group=tuple(range(degree)),
+            kvp_size=degree,
+            kvp_rank=0,
+            kvp_group=tuple(range(degree)),
         )
         recipes.append(recipe)
     base, sharded = [r.setup().spec for r in recipes]
@@ -228,7 +228,7 @@ def test_flashmla_shards_merge_to_full_attention(degree):
         )
         assert not local_cache[:128].any()
         out, local = torch.empty_like(table), torch.empty_like(lengths)
-        compact_dcp_pages(
+        compact_kvp_pages(
             table,
             lengths,
             page_size=64,
@@ -256,7 +256,7 @@ def test_compaction_graph_replay_refreshes_lengths_and_owners():
     out, local = torch.empty_like(table), torch.empty_like(lengths)
 
     def refresh():
-        compact_dcp_pages(
+        compact_kvp_pages(
             table,
             lengths,
             page_size=64,
@@ -376,10 +376,10 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     )
     backend = object.__new__(flashmla.FlashMLABackend)
     backend.cache_pool = pool
-    backend.dcp_group = (0, 1)
-    backend.dcp_rank = 0
-    backend.dcp_block_granularity = 4
-    backend.dcp_virtual_block_count = arena.runtime_contract.virtual_block_counts[
+    backend.kvp_group = (0, 1)
+    backend.kvp_rank = 0
+    backend.kvp_block_granularity = 4
+    backend.kvp_virtual_block_count = arena.runtime_contract.virtual_block_counts[
         "full_attention"
     ]
     backend.kv_lora_rank = 512
@@ -437,8 +437,8 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     torch.testing.assert_close(
         torch.cat((local_nope, local_rope), dim=-1), values[[0, 2]].float()
     )
-    assert "dcp_group" not in vars(pool)
-    assert "dcp_rank" not in vars(pool)
+    assert "kvp_group" not in vars(pool)
+    assert "kvp_rank" not in vars(pool)
 
     def gather_owner_rows(local, group):
         assert group == (0, 1)
@@ -523,7 +523,7 @@ def test_unsharded_backends_preserve_physical_slots(kind):
     }[kind]
     backend = object.__new__(cls)
     if kind in ("flashmla", "dsa"):
-        backend.dcp_group = (0,)
+        backend.kvp_group = (0,)
     loc = torch.tensor([0, 3, 8])
     slots, mask = resolve_cache_slots(
         loc, backend.cache_placement(SimpleNamespace(layer_id=0))
@@ -564,9 +564,9 @@ def test_kimi_capacity_fits_physical_parents_with_state_reservations(degree):
         device="cuda",
         components=(replace(components[0], backend_name="flashmla"), *components[1:]),
         pd_disaggregation_enabled=False,
-        dcp_size=degree,
-        dcp_rank=0,
-        dcp_group=tuple(range(degree)),
+        kvp_size=degree,
+        kvp_rank=0,
+        kvp_group=tuple(range(degree)),
     )
     groups = recipe.groups()
     layout = pack(
@@ -617,7 +617,7 @@ def test_gather_owned_rows_masks_nan_and_preserves_order(monkeypatch, shape, gro
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("token_limit", [None, 64, 128, 576])
-def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
+def test_ordinary_mla_kvp_capacity_and_token_limit(degree, token_limit):
     from test.runtime.test_cache_setup import _mla_config
     from types import SimpleNamespace
 
@@ -630,9 +630,9 @@ def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
         config,
         device="cuda",
         components=(replace(config.components[0], backend_name="flashmla"),),
-        dcp_size=degree,
-        dcp_rank=0,
-        dcp_group=tuple(range(degree)),
+        kvp_size=degree,
+        kvp_rank=0,
+        kvp_group=tuple(range(degree)),
     )
     setup = prepare_cache_setup(
         family="mla",
@@ -656,7 +656,7 @@ def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
 
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
-def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
+def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
     from dataclasses import asdict
     from test.runtime.test_cache_setup import _mla_config
     from types import SimpleNamespace
@@ -680,9 +680,9 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
         base,
         device="cuda",
         components=(spec,),
-        dcp_size=degree,
-        dcp_group=tuple(range(degree)),
-        dcp_rank=0,
+        kvp_size=degree,
+        kvp_group=tuple(range(degree)),
+        kvp_rank=0,
     )
     setup = prepare_cache_setup(
         family="dsa",
@@ -720,10 +720,10 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     backend.qk_rope_head_dim = 0
     backend.index_topk = 512
     backend.max_context_len = 512
-    backend.dcp_group = (0, 1, 2, 3)
-    backend.dcp_rank = rank
-    backend.dcp_block_granularity = 64
-    backend.dcp_virtual_block_count = 5
+    backend.kvp_group = (0, 1, 2, 3)
+    backend.kvp_rank = rank
+    backend.kvp_block_granularity = 64
+    backend.kvp_virtual_block_count = 5
     backend.qcp_group = (0,)
     # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
     # combine form.
@@ -750,7 +750,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     )
 
     def gather(q, group):
-        assert group == backend.dcp_group
+        assert group == backend.kvp_group
         return q.repeat(1, 4, 1)
 
     def decode(**kwargs):
@@ -762,7 +762,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
         return torch.full((1, 8, 128), 7.0), torch.zeros(1, 8)
 
     def combine(out, lse, *, group, rank, sink, keep_all_heads):
-        assert sink is None and group == backend.dcp_group
+        assert sink is None and group == backend.kvp_group
         assert keep_all_heads is False
         assert lse.shape == out.shape[:-1]
         return out[:, rank * 2 : (rank + 1) * 2]

@@ -1385,8 +1385,8 @@ def run_event_loop(
         process_title += f"_ep{mapping.moe.ep_rank}"
     if mapping.attn.has_dp:
         process_title += f"_dp{dp_rank}"
-    if mapping.attn.has_dcp:
-        process_title += f"_dcp{mapping.attn.dcp_rank}"
+    if mapping.attn.has_kvp:
+        process_title += f"_kvp{mapping.attn.kvp_rank}"
     if mapping.has_pp:
         process_title += f"_pp{mapping.pp_rank}"
     setproctitle.setproctitle(process_title)
