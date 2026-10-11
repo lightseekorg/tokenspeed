@@ -762,7 +762,9 @@ def gluon_dsa_kpool_prefill_logits_gfx1250(
         pool_offset: First global pool represented by output column zero.
         window_cols: Output columns in the local scoring window.
         softmax_scale: Scale applied after weighted per-head ReLU reduction.
-        ordered_head_fold: Whether to fold heads in logical order.
+        ordered_head_fold: Whether the caller requires heads folded in
+            logical order. GFX1250 always folds heads in logical order, its
+            fastest reduction, so both values return identical scores.
         out: Optional contiguous FP32 scoring workspace.
         row_ends_out: Optional contiguous int32 local exclusive bounds.
 
@@ -860,7 +862,6 @@ def gluon_dsa_kpool_prefill_logits_gfx1250(
         BLOCK_N=_KPOOL_SCORE_BLOCK_N,
         WINDOW_COLS=window_cols,
         NUM_WARPS=num_warps,
-        ORDERED_HEAD_FOLD=ordered_head_fold,
         USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
         USE_BUFFER_STORE=out.nbytes < 2**31,
         num_warps=num_warps,
@@ -900,7 +901,9 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         pool_offset: First request-local pool represented by output column zero.
         window_cols: Output columns in the local scoring window.
         softmax_scale: Scale applied after weighted per-head ReLU reduction.
-        ordered_head_fold: Whether to fold heads in logical order.
+        ordered_head_fold: Whether the caller requires heads folded in
+            logical order. GFX1250 always folds heads in logical order, its
+            fastest reduction, so both values return identical scores.
         out: Optional contiguous FP32 scoring workspace.
         row_ends_out: Optional contiguous int32 local exclusive bounds.
 
@@ -988,7 +991,6 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         BLOCK_N=_KPOOL_SCORE_BLOCK_N,
         WINDOW_COLS=window_cols,
         NUM_WARPS=num_warps,
-        ORDERED_HEAD_FOLD=ordered_head_fold,
         USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
         USE_BUFFER_STORE=out.nbytes < 2**31,
         num_warps=num_warps,

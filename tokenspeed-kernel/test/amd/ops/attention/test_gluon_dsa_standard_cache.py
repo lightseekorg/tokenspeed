@@ -628,6 +628,99 @@ def test_standard_cache_decode_cuda_graph_replays_changed_inputs(q_len: int) -> 
     _assert_topk(out, lens_out, expected, expected_lens)
 
 
+def _standard_prefill_logits_gfx1250(
+    query: torch.Tensor,
+    scales: torch.Tensor | None,
+    cache: torch.Tensor,
+    weights: torch.Tensor,
+    slots: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    logits: torch.Tensor,
+    *,
+    softmax_scale: float,
+    use_buffer: bool,
+) -> None:
+    """Launch the GFX1250 prefill scorer with the launcher's tile constants."""
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa import sparse_mla
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (
+        gluon_dsa_prefill_topk_standard_gfx1250,
+    )
+
+    scale_arg = scales if scales is not None else weights
+    num_warps = sparse_mla._STANDARD_PREFILL_NUM_WARPS
+    gluon_dsa_prefill_topk_standard_gfx1250[(query.shape[0], 1)](
+        query,
+        scale_arg,
+        cache.view(torch.float8_e4m3fn),
+        cache.view(torch.float32),
+        weights,
+        slots,
+        starts,
+        ends,
+        starts,
+        logits,
+        *query.stride(),
+        *scale_arg.stride(),
+        *weights.stride(),
+        logits.stride(0),
+        softmax_scale,
+        logits.shape[1],
+        PAGE_SIZE=_PAGE_SIZE,
+        PAGE_STRIDE_BYTES=_PAGE_SIZE * cache.stride(0),
+        NUM_HEADS=query.shape[1],
+        HEAD_DIM=_HEAD_DIM,
+        BLOCK_N=sparse_mla._STANDARD_PREFILL_BLOCK_N,
+        NUM_WARPS=num_warps,
+        Q_IS_FP8=scales is not None,
+        USE_BUFFER_LOAD=use_buffer,
+        USE_BUFFER_STORE=use_buffer,
+        num_warps=num_warps,
+        waves_per_eu=sparse_mla._STANDARD_PREFILL_WAVES_PER_EU,
+    )
+
+
+@pytest.mark.skipif(not is_cdna5(), reason="GFX1250 logical head fold")
+def test_standard_prefill_logits_fold_64_heads_in_logical_order() -> None:
+    # Heads 30..33 straddle the two 32-head WMMA groups. A sequential FP32 sum
+    # absorbs the first +1 into 1e8 and keeps the last one; summing each group
+    # first absorbs both and returns zero.
+    heads, rows, width = 64, 1, _PAGE_SIZE
+    query = torch.zeros((rows, heads, _HEAD_DIM), device=_DEVICE)
+    query[:, :, 0] = 1.0
+    query = query.to(torch.bfloat16)
+    weights = torch.zeros((rows, heads), device=_DEVICE)
+    weights[0, 30:34] = torch.tensor((1.0e8, 1.0, -1.0e8, 1.0), device=_DEVICE)
+    keys = torch.zeros((width, _HEAD_DIM), device=_DEVICE)
+    keys[:, 0] = 1.0
+    cache, _, key_fp8, key_scales = _pack_standard_cache(keys)
+    slots = torch.arange(width, device=_DEVICE, dtype=torch.int64)
+    starts = torch.zeros((rows,), device=_DEVICE, dtype=torch.int32)
+    ends = torch.full((rows,), width, device=_DEVICE, dtype=torch.int32)
+    logits = torch.empty((rows, width), device=_DEVICE)
+
+    _standard_prefill_logits_gfx1250(
+        query,
+        None,
+        cache,
+        weights,
+        slots,
+        starts,
+        ends,
+        logits,
+        softmax_scale=1.0,
+        use_buffer=True,
+    )
+
+    head_score = key_fp8[:, 0].float()
+    expected = torch.zeros((width,), device=_DEVICE)
+    for head in range(heads):
+        expected += head_score * weights[0, head]
+    expected = expected * key_scales[:, 0]
+    torch.testing.assert_close(logits[0], expected, atol=0, rtol=0)
+    assert (expected > 0).all()
+
+
 @pytest.mark.skipif(not is_cdna5(), reason="GFX1250 memory layouts")
 @pytest.mark.parametrize("heads", (32, 64))
 @pytest.mark.parametrize("q_dtype", (torch.bfloat16, torch.float8_e4m3fn))
@@ -635,10 +728,6 @@ def test_standard_cache_decode_cuda_graph_replays_changed_inputs(q_len: int) -> 
 def test_standard_prefill_logits_graph_refresh_and_memory_paths(
     heads: int, q_dtype: torch.dtype, use_buffer: bool
 ) -> None:
-    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.standard_cache_logits import (
-        gluon_dsa_prefill_topk_standard_gfx1250,
-    )
-
     generator = _generator(821 + heads)
     rows, width = 4, 641
     keys = torch.randn((704, _HEAD_DIM), device=_DEVICE, generator=generator) * 0.15
@@ -649,37 +738,19 @@ def test_standard_prefill_logits_graph_refresh_and_memory_paths(
     starts = torch.tensor((0, 7, 63, 64), device=_DEVICE, dtype=torch.int32)
     ends = torch.tensor((641, 529, 64, 64), device=_DEVICE, dtype=torch.int32)
     logits = torch.empty((rows, width), device=_DEVICE, dtype=torch.float32)
-    scale_arg = scales if scales is not None else weights
 
     def invoke() -> None:
-        gluon_dsa_prefill_topk_standard_gfx1250[(rows, 1)](
+        _standard_prefill_logits_gfx1250(
             query,
-            scale_arg,
-            cache.view(torch.float8_e4m3fn),
-            cache.view(torch.float32),
+            scales,
+            cache,
             weights,
             slots,
             starts,
             ends,
-            starts,
             logits,
-            *query.stride(),
-            *scale_arg.stride(),
-            *weights.stride(),
-            logits.stride(0),
-            _SOFTMAX_SCALE,
-            width,
-            PAGE_SIZE=_PAGE_SIZE,
-            PAGE_STRIDE_BYTES=_PAGE_SIZE * cache.stride(0),
-            NUM_HEADS=heads,
-            HEAD_DIM=_HEAD_DIM,
-            BLOCK_N=128,
-            NUM_WARPS=8,
-            Q_IS_FP8=scales is not None,
-            USE_BUFFER_LOAD=use_buffer,
-            USE_BUFFER_STORE=use_buffer,
-            num_warps=8,
-            waves_per_eu=1,
+            softmax_scale=_SOFTMAX_SCALE,
+            use_buffer=use_buffer,
         )
 
     invoke()

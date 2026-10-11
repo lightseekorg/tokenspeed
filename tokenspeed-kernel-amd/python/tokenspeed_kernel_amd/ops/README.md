@@ -221,24 +221,23 @@ until the first call in an unwarmed range.
 
 ### gfx1250 standard-cache DSA and KPool scoring
 
-Standard-cache DSA prefill loads eight adjacent FP8 key bytes per lane.
-KPool uses sixteen bytes for unplanned scoring and planned scoring with
-ordered head reduction. Both convert the loaded keys to the existing WMMA
-operand layout before arithmetic. The mode flags already select these paths;
-this adds no request-size specialization. Standard decode and planned KPool
-with parallel head reduction keep their original key layouts, since the
-conversion did not improve those paths.
+Each program scores 32 or 64 heads of one query row against key tiles with
+WMMA. One layout conversion then gives each lane all heads of one output
+column, and the lane adds the weighted ReLU scores in logical head order with
+register adds. This beats the cross-lane tree reduction of `gl.sum`, so every
+path uses it and the scores are deterministic. The KPool `ordered_head_fold`
+argument therefore selects nothing on gfx1250; it remains for the stage
+interface shared with gfx950.
 
-Ordered KPool head reduction redistributes the contributions once so that
-each lane owns all 32 heads of its output columns. It accumulates in the
-original head order and keeps that layout through key scaling and output
-stores, avoiding repeated LDS gathers and a conversion back to the WMMA
-layout. Parallel head reduction is unchanged.
+Standard-cache DSA prefill loads eight adjacent FP8 key bytes per lane and
+KPool loads sixteen. Both convert the keys to the WMMA operand layout before
+arithmetic. Standard decode keeps loading in the operand layout, since the
+conversion did not improve that path.
 
-The cache format, query scaling, weighted ReLU, reduction order, row bounds,
-and top-k contracts are unchanged. Tests cover BF16/FP8 queries, both head
-counts, buffer/global memory paths, ragged windows, padded KPool pages, and
-CUDA graph replay after changing inputs.
+The cache format, query scaling, weighted ReLU, row bounds, and top-k
+contracts are unchanged. Tests cover BF16/FP8 queries, both head counts,
+buffer/global memory paths, ragged windows, padded KPool pages, and CUDA graph
+replay after changing inputs.
 
 ### DeepSeek V4 attention
 
