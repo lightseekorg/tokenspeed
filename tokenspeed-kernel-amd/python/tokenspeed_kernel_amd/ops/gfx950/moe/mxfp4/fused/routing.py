@@ -1068,8 +1068,9 @@ def _route_from_topk_torch(
 _PRECOMPUTED_ROUTE_CHUNK = 64
 _PRECOMPUTED_ROUTE_WARPS = 8
 # Every program re-reads all G ids to build the expert histogram, so the
-# total work grows as G^2 / chunk: 56 us at G=49152 vs 170 us for the torch
-# route, about even near G=10^5. Larger routes use _route_from_topk_torch.
+# total work grows as G^2 / chunk while the torch route grows about linearly.
+# The cap sits below the measured crossover; larger routes use
+# _route_from_topk_torch.
 PRECOMPUTED_ROUTE_MAX_G = 65536
 
 
@@ -1130,7 +1131,7 @@ def _precomputed_topk_route(
     start = pid * CH
 
     # Expert histogram of all rows and of the rows before this chunk, by LDS
-    # atomics (gl.histogram's per-bin ballots cost ~1 us per 128 rows here).
+    # atomics; gl.histogram's per-bin ballots measured much slower here.
     LH: gl.constexpr = gl.BlockedLayout([4], [64], [NUM_WARPS], [0])
     HT: gl.constexpr = 4 * 64 * NUM_WARPS
     SL: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
