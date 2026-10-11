@@ -599,11 +599,15 @@ cudaError_t mnnvl_launch_twoshot(AllReduceFusionParams<T> const& params, MnnvlCo
   return cudaSuccess;
 }
 
-template <AllReduceFusionPattern Pattern, typename T, int NRanks>
+// Fp32AccKernels = false instantiates only the kernels of the sum in T, for a
+// caller that never passes fp32_acc.
+template <AllReduceFusionPattern Pattern, typename T, int NRanks, bool Fp32AccKernels = true>
 cudaError_t mnnvl_allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& params,
                                                    MnnvlCommArgs const& comm, bool launch_with_pdl,
                                                    bool fp32_acc) {
   static constexpr int VEC_SIZE = details::kBytesPerAccess / sizeof(T);
+  FLASHINFER_CHECK(Fp32AccKernels || !fp32_acc,
+                   "mnnvl allreduce fusion: fp32_acc kernels are not instantiated");
   FLASHINFER_CHECK(params.size % params.hidden_dim == 0, "params.size % params.hidden_dim != 0");
   int token_num = params.size / params.hidden_dim;
   bool const use_twoshot = !params.use_oneshot;
@@ -632,14 +636,14 @@ cudaError_t mnnvl_allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> cons
   cfg.numAttrs = 2;
 
   if (use_twoshot) {
-    if constexpr (!std::is_same_v<T, float>) {
+    if constexpr (Fp32AccKernels && !std::is_same_v<T, float>) {
       if (fp32_acc) {
         return mnnvl_launch_twoshot<Pattern, T, NRanks, true>(params, comm, cfg);
       }
     }
     return mnnvl_launch_twoshot<Pattern, T, NRanks, false>(params, comm, cfg);
   }
-  if constexpr (!std::is_same_v<T, float>) {
+  if constexpr (Fp32AccKernels && !std::is_same_v<T, float>) {
     if (fp32_acc) {
       return mnnvl_launch_oneshot<Pattern, T, NRanks, true>(params, comm, cfg);
     }

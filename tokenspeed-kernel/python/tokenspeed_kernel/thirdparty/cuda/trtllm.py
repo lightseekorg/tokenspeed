@@ -121,6 +121,10 @@ class AllReduceFusionPattern:
     kARResidualRMSNormPartialOut = 8
     kARResidualAttnResCombine = 9
     kAllReduceLatentNorm = 10
+    # The pre/post ("sandwich") norm boundary: MNNVL only, BF16, launched by
+    # trtllm_mnnvl_sandwich_norm_allreduce (its own binding); the generic
+    # trtllm_allreduce_fusion dispatchers refuse it.
+    kARSandwichResidualRMSNorm = 11
 
 
 class AllGatherFusionPattern:
@@ -300,6 +304,9 @@ _MNNVL_SUPPORTED_PATTERNS = frozenset(
         # no IPC and the alternative is NCCL, which mnnvl beats ~3.3x --
         # excluding it there crashed K3's latent-MoE tail with no fallback.
         AllReduceFusionPattern.kAllReduceLatentNorm,
+        # Served by trtllm_mnnvl_sandwich_norm_allreduce, not by the generic
+        # mnnvl dispatcher; listed so the workspace check admits its shapes.
+        AllReduceFusionPattern.kARSandwichResidualRMSNorm,
     }
 )
 
@@ -536,6 +543,76 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
         buffer_flags=buffer_flags,
         oneshot_token_cap=oneshot_token_cap,
         refs=(buf, handle),
+    )
+
+
+def trtllm_mnnvl_sandwich_norm_allreduce(
+    workspace: MnnvlAllReduceFusionWorkspace,
+    allreduce_in: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_norm_gamma: torch.Tensor,
+    rms_gamma: torch.Tensor,
+    norm_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    *,
+    world_rank: int,
+    use_oneshot: bool,
+    rms_eps: float,
+    x_scale: float,
+    residual_scale: float,
+    trigger_completion_at_end: bool = True,
+    launch_with_pdl: Optional[bool] = None,
+) -> None:
+    """Launch the pre/post norm boundary (kARSandwichResidualRMSNorm) on ``workspace``.
+
+    The MNNVL one-shot or two-shot all-reduce of ``allreduce_in`` with the
+    epilogue of trtllm_mnnvl_sandwich_norm.cuh: ``a = RMSNorm(sum;
+    post_norm_gamma)``, ``residual_out = RN(RN(x_scale * a) +
+    RN(residual_scale * residual_in))``, ``norm_out = RMSNorm(residual_out;
+    rms_gamma)``, both norms with ``rms_eps``. All tensors are contiguous
+    BF16; ``use_oneshot`` is the strategy ``workspace.resolve_use_oneshot``
+    gave for this call.
+
+    Raises:
+        RuntimeError: the workspace does not serve this shape and strategy.
+    """
+    token_num, hidden_dim = allreduce_in.shape
+    world_size = workspace.tp_size
+    if not workspace.supports(
+        token_num,
+        hidden_dim,
+        allreduce_in.dtype,
+        world_size,
+        AllReduceFusionPattern.kARSandwichResidualRMSNorm,
+        use_oneshot=use_oneshot,
+    ):
+        raise RuntimeError(
+            "mnnvl workspace does not serve this sandwich norm call "
+            f"(token_num={token_num}, hidden_dim={hidden_dim}, "
+            f"dtype={allreduce_in.dtype}, use_oneshot={use_oneshot})"
+        )
+    launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
+    _load_trtllm_comm_module().trtllm_mnnvl_sandwich_norm_allreduce(
+        allreduce_in,
+        residual_in,
+        post_norm_gamma,
+        rms_gamma,
+        norm_out,
+        residual_out,
+        world_size,
+        world_rank,
+        token_num,
+        hidden_dim,
+        workspace.multicast_ptr,
+        workspace.local_ptr,
+        workspace.peer_ptrs,
+        workspace.buffer_flags,
+        launch_with_pdl,
+        use_oneshot,
+        trigger_completion_at_end,
+        float(rms_eps),
+        float(x_scale),
+        float(residual_scale),
     )
 
 
