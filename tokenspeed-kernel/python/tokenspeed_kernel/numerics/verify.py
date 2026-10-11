@@ -171,7 +171,7 @@ def verify_kernel(
                 f"got actual={type(actual)!r}, expected={type(expected)!r}"
             )
 
-        tol = tol_fn(dtype, inputs=inputs, **shape)
+        tol = tol_fn(dtype, inputs=inputs, expected=expected, **shape)
         result = compare_outputs(actual, expected, tolerance=tol)
         if verbose:
             print(format_comparison(result, f"{kernel_name} shape={shape}"))

@@ -45,12 +45,15 @@ _ATOL = {
     torch.float16: 1.5e-2,
     torch.bfloat16: 1.5e-2,
     # fp8 inputs: the reference dequantizes exactly and the GEMMs emit bf16, so
-    # the same output-cast floor applies. Kernels accumulate in fp32, or on
-    # sm90 promote the tensor-core accumulator to fp32 at every scale block,
-    # which keeps accumulation error well below the floor at any K.
+    # the same output-cast floor applies to outputs of unit scale. FP8 matrix
+    # instructions (e.g. gfx950 MFMA) do not accumulate their products exactly
+    # in fp32, so a small output from heavily cancelling terms can be off by
+    # more than the floor; tolerance() scales the fp8 atol by the output RMS.
     torch.float8_e4m3fn: 1.5e-2,
     torch.float8_e4m3fnuz: 1.5e-2,
 }
+
+_FP8_DTYPES: set[torch.dtype] = {torch.float8_e4m3fn, torch.float8_e4m3fnuz}
 
 # Dtypes whose GEMM error is set by the output cast rather than by K.
 _OUTPUT_CAST_BOUND_DTYPES: set[torch.dtype] = {
@@ -66,6 +69,7 @@ def tolerance(
     *,
     K: int | None = None,
     inputs: dict[str, Any] | None = None,
+    expected: torch.Tensor | None = None,
     acc_dtype: torch.dtype = torch.float32,
     **_: Any,
 ) -> Tolerance:
@@ -76,7 +80,11 @@ def tolerance(
       dtype's rounding floor, so error is dominated by the final cast.
     - fp8: K-independent for the same reason. The reference dequantizes the
       FP8 operands exactly, so any error that grows with K is a kernel
-      accumulation bug, not quantization noise.
+      accumulation bug, not quantization noise. Given the reference output
+      ``expected``, atol scales with its RMS (at least 1): FP8 matrix
+      instructions round their product sums, so the absolute error follows the
+      output's magnitude rather than each element's. Without ``expected`` the
+      unit-scale floor applies.
     """
     if dtype not in _ATOL:
         raise KeyError(f"No GEMM tolerance baseline for dtype={dtype}")
@@ -93,7 +101,11 @@ def tolerance(
         scale = math.sqrt(max(K, 1) / 128.0)
     if acc_dtype != torch.float32:
         scale *= 8.0
-    return Tolerance(atol=base * scale, rtol=base * scale)
+    atol = base * scale
+    if dtype in _FP8_DTYPES and expected is not None and expected.numel():
+        rms = float(expected.float().pow(2).mean().sqrt())
+        atol *= max(rms, 1.0)
+    return Tolerance(atol=atol, rtol=base * scale)
 
 
 set_family_tolerance("gemm", tolerance)

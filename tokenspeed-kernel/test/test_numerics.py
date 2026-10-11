@@ -87,6 +87,18 @@ def test_gemm_tolerance_stays_at_output_cast_floor(dtype: torch.dtype) -> None:
         assert gemm_tolerance(dtype, K=k) == Tolerance(atol=1.5e-2, rtol=1.5e-2)
 
 
+def test_gemm_fp8_atol_scales_with_output_rms() -> None:
+    # FP8 matrix instructions round their product sums, so a small output from
+    # cancelling terms carries error proportional to the output's scale.
+    expected = torch.full((4, 4), 300.0)
+    scaled = gemm_tolerance(_fp8_dtype, K=7168, expected=expected)
+    assert scaled == Tolerance(atol=1.5e-2 * 300.0, rtol=1.5e-2)
+    # Outputs below unit scale keep the floor; BF16 inputs are unaffected.
+    small = torch.full((4, 4), 0.25)
+    assert gemm_tolerance(_fp8_dtype, K=7168, expected=small).atol == 1.5e-2
+    assert gemm_tolerance(torch.bfloat16, K=7168, expected=expected).atol == 1.5e-2
+
+
 def test_gemm_input_generator_uses_signature_scale_metadata() -> None:
     scale = ScaleFormat(
         storage_dtype=torch.float32,
