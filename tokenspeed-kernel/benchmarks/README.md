@@ -176,10 +176,11 @@ settle a verdict. The comparison runs every case once per revision, then
 re-measures only the cases outside their budgets in further rounds. Each
 round starts fresh baseline and candidate processes, and the revision that runs
 first alternates between rounds. The round with the median relative change
-supplies the reported times and the verdict. If the rounds' relative changes
-spread wider than the whole within-budget band, twice the relative limit, they
-cannot tell a regression from an improvement of the budgeted size, and the
-result is inconclusive.
+supplies the reported times and the verdict. If one round finds a regression
+and another an improvement, the measurement cannot tell the direction, and the
+result is inconclusive. A wide spread alone does not void the verdict: noise
+grows with the size of the change, so a large regression that every round
+reproduces still fails.
 
 ## Running a suite
 

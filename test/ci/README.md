@@ -327,7 +327,7 @@ possible. Direct manual worker runs on AMD retain Proton as their default.
 A benchmark fails only when it exceeds both its merge-base relative and absolute
 regression limits in the median of three measurement rounds. Only cases that the
 first round finds outside their budgets are re-measured, so a passing run costs
-no extra time. Rounds that disagree too much to support a verdict, and successful
+no extra time. Rounds that disagree on the direction of the change, and successful
 added, changed, or missing cases, remain informational. Correctness, execution, environment, and
 infrastructure failures fail the task.
 

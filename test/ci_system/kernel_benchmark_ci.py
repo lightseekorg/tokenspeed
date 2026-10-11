@@ -277,17 +277,18 @@ def _measurement_comparison(
     detail = _CLASSIFICATION_DETAILS[classification]
     if len(rounds) > 1:
         first_classification = _classify(policy, rounds[0])
-        low = min(item["delta_percent"] for item in rounds)
-        high = max(item["delta_percent"] for item in rounds)
-        band_percent = 200.0 * policy["max_regression_relative"]
-        if classification != "within_budget" and high - low > band_percent:
-            # Rounds spread wider than the whole within-budget band cannot
-            # tell a regression from an improvement of the budgeted size.
+        round_classifications = {_classify(policy, item) for item in rounds}
+        # Only rounds on opposite sides of the budgets void the median. The
+        # width of the spread alone does not: noise grows with the change, so
+        # a large regression measured in every round can still spread widely.
+        if {"regression", "improvement"} <= round_classifications:
+            low = min(item["delta_percent"] for item in rounds)
+            high = max(item["delta_percent"] for item in rounds)
             classification = "inconclusive"
             detail = (
                 f"changes across {len(rounds)} measurement rounds range from "
-                f"{low:+.2f}% to {high:+.2f}%, wider than the "
-                f"{band_percent:.2f}% budget band"
+                f"{low:+.2f}% to {high:+.2f}%, both a regression and an "
+                "improvement beyond the budgets"
             )
         elif classification != first_classification:
             detail = (

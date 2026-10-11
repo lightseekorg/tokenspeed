@@ -264,17 +264,18 @@ def test_compare_classifies_non_regressions(base_time, candidate_time, classific
             10.1,
             "first round's regression did not reproduce",
         ),
+        # A large regression stays decisive however widely its rounds spread.
         (
-            [(10.0, 12.2), (10.0, 11.9)],
+            [(10.0, 15.0), (10.0, 18.0)],
             "regression",
-            12.0,
+            15.0,
             "median of 3 measurement rounds",
         ),
         (
             [(10.0, 7.0), (10.0, 12.5)],
             "inconclusive",
             12.0,
-            "wider than the 20.00% budget band",
+            "both a regression and an improvement",
         ),
     ],
 )
