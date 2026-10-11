@@ -1114,6 +1114,50 @@
         "max_regression_relative": 0.05,
         "max_regression_absolute_us": 5.0
       }
+    },
+    {
+      "id": "dsv41_flash.gemm.grouped_bf16_projection/tp4-wo_a-decode-g2-n1024-k4096-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "grouped_bf16_projection",
+        "parameters": {
+          "groups": 2,
+          "M": [6, 192],
+          "N": 1024,
+          "K": 4096,
+          "x_token_stride": 32768,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5532
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.grouped_bf16_projection/tp4-wo_a-prefill-g2-n1024-k4096-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "grouped_bf16_projection",
+        "parameters": {
+          "groups": 2,
+          "M": [1024, 8192],
+          "N": 1024,
+          "K": 4096,
+          "x_token_stride": 8192,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5533
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0
+      }
     }
   ]
 }

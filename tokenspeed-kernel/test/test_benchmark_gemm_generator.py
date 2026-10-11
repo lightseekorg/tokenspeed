@@ -598,3 +598,112 @@ def test_dense_bmm_gluon_registration_graph_replay(selection, selection_mode):
     assert result.correctness is not None
     assert result.correctness["passed"] is True
     assert result.correctness["runs"] == 3
+
+
+def _grouped_projection_request(**updates) -> BenchmarkRequest:
+    parameters = {
+        "groups": 2,
+        "M": 3,
+        "N": 8,
+        "K": 16,
+        "x_token_stride": 64,
+        "dtype": "bfloat16",
+    }
+    parameters.update(updates)
+    return BenchmarkRequest(
+        family="gemm",
+        mode="grouped_bf16_projection",
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+def _cpu_random_tensors(_seed, dtype, *shapes):
+    return [torch.zeros(shape, dtype=dtype) for shape in shapes]
+
+
+@pytest.mark.parametrize(
+    ("updates", "match"),
+    [
+        ({"extra": 1}, "Unknown"),
+        ({"groups": 0}, "groups"),
+        ({"x_token_stride": 31}, "x_token_stride"),
+        ({"dtype": "float16"}, "dtype"),
+    ],
+)
+def test_grouped_bf16_projection_rejects_invalid_parameters(updates, match):
+    with pytest.raises(BenchmarkCaseError, match=match):
+        gemm_generator.prepare_grouped_bf16_projection(
+            _grouped_projection_request(**updates), None
+        )
+
+
+@pytest.mark.parametrize("x_token_stride", [32, 128])
+def test_grouped_bf16_projection_selection_matches_operation_api(
+    monkeypatch, x_token_stride
+):
+    from tokenspeed_kernel.ops import gemm as gemm_ops
+
+    captured = {}
+
+    def capture_operation(_family, _mode, signature, *, traits, **_kwargs):
+        captured["operation"] = (signature, traits)
+        raise RuntimeError("selection captured")
+
+    def capture_generator(_request, _platform, signature, traits, _shape):
+        captured["generator"] = (signature, traits)
+        raise RuntimeError("selection captured")
+
+    monkeypatch.setattr(gemm_ops, "select_kernel", capture_operation)
+    monkeypatch.setattr(gemm_generator, "_random_tensors", _cpu_random_tensors)
+    monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(gemm_generator, "_select_registration", capture_generator)
+
+    rows = torch.zeros((3, x_token_stride), dtype=torch.bfloat16)
+    x = rows[:, :32].unflatten(1, (2, 16))
+    weight = torch.zeros((2, 8, 16), dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="selection captured"):
+        gemm_ops.grouped_bf16_projection(x, weight, None, None)
+    with pytest.raises(RuntimeError, match="selection captured"):
+        gemm_generator.prepare_grouped_bf16_projection(
+            _grouped_projection_request(x_token_stride=x_token_stride), None
+        )
+
+    assert captured["generator"] == captured["operation"]
+
+
+def test_grouped_bf16_projection_times_strided_view_without_out(
+    mi350_platform, monkeypatch
+):
+    spec = KernelSpec(
+        name="unit_grouped_projection",
+        family="gemm",
+        mode="grouped_bf16_projection",
+        solution="unit",
+        format_signatures=frozenset(),
+        traits={},
+    )
+    calls = []
+    monkeypatch.setattr(gemm_generator, "_random_tensors", _cpu_random_tensors)
+    monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(
+        gemm_generator,
+        "_select_registration",
+        lambda *_args: (spec, lambda *args: calls.append(args)),
+    )
+
+    prepared = gemm_generator.prepare_grouped_bf16_projection(
+        _grouped_projection_request(), mi350_platform
+    )
+    prepared.invocation.invoke()
+
+    ((x, weight, out),) = calls
+    assert x.shape == (3, 2, 16)
+    assert x.stride() == (64, 16, 1)
+    assert weight.shape == (2, 8, 16)
+    assert weight.is_contiguous()
+    assert out is None
+    assert prepared.parameters["x_token_stride"] == 64
