@@ -635,7 +635,9 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         global_cb = 1
 
     tile_k = _tile_k()
-    head_groups = triton.cdiv(q.shape[1], 16)
+    # All heads share the KV rows; a wider head block gathers them once.
+    block_h = min(64, max(16, triton.next_power_of_2(q.shape[1])))
+    head_groups = triton.cdiv(q.shape[1], block_h)
     max_tiles = triton.cdiv(swa_slots_i.shape[1], tile_k) + triton.cdiv(
         global_width, tile_k
     )
@@ -697,7 +699,7 @@ def launch_gluon_dsv41_selected_attention_gfx950(
         SWA_CB=swa_cache.stride(2),
         GLOBAL_CR=global_cr,
         GLOBAL_CB=global_cb,
-        BLOCK_H=16,
+        BLOCK_H=block_h,
         TILE_K=tile_k,
         HEAD_DIM=_HEAD_DIM,
         NUM_SPLITS=num_splits,
