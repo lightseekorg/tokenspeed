@@ -169,9 +169,8 @@ rows on weights of at least 2**26 elements, use the prefill kernel above.
   unit inner stride and an explicit `[1, 32]` scale block.
 - Output is BF16 or FP16. A caller-owned output may have a padded row stride,
   but its inner stride must be one.
-- Products are exact and accumulate in FP32, meeting the FP8 GEMM tolerance
-  at any K. Scale codes 1..254 are exact; code 255 gives infinity (as
-  `exp2`) and code 0 gives 0 rather than 2^-127.
+- Products are exact and accumulate in FP32. Scale codes 1..254 are exact;
+  code 255 gives infinity (as `exp2`) and code 0 gives 0 rather than 2^-127.
 - `M` is a runtime argument and is not specialized. The tile configuration
   comes from the smallest M bucket (16, 32, 64, 128, 256) covering `M`:
   measured per bucket for the V4.1 TP4 projection shapes, a heuristic
@@ -188,14 +187,15 @@ so each warp writes one contiguous KiB. Each K tile's scales are loaded into
 registers just before its values, so the in-order wait for the values also
 covers the scales; dword-aligned scale rows load four groups per dword.
 
-gfx950 FP8 MFMAs sum their products at reduced internal precision, which
-misses the FP8 GEMM tolerance on small results of large cancelling terms.
-Instead, each 32-value scale group is read from LDS, upcast exactly to BF16
-(`v_cvt_scalef32_pk_bf16_fp8`), and fed to one `16 x 16 x 32` BF16 MFMA, so
-its products are exact and only the FP32 sum rounds. A tile issues all of
-its group MFMAs first, then multiplies each partial by the outer product of
-its power-of-two row and column scales, which is exact, and adds it to the
-FP32 accumulator.
+The math runs in BF16, one 32-value scale group per `16 x 16 x 32` BF16
+MFMA. Each group's E4M3 values are read from LDS in the BF16 operand layout
+and upcast to BF16 (`v_cvt_scalef32_pk_bf16_fp8`), which every E4M3 value
+fits exactly, so the MFMA's products are exact and only its FP32 sum rounds.
+A tile issues all of its group MFMAs first so their latency overlaps, then
+multiplies each group's partial by the outer product of its row and column
+scales and adds it to the FP32 accumulator. The scales are powers of two,
+formed by placing the UE8M0 code in the FP32 exponent field, so the multiply
+is exact.
 
 Activation rows past `M` are masked (no traffic), weight rows past `N` are
 clamped, a K tail is zero-filled, and stores are masked. Split-K uses the
