@@ -39,7 +39,7 @@ cd tokenspeed
 
 ### Nightly wheels
 
-On a CUDA 13 GPU host, in an activated Python 3.10–3.13 environment:
+On a CUDA 13 GPU host, in an activated Python 3.11–3.13 environment:
 
 ```bash
 python -m pip install --upgrade tokenspeed --extra-index-url https://lightseek.org/whl/nightly
@@ -53,7 +53,7 @@ python -m pip install "tokenspeed==0.1.0.post20260930" --extra-index-url https:/
 ```
 
 For ROCm 7.2 on Linux x86_64, first install ROCm PyTorch in a fresh Python
-3.10–3.13 environment, then use the separate ROCm nightly index:
+3.11–3.13 environment, then use the separate ROCm nightly index:
 
 ```bash
 python -m pip install "torch==2.14.0" "torchvision==0.29.0" \

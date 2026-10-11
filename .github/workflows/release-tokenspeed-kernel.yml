@@ -200,6 +200,13 @@ jobs:
           - version: "3.13"
             tag: cp313-cp313
         cuda: ${{ fromJSON(needs.metadata.outputs.cuda_matrix) }}
+        nightly:
+          - ${{ needs.metadata.outputs.nightly == 'true' }}
+        exclude:
+          - nightly: true
+            python:
+              version: "3.10"
+              tag: cp310-cp310
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
