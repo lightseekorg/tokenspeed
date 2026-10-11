@@ -148,6 +148,19 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return "mxint4"
             if weight_quant.type == QuantizationType.FLOAT:
                 return "mxfp4"
+        if self._is_fp8_w8a8(weight_quant, input_quant) and (
+            weight_quant.num_bits == input_quant.num_bits == 8
+        ):
+            # FP8 E4M3 experts with one FP32 scale per output channel (a
+            # per-tensor scale fills its channels); the MoE kernel quantizes
+            # its input per token.
+            if not input_quant.dynamic:
+                raise ValueError(
+                    "compressed-tensors FP8 experts with a static input scale are "
+                    "not supported: the FP8 channel MoE quantizes its input per "
+                    "token"
+                )
+            return "fp8_channel"
         raise ValueError(
             f"unsupported compressed-tensors MoE scheme for kernel selection: "
             f"{weight_quant}"
