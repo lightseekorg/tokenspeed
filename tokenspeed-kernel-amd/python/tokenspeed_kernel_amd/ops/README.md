@@ -105,8 +105,10 @@ share a weight tile on one XCD's L2.
 ### gfx950 MXFP8 projection
 
 The gfx950 package provides a prefill-oriented MXFP8 GEMM for DeepSeek V4.1
-dense projections. Automatic selection uses it above 256 rows; smaller row
-counts belong to weight-bandwidth-bound decode kernels.
+dense projections. Automatic selection uses it above 256 rows, and from 64
+rows for weights of at least 2**26 elements (V4.1 25600x6144 and 5120x15360),
+where streaming the weight once per row tile no longer pays off; other row
+counts belong to the weight-bandwidth-bound decode kernel below.
 
 #### Contract
 
@@ -151,6 +153,45 @@ Launches that leave most CUs idle with a long K walk (medium `M` with small
 `gluon_mm_mxfp8_reduce_gfx950` sums them in split order. A measured cost model
 picks the count and splits only within one wave of workgroups. The count is a
 runtime argument.
+
+### gfx950 MXFP8 decode projection
+
+The gfx950 package provides the weight-bandwidth-bound MXFP8 projection used
+for DeepSeek V4.1 decode (up to 256 rows); larger row counts, and 64 or more
+rows on weights of at least 2**26 elements, use the prefill kernel above.
+
+#### Contract
+
+- The operation computes `A @ B.T` from E4M3 matrices shaped `[M, K]` and
+  `[N, K]` with `1 <= M <= 256`, `N >= 16`, `K >= 128` divisible by 32, and
+  `N * K < 2**31`. Inner strides must be one and row strides 16-byte aligned.
+- Scales are uint8 UE8M0 matrices shaped `[M, K/32]` and `[N, K/32]` with
+  unit inner stride and an explicit `[1, 32]` scale block.
+- Output is BF16 or FP16. A caller-owned output may have a padded row stride,
+  but its inner stride must be one.
+- `M` is a runtime argument and is not specialized. The tile configuration
+  comes from the smallest M bucket (16, 32, 64, 128, 256) covering `M`:
+  measured per bucket for the V4.1 TP4 projection shapes, a heuristic
+  otherwise. `K` is a compile-time model constant.
+
+#### Algorithm
+
+Each program owns a `BLOCK_M x BLOCK_N` output tile and one K slice, so the
+weight is streamed from HBM once while the small activation stays in L2.
+Small N tiles and an optional split-K fill the 256 CUs. The fully unrolled K
+loop keeps a `NUM_BUFFERS`-deep LDS ring in flight with direct-to-LDS 16-byte
+copies; their distributed layout follows the conflict-free padded LDS layout
+so each warp writes one contiguous KiB. Each K tile's scale bytes are loaded
+into registers just before its values, so the in-order wait for the values
+also covers the scales, and native `16 x 16 x 128` E4M3 scaled MFMAs consume
+them directly.
+
+Activation rows past `M` are masked (no traffic), weight rows past `N` are
+clamped, a K tail is zero-filled, and stores are masked. Split-K uses the
+dense BF16 decode protocol above: write-through FP32 partials, a relaxed
+arrival counter, and a reduction in split order by the last arrival, so
+results are deterministic and the launch is HIP-graph safe. An XCD remap
+keeps the M tiles that share a weight tile on one XCD's L2.
 
 ### gfx1250 MXFP8 decode projection
 

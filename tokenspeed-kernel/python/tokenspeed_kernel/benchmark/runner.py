@@ -277,7 +277,7 @@ class BenchmarkRunner:
         except KeyError:
             return None, None, None
 
-        tolerance = tol_fn(dtype, inputs=verify_inputs, **shape)
+        tolerance = tol_fn(dtype, inputs=verify_inputs, expected=expected, **shape)
         comparison = compare_outputs(actual, expected, tolerance=tolerance)
         return (
             comparison.passed,
