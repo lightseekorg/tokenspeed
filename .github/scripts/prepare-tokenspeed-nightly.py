@@ -49,12 +49,6 @@ def prepare_nightly(root: Path, date: str, kernel_version: str) -> str:
     updated, dependencies = re.subn(
         r'"tokenspeed-kernel[^"\n]*"', f'"tokenspeed-kernel=={kernel_version}"', updated
     )
-    updated, python_requirements = re.subn(
-        r'^requires-python = "[^"\n]+"$',
-        'requires-python = ">=3.11"',
-        updated,
-        flags=re.MULTILINE,
-    )
     version_path = root / "python/tokenspeed/version.py"
     version_source, runtime_versions = re.subn(
         r'^__version__ = "[^"\n]+"$',
@@ -62,10 +56,9 @@ def prepare_nightly(root: Path, date: str, kernel_version: str) -> str:
         version_path.read_text(),
         flags=re.MULTILINE,
     )
-    if (versions, dependencies, python_requirements, runtime_versions) != (1, 1, 1, 1):
+    if (versions, dependencies, runtime_versions) != (1, 1, 1):
         raise ValueError(
-            "Expected one project version, kernel dependency, Python requirement "
-            "and runtime version"
+            "Expected one project version, kernel dependency and runtime version"
         )
     pyproject.write_text(updated)
     version_path.write_text(version_source)

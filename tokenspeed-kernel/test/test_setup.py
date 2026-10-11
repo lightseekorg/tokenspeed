@@ -61,16 +61,14 @@ def _requirements_by_name(requirements: list[str]) -> dict[str, Requirement]:
 def test_nightly_version_uses_post_date(monkeypatch) -> None:
     monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "false")
     monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "release/test")
-    stable = _capture_setup_kwargs(monkeypatch, "cuda")
-    base_version = stable["version"]
-    assert stable["python_requires"] == ""
+    base_version = _capture_setup_kwargs(monkeypatch, "cuda")["version"]
 
     monkeypatch.setenv("TOKENSPEED_KERNEL_NIGHTLY", "true")
     monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20260929")
     monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_BRANCH", "main")
-    nightly = _capture_setup_kwargs(monkeypatch, "cuda")
-    assert nightly["version"] == f"{base_version}.post20260929"
-    assert nightly["python_requires"] == ">=3.11"
+    assert _capture_setup_kwargs(monkeypatch, "cuda")["version"] == (
+        f"{base_version}.post20260929"
+    )
 
     monkeypatch.setenv("TOKENSPEED_KERNEL_VERSION_DATE", "20260230")
     with pytest.raises(ValueError):

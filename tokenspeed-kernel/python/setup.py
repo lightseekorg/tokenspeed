@@ -1037,9 +1037,6 @@ class BuildPyWithBuild(build_py):
 setup(
     name="tokenspeed_kernel",
     version=_package_version(),
-    python_requires=(
-        ">=3.11" if os.environ.get("TOKENSPEED_KERNEL_NIGHTLY") == "true" else ""
-    ),
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
