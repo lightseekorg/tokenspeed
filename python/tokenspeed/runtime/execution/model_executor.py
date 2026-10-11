@@ -23,7 +23,7 @@ from __future__ import annotations
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -149,6 +149,35 @@ def _sampling_info_for_requests(
         ]
         info.vocab_mask = mask[::mask_width].contiguous() if prefill else mask
     return info
+
+
+def _with_prefill_sample_offsets(
+    sampling_info: SamplingBatchInfo, input_lengths: torch.Tensor
+) -> SamplingBatchInfo:
+    """Key each prefill row's sample on the position of its last input token.
+
+    The pool kernels draw a request's noise from (seed, offset), and decode
+    and verify take the offset from ``valid_cache_lengths``, which is the
+    absolute position of the step's first input token. A prefill samples
+    before its frontier advances, so that table still holds the chunk's
+    prefix length: a prefix-cache hit or a chunk boundary would move the
+    first sampled token's stream, and the same seeded request would diverge
+    from its first token. The last input position is the same however the
+    prompt was split, and it sits one below the first decode's offset.
+    ``sampling_info`` covers exactly the prefill rows; ``input_lengths`` are
+    their input lengths, in the same order.
+    """
+    cache_lengths = sampling_info.valid_cache_lengths
+    if cache_lengths is None or sampling_info.req_pool_indices is None:
+        return sampling_info
+    pool_rows = sampling_info.req_pool_indices.long()
+    last = cache_lengths.index_select(0, pool_rows) + input_lengths[
+        : pool_rows.shape[0]
+    ].to(cache_lengths.dtype)
+    offsets = cache_lengths.index_copy(
+        0, pool_rows, (last - 1).clamp_min(0).to(cache_lengths.dtype)
+    )
+    return replace(sampling_info, valid_cache_lengths=offsets)
 
 
 PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
@@ -1390,7 +1419,12 @@ class ModelExecutor:
         num_prefill_outputs = layout.num_prefill_outputs
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
-            return self.sampling_backend.sample(logits_output, sampling_info)
+            return self.sampling_backend.sample(
+                logits_output,
+                _with_prefill_sample_offsets(
+                    sampling_info, self.input_buffers.input_lengths_buf
+                ),
+            )
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output,
@@ -1426,8 +1460,11 @@ class ModelExecutor:
             prefill_out = LogitsProcessorOutput(next_token_logits=logits[prefill])
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
-                _sampling_info_for_requests(
-                    sampling_info, prefill, mask_width=mask_width, prefill=True
+                _with_prefill_sample_offsets(
+                    _sampling_info_for_requests(
+                        sampling_info, prefill, mask_width=mask_width, prefill=True
+                    ),
+                    self.input_buffers.input_lengths_buf,
                 ),
             )
             # verify writes the same backend buffers; snapshot the prefix.
