@@ -187,6 +187,62 @@ python ./tokenspeed-mla/python/tokenspeed_mla/mla_decode_fp8.py \
   --skip_ref_check
 ```
 
+### MLA 2 decode benchmarks
+
+The [MLA 2 benchmark article](https://lightseek.org/blog/tokenspeed-mla-2.html)
+compares the M256, four-CTA MLA 2 implementation for NVIDIA Vera Rubin with
+MLA 1, the Blackwell M128 implementation. The 16 workloads use 96 query heads
+(H96), 4 or 8 query tokens (Q4 or Q8), batch sizes 1, 4, 16, and 64, and KV
+context lengths of 65,536 or 131,072 tokens (KV64K or KV128K).
+Speedup is baseline latency divided by MLA 2 latency for the same workload;
+summary values are geometric means, while peaks are individual results.[^mla2-benchmark]
+
+#### Same-GPU comparisons
+
+Both comparisons below run on the same NVIDIA Vera Rubin GPU with FP8 inputs
+and outputs; they do not measure the default BF16-output path.
+
+| Baseline | Overall speedup | Q4 speedup | Q8 speedup |
+| --- | --- | --- | --- |
+| MLA 1 recompiled for NVIDIA Vera Rubin | 1.142× | 1.027× | 1.271× |
+| Adapted FlashInfer | 1.327× | 1.227× | 1.434× |
+
+MLA 2 has lower median latency than recompiled MLA 1 in 13 of 16 workloads,
+including all eight Q8 workloads. Three Q4 workloads are slower. Native Q8
+packing fills three M256 tiles, while Q4 fills only 75% of two tiles.
+
+![MLA 2 versus recompiled MLA 1 on the same GPU across 16 H96 FP8 workloads](https://lightseek.org/blog/images/202610/tokenspeed-mla-2-recompiled-mla-1.png)
+
+The FlashInfer comparison uses the benchmarked
+[PR #6177](https://github.com/flashinfer-ai/flashinfer/pull/6177) implementation
+with an H96-to-H128 adapter that splits Q8 into two Q4 requests. Timing includes
+query packing and output unpacking. It compares native H96 support and tuning
+against that adapted baseline, not native H128 performance or current
+FlashInfer releases.
+
+![MLA 2 versus adapted FlashInfer on the same GPU across 16 H96 FP8 workloads](https://lightseek.org/blog/images/202610/tokenspeed-mla-2-adapted-flashinfer.png)
+
+#### Cross-hardware comparison
+
+Across the same 16 workloads, MLA 2 on NVIDIA Vera Rubin achieves:
+
+| Baseline | Geometric mean speedup | Peak speedup |
+| --- | --- | --- |
+| MLA 1 on NVIDIA B200 | 2.62× | 3.44× |
+| MLA 1 on NVIDIA GB200 | 2.05× | 2.84× |
+
+Both peaks occur at batch size 16, Q8, and KV64K. Each run uses one GPU.
+Hardware, power, clocks, and implementations differ, so these ratios include
+both hardware and software changes and do not isolate architectural gains.
+These are kernel-latency results, not end-to-end serving results.
+
+![TokenSpeed MLA across B200, B300, GB200, GB300, and NVIDIA Vera Rubin, normalized to B200](https://lightseek.org/blog/images/202610/tokenspeed-mla-2-cross-gpu-speedup.png)
+
+The chart normalizes every series to B200 at 1×. For a comparison with GB200,
+divide the NVIDIA Vera Rubin ratio by the GB200 ratio for the same workload.
+Cross-hardware ratios are separate comparisons, not additional factors to
+multiply by the same-GPU speedups.
+
 ## Kernel capability summary
 
 ### MLA Prefill (`tokenspeed_mla_prefill`)
@@ -335,3 +391,12 @@ partial storage. Accumulation and log-sum-exp remain FP32; the reducer applies
 `output_scale` after combining normalized partials. Direct FP8 kernel callers
 must explicitly specify `partial_fp16` and a `reducer_max_splits` capacity that
 covers every split in their launches.
+
+[^mla2-benchmark]: The same-GPU tests use FP8 queries, KV data, and outputs;
+    64-token pages; a cold L2 cache through KV rotation; and disabled programmatic
+    dependent launch (PDL). Latency is the median of 15 repeats of 20 CUDA graph
+    iterations, including split-KV reduction and, for adapted FlashInfer, query
+    packing and output unpacking. MLA 1 is recompiled with four key and four value
+    stages. Overall geometric means weight all 16 workloads equally; Q4 and Q8
+    means each cover eight workloads. See the linked article for the full
+    benchmark context.
