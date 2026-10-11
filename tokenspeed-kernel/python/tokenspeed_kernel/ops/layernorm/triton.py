@@ -44,6 +44,7 @@ def _rmsnorm_kernel(
     residual_out_ptr,
     x_scale,
     residual_scale,
+    x_row_stride,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -59,7 +60,9 @@ def _rmsnorm_kernel(
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
-    x = tl.load(x_ptr + row_offsets, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(
+        x_ptr + row.to(tl.int64) * x_row_stride + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
     if HAS_RESIDUAL:
         residual = tl.load(residual_ptr + row_offsets, mask=mask, other=0.0).to(
             tl.float32
@@ -272,7 +275,10 @@ def rmsnorm(
             f"residual shape {tuple(residual.shape)} does not match input shape {tuple(x.shape)}"
         )
 
-    if not x.is_contiguous():
+    # Row slices of a wider buffer (e.g. a split of a fused projection) are
+    # read in place through their row stride; other layouts are copied.
+    strided_rows = residual is None and x.ndim == 2 and x.stride(-1) == 1
+    if not x.is_contiguous() and not strided_rows:
         x = x.contiguous()
     if residual is not None and not residual.is_contiguous():
         residual = residual.contiguous()
@@ -280,8 +286,8 @@ def rmsnorm(
         weight = weight.contiguous()
 
     hidden_size = x.shape[-1]
-    x_2d = x.view(-1, hidden_size)
-    out = torch.empty_like(x) if out is None else out
+    x_2d = x if x.ndim == 2 else x.view(-1, hidden_size)
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device) if out is None else out
     if not out.is_contiguous():
         raise ValueError("out must be contiguous")
     out_2d = out.view(-1, hidden_size)
@@ -300,6 +306,7 @@ def rmsnorm(
         residual_out,
         x_scale,
         residual_scale,
+        x_2d.stride(0),
         hidden_size,
         eps,
         BLOCK=block,

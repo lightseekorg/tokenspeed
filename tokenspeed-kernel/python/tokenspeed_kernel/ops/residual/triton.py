@@ -1660,6 +1660,134 @@ def _mhc_pre_layer_norm_hc4_kernel(
     )
 
 
+@triton.jit
+def _mhc_post_pre_layer_norm_hc4_kernel(
+    comb,
+    residual,
+    post,
+    hidden_states,
+    pre_mix,
+    weight,
+    residual_out,
+    out,
+    hidden_size: tl.constexpr,
+    eps: tl.constexpr,
+    block_h: tl.constexpr,
+):
+    # _mhc_post_hc4_triton_kernel then _mhc_pre_layer_norm_hc4_kernel for one
+    # token, in the same operation order: the BF16 residual is stored and the
+    # pre mix reads it back rounded.
+    token_id = tl.program_id(0)
+    hidden_offsets = tl.arange(0, block_h)
+    hidden_mask = hidden_offsets < hidden_size
+    token_residual_offset = token_id * 4 * hidden_size
+
+    hidden_values = tl.load(
+        hidden_states + token_id * hidden_size + hidden_offsets,
+        mask=hidden_mask,
+        other=0.0,
+    ).to(tl.float32)
+    post_base = token_id * 4
+    acc0 = tl.load(post + post_base).to(tl.float32) * hidden_values
+    acc1 = tl.load(post + post_base + 1).to(tl.float32) * hidden_values
+    acc2 = tl.load(post + post_base + 2).to(tl.float32) * hidden_values
+    acc3 = tl.load(post + post_base + 3).to(tl.float32) * hidden_values
+    comb_base = token_id * 16
+    for in_hc in tl.static_range(0, 4):
+        residual_values = tl.load(
+            residual + token_residual_offset + in_hc * hidden_size + hidden_offsets,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+        comb_row = comb_base + in_hc * 4
+        acc0 += tl.load(comb + comb_row).to(tl.float32) * residual_values
+        acc1 += tl.load(comb + comb_row + 1).to(tl.float32) * residual_values
+        acc2 += tl.load(comb + comb_row + 2).to(tl.float32) * residual_values
+        acc3 += tl.load(comb + comb_row + 3).to(tl.float32) * residual_values
+
+    layer_input = tl.zeros((block_h,), tl.float32)
+    new0 = acc0.to(tl.bfloat16)
+    new1 = acc1.to(tl.bfloat16)
+    new2 = acc2.to(tl.bfloat16)
+    new3 = acc3.to(tl.bfloat16)
+    base = residual_out + token_residual_offset + hidden_offsets
+    tl.store(base, new0, mask=hidden_mask)
+    tl.store(base + hidden_size, new1, mask=hidden_mask)
+    tl.store(base + hidden_size * 2, new2, mask=hidden_mask)
+    tl.store(base + hidden_size * 3, new3, mask=hidden_mask)
+    pre_base = token_id * 4
+    layer_input += tl.load(pre_mix + pre_base).to(tl.float32) * new0.to(tl.float32)
+    layer_input += tl.load(pre_mix + pre_base + 1).to(tl.float32) * new1.to(tl.float32)
+    layer_input += tl.load(pre_mix + pre_base + 2).to(tl.float32) * new2.to(tl.float32)
+    layer_input += tl.load(pre_mix + pre_base + 3).to(tl.float32) * new3.to(tl.float32)
+
+    layer_input = layer_input.to(tl.bfloat16).to(tl.float32)
+    variance = tl.sum(layer_input * layer_input, axis=0) / hidden_size
+    norm_scale = tl.rsqrt(variance + eps)
+    norm_weight = tl.load(weight + hidden_offsets, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+    tl.store(
+        out + token_id * hidden_size + hidden_offsets,
+        layer_input * norm_scale * norm_weight,
+        mask=hidden_mask,
+    )
+
+
+def mhc_post_pre_layer_norm_hc4(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    pre_mix: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply an hc=4 mHC post mapping and form the next RMS-normed layer input.
+
+    Equals ``triton_mhc_post`` followed by ``mhc_pre_layer_norm_hc4`` on its
+    output, in one launch.
+
+    Args:
+        hidden_states: BF16 sublayer output ``[tokens, hidden_size]``.
+        residual: BF16 residual streams ``[tokens, 4, hidden_size]``.
+        post: FP32 post mix ``[tokens, 4]``.
+        comb: FP32 combination ``[tokens, 4 (input), 4 (output)]``.
+        pre_mix: FP32 pre mix for the next layer input ``[tokens, 4]``.
+        weight: RMSNorm weight ``[hidden_size]``.
+        eps: RMSNorm epsilon.
+
+    Returns:
+        The new BF16 residual ``[tokens, 4, hidden_size]`` and the normalized
+        BF16 layer input ``[tokens, hidden_size]``.
+    """
+    hidden_size = residual.shape[-1]
+    if residual.shape[-2] != 4 or post.shape[-1] != 4 or pre_mix.shape[-1] != 4:
+        raise ValueError("mhc_post_pre_layer_norm_hc4 requires exactly four streams")
+    hidden_states, residual, post, comb, pre_mix, weight = (
+        t.contiguous() for t in (hidden_states, residual, post, comb, pre_mix, weight)
+    )
+    residual_out = torch.empty_like(residual)
+    out = hidden_states.new_empty((*residual.shape[:-2], hidden_size))
+    num_tokens = residual.numel() // (4 * hidden_size)
+    if num_tokens:
+        _mhc_post_pre_layer_norm_hc4_kernel[(num_tokens,)](
+            comb,
+            residual,
+            post,
+            hidden_states,
+            pre_mix,
+            weight,
+            residual_out,
+            out,
+            hidden_size=hidden_size,
+            eps=eps,
+            block_h=triton.next_power_of_2(hidden_size),
+            num_warps=8,
+        )
+    return residual_out, out
+
+
 def mhc_pre_layer_norm_hc4(
     pre_mix: torch.Tensor,
     residual: torch.Tensor,

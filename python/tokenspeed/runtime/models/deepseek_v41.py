@@ -76,6 +76,7 @@ from weakref import WeakValueDictionary
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.dsv41 import (
+    query_heads,
     rope_inplace,
     rope_pad_query,
 )
@@ -87,7 +88,11 @@ from torch import nn
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_all_reduce_outputs,
+    all_reduce,
+    can_acquire_all_reduce_outputs,
+)
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
@@ -558,6 +563,25 @@ def v41_hc_post(
     return mhc_post(x, residual, post.unsqueeze(-1), comb, override=None, solution=None)
 
 
+def _v41_hc_post_input(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    pre: torch.Tensor,
+    norm: RMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """HC post, then the next sublayer's normed input from the new residual."""
+    if not x.is_cuda:
+        residual = v41_hc_post(x, residual, post, comb)
+        return residual, _v41_hc_input(residual, pre, norm)
+    from tokenspeed_kernel.ops.residual.triton import mhc_post_pre_layer_norm_hc4
+
+    return mhc_post_pre_layer_norm_hc4(
+        x, residual, post, comb, pre, norm.weight, norm.variance_epsilon
+    )
+
+
 def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     if not x.is_cuda:
         return _norm(v41_hc_pre(x, pre), norm)
@@ -804,7 +828,7 @@ class DeepseekV41Attention(nn.Module):
             self._padded_attn_sink[: self.n_local_heads].copy_(param)
 
     def _kernel_attn_sink(self):
-        padded = 64 if self.n_local_heads <= 64 else 128
+        padded = query_heads(self.n_local_heads)
         if not self.attn_sink.is_cuda or padded == self.n_local_heads:
             return self.attn_sink
         if self._padded_attn_sink is None:
@@ -949,15 +973,19 @@ class DeepseekV41Attention(nn.Module):
         grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
         weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
         out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
+        if not self.mapping.attn.has_tp:
+            return self.wo_b(out, scale=None)[0]
+        group = self.mapping.attn.tp_group
+        shapes = ((out.shape[0], self.wo_b.output_size),)
+        if can_acquire_all_reduce_outputs(shapes, out, group):
+            # wo_b writes straight into the all-reduce's memory.
+            outputs = acquire_all_reduce_outputs(shapes, out, group)
+            self.wo_b(out, scale=None, out=outputs[0])
+            return all_reduce(outputs, group=group)[0]
         out, _ = self.wo_b(out, scale=None)
-        if self.mapping.attn.has_tp:
-            out = all_reduce(
-                out,
-                group=self.mapping.attn.tp_group,
-                backend=None,
-                op=torch.distributed.ReduceOp.SUM,
-            )
-        return out
+        return all_reduce(
+            out, group=group, backend=None, op=torch.distributed.ReduceOp.SUM
+        )
 
 
 class DeepseekV41MoE(DeepseekV4MoE):
@@ -1145,8 +1173,10 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        hidden_states = v41_hc_post(x, residual, post, comb)
-        residual = hidden_states
+        # One launch: attention HC post and the FFN's normed input.
+        residual, x = _v41_hc_post_input(
+            x, residual, post, comb, attn_pre, self.ffn_norm
+        )
         if overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
         with self.hc_stream_fork.scope(enable=overlap, overlap=True) as fork:
@@ -1163,7 +1193,6 @@ class DeepseekV41DecoderLayer(nn.Module):
             if overlap:
                 for tensor in (ffn_pre, post, comb):
                     tensor.record_stream(consumer)
-            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
             x = self._forward_ffn(x, image_mask, ctx)
         return v41_hc_post(x, residual, post, comb), ffn_pre
 
@@ -1182,8 +1211,12 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
         x = self.comm_manager.pre_mlp_comm(x, ctx)
         total, maximum = self.comm_manager.get_num_tokens(ctx)
-        x = self.ffn(x, image_mask, total, maximum, ctx=None, comm_manager=None)
-        x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
+        # Produce the MoE output straight into the all-reduce's memory.
+        out = self.comm_manager.acquire_post_moe_output(tuple(x.shape), x, ctx)
+        x = self.ffn(
+            x, image_mask, total, maximum, ctx=None, comm_manager=None, out=out
+        )
+        x, _ = self.comm_manager.post_mlp_comm(x, None, ctx, acquired=out is not None)
         return x
 
 

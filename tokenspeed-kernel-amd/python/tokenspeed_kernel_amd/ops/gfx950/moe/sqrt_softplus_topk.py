@@ -50,6 +50,7 @@ def gluon_sqrt_softplus_topk_gfx950(
     stride_ik,
     stride_sm,
     stride_se,
+    scaling,
     E: gl.constexpr,
     EP: gl.constexpr,
     TOPK: gl.constexpr,
@@ -134,6 +135,7 @@ def gluon_sqrt_softplus_topk_gfx950(
         denominator = gl.sum(selected_weights, axis=0)
         denominator = gl.maximum(denominator, 1.1754943508222875e-38)
         selected_weights = selected_weights / denominator
+    selected_weights = selected_weights * scaling
 
     topk_mask = topk_lane < TOPK
     cdna4.buffer_store(
@@ -165,6 +167,7 @@ def launch_gluon_sqrt_softplus_topk_gfx950(
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     need_scores: bool = True,
+    routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select DeepSeek V4 experts with one GFX950 Gluon kernel launch.
 
@@ -177,6 +180,7 @@ def launch_gluon_sqrt_softplus_topk_gfx950(
             ``[vocabulary, top_k]``.
         input_ids: Token ids corresponding to rows of ``router_logits``.
         need_scores: Whether to materialize all FP32 sqrt-softplus scores.
+        routed_scaling_factor: FP32 multiplier of the stored route weights.
 
     Returns:
         FP32 weights, INT32 expert ids, and FP32 scores. When ``need_scores`` is
@@ -281,6 +285,7 @@ def launch_gluon_sqrt_softplus_topk_gfx950(
         topk_ids.stride(1),
         scores.stride(0),
         scores.stride(1),
+        float(routed_scaling_factor),
         E=experts,
         EP=256 if experts == 256 else 512,
         TOPK=top_k,
