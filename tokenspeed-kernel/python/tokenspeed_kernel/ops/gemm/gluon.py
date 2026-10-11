@@ -256,7 +256,7 @@ if current_platform().is_amd:
         solution="gluon",
         capability=_GFX950_CAPABILITY,
         signatures=_MXFP8_SIGNATURES,
-        priority=Priority.SPECIALIZED,
+        priority=Priority.SPECIALIZED + 1,
         traits={
             "mnk_problem_filter": frozenset({_is_mxfp8_decode_problem}),
             "a_inner_stride_one": frozenset({True}),

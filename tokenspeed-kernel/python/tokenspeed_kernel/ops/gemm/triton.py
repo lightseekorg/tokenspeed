@@ -1335,7 +1335,7 @@ if Platform.get().is_amd:
                 )
             }
         ),
-        priority=Priority.PERFORMANT + 3,
+        priority=Priority.SPECIALIZED,
         traits={
             "mnk_problem_filter": frozenset({_supports_mxfp8_skinny_shape}),
             "a_inner_stride_one": frozenset({True}),
