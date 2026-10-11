@@ -306,6 +306,9 @@ def test_amd_kernel_benchmarks_run_in_their_own_workflow():
     # The `high priority` label only affects model tests; it must not restart
     # the benchmark.
     assert "labeled" not in triggers["pull_request"]["types"]
+    # tokenspeed-mla is NVIDIA-only, so its changes must not start the workflow.
+    for event in ("push", "pull_request"):
+        assert "tokenspeed-mla/**" not in triggers[event]["paths"]
     jobs = workflow["jobs"]
     assert (
         '--workflow-stage "kernel-benchmark"'
