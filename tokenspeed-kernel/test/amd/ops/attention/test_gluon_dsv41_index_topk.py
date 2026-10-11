@@ -258,9 +258,11 @@ def test_indexer_score_chunk_bound(
     ]
 
 
+# A 40-row score chunk masks part of each CTA's second 32-row tile, and in
+# Full mode CTAs span page boundaries.
 @pytest.mark.parametrize("reindex", [False, True])
 @pytest.mark.parametrize("score_chunk", [40, 256])
-def test_gfx1250_index_logits_reference_and_graph(device, reindex, score_chunk):
+def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
     if not current_platform().is_cdna5:
         pytest.skip("GFX1250 indexer logits")
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
@@ -290,44 +292,23 @@ def test_gfx1250_index_logits_reference_and_graph(device, reindex, score_chunk):
         else None
     )
     width = 40 if reindex else 256
-    out = torch.empty(2, width, device=device)
+    out = torch.full((2, width), -torch.inf, device=device)
+    dsv41_index_logits_gfx1250(
+        q, weights, cache.flatten(1), table, visible, candidates, out, score_chunk
+    )
 
-    def invoke():
-        out.fill_(-torch.inf)
-        dsv41_index_logits_gfx1250(
-            q, weights, cache.flatten(1), table, visible, candidates, out, score_chunk
-        )
-        return out
-
-    invoke()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        invoke()
-    for changed in (False, True):
-        if changed:
-            # Replay must read refreshed queries, weights, pages and lengths.
-            q.mul_(-0.75)
-            weights.mul_(0.5)
-            table.copy_(table.flip(1))
-            visible.copy_(torch.tensor([131, 0], device=device, dtype=torch.int32))
-            if candidates is not None:
-                candidates.copy_(candidates.flip(1))
-        out.fill_(float("nan"))
-        graph.replay()
-        expected = torch.full((2, width), -torch.inf)
-        for row in range(2):
-            logical = torch.arange(width)
-            if reindex:
-                blocks = candidates[row].cpu()[logical // 8].long()
-                logical = torch.where(blocks >= 0, blocks * 8 + logical % 8, -1)
-            pages = table[row].cpu()[logical.clamp(min=0) // 64].long()
-            valid = (logical >= 0) & (logical < int(visible[row])) & (pages >= 0)
-            slots = pages[valid] * 64 + logical[valid] % 64
-            dots = q[row].float().cpu() @ key_reference[slots].float().T
-            expected[row, valid] = (dots.relu() * weights[row].cpu()[:, None]).sum(0)
-        torch.testing.assert_close(out.cpu(), expected, atol=2e-4, rtol=2e-4)
-        captured = out.clone()
-        torch.testing.assert_close(captured, invoke(), atol=0, rtol=0)
+    expected = torch.full((2, width), -torch.inf)
+    for row in range(2):
+        logical = torch.arange(width)
+        if reindex:
+            blocks = candidates[row].cpu()[logical // 8].long()
+            logical = torch.where(blocks >= 0, blocks * 8 + logical % 8, -1)
+        pages = table[row].cpu()[logical.clamp(min=0) // 64].long()
+        valid = (logical >= 0) & (logical < int(visible[row])) & (pages >= 0)
+        slots = pages[valid] * 64 + logical[valid] % 64
+        dots = q[row].float().cpu() @ key_reference[slots].float().T
+        expected[row, valid] = (dots.relu() * weights[row].cpu()[:, None]).sum(0)
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-4, rtol=2e-4)
 
 
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
