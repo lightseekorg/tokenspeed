@@ -30,8 +30,6 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.gemm import mm  # noqa: E402
-from tokenspeed_kernel.ops.quantization import quantize_fp8  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import decode  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (  # noqa: E402
     gluon_mm_mxfp8_decode_gfx950,
@@ -163,38 +161,3 @@ def test_hip_graph_replay_uses_private_counters() -> None:
             atol=_ATOL,
             rtol=_RTOL,
         )
-
-
-@pytest.mark.parametrize("m", [6, 192])
-def test_mm_selects_decode_kernel(monkeypatch, m: int) -> None:
-    torch.manual_seed(0)
-    n, k = 5120, 2048
-    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
-    a, a_scales = quantize_fp8(
-        x,
-        granularity="token_group",
-        group_size=32,
-        scale_encoding="ue8m0",
-        enable_pdl=False,
-        override="triton_quantize_fp8_group32_ue8m0",
-        solution=None,
-    )
-    _, b, _, b_scales = _operands(1, n, k)
-    launches = []
-    launch = decode._launch
-    monkeypatch.setattr(
-        decode, "_launch", lambda *args: launches.append(args) or launch(*args)
-    )
-    actual = mm(
-        a,
-        b,
-        A_scales=a_scales,
-        B_scales=b_scales,
-        out_dtype=torch.bfloat16,
-        quant="mxfp8",
-        block_size=[1, 32],
-    )
-    assert len(launches) == 1
-    torch.testing.assert_close(
-        actual.float(), _reference(a, b, a_scales, b_scales), atol=_ATOL, rtol=_RTOL
-    )

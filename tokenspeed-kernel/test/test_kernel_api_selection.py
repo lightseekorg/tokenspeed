@@ -596,6 +596,23 @@ def _mm_mxfp8(m: int) -> torch.Tensor:
     )
 
 
+def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
+    """True MXFP8: E4M3 operands with one UE8M0 scale byte per 32 K values."""
+    a = torch.empty((m, k), dtype=_fp8_dtype())
+    b = torch.empty((n, k), dtype=_fp8_dtype())
+    a_scales = torch.empty((m, k // 32), dtype=torch.uint8)
+    b_scales = torch.empty((n, k // 32), dtype=torch.uint8)
+    return kernel_mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.bfloat16,
+        block_size=[1, 32],
+        quant="mxfp8",
+    )
+
+
 @pytest.mark.parametrize("scale_dtype", [torch.float32, torch.uint8])
 @pytest.mark.parametrize("batched", [False, True])
 def test_mxfp8_online_scale_signature_matches_weight_encoding(
@@ -5907,6 +5924,28 @@ _CASES = [
         "triton_mm_fp8_blockscale",
         lambda: _mm_mxfp8(4),
     ),
+    # DeepSeek V4.1 MXFP8 projections on gfx950 above the 64-row skinny range:
+    # the weight-streaming decode kernel through 256 rows, the large-tile
+    # kernel beyond, and from 64 rows on for 2**26-element weights.
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "gemm",
+            "mm",
+            expected,
+            partial(_mm_mxfp8_ue8m0, m, n, k),
+            id_suffix=f"mxfp8-ue8m0-m{m}-n{n}-k{k}",
+        )
+        for m, n, k, expected in (
+            (65, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (192, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (256, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (257, 5120, 2048, "gluon_mm_mxfp8_gfx950"),
+            (65, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+            (256, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+        )
+    ],
     _case(
         _is_hopper_plus,
         "hopper-plus",
