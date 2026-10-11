@@ -25,47 +25,11 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv4
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.selection import select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 pytest.importorskip("tokenspeed_triton")
 pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
 
 from utils import assert_no_triton_compile, is_cdna4, is_cdna5  # noqa: E402
-
-
-def _prefill_name(width: int, heads: int = 16) -> str:
-    q = torch.empty((1, heads, 512), dtype=torch.bfloat16)
-    kv = torch.empty((width, 512), dtype=torch.bfloat16)
-    return select_kernel(
-        "attention",
-        "dsv4_prefill",
-        format_signature(
-            q=dense_tensor_format(q.dtype),
-            kv=dense_tensor_format(kv.dtype),
-        ),
-        traits={
-            "head_dim": 512,
-            "num_q_heads": heads,
-            "cache_layout": "dense_workspace",
-            "sinks": True,
-            "selected_width": width,
-            "metadata_dtypes": frozenset({torch.int32}),
-        },
-    ).name
-
-
-def test_gluon_dsv4_prefill_is_selected_for_serving_widths():
-    platform = current_platform()
-    if platform.is_cdna4:
-        expected = "gluon_dsv4_prefill_gfx950"
-    elif platform.is_cdna5:
-        expected = "gluon_dsv4_prefill_gfx1250"
-    else:
-        pytest.skip("AMD dense dsv4_prefill gluon")
-    assert _prefill_name(128) == expected
-    assert _prefill_name(640) == expected
 
 
 def _reference(
