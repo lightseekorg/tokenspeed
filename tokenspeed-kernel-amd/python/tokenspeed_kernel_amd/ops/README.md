@@ -544,10 +544,12 @@ such groups skip the score and PV passes, and one all-ones MFMA per tile
 accumulates the V row sum for all of them.
 
 The main kernel runs one workgroup per CU (VGPR-bound). While
-`tokens * head_blocks` is below 256, rows are split over up to eight
+`tokens * head_blocks` is below 256, rows are split over up to 16
 workgroups that store FP32 `(max, sum, P @ V)` partials (zero-query groups store
 the row sum and count). `gluon_dsv41_selected_attention_reduce_gfx950` merges
-them in a fixed order and adds the sink once.
+them in a fixed order and adds the sink once; each of its workgroups owns one
+token, 16 heads and a 64-dim slice, so the merge of a small batch still spreads
+over many CUs.
 
 ### gfx1250 MLA decode
 

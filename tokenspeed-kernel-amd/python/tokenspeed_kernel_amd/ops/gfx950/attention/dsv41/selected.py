@@ -52,7 +52,10 @@ _TILE_K = 64
 # The main kernel keeps one workgroup per CU (VGPR-bound occupancy), so rows
 # are split over workgroups only while the grid still fits the 256 CUs once.
 _TARGET_CTAS = 256
-_MAX_SPLITS = 8
+_MAX_SPLITS = 16
+# The reduce splits head dims over workgroups too: one workgroup per token and
+# 16-head group alone is too few to stream a small batch's partials.
+_REDUCE_DIM_BLOCK = 64
 # One workgroup covers at most 64 query heads (four 16-head groups).
 _HEAD_GROUPS_PER_CTA = 4
 
@@ -738,19 +741,24 @@ def gluon_dsv41_selected_attention_reduce_gfx950(
     HEAD_GROUPS: gl.constexpr,
     MAX_SPLITS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
+    DIM_BLOCK: gl.constexpr,
 ):
-    """Merge one token's split partials for 16 heads and add the sink once.
+    """Merge one token's split partials for 16 heads and ``DIM_BLOCK`` dims,
+    adding the sink once.
 
     Zero-query heads use frame 0, weight ``count`` and value ``row_sum`` for
     every split, which is exactly their all-zero-score softmax state. Splits
     are merged four at a time so their loads are in flight together.
     """
     CHUNK: gl.constexpr = 4
-    layout: gl.constexpr = gl.BlockedLayout([1, 1, 4], [1, 1, 64], [1, 4, 1], [2, 1, 0])
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 4], [1, 64 // (DIM_BLOCK // 4), DIM_BLOCK // 4], [1, 4, 1], [2, 1, 0]
+    )
     stat_layout: gl.constexpr = gl.SliceLayout(2, layout)
     out_layout: gl.constexpr = gl.SliceLayout(0, layout)
     token_idx = gl.program_id(axis=0)
     group_idx = gl.program_id(axis=1)
+    dim_base = gl.program_id(axis=2) * DIM_BLOCK
     heads = group_idx * BLOCK_H + gl.arange(
         0, BLOCK_H, layout=gl.SliceLayout(0, stat_layout)
     )
@@ -773,14 +781,14 @@ def gluon_dsv41_selected_attention_reduce_gfx950(
     frame = gl.maximum(gl.max(split_max, axis=0), sink)
     frame = gl.where(frame > -float("inf"), frame, 0.0)
     total = gl.exp(sink - frame)
-    merged = gl.zeros([BLOCK_H, HEAD_DIM], dtype=gl.float32, layout=out_layout)
+    merged = gl.zeros([BLOCK_H, DIM_BLOCK], dtype=gl.float32, layout=out_layout)
     out_heads = group_idx * BLOCK_H + gl.arange(
         0, BLOCK_H, layout=gl.SliceLayout(1, out_layout)
     )
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, out_layout))
+    dims = dim_base + gl.arange(0, DIM_BLOCK, layout=gl.SliceLayout(0, out_layout))
     chunk = gl.arange(0, CHUNK, layout=gl.SliceLayout(1, stat_layout))
-    chunk_dims = gl.arange(
-        0, HEAD_DIM, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout))
+    chunk_dims = dim_base + gl.arange(
+        0, DIM_BLOCK, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout))
     )
     for start in gl.static_range(0, MAX_SPLITS, CHUNK):
         if start < num_splits:
@@ -1048,7 +1056,7 @@ def launch_gluon_dsv41_selected_attention_gfx950(
     )
     if splits > 1:
         gluon_dsv41_selected_attention_reduce_gfx950[
-            (tokens, triton.cdiv(q.shape[1], _BLOCK_H))
+            (tokens, triton.cdiv(q.shape[1], _BLOCK_H), _HEAD_DIM // _REDUCE_DIM_BLOCK)
         ](
             part_stats,
             part_acc,
@@ -1066,6 +1074,7 @@ def launch_gluon_dsv41_selected_attention_gfx950(
             HEAD_GROUPS=head_groups,
             MAX_SPLITS=_MAX_SPLITS,
             HEAD_DIM=_HEAD_DIM,
+            DIM_BLOCK=_REDUCE_DIM_BLOCK,
             num_warps=4,
         )
     return out
