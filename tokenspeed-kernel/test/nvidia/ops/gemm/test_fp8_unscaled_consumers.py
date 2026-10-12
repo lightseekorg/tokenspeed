@@ -81,7 +81,9 @@ def _rel(out, ref):
     return ((out.double() - ref).norm() / ref.norm()).item()
 
 
-@pytest.mark.parametrize("n,k", [(1536, 4096), (4096, 4096), (4096, 2048), (4096, 768)])
+# (N, K): Llama-3.1-8B shards at 8-way tensor parallelism (fused Q/K/V,
+# output, gate/up, down).
+@pytest.mark.parametrize("n,k", [(768, 4096), (4096, 512), (3584, 4096), (4096, 1792)])
 @pytest.mark.parametrize("m", [1, 4, 17, 64])
 def test_the_unit_scale_gemm_is_the_rounded_code_product(m, n, k):
     w8, _ = _weight(n, k, seed=n + k)
