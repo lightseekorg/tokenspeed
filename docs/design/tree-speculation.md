@@ -87,8 +87,11 @@ state after its parent, not after node `t - 1`: `mamba2_verify_scan` takes
 `parent_indices` and `gdn_decode_mtp` the tree's ancestor mask (the one tree
 attention reads), and both reload the parent's state at branch points (a chain
 never reloads). `causal_conv1d_update` with `parent_indices` rebuilds each
-node's window from its ancestors' inputs and the initial window. The commit
-copies the scratch row of the
+node's window from its ancestors' inputs and the initial window. Where the
+selected GDN verify kernel takes a separate destination pool
+(`gdn_decode_mtp(output_state=...)`), roots read the committed recurrent state
+in place and only the node states go to the scratch, so the scratch is never
+seeded with a copy of the committed state. The commit copies the scratch row of the
 last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
 familiar `accept_len`. The fused KDA verify kernel follows a chain and refuses
 trees.

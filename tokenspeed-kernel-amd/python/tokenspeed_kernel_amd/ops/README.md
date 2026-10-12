@@ -809,6 +809,36 @@ code, and the boundary tiles mask keys only, since rows past `q_len` are
 never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
 those keys score `-inf`.
 
+### gfx950 GDN decode and MTP verify
+
+`gluon_gdn_decode_gfx950` runs the sigmoid-gated delta-rule recurrence for
+`gdn_decode_step` (one token) and chain `gdn_decode_mtp` (T tokens) over the
+K-last recurrent-state pool. Draft trees stay on the Triton kernel.
+
+#### Contract
+
+- q/k are `[B, T, H, 128]` and v is `[B, T, HV, V]` (V a multiple of 16), with
+  contiguous heads and any batch/token strides, so packed conv-output views
+  need no split copy. a/b are `[B, T, HV]` with any strides.
+- The pool is K-last `[rows, HV, V, K]`, FP32 or BF16, with any row stride.
+  A negative read row starts from a zero state; negative destination rows are
+  skipped.
+- Per-token states go to `output_state_indices` rows of `output_state` (default
+  the read pool) or to the dense intermediate buffer; the final state goes
+  back to the read row only when neither applies and updates are enabled.
+- `T` and the batch are runtime values. The kernel stages tokens in LDS in
+  chunks of `min(next_power_of_2(T), 16)`, the only T-derived constexpr.
+
+#### Algorithm
+
+One wave owns 16 V rows of one request and value head: each lane holds two
+rows by four 4-wide K runs, so every state access is a 16-byte load or store
+filling whole 128-byte lines, and each K reduction is 16 in-register FMAs plus
+a three-step DPP butterfly. The prologue loads the chunk's q/k (L2-normalized
+and scaled), beta-scaled v, beta and decay into LDS once, so the serial steps
+wait only on LDS rather than one global round trip per token. The kernel is
+HBM bound: it reads the state once and writes it once per destination.
+
 ## Transform
 
 ### gfx950 Hadamard query transform
