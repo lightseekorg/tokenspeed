@@ -64,6 +64,8 @@ __all__ = [
     "dequantize_fp8_per_channel",
     "fp8_channel_gemm_available",
     "fp8_dynamic_linear",
+    "fp8_unscaled_gemm_available",
+    "fp8_unscaled_linear",
 ]
 
 _FP8 = torch.float8_e4m3fn
@@ -105,6 +107,63 @@ def fp8_channel_gemm_available(platform=None) -> bool:
         if "token" in spec.traits.get("granularity", ())
     ]
     return bool(kernels) and bool(quantizers)
+
+
+def fp8_unscaled_gemm_available(platform=None) -> bool:
+    """Whether a vendor (not Triton, not reference) FP8 GEMM taking one FP32
+    scale per operand is registered for ``platform`` (default: this
+    process's): the GEMM ``fp8_unscaled_linear`` runs with unit scales,
+    leaving the per-token and per-channel scales to the kernel that consumes
+    its output."""
+    import tokenspeed_kernel.ops.gemm  # noqa: F401  (registers the GEMMs)
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.signature import ScaleFormat, format_signature, tensor_format
+
+    scale = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
+    operand = tensor_format("scaled-fp8", _FP8, scale=scale)
+    kernels = KernelRegistry.get().get_for_operator(
+        "gemm",
+        "mm",
+        platform=platform or current_platform(),
+        format_signature=format_signature(a=operand, b=operand),
+    )
+    return any(spec.solution not in ("triton", "reference") for spec in kernels)
+
+
+def fp8_unscaled_linear(
+    codes: torch.Tensor, weight: torch.Tensor, unit_scale: torch.Tensor
+) -> torch.Tensor:
+    """The FP8 codes' product with an FP8 weight, unscaled, in BF16.
+
+    The per-tensor FP8 GEMM the registry selects (a vendor GEMM where
+    ``fp8_unscaled_gemm_available``) with both scales 1: the output is the
+    exact product of the codes accumulated in FP32 and rounded once to BF16.
+    ``|code| <= 448``, so a sum over K stays below ``448^2 * K`` (8.2e8 at
+    K = 4,096), far inside BF16's range, and the rounding is relative (2^-9),
+    as the scaled GEMM's own output rounding is. The consumer of the output
+    applies the per-token and per-channel scales
+    (``tokenspeed_kernel.ops.quantization.triton.fp8_dequantize_unscaled``).
+
+    Args:
+        codes: ``[M, K]`` FP8 E4M3 activation codes.
+        weight: ``[K, N]`` FP8 weight (a transposed ``[N, K]``).
+        unit_scale: A one-element FP32 tensor holding 1 on the device,
+            allocated outside CUDA-graph capture by the caller.
+
+    Returns:
+        ``[M, N]`` BF16 ``codes @ weight``.
+    """
+    from tokenspeed_kernel.ops.gemm import mm
+
+    return mm(
+        codes,
+        weight,
+        A_scales=unit_scale,
+        B_scales=unit_scale,
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+    )
 
 
 def _round_once(exact: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

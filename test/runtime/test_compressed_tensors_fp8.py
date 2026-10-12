@@ -718,6 +718,40 @@ def test_hopper_dequantizes_at_load_and_says_so(
     assert seen == [(layer, x, None)]
 
 
+@pytest.mark.parametrize("arch", [(10, 0), (10, 3)])
+def test_the_unscaled_linear_runs_a_vendor_gemm_with_unit_scales(
+    platform, monkeypatch, arch
+):
+    """fp8_unscaled_linear: the per-tensor FP8 GEMM the registry selects, with
+    both scales the one unit tensor, writing BF16; a vendor kernel serves it
+    on NVIDIA arch 10."""
+    platform(*arch)
+    assert w8a8.fp8_unscaled_gemm_available()
+    calls = []
+    select = gemm.select_kernel
+
+    def selected(*args, **kwargs):
+        kernel = select(*args, **kwargs)
+
+        def run(A, B, A_scales, B_scales, out_dtype, **extra):
+            calls.append(dict(kernel=kernel.name, A_scales=A_scales, B_scales=B_scales))
+            return (A.double() @ B.double()).to(out_dtype)
+
+        return SelectedKernel(kernel.name, run)
+
+    monkeypatch.setattr(gemm, "select_kernel", selected)
+    codes, _ = _fp8_checkpoint(3, 16)
+    weight, _ = _fp8_checkpoint(8, 16)
+    unit = torch.ones(1)
+    out = w8a8.fp8_unscaled_linear(codes, weight.t(), unit)
+    (call,) = calls
+    assert not call["kernel"].startswith(("triton", "torch_mm_fp8_scaled_"))
+    assert call["A_scales"].item() == 1 and call["B_scales"].item() == 1
+    assert out.dtype == torch.bfloat16
+    exact = codes.double() @ weight.double().t()
+    assert torch.equal(out, exact.to(torch.bfloat16))
+
+
 def test_dequantization_rounds_the_exact_product_once():
     """1.125 times 15087843 * 2**-24 lies just below the BF16 midpoint
     1 + 3 * 2**-8; rounded once it is 1 + 2**-7 (through FP32, 1 + 2**-6)."""

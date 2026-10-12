@@ -239,6 +239,39 @@ def fp8_quantize_by_multiplier(x, multiplier):
 
 
 @triton.jit
+def fp8_dequantize_unscaled(raw, token_scale, channel_scale):
+    """The scaled FP8 GEMM's output from an unscaled one, widened to FP32.
+
+    ``raw`` is a 16-bit load of an FP8 GEMM run with unit scales (the codes'
+    product, rounded once to the 16-bit output dtype); ``token_scale`` and
+    ``channel_scale`` are the FP32 per-token and per-channel dequant scales it
+    did not apply. The result is ``(raw * token_scale) * channel_scale`` in
+    FP32 (token first, as the scaled GEMMs' epilogues multiply), rounded to
+    ``raw``'s dtype as their output is, then widened back to FP32.
+    """
+    value = (raw.to(tl.float32) * token_scale) * channel_scale
+    return value.to(raw.dtype).to(tl.float32)
+
+
+def dequantize_unscaled_fp8(
+    raw: torch.Tensor, token_scales: torch.Tensor, channel_scales: torch.Tensor
+) -> torch.Tensor:
+    """``fp8_dequantize_unscaled`` in PyTorch, for a whole ``[M, N]`` output.
+
+    Args:
+        raw: ``[M, N]`` 16-bit output of an FP8 GEMM run with unit scales.
+        token_scales: FP32 ``[M]`` / ``[M, 1]`` per-token scales.
+        channel_scales: FP32 ``[N]`` / ``[N, 1]`` per-channel scales.
+
+    Returns:
+        ``[M, N]`` tensor in ``raw``'s dtype: ``(raw * token) * channel`` in
+        FP32, rounded once.
+    """
+    value = raw.float() * token_scales.reshape(-1, 1)
+    return (value * channel_scales.reshape(1, -1)).to(raw.dtype)
+
+
+@triton.jit
 def _fp8_token_quantize_kernel(
     x_ptr,
     q_ptr,
