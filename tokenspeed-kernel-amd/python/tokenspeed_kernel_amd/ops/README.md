@@ -808,6 +808,23 @@ them in a fixed order and adds the sink once; each of its workgroups owns one
 token, 16 heads and a 64-dim slice, so the merge of a small batch still spreads
 over many CUs.
 
+### gfx1250 DeepSeek V4.1 selected attention
+
+`gluon_dsv41_selected_attention_gfx1250` and its reduce kernel follow the
+gfx950 contract, split and zero-query shortcut above. QK and PV use 16x16x32
+BF16 WMMA. Rows are dequantized with the CDNA5 `scaled_upcast` at a unit
+scale and then multiplied by the block scale: the E8M0 SWA scale as an exact
+BF16 power of two, the E4M3 global scale as BF16. Rows are not prefetched,
+and V is read from LDS only after QK: the registers this saves buy more
+workgroups per CU than the overlap would.
+
+The launch differs from gfx950 in two ways. Small batches give each
+workgroup one or two 16-head groups instead of four while rows x head blocks
+x tiles stays within 640. That re-reads each selected row once per head
+block in exchange for more parallel workgroups, so the token count picks one
+of three compiled head-group widths. A split also covers at least two tiles,
+so SWA-only calls, which have two tiles, never split.
+
 ### gfx950 QSA sparse attention
 
 `gluon_qsa_sparse_attention_gfx950` serves `qsa_sparse_attention`: each query
