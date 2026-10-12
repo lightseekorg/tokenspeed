@@ -507,16 +507,63 @@ if current_platform().is_amd:
         else:
             _mhc_prenorm_gemm_triton(x, fn, out_mul, out_sqrsum, n_splits)
 
+    _GFX1250 = CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 5),
+        max_arch_version=ArchVersion(12, 5),
+        vendors=frozenset({"amd"}),
+    )
+
+    @register_kernel(
+        "residual",
+        "mhc_pre",
+        name="gluon_mhc_pre_gfx1250",
+        solution="gluon",
+        capability=_GFX1250,
+        signatures=frozenset(
+            {
+                format_signature(
+                    residual=dense_tensor_format(torch.bfloat16),
+                    fn=dense_tensor_format(torch.float32),
+                    hc_scale=dense_tensor_format(torch.float32),
+                    hc_base=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        traits={"hc_mult": frozenset({4})},
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mhc_pre_gfx1250(
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_eps: float,
+        sinkhorn_iters: int,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the hc=4 prenorm projection and reduction on GFX1250 Gluon."""
+        return _mhc_pre_impl(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+            _mhc_prenorm_gemm_gfx1250,
+            norm_weight,
+            norm_eps,
+            pre_mix_impl=launch_gluon_mhc_mixes_reduce_gfx1250,
+        )
+
     @register_kernel(
         "residual",
         "mhc_mixes",
         name="gluon_mhc_mixes_gfx1250",
         solution="gluon",
-        capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(12, 5),
-            max_arch_version=ArchVersion(12, 5),
-            vendors=frozenset({"amd"}),
-        ),
+        capability=_GFX1250,
         signatures=frozenset(
             {format_signature(residual=dense_tensor_format(torch.bfloat16))}
         ),

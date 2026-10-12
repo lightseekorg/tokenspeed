@@ -1792,7 +1792,8 @@ four branches across waves, so the gate tensor never reaches memory.
 BF16 residual streams. It shares split selection with `triton_mhc_mixes` and
 replaces both of its kernels: the projection `x @ fn.T` with its row sums of
 squares, and the reduction that runs normalization and the Sinkhorn
-iterations.
+iterations. `gluon_mhc_pre_gfx1250` runs the same two kernels for `mhc_pre`
+at every token count, then collapses the streams with the portable kernel.
 
 #### Contract
 

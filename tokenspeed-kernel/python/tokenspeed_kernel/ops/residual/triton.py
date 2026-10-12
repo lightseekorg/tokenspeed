@@ -932,12 +932,12 @@ def _mhc_pre_impl(
                 pre_mix,
                 post_mix,
                 comb_mix,
-                hidden_size,
-                rms_eps,
-                hc_eps,
-                sinkhorn_iters,
-                n_splits,
-                num_tokens,
+                hidden_size=hidden_size,
+                rms_eps=rms_eps,
+                hc_eps=hc_eps,
+                sinkhorn_iters=sinkhorn_iters,
+                n_splits=n_splits,
+                num_tokens=num_tokens,
             )
         _mhc_pre_layer_triton_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
             pre_mix,

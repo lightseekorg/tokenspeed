@@ -30,7 +30,10 @@ from utils import assert_no_triton_compile, is_cdna5
 if not is_cdna5():
     pytest.skip("AMD CDNA5 is required", allow_module_level=True)
 
-from tokenspeed_kernel.ops.residual.gluon import gluon_mhc_mixes_gfx1250  # noqa: E402
+from tokenspeed_kernel.ops.residual.gluon import (  # noqa: E402
+    gluon_mhc_mixes_gfx1250,
+    gluon_mhc_pre_gfx1250,
+)
 from tokenspeed_kernel.ops.residual.triton import (  # noqa: E402
     compute_mhc_num_splits,
 )
@@ -133,6 +136,38 @@ def test_mhc_mixes_selects_gfx1250_kernel() -> None:
         format_signature(residual=dense_tensor_format(torch.bfloat16)),
     )
     assert kernel.name == "gluon_mhc_mixes_gfx1250"
+
+
+@pytest.mark.parametrize("tokens", [1, 96, 2048])
+def test_mhc_pre_matches_reference(tokens: int) -> None:
+    residual, weight, scale, base = _operands(tokens, 4096, seed=tokens)
+    layer_input, post, comb = gluon_mhc_pre_gfx1250(
+        residual, weight, scale, base, _RMS_EPS, _HC_EPS, _SINKHORN_ITERS, None, None
+    )
+    pre, post_ref, comb_ref = _reference(residual, weight, scale, base)
+    torch.testing.assert_close(post.squeeze(-1).double(), post_ref, atol=1e-4, rtol=0)
+    torch.testing.assert_close(comb.double(), comb_ref, atol=1e-4, rtol=0)
+    torch.testing.assert_close(
+        layer_input.double(),
+        (pre[:, :, None] * residual.double()).sum(1),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+def test_mhc_pre_selects_gfx1250_kernel() -> None:
+    kernel = select_kernel(
+        "residual",
+        "mhc_pre",
+        format_signature(
+            residual=dense_tensor_format(torch.bfloat16),
+            fn=dense_tensor_format(torch.float32),
+            hc_scale=dense_tensor_format(torch.float32),
+            hc_base=dense_tensor_format(torch.float32),
+        ),
+        traits={"num_tokens": 8, "hc_mult": 4, "hidden_size": 4096},
+    )
+    assert kernel.name == "gluon_mhc_pre_gfx1250"
 
 
 def test_mhc_mixes_cuda_graph_replay() -> None:
