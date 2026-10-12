@@ -421,7 +421,6 @@ class _SyntheticHybridRecipe(CacheRecipe):
                     retention="full_history",
                     sliding_window_tokens=None,
                     family="state",
-                    checkpoint_granularity=self.prefix_granularity,
                     replayable=False,
                 ),
                 (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),

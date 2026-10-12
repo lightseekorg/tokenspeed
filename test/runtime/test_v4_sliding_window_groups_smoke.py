@@ -467,7 +467,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             layer_ratio=(1, 4, 128),
         )
         self.assertEqual({spec.family for spec in specs}, {"history"})
-        self.assertTrue(all(spec.checkpoint_granularity is None for spec in specs))
+        self.assertTrue(all(spec.family == "history" for spec in specs))
         retentions = {spec.group_id: spec.retention for spec in specs}
         self.assertEqual(retentions["v4.swa_kv"], "sliding_window")
         self.assertEqual(retentions["v4.c4a.compressor_state"], "sliding_window")
@@ -479,13 +479,11 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
     def test_v4_groups_cross_the_bridge_into_a_live_scheduler(self):
         # The whole V4 set arrives at the C++ scheduler as History groups,
         # passes SchedulerConfig::Validate (which refuses a sliding State
-        # group) and builds a scheduler; with no snapshot group there is no
-        # state grain for the prefill chunk to align to.
+        # group) and builds a scheduler.
         try:
             from tokenspeed_scheduler import CacheGroupFamily, Scheduler
 
             from tokenspeed.runtime.engine.scheduler_utils import (
-                aligned_max_scheduled_tokens,
                 make_config,
                 pool_to_cache_groups,
             )
@@ -534,7 +532,6 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             cache_groups=groups,
         )
         Scheduler(config)
-        self.assertEqual(aligned_max_scheduled_tokens(8192, groups), 8192)
 
     def test_c4_state_window_is_the_kernel_read_window(self):
         """The ratio-4 compress kernel reads eight positions (two groups) when a

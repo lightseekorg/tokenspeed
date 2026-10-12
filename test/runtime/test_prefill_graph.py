@@ -314,10 +314,10 @@ def _spec(
     """A published group spec.
 
     The real dataclass, not a namespace: it derives ``block_granularity`` from
-    the geometry the way production does, refuses ``page_size`` on a
-    checkpoint-state group, and carries ``retention`` -- which the width rule
-    deliberately ignores, and which a namespace double cannot express at all,
-    so ``test_sliding_window_group_still_spans_the_whole_extent`` could not be
+    the geometry the way production does, refuses ``page_size`` on a state
+    group, and carries ``retention`` -- which the width rule deliberately
+    ignores, and which a namespace double cannot express at all, so
+    ``test_sliding_window_group_still_spans_the_whole_extent`` could not be
     written against one.
     """
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -329,7 +329,6 @@ def _spec(
             group_id=group_id,
             retention=retention,
             family="state",
-            checkpoint_granularity=block_granularity,
             sliding_window_tokens=sliding_window_tokens,
             replayable=False,
         )
@@ -418,7 +417,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 _spec("full_attention", block_granularity=64),
                 _spec("sliding_attention", block_granularity=64),
                 # state: included
-                _spec("linear_attention", family="state", block_granularity=128),
+                _spec("linear_attention", family="state"),
             )
         )
         tables = self._bare(backend, pool)._dummy_group_tables(1)
@@ -426,17 +425,20 @@ class DummyGroupTablesTest(unittest.TestCase):
             set(tables),
             {"full_attention", "sliding_attention", "linear_attention"},
         )
-        # Each group in its own grain, rounded UP: 1000 is a multiple of
-        # neither, so a floor would give 15 and 7 and fail here.
+        # Each history group in its own grain, rounded UP: 1000 is not a
+        # multiple of 64, so a floor would give 15 and fail here. A state row
+        # is its two slots.
         self.assertEqual(tables["full_attention"].shape, (1, 16))
-        self.assertEqual(tables["linear_attention"].shape, (1, 8))
-        for group_id, table in tables.items():
+        self.assertEqual(tables["linear_attention"].shape, (1, 2))
+        for group_id in ("full_attention", "sliding_attention"):
             self.assertGreater(
-                int(table.min()),
+                int(tables[group_id].min()),
                 0,
                 f"{group_id}: capture writes KV, so no group may get the "
                 "reserved null block",
             )
+        # The fabricated request starts from the zero state and writes a real block.
+        self.assertEqual(tables["linear_attention"].tolist(), [[0, 1]])
 
     def test_width_spans_the_extent_at_a_realistic_magnitude(self):
         """Width is ceil(physical extent / grain), at a size where a silent
@@ -512,12 +514,14 @@ class DummyGroupTablesTest(unittest.TestCase):
         pool = _fake_pool(
             specs=(
                 _spec("full_attention", block_granularity=128),
-                _spec("linear_attention", family="state", block_granularity=128),
+                _spec("linear_attention", family="state"),
             )
         )
         tables = self._bare(wrapper, pool)._dummy_group_tables(1)
         self.assertEqual(set(tables), {"full_attention", "linear_attention"})
         self.assertEqual(tables["full_attention"].shape, (1, 8))  # ceil(1000/128)
+        # A state row is its two slots: a null input checkpoint and the live block.
+        self.assertEqual(tables["linear_attention"].tolist(), [[0, 1]])
 
     def test_each_capture_row_gets_its_own_block(self):
         """A state group needs one working block per request: two rows sharing
@@ -535,7 +539,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         pool = _fake_pool(
             specs=(
                 _spec("full_attention", block_granularity=64),
-                _spec("linear_attention", family="state", block_granularity=128),
+                _spec("linear_attention", family="state"),
             )
         )
         bare = self._bare(_backend(), pool)
@@ -543,24 +547,21 @@ class DummyGroupTablesTest(unittest.TestCase):
         tables = bare._dummy_group_tables(3)
         for group_id, table in tables.items():
             self.assertEqual(table.shape[0], 3, group_id)
-            self.assertGreater(int(table.min()), 0, group_id)
-            # The state path gathers at (seq_len - 1) // grain -- the LAST live
-            # column, never column 0. Asserting only on column 0 admits a table
-            # that aliases everywhere the runtime actually reads.
+            # The live block the state path writes is the LAST column; the
+            # history rows hold one block throughout.
             last_column = table[:, -1].tolist()
             self.assertEqual(
                 len(set(last_column)),
                 3,
-                f"{group_id}: rows alias at the column the state path reads, "
+                f"{group_id}: rows alias at the column the state path writes, "
                 f"got {last_column}",
             )
+        self.assertGreater(int(tables["full_attention"].min()), 0)
         # Strongest form: hand the shipped table to the production helper and
         # let its own uniqueness rule be the assertion.
         compute_state_block_indices(
             tables["linear_attention"],
-            128,
             torch.zeros(3, dtype=torch.int32),
-            torch.full((3,), 1024, dtype=torch.int32),
             validate=True,
             group_id="linear_attention",
         )

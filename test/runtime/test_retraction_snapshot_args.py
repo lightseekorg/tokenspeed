@@ -329,7 +329,6 @@ STATE = CacheGroupSpec(
     retention="full_history",
     replayable=False,
     family="state",
-    checkpoint_granularity=PAGE,
 )
 
 
