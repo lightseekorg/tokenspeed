@@ -272,7 +272,7 @@ class TestQwen3OmniMrope(unittest.TestCase):
 
 class _FakeCommManager:
     def final_norm(self, hidden_states, residual, ctx, norm):
-        return hidden_states, None
+        return hidden_states + residual, None
 
 
 class _IdentityDecoderLayer(nn.Module):
@@ -288,7 +288,9 @@ class _IdentityDecoderLayer(nn.Module):
         residual,
         cos_sin=None,
     ):
-        return hidden_states, residual
+        # The layer contributes nothing; the residual stream carries its input.
+        stream = hidden_states if residual is None else hidden_states + residual
+        return torch.zeros_like(stream), stream
 
 
 class TestQwen3OmniModelHelpers(unittest.TestCase):

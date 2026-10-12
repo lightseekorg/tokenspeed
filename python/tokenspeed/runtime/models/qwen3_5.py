@@ -1136,8 +1136,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                # Add to the residual: under all-reduce fusion hidden_states is
+                # this rank's partial sum, which the next layer reduces.
+                residual = (
+                    residual + input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
 
         # Apply final normalization with optional allreduce fusion

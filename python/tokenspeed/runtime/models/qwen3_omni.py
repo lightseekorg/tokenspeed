@@ -151,8 +151,10 @@ class Qwen3OmniMoeTextModel(Qwen3MoeModel):
             )
             if layer_idx < num_deepstack and input_deepstack_embeds.numel() > 0:
                 start = layer_idx * hidden_size
-                hidden_states.add_(
-                    input_deepstack_embeds[:, start : start + hidden_size]
+                # Add to the residual: under all-reduce fusion hidden_states is
+                # this rank's partial sum, which the next layer reduces.
+                residual = (
+                    residual + input_deepstack_embeds[:, start : start + hidden_size]
                 )
 
         if not ctx.forward_mode.is_idle():
