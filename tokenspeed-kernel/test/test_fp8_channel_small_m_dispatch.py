@@ -136,9 +136,11 @@ def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
     ],
 )
 def test_other_kernels_receive_rows_quantized_per_token(
-    arch, monkeypatch, major, minor, m, k, expected, quantizer
+    arch, require, monkeypatch, major, minor, m, k, expected, quantizer
 ):
     arch(major, minor)
+    if quantizer == "trtllm":
+        require("quantization", "fp8_with_scale", "trtllm", torch.bfloat16, "x")
     calls, quantized = [], []
     _stand_in_quantizer(monkeypatch, quantized)
     _recording_kernels(monkeypatch, calls)
