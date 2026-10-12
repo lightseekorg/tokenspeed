@@ -46,7 +46,7 @@ from compressed_tensors.quantization import (
     QuantizationScheme,
     preset_name_to_scheme,
 )
-from tokenspeed_kernel.ops.quantization import triton as triton_quantization
+from tokenspeed_kernel.ops.quantization import triton as quant_triton
 from tokenspeed_kernel.platform import (
     ArchVersion,
     Platform,
@@ -509,15 +509,20 @@ def _loaded(config, rows=8, cols=16, scale_dtype=torch.bfloat16):
 
 
 def _stand_ins(monkeypatch, calls, op_scale_shape="M1"):
-    """The TRT-LLM activation quantizer (scales [M, 1] or [M]), the static
-    quantizer's Triton launch (it returns the codes of x over the scale) and the
-    body of the kernel the real mm dispatcher selects (scales of one dimension
-    or none become columns, as triton_scaled_mm takes them)."""
+    """The TRT-LLM activation quantizer (scales [M, 1] or [M]) and the Triton
+    one mm runs up to 64 rows (scales [M, 1]), the static quantizer's Triton
+    launch (it returns the codes of x over the scale) and the body of the
+    kernel the real mm dispatcher selects (scales of one dimension or none
+    become columns, as triton_scaled_mm takes them)."""
 
     def quantize_e4m3_activation(x):
         scale = x.float().abs().amax(-1, keepdim=True) / 448.0
         codes = (x.float() / scale).clamp(-448, 448).to(FP8)
         return codes, scale if op_scale_shape == "M1" else scale.squeeze(-1)
+
+    def fp8_quantize_per_token(x):
+        scale = x.float().abs().amax(-1, keepdim=True) / 448.0
+        return (x.float() / scale).clamp(-448, 448).to(FP8), scale
 
     def static_quant(x, scale=None, enable_pdl=None, **_):
         assert x.is_contiguous() and scale.numel() == 1
@@ -552,7 +557,8 @@ def _stand_ins(monkeypatch, calls, op_scale_shape="M1"):
         quantize_e4m3_activation,
         raising=False,
     )
-    monkeypatch.setattr(triton_quantization, "fp8_quantize", static_quant)
+    monkeypatch.setattr(quant_triton, "fp8_quantize_per_token", fp8_quantize_per_token)
+    monkeypatch.setattr(quant_triton, "fp8_quantize", static_quant)
     monkeypatch.setattr(gemm, "select_kernel", selected)
 
 
@@ -605,6 +611,68 @@ def test_blackwell_runs_the_fp8_gemm(
         else codes.double() * scale.double()
     )
     reference = (expected_codes.double() * input_scale) @ weight.T
+    assert torch.equal(out, reference.to(torch.bfloat16))
+
+
+@pytest.mark.parametrize("tokens", [1, 8, 9, 64, 65])
+@pytest.mark.parametrize("arch", [(10, 0), (10, 3)])
+def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
+    platform, monkeypatch, arch, tokens
+):
+    """With K in whole 128-element tiles, up to 64 rows of a dynamic FP8
+    linear go to the small-M FP8 GEMM as FP8 codes and scales from the Triton
+    per-token quantizer; 65 rows go to the next kernel quantized by TRT-LLM's.
+    Both equal the FP64 product of per-token codes."""
+    platform(*arch)
+    layer, codes, scale = _loaded(_parse(CHANNEL_DYNAMIC), rows=32, cols=256)
+    layer.quant_method.process_weights_after_loading(layer)
+    calls, quantized = [], []
+
+    def quantizer(name):
+        def quantize(x):
+            quantized.append((name, x))
+            x_scale = x.float().abs().amax(-1, keepdim=True) / 448.0
+            return (x.float() / x_scale).clamp(-448, 448).to(FP8), x_scale
+
+        return quantize
+
+    select = gemm.select_kernel
+
+    def selected(*args, **kwargs):
+        kernel = select(*args, **kwargs)
+
+        def run(A, B, A_scales, B_scales, out_dtype, **extra):
+            calls.append(dict(kernel=kernel.name, A=A, A_scales=A_scales))
+            product = (A.double() * A_scales.double()) @ (
+                B.double() * B_scales.double().T
+            )
+            return product.to(out_dtype)
+
+        return SelectedKernel(kernel.name, run)
+
+    monkeypatch.setattr(
+        torch.ops.tensorrt_llm,
+        "quantize_e4m3_activation",
+        quantizer("trtllm"),
+        raising=False,
+    )
+    monkeypatch.setattr(quant_triton, "fp8_quantize_per_token", quantizer("triton"))
+    monkeypatch.setattr(gemm, "select_kernel", selected)
+    x = torch.randn(tokens, 256).to(torch.bfloat16)
+    out = layer.quant_method.apply(layer, x)
+    (call,) = calls
+    ((source, rows),) = quantized
+    assert call["A"].dtype == FP8 and rows.data_ptr() == x.data_ptr()
+    if tokens <= 64:
+        assert call["kernel"] == "triton_mm_fp8_channel_small_m"
+        assert source == "triton"
+    else:
+        assert call["kernel"] != "triton_mm_fp8_channel_small_m"
+        assert source == "trtllm"
+    x_scale = (x.float().abs().amax(-1, keepdim=True) / 448.0).double()
+    x_codes = (x.float() / x_scale.float()).clamp(-448, 448).to(FP8)
+    weight = codes.double() * scale.double().reshape(-1, 1)
+    reference = (x_codes.double() * x_scale) @ weight.T
     assert torch.equal(out, reference.to(torch.bfloat16))
 
 

@@ -1,0 +1,298 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""The small-M FP8 GEMM's selection, dispatch and launch arguments, on CPU.
+
+On a synthetic SM100 / SM103 / SM90 platform: which ``gemm.mm`` kernel serves
+per-token x per-channel FP8 rows, what it receives for ``quant="fp8"``
+without ``A_scales`` (FP8 codes and ``[M, 1]`` scales, from the Triton
+quantizer up to 64 rows and from TRT-LLM's token quantizer above), and the
+scale layouts and tile constexprs the small-M wrapper launches with.
+Kernel bodies and launches are recorders; the numerics run on the GPU
+(``test/nvidia/ops/gemm/test_fp8_channel_small_m.py``).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+import tokenspeed_kernel.ops.gemm as gemm
+import torch
+from tokenspeed_kernel.ops.gemm import triton_fp8_channel
+from tokenspeed_kernel.ops.quantization import triton as quant_triton
+from tokenspeed_kernel.platform import ArchVersion, Platform
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import SelectedKernel
+
+FP8 = torch.float8_e4m3fn
+SMALL_M = "triton_mm_fp8_channel_small_m"
+
+
+@pytest.fixture
+def arch(b200_platform):
+    """Switch to a synthetic NVIDIA platform of the given arch; restored after."""
+    original = Platform.get()
+
+    def switch(major: int, minor: int) -> None:
+        Platform.override(
+            dataclasses.replace(b200_platform, arch_version=ArchVersion(major, minor))
+        )
+        KernelRegistry.get().clear_cache()
+
+    switch(10, 0)
+    yield switch
+    Platform.override(original)
+    KernelRegistry.get().clear_cache()
+
+
+def _stand_in_quantizer(monkeypatch, quantized):
+    """TRT-LLM's per-token quantizer (codes, FP32 [M, 1] scales) and the Triton
+    one, recorded as ("trtllm" | "triton", rows)."""
+
+    def quantize(x):
+        scale = (x.float().abs().amax(-1, keepdim=True) / 448.0).clamp_min(1e-12)
+        return (x.float() / scale).clamp(-448, 448).to(FP8), scale
+
+    def quantize_e4m3_activation(x):
+        quantized.append(("trtllm", x))
+        return quantize(x)
+
+    def fp8_quantize_per_token(x):
+        quantized.append(("triton", x))
+        return quantize(x)
+
+    monkeypatch.setattr(
+        torch.ops.tensorrt_llm,
+        "quantize_e4m3_activation",
+        quantize_e4m3_activation,
+        raising=False,
+    )
+    monkeypatch.setattr(quant_triton, "fp8_quantize_per_token", fp8_quantize_per_token)
+
+
+def _recording_kernels(monkeypatch, calls):
+    select = gemm.select_kernel
+
+    def selected(*args, **kwargs):
+        kernel = select(*args, **kwargs)
+
+        def run(A, B, A_scales, B_scales, out_dtype, **extra):
+            calls.append(dict(kernel=kernel.name, A=A, A_scales=A_scales))
+            return torch.zeros(A.shape[0], B.shape[1], dtype=out_dtype)
+
+        return SelectedKernel(kernel.name, run)
+
+    monkeypatch.setattr(gemm, "select_kernel", selected)
+
+
+def _weight(n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A ``[K, N]`` column-major FP8 weight and its FP32 ``[N, 1]`` scales."""
+    return torch.zeros(n, k, dtype=FP8).t(), torch.ones(n, 1)
+
+
+@pytest.mark.parametrize("major,minor", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("m", [1, 8, 9, 64])
+def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
+    arch, monkeypatch, major, minor, m
+):
+    arch(major, minor)
+    calls, quantized = [], []
+    _stand_in_quantizer(monkeypatch, quantized)
+    _recording_kernels(monkeypatch, calls)
+    weight, scales = _weight(1536, 4096)
+    x = torch.randn(m, 4096).to(torch.bfloat16)
+    gemm.mm(x, weight, B_scales=scales, out_dtype=torch.bfloat16, quant="fp8")
+    (call,) = calls
+    assert call["kernel"] == SMALL_M
+    ((source, rows),) = quantized
+    assert source == "triton" and rows is x
+    assert call["A"].dtype == FP8 and tuple(call["A_scales"].shape) == (m, 1)
+
+
+@pytest.mark.parametrize(
+    "major,minor,m,k,expected,quantizer",
+    [
+        (10, 0, 65, 4096, "torch_mm_fp8_scaled", "trtllm"),
+        (10, 3, 65, 4096, "triton_mm_fp8_scaled", "trtllm"),
+        (10, 0, 8, 1000, "triton_mm_fp8_scaled", "triton"),
+    ],
+)
+def test_other_kernels_receive_rows_quantized_per_token(
+    arch, monkeypatch, major, minor, m, k, expected, quantizer
+):
+    arch(major, minor)
+    calls, quantized = [], []
+    _stand_in_quantizer(monkeypatch, quantized)
+    _recording_kernels(monkeypatch, calls)
+    weight, scales = _weight(1536, k)
+    x = torch.randn(m, k).to(torch.bfloat16)
+    gemm.mm(x, weight, B_scales=scales, out_dtype=torch.bfloat16, quant="fp8")
+    (call,) = calls
+    assert call["kernel"] == expected
+    ((source, rows),) = quantized
+    assert source == quantizer and rows is x
+    assert call["A"].dtype == FP8 and tuple(call["A_scales"].shape) == (m, 1)
+
+
+@pytest.mark.parametrize("major,minor", [(9, 0), (12, 0)])
+def test_no_small_m_gemm_outside_sm100_to_sm103(arch, major, minor):
+    arch(major, minor)
+    names = {
+        spec.name
+        for spec in KernelRegistry.get().get_for_operator(
+            "gemm", "mm", platform=Platform.get()
+        )
+    }
+    assert SMALL_M not in names
+
+
+def test_prequantized_rows_keep_their_scales(arch, monkeypatch):
+    calls, quantized = [], []
+    _stand_in_quantizer(monkeypatch, quantized)
+    _recording_kernels(monkeypatch, calls)
+    weight, scales = _weight(1536, 4096)
+    codes = torch.zeros(4, 4096, dtype=FP8)
+    a_scales = torch.ones(4, 1)
+    gemm.mm(
+        codes,
+        weight,
+        A_scales=a_scales,
+        B_scales=scales,
+        out_dtype=torch.bfloat16,
+        quant="fp8",
+    )
+    (call,) = calls
+    assert call["kernel"] == SMALL_M
+    assert call["A"] is codes and call["A_scales"] is a_scales
+    assert not quantized
+
+
+def test_online_signature_names_the_quantized_activation():
+    weight, scales = _weight(256, 512)
+    x = torch.empty(4, 512, dtype=torch.bfloat16)
+    signature = gemm._gemm_format_signature(
+        x, weight, None, scales, torch.bfloat16, "fp8", None
+    )
+    a = signature.format_for("a")
+    assert a.format == "scaled-fp8" and a.storage_dtype == FP8
+    assert a.scale.granularity == "channel" and a.scale.storage_dtype == torch.float32
+
+
+class _LaunchRecorder:
+    def __init__(self):
+        self.launches = []
+
+    def __getitem__(self, grid):
+        def launch(*args, **kwargs):
+            self.launches.append(dict(grid=grid, args=args, kwargs=kwargs))
+
+        return launch
+
+
+@pytest.mark.parametrize(
+    "m,a_layout,b_layout",
+    [
+        (1, "M1", "N1"),
+        (3, "M", "N1"),
+        (5, "T", "T"),
+        (16, "M1", "N1"),
+        (17, "M1", "N1"),
+        (33, "M1", "T"),
+        (64, "M", "N1"),
+    ],
+)
+@pytest.mark.parametrize("n,k", [(1536, 4096), (4096, 768), (1024, 4096), (200, 384)])
+def test_launch_arguments(arch, monkeypatch, m, a_layout, b_layout, n, k):
+    """Scale layouts become the per-row / per-column constexprs; BLOCK_M
+    buckets M to 16, 32 or 64; the tile is the measured table's for the
+    measured shards and the rule's otherwise."""
+    recorder = _LaunchRecorder()
+    monkeypatch.setattr(triton_fp8_channel, "_fp8_channel_small_m_kernel", recorder)
+    weight = torch.zeros(n, k, dtype=FP8)
+    b_scales = torch.ones(n, 1) if b_layout == "N1" else torch.ones(1)
+    a = torch.zeros(m, k, dtype=FP8)
+    a_scales = {"M1": torch.ones(m, 1), "M": torch.ones(m), "T": torch.ones(1, 1)}[
+        a_layout
+    ]
+    out = triton_fp8_channel.triton_mm_fp8_channel_small_m(
+        a, weight.t(), a_scales, b_scales, torch.bfloat16
+    )
+    assert tuple(out.shape) == (m, n) and out.dtype == torch.bfloat16
+    (launch,) = recorder.launches
+    kwargs = launch["kwargs"]
+    assert "QUANTIZE_A" not in kwargs
+    assert kwargs["A_SCALE_PER_ROW"] is (a_scales.numel() > 1)
+    assert kwargs["B_SCALE_PER_COL"] is (b_layout == "N1")
+    block_m = max(16, 1 << (m - 1).bit_length())
+    assert kwargs["BLOCK_M"] == block_m
+    tile = (
+        kwargs["BLOCK_N"],
+        kwargs["BLOCK_K"],
+        kwargs["num_warps"],
+        kwargs["num_stages"],
+    )
+    measured = triton_fp8_channel._SMALL_M_TILES.get((n, k, block_m))
+    if measured is not None:
+        assert tile == measured
+    assert launch["grid"] == ((n + kwargs["BLOCK_N"] - 1) // kwargs["BLOCK_N"],)
+    assert k % kwargs["BLOCK_K"] == 0
+    # M, N, K and the strides are runtime arguments.
+    assert launch["args"][5:11] == (m, n, k, k, k, n)
+
+
+def test_tiles_follow_the_rule_unless_measured(monkeypatch):
+    """The rule fitted to the GB200 sweep (1-16 | 32 | 64 rows), and a
+    measured ``_SMALL_M_TILES`` entry taking precedence for its shape."""
+    config = triton_fp8_channel._small_m_config
+    assert config(1, 1536, 4096) == (16, 16, 512, 4, 4)
+    assert config(32, 1536, 4096) == (32, 16, 512, 4, 3)
+    assert config(64, 1536, 4096) == (64, 64, 256, 8, 3)
+    assert config(8, 4096, 768) == (16, 64, 256, 4, 4)
+    assert config(17, 4096, 4096) == (32, 64, 512, 4, 3)
+    assert config(1, 768, 4096) == (16, 16, 512, 4, 4)
+    assert config(40, 4096, 384) == (64, 64, 128, 8, 3)
+    monkeypatch.setitem(
+        triton_fp8_channel._SMALL_M_TILES, (1536, 4096, 16), (16, 256, 4, 3)
+    )
+    assert config(1, 1536, 4096) == (16, 16, 256, 4, 3)
+    assert config(32, 1536, 4096) == (32, 16, 512, 4, 3)
+
+
+@pytest.mark.parametrize(
+    "a,a_scales,b,kwargs,match",
+    [
+        ("fp8", None, "kn", {}, "FP8 A needs A_scales"),
+        ("bf16", None, "kn", {}, "must be FP8 E4M3"),
+        ("fp8", "m1", "nk", {}, "column-major"),
+        ("fp8", "m1", "kn", {"alpha": torch.ones(1)}, "no alpha"),
+        ("fp8_65", "m1", "kn", {}, "up to 64 rows"),
+    ],
+)
+def test_wrapper_refusals(a, a_scales, b, kwargs, match):
+    m = 65 if a == "fp8_65" else 4
+    x = torch.zeros(m, 256, dtype=torch.bfloat16 if a == "bf16" else FP8)
+    weight = torch.zeros(128, 256, dtype=FP8)
+    b_arg = weight.t() if b == "kn" else weight.t().contiguous()
+    scales = torch.ones(m, 1) if a_scales else None
+    with pytest.raises(ValueError, match=match):
+        triton_fp8_channel.triton_mm_fp8_channel_small_m(
+            x, b_arg, scales, torch.ones(128, 1), torch.bfloat16, **kwargs
+        )

@@ -206,6 +206,103 @@ def fp8_quantize(
     return out
 
 
+# Dynamic per-token FP8 E4M3 activation quantization (compressed-tensors
+# FP8_DYNAMIC), by TRT-LLM's rule (perTokenQuantization with FP8 min scaling,
+# as its FP8 per-channel MoE quantizes its input): for a row with largest
+# magnitude amax, the dequant scale is max(amax / 448, 1 / (448 * 512)) and the
+# codes are RN(x * min(448 / amax, 448 * 512)), saturated to +-448; a zero row
+# quantizes to zeros. Both divisions are IEEE-rounded (div_rn), so every kernel
+# that inlines these helpers (the standalone quantizer below, the small-M FP8
+# GEMM's prologue, the RMSNorm epilogue) writes the same scales and codes.
+_FP8_E4M3_MAX = tl.constexpr(448.0)
+_FP8_TOKEN_MIN_SCALE = tl.constexpr(1.0 / (448.0 * 512.0))
+_FP8_TOKEN_MAX_MULTIPLIER = tl.constexpr(448.0 * 512.0)
+
+
+@triton.jit
+def fp8_token_scale(amax):
+    """FP32 dequant scale of a row (or rows) whose largest magnitude is ``amax``."""
+    return tl.maximum(tl.div_rn(amax, _FP8_E4M3_MAX), _FP8_TOKEN_MIN_SCALE)
+
+
+@triton.jit
+def fp8_token_multiplier(amax):
+    """FP32 quantization multiplier of a row whose largest magnitude is ``amax``."""
+    return tl.minimum(tl.div_rn(_FP8_E4M3_MAX, amax), _FP8_TOKEN_MAX_MULTIPLIER)
+
+
+@triton.jit
+def fp8_quantize_by_multiplier(x, multiplier):
+    """FP8 E4M3 codes of FP32 ``x`` times its quantization ``multiplier``."""
+    q = tl.clamp(x * multiplier, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+    return q.to(tl.float8e4nv)
+
+
+@triton.jit
+def _fp8_token_quantize_kernel(
+    x_ptr,
+    q_ptr,
+    scale_ptr,
+    K,
+    x_row_stride,
+    q_row_stride,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < K
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + row * x_row_stride + cols, mask=mask, other=0.0)
+    x = x.to(tl.float32)
+    amax = tl.max(tl.abs(x), axis=0)
+    codes = fp8_quantize_by_multiplier(x, fp8_token_multiplier(amax))
+    tl.store(q_ptr + row * q_row_stride + cols, codes, mask=mask)
+    tl.store(scale_ptr + row, fp8_token_scale(amax))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def fp8_quantize_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize the rows of ``x`` to FP8 E4M3 with one FP32 scale each, in one launch.
+
+    Args:
+        x: ``[M, K]`` BF16 or FP16 activations with a contiguous last axis.
+
+    Returns:
+        ``(codes, scales)``: contiguous ``[M, K]`` FP8 E4M3 codes and FP32
+        ``[M, 1]`` dequant scales, ``x ~= codes * scales``.
+    """
+    if x.ndim != 2 or x.stride(-1) != 1:
+        raise ValueError(
+            f"x must be [M, K] with a contiguous last axis, got shape "
+            f"{tuple(x.shape)} stride {x.stride()}"
+        )
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError(f"x must be BF16 or FP16, got {x.dtype}")
+    m, k = x.shape
+    codes = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+    if m == 0:
+        return codes, scales
+    block = triton.next_power_of_2(k)
+    enable_pdl = pdl_enabled()
+    _fp8_token_quantize_kernel[(m,)](
+        x,
+        codes,
+        scales,
+        k,
+        x.stride(0),
+        codes.stride(0),
+        BLOCK=block,
+        ENABLE_PDL=enable_pdl,
+        num_warps=min(max(block // 512, 1), 8),
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return codes, scales
+
+
 @triton.jit
 def _fp8_token_group_quantize_kernel(
     x_ptr,

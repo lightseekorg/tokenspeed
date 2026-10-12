@@ -63,6 +63,7 @@ __all__ = [
     "CompressedTensorsW8A8Fp8",
     "dequantize_fp8_per_channel",
     "fp8_channel_gemm_available",
+    "fp8_dynamic_linear",
 ]
 
 _FP8 = torch.float8_e4m3fn
@@ -269,22 +270,43 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 self._unquantized = UnquantizedLinearMethod()
             return self._unquantized.apply(layer, x, bias)
 
-        from tokenspeed_kernel.ops.gemm import mm
-        from tokenspeed_kernel.ops.quantization import quantize_fp8
-
         input_2d = x.reshape(-1, x.shape[-1])
         if layer.input_scale is not None:
+            from tokenspeed_kernel.ops.gemm import mm
+            from tokenspeed_kernel.ops.quantization import quantize_fp8
+
             qinput, x_scale = quantize_fp8(input_2d, scale=layer.input_scale)
+            output = mm(
+                qinput,
+                layer.weight,
+                A_scales=x_scale,
+                B_scales=layer.weight_scale,
+                out_dtype=x.dtype,
+                quant="fp8",
+            )
         else:
-            qinput, x_scale = quantize_fp8(input_2d, granularity="token")
-        output = mm(
-            qinput,
-            layer.weight,
-            A_scales=x_scale,
-            B_scales=layer.weight_scale,
-            out_dtype=x.dtype,
-            quant="fp8",
-        )
+            output = fp8_dynamic_linear(input_2d, layer.weight, layer.weight_scale)
         if bias is not None:
             output = output + bias
         return output.view(*x.shape[:-1], layer.weight.shape[1])
+
+
+def fp8_dynamic_linear(
+    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> torch.Tensor:
+    """``x @ weight`` of an FP8 W8A8 linear with dynamic per-token activations.
+
+    Args:
+        x: ``[M, K]`` BF16 or FP16 activations.
+        weight: ``[K, N]`` FP8 E4M3 weight (a transposed ``[N, K]``), as
+            ``process_weights_after_loading`` leaves it.
+        weight_scale: FP32 ``[N, 1]`` per-channel scales.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype. ``tokenspeed_kernel.ops.gemm.mm``
+        quantizes ``x`` per token in one launch before the GEMM (the Triton
+        quantizer for decode rows, TRT-LLM's above 64 rows).
+    """
+    from tokenspeed_kernel.ops.gemm import mm
+
+    return mm(x, weight, B_scales=weight_scale, out_dtype=x.dtype, quant="fp8")
