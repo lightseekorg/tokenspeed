@@ -155,9 +155,10 @@ def _dequant_global_rows(values, scales):
     """
     scale = scales.to(tl.float8e4nv, bitcast=True).to(gl.float32)
     values, scale = gl.broadcast(values, scale[:, :, :, None])
-    # One conversion per byte; op_sel picks the byte of the 32-bit word. Gluon
-    # has no FP4 dtype, and its scaled upcast only yields BF16/FP16, which
-    # would need unpacking to FP32 before the E4M3 scale multiply.
+    # Each v_cvt_scalef32_pk_f32_fp4 turns one byte (op_sel picks it from the
+    # word) into an FP32 pair, returned as an int64, at unit scale. Inline asm
+    # because Gluon has no FP4 dtype and its scaled upcast yields only
+    # BF16/FP16, which would need unpacking to FP32 for the E4M3 multiply.
     byte0, byte1, byte2, byte3 = gl.inline_asm_elementwise(
         "v_cvt_scalef32_pk_f32_fp4 $0, $4, 1.0\n"
         "v_cvt_scalef32_pk_f32_fp4 $1, $4, 1.0 op_sel:[1,0,0]\n"
