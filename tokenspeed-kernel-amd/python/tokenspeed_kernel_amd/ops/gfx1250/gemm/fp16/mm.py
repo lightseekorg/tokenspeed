@@ -22,13 +22,22 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 _LARGEM_MIN_M = 512
 _LARGEM_BLOCK_M_CROSSOVER = 12288
-_LARGEM_WIDE_M = 4096
 _LARGEM_WIDE_N = 3072
+# From this many rows the 256 x 256 ping-pong tile fills the device.
+_LARGEM_WIDE_M = 4096
+_LARGEM_BLOCK_K = 128
+_LARGEM_PINGPONG_GROUP_M = 4
+_LARGEM_PINGPONG_MIN_N = 1536
+# MI450 has eight XCDs, each with its own L2; workgroups are dispatched
+# round-robin over them.
+_LARGEM_NUM_XCDS = 8
 _DENSE_M64_MIN_M = 17
 _DENSE_MAX_M = 64
 _DENSE_M64_MAX_N = 8192
@@ -1216,16 +1225,255 @@ def _wmma_tdm_dense_largem_kernel(
     )
 
 
+def _wmma_tdm_dense_largem_pingpong_launch_metadata(grid, kernel, args):
+    """Report useful FLOPs and the issued A/B tile reads plus the BF16 store."""
+    m, n, k = args["M"], args["N"], args["K"]
+    block_m, block_n = args["BLOCK_M"], args["BLOCK_N"]
+    elem = args["a_ptr"].element_size()
+    grid_m = triton.cdiv(m, block_m)
+    grid_n = triton.cdiv(n, block_n)
+    return {
+        "name": f"{kernel.name} [M={m}, N={n}, K={k}]",
+        "flops16": 2 * m * n * k,
+        # Every output tile streams its full A row panel and B column panel.
+        "bytes": (grid_n * m + grid_m * n) * k * elem + m * n * elem,
+    }
+
+
+@gluon.jit
+def _largem_pingpong_xcd_tile(
+    pid, grid_m, grid_n, NUM_XCDS: gl.constexpr, GROUP_M: gl.constexpr
+):
+    # Workgroups are dispatched round-robin over the XCDs. Give each XCD a
+    # contiguous run of tile ids, then group GROUP_M row tiles per column
+    # sweep, so tiles that share A rows or B columns run on the same L2.
+    num_tiles = grid_m * grid_n
+    xcd = pid % NUM_XCDS
+    tile = (
+        xcd * (num_tiles // NUM_XCDS)
+        + gl.minimum(xcd, num_tiles % NUM_XCDS)
+        + pid // NUM_XCDS
+    )
+    width = GROUP_M * grid_n
+    first_m = (tile // width) * GROUP_M
+    group_size = gl.minimum(grid_m - first_m, GROUP_M)
+    pid_m = first_m + (tile % width) % group_size
+    pid_n = (tile % width) // group_size
+    return pid_m, pid_n
+
+
+@gluon.jit
+def _largem_pingpong_consume(
+    a_smem,
+    b_smem,
+    slot,
+    refill_slot,
+    a_desc,
+    b_desc,
+    acc,
+    DOT_A: gl.constexpr,
+    DOT_B: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    REFILL: gl.constexpr,
+):
+    # One K tile in two half-K steps. The two waves sharing a SIMD alternate
+    # between stage0 (TDM issue + LDS reads) and stage1 (WMMA), so one wave's
+    # LDS reads overlap the other wave's matrix work.
+    HALF_K: gl.constexpr = BLOCK_K // 2
+    gl.amd.cdna5.tdm.async_wait(0)
+    with gl.amd.warp_pipeline_stage("stage0"):
+        if REFILL:
+            # Waves 0-3 (one per SIMD) issue the refill of the other slot.
+            gl.amd.cdna5.tdm.async_load(
+                a_desc, [0, 0], a_smem.index(refill_slot), warp_used_hint=0b1111
+            )
+            gl.amd.cdna5.tdm.async_load(
+                b_desc, [0, 0], b_smem.index(refill_slot), warp_used_hint=0b1111
+            )
+        a = a_smem.index(slot).slice(0, HALF_K, 1).load(layout=DOT_A)
+        b = b_smem.index(slot).slice(0, HALF_K, 1).permute([1, 0]).load(layout=DOT_B)
+    with gl.amd.warp_pipeline_stage("stage1"):
+        acc = gl.amd.cdna5.wmma(a, b, acc)
+    with gl.amd.warp_pipeline_stage("stage0"):
+        a = a_smem.index(slot).slice(HALF_K, HALF_K, 1).load(layout=DOT_A)
+        b = (
+            b_smem.index(slot)
+            .slice(HALF_K, HALF_K, 1)
+            .permute([1, 0])
+            .load(layout=DOT_B)
+        )
+        if REFILL:
+            a_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
+                a_desc, add_offsets=[0, BLOCK_K]
+            )
+            b_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
+                b_desc, add_offsets=[0, BLOCK_K]
+            )
+    with gl.amd.warp_pipeline_stage("stage1"):
+        acc = gl.amd.cdna5.wmma(a, b, acc)
+    return a_desc, b_desc, acc
+
+
+# The live row count varies with the prefill chunk, so it must not split the
+# compile cache on its divisibility.
+@gluon.jit(
+    launch_metadata=_wmma_tdm_dense_largem_pingpong_launch_metadata,
+    do_not_specialize=["M"],
+)
+def _wmma_tdm_dense_largem_pingpong_kernel(
+    a_ptr,
+    b_ptr,
+    out_ptr,
+    stride_am,
+    stride_bn,
+    stride_om,
+    M,
+    N,
+    K,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    SHARED_A: gl.constexpr,
+    SHARED_B: gl.constexpr,
+    SHARED_OUT: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+):
+    """Eight-wave ping-pong BF16 CDNA5 GEMM for wide large-M projections.
+
+    Computes ``out = A @ B.T`` for unit-inner-stride A ``[M, K]``, B ``[N, K]``
+    and out ``[M, N]``; K must be a multiple of BLOCK_K. Ragged M and N edges
+    are handled by bounding the TDM descriptors at the real M and N, which
+    zero-fills the loads past the edge and clips the TDM store.
+    """
+    gl.static_assert(gl.num_warps() == 8, "ping-pong needs two waves per SIMD")
+    pid_m, pid_n = _largem_pingpong_xcd_tile(
+        gl.program_id(0),
+        gl.cdiv(M, BLOCK_M),
+        gl.cdiv(N, BLOCK_N),
+        NUM_XCDS,
+        GROUP_M,
+    )
+    off_m = pid_m * BLOCK_M
+    off_n = pid_n * BLOCK_N
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 8)
+
+    a_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=a_ptr + off_m * stride_am,
+        shape=(M - off_m, K),
+        strides=(stride_am, 1),
+        block_shape=(BLOCK_M, BLOCK_K),
+        layout=SHARED_A,
+    )
+    b_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=b_ptr + off_n * stride_bn,
+        shape=(N - off_n, K),
+        strides=(stride_bn, 1),
+        block_shape=(BLOCK_N, BLOCK_K),
+        layout=SHARED_B,
+    )
+    a_smem = gl.allocate_shared_memory(
+        a_ptr.dtype.element_ty, [2, BLOCK_M, BLOCK_K], SHARED_A
+    )
+    b_smem = gl.allocate_shared_memory(
+        b_ptr.dtype.element_ty, [2, BLOCK_N, BLOCK_K], SHARED_B
+    )
+
+    gl.amd.cdna5.tdm.async_load(a_desc, [0, 0], a_smem.index(0), warp_used_hint=0b1111)
+    gl.amd.cdna5.tdm.async_load(b_desc, [0, 0], b_smem.index(0), warp_used_hint=0b1111)
+    a_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(a_desc, add_offsets=[0, BLOCK_K])
+    b_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(b_desc, add_offsets=[0, BLOCK_K])
+    acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, WMMA_LAYOUT)
+    num_k_tiles = gl.cdiv(K, BLOCK_K)
+    gl.assume(num_k_tiles > 0)
+    # Double buffer: consuming K tile i refills the other slot with tile i + 1.
+    for i in range(0, num_k_tiles - 1):
+        a_desc, b_desc, acc = _largem_pingpong_consume(
+            a_smem,
+            b_smem,
+            i % 2,
+            (i + 1) % 2,
+            a_desc,
+            b_desc,
+            acc,
+            dot_a,
+            dot_b,
+            BLOCK_K,
+            True,
+        )
+    a_desc, b_desc, acc = _largem_pingpong_consume(
+        a_smem,
+        b_smem,
+        (num_k_tiles - 1) % 2,
+        0,
+        a_desc,
+        b_desc,
+        acc,
+        dot_a,
+        dot_b,
+        BLOCK_K,
+        False,
+    )
+
+    # The operand buffers are dead here, so the output staging tile reuses
+    # their LDS; one TDM store then writes the clipped tile.
+    out_smem = gl.allocate_shared_memory(
+        out_ptr.dtype.element_ty, [BLOCK_M, BLOCK_N], SHARED_OUT
+    )
+    out_smem.store(acc.to(out_ptr.dtype.element_ty))
+    out_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=out_ptr + off_m * stride_om + off_n,
+        shape=(M - off_m, N - off_n),
+        strides=(stride_om, 1),
+        block_shape=(BLOCK_M, BLOCK_N),
+        layout=SHARED_OUT,
+    )
+    gl.amd.cdna5.tdm.async_store(out_desc, [0, 0], out_smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+
+
+@functools.lru_cache(maxsize=None)
+def _largem_pingpong_layouts(block_m: int, block_n: int, block_k: int, num_warps: int):
+    """Partitioned LDS layouts and the matching WMMA layout for one tile."""
+    padded_a = gl.PaddedSharedLayout.with_identity_for(
+        [[block_k, 8]], [block_m, block_k], [1, 0]
+    )
+    padded_b = gl.PaddedSharedLayout.with_identity_for(
+        [[block_k, 8]], [block_n, block_k], [1, 0]
+    )
+    # Splitting the A rows and B columns across the two LDS partitions lets
+    # paired waves read different partitions in the same instruction.
+    shared_a, shared_b, wmma_layout = gl.amd.cdna5.make_partitioned_dot_layouts(
+        block_m,
+        block_n,
+        padded_a,
+        padded_b,
+        num_warps,
+        [16, 16, 32],
+        a_transposed=False,
+        b_transposed=True,
+        transposed=True,
+    )
+    shared_out = gl.PaddedSharedLayout.with_identity_for(
+        [[block_n, 8]], [block_m, block_n], [1, 0]
+    )
+    return shared_a, shared_b, shared_out, wmma_layout
+
+
 def gluon_mm_a16w16_largem_gfx1250(
     A: torch.Tensor,
     B: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run K3 BF16 projections on a single CDNA5 WMMA kernel.
+    """Run K3 BF16 projections on one CDNA5 WMMA kernel launch.
 
-    The kernel covers the whole output, including ragged M and N edges, which
-    it masks rather than having the caller peel them off into vendor calls.
+    From ``_LARGEM_WIDE_M`` rows this is the eight-wave ping-pong kernel with
+    256 x 256 tiles; fewer rows use the four-warp 128 x 128 kernel. Either
+    covers the whole output, including ragged M and N edges, rather than
+    having the caller peel them off into vendor calls.
     """
 
     if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[1]:
@@ -1270,9 +1518,41 @@ def gluon_mm_a16w16_largem_gfx1250(
 
 
 def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
-    """Store ``A @ B.T`` in ``out``'s dtype with the large-M kernel."""
+    """Store ``A @ B.T`` in ``out``'s dtype with the large-M kernels."""
     m, k = A.shape
     n = B.shape[0]
+    # The ping-pong kernel writes its tile with one TDM store, so it needs a
+    # contiguous output; narrower outputs leave its 256-wide grid underfilled.
+    if m >= _LARGEM_WIDE_M and n >= _LARGEM_PINGPONG_MIN_N and out.is_contiguous():
+        block_m = block_n = 256
+        shared_a, shared_b, shared_out, wmma_layout = _largem_pingpong_layouts(
+            block_m, block_n, _LARGEM_BLOCK_K, 8
+        )
+        grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
+        _wmma_tdm_dense_largem_pingpong_kernel[(grid,)](
+            A,
+            B,
+            out,
+            A.stride(0),
+            B.stride(0),
+            out.stride(0),
+            m,
+            n,
+            k,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=_LARGEM_BLOCK_K,
+            GROUP_M=_LARGEM_PINGPONG_GROUP_M,
+            NUM_XCDS=_LARGEM_NUM_XCDS,
+            SHARED_A=shared_a,
+            SHARED_B=shared_b,
+            SHARED_OUT=shared_out,
+            WMMA_LAYOUT=wmma_layout,
+            num_warps=8,
+            waves_per_eu=2,
+        )
+        return
+
     if m >= _LARGEM_WIDE_M and n >= _LARGEM_WIDE_N:
         block_m, block_n = 256, 256
         warp_bases, num_warps = _WARP_BASES_8, 8
@@ -1284,10 +1564,7 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
         # Only the block shape has to divide evenly here. Ragged M and N edges
         # are handled inside the kernel: its TDM descriptors are bounded by the
         # real M and N, so the trailing partial tiles load only the rows that
-        # exist, and its stores are masked against the same bounds. Peeling
-        # those edges off into vendor calls would cost a second full pass over
-        # A plus, for a ragged N, a scratch buffer and a copy of the whole
-        # result.
+        # exist, and its stores are masked against the same bounds.
         block_n = block_m if n % block_m == 0 else 128
         warp_bases, num_warps = _WARP_BASES_4, 4
         group_m = 8

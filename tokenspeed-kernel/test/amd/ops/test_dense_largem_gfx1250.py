@@ -1,0 +1,72 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Dense large-M ping-pong projection coverage on gfx1250."""
+
+import pytest
+import torch
+from utils import assert_no_triton_compile, is_cdna5
+
+if not is_cdna5():
+    pytest.skip("AMD CDNA5 is required", allow_module_level=True)
+
+from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+    _wmma_tdm_dense_largem_pingpong_kernel,
+    gluon_mm_a16w16_largem_gfx1250,
+)
+
+
+def _project(a, b):
+    """Run into a NaN-filled buffer and check nothing past the output moved."""
+    m, n = a.shape[0], b.shape[0]
+    storage = torch.full((m * n + 4096,), float("nan"), device="cuda", dtype=a.dtype)
+    out = storage[: m * n].view(m, n)
+    actual = gluon_mm_a16w16_largem_gfx1250(a, b, out=out)
+    assert actual.data_ptr() == out.data_ptr()
+    assert torch.isnan(storage[m * n :]).all()
+    return actual
+
+
+# Ragged M and N edges (2112 = 8.25 tiles), an odd K-tile count (4224 / 128),
+# and full tiles.
+@pytest.mark.parametrize(
+    "m,n,k", [(4097, 2112, 7168), (4352, 7168, 4224), (4096, 3072, 512)]
+)
+def test_largem_pingpong_matches_torch(m, n, k):
+    torch.manual_seed(m + n + k)
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    actual = _project(a, b)
+    expected = (a.float() @ b.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_largem_pingpong_row_counts_reuse_compilation():
+    torch.manual_seed(1250)
+    k, n = 1536, 2304
+    a = torch.randn(8192, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    _project(a[:4096], b)
+    with assert_no_triton_compile(_wmma_tdm_dense_largem_pingpong_kernel):
+        for rows in (4097, 6096, 8144, 8192):
+            actual = _project(a[:rows], b)
+            torch.testing.assert_close(
+                actual, a[:rows] @ b.T, atol=1e-2, rtol=1e-2
+            )
