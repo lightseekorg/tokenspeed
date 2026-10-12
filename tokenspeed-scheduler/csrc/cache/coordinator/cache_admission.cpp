@@ -229,6 +229,13 @@ private:
                         "a sparse suffix lands past the hit's tail blocks");
             }
         }
+        // A Host tail's hits land on fresh destinations counted per bucket
+        // (collectHostHitBuckets); its holes -- tail blocks no lookback of
+        // this group reaches -- are still slots the request writes and get a
+        // fresh block each.
+        if (const auto& tail = prefix_.host.tail; tail && !tail->group_keys[i].empty()) {
+            blocks += std::ranges::count(tail->per_group[i].hits, std::uint8_t{0});
+        }
         if (completed_ != nullptr && completed_->owner_continues && completed_->tail &&
             groups_[i].Spec().kind != AttnKind::kMambaState && !groups_[i].Spec().replayable) {
             blocks += (completed_->tail->tail_tokens + block_granularity - 1) / block_granularity;
@@ -936,6 +943,25 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     if (!candidate) {
         return std::nullopt;
     }
+    // Claim before evicting, as Admit does: a claimed entry is pinned, so a
+    // victim's eviction cascade (a tail's companions, a page's state
+    // checkpoints) cannot take a block the image is about to resume on.
+    std::vector<std::vector<CacheBlockRef>> claimed(groups_.size());
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const ImageTable& shape = image.tables[i];
+        claimed[i].resize(shape.slots.size());
+        for (std::size_t j = 0; j < shape.slots.size(); ++j) {
+            const ImageSlot& slot = shape.slots[j];
+            if (!claimable(i, shape, slot) || !groups_[i].Index().Find(pool_, slot.key)) {
+                continue;
+            }
+            // The planner protected this entry; claim it like a prefix hit.
+            const std::array<CacheKey, 1> keys{slot.key};
+            PrefixMatch hit = groups_[i].Index().AcquireMatched(pool_, keys, /*begin_blocks=*/0,
+                                                                GroupPrefixProbe{.hits = {1}}, request_access_epoch);
+            claimed[i][j] = std::move(hit.blocks.front());
+        }
+    }
     // Nothing is published or reclaimed here, so every planned victim is a
     // cache-only block the planner saw as evictable (or a tail companion an
     // earlier victim's eviction already took).
@@ -954,19 +980,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         GroupAllocator& allocator = groups_[i].Allocator();
         BlockTable& table = *demands[i].table;
         const ImageTable& shape = image.tables[i];
-        std::vector<CacheBlockRef> claimed(shape.slots.size());
-        for (std::size_t j = 0; j < shape.slots.size(); ++j) {
-            const ImageSlot& slot = shape.slots[j];
-            if (!claimable(i, shape, slot) || !groups_[i].Index().Find(pool_, slot.key)) {
-                continue;
-            }
-            // The planner protected this entry; claim it like a prefix hit.
-            const std::array<CacheKey, 1> keys{slot.key};
-            PrefixMatch hit = groups_[i].Index().AcquireMatched(pool_, keys, /*begin_blocks=*/0,
-                                                                GroupPrefixProbe{.hits = {1}}, request_access_epoch);
-            claimed[j] = std::move(hit.blocks.front());
-        }
-        FatalCheck(allocator.AcquireShape(pool_, table, shape, std::move(claimed)),
+        FatalCheck(allocator.AcquireShape(pool_, table, shape, std::move(claimed[i])),
                    "restore plan no longer fits the block pool");
         for (const ImageSlot& slot : shape.slots) {
             const CacheBlockRef& destination = table.Blocks()[static_cast<std::size_t>(slot.slot_index)];

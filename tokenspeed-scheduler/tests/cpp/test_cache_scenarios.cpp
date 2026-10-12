@@ -5715,6 +5715,94 @@ TEST_F(HostHitSuite, DuplicateLoadBackDoneIsIgnored) {
 // computed tokens, and an SWA slide that punches a still-loading destination
 // page must leave it ticket-protected until LoadBackDone.
 // ---------------------------------------------------------------------------
+// A Host tail whose blocks a sliding group only partly needs (W=2 over
+// two-token blocks looks back one block; a three-token tail spans two): the
+// unneeded block is a hole the admission still fills with a fresh page, which
+// the planner must count.
+class HostTailHoleSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = 13;  // twelve usable
+        cfg.host_allocator.total_pages = 33;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = false;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full", 4, cfg.device_allocator.total_pages, CacheGroupConfig::Retention::FullHistory,
+                      CacheGroupFamily::History),
+            MakeGroup("swa", 2, cfg.device_allocator.total_pages, CacheGroupConfig::Retention::SlidingWindow,
+                      CacheGroupFamily::History, /*sliding_window_tokens=*/2),
+        };
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(HostTailHoleSuite, ThePlanCountsTheFreshBlockOfAHostTailHole) {
+    // r1 = [1..7] + one decode: finish publishes page 0 and the tail at 7 --
+    // the full group's block [4, 7), the sliding group's lookback block [6, 7)
+    // -- and streams them to Host.
+    Submit(RequestSpec{.request_id = "r1", .tokens = MakeTokens(7), .max_new_tokens = 2});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("r1", {101});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("r1", {102});
+    SendFinish("r1");
+    AckWriteBacks(PlanOnce());
+    ASSERT_TRUE(scheduler_->ClearL1Cache()) << "the Host tier alone holds r1";
+    ASSERT_EQ(scheduler_->TailEntries(), 1u);
+
+    // A filler holds seven of the twelve blocks: 3 full (seven tokens, the
+    // decode slot and the two-token admission headroom) + 4 sliding.
+    Submit(RequestSpec{.request_id = "filler", .tokens = MakeTokens(7, 501), .max_new_tokens = 2});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 5);
+
+    // r2 = [1..7, 77]: the Host tail at 7 is the hit. The full group loads
+    // page 0 and the tail block (2) and grows by one (3); the sliding group
+    // loads the tail block [6, 7) its lookback reaches (1), fills the tail
+    // hole [4, 6) with a fresh page (1) and grows by one (3): six blocks, one
+    // more than the pool has free, so the admission waits for the filler
+    // instead of planning five and failing to acquire the sixth.
+    Submit(RequestSpec{.request_id = "r2",
+                       .tokens =
+                           [] {
+                               std::vector<std::int32_t> tokens = MakeTokens(7);
+                               tokens.push_back(77);
+                               return tokens;
+                           }(),
+                       .max_new_tokens = 1});
+    const ExecutionPlan blocked = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(blocked);
+    ASSERT_TRUE(batch == nullptr || std::ranges::find(batch->request_ids, "r2") == batch->request_ids.end())
+        << "r2 waits";
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+
+    SendForwardDone("filler", {601});
+    SendForwardDone("filler", {602});
+    SendFinish("filler");
+    const ExecutionPlan admitted = PlanOnce();
+    const ForwardBatch* r2 = FindForwardBatch(admitted);
+    ASSERT_NE(r2, nullptr);
+    ASSERT_EQ(r2->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(r2->extend_prefix_lens, std::vector<std::int32_t>{7});
+    const auto loads = ExtractCacheOpsOfKind<LoadBackBatch>(admitted);
+    ASSERT_EQ(loads.size(), 1u);
+    EXPECT_EQ(std::get<LoadBackBatch>(loads.front()).src_pages.at(0).size(), 3u)
+        << "page 0 and the tail block of the full group; the tail block [6, 7) of the sliding group";
+    const auto& swa = r2->block_tables.at("swa").at(0);
+    ASSERT_GE(swa.size(), 4u);
+    EXPECT_EQ(swa.at(0), 0);
+    EXPECT_EQ(swa.at(1), 0);
+    EXPECT_GT(swa.at(2), 0) << "the hole [4, 6) is a fresh page the request writes";
+    EXPECT_EQ(std::ranges::count(admitted.pages_to_zero.at("swa"), swa.at(2)), 1);
+    EXPECT_GT(swa.at(3), 0) << "the loaded tail block";
+}
+
 class ChunkedHostHitSuite : public HostHitSuite {
 protected:
     SchedulerConfig MakeConfig() override {

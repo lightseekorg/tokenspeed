@@ -447,4 +447,81 @@ TEST_F(StateRetractionSuite, TheImageCarriesBothSlotsAndRestoresTheLiveOneAsACop
     EXPECT_EQ(Probe("hit", {1, 2, 3, 4, 5, 6, 101, 102, 77}).prefix_tokens, 8) << "the retraction's checkpoint";
 }
 
+// A restore whose planned victim is a tail block cascades to the state
+// checkpoint published under the same hash -- the very block the image
+// resumes on. Claiming before evicting pins it, as an admission's hit is.
+class StateRestoreClaimSuite : public StateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
+        cfg.disable_l2_cache = false;
+        cfg.debug_force_retraction_interval = 3;
+        // One full and one State group over six usable blocks: the retraction
+        // leaves five cache-only entries and one empty block, fewer than the
+        // restore's two fresh ones.
+        std::erase_if(cfg.cache_groups, [](const CacheGroupConfig& group) {
+            return group.group_id == "state1" || group.group_id == "state2";
+        });
+        cfg.device_allocator.total_pages = 7;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+        }
+        return cfg;
+    }
+};
+
+TEST_F(StateRestoreClaimSuite, TheRestoreClaimsTheCheckpointBeforeEvictingItsTailCompanions) {
+    Reset(/*host_cache=*/true, /*decode_width=*/2);
+    // r = [1..6]: plan 1 prefills; plan 2 (the first decode) publishes the tail
+    // at 6 and the checkpoint at 6, which rotates into slot 0 while the tail's
+    // block is copied in; plan 3 retracts r at frontier 7 and publishes the
+    // tail at 7 and the checkpoint at 7. The image: page 0 and slot 0 (the
+    // checkpoint at 6) are published slots the restore claims from the
+    // Device; the tail block and slot 1 are writable and come back as copies.
+    // The two-token decode width makes the full group need a growth block
+    // beyond the tail copy, so it evicts within its own index.
+    Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(6), .max_new_tokens = 2});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("r", {101});
+    ExecutionPlan plan;
+    const std::vector<std::int32_t> first = PlanAndStateRow("r", &plan);
+    ASSERT_GT(first[0], 0) << "the checkpoint at 6 is the first decode's input";
+    SendForwardDone("r", {102});
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    AckImageStores(retraction);
+    ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 1);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 6)
+        << "five cache-only entries: page 0, the two tails' full blocks, the two checkpoints";
+
+    // The restore claims page 0 and the checkpoint at 6 and needs fresh blocks
+    // for the tail copy, the full group's growth and the live slot: more than
+    // the one empty, so each group evicts within its own index -- the full
+    // group the tail at 6's block, the oldest. Its cascade reaches the state
+    // entry at 6, which the restore has already claimed and pinned; evicting
+    // first would have taken it, and slot 0 would have come back as a keyed
+    // Host load the plan never counted a block for.
+    const ExecutionPlan readmit = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"r"});
+    std::int32_t keyed_state_rows = 0;
+    std::int32_t unkeyed_state_rows = 0;
+    for (std::size_t i = 0; i < restore->group_ids.at(0).size(); ++i) {
+        if (restore->group_ids.at(0)[i] == 0) {
+            continue;
+        }
+        (restore->content_hashes.at(0)[i].empty() ? unkeyed_state_rows : keyed_state_rows) += 1;
+    }
+    EXPECT_EQ(unkeyed_state_rows, 1) << "slot 1 is a private copy";
+    EXPECT_EQ(keyed_state_rows, 0) << "slot 0 was claimed on the Device, not loaded";
+    EXPECT_EQ(restore->group_ids.at(0).size(), 2u) << "the tail copy and the live slot";
+    AckRestores(readmit);
+    // The resumed decode releases the claimed slot 0 and writes its copy of
+    // slot 1 in place.
+    const std::vector<std::int32_t> resumed = PlanAndStateRow("r");
+    EXPECT_EQ(resumed[0], 0);
+    EXPECT_GT(resumed[1], 0);
+}
+
 }  // namespace tokenspeed::test
