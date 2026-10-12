@@ -95,6 +95,9 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.HostTransferLane = Mock
     lanes.build_transfer_geometry = Mock()
     lanes.check_host_memory = Mock()
+    lanes.host_memory_share = Mock(return_value=10**12)
+    lanes.largest_pinned_fit = Mock(side_effect=lambda room_bytes: max(room_bytes, 0))
+    lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
     lanes.load_stream_priority = Mock(return_value=None)
     lanes.new_cache_stream = Mock()
     scheduler = ModuleType("tokenspeed_scheduler")
@@ -1257,6 +1260,8 @@ class GroupAwareWireTest(unittest.TestCase):
                 io_backend="kernel",
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
 
         build_geometry.assert_called_once_with(
@@ -1355,6 +1360,8 @@ class GroupAwareWireTest(unittest.TestCase):
                         io_backend=io_backend,
                         attn_tp_rank=0,
                         kvp_rank=0,
+                        nprocs_per_node=1,
+                        world_cpu_group=None,
                     )
                     self.assertIsNone(executor._transfer_geometry.device_rows)
                     executor._transfer_geometry.bind.assert_not_called()
@@ -1580,6 +1587,222 @@ class GroupAwareWireTest(unittest.TestCase):
                 executor._start_loading([10], [(0, 3, 2)], prerequisite_stream=object())
 
         tracker.begin_load.assert_called_once_with()
+
+
+class HostMemoryShareTest(unittest.TestCase):
+    """The ranks of a node pin their Host tiers at once: each sizes them
+    against an equal share of the Host memory the node has available, every
+    buffer at the power of two its pinned allocation rounds up to."""
+
+    GB = 10**9
+    BLOCK_BYTES = 10**6  # one Host LCM block
+    # --kvstore-ratio 2 over a ~139 GB Device KV: 277.95 GB of L2 per rank.
+    LARGE_POOL_BLOCKS = 138_975
+
+    def setUp(self):
+        try:
+            self.executor_module = import_module("tokenspeed.runtime.cache.l2.executor")
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+        self.headroom = self.executor_module._HOST_MEM_HEADROOM_BYTES
+
+    def _fitting_blocks(self, available_gb, nprocs_per_node):
+        """The L2 blocks in the largest power of two of a rank's share."""
+        share = int(available_gb * self.GB) // nprocs_per_node - self.headroom
+        return (1 << (share.bit_length() - 1)) // self.BLOCK_BYTES
+
+    def _build(
+        self,
+        *,
+        available_gb,
+        nprocs_per_node,
+        device_lcm_blocks,
+        host_size_gb=0,
+        world_cpu_group=None,
+    ):
+        """An L2-only executor at --kvstore-ratio 2 and its mocked logger."""
+        executor_module = self.executor_module
+        lanes_module = _lanes_module()
+        field = SimpleNamespace(
+            field_id="field",
+            device_buffer_index=0,
+            device_block_zero_offset_bytes=0,
+            block_stride_bytes=16,
+            payload_bytes=16,
+        )
+        pool = Mock()
+        pool.cache_transfer_layout.return_value = SimpleNamespace(
+            num_lcm_blocks=device_lcm_blocks,
+            buffers=(SimpleNamespace(device=SimpleNamespace(type="cuda")),),
+            groups=(
+                SimpleNamespace(
+                    group_id="group", cache_blocks_per_lcm_block=1, fields=(field,)
+                ),
+            ),
+            consumers=(("field",),),
+        )
+        pool.arena.runtime_contract = SimpleNamespace(
+            group_specs=(SimpleNamespace(group_id="group", shard_count=1),),
+            virtual_block_counts={"group": 1 + device_lcm_blocks},
+        )
+        storage = SimpleNamespace(
+            host_cache_block_bytes=(self.BLOCK_BYTES,),
+            host_field_offsets=((0,),),
+            host_lcm_block_bytes=self.BLOCK_BYTES,
+            num_host_lcm_blocks=0,
+            host_buffer="host",
+        )
+        tracker = Mock()
+        tracker.event_sets = [object()]
+        logger = Mock()
+        available = SimpleNamespace(available=int(available_gb * self.GB))
+        with (
+            patch.object(
+                executor_module,
+                "compute_host_lcm_block_bytes",
+                return_value=self.BLOCK_BYTES,
+            ),
+            patch.object(executor_module, "HostCacheStorage", return_value=storage),
+            patch.object(lanes_module.psutil, "virtual_memory", return_value=available),
+            patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
+            patch.object(executor_module, "new_cache_stream", return_value="stream"),
+            patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(
+                lanes_module,
+                "build_host_transfer_geometry",
+                return_value=SimpleNamespace(device_rows=None, bind=Mock()),
+            ),
+            patch.object(executor_module, "logger", logger),
+        ):
+            executor = executor_module.HostCacheExecutor(
+                pool,
+                l2_tier=True,
+                host_ratio=2.0,
+                host_size_gb=host_size_gb,
+                snapshot_pool=NO_POOL,
+                slot_state_exporters=None,
+                io_backend="direct",
+                attn_tp_rank=0,
+                kvp_rank=0,
+                nprocs_per_node=nprocs_per_node,
+                world_cpu_group=world_cpu_group,
+            )
+        return executor, logger
+
+    def test_four_ranks_cap_an_over_committed_ratio_l2_to_the_node(self):
+        # 4 x 277.95 GB of L2 does not fit a node with 956 GB available, and
+        # neither does an L2 of the whole 228.26 GB share: it pins 274.88 GB.
+        executor, logger = self._build(
+            available_gb=956,
+            nprocs_per_node=4,
+            device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+        )
+        l2_blocks = executor.num_host_pages - 1
+        self.assertEqual(l2_blocks, self._fitting_blocks(956, 4))
+        self.assertEqual(l2_blocks, 2**37 // self.BLOCK_BYTES)
+        pinned = _lanes_module().pinned_host_bytes(l2_blocks * self.BLOCK_BYTES)
+        self.assertLessEqual(4 * (pinned + self.headroom), 956 * self.GB)
+        logger.warning.assert_called_once()
+        message = logger.warning.call_args.args[0]
+        self.assertIn("from 277.95 GB to 137.44 GB", message)
+        self.assertIn("--kvstore-ratio 2.0", message)
+
+    def test_an_explicit_size_that_does_not_fit_the_node_is_refused(self):
+        # 278 GB and 200 GB pin 549.76 GB and 274.88 GB: neither fits the
+        # 228.26 GB share of 4 ranks on 956 GB.
+        for host_size_gb in (278, 200):
+            with (
+                self.subTest(host_size_gb=host_size_gb),
+                self.assertRaisesRegex(ValueError, "Not enough Host memory"),
+            ):
+                self._build(
+                    available_gb=956,
+                    nprocs_per_node=4,
+                    device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                    host_size_gb=host_size_gb,
+                )
+        # One whose pinned size fits the node's share is kept as asked.
+        executor, logger = self._build(
+            available_gb=956,
+            nprocs_per_node=4,
+            device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+            host_size_gb=128,
+        )
+        self.assertEqual(executor.num_host_pages - 1, 128_000)
+        logger.warning.assert_not_called()
+
+    def test_a_single_rank_and_a_small_pool_keep_the_ratio_size(self):
+        for nprocs_per_node, device_lcm_blocks in (
+            (1, self.LARGE_POOL_BLOCKS),  # 277.95 GB pins 549.76 GB of 956
+            (4, 50_760),  # 4 x 101.52 GB pin 4 x 137.44 GB
+        ):
+            with self.subTest(nprocs_per_node=nprocs_per_node):
+                executor, logger = self._build(
+                    available_gb=956,
+                    nprocs_per_node=nprocs_per_node,
+                    device_lcm_blocks=device_lcm_blocks,
+                )
+                self.assertEqual(executor.num_host_pages - 1, 2 * device_lcm_blocks)
+                logger.warning.assert_not_called()
+
+    def test_no_room_for_one_block_is_refused_not_capped_to_nothing(self):
+        with self.assertRaisesRegex(ValueError, "Not enough Host memory"):
+            self._build(
+                available_gb=4 * self.headroom / self.GB,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+            )
+
+    def test_every_rank_takes_the_l2_size_the_smallest_share_holds(self):
+        # A peer node has 500 GB available: every rank takes what it holds,
+        # and the agreement runs before any rank pins, explicit size or not.
+        torch = import_module("torch")
+        group = object()
+        peer_blocks = self._fitting_blocks(500, 4)
+        self.assertLess(peer_blocks, self._fitting_blocks(956, 4))
+
+        def all_reduce(tensor, *, op, group):
+            self.assertIs(op, torch.distributed.ReduceOp.MIN)
+            tensor.fill_(min(int(tensor.item()), peer_blocks))
+
+        with patch.object(
+            torch.distributed, "all_reduce", side_effect=all_reduce
+        ) as reduce:
+            executor, _ = self._build(
+                available_gb=956,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                world_cpu_group=group,
+            )
+            self.assertEqual(executor.num_host_pages - 1, peer_blocks)
+            explicit, _ = self._build(
+                available_gb=956,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                host_size_gb=128,
+                world_cpu_group=group,
+            )
+            self.assertEqual(explicit.num_host_pages - 1, 128_000)
+        self.assertEqual(reduce.call_count, 2)
+        self.assertTrue(all(c.kwargs["group"] is group for c in reduce.call_args_list))
+
+    def test_a_pinned_buffer_takes_the_power_of_two_it_rounds_up_to(self):
+        lanes_module = _lanes_module()
+        pinned = lanes_module.pinned_host_bytes
+        fit = lanes_module.largest_pinned_fit
+        self.assertEqual(pinned(0), 0)
+        self.assertEqual(pinned(1), 1)
+        self.assertEqual(pinned(2**37), 2**37)
+        self.assertEqual(pinned(2**37 + 1), 2**38)
+        self.assertEqual(pinned(228_260 * self.BLOCK_BYTES), 2**38)
+        self.assertEqual(fit(-1), 0)
+        self.assertEqual(fit(0), 0)
+        self.assertEqual(fit(2**38 - 1), 2**37)
+        self.assertEqual(fit(2**38), 2**38)
+        for room in (1, 3, 2**37 - 1, 228_260 * self.BLOCK_BYTES):
+            self.assertLessEqual(pinned(fit(room)), room)
+            self.assertGreater(pinned(fit(room) + 1), room)
 
 
 class L3FlatKvExecutorTest(unittest.TestCase):
@@ -1899,6 +2122,8 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 io_backend=io_backend,
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
         self.addCleanup(executor.shutdown)
         return executor, pool, draft_pool

@@ -1432,6 +1432,9 @@ def build_device_side(
     )
     if server_args.enable_kvstore or not snapshot_pool.disabled:
         from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
 
         host_cache_executor = HostCacheExecutor(
             views.token_to_kv_pool,
@@ -1444,6 +1447,12 @@ def build_device_side(
             io_backend=server_args.kvstore_io_backend,
             attn_tp_rank=attn_tp_rank,
             kvp_rank=server_args.mapping.attn.kvp_rank,
+            nprocs_per_node=server_args.mapping.nprocs_per_node,
+            world_cpu_group=(
+                pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+                if server_args.mapping.world_size > 1
+                else None
+            ),
         )
     elif attn_tp_rank == 0:
         # With an executor the line comes from its resolved sizing.

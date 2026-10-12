@@ -84,8 +84,11 @@ from tokenspeed.runtime.cache.transfer.lanes import (
     HostTransferLane,
     build_transfer_geometry,
     check_host_memory,
+    host_memory_share,
+    largest_pinned_fit,
     load_stream_priority,
     new_cache_stream,
+    pinned_host_bytes,
 )
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.cache.transfer.ops import (
@@ -165,6 +168,17 @@ def _num_host_lcm_blocks(
     return count
 
 
+def _min_over_ranks(value: int, cpu_group) -> int:
+    """``value``'s minimum over the gloo ``cpu_group``; ``value`` without one."""
+    if cpu_group is None:
+        return value
+    tensor = torch.tensor(value, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
+    )
+    return int(tensor.item())
+
+
 def allocate_blob_arena(rows: int, nbytes: int) -> torch.Tensor:
     """The pinned ``[rows, nbytes]`` uint8 slot-state arena."""
     return torch.empty((rows, nbytes), dtype=torch.uint8, pin_memory=nbytes > 0)
@@ -186,6 +200,8 @@ class HostCacheExecutor:
         io_backend: str,
         attn_tp_rank: int,
         kvp_rank: int,
+        nprocs_per_node: int,
+        world_cpu_group,
     ):
         """
         Args:
@@ -197,9 +213,11 @@ class HostCacheExecutor:
                 ``LoadBackOp`` are refused and a retraction image lives
                 wholly in the snapshot pool.
             host_ratio: L2 LCM blocks as a multiple of the Device's, when
-                ``host_size_gb`` is 0.
+                ``host_size_gb`` is 0; capped to what fits in every rank's
+                share of its node's Host memory.
             host_size_gb: L2 size in decimal gigabytes; overrides the ratio
-                when positive.
+                when positive and is never capped: one that does not fit is
+                refused.
             snapshot_pool: The retraction snapshot pool's knobs as
                 ``ServerArgs`` resolved them, sized here against this
                 rank's layout (``resolve_retraction_pool``); a disabled
@@ -214,6 +232,11 @@ class HostCacheExecutor:
             attn_tp_rank: Attention-TP rank; rank 0 logs.
             kvp_rank: This rank in the KVP subgroup; selects the blocks it
                 owns of a sharded group (the identity for replicated groups).
+            nprocs_per_node: The ranks on this node. They all pin their Host
+                tiers here at once, so each checks against an equal share
+                of the Host memory the node has available.
+            world_cpu_group: The gloo group of every rank, over which the L2
+                size is agreed; None with a single rank.
         """
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -247,7 +270,6 @@ class HostCacheExecutor:
                 host_ratio=host_ratio,
                 host_size_gb=host_size_gb,
             )
-        l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # --- retraction snapshot pool -----------------------------------------
         self.snapshot_sizing = resolve_retraction_pool(
             snapshot_pool,
@@ -266,10 +288,41 @@ class HostCacheExecutor:
         self.max_retracted_requests = self.snapshot_sizing.max_retracted_requests
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
         arena_bytes = (self.max_retracted_requests + 1) * self.blob_bytes
-        # Both tiers count against the one headroom check.
+        share_bytes = host_memory_share(
+            nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
+        )
+        # Each buffer takes the power of two its pinned allocation rounds to.
+        pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
+            arena_bytes
+        )
+        # The L2 blocks every rank's share holds beside the pool. Agreeing on
+        # it is also a barrier: no rank pins before every rank read its share.
+        fitting_l2_blocks = _min_over_ranks(
+            largest_pinned_fit(share_bytes - pool_pinned_bytes) // host_lcm_block_bytes,
+            world_cpu_group,
+        )
+        if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
+            # Only the ratio's size shrinks, to one size on every rank: the
+            # mirrored schedulers share one Host page count. An explicit
+            # --kvstore-size that does not fit is refused below instead.
+            logger.warning(
+                "Capped the compact Host L2 from "
+                f"{host_lcm_blocks * host_lcm_block_bytes / 1e9:.2f} GB to "
+                f"{fitting_l2_blocks * host_lcm_block_bytes / 1e9:.2f} GB per "
+                "rank, the most every rank's share of its node holds: "
+                f"--kvstore-ratio {host_ratio} asks for more. The "
+                f"{nprocs_per_node} ranks of a node pin Host memory together, "
+                "and each pinned buffer takes a power of two; this rank's share "
+                f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
+                "memory over its ranks, less "
+                f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
+            )
+            host_lcm_blocks = fitting_l2_blocks
+        l2_bytes = host_lcm_blocks * host_lcm_block_bytes
+        # Both tiers count against the one check, at the sizes they pin.
         check_host_memory(
-            l2_bytes + snapshot_bytes + arena_bytes,
-            headroom_bytes=_HOST_MEM_HEADROOM_BYTES,
+            pinned_host_bytes(l2_bytes) + pool_pinned_bytes,
+            share_bytes=share_bytes,
             purpose="the compact Host cache",
         )
 

@@ -2319,13 +2319,15 @@ class ServerArgs:
             "--kvstore-ratio",
             type=float,
             default=ServerArgs.kvstore_ratio,
-            help="The ratio of the size of the KVStore host memory pool to the size of the device pool.",
+            help="The ratio of the size of the KVStore host memory pool to the size of the device pool. "
+            "Capped, with a warning, to what fits in this rank's share of the Host memory its node has available.",
         )
         parser.add_argument(
             "--kvstore-size",
             type=int,
             default=ServerArgs.kvstore_size,
-            help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set.",
+            help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set. "
+            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available.",
         )
         parser.add_argument(
             "--kvstore-io-backend",

@@ -319,6 +319,8 @@ def _build(
             io_backend="direct",
             attn_tp_rank=0,
             kvp_rank=rank,
+            nprocs_per_node=1,
+            world_cpu_group=None,
         )
     return executor, slot_state, lanes
 
@@ -369,6 +371,8 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
                 io_backend="direct",
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
         with pytest.raises(ValueError, match="slot-state rows"):
             HostCacheExecutor(
@@ -381,6 +385,8 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
                 io_backend="direct",
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
     # Too small a size holds no whole block and is refused, not rounded to none.
     with pytest.raises(ValueError, match="no whole LCM block"):
@@ -1128,6 +1134,8 @@ def _round_trip_two_ranks(io_backend, executors):
                 io_backend=io_backend,
                 attn_tp_rank=0,
                 kvp_rank=rank,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
     assert (executors[0].num_host_pages, executors[0].num_snapshot_pages) == (4, 4)
 
