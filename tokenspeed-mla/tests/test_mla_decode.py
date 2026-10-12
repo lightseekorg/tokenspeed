@@ -1049,18 +1049,16 @@ def _check_sm107_output_gpu(
         # P remains FP8 even when the final output is BF16.
         lse_atol = 1e-2 if fp16_softmax else 1e-3
         torch.testing.assert_close(lse, expected_lse, atol=lse_atol, rtol=1e-4)
-        actual = out.float()
         if output_dtype == torch.bfloat16:
-            # FP8 probability rounding can dominate an output near zero;
-            # BF16 stores do not remove that error. Bound RMS error below too.
-            torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.05)
+            # Share Blackwell's FP8-input/BF16-output accuracy checks.
+            _check_output(out, expected, "fp8")
         else:
+            actual = out.float()
             torch.testing.assert_close(actual, expected, atol=0.1, rtol=0.13)
-        relative_rmse = (actual - expected).square().mean().sqrt() / (
-            expected.square().mean().sqrt()
-        )
-        max_rmse = 0.03 if output_dtype == torch.bfloat16 else 0.05
-        assert relative_rmse < max_rmse, f"Relative RMSE too large: {relative_rmse:.6f}"
+            relative_rmse = (actual - expected).square().mean().sqrt() / (
+                expected.square().mean().sqrt()
+            )
+            assert relative_rmse < 0.05, f"Relative RMSE too large: {relative_rmse:.6f}"
         assert torch.all(out_storage[output_elements:].view(torch.uint8) == 0xA5)
 
     result, lse = _call_sm107_decode(**kwargs)
@@ -1222,7 +1220,7 @@ def _check_sm107_output_empty_rows_gpu(heads, min_split_kv, fp16_softmax, output
     lse_atol = 1e-2 if fp16_softmax else 1e-3
     torch.testing.assert_close(lse, expected_lse, atol=lse_atol, rtol=1e-4)
     if output_dtype == torch.bfloat16:
-        torch.testing.assert_close(out.float(), expected, atol=0.05, rtol=0.05)
+        _check_output(out, expected, "fp8")
     else:
         torch.testing.assert_close(out.float(), expected, atol=0.1, rtol=0.13)
     empty_rows = torch.isneginf(expected_lse)
