@@ -72,6 +72,8 @@ _PREPROCESSING_PREFIXES = (
     "vision_model.radio_model.input_conditioner.",
     "sound_encoder.encoder.feature_extractor.",
 )
+# Encoder and projector tensors, skipped when the encoders are disabled.
+_ENCODER_PREFIXES = (_RADIO_PREFIX, "mlp1.", _PARAKEET_PREFIX, "sound_projection.")
 # The vision projector's checkpoint indices into its nn.Sequential.
 _MLP1_NAMES = {"0": "norm", "1": "linear1", "3": "linear2"}
 
@@ -313,7 +315,9 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
         for name, loaded in weights:
             if name.startswith("language_model."):
                 yield name.removeprefix("language_model."), loaded
-            elif self.visual is None or name.startswith(_PREPROCESSING_PREFIXES):
+            elif name.startswith(_PREPROCESSING_PREFIXES) or (
+                self.visual is None and name.startswith(_ENCODER_PREFIXES)
+            ):
                 continue
             elif name.startswith(_RADIO_PREFIX):
                 self.visual.load_weight(name.removeprefix(_RADIO_PREFIX), loaded)

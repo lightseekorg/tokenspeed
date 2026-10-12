@@ -51,6 +51,9 @@ from transformers import ParakeetEncoderConfig  # noqa: E402
 from transformers.models.parakeet.modeling_parakeet import (  # noqa: E402
     ParakeetEncoder as HFParakeetEncoder,
 )
+from transformers.models.parakeet.modeling_parakeet import (  # noqa: E402
+    ParakeetEncoderRelPositionalEncoding,
+)
 
 from tokenspeed.runtime.configs.nemotron_omni_config import (  # noqa: E402
     NemotronHOmniConfig,
@@ -59,7 +62,10 @@ from tokenspeed.runtime.configs.nemotron_omni_config import (  # noqa: E402
 )
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.models import nemotron_omni  # noqa: E402
-from tokenspeed.runtime.models.parakeet import ParakeetEncoder  # noqa: E402
+from tokenspeed.runtime.models.parakeet import (  # noqa: E402
+    ParakeetEncoder,
+    _relative_positions,
+)
 from tokenspeed.runtime.models.radio import RadioVisionModel  # noqa: E402
 
 DEVICE = "cuda"
@@ -236,17 +242,68 @@ def test_radio_video_runs_tubelets_in_bounded_passes_bit_for_bit():
     assert torch.equal(passes, whole)
 
 
+SOUND_CONFIG = {
+    "hidden_size": 32,
+    "num_attention_heads": 4,
+    "num_hidden_layers": 2,
+    "intermediate_size": 64,
+    "conv_kernel_size": 9,
+    "convolution_bias": False,
+    "subsampling_conv_channels": 16,
+    "subsampling_conv_kernel_size": 3,
+    "subsampling_conv_stride": 2,
+    "subsampling_factor": 8,
+    "num_mel_bins": 32,
+    "projection_hidden_size": 64,
+    "projection_bias": False,
+    "sampling_rate": 16000,
+}
+
+
 def test_config_round_trips_through_its_dict():
     config = NemotronHOmniConfig(
         llm_config={"hidden_size": 64},
         vision_config={"args": {"model": "vit_base_patch16_224"}},
-        sound_config={"hidden_size": 32},
+        sound_config=SOUND_CONFIG,
         sound_context_token_id=27,
     )
     rebuilt = NemotronHOmniConfig.from_dict(config.to_dict())
     assert rebuilt.text_config.hidden_size == 64
     assert rebuilt.to_dict() == config.to_dict()
     assert (rebuilt.image_token_id, rebuilt.audio_token_id) == (18, 27)
+
+
+def test_config_refuses_a_sound_config_without_the_encoder_shape():
+    sound = {k: v for k, v in SOUND_CONFIG.items() if k != "conv_kernel_size"}
+    with pytest.raises(ValueError, match="conv_kernel_size"):
+        NemotronHOmniConfig(sound_config=sound)
+
+
+def test_encoders_honor_or_refuse_settings_they_do_not_implement():
+    config = _radio_config(final_norm=True, temporal_patch_size=2)
+    config.args["layer_norm_eps"] = 1e-3
+    model = RadioVisionModel(
+        config, Mapping(rank=0, world_size=1), mm_attention_backend=None, prefix="v"
+    )
+    norms = [m for m in model.modules() if isinstance(m, torch.nn.LayerNorm)]
+    assert norms and all(norm.eps == 1e-3 for norm in norms)
+    with pytest.raises(ValueError, match="hidden_act"):
+        ParakeetAudioConfig(hidden_act="relu")
+    for name, value in [
+        ("hidden_act", "relu"),
+        ("qkv_bias", False),
+        ("qk_normalization", True),
+        ("norm_type", "rms_norm"),
+    ]:
+        with pytest.raises(ValueError, match=f"args.{name}"):
+            RadioVisionConfig(args={**config.args, name: value})
+    with pytest.raises(NotImplementedError, match="flashinfer_cudnn"):
+        RadioVisionModel(
+            config,
+            Mapping(rank=0, world_size=1),
+            mm_attention_backend="flashinfer_cudnn",
+            prefix="v",
+        )
 
 
 def test_pixel_shuffle_orders_each_block_by_row_column_channel():
@@ -408,6 +465,17 @@ def test_parakeet_matches_transformers_unpadded_and_as_a_padded_batch():
         )
 
 
+def test_parakeet_relative_positions_stay_fp32_for_bf16_long_clips():
+    # A 30-second clip has 375 encoder positions; offsets past 256 are not exact in
+    # bf16, so the sinusoids must be computed in fp32 and only the result cast.
+    length, hidden = 375, 1024
+    like = torch.zeros(1, length, hidden, dtype=torch.bfloat16, device=DEVICE)
+    reference = ParakeetEncoderRelPositionalEncoding(
+        ParakeetEncoderConfig(hidden_size=hidden), device=DEVICE
+    )
+    assert torch.equal(_relative_positions(length, hidden, like), reference(like)[0])
+
+
 def test_audio_feature_encodes_every_clip_of_every_item_in_order():
     ours, _ = _parakeet_pair()
     ours = ours.to(torch.bfloat16)
@@ -465,3 +533,9 @@ def test_checkpoint_tensors_route_to_their_modules():
     ]
     with pytest.raises(KeyError):
         list(route(model, [("unknown.weight", tensor)]))
+    # With the encoders disabled their tensors are skipped, not unknown names.
+    text_only = SimpleNamespace(visual=None)
+    language = [name for name, _ in route(text_only, [(n, tensor) for n in names])]
+    assert language == ["backbone.layers.0.mixer.in_proj.weight"]
+    with pytest.raises(KeyError):
+        list(route(text_only, [("unknown.weight", tensor)]))
