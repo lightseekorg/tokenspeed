@@ -1286,6 +1286,8 @@ class GlmMoeDsaModel(DeepseekV3Model):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: set = set()
+        # DFLASH: each capture layer's positional tap index.
+        self._dflash_capture_idx_map: dict[int, int] = {}
 
 
 def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:

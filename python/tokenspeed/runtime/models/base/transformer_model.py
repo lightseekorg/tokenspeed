@@ -53,7 +53,8 @@ def notify_target_capture(
     """Hand the tap capture layer ``layer_idx`` just appended to the
     forward's sink.
 
-    An idle forward skips the attention block, so nothing was appended.
+    An idle forward skips BaseDecoderLayer's attention block, so nothing was
+    appended; layers that keep idle taps aligned append an empty one.
 
     Args:
         sink: The forward's ``ctx.target_capture_sink``.

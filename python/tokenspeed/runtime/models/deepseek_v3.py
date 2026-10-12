@@ -2083,8 +2083,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         return self._routed_experts_weights_of_layer.value
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
-        # layer_ids are 0-indexed from the external API; +1 because the capture
-        # check runs *before* the layer forward, so index i captures layer i-1's output.
+        # layer_ids are 0-indexed from the external API; +1 because a layer
+        # captures the residual entering it, so index i captures layer i-1's output.
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = {2, num_layers // 2, num_layers - 3}
@@ -2092,8 +2092,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        # DFlash checkpoints name 0-indexed target layer outputs. The capture
-        # check runs before layer i, so capture at i + 1 for layer i's output.
+        # DFlash checkpoints name 0-indexed target layer outputs. A layer
+        # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")

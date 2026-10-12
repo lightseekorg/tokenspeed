@@ -1530,8 +1530,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         return self.model.embed_tokens
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        # DFLASH checkpoints name 0-indexed target layer outputs. The capture
-        # check runs before layer i, so capture at i + 1 for layer i's output.
+        # DFLASH checkpoints name 0-indexed target layer outputs. A layer
+        # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")
