@@ -53,7 +53,10 @@ def test_disabled_records_nothing() -> None:
     metrics.record_kv_transfer_timeout("bootstrapping")
     metrics.record_kv_transfer_failure()
 
-    assert registry.get_sample_value("tokenspeed:kv_transfer_latency_seconds_count") is None
+    assert (
+        registry.get_sample_value("tokenspeed:kv_transfer_latency_seconds_count")
+        is None
+    )
     assert registry.get_sample_value("tokenspeed:kv_transfer_timeouts_total") is None
     assert registry.get_sample_value("tokenspeed:kv_transfer_failures_total") is None
 
