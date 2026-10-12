@@ -218,7 +218,9 @@ def test_sliding_release_before_admit_prevents_oom():
 
 
 def test_batch_admission_debits_simulated_free_pages():
-    cfg = _base_config(num_device_pages=12)
+    # Thirteen usable pages admit one eight-token prompt (two groups of
+    # ceil(9 / 2) blocks plus a tail handover each), never two.
+    cfg = _base_config(num_device_pages=14)
     cfg.prefix_granularity = 2
     cfg.max_batch_size = 4
     cfg.max_scheduled_tokens = 512
@@ -226,7 +228,7 @@ def test_batch_admission_debits_simulated_free_pages():
         CacheGroupConfig(
             group_id=f"swa.g{i}",
             block_granularity=2,
-            total_pages=12,
+            total_pages=14,
             retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
         )

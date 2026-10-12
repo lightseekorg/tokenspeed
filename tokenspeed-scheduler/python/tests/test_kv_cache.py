@@ -232,10 +232,11 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
 def test_k3_reports_group_aware_single_request_capacity() -> None:
     # Each State group holds two slots (the input checkpoint and the live
     # state) whatever the prompt length. The three groups therefore leave 278
-    # of the 284 usable parents for Full KV. K_full=12 and P=128 expose
-    # 278 * 12 * 128 tokens.
+    # of the 284 usable parents for Full KV: 278 * 12 child pages, one of
+    # which a tail handover holds, so P=128 exposes (278 * 12 - 1) * 128
+    # tokens.
     scheduler = ts.Scheduler(_make_k3_128k_config(285))
-    assert scheduler.max_single_request_tokens() == 427_008
+    assert scheduler.max_single_request_tokens() == 426_880
 
 
 def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:

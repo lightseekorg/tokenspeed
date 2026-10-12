@@ -101,11 +101,14 @@ def test_reports_group_pages_in_config_order() -> None:
     model = ts.CapacityModel(cfg)
     assert model.num_groups == 3
     pages = model.concurrent_group_pages(max_total_tokens=65536, max_context_len=4096)
-    # A State group holds two slots per live request, whatever the history.
-    assert pages == [1024 + 16 * 2, 16 * 2, 16 * 4 + 2 + 128]
+    # Dense history plus, per request, the unaligned tail page and the block a
+    # tail handover holds; a State group holds two slots per live request,
+    # whatever the history; a sliding group its window pages plus the handover
+    # block, and one in-flight chunk behind its lookback.
+    assert pages == [1024 + 16 * (2 + 1), 16 * 2, 16 * (4 + 1) + 2 + 128]
     assert model.single_request_group_pages(token_limit=4096)[1] == 2
-    # ceil(1056 / 12) + ceil(32 / 1) + ceil(194 / 3)
-    assert model.lcm_blocks_needed_for(pages) == 88 + 32 + 65
+    # ceil(1072 / 12) + ceil(32 / 1) + ceil(210 / 3)
+    assert model.lcm_blocks_needed_for(pages) == 90 + 32 + 70
     # A model outlives the config it was built from.
     del cfg
     assert model.max_single_request_tokens(usable_lcm_blocks=100) > 0
