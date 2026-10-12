@@ -81,4 +81,12 @@ private:
     std::deque<std::int32_t> free_slots_;
 };
 
+// The slot-state blob slots of retracted requests: the same RAII slot pool,
+// sized by SchedulerConfig::max_retracted_requests, slots numbered from 1 like
+// request-pool indices (the runtime's blob arena has max_retracted_requests + 1
+// rows). A retracted request that finishes, aborts or is restored releases
+// its slot by dropping the index.
+using SnapshotSlotAllocator = ReqPoolAllocator;
+using SnapshotSlotIndex = ReqPoolIndex;
+
 }  // namespace tokenspeed

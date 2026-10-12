@@ -26,6 +26,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -138,12 +139,6 @@ def validate_run_document(
         raise CoordinatorError(f"malformed benchmark run: {exc}") from exc
 
 
-def _relative_mad(samples: Sequence[float]) -> float:
-    median = float(statistics.median(samples))
-    deviations = [abs(sample - median) for sample in samples]
-    return float(statistics.median(deviations)) / median
-
-
 def _empty_comparison(case_id: str, classification: str, detail: str) -> dict[str, Any]:
     return {
         "id": case_id,
@@ -152,6 +147,7 @@ def _empty_comparison(case_id: str, classification: str, detail: str) -> dict[st
         "candidate_median_us": None,
         "delta_us": None,
         "delta_percent": None,
+        "rounds": None,
         "detail": detail,
     }
 
@@ -163,10 +159,50 @@ def _result_median(case: Mapping[str, Any]) -> float | None:
     return float(statistics.median(result["samples_us"]))
 
 
+def _round_measurement(
+    base_result: Mapping[str, Any],
+    candidate_result: Mapping[str, Any],
+) -> dict[str, float]:
+    base_median = float(statistics.median(base_result["samples_us"]))
+    candidate_median = float(statistics.median(candidate_result["samples_us"]))
+    return {
+        "base_median_us": base_median,
+        "candidate_median_us": candidate_median,
+        "delta_us": candidate_median - base_median,
+        "delta_percent": (candidate_median / base_median - 1.0) * 100.0,
+    }
+
+
+def _classify(policy: Mapping[str, Any], measurement: Mapping[str, float]) -> str:
+    delta_relative = (
+        measurement["candidate_median_us"] / measurement["base_median_us"] - 1.0
+    )
+    delta_us = measurement["delta_us"]
+    if (
+        delta_relative > policy["max_regression_relative"]
+        and delta_us > policy["max_regression_absolute_us"]
+    ):
+        return "regression"
+    if (
+        delta_relative < -policy["max_regression_relative"]
+        and delta_us < -policy["max_regression_absolute_us"]
+    ):
+        return "improvement"
+    return "within_budget"
+
+
+_CLASSIFICATION_DETAILS = {
+    "regression": "slowdown exceeds both the relative and absolute budgets",
+    "improvement": "speedup exceeds both the relative and absolute budgets",
+    "within_budget": "change does not exceed both regression budgets",
+}
+
+
 def _measurement_comparison(
     case_id: str,
     base_case: Mapping[str, Any],
     candidate_case: Mapping[str, Any],
+    confirmation_cases: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
 ) -> dict[str, Any]:
     base_result = base_case["result"]
     candidate_result = candidate_case["result"]
@@ -214,35 +250,53 @@ def _measurement_comparison(
             "timing result formats differ between revisions",
         )
 
-    base_samples = tuple(float(value) for value in base_result["samples_us"])
-    candidate_samples = tuple(float(value) for value in candidate_result["samples_us"])
-    base_median = float(statistics.median(base_samples))
-    candidate_median = float(statistics.median(candidate_samples))
-    delta_us = candidate_median - base_median
-    delta_relative = candidate_median / base_median - 1.0
+    for number, (round_base, round_candidate) in enumerate(confirmation_cases, 2):
+        for side, round_case in (
+            ("baseline", round_base),
+            ("candidate", round_candidate),
+        ):
+            status = round_case["result"].get("status", "unknown")
+            if status != "success":
+                return _empty_comparison(
+                    case_id,
+                    "invalid",
+                    f"measurement round {number} {side} benchmark returned {status}",
+                )
 
-    relative_mad = max(_relative_mad(base_samples), _relative_mad(candidate_samples))
-    if relative_mad > policy["max_relative_mad"]:
-        classification = "inconclusive"
-        detail = (
-            f"relative timing MAD {relative_mad:.2%} exceeds "
-            f"the {policy['max_relative_mad']:.2%} limit"
-        )
-    elif (
-        delta_relative > policy["max_regression_relative"]
-        and delta_us > policy["max_regression_absolute_us"]
-    ):
-        classification = "regression"
-        detail = "slowdown exceeds both the relative and absolute budgets"
-    elif (
-        delta_relative < -policy["max_regression_relative"]
-        and delta_us < -policy["max_regression_absolute_us"]
-    ):
-        classification = "improvement"
-        detail = "speedup exceeds both the relative and absolute budgets"
-    else:
-        classification = "within_budget"
-        detail = "change does not exceed both regression budgets"
+    rounds = [_round_measurement(base_result, candidate_result)] + [
+        _round_measurement(round_base["result"], round_candidate["result"])
+        for round_base, round_candidate in confirmation_cases
+    ]
+    # Each round pairs fresh baseline and candidate processes, so a one-off
+    # process-level shift moves only its own round. The round with the median
+    # relative change decides; an odd round count makes it unique.
+    verdict_round = sorted(rounds, key=lambda item: item["delta_percent"])[
+        len(rounds) // 2
+    ]
+    classification = _classify(policy, verdict_round)
+    detail = _CLASSIFICATION_DETAILS[classification]
+    if len(rounds) > 1:
+        first_classification = _classify(policy, rounds[0])
+        round_classifications = {_classify(policy, item) for item in rounds}
+        # Only rounds on opposite sides of the budgets void the median. The
+        # width of the spread alone does not: noise grows with the change, so
+        # a large regression measured in every round can still spread widely.
+        if {"regression", "improvement"} <= round_classifications:
+            low = min(item["delta_percent"] for item in rounds)
+            high = max(item["delta_percent"] for item in rounds)
+            classification = "inconclusive"
+            detail = (
+                f"changes across {len(rounds)} measurement rounds range from "
+                f"{low:+.2f}% to {high:+.2f}%, both a regression and an "
+                "improvement beyond the budgets"
+            )
+        elif classification != first_classification:
+            detail = (
+                f"the first round's {first_classification} did not reproduce; "
+                f"median of {len(rounds)} measurement rounds: {detail}"
+            )
+        else:
+            detail = f"median of {len(rounds)} measurement rounds: {detail}"
 
     if base_result["registration_name"] != candidate_result["registration_name"]:
         detail += (
@@ -256,10 +310,8 @@ def _measurement_comparison(
     return {
         "id": case_id,
         "classification": classification,
-        "base_median_us": base_median,
-        "candidate_median_us": candidate_median,
-        "delta_us": delta_us,
-        "delta_percent": delta_relative * 100.0,
+        **verdict_round,
+        "rounds": rounds,
         "detail": detail,
     }
 
@@ -285,9 +337,15 @@ def compare_runs(
     merge_base_sha: str,
     candidate_sha: str,
     merge_sha: str | None,
+    confirmation_rounds: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]],
     bootstrap_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Compare one merge-base run with one candidate run."""
+    """Compare one merge-base run with one candidate run.
+
+    ``confirmation_rounds`` holds later (baseline, candidate) run pairs that
+    re-measured a subset of cases. Each case present in them is judged on the
+    median of all its rounds instead of on the first pair alone.
+    """
 
     candidate = validate_run_document(candidate_run, expected_revision=candidate_sha)
     base = (
@@ -295,6 +353,27 @@ def compare_runs(
         if base_run is not None
         else None
     )
+    confirmations = [
+        (
+            validate_run_document(base_round, expected_revision=merge_base_sha),
+            validate_run_document(candidate_round, expected_revision=candidate_sha),
+        )
+        for base_round, candidate_round in confirmation_rounds
+    ]
+    if confirmations and base is None:
+        raise CoordinatorError("measurement rounds require a baseline run")
+    if len(confirmations) % 2:
+        raise CoordinatorError("the total number of measurement rounds must be odd")
+    for base_round, candidate_round in confirmations:
+        if (
+            base_round["environment"] != base["environment"]
+            or candidate_round["environment"] != candidate["environment"]
+        ):
+            raise CoordinatorError("measurement rounds ran on different hardware")
+    confirmation_maps = [
+        (_case_map(base_round), _case_map(candidate_round))
+        for base_round, candidate_round in confirmations
+    ]
     candidate_cases = _case_map(candidate)
     base_cases = _case_map(base) if base is not None else {}
     comparisons: list[dict[str, Any]] = []
@@ -387,8 +466,19 @@ def compare_runs(
                     )
                 )
                 continue
+            confirmation_cases = [
+                (base_map[case_id], candidate_map[case_id])
+                for base_map, candidate_map in confirmation_maps
+                if case_id in base_map and case_id in candidate_map
+            ]
+            if confirmation_cases and len(confirmation_cases) != len(confirmation_maps):
+                raise CoordinatorError(
+                    f"{case_id} is missing from some measurement rounds"
+                )
             comparisons.append(
-                _measurement_comparison(case_id, base_case, candidate_case)
+                _measurement_comparison(
+                    case_id, base_case, candidate_case, confirmation_cases
+                )
             )
 
     for comparison in comparisons:
@@ -530,7 +620,9 @@ def render_summary(report: Mapping[str, Any]) -> str:
             (
                 "Comparisons require matching comparison epochs, benchmark "
                 "definitions, timing settings, and hardware. The merge-base "
-                "policy supplies the regression and noise budgets."
+                "policy supplies the regression budgets. Benchmarks outside "
+                "their budgets in the first round are re-measured in fresh "
+                "processes and judged on the median round."
             ),
         ]
     )
@@ -738,7 +830,10 @@ def _run_revision(
     output_path: Path,
     log_path: Path,
     cache_dir: Path,
+    case_ids: Sequence[str] | None,
 ) -> dict[str, Any]:
+    """Run the suite at one checkout, or only ``case_ids`` when given."""
+
     suite = checkout / suite_relative
     command = [
         str(python),
@@ -751,6 +846,9 @@ def _run_revision(
         "--output",
         str(output_path),
     ]
+    if case_ids is not None:
+        for case_id in case_ids:
+            command.extend(["--case-filter", f"^{re.escape(case_id)}$"])
     _run_logged(
         command,
         cwd=checkout,
@@ -866,47 +964,95 @@ def orchestrate(
                     candidate_python = Path(sys.executable)
                     base_python = Path(sys.executable) if base_supported else None
 
-                base_run = None
-                if base_python is not None:
-                    base_run = _run_revision(
-                        base_checkout,
-                        base_python,
+                sides = {
+                    "base": (base_checkout, base_python, merge_base_sha),
+                    "candidate": (candidate_checkout, candidate_python, candidate_sha),
+                }
+
+                def run_side(
+                    side: str, output_name: str, case_ids: Sequence[str] | None
+                ) -> dict[str, Any]:
+                    checkout, python, revision = sides[side]
+                    return _run_revision(
+                        checkout,
+                        python,
                         suite_relative=suite_relative,
-                        revision=merge_base_sha,
-                        output_path=output_dir / "base.json",
-                        log_path=output_dir / "base.log",
-                        cache_dir=temporary / "base-cache",
+                        revision=revision,
+                        output_path=output_dir / output_name,
+                        log_path=output_dir / f"{side}.log",
+                        cache_dir=temporary / f"{side}-cache",
+                        case_ids=case_ids,
                     )
-                candidate_run = _run_revision(
-                    candidate_checkout,
-                    candidate_python,
-                    suite_relative=suite_relative,
-                    revision=candidate_sha,
-                    output_path=output_dir / "candidate.json",
-                    log_path=output_dir / "candidate.log",
-                    cache_dir=temporary / "candidate-cache",
+
+                base_run = (
+                    run_side("base", "base.json", None)
+                    if base_python is not None
+                    else None
                 )
-                return compare_runs(
-                    base_run,
-                    candidate_run,
-                    repository=args.repository,
-                    pull_request_number=args.pull_request_number,
-                    github_run_id=args.github_run_id,
-                    github_run_attempt=args.github_run_attempt,
-                    target_sha=target_sha,
-                    merge_base_sha=merge_base_sha,
-                    candidate_sha=candidate_sha,
-                    merge_sha=args.merge_sha,
-                    bootstrap_reason=(
+                candidate_run = run_side("candidate", "candidate.json", None)
+                comparison_arguments = {
+                    "repository": args.repository,
+                    "pull_request_number": args.pull_request_number,
+                    "github_run_id": args.github_run_id,
+                    "github_run_attempt": args.github_run_attempt,
+                    "target_sha": target_sha,
+                    "merge_base_sha": merge_base_sha,
+                    "candidate_sha": candidate_sha,
+                    "merge_sha": args.merge_sha,
+                    "bootstrap_reason": (
                         None
                         if base_supported
                         else "the merge base does not contain the benchmark suite"
                     ),
+                }
+                report = compare_runs(
+                    base_run,
+                    candidate_run,
+                    confirmation_rounds=(),
+                    **comparison_arguments,
+                )
+                flagged = [
+                    comparison["id"]
+                    for comparison in report["comparisons"]
+                    if comparison["classification"] in {"regression", "improvement"}
+                ]
+                if not flagged or args.measurement_rounds == 1:
+                    return report
+
+                # Re-measure flagged cases in fresh processes. The first round
+                # runs the baseline first; alternating the order afterwards
+                # keeps slow drift in device state from favoring one side.
+                confirmation_rounds = []
+                for number in range(2, args.measurement_rounds + 1):
+                    order = (
+                        ("candidate", "base")
+                        if number % 2 == 0
+                        else ("base", "candidate")
+                    )
+                    round_runs = {
+                        side: run_side(side, f"{side}-round{number}.json", flagged)
+                        for side in order
+                    }
+                    confirmation_rounds.append(
+                        (round_runs["base"], round_runs["candidate"])
+                    )
+                return compare_runs(
+                    base_run,
+                    candidate_run,
+                    confirmation_rounds=confirmation_rounds,
+                    **comparison_arguments,
                 )
             finally:
                 _remove_worktree(repo, candidate_checkout)
         finally:
             _remove_worktree(repo, base_checkout)
+
+
+def _odd_round_count(value: str) -> int:
+    count = int(value)
+    if count < 1 or count % 2 == 0:
+        raise argparse.ArgumentTypeError("must be a positive odd integer")
+    return count
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -920,6 +1066,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("tokenspeed-kernel/benchmarks/amd/gfx950.json"),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--measurement-rounds",
+        type=_odd_round_count,
+        required=True,
+        help=(
+            "Total baseline/candidate rounds for benchmarks the first round "
+            "finds outside their budgets; odd so that a median round exists"
+        ),
+    )
     parser.add_argument("--work-dir", type=Path)
     parser.add_argument(
         "--environment-mode",

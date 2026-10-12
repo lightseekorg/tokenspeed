@@ -46,6 +46,7 @@ def _base_config(num_device_pages: int = 64) -> SchedulerConfig:
     cfg.max_scheduled_tokens = 4096
     cfg.max_batch_size = 8
     cfg.num_device_pages = num_device_pages
+    cfg.num_snapshot_pages = 1  # never retracts
     cfg.disable_l2_cache = True
     return cfg
 

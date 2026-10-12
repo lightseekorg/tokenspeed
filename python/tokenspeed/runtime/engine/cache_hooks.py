@@ -18,31 +18,33 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""L2 cache-op submission and rank-synchronized completion tracking.
+"""Cache-op accounting and rank-synchronized completion tracking.
 
-Owns everything between an execution plan's cache ops and the scheduler
-events their completions eventually produce: count what the plan puts in
-flight (``DeviceHandle.execute`` submits the transfers themselves, on the
-data plane, from the same plan), poll
-completions (control-side event queries), and agree across every
-cache-owning rank in the replica (attention TP, then CP, then PP) on
-which completions EVERY rank has seen (the C++ scheduler is mirrored, so an
-event may only advance once all ranks hold it). L3 Host backups complete
-asynchronously, so a rank-local ``WriteBackDone`` would ``CacheHostBlock``
-on one mirrored scheduler while a CP/PP peer still has the op pending.
-Every rank enters every replica-group gather, including with an empty
-intermediate intersection; skipping a later CP/PP ``all_gather_object``
-hangs ranks whose first group already agreed. An L3 backup future that
-fails is converted into a rank-local flag and MAX-reduced on that same
-first replica all_reduce so every rank raises together instead of one
-rank raising out of ``poll_results`` while peers wait in the gather.
-``poll_ready_events`` returns events for the event loop to apply —
-feedback into the scheduler stays an explicit ``advance_scheduler`` call
-in the loop body.
+Owns everything between an execution plan's cache ops -- the Host L2 tier's
+write-backs and load-backs, the L3 prefetches, the retraction snapshot's
+stores and restores -- and the scheduler events their completions eventually
+produce: count what
+the plan puts in flight (``DeviceHandle.execute`` submits the transfers
+themselves, on the data plane, from the same plan), poll completions
+(control-side event queries), and agree across every cache-owning rank in
+the replica (attention TP, then CP, then PP) on which completions EVERY rank
+has seen (the C++ scheduler is mirrored, so an event may only advance once
+all ranks hold it). L3 Host backups complete asynchronously, so a rank-local
+``WriteBackDone`` would ``CacheHostBlock`` on one mirrored scheduler while a
+CP/PP peer still has the op pending; a KVP rank that copied a different
+owned subset of a snapshot op completes at a different time too. Every rank
+enters every replica-group gather, including with an empty intermediate
+intersection; skipping a later CP/PP ``all_gather_object`` hangs ranks whose
+first group already agreed. An L3 backup future that fails is converted into
+a rank-local flag and MAX-reduced on that same first replica all_reduce so
+every rank raises together instead of one rank raising out of
+``poll_results`` while peers wait in the gather. ``poll_ready_events``
+returns events for the event loop to apply — feedback into the scheduler
+stays an explicit ``advance_scheduler`` call in the loop body.
 
 Depends only on the device handle and static parallel-layout config, not on
-live event-loop state. ``device=None`` (kvstore disabled) makes every method
-a cheap no-op.
+live event-loop state. ``device=None`` (the engine can emit no cache op, see
+``cache_hooks_armed``) makes every method a cheap no-op.
 """
 
 from __future__ import annotations
@@ -52,12 +54,13 @@ from collections import OrderedDict
 
 import torch
 import torch.distributed as dist
-from tokenspeed_scheduler import Cache
 
+from tokenspeed.runtime.cache.transfer.ops import PrefetchOp, RestoreOp, SnapshotOp
 from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_from_payload,
     cache_event_key,
     cache_event_to_payload,
+    cache_ops_from_plan,
     cache_sync_debug_enabled,
     pop_common_cache_event_payloads,
 )
@@ -65,8 +68,24 @@ from tokenspeed.runtime.engine.scheduler_utils import (
 logger = logging.getLogger(__name__)
 
 
-class L2CacheHooks:
-    """Tracks in-flight L2 cache ops for one scheduler event loop."""
+def cache_hooks_armed(*, enable_kvstore: bool, max_retracted_requests: int) -> bool:
+    """Whether the engine can emit cache ops, so the hooks must poll for them.
+
+    Armed hooks poll completions and run a gloo all-reduce on every round, so
+    they are armed only for an engine that can emit cache ops: one with the
+    Host L2 tier (write-backs, load-backs) or with a retraction snapshot pool
+    (the scheduler retracts by snapshot store and resumes by restore).
+
+    Args:
+        enable_kvstore: The Host L2 tier is configured.
+        max_retracted_requests: The retraction snapshot pool's slot-state
+            rows; positive when a pool is configured.
+    """
+    return bool(enable_kvstore) or max_retracted_requests > 0
+
+
+class CacheOpHooks:
+    """Tracks in-flight cache ops for one scheduler event loop."""
 
     def __init__(
         self,
@@ -106,20 +125,27 @@ class L2CacheHooks:
         """Count the cache ops this plan will put in flight.
 
         ``DeviceHandle.execute`` submits them, from the same plan (write-backs
-        ahead of the page zeroing, load-backs behind it). Call this with the
-        SAME plan and only when ``execute`` will run: a plan counted but never
-        submitted leaves ops in flight forever.
+        and snapshot stores ahead of the page zeroing, L3 prefetches on their
+        own lane, load-backs and restores behind the zeroing), through the
+        same adapter (``scheduler_utils.cache_ops_from_plan``). An L2 batch
+        carries one ticket per ``op_ids`` entry; each request of a snapshot
+        store, restore or prefetch batch is one ticket, acknowledged on its
+        own. Call this with the SAME plan and only when ``execute`` will run:
+        a plan counted but never submitted leaves ops in flight forever.
+
+        Raises:
+            TypeError: The plan carries a cache op kind the runtime cannot run.
         """
         if self._device is None:
             return
-        for op in execution_plan.cache:
-            if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
-                self._num_inflight += len(op.op_ids)
+        for op in cache_ops_from_plan(execution_plan):
+            if isinstance(op, (SnapshotOp, RestoreOp, PrefetchOp)):
+                self._num_inflight += 1
             else:
-                raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
+                self._num_inflight += len(op.op_ids)
 
     def poll_ready_events(self) -> list:
-        """Poll completed L2 cache ops and return their rank-synchronized
+        """Poll completed cache ops and return their rank-synchronized
         scheduler events. Returns an empty list when there is nothing ready.
         """
         if self._device is None:

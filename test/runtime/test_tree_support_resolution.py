@@ -75,11 +75,11 @@ def _trtllm(kv_cache_dtype=torch.bfloat16):
     return leaf
 
 
-def _mla(cls, kv_cache_dtype=torch.bfloat16, dcp_size=1):
+def _mla(cls, kv_cache_dtype=torch.bfloat16, kvp_size=1):
     leaf = object.__new__(cls)
     leaf.data_type = kv_cache_dtype
     leaf.q_data_type = torch.bfloat16
-    leaf.dcp_group = tuple(range(dcp_size))
+    leaf.kvp_group = tuple(range(kvp_size))
     return leaf
 
 
@@ -167,8 +167,8 @@ def test_draft_with_linear_layers_is_refused():
             "latent rows .* kv_cache_dtype",
         ),
         (
-            lambda: _router(_mla(CuteDSLMLABackend, dcp_size=2)),
-            "decode context parallelism",
+            lambda: _router(_mla(CuteDSLMLABackend, kvp_size=2)),
+            "KV parallelism",
         ),
     ],
 )

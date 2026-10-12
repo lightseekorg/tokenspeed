@@ -430,12 +430,18 @@ class TestCLIConfigCompat(unittest.TestCase):
                             "3",
                             "--kvstore-size",
                             "8",
+                            "--max-num-seqs",
+                            "16",
                         ]
                         if disabled:
                             argv.append("--disable-kvstore")
                         if role == "decode":
                             argv.append("--disable-prefix-caching")
                         sa = self._from_cli_args_no_init(self._parse_args(argv))
+                        # resolve_cache derives the retraction snapshot request
+                        # cap from max_num_seqs per attention-DP rank, so the
+                        # mapping must be resolved first, as in __post_init__.
+                        sa.resolve_parallelism()
                         sa.resolve_cache()
 
                         self.assertEqual(

@@ -65,6 +65,57 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
+    if (enable_l3_storage && l3_prefetch_min_pages < 1) {
+        throw std::invalid_argument(
+            "Scheduler: L3 storage requires l3_prefetch_min_pages >= 1 (the L3 prefetch threshold, in prefix pages)");
+    }
+    if (!enable_l3_storage && l3_prefetch_min_pages != 0) {
+        throw std::invalid_argument(
+            "Scheduler: l3_prefetch_min_pages is an L3 setting; it must be 0 without L3 storage");
+    }
+    if (enable_l3_storage) {
+        // A Host copy keeps its Device block's residue, but an L3 prefetch
+        // allocates its Host page before any Device destination exists.
+        for (const CacheGroupConfig& group : cache_groups) {
+            if (group.shard_count > 1) {
+                throw std::invalid_argument(
+                    "Scheduler: L3 storage is not supported for page-cyclic sharded cache "
+                    "groups (group '" +
+                    group.group_id + "')");
+            }
+        }
+    }
+    // The snapshot pool is stated explicitly on every role: the null page
+    // alone (and no slots) says "never retract", anything more needs slots.
+    // The messages name the binding field and the server arg that sets it,
+    // because the runtime surfaces them verbatim at startup.
+    if (snapshot_allocator.total_pages < 1) {
+        throw std::invalid_argument(
+            "Scheduler: snapshot_allocator.total_pages (num_snapshot_pages, from --retraction-snapshot-host-gb) "
+            "must include the null page: 1 means the engine never retracts");
+    }
+    if (max_retracted_requests < 0) {
+        throw std::invalid_argument(
+            "Scheduler: max_retracted_requests (--retraction-snapshot-max-requests) must be >= 0");
+    }
+    if (HasSnapshotPool() != (max_retracted_requests > 0)) {
+        throw std::invalid_argument(
+            "Scheduler: a snapshot pool above the null page (num_snapshot_pages > 1, from "
+            "--retraction-snapshot-host-gb) requires max_retracted_requests > 0 "
+            "(--retraction-snapshot-max-requests), and max_retracted_requests > 0 requires a snapshot pool");
+    }
+    if (role == Role::kP && HasSnapshotPool()) {
+        throw std::invalid_argument(
+            "Scheduler: the P role never retracts and takes no snapshot pool (--retraction-snapshot-host-gb "
+            "must be 0 on the prefill role)");
+    }
+    // The knob retracts through the same path capacity pressure uses, and
+    // that path needs somewhere to put the image.
+    if (debug_force_retraction_interval != 0 && !HasSnapshotPool()) {
+        throw std::invalid_argument(
+            "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) requires a snapshot "
+            "pool (--retraction-snapshot-host-gb > 0): without one nothing can be retracted");
+    }
 }
 
 void SchedulerConfig::ValidateCapacityInputs() const {

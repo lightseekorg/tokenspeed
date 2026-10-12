@@ -66,7 +66,6 @@ def _policy() -> dict:
     return {
         "max_regression_relative": 0.1,
         "max_regression_absolute_us": 0.5,
-        "max_relative_mad": 0.05,
     }
 
 
@@ -89,6 +88,7 @@ def _suite_payload(cases: list[dict] | None = None) -> dict:
             "replay_warmup_iterations": 3,
             "measurement_blocks": 5,
         },
+        "min_regression_absolute_us": 0.5,
         "cases": cases,
     }
 
@@ -585,9 +585,17 @@ def test_builtin_harness_factory_passes_explicit_dependencies(tmp_path, monkeypa
         ),
         (
             lambda payload: payload["cases"][0]["policy"].update(
-                max_regression_absolute_us=-0.1
+                max_regression_absolute_us=0.4
             ),
-            "max_regression_absolute_us",
+            "at least the suite's min_regression_absolute_us",
+        ),
+        (
+            lambda payload: payload.pop("min_regression_absolute_us"),
+            "min_regression_absolute_us",
+        ),
+        (
+            lambda payload: payload["cases"][0]["policy"].update(max_relative_mad=0.05),
+            "max_relative_mad was removed",
         ),
         (
             lambda payload: payload["cases"][0]["definition"].pop("seed"),

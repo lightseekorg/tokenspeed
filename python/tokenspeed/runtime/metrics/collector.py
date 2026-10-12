@@ -269,6 +269,16 @@ class EngineMetrics:
             labelnames=labelnames,
             **kw,
         )
+        self.num_capacity_aborted_requests = Counter(
+            name="tokenspeed:num_capacity_aborted_requests",
+            documentation=(
+                "Requests the scheduler aborted because a capacity retraction "
+                "could not image its victim (retraction snapshot pool or image "
+                "rows exhausted); clients may resubmit them."
+            ),
+            labelnames=labelnames,
+            **kw,
+        )
 
     def set_scheduler_snapshot(
         self, *, running: int, waiting: int, kv_cache_usage_ratio: float
@@ -338,6 +348,11 @@ class EngineMetrics:
         if not self.enabled:
             return
         self.num_nan_aborted_requests.labels(**self.labels).inc()
+
+    def record_capacity_abort(self) -> None:
+        if not self.enabled:
+            return
+        self.num_capacity_aborted_requests.labels(**self.labels).inc()
 
 
 class RequestMetrics:

@@ -48,12 +48,10 @@ def test_the_prefill_role_accepts_a_full_tp_query_shard():
     args.mapping.rank = 1
     assert args.mapping.attn.qcp_group == args.mapping.attn.tp_group == (0, 1)
     assert args.mapping.attn.qcp_rank == 1
-    # DCP equal to the shard group is the one sharded-page layout allowed
-    # (and it inherits DCP's Host KVStore refusal).
-    args = prepare_server_args(
-        BASE + ["--decode-context-parallel-size", "2", "--disable-kvstore"]
-    )
-    assert args.mapping.attn.dcp_size == 2
+    # KVP equal to the shard group is the one sharded-page layout allowed
+    # (and it inherits KVP's Host KVStore refusal).
+    args = prepare_server_args(BASE + ["--kv-parallel-size", "2", "--disable-kvstore"])
+    assert args.mapping.attn.kvp_size == 2
 
 
 def test_off_by_default_everywhere():
@@ -86,10 +84,10 @@ def test_refusals(argv, match):
         prepare_server_args(BASE + argv)
 
 
-def test_refuses_dcp_narrower_than_the_shard_group():
+def test_refuses_kvp_narrower_than_the_shard_group():
     argv = [flag if flag != "2" else "4" for flag in BASE]
-    with pytest.raises(ValueError, match="--decode-context-parallel-size must be 1"):
-        prepare_server_args(argv + ["--decode-context-parallel-size", "2"])
+    with pytest.raises(ValueError, match="--kv-parallel-size must be 1"):
+        prepare_server_args(argv + ["--kv-parallel-size", "2"])
 
 
 def test_refuses_the_prefill_graph():
@@ -226,7 +224,7 @@ def test_validate_qcp_rejects_a_shard_below_the_tp_width():
             attn_dp_size=1,
             dense_tp_size=1,
             moe_tp_ep_size=4,
-            dcp_size=1,
+            kvp_size=1,
             disaggregation_mode="prefill",
             disable_prefill_graph=True,
             enable_mixed_batch=False,
@@ -242,7 +240,7 @@ def test_validate_qcp_rejects_a_shard_below_the_tp_width():
         attn_dp_size=1,
         dense_tp_size=4,
         moe_tp_ep_size=4,
-        dcp_size=4,
+        kvp_size=4,
         disaggregation_mode="prefill",
         disable_prefill_graph=True,
         enable_mixed_batch=False,

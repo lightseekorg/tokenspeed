@@ -23,6 +23,7 @@
 #include "cache/coordinator/group_geometry.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -41,20 +42,35 @@ struct AdmissionPlan {
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
 };
 
+// The table shape a restore rebuilds before its dense demand is placed: how
+// many blocks each bucket must receive and the tail capacity the rebuilt
+// table then has. An admission plans against the live table instead and
+// passes none.
+struct PlannedShape {
+    std::vector<std::int64_t> blocks_by_bucket;
+    std::int32_t available_tokens{0};
+};
+
 class AdmissionPlanner {
 public:
     AdmissionPlanner(const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
-                     const BlockPool& pool, std::span<const GroupDemand> demands,
+                     const BlockPool& pool, const BlockPool* host_pool, std::span<const GroupDemand> demands,
                      std::optional<std::int32_t> num_computed_tokens, const CacheCoordinator::PrefixProbe& prefix,
+                     std::span<const PlannedShape> shapes,
+                     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
         : groups_{groups},
           geometry_{geometry},
           pool_{pool},
+          host_pool_{host_pool},
           demands_{demands},
           num_computed_tokens_{num_computed_tokens},
           prefix_{prefix},
+          shapes_{shapes},
+          claimed_{claimed},
           victims_{victims},
-          local_free_slots_(groups.size()),
+          local_free_slots_by_bucket_(groups.size()),
+          shape_need_(groups.size()),
           blocks_needed_(groups.size()) {}
 
     bool Plan() {
@@ -138,18 +154,61 @@ private:
 
     void initializeCapacity() {
         _assert(demands_.size() == groups_.size(), "demands/groups size mismatch");
+        _assert(shapes_.empty() || shapes_.size() == groups_.size(), "shapes/groups size mismatch");
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const GroupDemand& demand = demands_[i];
             _assert(demand.table != nullptr, "group demand requires a block table");
-            const std::int32_t device_blocks = geometry_[i].BlocksNeededFor(*demand.table, demand);
-            const std::int32_t host_blocks =
-                prefix_.host.per_group.empty()
-                    ? 0
-                    : static_cast<std::int32_t>(std::ranges::count(prefix_.host.per_group[i].hits, std::uint8_t{1}));
-            blocks_needed_[i] = static_cast<std::int64_t>(device_blocks) + host_blocks;
-            local_free_slots_[i] = pool_.NumFreeSlots(static_cast<std::uint32_t>(i));
+            const auto buckets = static_cast<std::size_t>(groups_[i].Allocator().ShardCount());
+            if (shapes_.empty()) {
+                // An admission grows the live table densely; each Host hit
+                // lands on a fresh Device destination in the Host block's own
+                // bucket, exactly like a restored slot.
+                blocks_needed_[i] = geometry_[i].BlocksNeededFor(*demand.table, demand);
+                shape_need_[i].assign(buckets, 0);
+                if (!prefix_.host.per_group.empty()) {
+                    collectHostHitBuckets(i, shape_need_[i]);
+                }
+            } else {
+                // A restore rebuilds the recorded shape, bucket for bucket,
+                // and grows the rebuilt table from its recorded tail.
+                _assert(demand.table->NumBlocks() == 0, "a restore rebuilds into an empty table");
+                const auto* dense = std::get_if<DenseGrowth>(&demand.extent);
+                _assert(dense != nullptr, "a restore demand grows the rebuilt table densely");
+                _assert(shapes_[i].blocks_by_bucket.size() == buckets,
+                        "restore shape buckets must match the shard count");
+                blocks_needed_[i] = geometry_[i].BlocksNeededBeyond(shapes_[i].available_tokens,
+                                                                    dense->num_tokens + demand.reserve_tokens);
+                shape_need_[i] = shapes_[i].blocks_by_bucket;
+            }
+            const std::span<const std::int64_t> holes = pool_.FreeSlotsByBucket(static_cast<std::uint32_t>(i));
+            local_free_slots_by_bucket_[i].assign(holes.begin(), holes.end());
+            if (local_free_slots_by_bucket_[i].empty()) {
+                local_free_slots_by_bucket_[i].assign(buckets, 0);  // never allocated: no bound parent
+            }
         }
         empty_parent_count_ = pool_.NumEmptyLcmBlocks();
+    }
+
+    // A Host hit's Device destination must share the Host block's bucket, so
+    // the copy's two ends have one owner under page-cyclic sharding. A hit
+    // with no Host block yet (an L3 prefetch, replicated groups only) takes
+    // bucket 0, where its block will be allocated.
+    void collectHostHitBuckets(std::size_t group_index, std::vector<std::int64_t>& need) const {
+        _assert(host_pool_ != nullptr, "Host prefix hits require a Host pool");
+        const GroupPrefixProbe& probe = prefix_.host.per_group[group_index];
+        const std::span<const CacheKey> keys = prefix_.group_keys[group_index];
+        const std::int32_t floor_pages = prefix_.device.num_common_tokens / geometry_[group_index].BlockGranularity();
+        const GroupAllocator& allocator = groups_[group_index].Allocator();
+        for (std::size_t hit_index = 0; hit_index < probe.hits.size(); ++hit_index) {
+            if (probe.hits[hit_index] == 0) {
+                continue;
+            }
+            const std::size_t key_index = static_cast<std::size_t>(floor_pages) + hit_index;
+            _assert(key_index < keys.size(), "host prefix hit is outside the probed key range");
+            const CacheBlockRef host_block = groups_[group_index].Index().Find(*host_pool_, keys[key_index]);
+            const std::int32_t bucket = host_block ? allocator.BucketOf(host_block->Location()) : 0;
+            ++need[static_cast<std::size_t>(bucket)];
+        }
     }
 
     VictimCandidate makeVictimCandidate(std::uint32_t group_id, CacheBlockLocation location,
@@ -193,6 +252,10 @@ private:
             const std::vector<CacheBlockLocation> hits = groups_[i].Index().MatchedLocations(
                 pool_, prefix_.group_keys[i], /*begin_blocks=*/0, prefix_.device.per_group[i]);
             protected_locations_.insert(hits.begin(), hits.end());
+        }
+        for (const auto& [group_id, location] : claimed_) {
+            (void)group_id;
+            protected_locations_.insert(location);
         }
 
         if (num_computed_tokens_) {
@@ -286,6 +349,9 @@ private:
         return candidate;
     }
 
+    // Shadow holes follow the pool's own bookkeeping: a parent whose last
+    // occupant leaves takes its holes with it into the empty FIFO, and every
+    // bucket owned packing / shard_count of them.
     void removeOccupant(std::uint32_t group_id, CacheBlockLocation location) {
         _assert(pool_.BoundGroup(location.lcm_block_id) == group_id,
                 "released admission location belongs to another group");
@@ -293,14 +359,20 @@ private:
             remaining_occupied_.try_emplace(location.lcm_block_id, pool_.OccupiedCount(location.lcm_block_id)).first;
         std::int32_t& occupied = it->second;
         _assert(occupied > 0, "admission released the same location twice");
-        const std::int32_t slots = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
+        const GroupAllocator& allocator = groups_[group_id].Allocator();
+        std::vector<std::int64_t>& holes = local_free_slots_by_bucket_[group_id];
+        const auto bucket = static_cast<std::size_t>(allocator.BucketOf(location));
         if (occupied == 1) {
-            local_free_slots_[group_id] -= slots - 1;
+            const std::int64_t per_bucket = allocator.CacheBlocksPerLcmBlock() / allocator.ShardCount();
+            for (std::int64_t& bucket_holes : holes) {
+                bucket_holes -= per_bucket;
+            }
+            ++holes[bucket];
             occupied = 0;
             ++empty_parent_count_;
         } else {
             --occupied;
-            ++local_free_slots_[group_id];
+            ++holes[bucket];
         }
     }
 
@@ -308,25 +380,34 @@ private:
         auto it = remaining_occupied_.find(location.lcm_block_id);
         _assert(it != remaining_occupied_.end(), "restored admission victim has no shadow occupancy");
         std::int32_t& occupied = it->second;
-        const std::int32_t slots = groups_[group_id].Allocator().CacheBlocksPerLcmBlock();
+        const GroupAllocator& allocator = groups_[group_id].Allocator();
+        const std::int32_t slots = allocator.CacheBlocksPerLcmBlock();
+        std::vector<std::int64_t>& holes = local_free_slots_by_bucket_[group_id];
+        const auto bucket = static_cast<std::size_t>(allocator.BucketOf(location));
         if (occupied == 0) {
             _assert(empty_parent_count_ > 0, "restoring an admission victim underflowed empty parents");
             --empty_parent_count_;
             occupied = 1;
-            local_free_slots_[group_id] += slots - 1;
+            const std::int64_t per_bucket = slots / allocator.ShardCount();
+            for (std::int64_t& bucket_holes : holes) {
+                bucket_holes += per_bucket;
+            }
+            --holes[bucket];
         } else {
             _assert(occupied < slots, "restoring an admission victim overflowed its parent");
             ++occupied;
-            --local_free_slots_[group_id];
+            --holes[bucket];
         }
     }
 
+    // One fit formula for both transactions: a restore's bucket demand shares
+    // the parents it opens, an admission's dense demand takes any hole, and
+    // a plain admission (no shape) reduces to holes plus parents times packing.
     bool fits() const {
         std::int64_t parents_needed = 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            const std::int64_t remaining = std::max<std::int64_t>(blocks_needed_[i] - local_free_slots_[i], 0);
-            const std::int64_t slots = groups_[i].Allocator().CacheBlocksPerLcmBlock();
-            parents_needed += (remaining + slots - 1) / slots;
+            parents_needed += ParentsNeededForBuckets(shape_need_[i], local_free_slots_by_bucket_[i], blocks_needed_[i],
+                                                      groups_[i].Allocator().CacheBlocksPerLcmBlock());
         }
         return parents_needed <= empty_parent_count_;
     }
@@ -334,12 +415,20 @@ private:
     const std::vector<CacheGroup>& groups_;
     std::span<const GroupGeometry> geometry_;
     const BlockPool& pool_;
+    const BlockPool* host_pool_;
     std::span<const GroupDemand> demands_;
     std::optional<std::int32_t> num_computed_tokens_;
     const CacheCoordinator::PrefixProbe& prefix_;
+    std::span<const PlannedShape> shapes_;
+    // Device-cached blocks a restore claims instead of copying: protected
+    // from eviction like the probe's prefix hits.
+    std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed_;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
     std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
-    std::vector<std::int64_t> local_free_slots_;
+    // Per group: holes per bucket in bound parents, the bucket-constrained
+    // blocks a restore rebuilds, and the dense blocks wanted in any bucket.
+    std::vector<std::vector<std::int64_t>> local_free_slots_by_bucket_;
+    std::vector<std::vector<std::int64_t>> shape_need_;
     std::vector<std::int64_t> blocks_needed_;
     std::int64_t empty_parent_count_{0};
     std::vector<VictimCandidate> request_reclaim_candidates_;
@@ -352,12 +441,16 @@ private:
 
 std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
                                            std::span<const GroupGeometry> geometry, const BlockPool& pool,
-                                           CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-                                           std::optional<std::int32_t> num_computed_tokens) {
+                                           const BlockPool* host_pool, CacheCoordinator::PrefixProbe&& prefix,
+                                           std::span<const GroupDemand> demands,
+                                           std::optional<std::int32_t> num_computed_tokens,
+                                           std::span<const PlannedShape> shapes,
+                                           std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups, geometry, pool, demands, num_computed_tokens, prefix, victims};
+    AdmissionPlanner planner{groups, geometry, pool,    host_pool, demands, num_computed_tokens,
+                             prefix, shapes,   claimed, victims};
     if (!planner.Plan()) {
         return std::nullopt;
     }
@@ -411,7 +504,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     }
 
     std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, pool_, std::move(prefix), demands, progress.num_computed_tokens);
+        planAdmission(groups_, geometry_, pool_, host_pool_, std::move(prefix), demands, progress.num_computed_tokens,
+                      /*shapes=*/{}, /*claimed=*/{});
     if (!candidate) {
         return std::nullopt;
     }
@@ -423,10 +517,6 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     }
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
     const std::int32_t promotion_boundary_tokens = PromotionBoundaryTokens(plan.prefix);
-    std::vector<std::vector<CacheKey>> group_keys;
-    if (enable_l3_storage_) {
-        group_keys = plan.prefix.group_keys;
-    }
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
@@ -470,44 +560,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupDemand& demand = demands[i];
         if (!acquired_prefix.host.per_group.empty() && !acquired_prefix.host.per_group[i].blocks.empty()) {
-            PrefixMatch& host_match = acquired_prefix.host.per_group[i];
-            std::vector<std::uint8_t> prefetch_flags;
-            std::vector<CacheKey> host_keys;
-            if (enable_l3_storage_) {
-                const std::int32_t floor_pages =
-                    acquired_prefix.device.num_common_tokens / geometry_[i].BlockGranularity();
-                prefetch_flags.assign(host_match.blocks.size(), 0);
-                host_keys.resize(host_match.blocks.size());
-                for (std::size_t hit_index = 0; hit_index < host_match.blocks.size(); ++hit_index) {
-                    if (!host_match.blocks[hit_index]) {
-                        continue;
-                    }
-                    const std::size_t key_index = static_cast<std::size_t>(floor_pages) + hit_index;
-                    FatalCheck(key_index < group_keys[i].size(),
-                               "host prefix hit is outside the planned prefix key range");
-                    const CacheKey& key = group_keys[i][key_index];
-                    host_keys[hit_index] = key;
-                    prefetch_flags[hit_index] =
-                        groups_[i].Index().Contains(*host_pool_, host_match.blocks[hit_index]->Location()) ? 0 : 1;
-                }
-            }
-            const std::size_t pair_begin = result.load_pairs.size();
-            groups_[i].Allocator().AppendHostExtension(pool_, *demand.table, std::move(host_match.blocks),
-                                                       result.load_pairs);
-            if (enable_l3_storage_) {
-                std::size_t pair_index = pair_begin;
-                for (std::size_t hit_index = 0; hit_index < prefetch_flags.size(); ++hit_index) {
-                    if (host_keys[hit_index].content_hash.empty()) {
-                        continue;
-                    }
-                    if (pair_index >= result.load_pairs.size()) {
-                        break;
-                    }
-                    BlockTransfer& transfer = result.load_pairs[pair_index++];
-                    transfer.key = std::move(host_keys[hit_index]);
-                    transfer.prefetch_from_storage = prefetch_flags[hit_index] != 0;
-                }
-            }
+            groups_[i].Allocator().AppendHostExtension(
+                pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
         const bool acquired =
@@ -520,6 +574,111 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             }
             result.new_page_ids[i].push_back(
                 groups_[i].Allocator().ResolveCacheBlockId(blocks[static_cast<std::size_t>(block)]->Location()));
+        }
+    }
+    return result;
+}
+
+std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const RetractionImage& image,
+                                                                           std::span<const GroupDemand> demands,
+                                                                           std::uint64_t request_access_epoch) {
+    _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
+    _assert(image.tables.size() == groups_.size(), "image/groups size mismatch");
+    _assert(request_access_epoch > 0 && request_access_epoch <= next_access_epoch_,
+            "request access epoch was not issued by this coordinator");
+    // A Host L2 slot whose key still has a Device-cached canonical block is
+    // claimed instead of copied: the same bytes by construction (the victim's
+    // own block, cache-only since it was freed, or the canonical block its
+    // table already pointed at). Those blocks are protected from the planner's
+    // eviction like prefix hits; every other slot is a bucket-constrained
+    // fresh block.
+    std::vector<PlannedShape> shapes(groups_.size());
+    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> protected_locations;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        _assert(demands[i].table != nullptr && demands[i].table->NumBlocks() == 0,
+                "a restore rebuilds into an empty table");
+        const GroupAllocator& allocator = groups_[i].Allocator();
+        const ImageTable& shape = image.tables[i];
+        shapes[i].blocks_by_bucket.assign(static_cast<std::size_t>(allocator.ShardCount()), 0);
+        shapes[i].available_tokens = shape.available_tokens;
+        for (const ImageSlot& slot : shape.slots) {
+            _assert(static_cast<bool>(slot.block), "image slot lost its block");
+            const CacheBlockRef canonical =
+                slot.InHostCache() ? groups_[i].Index().Find(pool_, slot.key) : CacheBlockRef{};
+            if (canonical) {
+                protected_locations.emplace_back(groups_[i].Id(), canonical->Location());
+                continue;
+            }
+            ++shapes[i].blocks_by_bucket[static_cast<std::size_t>(allocator.BucketOf(slot.block->Location()))];
+        }
+    }
+
+    std::optional<AdmissionPlan> candidate =
+        planAdmission(groups_, geometry_, pool_, host_pool_, ProbePrefix({}), demands,
+                      /*num_computed_tokens=*/std::nullopt, shapes, protected_locations);
+    if (!candidate) {
+        return std::nullopt;
+    }
+    // Nothing is published or reclaimed here, so every planned victim is a
+    // cache-only block the planner saw as evictable.
+    for (const auto& [group_id, location] : candidate->victims) {
+        FatalCheck(evictCachedBlock(group_id, location), "restore victim changed before acquisition");
+    }
+
+    AdmissionResult result{
+        .access_epoch = request_access_epoch,
+        .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
+    };
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        GroupAllocator& allocator = groups_[i].Allocator();
+        BlockTable& table = *demands[i].table;
+        const ImageTable& shape = image.tables[i];
+        std::vector<CacheBlockRef> claimed(shape.slots.size());
+        for (std::size_t j = 0; j < shape.slots.size(); ++j) {
+            const ImageSlot& slot = shape.slots[j];
+            if (!slot.InHostCache() || !groups_[i].Index().Find(pool_, slot.key)) {
+                continue;
+            }
+            // The planner protected this entry; claim it like a prefix hit.
+            const std::array<CacheKey, 1> keys{slot.key};
+            PrefixMatch hit = groups_[i].Index().AcquireMatched(pool_, keys, /*begin_blocks=*/0,
+                                                                GroupPrefixProbe{.hits = {1}}, request_access_epoch);
+            claimed[j] = std::move(hit.blocks.front());
+        }
+        FatalCheck(allocator.AcquireShape(pool_, table, shape, std::move(claimed)),
+                   "restore plan no longer fits the block pool");
+        for (const ImageSlot& slot : shape.slots) {
+            const CacheBlockRef& destination = table.Blocks()[static_cast<std::size_t>(slot.slot_index)];
+            if (slot.InHostCache() && groups_[i].Index().Contains(destination)) {
+                continue;  // claimed: already the published Device block, nothing to copy
+            }
+            BlockTransfer transfer{
+                .group_id = groups_[i].Id(),
+                .source = slot.block,
+                .destination = destination,
+                .key = slot.key,
+                .logical_block_index = slot.logical_block_index,
+                .boundary_kind = slot.boundary_kind,
+            };
+            // A published slot comes back from Host L2 (and is re-published at
+            // the ACK); a private slot from the snapshot pool. Neither is
+            // listed in new_page_ids: the copy fills the whole block, as a
+            // Host hit's load-back does.
+            if (slot.InHostCache()) {
+                result.load_pairs.push_back(std::move(transfer));
+            } else {
+                result.snapshot_pairs.push_back(std::move(transfer));
+            }
+        }
+        // Only the reserve appended beyond the imaged shape is fresh, unfilled
+        // Device memory for the plan to zero.
+        const std::int32_t first_new_block = table.NumBlocks();
+        FatalCheck(allocator.Acquire(pool_, table, geometry_[i].PlanAcquire(table, demands[i])),
+                   "restore plan no longer fits the block pool");
+        const std::span<const CacheBlockRef> blocks = table.Blocks();
+        for (std::int32_t block = first_new_block; block < table.NumBlocks(); ++block) {
+            result.new_page_ids[i].push_back(
+                allocator.ResolveCacheBlockId(blocks[static_cast<std::size_t>(block)]->Location()));
         }
     }
     return result;

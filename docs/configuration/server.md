@@ -369,6 +369,10 @@ for gateway discovery.
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
+| `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's unaligned tail pages, its blocks of groups Host L2 never holds, and its slot state; the hash-complete blocks go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
+| `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` makes every resident suspendable), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
+| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, i.e. the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, which covers every resident request of the rank; refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
+| `--debug-force-retraction-interval` | **Test only.** Every `N` scheduler plans retract the oldest quiescent decoding request (`N > 0`), or with `-N` the one prefilling request between its chunks, without capacity pressure, so a test run exercises the suspend/restore path on every request (the bitwise continuation oracle of [Numerics](../design/numerics.md)). Refused with `--retraction-snapshot-ratio 0` (no pool to image into). `0` (the default) is off; never set it in serving. |
 
 For pure prefill, token capacities count newly computed tokens, not cached
 prefixes or each request's full sequence length. Two requests extending by
@@ -393,11 +397,11 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
-| `--decode-context-parallel-size` | Shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. Allowed on aggregated engines and with `--disaggregation-mode prefill` (every rank of the subgroup sends its owned pages to an unsharded decode). Not supported yet: the decode role; speculative decoding on any ordinary MLA/DSA model (the recipe refuses to shard a cache holding a draft group, whichever dense kernel runs it -- only the DeepSeek V4 and Kimi K3 recipes shard with a draft, and FlashMLA/GPU DSA reject speculation under DCP outright); and the Host KVStore, so pass `--disable-kvstore`. |
-| `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph`, tunes on a decode step, and admits only requests whose `max_new_tokens` is at most 4096 (the scheduler then never retracts them, so no local recovery prefill is scheduled). Over the query shards of a prefill engine (must equal `--prefill-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--prefill-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
+| `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages; decode attends the owned pages and merges the partials by LSE (DCP, `docs/serving/parallelism.md`). Allowed on aggregated engines and with `--disaggregation-mode prefill` (every rank of the subgroup sends its owned pages to an unsharded decode). Not supported yet: the decode role; speculative decoding on any ordinary MLA/DSA model (the recipe refuses to shard a cache holding a draft group, whichever dense kernel runs it -- only the DeepSeek V4 and Kimi K3 recipes shard with a draft, and FlashMLA/GPU DSA reject speculation in their DCP decode outright); and L3 storage (`--kvstore-storage-backend`: a page-cyclic sharded group has no owner-stable L3 key). The Host KVStore and the retraction snapshot pool are supported: the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
+| `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph` and tunes on a decode step; it admits any `max_new_tokens`, because a retracted request resumes by restore rather than by a recovery prefill. Over the query shards of a prefill engine (must equal `--prefill-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--prefill-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
 | `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--prefill-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
-| `--prefill-context-parallel-size` | Query context parallelism on the PD prefill role: shard every extend forward's rows over the attention TP group, rank `r` computing a contiguous slice of the chunk against the gathered KV history of its requests (the KV write, index-K write, sampled rows and prompt-logprob rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Must equal `--attn-tp-size`; requires `--disaggregation-mode prefill`, `--disable-prefill-graph`, attention DP 1, no `--enable-mixed-batch`, a DSA-family attention backend with a bf16 KV cache (the gathered write stores native latent rows), `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width, and `--decode-context-parallel-size` 1 or equal to it (the sharded-page combination inherits DCP's `--disable-kvstore` requirement). The attention weights are head-replicated unless `--attn-head-tp-size` equals it, which shards them over the shard group. 1 (default) is off. |
+| `--prefill-context-parallel-size` | Query context parallelism on the PD prefill role: shard every extend forward's rows over the attention TP group, rank `r` computing a contiguous slice of the chunk against the gathered KV history of its requests (the KV write, index-K write, sampled rows and prompt-logprob rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Must equal `--attn-tp-size`; requires `--disaggregation-mode prefill`, `--disable-prefill-graph`, attention DP 1, no `--enable-mixed-batch`, a DSA-family attention backend with a bf16 KV cache (the gathered write stores native latent rows), `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width, and `--kv-parallel-size` 1 or equal to it (the sharded-page combination inherits KVP's rules: Host KVStore and snapshot pool allowed, L3 refused). The attention weights are head-replicated unless `--attn-head-tp-size` equals it, which shards them over the shard group. 1 (default) is off. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
@@ -547,13 +551,16 @@ requests sample at temperature. Greedy requests behave identically under both
 rules. `top_k`, `top_p`, `min_p`, penalties and `logit_bias` stay on the
 verifier's side. `q` only follows the temperature.
 
-A request admitted (or re-admitted after retraction) has no recorded `q` for
-its first chain: its rows hold a sentinel above
-`--spec-reject-draft-prob-threshold`, which makes the verifier reject the
-first draft and sample the first token from the full target. The runtime
-writes the sentinel as `threshold + 1.0` in fp32, hence the range: below
-`1.0` a real probability would read as the sentinel, and the cap keeps the
-`+ 1.0` representable.
+A request admitted has no
+recorded `q` for its first chain: its rows hold a sentinel above
+`--spec-reject-draft-prob-threshold`, which rejects at the first draft and
+samples the first token from the full target. A request a capacity
+retraction suspends keeps its `q`: the recorded distributions travel in its
+slot-state image and come back with the restore, so its first verify after
+resuming accepts drafts exactly as the uninterrupted run would. The
+sentinel is written as
+`threshold + 1.0` in fp32, hence the range: below `1.0` a real probability
+would read as the sentinel, and the cap keeps the `+ 1.0` representable.
 Under PD disaggregation the prefill node's candidates land the same way, so
 the decode node's first verify of a landed request accepts nothing.
 TokenSpeed refuses the flag on the prefill role (`--disaggregation-mode
@@ -746,11 +753,97 @@ features directly:
 - `--dense-tp-size`
 - `--moe-tp-size`
 - `--kvstore-*`
+- `--retraction-snapshot-*`
 - `--kv-events-config`
 - `--mla-chunk-multiplier`
 - `--disaggregation-*`
 - `--comm-fusion-max-num-tokens`
 - `--enable-allreduce-fusion`
+
+### Retraction snapshot pool
+
+A capacity retraction suspends a resident request instead of recomputing
+it: the request's cache pages and its per-slot Device state are imaged to
+pinned Host memory, and once Device pages are free again the image is copied
+back and the request continues exactly where it stopped -- a decoding
+request decodes, a mid-prompt request runs its next chunk
+(`docs/design/scheduler.md` section 4). The image is split: the
+hash-complete prefix pages go to Host L2 as a stream-ordered write-back and
+stay pinned there until the restore; the unaligned tail, the blocks of
+groups L2 never holds (a replayable sliding-window group, a state group's
+live block) and the slot-state blob go to the request-private pool
+(`docs/design/cache-concepts.md`, "Retraction image"). The two buffers are
+separate allocations of one Host cache executor and both count against its
+Host-memory headroom check. The pool is independent of the KVStore: with
+`--disable-kvstore` there is no L2 leg and the pool holds whole images; with
+L2 it holds the tails plus the slot-state blob.
+
+**Sizing.** The pool is on by default on the roles that retract and sized
+like the Host KVStore, in LCM blocks of the rank's transfer layout
+(`python/tokenspeed/runtime/cache/l2/sizing.py`); the slot-state arena
+(`--retraction-snapshot-max-requests` x blob bytes) is allocated on top.
+The first rule that applies wins:
+
+| Arguments | Pool size | Request cap (`--retraction-snapshot-max-requests` when `0`) |
+|---|---|---|
+| `--retraction-snapshot-host-gb G` (G > 0) | `G` GB, whole LCM blocks | `--max-num-seqs / attention-DP size` |
+| `--retraction-snapshot-ratio R` (R > 0) | `R` x this rank's Device LCM blocks | same |
+| `--retraction-snapshot-ratio 0` | **no pool**: a capacity block aborts its victim | `0` (an explicit cap is refused) |
+| neither, `--disable-kvstore` | 0.1 x this rank's Device LCM blocks (whole images) | same as above |
+| neither, Host KVStore on | request cap x one image tail | same as above |
+
+One image tail, per cache group, is one page for a group that publishes
+to Host L2 (its unaligned last page; a state group's live block) and a
+request's worst-case pages at the context limit for a group that never
+publishes (a replayable sliding-window group), folded to LCM blocks by the
+scheduler's `CapacityModel`, so the pool is counted the way the scheduler
+later claims it. Without the KVStore a whole image is the request's every
+page, so the default is a tenth of the Device KV rather than all of it: an
+on-by-default pool must stay cheap to pin (the Device KV once is hundreds of
+gigabytes of pinned Host memory for a small model on a large GPU), and it
+still suspends a few residents; an image that does not fit aborts its
+victim. A deployment that wants every resident suspendable passes
+`--retraction-snapshot-ratio 1`, or enables the KVStore, whose tails are
+cheap. A size or ratio that holds no whole LCM block is refused,
+not rounded down to none. Each engine logs one line at startup with the
+resolved pool (GB and LCM blocks, which rule sized it), the request cap
+and arena, and whether Host L2 takes the hash-complete pages; without a
+pool the line says that capacity blocks abort. The prefill and encode
+roles never retract: their pool arguments are ignored with a log.
+
+**When the image does not fit.** Host accounting stays optimistic -- no
+admission gate charges a request's worst-case image -- and retraction never
+waits on Host capacity or falls back to recomputation. The capacity policy
+ranks only victims whose image fits (a free slot-state row and pool room for
+the tail; hash-complete pages ride Host L2, whose shortfall falls back to
+the pool). When no resident fits, the scheduler **aborts the newest
+retractable resident** in the same round and grants its pages to the
+blocked request. The client sees the finish `{"type": "abort", "err_type":
+524, "message": "Request aborted by the scheduler: <detail>"}`
+(`ABORT_CODE.CapacityAbort`; the detail names the shortfall -- "snapshot
+pool cannot hold the image" or "no blob slot free
+(max_retracted_requests=N)" -- and the arg to raise), distinguishable from
+a NaN abort (523) or a transfer failure (521), so a caller that can retry --
+an RL rollout, a batch job -- resubmits; the engine counts them in
+`tokenspeed:num_capacity_aborted_requests`. The two args therefore size how
+much work may be suspended at once, and exceeding them costs an abort of
+one request, never latency for everyone else. With no pool
+(`--retraction-snapshot-ratio 0`) nothing can be imaged, so a
+capacity-blocked round aborts the newest resident instead of imaging
+anyone. `--debug-force-retraction-interval` never aborts: a forced
+retraction whose image does not fit is refused and logged. The scheduler's
+victim choice is in `docs/design/scheduler.md` section 2.
+
+The ops ride the round's `DeviceHandle.execute` with the L2 write-backs and
+load-backs (`docs/design/event-loop.md`), their ACKs the same cache poll, and
+the pool arms the completion hooks like the L2 tier does. Both Host tiers are
+allowed under `--kv-parallel-size > 1`: the scheduler allocates
+every Host block in its Device block's residue class and each rank copies the
+blocks it owns; L3 storage stays refused there. The weight-update cache flush
+is refused while a request is suspended with an image, so an image of
+old-weight KV is never restored under new weights.
+`--debug-force-retraction-interval` exercises the path without pressure in
+tests (see the flag above).
 
 ### Host L2 and Mooncake Store L3
 
@@ -824,25 +917,16 @@ split flush would leave mirrored
 schedulers with different prefix indexes. The weight-update RPC then
 fails so the caller retries instead of serving new weights against the
 previous checkpoint or entering NCCL weight broadcasts alone. A
-`batch_exists` hit is not a lease: if
-`batch_get_into` misses after Admit, the runtime unregisters the key,
-skips publishing empty Host pages, and retracts the batch snapshot-less
-so the next admit recomputes those tokens. A short Mooncake read (fewer
-bytes than the requested page) is a miss, not a success. Failed `batch_get_into` pages
-stay unread so a later `batch_exists` hit cannot re-register them and
-retry the same prefetch. The runtime blacklists only replica-converged misses.
-Replica admission MIN-reduces local readability (exists and not unread).
-A later Host backup forgets an unread entry only when it created a
-missing object. A create-only skip of an unreadable object keeps the
-blacklist. The runtime bounds the unread set to Host CacheBlock capacity
-(LCM parents times each group's `cache_blocks_per_lcm_block`).
-A backend exception or malformed result is a
-local miss so every replica rank still enters the MIN-reduce.
-The engine does not fail clients.
-L2 write-back ACKs use the same replica groups: the runtime emits
-`WriteBackDone` only after every cache-owning rank holds the completion,
-so a worker cannot publish Host while a replica peer's Mooncake put is
-still in flight. A truncated `batch_is_exist` reply is a failed put, not
+`batch_exists` hit is not a lease: the L3 pages are fetched into Host
+before the request is admitted (below), and whatever is no longer there
+lands short. A short Mooncake read (fewer bytes than the requested
+page) is a miss, not a success. A backend exception or malformed result is a
+local miss so every replica rank still enters the MIN-reduce. Clients are
+not failed.
+L2 write-back ACKs use the same replica groups: `WriteBackDone` is
+emitted only after every cache-owning rank holds the completion, so a
+worker cannot publish Host while a replica peer's Mooncake put is still in
+flight. A truncated `batch_is_exist` reply is a failed put, not
 an implicit success.
 When L3 is on, the engine rejects supplying a new `weight_version` with
 `flush_cache=False`, so the runtime cannot treat stale Device/Host KV
@@ -862,7 +946,8 @@ reusing objects written without backend identity.
 TokenSpeed splits `global_segment_size` across
 attention-TP × pipeline-parallel ranks so the mounted total matches the
 configured size. Use the resolved `mapping.attn.tp_size`, not
-`--attn-tp-size` alone. L3 requires Host L2 (do not pass `--disable-kvstore`).
+`--attn-tp-size` alone. L3 requires Host L2 (do not pass `--disable-kvstore`)
+and an unsharded KV cache (not `--kv-parallel-size > 1`).
 Pass Mooncake client settings as JSON
 in `--kvstore-storage-backend-extra-config`, for example:
 
@@ -878,10 +963,40 @@ in `--kvstore-storage-backend-extra-config`, for example:
 
 Constructing `MooncakeKvStore` requires `extra_config`. Pass `None` to
 use `MOONCAKE_MASTER` / `MOONCAKE_CLIENT` and the other env defaults.
-Queued requests that can take a batch slot and Device pages this round
-re-probe L3 immediately before admission so a hit that waited for capacity
-cannot keep a deleted or evicted object as a Host hit. A full decode batch
-or exhausted Device pool does not rehash the rest of the wait queue.
+
+**Prefetch before admission.** An L3 hit is never loaded under a running
+forward. When a waiting request's registered L3 keys past its Device/Host
+hit span at least `--kvstore-prefetch-min-pages` prefix pages, the
+scheduler allocates Host blocks for them, emits a prefetch op and holds the
+request in a pre-admission state that owns those Host blocks and nothing
+else -- no Device page, no batch slot -- while later requests may be
+admitted past it. The Host cache executor's prefetch lane (a CPU thread)
+fills the pages in prefix order, `--kvstore-prefetch-batch-pages` per
+`batch_get_into`, and stops at the first missing page or at the deadline
+`--kvstore-prefetch-timeout-base-s + --kvstore-prefetch-timeout-per-page-s
+x pages`, counted from when the op starts on the lane and checked between
+batches only (a `batch_get_into` already issued runs to completion -- the
+store API has no timeout -- so one batch may overrun the deadline, and a
+hung store holds the lane and every later prefetch behind it); the replica
+agrees (a MIN across TP, CP and PP) on the pages
+landed, the scheduler publishes exactly that prefix in Host L2 and forgets
+the rest of the keys, and the request's admission is then an ordinary Host
+hit whose Host-to-Device load overlaps its first chunk layer by layer.
+Fewer free Host blocks than the hit truncate the prefetch; below the minimum
+there is none and the pages are computed -- admission never waits on Host
+room. The cost: an L3 hit waits for its prefetch before it is admitted (one
+plan of latency at least), holding no Device pages meanwhile; the gain: no
+forward is ever skipped or recomputed because of L3. The decode role of a PD
+deployment never prefetches (its admission probes Device only). The four
+knobs are required with `--kvstore-storage-backend` and refused without it:
+
+| Argument | Description |
+| --- | --- |
+| `--kvstore-prefetch-min-pages` | The shortest L3-only prefix, in prefix pages, worth a prefetch; a shorter hit is computed. The reference engine's `prefetch_threshold`. |
+| `--kvstore-prefetch-timeout-base-s` | The prefetch deadline's base term in seconds (positive). The deadline says when the lane stops starting batches; it does not interrupt a batch in flight. |
+| `--kvstore-prefetch-timeout-per-page-s` | The deadline's per-page term in seconds (0 for a fixed deadline). |
+| `--kvstore-prefetch-batch-pages` | Prefix pages per `batch_get_into` of a prefetch; the fetch stops at the first batch with a missing page (the reference engine uses 128). |
+
 `--kvstore-storage-backend memory` is an in-process dict for tests only.
 CI exercises that Mooncake-compatible contract end-to-end (scheduler
 prefetch after `register_storage_keys` / Host eviction, and a CUDA

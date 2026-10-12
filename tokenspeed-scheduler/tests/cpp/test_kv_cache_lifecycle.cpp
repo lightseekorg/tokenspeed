@@ -60,6 +60,7 @@ protected:
         swa_grp.family = CacheGroupFamily::History;
 
         cfg.cache_groups = {full_grp, swa_grp};
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };

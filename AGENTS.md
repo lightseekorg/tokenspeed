@@ -77,7 +77,16 @@ subsystem and the C++ scheduler can own it — as a cache group with its own
 block granularity, allocated, prefix-matched, transferred and freed with the
 request's other blocks — before adding state maintenance inside a particular
 model or attention backend. Backend-private state is the exception, not the
-default.
+default; when it exists and is keyed by the request slot, it must implement
+`SlotStateExporter` (`python/tokenspeed/runtime/execution/slot_state.py`) so a
+retraction snapshot carries it with the pages. `test/runtime/test_slot_state.py`
+guards this for the owner classes it constructs (`RuntimeStates`, the
+drafters, the Inkling and DSA backends, the sampling backends, and the owners a
+`ModelExecutor` built from them lists): every tensor with a slot-sized
+dimension on such an owner, or on a runtime component it holds, must be
+exported or declared in the exporter's `token_derived_slot_state` /
+`constant_slot_state`. A new owner class is covered only once that test
+constructs it; add a builder for it there in the same change.
 
 `docs/design/` records the deliberate invariants of each subsystem — what
 belongs where, and why. Read the document covering the code you are touching

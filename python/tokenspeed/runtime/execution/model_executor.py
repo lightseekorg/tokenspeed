@@ -73,6 +73,7 @@ from tokenspeed.runtime.execution.prefill_graph import (
 )
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.execution.slot_state import SlotStateExporter
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -521,8 +522,8 @@ class ModelExecutor:
             device=self.device,
         )
         # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
-        # rank's position in the DCP group selects the pages it owns.
-        self._cache_dcp_rank = model_runner.mapping.attn.dcp_rank
+        # rank's position in the KVP group selects the pages it owns.
+        self._cache_kvp_rank = model_runner.mapping.attn.kvp_rank
         ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
         if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
             raise NotImplementedError(
@@ -1590,7 +1591,8 @@ class ModelExecutor:
                 accept_lengths=accept_lengths,
             )
             # _update_runtime_state skips future_input_map when drafter is
-            # active — drafter writes the next-round inputs directly.
+            # active — drafter writes the next-round inputs directly, and the
+            # row's candidate columns are real from here on.
             indices = self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
             for requests in (
                 ctx.output_layout.prefill_slice,
@@ -1601,6 +1603,7 @@ class ModelExecutor:
                 self.runtime_states.future_input_map[indices[requests]] = (
                     next_round_input_ids[requests].to(torch.int32)
                 )
+                self.runtime_states.mark_spec_candidates_drafted(indices[requests])
                 if self.tree_spec is not None:
                     self.runtime_states.future_parent_map[indices[requests]] = (
                         self.tree_spec.draft_parent_buf[requests]
@@ -1797,6 +1800,39 @@ class ModelExecutor:
                     **draft_kwargs,
                 )
 
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter): the retraction snapshot's blob
+    # ------------------------------------------------------------------
+
+    def slot_state_exporters(self) -> tuple[SlotStateExporter, ...]:
+        """The owners of per-slot state outside the cache groups, in blob order.
+
+        The runtime states, every node of the target attention tree, the
+        nodes of the draft tree not already listed (a draft Inkling wrapper
+        owns its own ring; a shared node is listed once), the drafter and the
+        sampling backend (its per-request scalars, penalty history and coin
+        generator). The Host cache executor lays these out once
+        (``SlotStateLayout``):
+        each contributes a fixed-size segment, exported on a retraction
+        store from the exporters' tensors on ``execution_stream`` (the caller
+        orders the transfer stream behind it) and imported on a restore
+        after the plan's zeroing, before the request's first forward.
+        """
+        exporters: list[SlotStateExporter] = [self.runtime_states]
+        exporters.extend(self.attn_backend.slot_state_exporters())
+        draft_backend = self.draft_attn_backend
+        if draft_backend is not None:
+            listed = {id(exporter) for exporter in exporters}
+            exporters.extend(
+                exporter
+                for exporter in draft_backend.slot_state_exporters()
+                if id(exporter) not in listed
+            )
+        if self.drafter is not None:
+            exporters.append(self.drafter)
+        exporters.append(self.sampling_backend)
+        return tuple(exporters)
+
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.
 
@@ -1817,7 +1853,7 @@ class ModelExecutor:
             pages = local_pages_by_group(
                 pages,
                 contract=self._cache_runtime_contract,
-                rank=self._cache_dcp_rank,
+                rank=self._cache_kvp_rank,
             )
 
         def sanitize(pool, pool_pages) -> bool:
@@ -2439,8 +2475,16 @@ class ModelExecutor:
             step_counter.record_cache()
 
     def prepare_remote_cache_slots(self, req_pool_indices: list[int]) -> None:
-        """Clear backend restore state before publishing RDMA destinations."""
+        """Clear backend restore state before publishing RDMA destinations.
+
+        A slot granted to a remote admission may be a victim's the same
+        plan retracted: the snapshot store reads the victim's slot state on
+        the write stream and fences the default stream, so this write
+        orders behind the default stream like ``_write_valid_cache_lengths``
+        does -- or it could race the export.
+        """
         slots = [int(slot) for slot in req_pool_indices]
+        self.execution_stream.wait_stream(self.default_stream)
         with self.device_module.stream(self.execution_stream):
             self.attn_backend.prepare_remote_cache_slots(slots)
 

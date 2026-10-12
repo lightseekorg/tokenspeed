@@ -23,9 +23,11 @@
 #include <algorithm>
 #include <concepts>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "cache/core/cache_types.h"
@@ -85,16 +87,54 @@ inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* to
     return shifted;
 }
 
+// Waiting for admission. A request whose L3 prefetch landed comes back here
+// holding the Host entries it fetched (prefetched_host_entries), pinned so
+// they are still there when its admission claims them as an ordinary Host hit;
+// the pins drop with the state at admission, after the admission acquired its
+// own references.
 struct Submitted {
     Submitted(TokenContainer* token_container, std::int32_t prefix_granularity)
         : token_container_{token_container}, prefix_granularity_{prefix_granularity} {}
+    Submitted(TokenContainer* token_container, std::int32_t prefix_granularity,
+              std::vector<CacheBlockRef> prefetched_host_entries)
+        : token_container_{token_container},
+          prefix_granularity_{prefix_granularity},
+          prefetched_host_entries_{std::move(prefetched_host_entries)} {}
 
     TokenContainer* TokenContainerPtr() const { return token_container_; }
     std::int32_t PrefixGranularity() const { return prefix_granularity_; }
+    std::size_t NumPrefetchedHostEntries() const { return prefetched_host_entries_.size(); }
+    // A further prefetch (the remainder beyond what landed) carries these on,
+    // so the first fetch's entries stay pinned until the admission that
+    // claims them all.
+    std::vector<CacheBlockRef> TakePrefetchedHostEntries() { return std::exchange(prefetched_host_entries_, {}); }
 
 private:
     TokenContainer* token_container_{};
     std::int32_t prefix_granularity_{};
+    std::vector<CacheBlockRef> prefetched_host_entries_;
+};
+
+// Before admission, with an L3 prefetch in flight: the request pins the Host
+// blocks the fetch fills -- and the entries an earlier prefetch of its own
+// already landed (host_blocks holds both) -- with nothing on the Device and
+// no request-pool row; it is skipped by admission (later Submitted requests
+// may be admitted past it, it holds no head of line) and is never a victim.
+// The op's ACK (PrefetchDone) returns it to Submitted holding every entry
+// that landed; an abort drops its pins, and the op's own pins keep the
+// blocks still being filled until the ACK.
+struct Prefetching {
+    Prefetching(TokenContainer* token_container, std::int32_t prefix_granularity,
+                std::vector<CacheBlockRef> host_blocks, std::uint32_t prefetch_op)
+        : token_container{token_container},
+          prefix_granularity{prefix_granularity},
+          host_blocks{std::move(host_blocks)},
+          prefetch_op{prefetch_op} {}
+
+    TokenContainer* token_container{};
+    std::int32_t prefix_granularity{};
+    std::vector<CacheBlockRef> host_blocks;
+    std::uint32_t prefetch_op{};
 };
 
 // Everything a page-holding state owns on the request's behalf: the KV
@@ -166,7 +206,20 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-struct PrefillDone {
+// Set by RestoreDoneEvent on the state a restore resumes into: the device
+// holds no in-flight capture for this request's next input (its forward
+// history belongs to the slot it left), so the first decode after a restore
+// carries the token explicitly, as a D-role bootstrap decode does. The
+// ScheduleDecodeEvent that consumes it builds a fresh state without it.
+struct RestoreMarker {
+    bool ResumedByRestore() const { return resumed_by_restore_; }
+    void MarkResumedByRestore() { resumed_by_restore_ = true; }
+
+private:
+    bool resumed_by_restore_{false};
+};
+
+struct PrefillDone : RestoreMarker {
     PrefillDone(ForwardResources resources, TokenContainer::Window window,
                 std::int32_t reserve_num_tokens_in_next_schedule_event)
         : resources{std::move(resources)},
@@ -184,7 +237,7 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-struct Decoding {
+struct Decoding : RestoreMarker {
     Decoding(ForwardResources resources, std::int32_t reserve_num_tokens_in_next_schedule_event)
         : resources{std::move(resources)},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
@@ -204,34 +257,83 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{-1};
 };
 
+// Where a retracted request resumes once its image is back on Device: the
+// state it left, with what that state carried beyond its ForwardResources.
+struct ResumePrefilling {
+    TokenContainer::Window window{};
+    std::int32_t reserve_num_tokens_in_next_schedule_event{};
+};
+struct ResumePrefillDone {
+    TokenContainer::Window window{};
+    std::int32_t reserve_num_tokens_in_next_schedule_event{};
+};
+struct ResumeDecoding {
+    std::int32_t reserve_num_tokens_in_next_schedule_event{};
+};
+using ResumeShape = std::variant<ResumePrefilling, ResumePrefillDone, ResumeDecoding>;
+
+// Suspended with its image: the request holds no Device pages and no request
+// pool slot, but its KV lives on -- the published pages as pinned Host L2
+// entries, everything else in the snapshot pool -- together with its cache
+// progress and the exact point it stopped at, so the restore continues it
+// where it was (a decoding victim decodes, a mid-prefill victim runs its next
+// chunk). Nothing is recomputed and nothing is rebased.
 struct Retracted {
     TokenContainer* token_container{};
     std::int32_t prefix_granularity{};
+    CacheProgress cache_progress;
+    RetractionImage image;
+    // The slot-state blob's slot in the runtime's arena. Shared with the
+    // store that exports into it and, later, the restore that imports from
+    // it: whichever of the state and the in-flight op lives longer keeps the
+    // slot, so an abort while either copy runs cannot hand the slot to a
+    // new victim before the ACK.
+    std::shared_ptr<SnapshotSlotIndex> blob_slot;
+    ResumeShape shape;
     // Monotonic stamp from the retraction that produced this state. The plan
     // builder derives the readmission order off the states themselves -- no
     // separate queue to keep in step with the FSM.
     std::int64_t retraction_epoch{0};
-    // False when the retraction had nowhere to store the KV (no host cache):
-    // there is no snapshot to recover, so the request re-prefills like any
-    // newcomer and does not queue behind other readmissions.
-    bool has_recoverable_snapshot{true};
     // A victim with generated output a client is reading resumes ahead of
     // one that had produced nothing, whatever their retraction epochs say.
     bool resumes_generation{false};
-    // Positions [0, landed_tokens) had their forward results land before the
-    // retraction, so their logits exist. The readmission probe may match this
-    // far whatever RequestSpec::max_cached_prefix_tokens says -- the request
-    // loses nothing it still needs -- but no further: beyond it a hit page
-    // (another request's, or a chunk skipped before it landed) would stand in
-    // for logits that were never produced.
-    std::int32_t landed_tokens{0};
+    // The store ops the image waits for: the L2 leg's write-back(s) -- its
+    // own and any earlier in-flight store carrying one of its keys -- and
+    // the tail leg's snapshot store. A restore is issued only once every one
+    // has been acknowledged.
+    std::vector<std::uint32_t> pending_store_ops;
 
     TokenContainer* TokenContainerPtr() const { return token_container; }
     std::int32_t PrefixGranularity() const { return prefix_granularity; }
     std::int64_t RetractionEpoch() const { return retraction_epoch; }
-    bool HasRecoverableSnapshot() const { return has_recoverable_snapshot; }
     bool ResumesGeneration() const { return resumes_generation; }
-    std::int32_t LandedTokens() const { return landed_tokens; }
+    bool ImageLanded() const { return pending_store_ops.empty(); }
+    bool WaitsForStore(std::uint32_t op_id) const {
+        return std::find(pending_store_ops.begin(), pending_store_ops.end(), op_id) != pending_store_ops.end();
+    }
+    // The store landed; its publications say which Host block is canonical
+    // for each key, and the image's L2 slots follow (an L3 prefetch of the
+    // same key may have published first, leaving the ticket's block unindexed).
+    void NoteStoreLanded(std::uint32_t op_id, std::span<const HostPublication> published) {
+        std::erase(pending_store_ops, op_id);
+        image.FollowPublished(published);
+    }
+};
+
+// The image is being copied back into freshly allocated Device pages: the
+// request holds pages again (so they count as active and are never granted
+// away), but nothing is schedulable until the restore's ACK. The image stays
+// alive here because the copy reads it. The request-pool row the copy imports
+// the slot-state blob into is NOT in `resources` yet: the restore op owns it
+// until its ACK (an abort meanwhile must not re-grant a row still being
+// written), and RestoreDoneEvent installs it; `resources.req_pool_index` is
+// empty here.
+struct Restoring {
+    ForwardResources resources;
+    RetractionImage image;
+    std::shared_ptr<SnapshotSlotIndex> blob_slot;
+    ResumeShape shape;
+    std::uint32_t restore_op{0};
 };
 
 struct Finished {};

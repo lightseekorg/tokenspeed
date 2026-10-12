@@ -257,9 +257,23 @@ def test_unrelated_paths_run_nothing():
         assert not should_run({"assets/logo.png"}, group, "pull_request", REPO_ROOT)
 
 
-@pytest.mark.parametrize("runner_group", RUNNER_GROUPS)
-def test_workflow_classifies_the_checkout_after_installing_pyyaml(runner_group):
-    workflow = load_yaml(REPO_ROOT / VENDOR_WORKFLOWS[runner_group])
+VENDOR_WORKFLOW_CASES = [
+    (group, workflow)
+    for group, workflows in VENDOR_WORKFLOWS.items()
+    for workflow in workflows
+]
+
+
+@pytest.mark.parametrize(("runner_group", "workflow_path"), VENDOR_WORKFLOW_CASES)
+def test_workflow_yaml_requires_only_its_runner_group(runner_group, workflow_path):
+    assert required_groups(workflow_path) == {runner_group}
+
+
+@pytest.mark.parametrize(("runner_group", "workflow_path"), VENDOR_WORKFLOW_CASES)
+def test_workflow_classifies_the_checkout_after_installing_pyyaml(
+    runner_group, workflow_path
+):
+    workflow = load_yaml(REPO_ROOT / workflow_path)
     steps = next(
         job["steps"]
         for job in workflow["jobs"].values()

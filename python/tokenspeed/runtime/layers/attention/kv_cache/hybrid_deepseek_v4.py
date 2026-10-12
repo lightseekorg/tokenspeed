@@ -77,15 +77,15 @@ class DeepseekV4CacheMetadata:
     ``block_tables`` hold the scheduler's virtual block IDs. Writers translate
     through :meth:`local_compressed_write_slots`; attention reads the tables
     :meth:`refresh_page_tables` derives from them, in which the null
-    block and every page another DCP rank owns are ``-1``. A replicated group
+    block and every page another KVP rank owns are ``-1``. A replicated group
     (``shard_count == 1``) translates to itself, so the same path serves every
-    DCP size.
+    KVP size.
     """
 
     page_size: int
     page_table: torch.Tensor
-    dcp_size: int
-    dcp_rank: int
+    kvp_size: int
+    kvp_rank: int
     runtime_contract: CacheRuntimeContract
     block_tables: dict[str, torch.Tensor] = field(default_factory=dict)
     swa_page_table: torch.Tensor | None = None
@@ -106,8 +106,8 @@ class DeepseekV4CacheMetadata:
         page_size: int,
         page_table: torch.Tensor,
         block_tables: dict[str, torch.Tensor],
-        dcp_size: int,
-        dcp_rank: int,
+        kvp_size: int,
+        kvp_rank: int,
         runtime_contract: CacheRuntimeContract,
     ) -> "DeepseekV4CacheMetadata":
         """Bind the cache-group tables and name the V4-specific ones.
@@ -118,8 +118,9 @@ class DeepseekV4CacheMetadata:
             block_tables: Cache-group tables keyed by group id; the SWA,
                 per-ratio compressor-state and indexer-state groups are
                 also exposed under their V4 names. Unknown ids ride along.
-            dcp_size: Owners of each sharded group's virtual blocks.
-            dcp_rank: This process's position among those owners.
+            kvp_size: Owners of each sharded group's virtual blocks (the KVP
+                subgroup width).
+            kvp_rank: This process's position among those owners.
             runtime_contract: The bound arena's contract; its virtual block
                 counts bound every translation.
 
@@ -134,8 +135,8 @@ class DeepseekV4CacheMetadata:
         return cls(
             page_size=page_size,
             page_table=page_table,
-            dcp_size=dcp_size,
-            dcp_rank=dcp_rank,
+            kvp_size=kvp_size,
+            kvp_rank=kvp_rank,
             runtime_contract=runtime_contract,
             block_tables=block_tables,
             swa_page_table=block_tables.get(V4_SWA_KV_GROUP_ID),
@@ -153,8 +154,8 @@ class DeepseekV4CacheMetadata:
             block_tables={
                 key: table[start:end] for key, table in self.block_tables.items()
             },
-            dcp_size=self.dcp_size,
-            dcp_rank=self.dcp_rank,
+            kvp_size=self.kvp_size,
+            kvp_rank=self.kvp_rank,
             runtime_contract=self.runtime_contract,
         )
         sliced.compressed_page_tables = {
@@ -193,8 +194,8 @@ class DeepseekV4CacheMetadata:
                 virtual_block_count=self.runtime_contract.virtual_block_counts[
                     group_id
                 ],
-                degree=self.dcp_size,
-                rank=self.dcp_rank,
+                degree=self.kvp_size,
+                rank=self.kvp_rank,
                 out=out,
             )
             local.masked_fill_(~owned, -1)
@@ -228,8 +229,8 @@ class DeepseekV4CacheMetadata:
             virtual_block_count=self.runtime_contract.virtual_block_counts[
                 V4_INDEXER_KV_GROUP_ID
             ],
-            degree=self.dcp_size,
-            rank=self.dcp_rank,
+            degree=self.kvp_size,
+            rank=self.kvp_rank,
         )
         return torch.where(owned, local, -1)
 
@@ -266,8 +267,8 @@ class DeepseekV4CacheMetadata:
             slots,
             rows_per_page=v4_compressed_rows_per_page(compress_ratio),
             virtual_block_count=self.runtime_contract.virtual_block_counts[group_id],
-            degree=self.dcp_size,
-            rank=self.dcp_rank,
+            degree=self.kvp_size,
+            rank=self.kvp_rank,
         )
 
     def _update_decode_compressed_slot_mapping(
@@ -439,7 +440,7 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
     caches are each a cache group of the one shared arena (the V4 recipe
     declares them; the scheduler addresses them as ``CacheGroup``s), and this
     view binds their planes per layer. Only the compressed-KV groups may be
-    sharded across DCP ranks; the indexer reads every rank's rows, so its K
+    sharded across KVP ranks; the indexer reads every rank's rows, so its K
     stays a replicated group of its own.
     """
 

@@ -156,6 +156,8 @@ from tokenspeed_kernel.ops.moe.triton import (
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
+from tokenspeed_kernel.ops.residual import mhc_apply_pre as kernel_mhc_apply_pre
+from tokenspeed_kernel.ops.residual import mhc_mixes as kernel_mhc_mixes
 from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
 from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
@@ -349,6 +351,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd_available",
         "gated_residual_combine",
         "gated_residual_mix",
+        "mhc_apply_pre",
         "mhc_fused_hc",
         "mhc_mixes",
         "mhc_post",
@@ -364,6 +367,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd",
         "hyperconnection_combine",
         "hyperconnection_mix",
+        "mhc_apply_pre",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
@@ -592,6 +596,23 @@ def _mm_mxfp8(m: int) -> torch.Tensor:
         B_scales=b_scales,
         out_dtype=torch.bfloat16,
         block_size=[128, 128],
+        quant="mxfp8",
+    )
+
+
+def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
+    """True MXFP8: E4M3 operands with one UE8M0 scale byte per 32 K values."""
+    a = torch.empty((m, k), dtype=_fp8_dtype())
+    b = torch.empty((n, k), dtype=_fp8_dtype())
+    a_scales = torch.empty((m, k // 32), dtype=torch.uint8)
+    b_scales = torch.empty((n, k // 32), dtype=torch.uint8)
+    return kernel_mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.bfloat16,
+        block_size=[1, 32],
         quant="mxfp8",
     )
 
@@ -2924,6 +2945,28 @@ def _mhc_post() -> object:
     post = torch.empty((1, 4, 1), dtype=torch.float32)
     comb = torch.empty((1, 4, 4), dtype=torch.float32)
     return kernel_mhc_post(hidden_states, residual, post, comb)
+
+
+def _mhc_mixes() -> object:
+    # The gfx950 projection is specialized to model hidden sizes.
+    residual = torch.empty((1, 4, 4096), dtype=torch.bfloat16)
+    weight = torch.empty((24, 4 * 4096), dtype=torch.float32)
+    scale = torch.empty((3,), dtype=torch.float32)
+    base = torch.empty((24,), dtype=torch.float32)
+    return kernel_mhc_mixes(residual, weight, scale, base, 1e-6, 1e-6, 2)
+
+
+def _mhc_apply_pre() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=None, norm_eps=None)
+
+
+def _mhc_apply_pre_fused_norm() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    norm_weight = torch.empty((16,), dtype=torch.bfloat16)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=1e-6)
 
 
 def _attention_gdn_chunk_prefill() -> object:
@@ -5907,6 +5950,31 @@ _CASES = [
         "triton_mm_fp8_blockscale",
         lambda: _mm_mxfp8(4),
     ),
+    # DeepSeek V4.1 MXFP8 projections on gfx950: the weight-streaming decode
+    # kernel through 256 rows (ahead of the skinny kernel's 64-row range),
+    # the large-tile kernel beyond, and from 64 rows on for 2**26-element
+    # weights.
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "gemm",
+            "mm",
+            expected,
+            partial(_mm_mxfp8_ue8m0, m, n, k),
+            id_suffix=f"mxfp8-ue8m0-m{m}-n{n}-k{k}",
+        )
+        for m, n, k, expected in (
+            (1, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
+            (64, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
+            (65, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (192, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (256, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (257, 5120, 2048, "gluon_mm_mxfp8_gfx950"),
+            (65, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+            (256, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+        )
+    ],
     _case(
         _is_hopper_plus,
         "hopper-plus",
@@ -6207,8 +6275,33 @@ _CASES = [
         "cdna4",
         "residual",
         "mhc_post",
-        "triton_mhc_post",
+        "gluon_mhc_post_gfx950",
         _mhc_post,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_mixes",
+        "gluon_mhc_mixes_gfx950",
+        _mhc_mixes,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre_fused_norm,
+        id_suffix="fused_norm",
     ),
     _case(
         _is_cdna4,

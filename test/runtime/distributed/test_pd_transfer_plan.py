@@ -410,7 +410,7 @@ def test_stage_placement_supports_noncontiguous_fields_without_model_counts():
     } == {rank: set(stage) for rank, stage in enumerate(fields)}
 
 
-# ---- DCP page-sharded prefill (sharded source, whole destination) ----
+# ---- KVP page-sharded prefill (sharded source, whole destination) ----
 
 
 def _latent_layout(*, shard_count: int, extra_replicated: bool = False):
@@ -442,7 +442,7 @@ def _latent_layout(*, shard_count: int, extra_replicated: bool = False):
 
 
 def test_sharded_prefill_fans_every_subgroup_rank_to_one_decode_rank():
-    """P TP4 x DCP4 -> D TP1: all four P ranks send, each tagged as an owner."""
+    """P TP4 x KVP4 -> D TP1: all four P ranks send, each tagged as an owner."""
     planner = _planner(
         4, 1, _latent_layout(shard_count=4), _latent_layout(shard_count=1)
     )
@@ -465,7 +465,7 @@ def test_sharded_prefill_fans_every_subgroup_rank_to_one_decode_rank():
 
 
 def test_sharded_prefill_picks_the_replica_subgroup_per_decode_rank():
-    """P TP4 x DCP2 -> D TP2: each D rank reads one whole DCP subgroup."""
+    """P TP4 x KVP2 -> D TP2: each D rank reads one whole KVP subgroup."""
     planner = _planner(
         4, 2, _latent_layout(shard_count=2), _latent_layout(shard_count=1)
     )
@@ -524,7 +524,7 @@ def test_sharded_prefill_leaves_the_equal_tp_fast_path():
 
 
 def test_equal_tp_sharded_route_sends_through_the_pages_api():
-    """P TP2 x DCP2 -> D TP2 leaves the empty-fragment route, yet every copy
+    """P TP2 x KVP2 -> D TP2 leaves the empty-fragment route, yet every copy
     still goes out as one pages x fields grid per group."""
     from tokenspeed.runtime.pd.mooncake.pack import PageFieldCopies
 
@@ -739,7 +739,7 @@ def _hybrid_layout(*, local_kda_heads: int, shard_count: int):
 
 
 def test_every_target_rank_of_a_hybrid_route_can_send_with_its_own_decisions():
-    """P TP8 x DCP2 -> D TP2: the KDA head partition routes ranks outside the
+    """P TP8 x KVP2 -> D TP2: the KDA head partition routes ranks outside the
     MLA subgroup; they hold no 'history' fragments and must say so."""
     prefill_layout = _hybrid_layout(local_kda_heads=1, shard_count=2)
     decode_layout = _hybrid_layout(local_kda_heads=4, shard_count=1)

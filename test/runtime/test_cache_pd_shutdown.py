@@ -43,17 +43,16 @@ class _SchedulerHarness:
 
     def next_execution_plan(self):
         self._trace.append("next_plan")
-        return SimpleNamespace(pages_to_zero=(), cache=())
+        return SimpleNamespace(pages_to_zero=(), cache=(), aborts=())
 
 
 class _DeviceHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
-    def execute(self, execution_plan, planned, *, submit_remote_prefill: bool):
+    def execute(self, execution_plan, planned):
         # The harness plans no device work and no batch; trace anything that
         # does appear rather than fail on a missing attr.
-        del submit_remote_prefill
         if execution_plan.pages_to_zero or execution_plan.cache or planned:
             self._trace.append("execute")
         return None
@@ -78,7 +77,9 @@ class _EventLoopHarness:
             pp_size=1,
             pp_cpu_group=None,
         )
-        self.output_processor = SimpleNamespace(rid_to_state={})
+        self.output_processor = SimpleNamespace(
+            rid_to_state={}, finish_scheduler_aborted_requests=lambda aborts: None
+        )
         self.has_dp = False
         self.kv_transfer = None
         self.in_flight_depth = 0

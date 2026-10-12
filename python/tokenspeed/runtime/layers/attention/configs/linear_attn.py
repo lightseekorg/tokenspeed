@@ -176,6 +176,9 @@ class Mamba2Config(LinearAttnConfig):
         if not linear_layer_ids:
             return None
         low, high = text_config.time_step_limit
+        # JSON has no infinity, so checkpoints write an unbounded dt as 1e30.
+        if high >= 1e30:
+            high = float("inf")
         return cls(
             num_k_heads=int(text_config.n_groups),
             num_v_heads=int(text_config.mamba_num_heads),

@@ -742,6 +742,118 @@ def test_dsa_sharded_index_candidates_global_windows(device, degree):
         assert actual == expected
 
 
+@pytest.mark.parametrize("explicit_rows", [False, True])
+@pytest.mark.parametrize("page_size", [32, 128])
+def test_dsa_fp8_logits_empty_tiles_graph_replay(device, explicit_rows, page_size):
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
+        _dsa_decode_logits_fp8_kernel,
+    )
+
+    # A 32-token page shares a tile with its neighbour; a 128-token page spans
+    # two tiles. Both must retain partial tiles and skip wholly absent ones.
+    rows, heads, dim, columns = 4, 2, 128, 8
+    width = columns * page_size
+    q = torch.randn(rows, heads, dim, device=device, dtype=torch.bfloat16)
+    weights = torch.randn(rows, heads, device=device)
+    packed, dequant = _pack_index_k_cache(
+        torch.randn(5 * page_size, dim, device=device), page_size
+    )
+    table = torch.tensor(
+        [
+            [3, -1, 0, 2, -1, 1, 4, -1],
+            [-1] * columns,
+            [1, 2, 3, 4, 0, 1, 2, 3],
+            [4, -1, 3, -1, 2, -1, 1, -1],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    requests = torch.tensor([3, 0, 1, 2], device=device, dtype=torch.int32)
+    lengths = torch.tensor(
+        (
+            [page_size * 5 + 9, page_size * 3 + 13, width, 0]
+            if explicit_rows
+            else [page_size * 3 + 13, 0]
+        ),
+        device=device,
+        dtype=torch.int32,
+    )
+    initial, local = (4, 8) if explicit_rows else (0, 0)
+    logits = torch.empty(rows, width, device=device)
+
+    def launch():
+        _dsa_decode_logits_fp8_kernel[(rows, (width + 63) // 64)](
+            q,
+            packed.view(torch.float8_e4m3fn),
+            packed.view(torch.float32),
+            weights,
+            lengths,
+            table,
+            logits,
+            table.stride(0),
+            logits.stride(0),
+            requests if explicit_rows else None,
+            EXPLICIT_ROWS=explicit_rows,
+            INITIAL_TOKENS=initial,
+            LOCAL_TOKENS=local,
+            page_size=page_size,
+            row_bytes=dim + 4,
+            page_stride_bytes=page_size * (dim + 4),
+            max_seq_len=width,
+            num_heads=heads,
+            head_dim=dim,
+            num_groups=1,
+            softmax_scale=0.1,
+            q_len_per_req=2,
+            BLOCK_N=64,
+            BLOCK_D=64,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    def check():
+        positions = torch.arange(width, device=device)
+        for row in range(rows):
+            req = int(requests[row]) if explicit_rows else row // 2
+            length = (
+                int(lengths[row])
+                if explicit_rows
+                else max(int(lengths[req]) - 1 + row % 2, 0)
+            )
+            pages = table[req, positions // page_size]
+            slots = pages.clamp_min(0).long() * page_size + positions % page_size
+            expected = torch.einsum("hd,sd->hs", q[row].float(), dequant[slots]).relu()
+            expected = (expected * weights[row, :, None]).sum(0) * 0.1
+            expected.masked_fill_(
+                (positions < initial) | (positions >= length - local), float("inf")
+            )
+            expected.masked_fill_(
+                (pages < 0) | (positions >= length) | torch.isnan(expected),
+                -float("inf"),
+            )
+            torch.testing.assert_close(logits[row], expected, rtol=2e-4, atol=2e-4)
+
+    launch()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for state in ("empty", "refill"):
+        if state == "empty":
+            table.fill_(-1)
+        else:
+            table.fill_(0)
+            lengths.fill_(width - 7)
+            requests.copy_(requests.roll(1))
+            q.normal_()
+            q[0, 0, 0] = float("nan")
+        # Poison every output so a skipped store cannot pass by retaining a
+        # previous replay's padding. Empty forced windows must stay -inf.
+        logits.fill_(123.0)
+        graph.replay()
+        check()
+
+
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
     from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates

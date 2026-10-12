@@ -48,6 +48,7 @@ from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
+from tokenspeed.runtime.execution.slot_state import aligned_slot_state_bytes
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
     SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
@@ -284,13 +285,16 @@ class FlashInferSamplingBackend(SamplingBackend):
         # Slot 0 is pre-filled with _capture_gen so capture warm-up works
         # without any real request having been registered.
         #
-        # Retract-resume note: if a request is retracted and later takes a
-        # different pool slot on resume, _reset_slot re-seeds a fresh
-        # Generator from sp.seed. Sampling stays deterministic given the same
-        # seed, and flashinfer's Philox path (seed + seq_len offset) already
-        # gives per-step uniqueness independent of the torch.Generator.
+        # A retraction image carries the generator's state (a fixed-size byte
+        # tensor, imaged in front of the slot's rows) and the restore installs
+        # it in the new slot, so the restored request's coins continue the
+        # stream exactly where the victim's stopped.
         self._cpu_generator_per_slot: list[torch.Generator | None] = [None] * pool_rows
         self._cpu_generator_per_slot[0] = self._capture_gen
+        self._generator_state_bytes = torch.Generator(device="cpu").get_state().numel()
+        self._generator_image_bytes = aligned_slot_state_bytes(
+            self._generator_state_bytes
+        )
 
     def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
         return SpeculativeSamplingPools(
@@ -308,6 +312,38 @@ class FlashInferSamplingBackend(SamplingBackend):
         cpu_gen = torch.Generator(device="cpu")
         cpu_gen.manual_seed(int(sp.seed))
         self._cpu_generator_per_slot[pool_idx] = cpu_gen
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter): the scalars and the coin generator
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        return [
+            self._temperature_pool[slot],
+            self._top_k_pool[slot],
+            self._top_p_pool[slot],
+            self._seed_pool[slot],
+        ]
+
+    def _slot_payload_bytes(self) -> int:
+        return self._generator_image_bytes + super()._slot_payload_bytes()
+
+    def _export_slot_payload(self, slot: int, out: torch.Tensor, stream) -> None:
+        # Only a prepared slot is exported (the base checks the marker), and
+        # _reset_slot gave every prepared slot its own CPU generator.
+        generator = self._cpu_generator_per_slot[slot]
+        if generator is None or generator.device.type != "cpu":
+            raise RuntimeError(
+                f"sampling slot {slot} has no per-request coin generator to image"
+            )
+        out[: self._generator_state_bytes].copy_(generator.get_state())
+        super()._export_slot_payload(slot, out[self._generator_image_bytes :], stream)
+
+    def _import_slot_payload(self, slot: int, src: torch.Tensor, stream) -> None:
+        generator = torch.Generator(device="cpu")
+        generator.set_state(src[: self._generator_state_bytes].clone())
+        self._cpu_generator_per_slot[slot] = generator
+        super()._import_slot_payload(slot, src[self._generator_image_bytes :], stream)
 
     def _init_shared_buffers(self, config: SamplingBackendConfig) -> None:
 

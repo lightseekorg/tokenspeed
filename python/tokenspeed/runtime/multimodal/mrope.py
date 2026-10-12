@@ -479,39 +479,3 @@ def _cat_grids_or_single(grids):
     if len(grids) == 1:
         return grids[0]
     return torch.cat(grids, dim=0)
-
-
-def extend_mrope_positions_for_retracted_request(
-    mrope_positions: torch.Tensor, output_ids_len: int
-) -> torch.Tensor:
-    """Extend ``mrope_positions`` to cover already-generated output tokens.
-
-    When a request carrying M-RoPE positions is retracted, the positions must be
-    extended over the output_ids generated so far. Output tokens are pure text,
-    so all three axes share the same incremental sequence.
-
-    Args:
-        mrope_positions: original positions, shape ``(3, origin_input_ids_len)``.
-        output_ids_len: number of output tokens to generate positions for.
-
-    Returns:
-        Extended positions, shape ``(3, origin_input_ids_len + output_ids_len)``.
-    """
-    if output_ids_len <= 0:
-        return mrope_positions
-
-    # Continue the incremental sequence from the last input position.
-    last_position = mrope_positions[:, -1]  # (3,)
-    start_pos = last_position[0] + 1
-    output_positions = (
-        torch.arange(
-            start_pos,
-            start_pos + output_ids_len,
-            dtype=torch.int64,
-            device=mrope_positions.device,
-        )
-        .unsqueeze(0)
-        .expand(3, -1)
-    )  # (3, output_ids_len)
-
-    return torch.cat([mrope_positions, output_positions], dim=1)

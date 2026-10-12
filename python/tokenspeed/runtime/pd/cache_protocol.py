@@ -310,7 +310,7 @@ class CachePDBlockManifest:
     """One request's transferable blocks per group, in logical slot order.
 
     Block IDs are the publishing side's scheduler IDs -- virtual IDs for a
-    DCP-sharded group. The sender translates its own IDs to local pages when
+    KVP-sharded group. The sender translates its own IDs to local pages when
     it copies; the destination's IDs are addressed as the destination's
     contract says.
     """
@@ -394,7 +394,7 @@ def validate_cache_peer_layout(
     for local_spec, peer_spec in zip(
         layout.group_specs, peer_layout.group_specs, strict=True
     ):
-        # shard_count is deliberately not compared: a DCP-sharded Prefill
+        # shard_count is deliberately not compared: a KVP-sharded Prefill
         # transfers into an unsharded Decode. Which rank sets exchange which
         # pages is the transfer planner's decision, not a contract mismatch.
         if (

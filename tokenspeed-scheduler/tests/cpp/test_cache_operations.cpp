@@ -13,6 +13,7 @@
 #include "cache/tier/transfer.h"
 #include "cache/tier/transfer_manager.h"
 #include "cache_test_access.h"
+#include "integration_test_helper.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
 
@@ -75,6 +76,97 @@ TEST(CacheOperationTest, OpWithoutTransfersIsASchedulerBug) {
     LoadBackOperation load;
     load.op_id = 9;
     EXPECT_THROW(LoadBackBatch{{load}}, std::runtime_error);
+}
+
+TEST(CacheOperationTest, SnapshotStoreMayCarryNoPageRowsButNeverADuplicate) {
+    // The tail leg always rides the plan for its slot-state blob, so an op
+    // with no page row is legal; a repeated (group, source, destination) is a
+    // scheduler bug, within and across ops.
+    SnapshotStoreOperation blob_only{.op_id = 3, .request_id = "r", .request_pool_index = 2, .snapshot_slot = 1};
+    SnapshotStoreOperation pages{.op_id = 4,
+                                 .request_id = "s",
+                                 .request_pool_index = 3,
+                                 .snapshot_slot = 2,
+                                 .transfers = {CacheTransfer{0, 5, 7}, CacheTransfer{1, 5, 7}}};
+    SnapshotStoreBatch batch({blob_only, pages});
+    ASSERT_EQ(batch.op_ids, std::vector<std::uint32_t>({3, 4}));
+    EXPECT_EQ(batch.request_ids, std::vector<std::string>({"r", "s"}));
+    EXPECT_EQ(batch.request_pool_indices, std::vector<std::int32_t>({2, 3}));
+    EXPECT_EQ(batch.snapshot_slots, std::vector<std::int32_t>({1, 2}));
+    EXPECT_TRUE(batch.src_pages[0].empty());
+    EXPECT_EQ(batch.group_ids[1], std::vector<std::uint32_t>({0, 1}));
+    EXPECT_EQ(batch.src_pages[1], std::vector<std::int32_t>({5, 5}));
+    EXPECT_EQ(batch.dst_pages[1], std::vector<std::int32_t>({7, 7}));
+
+    SnapshotStoreOperation repeated = pages;
+    repeated.op_id = 5;
+    EXPECT_THROW(SnapshotStoreBatch({pages, repeated}), std::runtime_error);
+    SnapshotStoreOperation unslotted = blob_only;
+    unslotted.snapshot_slot = -1;
+    EXPECT_THROW(SnapshotStoreBatch({unslotted}), std::runtime_error);
+}
+
+TEST(CacheOperationTest, SnapshotRestoreRowsNameTheirSourceTierAndCarryL2Keys) {
+    SnapshotRestoreOperation op{
+        .op_id = 9,
+        .request_id = "r",
+        .request_pool_index = 4,
+        .snapshot_slot = 1,
+        .transfers = {CacheTransfer{.group_id = 0, .source_page = 10, .destination_page = 20, .content_hash = "h0"},
+                      CacheTransfer{.group_id = 0, .source_page = 11, .destination_page = 21}},
+        .source_tier = {HostTier::kL2, HostTier::kSnapshotPool},
+    };
+    SnapshotRestoreBatch batch({op});
+    ASSERT_EQ(batch.op_ids, std::vector<std::uint32_t>({9}));
+    EXPECT_EQ(batch.request_pool_indices, std::vector<std::int32_t>({4}));
+    EXPECT_EQ(batch.src_pages[0], std::vector<std::int32_t>({10, 11}));
+    EXPECT_EQ(batch.dst_pages[0], std::vector<std::int32_t>({20, 21}));
+    EXPECT_EQ(batch.content_hashes[0], std::vector<std::string>({"h0", ""}));
+    EXPECT_EQ(batch.source_tiers[0], std::vector<std::uint8_t>({0, 1}));
+
+    SnapshotRestoreOperation untiered = op;
+    untiered.source_tier.pop_back();
+    EXPECT_THROW(SnapshotRestoreBatch({untiered}), std::runtime_error) << "every row names its source tier";
+    SnapshotRestoreOperation repeated = op;
+    repeated.op_id = 10;
+    EXPECT_THROW(SnapshotRestoreBatch({op, repeated}), std::runtime_error);
+}
+
+TEST(CacheOperationTest, EveryTierTransferPairsBlocksOfEqualResidue) {
+    // Under page-cyclic sharding the rank that owns one end of a copy must own
+    // the other: a Host block in another bucket than its Device source is
+    // refused when the op is built.
+    BlockPool device_pool{2, {2}};
+    BlockPool host_pool{2, {2}};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 2,
+        .block_granularity = 2,
+        .shard_count = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+    TierTransferManager transfers{coordinator};
+    std::vector<CacheBlockRef> device = device_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
+    std::vector<CacheBlockRef> same_bucket = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
+    std::vector<CacheBlockRef> other_bucket = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{1});
+    ASSERT_EQ(device.size() + same_bucket.size() + other_bucket.size(), 3u);
+    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    coordinator.CacheHostBlock(same_bucket.front(), key);
+    coordinator.CacheHostBlock(other_bucket.front(), CacheKey{.group_id = 0, .content_hash = "h1"});
+
+    std::vector<BlockTransfer> ok;
+    ok.push_back(
+        BlockTransfer{.group_id = 0, .source = same_bucket.front(), .destination = device.front(), .key = key});
+    EXPECT_NO_THROW(transfers.StartPrefixLoad(std::move(ok)));
+
+    std::vector<BlockTransfer> crossed;
+    crossed.push_back(BlockTransfer{.group_id = 0,
+                                    .source = other_bucket.front(),
+                                    .destination = device.front(),
+                                    .key = CacheKey{.group_id = 0, .content_hash = "h1"}});
+    EXPECT_THROW(transfers.StartPrefixLoad(std::move(crossed)), std::runtime_error);
 }
 
 TEST(CacheOperationTest, SamePagesInDifferentGroupsAreDistinctTransfers) {
@@ -142,15 +234,18 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
             .family = CacheGroupFamily::History,
             .transfer_policy = CacheTransferPolicy::FullSuffix,
         });
+        SetTestSnapshotPool(config);
         return config;
     };
 
     SchedulerConfig disabled = make_config();
     disabled.disable_l2_cache = true;
+    SetTestSnapshotPool(disabled);
     EXPECT_NO_THROW(Scheduler{std::move(disabled)});
 
     SchedulerConfig empty = make_config();
     empty.host_allocator.total_pages = 1;
+    SetTestSnapshotPool(empty);
     EXPECT_NO_THROW(Scheduler{std::move(empty)});
 }
 
@@ -171,6 +266,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
             .family = CacheGroupFamily::History,
             .transfer_policy = CacheTransferPolicy::FullSuffix,
         });
+        SetTestSnapshotPool(config);
         return config;
     };
 
@@ -190,6 +286,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
@@ -224,6 +321,7 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
@@ -265,6 +363,7 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
     const auto cache_device = [&](const CacheKey& key) {
@@ -310,6 +409,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
@@ -345,6 +445,7 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/false);
     TierTransferManager transfers{coordinator};
 
@@ -399,6 +500,7 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false);
 
     std::vector<BlockTable> tables(1);
@@ -430,6 +532,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
         .family = CacheGroupFamily::History,
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
+    SetTestSnapshotPool(config);
     Scheduler scheduler{std::move(config)};
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
     RequestSpec spec{
@@ -457,6 +560,7 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
         .family = CacheGroupFamily::History,
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
+    SetTestSnapshotPool(config);
     Scheduler scheduler{std::move(config)};
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
     RequestSpec spec{
@@ -474,7 +578,8 @@ TEST(CacheOperationTest, ComputedStateChunkDoesNotQueueAStoreButEndpointUsesNorm
         BlockPool pool(2, {1});
         BlockPool host_pool(2, {1});
         const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
-        auto coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, true);
+        auto coordinator =
+            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr, true);
         TierTransferManager transfers(coordinator);
         const std::vector<std::string> hashes{"state2"};
         const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
@@ -504,11 +609,12 @@ TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorki
     BlockPool pool(1, {1});
     BlockPool host_pool(1, {1});
     const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
-    auto coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, false);
+    auto coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr, false);
     TierTransferManager transfers(coordinator);
     const std::vector<std::string> hashes{"restored-state"};
     const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
-    CacheBlockRef source = coordinator.AcquireHostBlock(0);
+    CacheBlockRef source = coordinator.AcquireHostBlock(0, /*bucket=*/0);
     ASSERT_TRUE(source);
     coordinator.CacheHostBlock(source, key);
     std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
@@ -519,7 +625,7 @@ TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorki
     const auto load = transfers.StartPrefixLoad(std::move(pairs));
     coordinator.Free(tables);
     EXPECT_FALSE(coordinator.ClearDeviceCache()) << "load completion still owns the destination";
-    transfers.CompleteLoadBack(load.op_id, /*success=*/true);
+    transfers.CompleteLoadBack(load.op_id);
     EXPECT_FALSE(transfers.HasAnyInFlight());
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
@@ -539,6 +645,7 @@ TEST(CacheOperationTest, L3StorageRequiresHostCache) {
     config.max_scheduled_tokens = 2;
     config.max_batch_size = 1;
     config.enable_l3_storage = true;
+    config.l3_prefetch_min_pages = 1;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
         .block_granularity = 2,
@@ -546,6 +653,7 @@ TEST(CacheOperationTest, L3StorageRequiresHostCache) {
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
     });
+    SetTestSnapshotPool(config);
     EXPECT_THROW(Scheduler{std::move(config)}, std::invalid_argument);
 }
 
@@ -557,6 +665,7 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
     config.max_scheduled_tokens = 2;
     config.max_batch_size = 1;
     config.enable_l3_storage = true;
+    config.l3_prefetch_min_pages = 1;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
         .block_granularity = 2,
@@ -564,10 +673,13 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
     });
+    SetTestSnapshotPool(config);
     EXPECT_NO_THROW(Scheduler{std::move(config)});
 }
 
-TEST(CacheOperationTest, L3StorageHitsAllocateHostPrefetch) {
+// L3 keys beyond the Host hit are a storage-tier probe, never a Host hit:
+// PlanPrefetch turns them into a Host fill before admission.
+TEST(CacheOperationTest, L3StorageHitsPlanAPrefetchNotAnAdmission) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
@@ -577,6 +689,7 @@ TEST(CacheOperationTest, L3StorageHitsAllocateHostPrefetch) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     ASSERT_TRUE(coordinator.EnablesL3Storage());
 
@@ -585,19 +698,32 @@ TEST(CacheOperationTest, L3StorageHitsAllocateHostPrefetch) {
     EXPECT_TRUE(coordinator.ContainsStorageKey(key));
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
-    EXPECT_EQ(probe.host.num_common_tokens, 2);
+    EXPECT_EQ(probe.host.num_common_tokens, 0) << "nothing is on Host yet";
+    EXPECT_EQ(probe.storage.num_common_tokens, 2) << "the object exists in L3";
 
+    auto plan = coordinator.PlanPrefetch(probe, /*min_pages=*/1);
+    ASSERT_TRUE(plan);
+    ASSERT_EQ(plan->rows.size(), 1u);
+    EXPECT_EQ(plan->rows[0].key, key);
+    EXPECT_TRUE(plan->rows[0].host_block.IsOwnedBy(host_pool));
+    EXPECT_EQ(plan->page_row_ends, std::vector<std::size_t>{1});
+    EXPECT_EQ(plan->first_page, 0);
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 3) << "the plan holds its Host block";
+
+    // Admitting on the same probe loads nothing: the storage tier is not a hit.
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission =
         coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
     ASSERT_TRUE(admission);
-    ASSERT_EQ(admission->load_pairs.size(), 1u);
-    EXPECT_TRUE(admission->load_pairs[0].prefetch_from_storage);
-    EXPECT_EQ(admission->load_pairs[0].key.content_hash, "h0");
+    EXPECT_TRUE(admission->load_pairs.empty());
+    EXPECT_EQ(admission->host_prefix_tokens, 0);
+    coordinator.Free(tables);
+    plan.reset();
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 4) << "dropping the plan returns its blocks";
 }
 
-TEST(CacheOperationTest, FailedLoadBackDoesNotPublishPrefetchedHost) {
+TEST(CacheOperationTest, APrefetchThatLandsNothingPublishesNothing) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
@@ -607,28 +733,33 @@ TEST(CacheOperationTest, FailedLoadBackDoesNotPublishPrefetchedHost) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
     coordinator.RegisterStorageKeys(std::array{key});
 
-    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
-    std::vector<BlockTable> tables(1);
-    std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
-    auto admission =
-        coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
-    ASSERT_TRUE(admission);
-    ASSERT_EQ(admission->load_pairs.size(), 1u);
-
+    auto plan = coordinator.PlanPrefetch(coordinator.ProbePrefix(std::array<std::string, 1>{"h0"}), /*min_pages=*/1);
+    ASSERT_TRUE(plan);
     TierTransferManager transfers(coordinator);
-    LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
-    transfers.CompleteLoadBack(op.op_id, false);
+    PrefetchOperation op = transfers.StartPrefetch("r1", std::move(*plan));
+    EXPECT_EQ(op.num_pages, 1);
+    ASSERT_EQ(op.transfers.size(), 1u);
+    EXPECT_EQ(op.transfers[0].content_hash, "h0");
+    EXPECT_TRUE(transfers.HasAnyInFlight());
+
+    auto done = transfers.CompletePrefetch(op.op_id, /*landed_pages=*/0);
+    ASSERT_TRUE(done);
+    EXPECT_EQ(done->request_id, "r1");
+    EXPECT_TRUE(done->published.empty());
+    EXPECT_EQ(done->unlanded, std::vector<CacheKey>{key});
+    EXPECT_FALSE(transfers.CompletePrefetch(op.op_id, 0)) << "a duplicate ACK is ignored";
     EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key));
-    EXPECT_FALSE(coordinator.AcquireDeviceCachedBlock(key))
-        << "failed L3 prefetch must not leave empty Device prefix hits";
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 4) << "the unlanded block returns";
+    EXPECT_FALSE(coordinator.AcquireDeviceCachedBlock(key)) << "nothing reaches the Device index";
 }
 
-TEST(CacheOperationTest, SuccessfulLoadBackPublishesPrefetchedHost) {
+TEST(CacheOperationTest, AMalformedPrefetchAckIsIgnoredAndTheOpStaysInFlight) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
@@ -638,79 +769,138 @@ TEST(CacheOperationTest, SuccessfulLoadBackPublishesPrefetchedHost) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
-    const CacheKey key{.group_id = 0, .content_hash = "h0"};
-    coordinator.RegisterStorageKeys(std::array{key});
-
-    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
-    std::vector<BlockTable> tables(1);
-    std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
-    auto admission =
-        coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
-    ASSERT_TRUE(admission);
-    ASSERT_EQ(admission->load_pairs.size(), 1u);
-
+    const CacheKey h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey h1{.group_id = 0, .content_hash = "h1"};
+    coordinator.RegisterStorageKeys(std::array{h0, h1});
+    auto plan =
+        coordinator.PlanPrefetch(coordinator.ProbePrefix(std::array<std::string, 2>{"h0", "h1"}), /*min_pages=*/1);
+    ASSERT_TRUE(plan);
     TierTransferManager transfers(coordinator);
-    LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
-    transfers.CompleteLoadBack(op.op_id, true);
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
-    EXPECT_TRUE(coordinator.AcquireDeviceCachedBlock(key))
-        << "successful L3 prefetch must publish filled Device destinations";
+    PrefetchOperation op = transfers.StartPrefetch("r1", std::move(*plan));
+    ASSERT_EQ(op.num_pages, 2);
+
+    // Out of range either way: nothing is published, nothing is released,
+    // and the op is still waiting for a well-formed ACK.
+    EXPECT_FALSE(transfers.CompletePrefetch(op.op_id, /*landed_pages=*/3));
+    EXPECT_FALSE(transfers.CompletePrefetch(op.op_id, /*landed_pages=*/-1));
+    EXPECT_TRUE(transfers.HasAnyInFlight());
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 2) << "the op's blocks are still pinned";
+
+    auto done = transfers.CompletePrefetch(op.op_id, /*landed_pages=*/2);
+    ASSERT_TRUE(done);
+    EXPECT_EQ(done->published.size(), 2u);
+    EXPECT_FALSE(transfers.HasAnyInFlight());
 }
 
-TEST(CacheOperationTest, MixedHostAndL3LoadBackPublishesEveryDeviceDestination) {
-    BlockPool device_pool{8, {1, 1}};
-    BlockPool host_pool{4, {1, 1}};
-    const std::array specs{
-        CacheGroupSpec{
-            .kind = AttnKind::kFull,
-            .cache_blocks_per_lcm_block = 1,
-            .block_granularity = 2,
-        },
-        CacheGroupSpec{
-            .kind = AttnKind::kFull,
-            .cache_blocks_per_lcm_block = 1,
-            .block_granularity = 2,
-        },
-    };
+TEST(CacheOperationTest, APrefetchBelowTheThresholdEvictsNothing) {
+    BlockPool device_pool{8, {1}};
+    BlockPool host_pool{4, {1}};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
-    CacheBlockRef host_block = host_pool.AcquireBlock(/*group_id=*/0);
-    ASSERT_TRUE(host_block);
-    const CacheKey host_key{.group_id = 0, .content_hash = "h0"};
-    const CacheKey l3_key{.group_id = 1, .content_hash = "h0"};
-    coordinator.CacheHostBlock(host_block, host_key);
-    host_block.reset();
-    coordinator.RegisterStorageKeys(std::array{l3_key});
+    // Two Host blocks hold another prompt's unpinned entries, two are pinned:
+    // at most two rows can ever be placed, both by eviction.
+    const CacheKey other0{.group_id = 0, .content_hash = "other0"};
+    const CacheKey other1{.group_id = 0, .content_hash = "other1"};
+    for (const CacheKey& key : {other0, other1}) {
+        CacheBlockRef block = coordinator.AcquireHostBlock(/*group_id=*/0, /*bucket=*/0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, key);
+    }
+    const std::vector<CacheBlockRef> pinned = host_pool.AcquireBlocks(/*group_id=*/0, 2);
+    ASSERT_EQ(pinned.size(), 2u);
+    ASSERT_EQ(coordinator.NumHostCachedBlocks(), 2);
 
-    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    const CacheKey h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey h1{.group_id = 0, .content_hash = "h1"};
+    const CacheKey h2{.group_id = 0, .content_hash = "h2"};
+    coordinator.RegisterStorageKeys(std::array{h0, h1, h2});
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"});
+    ASSERT_EQ(probe.storage.num_common_tokens, 6);
+
+    // Three pages are wanted but two can be placed: below a three-page
+    // threshold the plan is refused before any block is acquired, so the
+    // other prompt's entries are untouched.
+    EXPECT_FALSE(coordinator.PlanPrefetch(probe, /*min_pages=*/3));
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 2) << "a refused plan evicts nothing";
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(other0));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(other1));
+
+    // At a two-page threshold the fill is worth its evictions.
+    auto plan = coordinator.PlanPrefetch(probe, /*min_pages=*/2);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->page_row_ends, (std::vector<std::size_t>{1, 2}));
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0) << "both entries gave way to the fill";
+}
+
+TEST(CacheOperationTest, ALandedPrefetchPublishesHostEntriesTheAdmissionThenLoads) {
+    BlockPool device_pool{4, {1}};
+    BlockPool host_pool{4, {1}};
+    const std::array specs{CacheGroupSpec{
+        .kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/true);
+    const CacheKey h0{.group_id = 0, .content_hash = "h0"};
+    const CacheKey h1{.group_id = 0, .content_hash = "h1"};
+    coordinator.RegisterStorageKeys(std::array{h0, h1});
+
+    auto plan =
+        coordinator.PlanPrefetch(coordinator.ProbePrefix(std::array<std::string, 2>{"h0", "h1"}), /*min_pages=*/1);
+    ASSERT_TRUE(plan);
+    ASSERT_EQ(plan->rows.size(), 2u);
+    TierTransferManager transfers(coordinator);
+    PrefetchOperation op = transfers.StartPrefetch("r1", std::move(*plan));
+    EXPECT_EQ(op.num_pages, 2);
+
+    // Only the first page landed: it is a Host entry, pinned for the request;
+    // the second page's block returns and its key is reported unlanded.
+    auto done = transfers.CompletePrefetch(op.op_id, /*landed_pages=*/1);
+    ASSERT_TRUE(done);
+    ASSERT_EQ(done->published.size(), 1u);
+    EXPECT_EQ(done->unlanded, std::vector<CacheKey>{h1});
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(h0));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(h1));
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 1);
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 3);
+    coordinator.UnregisterStorageKeys(done->unlanded);
+
+    // The next probe is an ordinary Host hit; admission loads it with a plain
+    // (unkeyed) row and the storage tier has nothing left to add.
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 2>{"h0", "h1"});
     EXPECT_EQ(probe.host.num_common_tokens, 2);
-    std::vector<BlockTable> tables(2);
-    std::vector<GroupDemand> demands{
-        {.table = &tables[0], .extent = DenseGrowth{2}},
-        {.table = &tables[1], .extent = DenseGrowth{2}},
-    };
+    EXPECT_EQ(probe.storage.num_common_tokens, 2) << "nothing registered beyond the Host hit";
+    EXPECT_FALSE(coordinator.PlanPrefetch(probe, /*min_pages=*/1));
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{4}}};
     auto admission =
         coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
     ASSERT_TRUE(admission);
-    ASSERT_EQ(admission->load_pairs.size(), 2u);
-    EXPECT_EQ(std::count_if(admission->load_pairs.begin(), admission->load_pairs.end(),
-                            [](const BlockTransfer& transfer) { return transfer.prefetch_from_storage; }),
-              1);
-
-    TierTransferManager transfers(coordinator);
-    LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
-    transfers.CompleteLoadBack(op.op_id, true);
+    EXPECT_EQ(admission->host_prefix_tokens, 2);
+    ASSERT_EQ(admission->load_pairs.size(), 1u);
+    EXPECT_TRUE(admission->load_pairs[0].key.content_hash.empty());
+    done->published.clear();  // the request's pins drop at admission; the load's own pins remain
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 1);
+    LoadBackOperation load = transfers.StartPrefixLoad(std::move(admission->load_pairs));
+    transfers.CompleteLoadBack(load.op_id);
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
     coordinator.Free(tables);
-    EXPECT_TRUE(coordinator.AcquireDeviceCachedBlock(host_key))
-        << "Host-warm sibling of an L3 prefetch must still enter the Device index";
-    EXPECT_TRUE(coordinator.AcquireDeviceCachedBlock(l3_key));
-    auto retry = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
-    EXPECT_EQ(retry.device.num_common_tokens, 2);
 }
 
-TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
+TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
@@ -720,6 +910,7 @@ TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false);
     ASSERT_FALSE(coordinator.EnablesL3Storage());
 
@@ -731,6 +922,7 @@ TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
     EXPECT_EQ(probe.host.num_common_tokens, 2);
+    EXPECT_TRUE(probe.storage.per_group.empty()) << "no storage tier without L3";
 
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
@@ -738,12 +930,11 @@ TEST(CacheOperationTest, HostHitsWithoutL3DoNotTagPrefetch) {
         coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
     ASSERT_TRUE(admission);
     ASSERT_EQ(admission->load_pairs.size(), 1u);
-    EXPECT_FALSE(admission->load_pairs[0].prefetch_from_storage);
     EXPECT_TRUE(admission->load_pairs[0].key.content_hash.empty());
 
     TierTransferManager transfers(coordinator);
     LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
-    transfers.CompleteLoadBack(op.op_id, true);
+    transfers.CompleteLoadBack(op.op_id);
 }
 
 TEST(CacheOperationTest, L3StorageMissCanBeUnregistered) {
@@ -756,6 +947,7 @@ TEST(CacheOperationTest, L3StorageMissCanBeUnregistered) {
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/true);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
     coordinator.RegisterStorageKeys(std::array{key});
@@ -764,7 +956,7 @@ TEST(CacheOperationTest, L3StorageMissCanBeUnregistered) {
     coordinator.UnregisterStorageKeys(std::array{key});
 
     EXPECT_FALSE(coordinator.ContainsStorageKey(key));
-    EXPECT_EQ(coordinator.ProbePrefix(std::array<std::string, 1>{"h0"}).host.num_common_tokens, 0);
+    EXPECT_EQ(coordinator.ProbePrefix(std::array<std::string, 1>{"h0"}).storage.num_common_tokens, 0);
 }
 
 TEST(CacheOperationTest, L3UnregisterPrunesStorageKeyOrder) {
@@ -777,6 +969,7 @@ TEST(CacheOperationTest, L3UnregisterPrunesStorageKeyOrder) {
     }};
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/true);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
     for (int cycle = 0; cycle < 8; ++cycle) {
@@ -792,7 +985,7 @@ TEST(CacheOperationTest, L3UnregisterPrunesStorageKeyOrder) {
     EXPECT_EQ(CacheCoordinatorTestAccess::NumStorageKeyOrder(coordinator), 1u);
 }
 
-TEST(CacheOperationTest, MultiGroupL3AllocationFailureTrimsEarlierPins) {
+TEST(CacheOperationTest, APrefetchPageIsPlannedForEveryGroupOrNotAtAll) {
     BlockPool device_pool{8, {1, 1}};
     BlockPool host_pool{1, {1, 1}};
     const std::array specs{
@@ -809,6 +1002,7 @@ TEST(CacheOperationTest, MultiGroupL3AllocationFailureTrimsEarlierPins) {
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool,
                                                    /*enable_l3_storage=*/true, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/true);
     const std::array keys{
         CacheKey{.group_id = 0, .content_hash = "h0"},
@@ -816,12 +1010,11 @@ TEST(CacheOperationTest, MultiGroupL3AllocationFailureTrimsEarlierPins) {
     };
     coordinator.RegisterStorageKeys(keys);
 
-    auto match = MatchPrefixForTest(coordinator, std::array<std::string, 1>{"h0"});
-
-    EXPECT_EQ(match.host.num_common_tokens, 0);
-    ASSERT_EQ(match.host.per_group.size(), 2u);
-    EXPECT_TRUE(match.host.per_group[0].blocks.empty());
-    EXPECT_TRUE(match.host.per_group[1].blocks.empty());
+    // One Host parent for two groups' rows of the page: the page cannot be
+    // planned whole, so nothing is -- and the first group's block is not kept.
+    auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
+    EXPECT_EQ(probe.storage.num_common_tokens, 2);
+    EXPECT_FALSE(coordinator.PlanPrefetch(probe, /*min_pages=*/1));
     EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 1);
 }
 
@@ -835,6 +1028,7 @@ TEST(CacheOperationTest, ExpandPrefixKeysCoversGroupsAndOffsets) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const std::vector<CacheKey> keys = coordinator.ExpandPrefixKeys(std::array<std::string, 1>{"h0"});
     ASSERT_EQ(keys.size(), 2u);
@@ -870,6 +1064,7 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
 
     const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
@@ -885,7 +1080,7 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
     ASSERT_TRUE(coordinator.ContainsHostCachedBlock(key_h0));
     ASSERT_TRUE(coordinator.ContainsStorageKey(key_h0));
 
-    CacheBlockRef replacement = coordinator.AcquireHostBlock(/*group_id=*/0);
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(/*group_id=*/0, /*bucket=*/0);
     ASSERT_TRUE(replacement);
     replacement.reset();
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key_h0)) << "Host eviction must drop the L2 index entry";
@@ -893,19 +1088,13 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
         << "Host eviction must not drop Mooncake keys still inside the Host-capacity shadow";
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
-    EXPECT_EQ(probe.host.num_common_tokens, 2);
-
-    std::vector<BlockTable> tables(1);
-    std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
-    auto admission =
-        coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
-    ASSERT_TRUE(admission);
-    ASSERT_EQ(admission->load_pairs.size(), 1u);
-    EXPECT_TRUE(admission->load_pairs[0].prefetch_from_storage);
-    EXPECT_EQ(admission->load_pairs[0].key.content_hash, "h0");
-
-    admission.reset();
-    coordinator.Free(tables);
+    EXPECT_EQ(probe.host.num_common_tokens, 0) << "the entry left Host";
+    EXPECT_EQ(probe.storage.num_common_tokens, 2) << "the object is still in L3";
+    auto plan = coordinator.PlanPrefetch(probe, /*min_pages=*/1);
+    ASSERT_TRUE(plan);
+    ASSERT_EQ(plan->rows.size(), 1u);
+    EXPECT_EQ(plan->rows[0].key, key_h0);
+    plan.reset();
     EXPECT_TRUE(coordinator.ClearCache());
 }
 
@@ -919,6 +1108,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowIsBoundedToHostCapacity) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
     const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
@@ -931,7 +1121,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowIsBoundedToHostCapacity) {
     EXPECT_FALSE(coordinator.ContainsStorageKey(key_h2))
         << "the shadow must drop the tail once it exceeds Host page capacity";
     EXPECT_EQ(coordinator.NumStorageKeys(), 2);
-    EXPECT_EQ(coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"}).host.num_common_tokens, 4)
+    EXPECT_EQ(coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"}).storage.num_common_tokens, 4)
         << "prefix-closed matching must still see the retained L3 prefix";
 
     coordinator.RegisterStorageKeys(std::array{key_h2});
@@ -955,6 +1145,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowEvictsProtectedSuffixToKeepPrefix) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
     const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
@@ -971,7 +1162,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowEvictsProtectedSuffixToKeepPrefix) {
         << "re-registering the prompt must evict protected suffix keys to keep the earliest prefix";
     EXPECT_TRUE(coordinator.ContainsStorageKey(key_h1));
     EXPECT_FALSE(coordinator.ContainsStorageKey(key_h2));
-    EXPECT_EQ(coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"}).host.num_common_tokens, 4)
+    EXPECT_EQ(coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"}).storage.num_common_tokens, 4)
         << "prefix-closed matching must see the restored leading keys, not a suffix-only hole";
 }
 
@@ -992,6 +1183,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowKeepsSharedPrefixAcrossGroups) {
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const std::array hashes{std::string{"h0"}, std::string{"h1"}, std::string{"h2"}};
     coordinator.RegisterStorageKeys(coordinator.ExpandPrefixKeys(hashes));
@@ -1003,11 +1195,11 @@ TEST(CacheOperationTest, L3StorageKeyShadowKeepsSharedPrefixAcrossGroups) {
     EXPECT_TRUE(coordinator.ContainsStorageKey(CacheKey{.group_id = 1, .content_hash = "h1"}));
     EXPECT_FALSE(coordinator.ContainsStorageKey(CacheKey{.group_id = 0, .content_hash = "h2"}));
     EXPECT_FALSE(coordinator.ContainsStorageKey(CacheKey{.group_id = 1, .content_hash = "h2"}));
-    EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 4)
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).storage.num_common_tokens, 4)
         << "both groups must keep the same prefix-hash boundary";
 }
 
-TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
+TEST(CacheOperationTest, APrefetchTruncatesAtTheFirstPageTheHostPoolCannotTake) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
@@ -1017,6 +1209,7 @@ TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
@@ -1026,23 +1219,23 @@ TEST(CacheOperationTest, L3PrefetchShortensHostPrefixWhenHostPoolIsExhausted) {
     coordinator.RegisterStorageKeys(std::array{key_h0, key_h1});
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 2>{"h0", "h1"});
-    EXPECT_EQ(probe.host.num_common_tokens, 4);
+    EXPECT_EQ(probe.storage.num_common_tokens, 4);
 
-    std::vector<BlockTable> tables(1);
-    std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
-    auto admission =
-        coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
-    ASSERT_TRUE(admission);
-    EXPECT_EQ(admission->host_prefix_tokens, 2)
-        << "a pinned Host pool must shorten the L3 prefix instead of admitting stale KV";
-    ASSERT_EQ(admission->load_pairs.size(), 1u);
-    EXPECT_TRUE(admission->load_pairs[0].prefetch_from_storage);
+    // One free Host block: the plan covers the first page and stops.
+    auto plan = coordinator.PlanPrefetch(probe, /*min_pages=*/1);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->page_row_ends, std::vector<std::size_t>{1});
+    ASSERT_EQ(plan->rows.size(), 1u);
+    EXPECT_EQ(plan->rows[0].key, key_h0);
+    plan.reset();
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 1);
 
-    admission.reset();
-    coordinator.Free(tables);
+    // Below the threshold the request computes instead: nothing is held.
+    EXPECT_FALSE(coordinator.PlanPrefetch(probe, /*min_pages=*/2));
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 1);
 }
 
-TEST(CacheOperationTest, SlidingWindowL3ShortageRematchesLookback) {
+TEST(CacheOperationTest, ATruncatedSlidingWindowPrefetchIsNoHitAtAdmission) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
@@ -1054,6 +1247,7 @@ TEST(CacheOperationTest, SlidingWindowL3ShortageRematchesLookback) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
@@ -1063,16 +1257,30 @@ TEST(CacheOperationTest, SlidingWindowL3ShortageRematchesLookback) {
     coordinator.RegisterStorageKeys(std::array{key_h1, key_h2});
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"});
-    ASSERT_EQ(probe.host.num_common_tokens, 6);
-    ASSERT_EQ(probe.host.per_group.size(), 1u);
-    ASSERT_EQ(probe.host.per_group[0].hits, (std::vector<std::uint8_t>{0, 1, 1}));
+    ASSERT_EQ(probe.storage.num_common_tokens, 6);
+    ASSERT_EQ(probe.storage.per_group.size(), 1u);
+    ASSERT_EQ(probe.storage.per_group[0].hits, (std::vector<std::uint8_t>{0, 1, 1}))
+        << "the window needs only its last two pages";
 
-    auto match = MatchPrefixForTest(coordinator, std::array<std::string, 3>{"h0", "h1", "h2"});
-    EXPECT_EQ(match.host.num_common_tokens, 0)
-        << "truncating [0, 1, 1] to [0, 1] would restore a window whose first live page is a hole";
-    ASSERT_EQ(match.host.per_group.size(), 1u);
-    EXPECT_TRUE(match.host.per_group[0].blocks.empty());
-    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 1);
+    // The first page needs no row; the second takes the one free block; the
+    // third finds none, so the plan stops at two pages with one row.
+    auto plan = coordinator.PlanPrefetch(probe, /*min_pages=*/1);
+    ASSERT_TRUE(plan);
+    EXPECT_EQ(plan->page_row_ends, (std::vector<std::size_t>{0, 1}));
+    ASSERT_EQ(plan->rows.size(), 1u);
+    EXPECT_EQ(plan->rows[0].key, key_h1);
+    TierTransferManager transfers(coordinator);
+    PrefetchOperation op = transfers.StartPrefetch("r1", std::move(*plan));
+    auto done = transfers.CompletePrefetch(op.op_id, /*landed_pages=*/2);
+    ASSERT_TRUE(done);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key_h1));
+
+    // With only [h1] on Host the window's first live page would be a hole:
+    // admission matches nothing rather than admitting stale KV.
+    auto retry = coordinator.ProbePrefix(std::array<std::string, 3>{"h0", "h1", "h2"});
+    EXPECT_EQ(retry.host.num_common_tokens, 0);
+    ASSERT_EQ(retry.host.per_group.size(), 1u);
+    EXPECT_TRUE(std::ranges::all_of(retry.host.per_group[0].hits, [](std::uint8_t hit) { return hit == 0; }));
 }
 
 TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
@@ -1085,28 +1293,34 @@ TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
     const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
-    coordinator.RegisterStorageKeys(std::array{key_h0, key_h1});
+    for (const CacheKey& key : {key_h0, key_h1}) {
+        CacheBlockRef host_block = coordinator.AcquireHostBlock(/*group_id=*/0, /*bucket=*/0);
+        ASSERT_TRUE(host_block);
+        coordinator.CacheHostBlock(host_block, key);
+    }
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 2>{"h0", "h1"});
+    ASSERT_EQ(probe.host.num_common_tokens, 4);
     std::vector<BlockTable> tables(1);
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission =
         coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
     ASSERT_TRUE(admission);
     ASSERT_FALSE(admission->load_pairs.empty());
-    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 2);
 
     coordinator.Free(tables);
-    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 0)
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 2)
         << "Host sources in load_pairs stay pinned after Free(tables); retry must reset admission";
     admission.reset();
-    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 2);
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
 }
 
-TEST(CacheOperationTest, L3HostShortageRoundsDownToPrefixGranularity) {
+TEST(CacheOperationTest, APrefetchPageNeedsEveryRowOfItsFinerGroup) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
@@ -1116,6 +1330,7 @@ TEST(CacheOperationTest, L3HostShortageRoundsDownToPrefixGranularity) {
     }};
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
@@ -1125,24 +1340,16 @@ TEST(CacheOperationTest, L3HostShortageRoundsDownToPrefixGranularity) {
     coordinator.RegisterStorageKeys(keys);
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
-    EXPECT_EQ(probe.host.num_common_tokens, 4);
-
-    std::vector<BlockTable> tables(1);
-    std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{4}}};
-    auto admission =
-        coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
-    ASSERT_TRUE(admission);
-    EXPECT_EQ(admission->host_prefix_tokens, 0)
-        << "a mid-prefix Host shortage must round down to prefix_granularity, not keep 2 tokens";
-    EXPECT_TRUE(admission->load_pairs.empty());
-
-    admission.reset();
-    coordinator.Free(tables);
+    EXPECT_EQ(probe.storage.num_common_tokens, 4);
+    // Two rows per prefix page, one free block: no whole page can be planned.
+    EXPECT_FALSE(coordinator.PlanPrefetch(probe, /*min_pages=*/1))
+        << "a mid-page shortage must not leave a half-fetched prefix page";
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 1);
 }
 
-TEST(CacheOperationTest, L3HostShortageDoesNotSkipACoarserGroup) {
+TEST(CacheOperationTest, APrefetchPageCountsEveryGroupsRows) {
     BlockPool device_pool{8, {1, 1}};
-    BlockPool host_pool{2, {1, 1}};
+    BlockPool host_pool{3, {1, 1}};
     const std::array specs{
         CacheGroupSpec{
             .kind = AttnKind::kFull,
@@ -1157,31 +1364,27 @@ TEST(CacheOperationTest, L3HostShortageDoesNotSkipACoarserGroup) {
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/4, device_pool, /*enable_l3_storage=*/true, &host_pool,
+                        /*snapshot_pool=*/nullptr,
                         /*stream_device_cache_to_host=*/true);
     CacheBlockRef pinned = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(pinned);
 
     const std::vector<CacheKey> keys = coordinator.ExpandPrefixKeys(std::array<std::string, 1>{"h0"});
+    ASSERT_EQ(keys.size(), 3u) << "two fine rows and one coarse row per prefix page";
     coordinator.RegisterStorageKeys(keys);
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
-    EXPECT_EQ(probe.host.num_common_tokens, 4);
+    EXPECT_EQ(probe.storage.num_common_tokens, 4);
+    // Three rows, two free blocks: the coarse group's row cannot be had, so
+    // the page is not planned and the fine group's blocks are not kept.
+    EXPECT_FALSE(coordinator.PlanPrefetch(probe, /*min_pages=*/1));
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 2);
 
-    std::vector<BlockTable> tables(2);
-    std::vector<GroupDemand> demands{
-        {.table = &tables[0], .extent = DenseGrowth{4}},
-        {.table = &tables[1], .extent = DenseGrowth{4}},
-    };
-    auto admission =
-        coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
-    ASSERT_TRUE(admission);
-    EXPECT_EQ(admission->host_prefix_tokens, 0)
-        << "rounding to prefix_granularity must drop the fine-group partial hit so the "
-           "coarse group is not skipped without KV";
-    EXPECT_TRUE(admission->load_pairs.empty());
-
-    admission.reset();
-    coordinator.Free(tables);
+    pinned.reset();
+    auto plan = coordinator.PlanPrefetch(probe, /*min_pages=*/1);
+    ASSERT_TRUE(plan) << "with the parent back, the whole page fits";
+    EXPECT_EQ(plan->rows.size(), 3u);
+    EXPECT_EQ(plan->page_row_ends, std::vector<std::size_t>{3});
 }
 
 }  // namespace tokenspeed::test

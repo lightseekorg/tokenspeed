@@ -14,7 +14,7 @@ directly.
 ## Nightly installation
 
 CUDA 13 nightly wheels are published daily from `main` for Linux x86_64 and
-ARM64, with Python 3.10–3.13. Versions append the UTC build date to the base
+ARM64, with Python 3.11–3.13. Versions append the UTC build date to the base
 version, for example `0.1.3.post20260929`.
 
 ```bash

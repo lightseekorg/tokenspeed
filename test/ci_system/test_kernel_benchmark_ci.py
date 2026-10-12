@@ -84,12 +84,10 @@ def _policy(
     *,
     relative: float = 0.10,
     absolute_us: float = 0.5,
-    max_relative_mad: float = 0.05,
 ) -> dict:
     return {
         "max_regression_relative": relative,
         "max_regression_absolute_us": absolute_us,
-        "max_relative_mad": max_relative_mad,
     }
 
 
@@ -170,9 +168,17 @@ def _compare(base: dict | None, candidate: dict, **overrides) -> dict:
         "merge_base_sha": BASE_SHA,
         "candidate_sha": CANDIDATE_SHA,
         "merge_sha": MERGE_SHA,
+        "confirmation_rounds": (),
     }
     arguments.update(overrides)
     return compare_runs(base, candidate, **arguments)
+
+
+def _round(base_time: float, candidate_time: float, case_id: str) -> tuple:
+    return (
+        _run(BASE_SHA, [_case(base_time, case_id=case_id)]),
+        _run(CANDIDATE_SHA, [_case(candidate_time, case_id=case_id)]),
+    )
 
 
 def test_compare_reports_regression_with_minimal_schema():
@@ -202,12 +208,14 @@ def test_compare_reports_regression_with_minimal_schema():
         "candidate_median_us",
         "delta_us",
         "delta_percent",
+        "rounds",
         "detail",
         "base_profile",
         "candidate_profile",
     }
     assert comparison["classification"] == "regression"
     assert comparison["delta_percent"] == pytest.approx(20.0)
+    assert len(comparison["rounds"]) == 1
     assert comparison_exit_code(report) == 1
 
 
@@ -247,15 +255,69 @@ def test_compare_classifies_non_regressions(base_time, candidate_time, classific
     assert comparison_exit_code(report) == 0
 
 
-def test_compare_marks_noisy_measurement_inconclusive():
+@pytest.mark.parametrize(
+    ("round_times", "classification", "candidate_median", "detail"),
+    [
+        (
+            [(10.0, 10.0), (10.0, 10.1)],
+            "within_budget",
+            10.1,
+            "first round's regression did not reproduce",
+        ),
+        # A large regression stays decisive however widely its rounds spread.
+        (
+            [(10.0, 15.0), (10.0, 18.0)],
+            "regression",
+            15.0,
+            "median of 3 measurement rounds",
+        ),
+        (
+            [(10.0, 7.0), (10.0, 12.5)],
+            "inconclusive",
+            12.0,
+            "both a regression and an improvement",
+        ),
+    ],
+)
+def test_compare_judges_remeasured_cases_on_the_median_round(
+    round_times, classification, candidate_median, detail
+):
+    case_id = _case(10.0)["id"]
     report = _compare(
-        _run(BASE_SHA, [_case(10.0, spread=1.0)]),
-        _run(CANDIDATE_SHA, [_case(13.0, spread=1.0)]),
+        _run(BASE_SHA, [_case(10.0)]),
+        _run(CANDIDATE_SHA, [_case(12.0)]),
+        confirmation_rounds=[_round(*times, case_id) for times in round_times],
     )
 
-    assert report["comparisons"][0]["classification"] == "inconclusive"
-    assert "MAD" in report["comparisons"][0]["detail"]
-    assert comparison_exit_code(report) == 0
+    comparison = report["comparisons"][0]
+    assert comparison["classification"] == classification
+    assert comparison["candidate_median_us"] == pytest.approx(candidate_median)
+    assert detail in comparison["detail"]
+    assert [item["candidate_median_us"] for item in comparison["rounds"]] == [
+        pytest.approx(12.0),
+        *(pytest.approx(candidate) for _, candidate in round_times),
+    ]
+
+
+def test_compare_rejects_unusable_measurement_rounds():
+    case_id = _case(10.0)["id"]
+    base = _run(BASE_SHA, [_case(10.0)])
+    candidate = _run(CANDIDATE_SHA, [_case(12.0)])
+
+    with pytest.raises(CoordinatorError, match="must be odd"):
+        _compare(base, candidate, confirmation_rounds=[_round(10.0, 12.0, case_id)])
+
+    failed_round = _round(10.0, 12.0, case_id)
+    failed_round[1]["cases"][0]["result"] = _result(0.0, status="execution_failure")
+    report = _compare(
+        base,
+        candidate,
+        confirmation_rounds=[_round(10.0, 12.0, case_id), failed_round],
+    )
+    assert report["comparisons"][0]["classification"] == "invalid"
+    assert "round 3 candidate benchmark returned execution_failure" in (
+        report["comparisons"][0]["detail"]
+    )
 
 
 def test_compare_uses_merge_base_policy():
@@ -451,9 +513,10 @@ def test_bootstrap_when_merge_base_lacks_the_suite(tmp_path):
     assert _baseline_supports_suite(tmp_path, suite) is True
 
 
-def test_orchestrate_runs_each_revision_once(monkeypatch, tmp_path):
+def _orchestrate(monkeypatch, tmp_path, candidate_times: dict[str, float]):
+    """Run the coordinator with fake revisions whose baseline times are 10 us."""
     suite = Path("tokenspeed-kernel/benchmarks/amd/gfx950.json")
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, list[str] | None]] = []
 
     def add_worktree(repo, path, revision):
         del repo, revision
@@ -462,9 +525,21 @@ def test_orchestrate_runs_each_revision_once(monkeypatch, tmp_path):
 
     def run_revision(checkout, python, **kwargs):
         del python
-        calls.append((checkout.name, kwargs["output_path"].name))
-        revision = kwargs["revision"]
-        return _run(revision, [_case(10.0)])
+        case_ids = kwargs["case_ids"]
+        calls.append((checkout.name, kwargs["output_path"].name, case_ids))
+        times = (
+            candidate_times
+            if checkout.name == "candidate"
+            else dict.fromkeys(candidate_times, 10.0)
+        )
+        return _run(
+            kwargs["revision"],
+            [
+                _case(time, case_id=case_id)
+                for case_id, time in times.items()
+                if case_ids is None or case_id in case_ids
+            ],
+        )
 
     monkeypatch.setattr(benchmark_ci, "_add_worktree", add_worktree)
     monkeypatch.setattr(benchmark_ci, "_remove_worktree", lambda *args: None)
@@ -475,6 +550,7 @@ def test_orchestrate_runs_each_revision_once(monkeypatch, tmp_path):
         base_ref=BASE_SHA,
         candidate_ref=CANDIDATE_SHA,
         suite=suite,
+        measurement_rounds=3,
         work_dir=None,
         environment_mode="current",
         repository="lightseekorg/tokenspeed",
@@ -483,16 +559,76 @@ def test_orchestrate_runs_each_revision_once(monkeypatch, tmp_path):
         github_run_attempt=1,
         merge_sha=None,
     )
-
     report = benchmark_ci.orchestrate(
         args, revisions=(TARGET_SHA, BASE_SHA, CANDIDATE_SHA)
     )
+    return report, calls
+
+
+def test_orchestrate_runs_each_revision_once(monkeypatch, tmp_path):
+    report, calls = _orchestrate(monkeypatch, tmp_path, {"steady": 10.0})
 
     assert report["comparisons"][0]["classification"] == "within_budget"
     assert calls == [
-        ("base", "base.json"),
-        ("candidate", "candidate.json"),
+        ("base", "base.json", None),
+        ("candidate", "candidate.json", None),
     ]
+
+
+def test_orchestrate_remeasures_flagged_cases_in_alternating_order(
+    monkeypatch, tmp_path
+):
+    report, calls = _orchestrate(
+        monkeypatch, tmp_path, {"slower": 12.0, "steady": 10.0}
+    )
+
+    classifications = {
+        item["id"]: item["classification"] for item in report["comparisons"]
+    }
+    assert classifications == {"slower": "regression", "steady": "within_budget"}
+    assert calls == [
+        ("base", "base.json", None),
+        ("candidate", "candidate.json", None),
+        ("candidate", "candidate-round2.json", ["slower"]),
+        ("base", "base-round2.json", ["slower"]),
+        ("base", "base-round3.json", ["slower"]),
+        ("candidate", "candidate-round3.json", ["slower"]),
+    ]
+
+
+def test_run_revision_selects_exact_case_ids(monkeypatch, tmp_path):
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        benchmark_ci,
+        "_run_logged",
+        lambda command, **kwargs: commands.append(list(command)),
+    )
+    monkeypatch.setattr(benchmark_ci, "_load_json", lambda path: {})
+
+    benchmark_ci._run_revision(
+        tmp_path,
+        Path("python"),
+        suite_relative=Path("suite.json"),
+        revision=CANDIDATE_SHA,
+        output_path=tmp_path / "out.json",
+        log_path=tmp_path / "log",
+        cache_dir=tmp_path / "cache",
+        case_ids=["kimi_k3.gemm.mm/m1-n7168+x_0"],
+    )
+
+    command = commands[0]
+    assert command[command.index("--case-filter") + 1] == (
+        r"^kimi_k3\.gemm\.mm/m1\-n7168\+x_0$"
+    )
+
+
+def test_measurement_rounds_must_be_odd():
+    arguments = ["--base-ref", "a", "--candidate-ref", "b", "--output-dir", "out"]
+
+    args = benchmark_ci._parse_args([*arguments, "--measurement-rounds", "3"])
+    assert args.measurement_rounds == 3
+    with pytest.raises(SystemExit):
+        benchmark_ci._parse_args([*arguments, "--measurement-rounds", "2"])
 
 
 def test_revision_environment_inherits_and_pins_prepared_rocm(monkeypatch, tmp_path):

@@ -582,5 +582,108 @@ TEST(BlockPoolOccupancyIndexTest, FreeSlotsAreScopedToTheOwningGroup) {
     second.reset();
 }
 
+// ---------------------------------------------------------------------------
+// Bucket-constrained acquisition: a retraction snapshot and its restore keep
+// every block in the bucket (slot % shard_count) of the block it images.
+// ---------------------------------------------------------------------------
+
+TEST(BlockPoolBucketAcquireTest, ParentsNeededSharesOpenedParentsAcrossBuckets) {
+    // packing 4, two buckets: an opened parent gives each bucket two slots.
+    const std::array<std::int64_t, 2> no_holes{0, 0};
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{3, 3}, no_holes, /*dense_need=*/0, /*packing=*/4), 2)
+        << "both buckets are served by the same two parents";
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{5, 0}, no_holes, 0, 4), 3)
+        << "one bucket alone forces ceil(5 / 2) parents";
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{1, 1}, std::array<std::int64_t, 2>{0, 1}, 0, 4), 1)
+        << "a hole in one bucket does not serve the other";
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{1, 1}, std::array<std::int64_t, 2>{1, 1}, 0, 4), 0);
+    // Dense blocks take the holes the bucket demands leave: four slots per
+    // parent minus the two bucket blocks leaves two, so three dense blocks
+    // need a second parent.
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{1, 1}, no_holes, /*dense_need=*/2, 4), 1);
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{1, 1}, no_holes, /*dense_need=*/3, 4), 2);
+    // One bucket is ordinary placement: holes plus parents times packing.
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 1>{0}, std::array<std::int64_t, 1>{1}, 5, 2), 2);
+}
+
+TEST(BlockPoolBucketAcquireTest, PlacementIsDeterministicAndOpensOneParentForBothBuckets) {
+    BlockPool pool(2, {4});
+    pool.RegisterGroup(/*group_id=*/0, /*packing=*/4, /*shard_count=*/2);
+
+    // Bucket 1 has no hole: the FIFO's first parent opens at slot 1. Its slot
+    // 3 serves the second bucket-1 block and slot 0 the bucket-0 block.
+    const std::array<std::int32_t, 3> buckets{1, 1, 0};
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocksInBuckets(0, buckets);
+    ASSERT_EQ(blocks.size(), 3u);
+    EXPECT_EQ(LocationsOf(blocks), (std::vector<CacheBlockLocation>{{1, 1}, {1, 3}, {1, 0}}));
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[0], 1) << "slot 2 is the one hole left, in bucket 0";
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[1], 0);
+
+    // The hole is used before a second parent opens; bucket 1 then opens the
+    // next FIFO parent at its own slot.
+    const std::array<std::int32_t, 2> more{0, 1};
+    std::vector<CacheBlockRef> second = pool.AcquireBlocksInBuckets(0, more);
+    ASSERT_EQ(second.size(), 2u);
+    EXPECT_EQ(LocationsOf(second), (std::vector<CacheBlockLocation>{{1, 2}, {2, 1}}));
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+}
+
+TEST(BlockPoolBucketAcquireTest, FailedAcquisitionLeavesIndicesUntouched) {
+    BlockPool pool(2, {4});
+    pool.RegisterGroup(/*group_id=*/0, /*packing=*/4, /*shard_count=*/2);
+    CacheBlockRef seed = pool.AcquireBlock(0);  // opens parent 1 at slot 0
+    ASSERT_TRUE(seed);
+    ASSERT_EQ(pool.FreeSlotsByBucket(0)[0], 1);
+    ASSERT_EQ(pool.FreeSlotsByBucket(0)[1], 2);
+
+    // Bucket 0 needs four with one hole and two slots per opened parent:
+    // two parents, but only one is empty.
+    const std::array<std::int32_t, 4> too_many{0, 0, 0, 0};
+    EXPECT_TRUE(pool.AcquireBlocksInBuckets(0, too_many).empty());
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+    EXPECT_EQ(pool.NumOccupiedSlots(), 1);
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[0], 1);
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[1], 2);
+
+    // The same pool still serves a demand that fits, in the untouched order:
+    // bucket 1's two holes in parent 1 first, then parent 2 at slot 1.
+    const std::array<std::int32_t, 3> fits{1, 1, 1};
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocksInBuckets(0, fits);
+    ASSERT_EQ(blocks.size(), 3u);
+    EXPECT_EQ(LocationsOf(blocks), (std::vector<CacheBlockLocation>{{1, 1}, {1, 3}, {2, 1}}));
+}
+
+TEST(BlockPoolBucketAcquireTest, ReleaseRestoresPerBucketHolesAndUnbindsWholeParents) {
+    BlockPool pool(1, {4});
+    pool.RegisterGroup(/*group_id=*/0, /*packing=*/4, /*shard_count=*/2);
+    const std::array<std::int32_t, 4> all{0, 1, 0, 1};
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocksInBuckets(0, all);
+    ASSERT_EQ(blocks.size(), 4u);
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[0], 0);
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[1], 0);
+
+    blocks[1].reset();  // slot 1, bucket 1
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[0], 0);
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[1], 1);
+    EXPECT_EQ(pool.NumFreeSlots(0), 1) << "the group total is the sum over buckets";
+
+    blocks.clear();  // the parent unbinds: its slots belong to the FIFO, not the group
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[0], 0);
+    EXPECT_EQ(pool.FreeSlotsByBucket(0)[1], 0);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+}
+
+TEST(BlockPoolBucketAcquireTest, OneBucketIsOrdinaryPlacement) {
+    BlockPool pool(2, {2});
+    CacheBlockRef seed = pool.AcquireBlock(0);  // parent 1, slot 0; slot 1 is a hole
+    ASSERT_TRUE(seed);
+    const std::array<std::int32_t, 2> zeros{0, 0};
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocksInBuckets(0, zeros);
+    ASSERT_EQ(blocks.size(), 2u);
+    EXPECT_EQ(LocationsOf(blocks), (std::vector<CacheBlockLocation>{{1, 1}, {2, 0}}))
+        << "the hole in the bound parent first, then the next FIFO parent";
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

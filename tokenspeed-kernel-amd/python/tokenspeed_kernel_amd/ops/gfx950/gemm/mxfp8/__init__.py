@@ -21,8 +21,11 @@
 
 """MXFP8 GEMM kernels for gfx950."""
 
+from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
+    launch_gluon_mm_mxfp8_decode_gfx950,
+)
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
     launch_gluon_mm_mxfp8_gfx950,
 )
 
-__all__ = ["launch_gluon_mm_mxfp8_gfx950"]
+__all__ = ["launch_gluon_mm_mxfp8_decode_gfx950", "launch_gluon_mm_mxfp8_gfx950"]

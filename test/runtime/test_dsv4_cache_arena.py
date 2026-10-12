@@ -20,8 +20,8 @@
 
 """Fixed-budget Flash MTP arena regression; no weights or GPU allocation.
 
-Run directly with Python, as runtime CI does. Compare DCP disabled (degree one)
-with DCP4 using the same model, concurrency, indexer format and per-rank budget.
+Run directly with Python, as runtime CI does. Compare KVP disabled (degree one)
+with KVP4 using the same model, concurrency, indexer format and per-rank budget.
 """
 
 import sys
@@ -69,10 +69,10 @@ def _recipe(degree, fp4):
             max_bs=16,
             context_len=4096,
             pd_disaggregation_enabled=False,
-            dcp_size=degree,
+            kvp_size=degree,
         ),
         draft_model_config=SimpleNamespace(hf_config=hf, num_attention_layers=1),
-        draft_attn_config=SimpleNamespace(dcp_size=degree),
+        draft_attn_config=SimpleNamespace(kvp_size=degree),
         cache_budget_bytes=32 << 30,
         probe_batch_rows=None,
         decode_input_tokens=4,
@@ -81,29 +81,29 @@ def _recipe(degree, fp4):
 
 
 class Dsv4CacheArenaBenefitTest(unittest.TestCase):
-    def test_dcp_increases_capacity_with_the_same_cache_budget(self):
+    def test_kvp_increases_capacity_with_the_same_cache_budget(self):
         for fp4 in (False, True):
             with self.subTest(fp4=fp4):
                 tp_recipe = _recipe(degree=1, fp4=fp4)
-                dcp_recipe = _recipe(degree=4, fp4=fp4)
+                kvp_recipe = _recipe(degree=4, fp4=fp4)
                 self.assertEqual(
-                    tp_recipe.cache_budget_bytes, dcp_recipe.cache_budget_bytes
+                    tp_recipe.cache_budget_bytes, kvp_recipe.cache_budget_bytes
                 )
                 tp = tp_recipe.setup().spec
-                dcp = dcp_recipe.setup().spec
-                for spec in (tp, dcp):
+                kvp = kvp_recipe.setup().spec
+                for spec in (tp, kvp):
                     self.assertGreater(spec.token_capacity, 0)
                     self.assertLessEqual(
                         spec.memory_plan.arena_bytes, tp_recipe.cache_budget_bytes
                     )
-                self.assertGreater(dcp.token_capacity, tp.token_capacity)
+                self.assertGreater(kvp.token_capacity, tp.token_capacity)
                 print(
                     f"indexer={'FP4' if fp4 else 'FP8'} "
                     f"budget_bytes={tp_recipe.cache_budget_bytes} "
-                    f"token_capacity(DCP1->DCP4)={tp.token_capacity}->{dcp.token_capacity} "
-                    f"capacity_ratio={dcp.token_capacity / tp.token_capacity:.3f} "
-                    f"arena_bytes(DCP1->DCP4)="
-                    f"{tp.memory_plan.arena_bytes}->{dcp.memory_plan.arena_bytes}",
+                    f"token_capacity(KVP1->KVP4)={tp.token_capacity}->{kvp.token_capacity} "
+                    f"capacity_ratio={kvp.token_capacity / tp.token_capacity:.3f} "
+                    f"arena_bytes(KVP1->KVP4)="
+                    f"{tp.memory_plan.arena_bytes}->{kvp.memory_plan.arena_bytes}",
                     flush=True,
                 )
 

@@ -43,6 +43,7 @@ _OPS = Path(__file__).resolve().parents[3] / "ops"
 if str(_OPS) not in sys.path:
     sys.path.insert(0, str(_OPS))
 
+from test_attention_dsv41 import _reference_quantize  # noqa: E402
 from test_attention_dsv41_index_scan import (  # noqa: E402
     run_index_scan_graph_oracle,
     run_index_topk_full_and_reindex,
@@ -257,6 +258,59 @@ def test_indexer_score_chunk_bound(
     ]
 
 
+# A 40-row score chunk masks part of each CTA's second 32-row tile, and in
+# Full mode CTAs span page boundaries.
+@pytest.mark.parametrize("reindex", [False, True])
+@pytest.mark.parametrize("score_chunk", [40, 256])
+def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
+    if not current_platform().is_cdna5:
+        pytest.skip("GFX1250 indexer logits")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer import (
+        dsv41_index_logits_gfx1250,
+    )
+
+    g = torch.Generator(device=device).manual_seed(251)
+    keys = torch.randn(512, 128, device=device, dtype=torch.bfloat16, generator=g)
+    keys *= 0.1
+    _, key_reference = _reference_quantize(keys, "index")
+    # Padding between pages gives a page stride wider than the 64 * 68 payload.
+    storage = torch.zeros(8, 64 * 68 + 16, device=device, dtype=torch.uint8)
+    cache = storage[:, : 64 * 68].view(8, 64, 68)
+    dsv41.cache_scatter(keys, cache, torch.arange(512, device=device), "index")
+    q = torch.randn(2, 32, 128, device=device, dtype=torch.bfloat16, generator=g)
+    q *= 0.1
+    weights = torch.randn(2, 32, device=device, generator=g)
+    table = torch.tensor(
+        [[3, 1, -1, 2], [7, 5, 4, 6]], device=device, dtype=torch.int32
+    )
+    visible = torch.tensor([193, 221], device=device, dtype=torch.int32)
+    candidates = (
+        torch.tensor(
+            [[3, 0, -1, 20, 31], [27, 4, 2, 1, -1]], device=device, dtype=torch.int32
+        )
+        if reindex
+        else None
+    )
+    width = 40 if reindex else 256
+    out = torch.full((2, width), -torch.inf, device=device)
+    dsv41_index_logits_gfx1250(
+        q, weights, cache.flatten(1), table, visible, candidates, out, score_chunk
+    )
+
+    expected = torch.full((2, width), -torch.inf)
+    for row in range(2):
+        logical = torch.arange(width)
+        if reindex:
+            blocks = candidates[row].cpu()[logical // 8].long()
+            logical = torch.where(blocks >= 0, blocks * 8 + logical % 8, -1)
+        pages = table[row].cpu()[logical.clamp(min=0) // 64].long()
+        valid = (logical >= 0) & (logical < int(visible[row])) & (pages >= 0)
+        slots = pages[valid] * 64 + logical[valid] % 64
+        dots = q[row].float().cpu() @ key_reference[slots].float().T
+        expected[row, valid] = (dots.relu() * weights[row].cpu()[:, None]).sum(0)
+    torch.testing.assert_close(out.cpu(), expected, atol=2e-4, rtol=2e-4)
+
+
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize("missing_page", [-1, 3])
 def test_index_topk_missing_latest_page(device, require, solution, missing_page):
@@ -319,15 +373,22 @@ def test_index_topk_latest_block_outside_table(
     assert visible.item() == length
 
 
-@pytest.mark.parametrize("byte_stride", [1, 2])
+# A gap between arena pages leaves a page stride that is not a 16-byte multiple.
+@pytest.mark.parametrize(
+    ("byte_stride", "page_gap"),
+    [(1, 0), (2, 0), (1, 13)],
+    ids=["arena", "byte-strided", "unaligned-pages"],
+)
 @pytest.mark.parametrize("reindex", [False, True])
 def test_index_topk_preserves_arena_page_stride(
-    device, require, monkeypatch, reindex, byte_stride
+    device, require, monkeypatch, reindex, byte_stride, page_gap
 ):
     require("attention", "dsv41_index_topk", "gluon", torch.bfloat16, "x")
     q = torch.ones((1, 32, 128), dtype=torch.bfloat16, device=device)
     weights = torch.ones((1, 32), dtype=torch.bfloat16, device=device)
-    arena = torch.zeros((4, 2, 64, 68 * byte_stride), dtype=torch.uint8, device=device)
+    page_bytes = 2 * 64 * 68 * byte_stride
+    storage = torch.zeros((4, page_bytes + page_gap), dtype=torch.uint8, device=device)
+    arena = storage[:, :page_bytes].view(4, 2, 64, 68 * byte_stride)
     cache = arena[:, 0, :, ::byte_stride]
     assert not cache.is_contiguous()
     dsv41.cache_scatter(
@@ -376,7 +437,7 @@ def test_index_topk_preserves_arena_page_stride(
         q, w, cache_2d, table, visible, candidates, logits, score_chunk_size
     ):
         assert cache_2d.stride(1) == 1
-        if byte_stride == 1:
+        if byte_stride == 1 and not page_gap:
             assert cache_2d.data_ptr() == cache.data_ptr()
             assert cache_2d.stride(0) == cache.stride(0)
         else:

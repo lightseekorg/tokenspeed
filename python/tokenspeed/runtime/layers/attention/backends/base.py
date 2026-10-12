@@ -49,6 +49,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.slot_state import (
+    pack_slot_rows,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+)
 from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
     CudaGraphSupport,
     TreeSupport,
@@ -108,6 +113,11 @@ class SparseTopKShare:
 class CachePoolBinding:
     """A node's bound cache pool."""
 
+    #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
+    #: none by default; a node that keeps some names them.
+    token_derived_slot_state: tuple[str, ...] = ()
+    constant_slot_state: tuple[str, ...] = ()
+
     def _init_pool_binding(self) -> None:
         self.cache_pool: CachePool | None = None
 
@@ -137,6 +147,53 @@ class CachePoolBinding:
     def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
         """Return logical-slot ownership, or None for local/replicated storage."""
         return None
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """This node's own per-slot rows a retraction snapshot images.
+
+        Backend-private state keyed by ``req_pool_index`` -- a recurrent
+        ring, a partial index pool not yet in a page -- is the exception
+        (``AGENTS.md``); a backend that keeps some lists it here, in a fixed
+        order, so a restore carries it with the pages. Paged state is in
+        cache groups and never listed. A node lists its own rows only; the
+        tree is flattened by :meth:`slot_state_exporters`. A leaf's default
+        is empty.
+        """
+        del slot
+        return []
+
+    def slot_state_exporters(self) -> tuple[CachePoolBinding, ...]:
+        """This node and every node below it, each imaging its own rows.
+
+        The model executor lists these in the blob, so a composite's rows and
+        its children's are separate segments laid out once by the Host cache
+        executor rather than re-measured at every export.
+        """
+        exporters = [self]
+        for child in self.child_backends():
+            exporters.extend(child.slot_state_exporters())
+        return tuple(exporters)
+
+    def slot_state_bytes(self) -> int:
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # Backend rows are rewritten by every forward and prepared at a PD
+        # landing, never keyed by request: always valid, nothing to mark.
+        del request_id
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        del request_id
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
 
 class AttentionBackend(CachePoolBinding, ABC):

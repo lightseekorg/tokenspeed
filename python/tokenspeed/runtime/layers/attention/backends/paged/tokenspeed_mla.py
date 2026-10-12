@@ -247,8 +247,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # consumed within each op and never zero-initialized, so sharing the
         # block is safe. Warm to the verify-path peak now: graph capture runs
         # the decode forward with the pool frozen.
-        self.dcp_group = tuple(config.dcp_group)
-        self.dcp_rank = config.dcp_rank
+        self.kvp_group = tuple(config.kvp_group)
+        self.kvp_rank = config.kvp_rank
         self._num_heads_per_tp = spec.num_attention_heads // spec.attn_tp_size
         self._workspace_pool = workspace_pool(config.device)
         self.cutedsl_workspace = self._cutedsl_workspace(
@@ -297,15 +297,15 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         **kwargs,
     ) -> None:
         super().configure_runtime(**kwargs)
-        if shard_count != len(self.dcp_group):
-            raise ValueError("CuTe MLA cache and DCP topology disagree")
+        if shard_count != len(self.kvp_group):
+            raise ValueError("CuTe MLA cache and KVP topology disagree")
         self._dcp = (
             _DCPDecodeState(
                 CachePlacement(
                     block_granularity,
                     virtual_block_count,
-                    self.dcp_group,
-                    self.dcp_rank,
+                    self.kvp_group,
+                    self.kvp_rank,
                 )
             )
             if shard_count > 1
@@ -317,7 +317,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         required = (
             get_num_sm(self.device)
             * self._num_heads_per_tp
-            * len(self.dcp_group)
+            * len(self.kvp_group)
             * q_len_capacity
             * (self.kv_lora_rank + 1)
             * 4
@@ -721,7 +721,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 else local.local_visible_lens
             )
             query = gather_query_heads(
-                query.reshape(-1, layer.tp_q_head_num, layer.head_dim), self.dcp_group
+                query.reshape(-1, layer.tp_q_head_num, layer.head_dim), self.kvp_group
             ).view(bs, query.shape[1], -1, layer.head_dim)
 
         # Prepare KV cache: [num_pages, page_size, kv_cache_dim] (3D for CuteDSL)
@@ -760,8 +760,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             raw_out = combine_attention_partials(
                 partial.flatten(0, 1),
                 lse_log2.flatten(0, 1) * math.log(2),
-                group=self.dcp_group,
-                rank=self.dcp_rank,
+                group=self.kvp_group,
+                rank=self.kvp_rank,
                 sink=None,
                 keep_all_heads=False,
             )
@@ -772,9 +772,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         support = mla_tree_support(
             type(self).__name__, self.data_type, self.q_data_type
         )
-        if len(self.dcp_group) == 1:
+        if len(self.kvp_group) == 1:
             return support
-        reason = f"{type(self).__name__} has no draft-tree path under decode context parallelism"
+        reason = f"{type(self).__name__} has no draft-tree path under KV parallelism"
         return TreeSupport(verify_blocker=reason, draft_blocker=reason)
 
     def _tree_cascade(

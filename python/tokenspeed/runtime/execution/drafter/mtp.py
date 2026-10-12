@@ -434,6 +434,12 @@ class Mtp(BaseDrafter):
         del global_bs
         return [global_num_tokens] * self.spec_num_steps
 
+    @override
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # The stash is a forward by-product (the target hiddens one position
+        # behind the last k-1 committed ids); recomputing it needs an extend.
+        return [self._stash_tokens_buf[slot], self._stash_hidden_buf[slot]]
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

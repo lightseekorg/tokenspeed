@@ -31,6 +31,7 @@
 #include "cache/core/cache_types.h"
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache_test_access.h"
+#include "integration_test_helper.h"
 #include "scheduler/operations/cache.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "scheduler/types.h"
@@ -54,6 +55,7 @@ CacheCoordinator MakeTwoGroup(BlockPool& pool) {
                        .block_granularity = 2},
     };
     return MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                           /*snapshot_pool=*/nullptr,
                            /*stream_device_cache_to_host=*/false);
 }
 
@@ -93,6 +95,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
                        .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false);
     // r1: 8 tokens -> 4 pages/group; freed blocks keep their hashes (prefix-hittable).
     std::vector<std::string> hashes8(4);
@@ -305,6 +308,7 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
@@ -486,6 +490,7 @@ SchedulerConfig MakeValidConfig() {
     group.block_granularity = 128;
     group.total_pages = config.device_allocator.total_pages;
     config.cache_groups = {group};
+    SetTestSnapshotPool(config);
     return config;
 }
 
@@ -657,8 +662,92 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowAndNoSnapshotStateO
         for (CacheGroupConfig& group : pd.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
+        SetTestSnapshotPool(pd);
         EXPECT_NO_THROW(pd.Validate());
     }
+}
+
+TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {
+    // The pool is explicit on every role: 0 pages says nothing, the null page
+    // alone says "never retract" (and takes no blob slots), anything above it
+    // needs blob slots -- and the P role, which never retracts, takes neither.
+    SchedulerConfig config = MakeValidConfig();
+    config.snapshot_allocator.total_pages = 0;
+    config.max_retracted_requests = 0;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.snapshot_allocator.total_pages = 1;
+    EXPECT_NO_THROW(config.Validate());
+    config.max_retracted_requests = 4;
+    EXPECT_THROW(config.Validate(), std::invalid_argument) << "slots without a pool";
+    config.snapshot_allocator.total_pages = 16;
+    EXPECT_NO_THROW(config.Validate());
+    config.max_retracted_requests = 0;
+    EXPECT_THROW(config.Validate(), std::invalid_argument) << "a pool without slots";
+    config.max_retracted_requests = -1;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+
+    config.max_retracted_requests = 4;
+    config.role = Role::kP;
+    config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
+    EXPECT_THROW(config.Validate(), std::invalid_argument) << "the P role never retracts";
+    config.snapshot_allocator.total_pages = 1;
+    config.max_retracted_requests = 0;
+    EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(SchedulerConfigValidateTest, ForcedRetractionRequiresASnapshotPool) {
+    // The knob retracts through the capacity path, which images the victim:
+    // with the null page alone there is nowhere to put the image.
+    SchedulerConfig config = MakeValidConfig();
+    config.snapshot_allocator.total_pages = 1;
+    config.max_retracted_requests = 0;
+    for (const std::int32_t interval : {3, -3}) {
+        config.debug_force_retraction_interval = interval;
+        EXPECT_THROW(config.Validate(), std::invalid_argument) << "interval " << interval << " without a pool";
+    }
+    config.snapshot_allocator.total_pages = 16;
+    config.max_retracted_requests = 4;
+    EXPECT_NO_THROW(config.Validate());
+    config.debug_force_retraction_interval = 0;
+    EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
+    // The runtime surfaces these messages verbatim at startup, so each one
+    // names the server arg the operator has to change.
+    SchedulerConfig config = MakeValidConfig();
+    config.snapshot_allocator.total_pages = 16;
+    config.max_retracted_requests = 0;
+    try {
+        config.Validate();
+        FAIL() << "a pool without slots must be rejected";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string(error.what()).find("--retraction-snapshot-max-requests"), std::string::npos)
+            << error.what();
+        EXPECT_NE(std::string(error.what()).find("--retraction-snapshot-host-gb"), std::string::npos) << error.what();
+    }
+    config.snapshot_allocator.total_pages = 1;
+    config.debug_force_retraction_interval = 2;
+    try {
+        config.Validate();
+        FAIL() << "the knob without a pool must be rejected";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string(error.what()).find("--debug-force-retraction-interval"), std::string::npos)
+            << error.what();
+    }
+}
+
+TEST(SchedulerConfigValidateTest, L3StorageRequiresReplicatedGroups) {
+    SchedulerConfig config = MakeValidConfig();
+    config.host_allocator.total_pages = 32;
+    config.enable_l3_storage = true;
+    config.l3_prefetch_min_pages = 1;
+    config.cache_groups[0].cache_blocks_per_lcm_block = 2;
+    config.cache_groups[0].shard_count = 2;
+    EXPECT_THROW(config.Validate(), std::invalid_argument)
+        << "an L3 prefetch allocates its Host page before any Device destination exists";
+    config.cache_groups[0].shard_count = 1;
+    EXPECT_NO_THROW(config.Validate());
 }
 
 TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {
@@ -738,6 +827,7 @@ TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
             .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                   /*snapshot_pool=*/nullptr,
                                                    /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));  // 2 pages
@@ -773,8 +863,9 @@ TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKerne
     const std::vector<CacheGroupSpec> specs{
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,
-                                                   /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,
+                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
@@ -794,8 +885,9 @@ TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
         {.kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,
-                                                   /*host_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,
+                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 

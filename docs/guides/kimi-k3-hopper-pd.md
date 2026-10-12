@@ -124,9 +124,12 @@ D arguments:
 ```
 
 `auto` keeps ordinary decode on low latency and CUDA graph. If cache
-pressure retracts a request and the scheduler performs a recovery prefill,
-that extend-shaped work uses normal dispatch and eager execution. Disabling
-KVStore does not eliminate recovery prefills.
+pressure retracts a request, the scheduler images it to Host and restores it
+by a copy, never by a prefill, so the decode node runs no extend-shaped work
+(the image pool is sized by default from `--max-num-seqs`; see
+`--retraction-snapshot-ratio` in [Server configuration](../configuration/server.md),
+whose explicit `0` removes the pool so a capacity-blocked round aborts the
+newest resident with finish `err_type` 524 instead).
 
 `max-num-seqs` is global across DP: this example allows 32 requests per D
 replica and captures through that local batch size. Keep graph padding
@@ -168,11 +171,10 @@ for the full admissible batch, not just the CUDA graph ladder: larger eager
 batches remain possible. The selected value must also satisfy DeepEP's
 alignment requirements.
 
-If `low_latency` is pinned, include the configured prefill/recovery chunk beside
-the decode batch before TP slicing, because no normal buffers exist. For the
-D example and an 8192-token chunk, this requires at least 1056 source rows per
-rank. The default 256 or a decode-only setting of 32 would be insufficient for
-that workload. Prefer `auto` to route extends through normal dispatch.
+The decode node runs no extend-shaped work -- a retracted request is restored
+from its image, never re-prefilled -- so a pinned `low_latency` needs only the
+decode batch's rows per rank. Prefer `auto` all the same: it keeps the
+default dispatch for anything that is not a graph-shaped decode step.
 
 DeepEP's own receive buffers still reserve expert capacity. The Marlin
 bridge uses device counts to construct aligned work and bound intermediate

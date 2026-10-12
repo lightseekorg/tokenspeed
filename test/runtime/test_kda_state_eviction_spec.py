@@ -257,6 +257,8 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
     config.prefix_granularity = _P
     config.num_device_pages = _USABLE + 1
     config.num_host_pages = 0
+    config.num_snapshot_pages = 1  # the null page alone: no pool
+    config.max_retracted_requests = 0
     config.max_scheduled_tokens = 8
     config.max_batch_size = 1
     config.decode_input_tokens = _WIDTH
