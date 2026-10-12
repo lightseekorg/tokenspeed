@@ -1745,7 +1745,15 @@ def _mhc_prefill_config_hc4(num_tokens: int) -> tuple[int, int, int]:
 
 
 def _mhc_mixes_impl(
-    residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters, prenorm_gemm
+    residual,
+    weight,
+    scale,
+    base,
+    rms_eps,
+    hc_eps,
+    sinkhorn_iters,
+    prenorm_gemm,
+    pre_mix_reduce,
 ):
     tokens, _, hidden = residual.shape
     splits = compute_mhc_num_splits(
@@ -1764,7 +1772,7 @@ def _mhc_mixes_impl(
         prenorm_gemm(
             residual.view(tokens, 4 * hidden), weight, projection, square_sum, splits
         )
-        mhc_pre_mix_hc4(
+        pre_mix_reduce(
             projection,
             square_sum,
             scale,
@@ -1803,6 +1811,7 @@ def triton_mhc_mixes(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_it
         hc_eps,
         sinkhorn_iters,
         _mhc_prenorm_gemm_triton,
+        mhc_pre_mix_hc4,
     )
 
 

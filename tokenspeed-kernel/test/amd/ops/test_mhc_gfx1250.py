@@ -41,6 +41,7 @@ from tokenspeed_kernel.signature import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.gfx1250.mhc import (  # noqa: E402
     gluon_mhc_mixes_project_gfx1250,
+    gluon_mhc_mixes_reduce_gfx1250,
     launch_gluon_mhc_mixes_project_gfx1250,
     use_gluon_mhc_mixes_project_gfx1250,
 )
@@ -152,9 +153,13 @@ def test_projection_varying_tokens_reuse_compiled_kernels() -> None:
     def run(tokens: int) -> None:
         _run(_operands(tokens, 5120, seed=tokens)[0], weight, scale, base)
 
-    # Warm both tile widths: 64-wide K tiles at 64 or more splits, 128-wide below.
-    for tokens in (1, 2048):
+    # Warm both tile widths (64-wide K tiles at 64 or more splits, 128-wide
+    # below) and the three reduction layouts (splits in registers, also over
+    # lanes beyond 256 tokens, and also over waves at or below).
+    for tokens in (1, 848, 8192):
         run(tokens)
-    with assert_no_triton_compile(gluon_mhc_mixes_project_gfx1250):
-        for tokens in (6, 192, 848, 8192):
+    with assert_no_triton_compile(
+        gluon_mhc_mixes_project_gfx1250, gluon_mhc_mixes_reduce_gfx1250
+    ):
+        for tokens in (6, 192, 600, 2048, 4097):
             run(tokens)

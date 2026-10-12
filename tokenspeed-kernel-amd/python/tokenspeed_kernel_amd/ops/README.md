@@ -1789,9 +1789,10 @@ four branches across waves, so the gate tensor never reaches memory.
 ### gfx1250 mHC mixes projection
 
 `gluon_mhc_mixes_gfx1250` computes the hc=4 prenorm mixing coefficients for
-BF16 residual streams. It shares split selection, normalization, and the
-Sinkhorn iterations with `triton_mhc_mixes`, and replaces only the projection
-`x @ fn.T` with its row sums of squares.
+BF16 residual streams. It shares split selection with `triton_mhc_mixes` and
+replaces both of its kernels: the projection `x @ fn.T` with its row sums of
+squares, and the reduction that runs normalization and the Sinkhorn
+iterations.
 
 #### Contract
 
@@ -1810,6 +1811,10 @@ give the FP32 projection up to accumulation order. Each program covers 64 rows
 and one K partition, pipelines K tiles through three or four TDM buffers, and
 pads the 24 mixes to two 16-wide WMMA tiles. The token count and tiles per
 partition are runtime arguments.
+
+The reduction is the gfx950 kernel on 32-lane waves: sixteen lanes own a
+token's 4x4 matrix, so a wave covers two tokens when the splits stay in
+registers and one when they also spread over lanes.
 
 ## Quantization
 
