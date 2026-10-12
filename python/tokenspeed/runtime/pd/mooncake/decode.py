@@ -338,6 +338,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
                     room,
                     f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
                 )
+                self.kv_transfer_metrics.record_kv_transfer_failure()
                 self.update_status(room, TransferPoll.Failed)
                 affected_rooms.append(room)
         logger.error(

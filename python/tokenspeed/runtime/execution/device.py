@@ -1831,7 +1831,7 @@ def _build_kv_transfer(
             bootstrap_port=server_args.disaggregation_bootstrap_port,
             dist_init_addr=server_args.dist_init_addr,
             topology=topology,
-            enable_metrics=False,
+            enable_metrics=server_args.enable_metrics,
             served_model_name=server_args.served_model_name,
             app_key=server_args.app_key,
             metrics_reporters=server_args.metrics_reporters,
