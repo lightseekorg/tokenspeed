@@ -485,3 +485,74 @@ def test_decode_add3_row_count_does_not_recompile() -> None:
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (2, 6, 7, 12, 14, 20, 27, 31):
             run(rows)
+
+
+# Qwen3.8-Flash-Next TP2 decode shapes: split-K with N not a multiple of
+# BLOCK_N (hyper-connection mix-down), every K tile in flight (mix-up), and
+# single-pass tiles, each at a ragged row count inside its bucket.
+_QWEN38_DECODE_CASES = [
+    pytest.param((61, 324, 10240), id="hc-down-splitk-ragged-n"),
+    pytest.param((5, 324, 10240), id="hc-down-splitk-small-m"),
+    pytest.param((13, 10240, 320), id="hc-up-all-tiles-in-flight"),
+    pytest.param((50, 10240, 320), id="hc-up-64-row-tile"),
+    pytest.param((64, 2560, 3072), id="out-proj"),
+    pytest.param((30, 512, 2560), id="router"),
+    pytest.param((3, 640, 2560), id="indexer"),
+    pytest.param((16, 2560, 2560), id="mtp-fc"),
+    pytest.param((11, 8240, 2560), id="gdn-in-proj-ragged-n"),
+]
+
+
+@pytest.mark.parametrize("shape", _QWEN38_DECODE_CASES)
+def test_qwen38_decode_gemm_matches_reference(shape: tuple[int, int, int]) -> None:
+    torch.manual_seed(0)
+    m, n, k = shape
+    assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    for _ in range(2):
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+        out = launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
+
+
+def test_qwen38_decode_keeps_hipblaslt_for_wide_projections() -> None:
+    # The fused GDN and attention input projections stream 34-42 MB of
+    # weight; hipBLASLt keeps the row counts where it runs as fast.
+    assert supports_gluon_mm_a16w16_decode_gfx950(16, 8240, 2560)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(64, 8240, 2560)
+    assert supports_gluon_mm_a16w16_decode_gfx950(4, 6656, 2560)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(16, 6656, 2560)
+
+
+def test_qwen38_decode_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    n, k = 324, 10240
+    a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def run(rows):
+        out = launch_gluon_mm_a16w16_decode_gfx950(a[:rows], b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+
+    for rows in (3, 4, 5, 8, 9, 16, 17, 32, 33, 64):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
+            run(rows)
+
+
+def test_qwen38_coalesced_store_masks_strided_out() -> None:
+    # The 64x64 mix-up tile stores through the coalesced row layout; a padded
+    # row stride and ragged rows must stay inside the output view.
+    torch.manual_seed(0)
+    m, n, k = 50, 10240, 320
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    backing = torch.full((m, n + 8), 7.0, device="cuda", dtype=torch.bfloat16)
+    out = backing[:, :n]
+
+    actual = launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.bfloat16, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
+    assert torch.all(backing[:, n:] == 7.0)

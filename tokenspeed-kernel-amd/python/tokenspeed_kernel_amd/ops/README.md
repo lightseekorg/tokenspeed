@@ -50,8 +50,8 @@ skew and regress perf even when the generated kernel remains correct.
 ### gfx950 dense BF16 projections
 
 The gfx950 package provides dense BF16 projection kernels: an eight-wave
-warp-pipeline prefill kernel, and a split-K tiled MFMA kernel for Kimi K3
-decode batches.
+warp-pipeline prefill kernel, and a split-K tiled MFMA kernel for Kimi K3 and
+Qwen3.8-Flash-Next decode batches.
 
 #### Contract
 
@@ -69,7 +69,9 @@ decode batches.
   or FP32 (the MoE router). It runs only `(N, K)` and M buckets
   (`4, 8, 16, 32, 64`) with a measured config in `_DECODE_CONFIGS`; each
   entry beat `torch.mm` (hipBLASLt) by at least 4% in cold-cache sweeps at
-  Kimi K3 TP8 shapes.
+  Kimi K3 TP8 and Qwen3.8-Flash-Next TP2 shapes. Qwen's wide fused GDN and
+  attention input projections stay on hipBLASLt, which streams their weights
+  near HBM bandwidth.
 - `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
   one launch, adding both BF16 addends to the FP32 accumulator before the
   single rounding. It reuses the decode tile for `M` and accepts only buckets
@@ -92,15 +94,19 @@ vectorized buffer operations. Partial tiles clamp out-of-range rows and
 columns onto the last valid one and mask them out of the stores. XCD-aware
 grouped tile ordering distributes adjacent output tiles across the eight XCDs.
 
-Decode GEMMs are weight-bandwidth bound, so the decode kernel uses 16- or
-32-row tiles over one- to three-buffer LDS pipelines and splits K when the
-output alone has too few tiles to fill the GPU. Each split writes an FP32
-partial through to memory, waits for its stores, and bumps a per-tile counter
-with a relaxed atomic; the last split to arrive sums all partials in split
-order with cache-bypassing loads, writes C, and resets the counter, so one
-launch does both phases without an acquire-release fence and results are
-deterministic. An optional XCD remap keeps the M tiles that
-share a weight tile on one XCD's L2.
+Decode GEMMs are weight-bandwidth bound, so the decode kernel uses 16- to
+64-row tiles over one- to three-buffer LDS pipelines and splits K when the
+output alone has too few tiles to fill the GPU. When a program's K range has at
+most eight tiles, it can instead give each tile its own LDS buffer and issue
+every copy up front, waiting on one memory round trip rather than one per
+refilled buffer (the Qwen hyper-connection mix-up has K = 320). Each split
+writes an FP32 partial through to memory, waits for its stores, and bumps a
+per-tile counter with a relaxed atomic; the last split to arrive sums all
+partials in split order with cache-bypassing loads, writes C, and resets the
+counter, so one launch does both phases without an acquire-release fence and
+results are deterministic. Tiles with at least eight outputs per lane store C
+through a row-contiguous layout, 16 bytes per lane. An optional XCD remap
+keeps the M tiles that share a weight tile on one XCD's L2.
 
 ### gfx950 MXFP8 projection
 

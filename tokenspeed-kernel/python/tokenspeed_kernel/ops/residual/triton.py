@@ -27,6 +27,7 @@ from functools import cache
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
@@ -263,12 +264,23 @@ def triton_hyperconnection_mix(
     """GEMM plus Triton-epilogue path for general decode and prefill shapes."""
     # Model loading aligns BF16/FP16 GEMM output widths; discard only the
     # extra output columns, preserving the GEMM's aligned row stride.
-    projected = F.linear(normalized, projection_weight)[:, :projection_rows]
+    projected = _dense_linear(normalized, projection_weight)[:, :projection_rows]
     activated, inject = _launch_projection_epilogue(
         projected, lowrank, hc_count, projection_scale
     )
-    gate = F.linear(activated, up_weight)
+    gate = _dense_linear(activated, up_weight)
     return _launch_mix_epilogue(gate, normalized, hc_count, hidden_size), inject
+
+
+def _dense_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T``, taking the decode GEMM that dense linear layers use.
+
+    Row counts the decode registry covers (for example the gfx950 Gluon
+    kernels for the measured shapes) take it; others keep ``F.linear``.
+    """
+    if use_decode_gemv(x, weight):
+        return decode_gemv(x, weight)
+    return F.linear(x, weight)
 
 
 @register_kernel(
