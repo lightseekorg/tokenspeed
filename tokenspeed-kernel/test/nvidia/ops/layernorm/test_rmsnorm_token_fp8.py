@@ -1,0 +1,68 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""RMSNorm's per-token FP8 output (``rmsnorm(..., token_fp8_out=...)``).
+
+The same launch writes the BF16 output, unchanged bit for bit, and its
+per-token FP8 E4M3 codes and FP32 scales, bit for bit those of
+``fp8_quantize_per_token`` of that output; with the residual and its BF16
+rounding, with and without the x and residual scales.
+"""
+
+import pytest
+import torch
+from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
+from tokenspeed_kernel.ops.quantization.triton import fp8_quantize_per_token
+from utils import is_nvidia
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_nvidia(), reason="NVIDIA GPU test"
+)
+
+FP8 = torch.float8_e4m3fn
+
+
+def _rows(rows, hidden, seed):
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(rows, hidden, device="cuda", generator=generator)
+    x[:, :: max(1, hidden // 7)] *= 20
+    return x.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("rows", [1, 7, 64])
+@pytest.mark.parametrize("scaled", [False, True])
+def test_rmsnorm_writes_the_per_token_fp8_of_its_output(rows, scaled):
+    hidden = 4096
+    x = _rows(rows, hidden, seed=12)
+    residual = _rows(rows, hidden, seed=13)
+    weight = (1 + 0.1 * torch.randn(hidden, device="cuda")).to(torch.bfloat16)
+    kwargs = dict(residual=residual, enable_pdl=None, round_residual_sum_bf16=True)
+    if scaled:
+        kwargs.update(x_scale=0.75, residual_scale=1.25)
+    out, residual_out = rmsnorm(x, weight, 1e-6, **kwargs)
+    codes = torch.empty(rows, hidden, device="cuda", dtype=FP8)
+    scales = torch.empty(rows, 1, device="cuda", dtype=torch.float32)
+    fused_out, fused_residual = rmsnorm(
+        x, weight, 1e-6, token_fp8_out=(codes, scales), **kwargs
+    )
+    assert torch.equal(out, fused_out) and torch.equal(residual_out, fused_residual)
+    expected_codes, expected_scales = fp8_quantize_per_token(out)
+    assert torch.equal(scales, expected_scales)
+    assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
