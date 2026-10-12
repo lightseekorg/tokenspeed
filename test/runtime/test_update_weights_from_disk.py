@@ -744,11 +744,13 @@ class TestReloadMatchesStartupLoad(unittest.TestCase):
     def test_models_own_checkpoint_load_group_wins(self):
         _write_checkpoint(self.root / "step-1", scale=7.0)
         model = _TinyModel()
-        model.checkpoint_load_group = (2, 3)
+        # The loading rank (0 here) belongs to every group it reads with; the
+        # loader splits shard prefetch among the group's ranks on this node.
+        model.checkpoint_load_group = (0, 2)
         runner = _runner(model, self.root / "step-1")
         runner.checkpoint_load_group = (0, 1)
 
-        self.assertEqual(self._groups_read(runner, self.root / "step-1"), [(2, 3)])
+        self.assertEqual(self._groups_read(runner, self.root / "step-1"), [(0, 2)])
 
 
 if __name__ == "__main__":
