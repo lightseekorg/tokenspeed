@@ -355,14 +355,20 @@ QKVFAB, QKV+gate, and add3 run the 64-row tile without split-K.
 
 Up to 16 rows, general dense projections use a two-warp `16 x 32` tile when
 `N` is divisible by 32 and has at least 192 such tiles; other accepted `N`
-uses one warp and a `16 x 16` tile. They use 256-wide K tiles when K is
-divisible by 256, falling back to 128-wide tiles otherwise, and request six
-TDM buffers. At up to 16 rows, KDA QKVFAB keeps its one-warp `16 x 16 x 128`
-tile and seven buffers, and add3 uses a two-warp `16 x 32` tile. The add3
-epilogue loads `X` and `Y` for the stored tile. The buffer count is clamped
-to the K tiles available per split. Once the K tiles fill that pipeline, the
-tail lowers the TDM wait before each remaining LDS read. Short K dimensions
-prefetch only valid tiles and drain each remaining pair before reading it.
+uses one warp and a `16 x 16` tile. KDA QKVFAB and MLA QKV+gate use the
+one-warp tile, and add3 uses the two-warp tile. All use 256-wide K tiles when
+K is divisible by 256, falling back to 128-wide tiles otherwise. The add3
+epilogue loads `X` and `Y` for the stored tile.
+
+The weight stream is latency bound per program: the TDM buffers ahead of the
+WMMAs set the bytes in flight. K3 projections request eight buffers and the
+BF16 GEMM below keeps its per-tile counts; launches cap the request by the K
+tiles per split and by LDS: a grid past 256 CUs keeps two programs resident
+on a CU, and they share its 320 KB. One K loop serves every tile and K length. It
+keeps up to `buffers - 1` A/B TDM pairs in flight, waits only for the next
+tile, and reads that tile from LDS while the current tile's WMMAs run. Each
+tile's two K halves accumulate separately and are summed after the loop, so
+the WMMAs do not form one long dependent chain.
 
 Both paths accumulate in FP32 and round to BF16 once. Direct launches store
 that conversion from the producer. Split-K launches write one FP32 partial

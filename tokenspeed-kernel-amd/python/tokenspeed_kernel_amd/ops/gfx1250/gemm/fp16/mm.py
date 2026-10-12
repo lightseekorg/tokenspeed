@@ -46,6 +46,9 @@ _DENSE_M64_MAX_N = 8192
 _NUM_CUS = 256
 _REDUCE_BLOCK_N = 512
 _MID_M_SPLIT_K = (5, 4, 2)
+_LDS_BYTES = 320 * 1024
+# Requested TDM buffers; _dense_num_buffers caps them by K and LDS.
+_DENSE_BUFFERS = 8
 _WARP_BASES_1 = ()
 _WARP_BASES_2 = ((0, 1),)
 _WARP_BASES_M2 = ((1, 0),)
@@ -204,56 +207,68 @@ def _wmma_tdm_dense_kernel(
 
     num_k_tiles: gl.constexpr = K // BLOCK_K // SPLIT_K
     k_base = pid_split * num_k_tiles
+    # Each K tile is one A and one B TDM load into buffer tile % NUM_BUFFERS;
+    # NUM_BUFFERS - 1 tiles stay in flight ahead of the tile being read.
     for tile in gl.static_range(min(NUM_BUFFERS - 1, num_k_tiles)):
         offset = (k_base + tile) * BLOCK_K
         gl.amd.cdna5.tdm.async_load(a_desc, [0, offset], a_smem.index(tile))
         gl.amd.cdna5.tdm.async_load(b_desc, [0, offset], b_smem.index(tile))
 
+    # The loop reads tile t + 1 from LDS while tile t's WMMAs run, and splits
+    # each K tile into two halves with separate accumulators, so neither the
+    # LDS latency nor one long dependent WMMA chain serializes a tile.
+    half_k: gl.constexpr = BLOCK_K // 2
     acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, wmma_layout)
-    if num_k_tiles >= NUM_BUFFERS:
-        # Lower the wait before each tail load. A fixed wait leaves the newest
-        # A/B pairs outstanding, so the next iteration can read them early.
-        main_k_tiles: gl.constexpr = num_k_tiles - (NUM_BUFFERS - 1)
-        gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
-        for tile in gl.static_range(main_k_tiles):
-            with gl.amd.warp_pipeline_stage("tdm+lds", priority=1):
-                a = a_smem.index(tile % NUM_BUFFERS).load(layout=dot_layout_a)
-                b = (
-                    b_smem.index(tile % NUM_BUFFERS)
-                    .permute([1, 0])
-                    .load(layout=dot_layout_b)
-                )
-                prefetch_tile = tile + NUM_BUFFERS - 1
-                prefetch = (k_base + prefetch_tile) * BLOCK_K
-                gl.amd.cdna5.tdm.async_load(
-                    a_desc,
-                    [0, prefetch],
-                    a_smem.index(prefetch_tile % NUM_BUFFERS),
-                )
-                gl.amd.cdna5.tdm.async_load(
-                    b_desc,
-                    [0, prefetch],
-                    b_smem.index(prefetch_tile % NUM_BUFFERS),
-                )
-            gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2))
-            with gl.amd.warp_pipeline_stage("wmma", priority=0):
-                acc = gl.amd.cdna5.wmma(a, b, acc)
-        for tail in gl.static_range(NUM_BUFFERS - 1):
-            gl.amd.cdna5.tdm.async_wait(2 * (NUM_BUFFERS - 2 - tail))
-            tile = main_k_tiles + tail
-            a = a_smem.index(tile % NUM_BUFFERS).load(layout=dot_layout_a)
-            b = (
-                b_smem.index(tile % NUM_BUFFERS)
+    acc_hi = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, wmma_layout)
+    gl.amd.cdna5.tdm.async_wait(2 * (min(NUM_BUFFERS - 1, num_k_tiles) - 1))
+    a_lo = a_smem.index(0).slice(0, half_k, 1).load(layout=dot_layout_a)
+    b_lo = b_smem.index(0).slice(0, half_k, 1).permute([1, 0]).load(layout=dot_layout_b)
+    a_hi = a_smem.index(0).slice(half_k, half_k, 1).load(layout=dot_layout_a)
+    b_hi = (
+        b_smem.index(0)
+        .slice(half_k, half_k, 1)
+        .permute([1, 0])
+        .load(layout=dot_layout_b)
+    )
+    for tile in gl.static_range(num_k_tiles):
+        if tile + NUM_BUFFERS - 1 < num_k_tiles:
+            # This buffer held tile - 1, which is already in registers.
+            offset = (k_base + tile + NUM_BUFFERS - 1) * BLOCK_K
+            buffer = (tile + NUM_BUFFERS - 1) % NUM_BUFFERS
+            gl.amd.cdna5.tdm.async_load(a_desc, [0, offset], a_smem.index(buffer))
+            gl.amd.cdna5.tdm.async_load(b_desc, [0, offset], b_smem.index(buffer))
+        if tile + 1 < num_k_tiles:
+            # Wait for tile + 1 only; later tiles' A/B pairs stay in flight.
+            gl.amd.cdna5.tdm.async_wait(
+                2 * (min(tile + NUM_BUFFERS - 1, num_k_tiles - 1) - tile - 1)
+            )
+            buffer = (tile + 1) % NUM_BUFFERS
+            next_a_lo = (
+                a_smem.index(buffer).slice(0, half_k, 1).load(layout=dot_layout_a)
+            )
+            next_b_lo = (
+                b_smem.index(buffer)
+                .slice(0, half_k, 1)
                 .permute([1, 0])
                 .load(layout=dot_layout_b)
             )
-            acc = gl.amd.cdna5.wmma(a, b, acc)
-    else:
-        for tile in gl.static_range(num_k_tiles):
-            gl.amd.cdna5.tdm.async_wait(2 * (num_k_tiles - 1 - tile))
-            a = a_smem.index(tile).load(layout=dot_layout_a)
-            b = b_smem.index(tile).permute([1, 0]).load(layout=dot_layout_b)
-            acc = gl.amd.cdna5.wmma(a, b, acc)
+            next_a_hi = (
+                a_smem.index(buffer).slice(half_k, half_k, 1).load(layout=dot_layout_a)
+            )
+            next_b_hi = (
+                b_smem.index(buffer)
+                .slice(half_k, half_k, 1)
+                .permute([1, 0])
+                .load(layout=dot_layout_b)
+            )
+        acc = gl.amd.cdna5.wmma(a_lo, b_lo, acc)
+        acc_hi = gl.amd.cdna5.wmma(a_hi, b_hi, acc_hi)
+        if tile + 1 < num_k_tiles:
+            a_lo = next_a_lo
+            b_lo = next_b_lo
+            a_hi = next_a_hi
+            b_hi = next_b_hi
+    acc = acc + acc_hi
     gl.amd.cdna5.tdm.async_wait(0)
 
     tile_m = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, wmma_layout))
@@ -364,6 +379,27 @@ def _dense_split_k(
     return 1
 
 
+def _dense_num_buffers(
+    requested: int,
+    k_tiles: int,
+    ctas: int,
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+) -> int:
+    """Return the TDM buffer count: the request, capped by K and by LDS.
+
+    Decode streams B once, so the buffers ahead of the WMMAs set the bytes in
+    flight. A grid past 256 CUs keeps two programs resident on a CU, which
+    then split its 320 KB; deeper buffers beat a third resident program. The
+    padded layout adds 8 elements per 256.
+    """
+    stage_bytes = (block_m + block_n) * block_k * 2 * 264 // 256
+    per_cta = _LDS_BYTES // min(triton.cdiv(ctas, _NUM_CUS), 2)
+    return max(2, min(requested, k_tiles, per_cta // stage_bytes))
+
+
 def _launch_wmma_tdm_dense_tiles(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -400,7 +436,14 @@ def _launch_wmma_tdm_dense_tiles(
         )
     if split_k > 1 and addends is not None:
         raise ValueError("the add3 epilogue needs split_k=1")
-    num_buffers = max(2, min(num_buffers, k_tiles // split_k))
+    num_buffers = _dense_num_buffers(
+        num_buffers,
+        k_tiles // split_k,
+        triton.cdiv(n, block_n) * split_k * triton.cdiv(m, block_m),
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+    )
     partial = (
         torch.empty((split_k, m, n), device=A.device, dtype=torch.float32)
         if split_k > 1
@@ -554,7 +597,7 @@ def gluon_wmma_tdm_dense_gfx1250(
             block_k=block_k,
             warp_bases=_WARP_BASES_4,
             split_k=split_k,
-            num_buffers=6,
+            num_buffers=_DENSE_BUFFERS,
         )
         return out
     # One warp per 16-column WMMA tile along N.
@@ -568,7 +611,7 @@ def gluon_wmma_tdm_dense_gfx1250(
         block_k=block_k,
         warp_bases=_WARP_BASES_2 if block_n == 32 else _WARP_BASES_1,
         split_k=split_k,
-        num_buffers=6,
+        num_buffers=_DENSE_BUFFERS,
     )
     return out
 
@@ -605,7 +648,7 @@ def gluon_wmma_tdm_mla_qkv_gate_gfx1250(
             block_k=256,
             warp_bases=_WARP_BASES_4,
             split_k=1,
-            num_buffers=6,
+            num_buffers=_DENSE_BUFFERS,
         )
         return out
     _launch_wmma_tdm_dense_tiles(
@@ -617,7 +660,7 @@ def gluon_wmma_tdm_mla_qkv_gate_gfx1250(
         block_k=256,
         warp_bases=_WARP_BASES_1,
         split_k=None,
-        num_buffers=6,
+        num_buffers=_DENSE_BUFFERS,
     )
     return out
 
@@ -668,7 +711,7 @@ def gluon_wmma_tdm_kda_qkvfab_gfx1250(
             block_k=256,
             warp_bases=_WARP_BASES_4,
             split_k=1,
-            num_buffers=6,
+            num_buffers=_DENSE_BUFFERS,
         )
         return out
     _launch_wmma_tdm_dense_tiles(
@@ -677,10 +720,10 @@ def gluon_wmma_tdm_kda_qkvfab_gfx1250(
         out,
         block_m=16,
         block_n=16,
-        block_k=128,
+        block_k=256,
         warp_bases=_WARP_BASES_1,
         split_k=None,
-        num_buffers=7,
+        num_buffers=_DENSE_BUFFERS,
     )
     return out
 
@@ -946,7 +989,7 @@ def gluon_wmma_tdm_add3_gfx1250(
         block_k=256,
         warp_bases=warp_bases,
         split_k=1,
-        num_buffers=6,
+        num_buffers=_DENSE_BUFFERS,
         addends=(addend_a, addend_b),
     )
     return out
