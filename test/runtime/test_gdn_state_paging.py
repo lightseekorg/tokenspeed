@@ -917,7 +917,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
                 **common,
             )
 
-        # Prompt ends inside what used to be an aligned span: 7 of 11 tokens.
+        # Boundaries off any kernel-chunk multiple: 7, 4 and 10 of 11 tokens.
         for boundary in (7, 4, 10):
             with (
                 self.subTest(boundary=boundary),

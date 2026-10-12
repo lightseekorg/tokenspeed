@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Exercise final-extent scheduling through the runtime configuration bridge."""
+"""Exercise chunked prefill and decode through the runtime configuration bridge."""
 
 import pytest
 
@@ -27,20 +27,7 @@ ts = pytest.importorskip("tokenspeed_scheduler")
 from tokenspeed.runtime.engine.scheduler_utils import make_config
 
 
-@pytest.mark.parametrize("disable_prefix_cache", [False, True])
-@pytest.mark.parametrize("with_state", [False, True])
-@pytest.mark.parametrize("token_budget, lengths", [(1024, [868]), (768, [768, 100])])
-def test_final_extent_and_decode_through_runtime_config(
-    disable_prefix_cache: bool,
-    with_state: bool,
-    token_budget: int,
-    lengths: list[int],
-) -> None:
-    """Cover whole/chunked prefill and decode across cache and model families.
-
-    There is no prefix hit or promotion here: only the token budget can shorten
-    the 868-token extent. This checks scheduling, not GPU checkpoint contents.
-    """
+def _groups(with_state: bool) -> list:
     groups = [
         ts.CacheGroupConfig(
             group_id="history",
@@ -51,15 +38,20 @@ def test_final_extent_and_decode_through_runtime_config(
         )
     ]
     if with_state:
+        # A state group covers no token span; the bridge sends 0 for it.
         groups.append(
             ts.CacheGroupConfig(
                 group_id="state",
-                block_granularity=128,
+                block_granularity=0,
                 total_pages=64,
                 retention=ts.CacheRetention.FullHistory,
                 family=ts.CacheGroupFamily.State,
             )
         )
+    return groups
+
+
+def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: bool):
     cfg = make_config(
         num_device_pages=64,
         max_scheduled_tokens=token_budget,
@@ -76,11 +68,35 @@ def test_final_extent_and_decode_through_runtime_config(
         decode_input_tokens=1,
         overlap_schedule_depth=0,
         disable_prefix_cache=disable_prefix_cache,
-        cache_groups=groups,
+        cache_groups=_groups(with_state),
         enable_mixed_prefill_decode=False,
         prefix_replay_tokens=0,
     )
-    scheduler = ts.Scheduler(cfg)
+    return ts.Scheduler(cfg)
+
+
+def _state_row(batch) -> list[int]:
+    return list(batch.block_tables_arrays()["state"][0, :2])
+
+
+@pytest.mark.parametrize("disable_prefix_cache", [False, True])
+@pytest.mark.parametrize("with_state", [False, True])
+@pytest.mark.parametrize(
+    "token_budget, lengths", [(1024, [868]), (768, [768, 100]), (300, [300, 300, 268])]
+)
+def test_chunks_follow_the_budget_alone(
+    disable_prefix_cache: bool,
+    with_state: bool,
+    token_budget: int,
+    lengths: list[int],
+) -> None:
+    """A state group does not shape the prefill chunk: chunks end where the
+    token budget says, on a page boundary or not, and decode follows."""
+    scheduler = _scheduler(
+        token_budget=token_budget,
+        with_state=with_state,
+        disable_prefix_cache=disable_prefix_cache,
+    )
     request = ts.RequestSpec()
     request.request_id = "prefill"
     request.tokens = list(range(868))
@@ -110,3 +126,49 @@ def test_final_extent_and_decode_through_runtime_config(
     assert list(forwards[0].decode_input_ids) == [-1]
     assert list(forwards[0].input_lengths) == [1]
     assert forwards[0].num_extends() == 0
+
+
+def test_state_rows_rotate_between_chunks_and_into_the_first_decode() -> None:
+    """A state group's row is two slots: the first chunk reads the zero state
+    (slot 0 null) and writes slot 1; each later chunk reads the previous live
+    block, rotated into slot 0, and writes a fresh slot 1; the first decode
+    reads the prompt-end block from slot 0 and writes a fresh live block, and
+    every later decode evolves that block in place with slot 0 released."""
+    scheduler = _scheduler(token_budget=300, with_state=True, disable_prefix_cache=True)
+    request = ts.RequestSpec()
+    request.request_id = "r"
+    request.tokens = list(range(700))
+    request.max_new_tokens = 4
+    scheduler.submit_requests([request])
+
+    rows = []
+    for computed in (300, 600, 700):
+        plan = scheduler.next_execution_plan()
+        (batch,) = [op for op in plan.forward if op.request_ids]
+        rows.append(_state_row(batch))
+        result = ts.ForwardEvent.ExtendResult()
+        result.request_id = "r"
+        result.tokens = [900] if computed == 700 else []
+        event = ts.ExecutionEvent()
+        event.add_event(result)
+        scheduler.advance(event)
+    first, second, third = rows
+    assert first[0] == 0 and first[1] > 0
+    assert second[0] == first[1] and second[1] > 0 and second[1] != second[0]
+    assert third[0] == second[1] and third[1] > 0 and third[1] != third[0]
+
+    plan = scheduler.next_execution_plan()
+    (decode,) = [op for op in plan.forward if op.request_ids]
+    decode_row = _state_row(decode)
+    assert decode_row[0] == third[1] and decode_row[1] > 0
+    assert decode_row[1] != decode_row[0]
+    result = ts.ForwardEvent.ExtendResult()
+    result.request_id = "r"
+    result.tokens = [901]
+    event = ts.ExecutionEvent()
+    event.add_event(result)
+    scheduler.advance(event)
+
+    plan = scheduler.next_execution_plan()
+    (decode,) = [op for op in plan.forward if op.request_ids]
+    assert _state_row(decode) == [0, decode_row[1]]
