@@ -3269,7 +3269,7 @@ class ServerArgs:
             help="Request capacities for inline prefill attention capture; "
             "replay rounds up to the smallest fitting captured batch size. "
             "Unset: the minimum request count that fits each token bucket within "
-            "the model context. KDA uses fixed checkpoint slots, so each token "
+            "the model context. KDA captures a fixed request count, so each token "
             "bucket needs one inline variant per configured request count. "
             "Adding request counts increases capture time and memory. "
             "This does not replace the scheduler's --max-num-seqs limit. "

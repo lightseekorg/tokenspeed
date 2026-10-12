@@ -49,7 +49,7 @@ class HybridLinearAttnBackend(AttentionBackend):
     """Hybrid backend that routes between full attention and linear attention by layer ID."""
 
     # Both sub-backends consume per-group tables (MHA: KV pages; Mamba:
-    # dual-index state pages). Target verify publishes only the accepted
+    # two-slot state tables). Target verify publishes only the accepted
     # position.
 
     def __init__(

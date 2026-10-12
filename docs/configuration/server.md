@@ -369,7 +369,7 @@ for gateway discovery.
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
-| `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's unaligned tail pages, its blocks of groups Host L2 never holds, and its slot state; the hash-complete blocks go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
+| `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's blocks of groups Host L2 never holds, and its slot state; the published blocks, the partial last page included, go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
 | `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` makes every resident suspendable), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
 | `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, i.e. the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, which covers every resident request of the rank; refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
 | `--debug-force-retraction-interval` | **Test only.** Every `N` scheduler plans retract the oldest quiescent decoding request (`N > 0`), or with `-N` the one prefilling request between its chunks, without capacity pressure, so a test run exercises the suspend/restore path on every request (the bitwise continuation oracle of [Numerics](../design/numerics.md)). Refused with `--retraction-snapshot-ratio 0` (no pool to image into). `0` (the default) is off; never set it in serving. |
@@ -768,15 +768,16 @@ pinned Host memory, and once Device pages are free again the image is copied
 back and the request continues exactly where it stopped -- a decoding
 request decodes, a mid-prompt request runs its next chunk
 (`docs/design/scheduler.md` section 4). The image is split: the
-hash-complete prefix pages go to Host L2 as a stream-ordered write-back and
-stay pinned there until the restore; the unaligned tail, the blocks of
-groups L2 never holds (a replayable sliding-window group, a state group's
-live block) and the slot-state blob go to the request-private pool
+retraction publishes the victim's completed prefix like a finish, its
+partial last page included, and those pages go to Host L2 as a
+stream-ordered write-back and stay pinned there until the restore; the
+blocks of groups L2 never holds (a replayable sliding-window group, a state
+group's live block) and the slot-state blob go to the request-private pool
 (`docs/design/cache-concepts.md`, "Retraction image"). The two buffers are
 separate allocations of one Host cache executor and both count against its
 Host-memory headroom check. The pool is independent of the KVStore: with
 `--disable-kvstore` there is no L2 leg and the pool holds whole images; with
-L2 it holds the tails plus the slot-state blob.
+L2 it holds the unpublished blocks plus the slot-state blob.
 
 **Sizing.** The pool is on by default on the roles that retract and sized
 like the Host KVStore, in LCM blocks of the rank's transfer layout
@@ -792,12 +793,12 @@ The first rule that applies wins:
 | neither, `--disable-kvstore` | 0.1 x this rank's Device LCM blocks (whole images) | same as above |
 | neither, Host KVStore on | request cap x one image tail | same as above |
 
-One image tail, per cache group, is one page for a group that publishes
-to Host L2 (its unaligned last page; a state group's live block) and a
-request's worst-case pages at the context limit for a group that never
-publishes (a replayable sliding-window group), folded to LCM blocks by the
-scheduler's `CapacityModel`, so the pool is counted the way the scheduler
-later claims it. Without the KVStore a whole image is the request's every
+One image tail, per cache group, is one block for a group that publishes
+to Host L2 (a state group's live block; a history group's partial last page
+is published, so none) and a request's worst-case pages at the context limit
+for a group that never publishes (a replayable sliding-window group), folded
+to LCM blocks by the scheduler's `CapacityModel`, so the pool is counted the
+way the scheduler later claims it. Without the KVStore a whole image is the request's every
 page, so the default is a tenth of the Device KV rather than all of it: an
 on-by-default pool must stay cheap to pin (the Device KV once is hundreds of
 gigabytes of pinned Host memory for a small model on a large GPU), and it

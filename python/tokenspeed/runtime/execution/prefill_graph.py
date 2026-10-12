@@ -504,7 +504,6 @@ class PrefillGraph:
         self._captured_hidden_mode = None
         # One owner for ordinary and attention-containing captures. None is the
         # batch-independent attention-break variant; integers require exact BS.
-        # Checkpoint counts are refreshed metadata, never another capture key.
         self._captures: dict[
             tuple[int, int | None], tuple[BreakableCapture, CapturedForward]
         ] = {}
@@ -669,7 +668,7 @@ class PrefillGraph:
                 logger.info(
                     "prefill inline attention: captured (tokens, requests) "
                     f"{sorted(variants)!s} "
-                    "with fixed checkpoint slots "
+                    "with fixed request slots "
                     f"(segments={next(iter(variants.values()))[0].num_segments:d}, "
                     "ordinary captures retained for fallback)",
                 )
