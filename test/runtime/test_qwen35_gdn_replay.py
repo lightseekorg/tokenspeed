@@ -391,7 +391,8 @@ def test_staged_verify_reading_committed_state_matches_seeded_scratch(
     state_dtype, parents
 ):
     """A staged verify that reads the committed state in place (no seed copy
-    into the scratch) verifies and commits exactly like the seeded scratch."""
+    into the scratch) and q/k/v as packed conv-output views (no split copy)
+    verifies and commits exactly like the seeded scratch and split inputs."""
     draft_tokens = DRAFT_TOKENS if parents is None else len(parents[0])
     conv, recurrent = _initial_pools(state_dtype=state_dtype)
     results = []
@@ -400,6 +401,7 @@ def test_staged_verify_reading_committed_state_matches_seeded_scratch(
             conv.clone(), recurrent.clone(), replay=False, draft_tokens=draft_tokens
         )
         backend._verify_reads_committed_recurrent_state = in_place
+        backend._verify_packed_qkv_views = in_place
         if parents is not None:
             backend.bind_tree_verify(_tree_verify_inputs(parents))
         out = _prepare_verify(backend, pool, _inputs(draft_tokens=draft_tokens))
