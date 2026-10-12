@@ -38,7 +38,12 @@ from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["prepare_attn_res_fwd", "prepare_mhc_mixes", "prepare_mhc_post"]
+__all__ = [
+    "prepare_attn_res_fwd",
+    "prepare_mhc_apply_pre",
+    "prepare_mhc_mixes",
+    "prepare_mhc_post",
+]
 
 
 _IMPLEMENTED_MODEL_PROFILES = frozenset({"kimi_k3_tp8"})
@@ -298,6 +303,85 @@ def prepare_mhc_mixes(
             "sinkhorn_iters": sinkhorn_iters,
             "rms_eps": rms_eps,
             "hc_eps": hc_eps,
+            "dtype": "bfloat16",
+        },
+        validation=None,
+    )
+
+
+def prepare_mhc_apply_pre(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one mHC collapse of the residual streams into a layer input.
+
+    DeepSeek V4.1 collapses the streams with the previous sublayer's pre
+    coefficients before attention and before the FFN of every layer, fusing
+    the following RMSNorm (``fused_norm``); only the final norm uses the plain
+    collapse. ``rms_eps`` is given exactly when ``fused_norm`` is set.
+    """
+
+    model_profile, tokens, hc_mult, hidden_size = _mhc_common(request, "mhc_apply_pre")
+    parameters = request.parameters
+    fused_norm = parameters["fused_norm"]
+    if not isinstance(fused_norm, bool):
+        raise _invalid("mhc_apply_pre fused_norm must be a boolean")
+    rms_eps = parameters.get("rms_eps")
+    if fused_norm != (rms_eps is not None):
+        raise _invalid("mhc_apply_pre takes rms_eps exactly when fused_norm is set")
+    if rms_eps is not None:
+        rms_eps = float(rms_eps)
+    from tokenspeed_kernel.ops import residual as residual_ops
+
+    load_builtin_kernels()
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_apply_pre",
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                pre=dense_tensor_format(torch.float32),
+            ),
+            platform=platform,
+            traits={
+                "buffer_offsets_fit_int32": tokens * hc_mult * hidden_size < 2**31,
+                "fused_norm": fused_norm,
+                "hc_mult": hc_mult,
+            },
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError as error:
+        raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
+
+    residual, norm_weight = _random_tensors(
+        request.seed,
+        (tokens, hc_mult, hidden_size),
+        (hidden_size,),
+    )
+    if not fused_norm:
+        norm_weight = None
+    generator = torch.Generator(device="cuda").manual_seed(request.seed + 1)
+    # Pre coefficients are sigmoid outputs.
+    pre = torch.rand(
+        (tokens, hc_mult), device="cuda", dtype=torch.float32, generator=generator
+    )
+
+    def invoke() -> object:
+        return residual_ops.mhc_apply_pre(
+            residual, pre, norm_weight=norm_weight, norm_eps=rms_eps
+        )
+
+    return PreparedBenchmark(
+        registration=_registered_spec(kernel.name),
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            "model_profile": model_profile,
+            "tokens": tokens,
+            "hc_mult": hc_mult,
+            "hidden_size": hidden_size,
+            "fused_norm": fused_norm,
+            "rms_eps": rms_eps,
             "dtype": "bfloat16",
         },
         validation=None,

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import tokenspeed_kernel.benchmark.generators.residual as residual_generator
+import torch
 from tokenspeed_kernel.benchmark.harness import BenchmarkCaseError, BenchmarkRequest
 
 
@@ -69,6 +70,44 @@ def test_mhc_post_generator_selects_with_operation_traits(
     }
 
 
+@pytest.mark.parametrize("fused_norm", [True, False])
+def test_mhc_apply_pre_generator_selection_matches_operation_api(
+    monkeypatch: pytest.MonkeyPatch, fused_norm: bool
+) -> None:
+    from tokenspeed_kernel.ops import residual as residual_ops
+
+    captured: dict[str, object] = {}
+
+    def capture(source: str):
+        def select(family, mode, signature, **kwargs):
+            captured[source] = (family, mode, signature, kwargs["traits"])
+            raise RuntimeError("selection captured")
+
+        return select
+
+    monkeypatch.setattr(residual_ops, "select_kernel", capture("operation"))
+    monkeypatch.setattr(residual_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(residual_generator, "select_kernel", capture("generator"))
+
+    residual = torch.empty((192, 4, 5120), dtype=torch.bfloat16, device="meta")
+    pre = torch.empty((192, 4), dtype=torch.float32, device="meta")
+    norm_weight = torch.empty((5120,), dtype=torch.bfloat16, device="meta")
+    with pytest.raises(RuntimeError, match="selection captured"):
+        residual_ops.mhc_apply_pre(
+            residual,
+            pre,
+            norm_weight=norm_weight if fused_norm else None,
+            norm_eps=1e-20 if fused_norm else None,
+        )
+    request = _request("mhc_apply_pre", fused_norm=fused_norm)
+    if not fused_norm:
+        del request.parameters["rms_eps"]
+    with pytest.raises(RuntimeError, match="selection captured"):
+        residual_generator.prepare_mhc_apply_pre(request, None)
+
+    assert captured["generator"] == captured["operation"]
+
+
 @pytest.mark.parametrize(
     ("prepare", "mode", "overrides", "message"),
     [
@@ -83,6 +122,12 @@ def test_mhc_post_generator_selects_with_operation_traits(
             "mhc_post",
             {"model_profile": "kimi_k3_tp8"},
             "mHC model_profile",
+        ),
+        (
+            residual_generator.prepare_mhc_apply_pre,
+            "mhc_apply_pre",
+            {"fused_norm": False},
+            "rms_eps exactly when fused_norm",
         ),
     ],
 )
