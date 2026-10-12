@@ -293,11 +293,12 @@ def load_per_tensor_weight_scale(
 def load_channel_weight_scale(
     param: torch.nn.Parameter,
     loaded_weight: torch.Tensor,
-    shard_id: str,
-    local_expert_id: int,
+    shard_id: str | None = None,
+    local_expert_id: int | None = None,
     *,
     tp_rank: int,
     tp_size: int,
+    param_name: str = "expert weight scale",
     use_presharded_weights: bool = False,
 ) -> None:
     """Load one projection's scales into ``[experts, 2 * ispp]`` (w13) or
@@ -312,7 +313,23 @@ def load_channel_weight_scale(
     parallelism does not split: every rank holds all of them. Any other count
     is refused. The values convert exactly to FP32 (from BF16, FP16, FP32 or
     FP8 E4M3).
+
+    A tensor that holds every expert's scales at once (stacked or fused, such
+    as ``[experts, N, 1]``) is refused: it comes without ``shard_id`` and
+    ``local_expert_id``, and this loader does not split it.
     """
+    stacked = loaded_weight.dim() > 2 or (
+        loaded_weight.dim() == 2 and loaded_weight.shape[1] != 1
+    )
+    if shard_id is None or local_expert_id is None or stacked:
+        raise ValueError(
+            f"{param_name}: got one scale tensor of shape "
+            f"{tuple(loaded_weight.shape)} for shard_id={shard_id!r}, "
+            f"local_expert_id={local_expert_id!r}. FP8 per-channel experts load "
+            f"one projection of one expert at a time ([N, 1], [N] or one value); "
+            f"stacked or fused expert scales such as [experts, N, 1] are not "
+            f"supported yet."
+        )
     scale = loaded_weight.reshape(-1)
     expert = param.data[local_expert_id]
     if shard_id == "w2":
@@ -363,9 +380,14 @@ def make_weight_loader(
     )
 
 
-def make_channel_scale_loader(spec: MoELayerSpec) -> Callable:
+def make_channel_scale_loader(
+    spec: MoELayerSpec, param_name: str = "expert weight scale"
+) -> Callable:
     return partial(
-        load_channel_weight_scale, tp_rank=spec.tp_rank, tp_size=spec.tp_size
+        load_channel_weight_scale,
+        tp_rank=spec.tp_rank,
+        tp_size=spec.tp_size,
+        param_name=f"{spec.prefix}.{param_name}",
     )
 
 

@@ -30,9 +30,10 @@ The logical layout a per-channel FP8 MoE kernel consumes, as loaded:
   hidden channels on every rank).
 
 A row dequantizes to ``weight[e, n, :] * scale[e, n]``. Activations are
-quantized per token by the kernel. Rows a padded ``ispp`` adds stay zero with
-scale 1. A kernel's own layout (shuffle, row interleave, padding) is its
-post-load step's.
+quantized per token by the kernel. The scales start as NaN, so a row the
+checkpoint did not fill fails ``check_fp8_channel_scales`` after loading
+instead of running with a made-up scale. A kernel's own layout (shuffle, row
+interleave, padding) is its post-load step's.
 """
 
 from __future__ import annotations
@@ -45,22 +46,41 @@ from tokenspeed.runtime.layers.moe.weights.loaders import make_channel_scale_loa
 from tokenspeed.runtime.layers.moe.weights.unquant import create_dense_weight_pair
 from tokenspeed.runtime.utils import set_weight_attrs
 
+_SCALE_NAMES = ("w13_weight_scale", "w2_weight_scale")
+
 
 def create_fp8_channel_weight_pair(spec: MoELayerSpec, layer: nn.Module) -> None:
     ispp = create_dense_weight_pair(spec, layer, params_dtype=torch.float8_e4m3fn)
-    w13_weight_scale = torch.nn.Parameter(
-        torch.ones(spec.num_local_experts, 2 * ispp, dtype=torch.float32),
-        requires_grad=False,
-    )
-    w2_weight_scale = torch.nn.Parameter(
-        torch.ones(spec.num_local_experts, spec.hidden_size, dtype=torch.float32),
-        requires_grad=False,
-    )
-    layer.register_parameter("w13_weight_scale", w13_weight_scale)
-    layer.register_parameter("w2_weight_scale", w2_weight_scale)
-    scale_loader = make_channel_scale_loader(spec)
-    set_weight_attrs(w13_weight_scale, {"weight_loader": scale_loader})
-    set_weight_attrs(w2_weight_scale, {"weight_loader": scale_loader})
+    rows = {"w13_weight_scale": 2 * ispp, "w2_weight_scale": spec.hidden_size}
+    for name in _SCALE_NAMES:
+        scale = torch.nn.Parameter(
+            torch.full(
+                (spec.num_local_experts, rows[name]),
+                float("nan"),
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter(name, scale)
+        set_weight_attrs(
+            scale, {"weight_loader": make_channel_scale_loader(spec, name)}
+        )
 
 
-__all__ = ["create_fp8_channel_weight_pair"]
+def check_fp8_channel_scales(layer: nn.Module, prefix: str) -> None:
+    """Refuse expert scales the checkpoint did not fill (still NaN) or filled
+    with a non-finite value, before a kernel's post-load step consumes them."""
+    for name in _SCALE_NAMES:
+        scale = getattr(layer, name)
+        bad = ~torch.isfinite(scale)
+        if bool(bad.any()):
+            expert, row = (int(i) for i in bad.nonzero()[0])
+            raise ValueError(
+                f"{prefix}: {name} has {int(bad.sum())} rows that the checkpoint "
+                f"did not load or loaded as NaN/inf (first: local expert "
+                f"{expert}, row {row}). FP8 per-channel experts need one finite "
+                f"scale per output row."
+            )
+
+
+__all__ = ["check_fp8_channel_scales", "create_fp8_channel_weight_pair"]

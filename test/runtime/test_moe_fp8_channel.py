@@ -53,9 +53,11 @@ from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
+from tokenspeed.runtime.layers.moe.weights.fp8_channel import check_fp8_channel_scales
 from tokenspeed.runtime.layers.quantization.compressed_tensors import (
     compressed_tensors as ct,
 )
+from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -180,7 +182,8 @@ def test_fp8_channel_experts_load_logical_tensors(scale_dtype, layout):
         "w13_weight_scale": (torch.float32, (local, 2 * ispp)),
         "w2_weight_scale": (torch.float32, (local, 16)),
     }
-    assert torch.equal(module.w13_weight_scale, torch.ones(local, 2 * ispp))
+    assert torch.isnan(module.w13_weight_scale).all()
+    assert torch.isnan(module.w2_weight_scale).all()
     params = {f"{PREFIX}.{n}": p for n, p in module.named_parameters()}
     loader = build_moe_checkpoint_loader(
         params_dict=params,
@@ -227,6 +230,7 @@ def test_fp8_channel_experts_load_logical_tensors(scale_dtype, layout):
             down[0][:, part].view(torch.uint8),
         )
         assert torch.equal(module.w2_weight_scale[local_id], down[1][:, 0].float())
+    check_fp8_channel_scales(module, PREFIX)
 
 
 def test_fp8_channel_per_tensor_scales_fill_their_rows():
@@ -288,6 +292,170 @@ def test_fp8_channel_scales_of_the_wrong_length_are_refused(presharded):
                 )
 
 
+def _load_all_scales(module, skip=()):
+    """Fill every expert's gate, up and down scales but the ``(shard,
+    expert)`` pairs in ``skip``."""
+    load = module.w13_weight_scale.weight_loader
+    experts = module.w13_weight_scale.shape[0]
+    for expert in range(experts):
+        for shard in ("w1", "w3", "w2"):
+            if (shard, expert) in skip:
+                continue
+            param = module.w2_weight_scale if shard == "w2" else module.w13_weight_scale
+            load(param, torch.tensor([0.5]), shard_id=shard, local_expert_id=expert)
+
+
+def test_fp8_channel_scales_the_checkpoint_did_not_fill_are_refused():
+    """Scales start as NaN, so a row no checkpoint tensor filled is refused
+    after loading instead of running with scale 1."""
+    module = _experts()
+    _load_all_scales(module)
+    check_fp8_channel_scales(module, PREFIX)
+    for skipped, name in (
+        (("w3", 2), "w13_weight_scale"),
+        (("w2", 0), "w2_weight_scale"),
+    ):
+        module = _experts()
+        _load_all_scales(module, skip={skipped})
+        with pytest.raises(ValueError, match=f"{PREFIX}: {name} has .* did not load"):
+            check_fp8_channel_scales(module, PREFIX)
+    module = _experts()
+    _load_all_scales(module)
+    module.w2_weight_scale.data[1, 3] = float("inf")
+    with pytest.raises(ValueError, match="local expert 1, row 3"):
+        check_fp8_channel_scales(module, PREFIX)
+
+
+@pytest.mark.parametrize("shape", [(4, 48, 1), (4, 16, 1), (4, 48), (48, 2)], ids=str)
+def test_fp8_channel_stacked_expert_scales_are_refused(shape):
+    """A checkpoint that stores all experts' scales in one tensor (for example
+    ``experts.w13_weight_scale [experts, 2 * intermediate, 1]``) reaches the
+    loader without shard_id and local_expert_id; it is refused with the
+    parameter's name instead of failing with a TypeError."""
+    module = _experts()
+    for name in ("w13_weight_scale", "w2_weight_scale"):
+        param = getattr(module, name)
+        with pytest.raises(ValueError, match=f"{PREFIX}.{name}: .*not supported"):
+            param.weight_loader(param, torch.ones(shape))
+        with pytest.raises(ValueError, match="stacked or fused expert scales"):
+            param.weight_loader(
+                param,
+                torch.ones(shape),
+                shard_id="w2" if name == "w2_weight_scale" else "w1",
+                local_expert_id=0,
+            )
+    assert torch.isnan(module.w13_weight_scale).all()
+
+
+# quantization_config fields of public checkpoints' config.json.
+# RedHatAI/Inkling-FP8-dynamic: the experts of layer 2 stay BF16 and are
+# ignored by an expert-name regex, while the MoE block itself is quantized.
+INKLING_FP8_DYNAMIC = {
+    "config_groups": {
+        "config_group_0": {
+            "format": "float-quantized",
+            "input_activations": {
+                "dynamic": True,
+                "num_bits": 8,
+                "strategy": "token",
+                "symmetric": True,
+                "type": "float",
+            },
+            "output_activations": None,
+            "targets": ["Linear"],
+            "weights": {
+                "dynamic": False,
+                "num_bits": 8,
+                "observer": "memoryless_minmax",
+                "strategy": "channel",
+                "symmetric": True,
+                "type": "float",
+            },
+        }
+    },
+    "format": "float-quantized",
+    "ignore": [
+        "model.llm.unembed",
+        "model.llm.embed",
+        "re:.*norm.*",
+        "re:.*bias$",
+        "re:.*\\.attn$",
+        "re:.*\\.attn\\..*",
+        "re:.*sconv$",
+        "re:.*\\.gate$",
+        "re:.*global_scale$",
+        "re:.*shared_experts.*",
+        "re:model\\.layers\\.[01]\\.mlp\\..*",
+        "re:model\\.layers\\.2\\.mlp\\.experts\\..*",
+        "re:model\\.visual\\..*",
+        "re:model\\.audio\\..*",
+    ],
+    "kv_cache_scheme": None,
+    "quant_method": "compressed-tensors",
+    "quantization_status": "compressed",
+    "transform_config": {},
+}
+
+# RedHatAI/Qwen3-30B-A3B-FP8-dynamic: only the routers and lm_head are ignored.
+QWEN3_30B_A3B_FP8_DYNAMIC = {
+    "config_groups": {
+        "group_0": {
+            "input_activations": {
+                "dynamic": True,
+                "num_bits": 8,
+                "strategy": "token",
+                "symmetric": True,
+                "type": "float",
+            },
+            "output_activations": None,
+            "targets": ["Linear"],
+            "weights": {
+                "dynamic": False,
+                "num_bits": 8,
+                "observer": "mse",
+                "strategy": "channel",
+                "symmetric": True,
+                "type": "float",
+            },
+        }
+    },
+    "format": "float-quantized",
+    "ignore": [f"model.layers.{i}.mlp.gate" for i in range(48)] + ["lm_head"],
+    "kv_cache_scheme": None,
+    "quant_method": "compressed-tensors",
+    "quantization_status": "compressed",
+}
+
+
+def test_public_fp8_dynamic_moe_configs():
+    """Experts that ``ignore`` names inside a quantized MoE block are refused
+    with the ignore entry in the message, instead of being cast to FP8 with
+    no scales. Blocks the ignore list covers whole stay unquantized, and the
+    other blocks take fp8_channel."""
+    inkling = _parse(INKLING_FP8_DYNAMIC)
+    with pytest.raises(
+        ValueError,
+        match=r"ignore entry .*layers.*2.*experts.* names the expert projection "
+        r"'model\.layers\.2\.mlp\.experts\.0\.gate_proj'",
+    ):
+        inkling.moe_weight_dtype("model.layers.2.mlp")
+    # Layers 0 and 1 are dense MLPs; the routed experts start at layer 2.
+    for prefix in ("model.layers.3.mlp", "model.layers.3.mlp.experts"):
+        assert inkling.moe_weight_dtype(prefix) == "fp8_channel"
+    assert inkling.moe_weight_dtype("model.layers.65.mlp") == "fp8_channel"
+    assert should_ignore_quant_layer(
+        "model.layers.1.mlp.up_proj", inkling.ignored_layers
+    )
+    assert not should_ignore_quant_layer("model.layers.2.mlp", inkling.ignored_layers)
+
+    qwen3 = _parse(QWEN3_30B_A3B_FP8_DYNAMIC)
+    for layer in range(48):
+        prefix = f"model.layers.{layer}.mlp"
+        assert qwen3.moe_weight_dtype(prefix) == "fp8_channel"
+        assert should_ignore_quant_layer(f"{prefix}.gate", qwen3.ignored_layers)
+        assert not should_ignore_quant_layer(prefix, qwen3.ignored_layers)
+
+
 @pytest.fixture
 def nvidia_arch(monkeypatch):
     """Plan on a synthetic NVIDIA arch; the host's platform and the
@@ -314,7 +482,9 @@ def nvidia_arch(monkeypatch):
     registry.clear_cache()
 
 
-def _moe_layer(tp_size, intermediate_size=512):
+def _moe_layer(
+    tp_size, intermediate_size=512, raw=CHANNEL_DYNAMIC, prefix="model.layers.1.mlp"
+):
     default_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -323,9 +493,9 @@ def _moe_layer(tp_size, intermediate_size=512):
             num_experts=4,
             hidden_size=256,
             intermediate_size=intermediate_size,
-            quant_config=_parse(CHANNEL_DYNAMIC),
+            quant_config=_parse(raw),
             layer_index=1,
-            prefix="model.layers.1.mlp",
+            prefix=prefix,
             tp_rank=0,
             tp_size=tp_size,
         )
@@ -360,6 +530,24 @@ def test_fp8_channel_moe_layer_plans_its_kernel(nvidia_arch, arch, tp_size):
         "w13_weight_scale": (torch.float32, (4, 2 * ispp)),
         "w2_weight_scale": (torch.float32, (4, 256)),
     }
+
+
+def test_fp8_channel_moe_layer_refuses_unloaded_scales(nvidia_arch):
+    """MoELayer checks the expert scales before the kernel's post-load step."""
+    nvidia_arch(10, 0)
+    layer = _moe_layer(1)
+    with pytest.raises(ValueError, match="model.layers.1.mlp: w13_weight_scale has"):
+        layer.process_weights_after_loading(layer)
+
+
+def test_moe_layer_refuses_ignored_experts_in_a_quantized_block(nvidia_arch):
+    nvidia_arch(10, 0)
+    with pytest.raises(ValueError, match="names the expert projection"):
+        _moe_layer(1, raw=INKLING_FP8_DYNAMIC, prefix="model.layers.2.mlp")
+    assert (
+        _moe_layer(1, raw=INKLING_FP8_DYNAMIC, prefix="model.layers.3.mlp")._quant_kind
+        == "fp8_channel"
+    )
 
 
 def test_fp8_channel_moe_layer_has_no_kernel_before_sm90(nvidia_arch):
