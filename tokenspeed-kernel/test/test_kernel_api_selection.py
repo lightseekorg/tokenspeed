@@ -2962,6 +2962,13 @@ def _mhc_apply_pre() -> object:
     return kernel_mhc_apply_pre(residual, pre, norm_weight=None, norm_eps=None)
 
 
+def _mhc_apply_pre_fused_norm() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    norm_weight = torch.empty((16,), dtype=torch.bfloat16)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=1e-6)
+
+
 def _attention_gdn_chunk_prefill() -> object:
     q = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
@@ -6286,6 +6293,15 @@ _CASES = [
         "mhc_apply_pre",
         "gluon_mhc_apply_pre_gfx950",
         _mhc_apply_pre,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre_fused_norm,
+        id_suffix="fused_norm",
     ),
     _case(
         _is_cdna4,
