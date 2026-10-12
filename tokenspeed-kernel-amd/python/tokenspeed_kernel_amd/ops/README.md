@@ -532,7 +532,7 @@ A four-wave workgroup owns one query row, up to 64 heads and a contiguous share
 of the row's 64-row tiles (SWA tiles, then global tiles). Each wave loads 16
 contiguous bytes of a row per lane, dequantizes with the CDNA4 scaled
 conversions (`v_cvt_scalef32_pk_bf16_fp8`; E2M1 via
-`v_cvt_scalef32_pk_f32_fp4` times the exact FP32 E4M3 scale) into BF16 pairs
+`v_cvt_scalef32_pk_f32_fp4` times the exact FP32 E4M3 scale) into BF16 rows
 in LDS, and the waves split the tile's rows for QK and the head dims for PV
 (16x16x32 BF16 MFMA). Slots are prefetched two tiles ahead and rows one tile
 ahead.

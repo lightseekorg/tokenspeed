@@ -70,57 +70,45 @@ def _tile_slots(slots, slot_row, tile_idx, length, width, capacity, TILE_K, LAYO
 
 
 @gluon.jit
-def _load_swa_rows(cache, slot, page_stride, RAW_LAYOUT: gl.constexpr):
-    """Load SWA rows: E4M3 words [TILE_K, 32, 4] and E8M0 scales [TILE_K, 32].
+def _load_swa_rows(cache, slot, valid, page_stride, RAW_LAYOUT: gl.constexpr):
+    """Load SWA rows: E4M3 bytes [TILE_K, 32, 16] and E8M0 scales [TILE_K, 32].
 
     A lane owns 16 contiguous value bytes of a row (one dwordx4). Chunk ``c``
     covers dims ``16c..16c+15``, whose E8M0 scale is byte ``c // 2``. Invalid
-    rows were clamped to slot 0, so loads stay unmasked and in bounds.
+    rows (clamped to slot 0) load zero values.
     """
     scale_layout: gl.constexpr = gl.SliceLayout(2, RAW_LAYOUT)
     page_base = (slot // 64).to(tl.int64) * page_stride
     row = slot % 64
     chunks = gl.arange(0, 32, layout=gl.SliceLayout(0, scale_layout))
-    words = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, RAW_LAYOUT)))
-    word_offsets = (
-        ((page_base + row * 512) // 4)[:, None, None]
-        + (chunks * 4)[None, :, None]
-        + words[None, None, :]
+    lanes = gl.arange(0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(1, RAW_LAYOUT)))
+    value_offsets = (
+        (page_base + row * 512)[:, None, None]
+        + (chunks * 16)[None, :, None]
+        + lanes[None, None, :]
     )
     scale_offsets = (page_base + 64 * 512 + row * 16)[:, None] + (chunks // 2)[None, :]
-    values = gl.load(cache.to(gl.pointer_type(gl.int32)) + word_offsets)
+    values = gl.load(cache + value_offsets, mask=valid[:, None, None], other=0)
     return values, gl.load(cache + scale_offsets)
 
 
 @gluon.jit
-def _dequant_swa_rows(values, scales, valid):
-    """E4M3 times E8M0 scale into BF16 pairs, as int32 words [TILE_K, 256].
-
-    The hardware scaled conversion multiplies by 2**(code - 127) (code 0 is
-    2**-127) and rounds once to BF16. Invalid rows convert zero words.
-    """
-    values = values & gl.where(valid, -1, 0)[:, None, None]
-    scale = (scales.to(gl.int32) << 23).to(gl.float32, bitcast=True)
-    values, scale = gl.broadcast(values, scale[:, :, None])
-    low, high = gl.inline_asm_elementwise(
-        "v_cvt_scalef32_pk_bf16_fp8 $0, $2, $3\n"
-        "v_cvt_scalef32_pk_bf16_fp8 $1, $2, $3 op_sel:[1,0,0]",
-        "=&v,=&v,v,v",
-        [values, scale],
-        dtype=(gl.int32, gl.int32),
-        is_pure=True,
-        pack=1,
+def _dequant_swa_rows(values, scales):
+    """E4M3 times E8M0 scale into BF16 [TILE_K, 512]."""
+    scales, values = gl.broadcast(scales[:, :, None], values)
+    kv = gl.amd.cdna4.scaled_upcast(
+        values.to(gl.float8e4nv, bitcast=True), scales, gl.bfloat16
     )
-    pairs = gl.join(low, high)
-    return pairs.reshape([pairs.shape[0], 256])
+    return kv.reshape([kv.shape[0], 512])
 
 
 @gluon.jit
-def _load_global_rows(cache, slot, page_stride, RAW_LAYOUT: gl.constexpr):
+def _load_global_rows(cache, slot, valid, page_stride, RAW_LAYOUT: gl.constexpr):
     """Load global rows: E2M1 words [TILE_K, 16, 2, 2], E4M3 scales [TILE_K, 16, 2].
 
     A lane owns 16 contiguous packed bytes (32 dims) of a row: chunk ``c``,
     scale group ``g`` of 16 dims (scale byte ``2c + g``), and word ``w``.
+    Invalid rows (clamped to slot 0) get zero words and zero scales.
     """
     scale_layout: gl.constexpr = gl.SliceLayout(3, RAW_LAYOUT)
     chunk_layout: gl.constexpr = gl.SliceLayout(0, scale_layout)
@@ -142,40 +130,34 @@ def _load_global_rows(cache, slot, page_stride, RAW_LAYOUT: gl.constexpr):
     scale_offsets = (page_base + 64 * 256 + row * 32)[:, None, None] + scale_idx[
         None, :, :
     ]
+    keep = gl.where(valid, -1, 0)
     values = gl.load(cache.to(gl.pointer_type(gl.int32)) + word_offsets)
-    return values, gl.load(cache + scale_offsets)
+    scales = gl.load(cache + scale_offsets).to(gl.int32)
+    return values & keep[:, None, None, None], (scales & keep[:, None, None]).to(
+        gl.uint8
+    )
 
 
 @gluon.jit
 def _e2m1_pair_scaled(pair, scale):
-    """Scale one byte's two E2M1 values (FP32 pair in an int64) into a BF16 pair."""
+    """Scale one byte's two E2M1 values (FP32 pair in an int64) into BF16."""
     low = (pair & 0xFFFFFFFF).to(gl.int32).to(gl.float32, bitcast=True) * scale
     high = (pair >> 32).to(gl.int32).to(gl.float32, bitcast=True) * scale
-    return gl.inline_asm_elementwise(
-        "v_cvt_pk_bf16_f32 $0, $1, $2",
-        "=v,v,v",
-        [low, high],
-        dtype=gl.int32,
-        is_pure=True,
-        pack=1,
-    )
+    return low.to(gl.bfloat16), high.to(gl.bfloat16)
 
 
 @gluon.jit
-def _dequant_global_rows(values, scales, valid):
-    """E2M1 (even dim in the low nibble) times E4M3 into BF16 pairs [TILE_K, 256].
+def _dequant_global_rows(values, scales):
+    """E2M1 (even dim in the low nibble) times E4M3 into BF16 [TILE_K, 512].
 
     Both factors convert exactly to FP32, so their product is exact before the
-    single BF16 rounding. Invalid rows convert zero words with a zero scale.
+    single BF16 rounding.
     """
-    keep = gl.where(valid, -1, 0)
-    values = values & keep[:, None, None, None]
     scale = scales.to(tl.float8e4nv, bitcast=True).to(gl.float32)
-    scale = (scale.to(gl.int32, bitcast=True) & keep[:, None, None]).to(
-        gl.float32, bitcast=True
-    )
     values, scale = gl.broadcast(values, scale[:, :, :, None])
-    # One conversion per byte; op_sel picks the byte of the 32-bit word.
+    # One conversion per byte; op_sel picks the byte of the 32-bit word. Gluon
+    # has no FP4 dtype, and its scaled upcast only yields BF16/FP16, which
+    # would need unpacking to FP32 before the E4M3 scale multiply.
     byte0, byte1, byte2, byte3 = gl.inline_asm_elementwise(
         "v_cvt_scalef32_pk_f32_fp4 $0, $4, 1.0\n"
         "v_cvt_scalef32_pk_f32_fp4 $1, $4, 1.0 op_sel:[1,0,0]\n"
@@ -187,17 +169,19 @@ def _dequant_global_rows(values, scales, valid):
         is_pure=True,
         pack=1,
     )
-    pairs = gl.join(
-        gl.join(_e2m1_pair_scaled(byte0, scale), _e2m1_pair_scaled(byte2, scale)),
-        gl.join(_e2m1_pair_scaled(byte1, scale), _e2m1_pair_scaled(byte3, scale)),
-    )
-    return pairs.reshape([pairs.shape[0], 256])
+    low0, high0 = _e2m1_pair_scaled(byte0, scale)
+    low1, high1 = _e2m1_pair_scaled(byte1, scale)
+    low2, high2 = _e2m1_pair_scaled(byte2, scale)
+    low3, high3 = _e2m1_pair_scaled(byte3, scale)
+    low = gl.join(gl.join(low0, low2), gl.join(low1, low3))
+    high = gl.join(gl.join(high0, high2), gl.join(high1, high3))
+    kv = gl.join(low, high)
+    return kv.reshape([kv.shape[0], 512])
 
 
 @gluon.jit
 def _attend_tile(
     kv,
-    kv_words,
     kv_shared,
     valid_rows,
     q_dot,
@@ -214,14 +198,14 @@ def _attend_tile(
     TILE_K: gl.constexpr,
     MFMA_LAYOUT: gl.constexpr,
 ):
-    """Fold one dequantized tile (BF16 pairs, int32 [TILE_K, 256]) into the softmax."""
+    """Fold one dequantized BF16 tile [TILE_K, 512] into the softmax."""
     k_dot_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=MFMA_LAYOUT, k_width=8
     )
     p_dot_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=MFMA_LAYOUT, k_width=8
     )
-    kv_words.store(kv)
+    kv_shared.store(kv)
     v_dot = kv_shared.load(k_dot_layout)
     if active:
         k_dot = kv_shared.permute([1, 0]).load(k_dot_layout)
@@ -330,7 +314,7 @@ def gluon_dsv41_selected_attention_gfx950(
         [1, 1, 8], [1, 1, 64], [1, 4, 1], [2, 1, 0]
     )
     swa_raw_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 4], [2, 32, 1], [4, 1, 1], [2, 1, 0]
+        [1, 1, 16], [2, 32, 1], [4, 1, 1], [2, 1, 0]
     )
     global_raw_layout: gl.constexpr = gl.BlockedLayout(
         [1, 1, 2, 2], [4, 16, 1, 1], [4, 1, 1, 1], [3, 2, 1, 0]
@@ -343,9 +327,6 @@ def gluon_dsv41_selected_attention_gfx950(
     head_layout: gl.constexpr = gl.SliceLayout(1, mfma)
     kv_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[512, 16]], [TILE_K, HEAD_DIM], [1, 0]
-    )
-    kv_word_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 8]], [TILE_K, HEAD_DIM // 2], [1, 0]
     )
     q_dot_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma, k_width=8
@@ -409,8 +390,6 @@ def gluon_dsv41_selected_attention_gfx950(
     kv_shared = gl.allocate_shared_memory(
         gl.bfloat16, [TILE_K, HEAD_DIM], layout=kv_shared_layout
     )
-    # Dequantization emits packed BF16 pairs; the same bytes as int32 words.
-    kv_words = kv_shared.reinterpret(gl.int32, [TILE_K, HEAD_DIM // 2], kv_word_layout)
 
     q_heads = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, q_layout))
     q_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_layout))
@@ -479,7 +458,7 @@ def gluon_dsv41_selected_attention_gfx950(
                     score_row_layout,
                 )
                 g_values, g_scales = _load_global_rows(
-                    global_cache, g_slot, global_page_stride, global_raw_layout
+                    global_cache, g_slot, g_valid, global_page_stride, global_raw_layout
                 )
             s_slot, s_valid = _tile_slots(
                 swa_slots,
@@ -502,7 +481,7 @@ def gluon_dsv41_selected_attention_gfx950(
                 score_row_layout,
             )
             s_values, s_scales = _load_swa_rows(
-                swa_cache, s_slot, swa_page_stride, swa_raw_layout
+                swa_cache, s_slot, s_valid, swa_page_stride, swa_raw_layout
             )
             n_slot, n_valid = _tile_slots(
                 swa_slots,
@@ -546,12 +525,11 @@ def gluon_dsv41_selected_attention_gfx950(
                     score_row_layout,
                 )
                 n_values, n_scales = _load_swa_rows(
-                    swa_cache, n_slot, swa_page_stride, swa_raw_layout
+                    swa_cache, n_slot, n_valid, swa_page_stride, swa_raw_layout
                 )
-                kv = _dequant_swa_rows(s_values, s_scales, s_valid)
+                kv = _dequant_swa_rows(s_values, s_scales)
                 max_value, denominator, accumulator, row_sum, row_count = _attend_tile(
                     kv,
-                    kv_words,
                     kv_shared,
                     s_score,
                     q_dot,
@@ -618,13 +596,16 @@ def gluon_dsv41_selected_attention_gfx950(
                         score_row_layout,
                     )
                     n_values, n_scales = _load_global_rows(
-                        global_cache, n_slot, global_page_stride, global_raw_layout
+                        global_cache,
+                        n_slot,
+                        n_valid,
+                        global_page_stride,
+                        global_raw_layout,
                     )
-                    kv = _dequant_global_rows(g_values, g_scales, g_valid)
+                    kv = _dequant_global_rows(g_values, g_scales)
                     max_value, denominator, accumulator, row_sum, row_count = (
                         _attend_tile(
                             kv,
-                            kv_words,
                             kv_shared,
                             g_score,
                             q_dot,
