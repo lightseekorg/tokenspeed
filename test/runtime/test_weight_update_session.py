@@ -42,7 +42,10 @@ from torch import nn
 from tokenspeed.runtime.model_loader.weight_utils import bind_or_copy
 from tokenspeed.runtime.models import deepseek_nextn
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.models.base.weight_update import weight_update_session
+from tokenspeed.runtime.models.base.weight_update import (
+    WeightUpdateReport,
+    weight_update_session,
+)
 from tokenspeed.runtime.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from tokenspeed.runtime.models.deepseek_v3 import (
     Eagle3DeepseekV2ForCausalLM,
@@ -351,6 +354,38 @@ def test_a_session_without_any_load_derives_nothing():
     with weight_update_session([lm]):
         pass
     assert lm.post_load_calls == 1
+
+
+def test_streamed_names_matching_no_parameter_are_reported(model):
+    """A trainer whose naming differs from the model's must not read a plain
+    success: the base loader skips such names, and the session reports them."""
+    stream = _checkpoint(8)
+    misnamed = [
+        ("model.layers.0.kv_b_proj.weight", torch.zeros(1)),
+        ("model.layers.0.kv_b_proj.weight", torch.zeros(1)),  # reported once
+        ("rotary_emb.inv_freq", torch.zeros(1)),  # deliberately skipped
+    ]
+
+    with weight_update_session([model]) as report:
+        model.load_weights(stream + misnamed)
+
+    assert report.unmatched_names == ["model.layers.0.kv_b_proj.weight"]
+    assert report.message(len(stream) + len(misnamed)) == (
+        "received 7 weights; 1 matched no parameter on this rank and were "
+        "skipped: model.layers.0.kv_b_proj.weight"
+    )
+    # The matched names still loaded, and the next session starts clean.
+    w_kc, _ = _expected_pair(model.layers[0].kv_b_proj.weight.detach())
+    assert torch.equal(model.layers[0].w_kc, w_kc)
+    with weight_update_session([model]) as report:
+        model.load_weights(stream)
+    assert report.unmatched_names == []
+    assert report.message(len(stream)) == "updated 4 weights"
+
+
+def test_the_reply_quotes_a_bounded_number_of_unmatched_names():
+    report = WeightUpdateReport(unmatched_names=[f"w{i}" for i in range(10)])
+    assert report.message(10).endswith("w6, w7, ... (2 more)")
 
 
 @pytest.mark.parametrize(

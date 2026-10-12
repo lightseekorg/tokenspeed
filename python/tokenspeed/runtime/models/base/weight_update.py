@@ -37,14 +37,47 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 
 from torch import nn
 
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
+# Unmatched names quoted in a reply; the full list goes to the log.
+_MAX_NAMES_SHOWN = 8
+
+
+@dataclass
+class WeightUpdateReport:
+    """What a finished session observed, filled in when the session ends.
+
+    Attributes:
+        unmatched_names: Streamed names the model that received them had no
+            parameter for on this rank, each once.
+    """
+
+    unmatched_names: list[str] = field(default_factory=list)
+
+    def message(self, num_received: int) -> str:
+        """The control-plane reply for an update that streamed ``num_received``
+        tensors. Names the first few unmatched ones so a trainer whose naming
+        differs from the model's sees it instead of a plain success."""
+        if not self.unmatched_names:
+            return f"updated {num_received} weights"
+        shown = ", ".join(self.unmatched_names[:_MAX_NAMES_SHOWN])
+        more = len(self.unmatched_names) - _MAX_NAMES_SHOWN
+        if more > 0:
+            shown += f", ... ({more} more)"
+        return (
+            f"received {num_received} weights; {len(self.unmatched_names)} "
+            f"matched no parameter on this rank and were skipped: {shown}"
+        )
+
 
 @contextmanager
-def weight_update_session(models: Sequence[nn.Module]) -> Iterator[None]:
+def weight_update_session(
+    models: Sequence[nn.Module],
+) -> Iterator[WeightUpdateReport]:
     """Bracket a live weight update of ``models``.
 
     ``end_weight_update`` runs only for the models whose session was opened,
@@ -57,18 +90,28 @@ def weight_update_session(models: Sequence[nn.Module]) -> Iterator[None]:
 
     Args:
         models: The modules the update streams into, target first.
+
+    Yields:
+        A ``WeightUpdateReport``, filled in once the session ends cleanly.
     """
+    report = WeightUpdateReport()
     opened: list[BaseCausalLM] = []
     try:
         for model in models:
             if isinstance(model, BaseCausalLM):
                 model.begin_weight_update()
                 opened.append(model)
-        yield
+        yield report
     except BaseException:
         for model in opened:
             model.abort_weight_update()
         raise
+    # Read before ``end_weight_update`` closes the session and drops the list.
+    report.unmatched_names = list(
+        dict.fromkeys(
+            name for model in opened for name in model.unmatched_weight_names()
+        )
+    )
     for index, model in enumerate(opened):
         try:
             model.end_weight_update()

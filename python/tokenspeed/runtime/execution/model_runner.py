@@ -462,7 +462,7 @@ class ModelRunner:
             # itself and raises at its end; this wrap covers the models that
             # take no session (multimodal wrappers).
             rejected: list[str] = []
-            with weight_update_session([self.model]):
+            with weight_update_session([self.model]) as report:
                 self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
             torch.cuda.synchronize(device)
             if rejected:
@@ -471,7 +471,13 @@ class ModelRunner:
                     f"its weight version not advanced: {non_unit_kv_scale_message(rejected)}; "
                     "resend the weights without KV-cache scales"
                 )
-            return True, f"updated {len(names)} weights"
+            if report.unmatched_names:
+                logger.warning(
+                    f"weight update skipped {len(report.unmatched_names)} streamed "
+                    f"names that match no parameter on this rank: "
+                    f"{report.unmatched_names}"
+                )
+            return True, report.message(len(names))
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_distributed failed")
             return False, str(e)

@@ -159,6 +159,11 @@ class BaseCausalLM(nn.Module):
     # calls (KV caches are written and read at unit scale); None outside a
     # session, where the loader screens the checkpoint itself.
     _weight_update_non_unit_kv_scales: list[str] | None = None
+    # Streamed names the base ``load_weights`` skipped because they matched no
+    # parameter on this rank; None outside a session. Under pipeline
+    # parallelism another stage's layers land here too, so this is reported,
+    # not rejected.
+    _weight_update_unmatched_names: list[str] | None = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -187,6 +192,7 @@ class BaseCausalLM(nn.Module):
         self._weight_update_loaded_names = None
         self._weight_update_derive_pending = False
         self._weight_update_non_unit_kv_scales = None
+        self._weight_update_unmatched_names = None
 
         self.encoder_only = encoder_only
         if encoder_only:
@@ -392,6 +398,7 @@ class BaseCausalLM(nn.Module):
         loaded: set[str] = set()
 
         for name, loaded_weight in weights:
+            source_name = name
 
             if any(pattern in name for pattern in skip_patterns):
                 continue
@@ -421,6 +428,8 @@ class BaseCausalLM(nn.Module):
                     continue
 
                 if name not in params_dict:
+                    if self._weight_update_unmatched_names is not None:
+                        self._weight_update_unmatched_names.append(source_name)
                     continue
 
                 param = params_dict[name]
@@ -447,6 +456,7 @@ class BaseCausalLM(nn.Module):
         self._weight_update_loaded_names = set()
         self._weight_update_derive_pending = False
         self._weight_update_non_unit_kv_scales = []
+        self._weight_update_unmatched_names = []
 
     def end_weight_update(self) -> None:
         """Leave the session and run the deferred derivation once.
@@ -490,6 +500,15 @@ class BaseCausalLM(nn.Module):
         self._weight_update_loaded_names = None
         self._weight_update_derive_pending = False
         self._weight_update_non_unit_kv_scales = None
+        self._weight_update_unmatched_names = None
+
+    def unmatched_weight_names(self) -> list[str]:
+        """Streamed names this session skipped as matching no parameter.
+
+        Each name is listed once, in first-seen order; empty outside a
+        session.
+        """
+        return list(dict.fromkeys(self._weight_update_unmatched_names or ()))
 
     def record_loaded_weights(self, names: Iterable[str]) -> None:
         """Remember which parameters this session's ``load_weights`` touched.
