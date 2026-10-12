@@ -348,7 +348,7 @@ class OutputProcessor:
             )
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
-            if num_new_tokens:
+            if num_new_tokens > 0:
                 new_time = time.time()
                 interval = new_time - state.last_time
                 pure_interval = recv_obj.generated_time - state.last_pure_time
@@ -387,7 +387,7 @@ class OutputProcessor:
             )
             if (completion_tokens - state.first_completion_tokens) > 0:
                 self.engine.metrics.observe_decode_time_per_output_token(
-                    (state.finished_time - state.first_token_time)
+                    (state.last_time - state.first_token_time)
                     / (completion_tokens - state.first_completion_tokens)
                 )
 

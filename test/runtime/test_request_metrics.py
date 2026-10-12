@@ -37,6 +37,7 @@ from tokenspeed.runtime.metrics.collector import RequestMetrics
 LABELS = {"model_name": "m"}
 ITL = "tokenspeed:inter_token_latency_seconds"
 SCHEDULER_ITL = "tokenspeed:scheduler_inter_token_latency_seconds"
+DECODE_TPOT = "tokenspeed:decode_time_per_output_token_seconds"
 
 
 def test_batched_inter_token_latency_matches_per_token_observe():
@@ -55,3 +56,42 @@ def test_batched_inter_token_latency_matches_per_token_observe():
     assert sample(f"{ITL}_sum") == pytest.approx(0.43)
     assert sample(f"{SCHEDULER_ITL}_count") == 2.0
     assert sample(f"{SCHEDULER_ITL}_sum") == pytest.approx(0.02)
+
+
+def test_decode_time_per_output_token_recording():
+    registry = CollectorRegistry()
+    metrics = RequestMetrics(LABELS, enabled=True, registry=registry)
+    metrics.observe_decode_time_per_output_token(0.010)
+    metrics.observe_decode_time_per_output_token(0.030)
+
+    def sample(name, **labels):
+        return registry.get_sample_value(name, {**LABELS, **labels})
+
+    assert sample(f"{DECODE_TPOT}_bucket", le="0.01") == 1.0
+    assert sample(f"{DECODE_TPOT}_bucket", le="0.03") == 2.0
+    assert sample(f"{DECODE_TPOT}_count") == 2.0
+    assert sample(f"{DECODE_TPOT}_sum") == pytest.approx(0.04)
+
+
+def test_observe_inter_token_latency_rejects_nonpositive_token_counts():
+    registry = CollectorRegistry()
+    metrics = RequestMetrics(LABELS, enabled=True, registry=registry)
+    for observe in (
+        metrics.observe_inter_token_latency,
+        metrics.observe_scheduler_inter_token_latency,
+    ):
+        observe(0.030, 0)
+        observe(0.030, -2)
+
+    def sample(name, **labels):
+        return registry.get_sample_value(name, {**LABELS, **labels})
+
+    # No labeled series may come into existence from rejected observations.
+    assert sample(f"{ITL}_count") is None
+    assert sample(f"{SCHEDULER_ITL}_count") is None
+
+    metrics.observe_inter_token_latency(0.030, 3)
+    metrics.observe_scheduler_inter_token_latency(0.030, 3)
+    assert sample(f"{ITL}_count") == 3.0
+    assert sample(f"{ITL}_sum") == pytest.approx(0.03)
+    assert sample(f"{SCHEDULER_ITL}_count") == 3.0

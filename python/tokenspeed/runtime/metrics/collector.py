@@ -20,10 +20,16 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.compile_monitor import CompileStats
 
 from tokenspeed.runtime.utils.env import envs
+
+if TYPE_CHECKING:
+    # Imported lazily at runtime; see _init_prometheus for the ordering
+    # requirement with PROMETHEUS_MULTIPROC_DIR.
+    from prometheus_client import Histogram
 
 TOKENSPEED_TEST_REQUEST_TIME_STATS = envs.TOKENSPEED_TEST_REQUEST_TIME_STATS.get()
 
@@ -521,7 +527,7 @@ class RequestMetrics:
             **kw,
         )
 
-        self.histogram_scheduler_inter_token_latency = Histogram(
+        self.histogram_scheduler_inter_token_latency_seconds = Histogram(
             name="tokenspeed:scheduler_inter_token_latency_seconds",
             documentation="Histogram of scheduler-side inter-token latency in seconds.",
             labelnames=labelnames,
@@ -588,7 +594,7 @@ class RequestMetrics:
         self.histogram_decode_time_per_output_token.labels(**self.labels).observe(value)
 
     def observe_inter_token_latency(self, interval: float, num_new_tokens: int) -> None:
-        if not self.enabled:
+        if not self.enabled or num_new_tokens <= 0:
             return
         self._observe_batched(
             self.histogram_inter_token_latency_seconds, interval, num_new_tokens
@@ -597,13 +603,17 @@ class RequestMetrics:
     def observe_scheduler_inter_token_latency(
         self, interval: float, num_new_tokens: int
     ) -> None:
-        if not self.enabled:
+        if not self.enabled or num_new_tokens <= 0:
             return
         self._observe_batched(
-            self.histogram_scheduler_inter_token_latency, interval, num_new_tokens
+            self.histogram_scheduler_inter_token_latency_seconds,
+            interval,
+            num_new_tokens,
         )
 
-    def _observe_batched(self, histogram, interval: float, num_new_tokens: int) -> None:
+    def _observe_batched(
+        self, histogram: "Histogram", interval: float, num_new_tokens: int
+    ) -> None:
         # A faster version of the Histogram::observe which observes multiple values at the same time.
         # reference: https://github.com/prometheus/client_python/blob/v0.21.1/prometheus_client/metrics.py#L639
         his = histogram.labels(**self.labels)
