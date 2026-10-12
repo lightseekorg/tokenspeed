@@ -133,12 +133,13 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
     disable_prefix_cache: bool,
 ) -> None:
     """A state group's row is two slots: the first chunk reads the zero state
-    (slot 0 null) and writes slot 1; each later chunk reads the previous live
-    block, rotated into slot 0, and writes a fresh slot 1. With the prefix
-    cache on, the prompt-end block is published, so the first decode reads it
-    from slot 0 and writes a fresh live block; without it nothing is
-    published and decode evolves the live block in place from the first step.
-    Every later decode evolves the live block in place with slot 0 null."""
+    from a fresh zeroed block in slot 0 (zeroed by the plan like any fresh
+    page) and writes slot 1; each later chunk reads the previous live block,
+    rotated into slot 0, and writes a fresh slot 1. With the prefix cache on,
+    the prompt-end block is published, so the first decode reads it from slot
+    0 and writes a fresh live block; without it nothing is published and
+    decode evolves the live block in place from the first step. Every later
+    decode evolves the live block in place with slot 0 null."""
     scheduler = _scheduler(
         token_budget=300, with_state=True, disable_prefix_cache=disable_prefix_cache
     )
@@ -153,6 +154,8 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
         plan = scheduler.next_execution_plan()
         (batch,) = [op for op in plan.forward if op.request_ids]
         rows.append(_state_row(batch))
+        if computed == 300:
+            assert all(block in plan.pages_to_zero["state"] for block in rows[0])
         result = ts.ForwardEvent.ExtendResult()
         result.request_id = "r"
         result.tokens = [900] if computed == 700 else []
@@ -160,7 +163,7 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
         event.add_event(result)
         scheduler.advance(event)
     first, second, third = rows
-    assert first[0] == 0 and first[1] > 0
+    assert first[0] > 0 and first[1] > 0 and first[0] != first[1]
     assert second[0] == first[1] and second[1] > 0 and second[1] != second[0]
     assert third[0] == second[1] and third[1] > 0 and third[1] != third[0]
 

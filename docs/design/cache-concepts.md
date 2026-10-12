@@ -210,7 +210,8 @@ not a position-indexed row:
 ```
 slot 0  input checkpoint   a claimed prefix hit (shared, immutable) |
                            the block the request's previous forward wrote |
-                           null: no history, the zero state
+                           a fresh zeroed block: no history, the zero state |
+                           null: read slot 1 instead
 slot 1  live               the block this request's forwards write
 ```
 
@@ -219,14 +220,20 @@ writes slot 1; the rule is the same for prefill, decode and verify, so the
 runtime needs no "first chunk" or "first decode" signal
 (`layers/attention/backends/state/checkpoint.py`, `compute_state_block_indices`;
 the decode prep tape and `verify_state_blocks` spell the same `where`). A
-prefill chunk therefore reads one block and writes another ("write-to-new");
-at the next admission the scheduler **rotates**: slot 0 leaves the table
-(the prefix index keeps it alive if it was published), slot 1 moves to slot
-0, and a fresh block becomes slot 1. When the prompt end is published (the
-prefix cache is on), the first decode step still sees the prompt-end state in
-slot 0 and writes a fresh slot 1; from the second step on -- from the first,
-with nothing to publish -- slot 0 is null and decode evolves slot 1 in place.
-Speculative verify commits the accepted state into slot 1 unconditionally
+prefill chunk therefore reads one block and writes another ("write-to-new"),
+and a request holds its two blocks from its first admission on: a prompt with
+no checkpoint to resume from gets a fresh block in slot 0, zeroed by the plan
+like any fresh page, so the zero state is a block like any other and no
+rotation ever needs a block the admission did not already grant. At the next
+admission the scheduler **rotates**: slot 0 leaves the table (the prefix
+index keeps it alive if it was published), slot 1 moves to slot 0, and a
+fresh block becomes slot 1. When the prompt end is published (the prefix
+cache is on), the first decode step still sees the prompt-end state in slot 0
+and writes a fresh slot 1; from the second step on -- from the first, with
+nothing to publish -- slot 0 is null and decode evolves slot 1 in place. A
+null slot 0 also means "read slot 1" for the rows the runtime fabricates
+(capture dummies) and for the decode role's landing row. Speculative verify
+commits the accepted state into slot 1 unconditionally
 (`commit_state_pages`).
 
 A **natural checkpoint** is a state block that exists because a forward ended

@@ -159,7 +159,8 @@ def test_prompt_end_and_finish_publish_tails_a_later_prompt_hits() -> None:
     table = prefill.block_tables_arrays()["history"][0]
     # The hitter's table: the two shared pages, then its private copy of page 2.
     assert table[2] == destination
-    assert destination not in plan.pages_to_zero
+    assert destination not in plan.pages_to_zero["history"]
+    assert source not in plan.pages_to_zero["history"]
     assert source not in table.tolist()
     _land(scheduler, prefill, 2000)
     plan = scheduler.next_execution_plan()
@@ -212,13 +213,14 @@ def test_a_state_group_hits_where_its_checkpoint_was_published() -> None:
     live slot, and the live block at finish. A prompt sharing the prompt end
     claims the state block into slot 0 (shared, never copied) beside the KV
     page copy; a prompt diverging inside the page finds no state below its
-    boundary and starts from the zero state."""
+    boundary and starts from the zero state, a fresh zeroed block in slot 0."""
     scheduler = _scheduler(with_state=True)
     _submit(scheduler, "a", PROMPT)
     plan = scheduler.next_execution_plan()
     (prefill,) = _forwards(plan)
     cold_row = _state_row(prefill)
-    assert cold_row[0] == 0 and cold_row[1] > 0
+    assert cold_row[0] > 0 and cold_row[1] > 0 and cold_row[0] != cold_row[1]
+    assert all(block in plan.pages_to_zero["state"] for block in cold_row)
     _land(scheduler, prefill, 1000)
     plan = scheduler.next_execution_plan()
     (decode,) = _forwards(plan)
@@ -263,7 +265,7 @@ def test_a_state_group_hits_where_its_checkpoint_was_published() -> None:
     assert list(prefill.extend_prefix_lens) == [0]
     assert list(prefill.input_lengths) == [32]
     row = _state_row(prefill)
-    assert row[0] == 0 and row[1] > 0
+    assert row[0] > 0 and row[0] in plan.pages_to_zero["state"] and row[1] > 0
     assert plan.pages_to_copy_arrays()["history"].shape == (0, 2)
     junction_block = row[1]
     advance_scheduler(scheduler, [make_extend_result_event("d", [])])

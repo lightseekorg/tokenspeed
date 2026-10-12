@@ -295,8 +295,9 @@ class _ScheduledKDA:
                 row = tables[group][0]
                 previous = self.previous_tables.get(group, [])
                 # Each chunk reads the previous chunk's block from slot 0 and
-                # writes a fresh slot 1; the block that left the row was an
-                # interior chunk end nobody published.
+                # writes a fresh slot 1; the block that left the row was the
+                # zeroed block the first chunk read or an interior chunk end
+                # nobody published.
                 self.released[group] |= set(previous) - set(row) - {0}
                 if state_block in self.released[group]:
                     self.reused_outputs[group].add(state_block)
@@ -367,8 +368,9 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
         assert active.scheduler.empty_lcm_blocks() > 0
         if steps == 3:
             # Packing is one block per parent. An interior chunk end is not a
-            # publication point, so the first chunk's block returns to the
-            # pool once the second chunk has read it.
+            # publication point, so the zeroed block the first chunk read and
+            # the first chunk's own block are back in the pool once the chunk
+            # after each has read what it needed.
             materialized = sum(
                 block > 0
                 for rows in actual.tables.values()
@@ -378,7 +380,7 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
             assert active.scheduler.empty_lcm_blocks() == (
                 _USABLE_BLOCKS - materialized
             )
-            assert all(len(active.released[group]) == 1 for group in KIMI_STATE_GROUPS)
+            assert all(len(active.released[group]) == 2 for group in KIMI_STATE_GROUPS)
 
     # The released parents cycle through the allocator and become real GPU
     # output destinations again. Unpublished working state returns directly

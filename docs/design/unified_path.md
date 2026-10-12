@@ -276,10 +276,11 @@ and leave output undefined. Consumers must ignore padded output; enabled
 intermediate caches always require real storage.
 
 A state group's block table holds two slots per request: the input
-checkpoint (slot 0: a claimed prefix hit, or the block the previous forward
-wrote before the scheduler rotated it; null once consumed) and the live block
-(slot 1). A forward reads slot 0 when it holds a block and slot 1 otherwise,
-and always writes slot 1 (`backends/state/checkpoint.py`). State backends
+checkpoint (slot 0: a claimed prefix hit, the block the previous forward
+wrote before the scheduler rotated it, or a fresh zeroed block for a prompt
+with no history; null once consumed) and the live block (slot 1). A forward
+reads slot 0 when it holds a block and slot 1 otherwise, and always writes
+slot 1 (`backends/state/checkpoint.py`). State backends
 refresh every state group's decode blocks in one prep-tape launch, up to eight
 groups; the tape loops over rows, so it covers every captured batch size.
 Target verify writes each group's committed-state blocks straight into the

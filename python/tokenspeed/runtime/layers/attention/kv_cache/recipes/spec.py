@@ -31,10 +31,10 @@ TransferPolicy = Literal["full_suffix", "latest_snapshot"]
 SlidingWindowTokens = int | Sequence[int | None] | None
 
 # A state group's block table holds two slots per request: the input
-# checkpoint the forward reads (a claimed prefix hit, or the block the previous
-# forward wrote before the scheduler rotated it; null once consumed) and the
-# live block it writes. The scheduler and the state kernels address them by
-# these fixed positions.
+# checkpoint the forward reads (a claimed prefix hit, the block the previous
+# forward wrote before the scheduler rotated it, or a fresh zeroed block for a
+# prompt with no history; null once consumed) and the live block it writes.
+# The scheduler and the state kernels address them by these fixed positions.
 STATE_INPUT_SLOT = 0
 STATE_LIVE_SLOT = 1
 STATE_TABLE_SLOTS = 2

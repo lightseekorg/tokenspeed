@@ -22,15 +22,16 @@
 
 A state group's block table holds two slots per request:
 
-* slot 0, the **input checkpoint**: the claimed prefix hit, or the block the
-  request's previous forward wrote before the scheduler rotated it; null
-  (``0``) once that block has been consumed or when the request starts from
-  the zero state;
+* slot 0, the **input checkpoint**: the claimed prefix hit, the block the
+  request's previous forward wrote before the scheduler rotated it, or a
+  fresh zeroed block when the request starts from the zero state; null
+  (``0``) once that block has been consumed;
 * slot 1, the **live block**: the block this request's forwards write.
 
 A forward reads slot 0 when it is non-null and slot 1 otherwise (in-place
 evolution), and always writes slot 1. A published checkpoint is never written:
-it only ever appears in slot 0, and slot 0 is never the write target.
+it only ever appears in slot 0, and slot 0 is never the write target. A
+request without history reads no block at all, whatever its row holds.
 """
 
 from __future__ import annotations
