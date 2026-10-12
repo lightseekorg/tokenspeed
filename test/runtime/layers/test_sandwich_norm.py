@@ -142,6 +142,25 @@ def test_a_served_call_is_one_fused_launch(calls, tokens):
     assert kwargs == dict(eps=1e-5, x_scale=0.5, residual_scale=0.75, max_token_num=64)
 
 
+@pytest.mark.parametrize(
+    "pair", [(0.5, None), (None, 0.5)], ids=["x-scale-only", "residual-scale-only"]
+)
+@pytest.mark.parametrize("tokens", [1, 65])  # 65: above --comm-fusion-max-num-tokens
+def test_a_one_sided_pair_reaches_either_path(calls, pair, tokens):
+    """One multiplier alone is a valid call on both paths (the missing one is
+    1.0 in the fused wrapper and in rmsnorm): at T = 1 it goes to the fused
+    launch, and above the fusion limit to the unfused chain, unchanged."""
+    calls.fused_result = ("out", "residual_out") if tokens == 1 else ("never",)
+    out, inputs = _run(tokens=tokens, x_scale=pair[0], residual_scale=pair[1])
+    if tokens == 1:
+        assert out == ("out", "residual_out")
+        ((kind, _, kwargs),) = calls.log
+        assert kind == "fused"
+        assert (kwargs["x_scale"], kwargs["residual_scale"]) == pair
+    else:
+        _assert_unfused(calls, inputs, reduced=True, pair=pair)
+
+
 def test_a_call_the_kernel_declines_runs_the_unfused_chain(calls):
     out, inputs = _run(x_scale=0.5, residual_scale=0.75)
     assert calls.log[0][0] == "fused"

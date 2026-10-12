@@ -673,11 +673,36 @@ def test_calls_no_kernel_serves_return_none_without_a_launch(wrapper, case):
 
 
 @pytest.mark.parametrize(
+    "scales,launched",
+    [
+        (dict(x_scale=0.5), (0.5, 1.0)),
+        (dict(residual_scale=0.5), (1.0, 0.5)),
+        (dict(x_scale=0.5, residual_scale=None), (0.5, 1.0)),
+    ],
+    ids=["x-scale-only", "residual-scale-only", "residual-scale-none"],
+)
+@pytest.mark.parametrize("tokens", [1, 2048, 2049])
+def test_a_one_sided_pair_takes_one_for_the_missing_side(
+    wrapper, scales, launched, tokens
+):
+    """As the unfused rmsnorm(): the missing multiplier is 1.0, at T = 1, at
+    the fused limit (max_token_num 2048), and above it, where the call
+    returns None for the unfused chain instead of raising."""
+    wrapper.manager.mnnvl_workspace = _workspace(8, 4096)
+    out = _call(wrapper, tokens=tokens, **scales)
+    if tokens > 2048:
+        assert out is None and wrapper.module.calls == []
+        return
+    assert out is not None
+    assert wrapper.module.calls[-1][-2:] == launched
+
+
+@pytest.mark.parametrize(
     "case",
     [
         dict(dtype=torch.float16),
-        dict(x_scale=0.5),
-        dict(residual_scale=0.5),
+        dict(x_scale=math.inf),
+        dict(residual_scale=math.nan),
         dict(x_scale=math.inf, residual_scale=1.0),
         dict(x_scale=True, residual_scale=1.0),
         dict(x_scale=1, residual_scale=1.0),

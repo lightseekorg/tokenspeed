@@ -962,12 +962,11 @@ if current_platform().is_nvidia:
     def _sandwich_scale_pair(
         x_scale: float | None, residual_scale: float | None
     ) -> tuple[float, float]:
-        """The multipliers of the two addends; a missing pair is (1.0, 1.0),
-        whose products are exact, so the add is the unscaled one."""
-        if (x_scale is None) != (residual_scale is None):
-            raise ValueError("x_scale and residual_scale are given together or not")
-        if x_scale is None:
-            return 1.0, 1.0
+        """The multipliers of the two addends. A missing one is 1.0, as in the
+        unfused ``rmsnorm()``: its product is exact, so that addend enters the
+        add unscaled (a missing pair is the plain sum)."""
+        x_scale = 1.0 if x_scale is None else x_scale
+        residual_scale = 1.0 if residual_scale is None else residual_scale
         for name, value in (("x_scale", x_scale), ("residual_scale", residual_scale)):
             # What the unfused rmsnorm() takes, so a declined call runs too.
             if not isinstance(value, float) or not math.isfinite(value):
@@ -1014,8 +1013,8 @@ if current_platform().is_nvidia:
             group: The device process group of the all-reduce.
             eps: Epsilon of both norms.
             x_scale, residual_scale: Optional multipliers of the normalized sum
-                and the residual (both or neither); each product is rounded to
-                BF16 before the add.
+                and the residual (a missing one is 1.0); each product is
+                rounded to BF16 before the add.
             max_token_num: Token capacity to arm the group's workspace for.
             trigger_completion_at_end: Release PDL dependents after the last
                 store (otherwise after the inputs are loaded).

@@ -641,7 +641,7 @@ def sandwich_rmsnorm(
         post_norm: The norm of the sublayer output (applied before the add).
         norm: The norm of the new residual stream (the next pre-norm).
         x_scale, residual_scale: Optional multipliers of the two addends
-            (both or neither; NVIDIA only, as ``rmsnorm``'s).
+            (a missing one is 1.0; NVIDIA only, as ``rmsnorm``'s).
 
     Returns:
         ``(out, residual_out)``.

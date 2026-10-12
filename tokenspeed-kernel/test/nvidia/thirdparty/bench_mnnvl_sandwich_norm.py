@@ -21,11 +21,16 @@
 """What does fusing a pre/post ("sandwich") norm boundary into the MNNVL
 all-reduce save?
 
-Per token count, a CUDA graph of ``BENCH_OPS`` boundaries is timed for:
+Per scale pair and token count, a CUDA graph of ``BENCH_OPS`` boundaries is
+timed for:
   * ``chain`` -- the plain MNNVL all-reduce, ``rmsnorm`` of the sum and
                  ``rmsnorm`` with the residual and the scale pair;
   * ``fused`` -- ``allreduce_sandwich_rmsnorm``, one launch per boundary.
 Rank 0 prints microseconds per boundary and the saving.
+
+``BENCH_PAIRS`` lists ``x_scale:residual_scale`` pairs, ``none`` for a missing
+side (1.0). The default is the plain boundary (1.0, 1.0), a scaled residual
+(1.0, 0.5) and a one-sided pair (none, 0.5).
 
 Launch (world size 2, 4, 8 or 16)::
 
@@ -42,7 +47,10 @@ import torch.distributed as dist
 
 HIDDEN = int(os.environ.get("BENCH_HIDDEN", 4096))
 EPS = 1e-5
-PAIR = (0.25, 0.97)
+PAIRS = [
+    tuple(None if v == "none" else float(v) for v in pair.split(":"))
+    for pair in os.environ.get("BENCH_PAIRS", "1.0:1.0,1.0:0.5,none:0.5").split(",")
+]
 TOKENS = [
     int(t)
     for t in os.environ.get("BENCH_TOKENS", "1,8,32,128,512,1024,2048").split(",")
@@ -51,7 +59,7 @@ OPS = int(os.environ.get("BENCH_OPS", 20))
 REPS = int(os.environ.get("BENCH_REPS", 30))
 
 
-def _boundaries(tokens, dev, fused):
+def _boundaries(tokens, dev, fused, pair):
     from tokenspeed_kernel.ops.communication import allreduce_sandwich_rmsnorm, trtllm
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
@@ -77,8 +85,8 @@ def _boundaries(tokens, dev, fused):
                 rank,
                 dist.group.WORLD,
                 eps=EPS,
-                x_scale=PAIR[0],
-                residual_scale=PAIR[1],
+                x_scale=pair[0],
+                residual_scale=pair[1],
             )
             assert out is not None
             return
@@ -103,8 +111,8 @@ def _boundaries(tokens, dev, fused):
             residual=residual,
             enable_pdl=None,
             round_residual_sum_bf16=True,
-            x_scale=PAIR[0],
-            residual_scale=PAIR[1],
+            x_scale=pair[0],
+            residual_scale=pair[1],
         )
 
     return one
@@ -145,18 +153,20 @@ def main() -> None:
     )
     if not armed or trtllm._manager_for_group(dist.group.WORLD).mnnvl_workspace is None:
         raise SystemExit("no MNNVL workspace on this fabric")
-    rows = []
-    for tokens in TOKENS:
-        chain = _time(_boundaries(tokens, dev, fused=False))
-        fused = _time(_boundaries(tokens, dev, fused=True))
-        rows.append((tokens, chain, fused))
-    if rank == 0:
-        print(
-            f"world {dist.get_world_size()} hidden {HIDDEN}, us per boundary ({OPS} per graph)"
-        )
-        print(f"{'tokens':>7} {'chain':>9} {'fused':>9} {'saved':>9}")
-        for tokens, chain, fused in rows:
-            print(f"{tokens:>7} {chain:>9.2f} {fused:>9.2f} {chain - fused:>9.2f}")
+    for pair in PAIRS:
+        rows = []
+        for tokens in TOKENS:
+            chain = _time(_boundaries(tokens, dev, False, pair))
+            fused = _time(_boundaries(tokens, dev, True, pair))
+            rows.append((tokens, chain, fused))
+        if rank == 0:
+            print(
+                f"world {dist.get_world_size()} hidden {HIDDEN} pair {pair}, "
+                f"us per boundary ({OPS} per graph)"
+            )
+            print(f"{'tokens':>7} {'chain':>9} {'fused':>9} {'saved':>9}")
+            for tokens, chain, fused in rows:
+                print(f"{tokens:>7} {chain:>9.2f} {fused:>9.2f} {chain - fused:>9.2f}")
     dist.destroy_process_group()
 
 
