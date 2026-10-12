@@ -346,10 +346,8 @@ def multimodal_context_for_forward(forward_op, rid_to_state, max_encoder_tokens:
     num_extends = forward_op.num_extends()
     mm_inputs = []
     has_mm = False
-    for index, rid in enumerate(forward_op.request_ids):
+    for rid in forward_op.request_ids:
         state = rid_to_state.get(rid)
-        if state is not None and index < num_extends:
-            state.maybe_extend_multimodal_mrope_positions()
         item = getattr(state, "multimodal_inputs", None) if state else None
         if item is not None:
             # Resolve the decode delta here rather than letting the forward

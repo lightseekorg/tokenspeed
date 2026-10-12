@@ -27,6 +27,15 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 
+from tokenspeed.runtime.execution.slot_state import (
+    PREPARED_MARKER_BYTES,
+    pack_slot_rows,
+    read_prepared_marker,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+    write_prepared_marker,
+)
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
@@ -147,6 +156,10 @@ class SamplingBackend(ABC):
     Requests asking for params a backend doesn't implement are NOT rejected;
     the backend silently applies only what it supports, so all requests go
     through the same captured graph.
+
+    Per-slot state is part of the retraction image (``SlotStateExporter``):
+    a restored request samples exactly as it would have unretracted, so the
+    import suppresses the rid-flip reset for the restored slot.
     """
 
     # Subclasses that hold per-pool-idx state (scalars like temperature /
@@ -156,6 +169,13 @@ class SamplingBackend(ABC):
     # a no-op.
     _HAS_POOL_STATE: bool = False
     _SUPPORTS_DP_VERIFY: bool = False
+
+    #: Pool-shaped buffers whose rows never change (every slot reads the same
+    #: constant), so a retraction image carries nothing for them. The
+    #: architecture test accepts these beside the exported rows; no sampling
+    #: row is token-derived.
+    constant_slot_state: tuple[str, ...] = ("_zero_offsets_pool",)
+    token_derived_slot_state: tuple[str, ...] = ()
 
     def __init__(self, config: SamplingBackendConfig) -> None:
 
@@ -411,6 +431,68 @@ class SamplingBackend(ABC):
         before CUDA graph capture. Warm-up runs sample()/verify() against
         pool row 0 (see ForwardStepRunner capture path); stateful backends
         override this to zero whatever row 0 accumulates. Default: no-op."""
+
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """The per-slot Device rows a retraction snapshot images, in a fixed order.
+
+        Everything ``_reset_slot`` scatters for a new occupant -- the
+        sampling scalars, the penalty counts, the logit bias -- because the
+        restore suppresses that reset for the restored slot. A stateless
+        backend keeps the empty default.
+        """
+        del slot
+        return []
+
+    def slot_state_bytes(self) -> int:
+        # A pool-stateful backend images the prepared marker ahead of its
+        # payload (``slot_state.py``); a stateless one images nothing.
+        if not self._HAS_POOL_STATE:
+            return 0
+        return PREPARED_MARKER_BYTES + self._slot_payload_bytes()
+
+    def _slot_payload_bytes(self) -> int:
+        """Bytes of the slot's rows behind the marker; subclasses add theirs."""
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def _export_slot_payload(self, slot: int, out: torch.Tensor, stream) -> None:
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def _import_slot_payload(self, slot: int, src: torch.Tensor, stream) -> None:
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        if not self._HAS_POOL_STATE:
+            return
+        # The slot holds ``request_id``'s state only once prepare_step ran a
+        # forward for it there; a victim retracted before its first forward
+        # (a PD decode role's landed request) still holds the previous
+        # occupant's, so the image carries the marker alone.
+        prepared = self._last_rid_per_slot[slot] == request_id
+        write_prepared_marker(out, prepared)
+        if prepared:
+            self._export_slot_payload(slot, out[PREPARED_MARKER_BYTES:], stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        if not self._HAS_POOL_STATE:
+            return
+        if read_prepared_marker(src):
+            self._import_slot_payload(slot, src[PREPARED_MARKER_BYTES:], stream)
+            # ``prepare_step`` compares the incoming rid against this sentinel;
+            # a match is not a flip, so the restored rows are not reset as a
+            # new occupant's.
+            self._last_rid_per_slot[slot] = request_id
+        else:
+            # Nobody's: the first prepare_step resets the slot from the
+            # request's own SamplingParams, as it would have unretracted.
+            self._last_rid_per_slot[slot] = None
 
     def get_packed_output_d2h(
         self,

@@ -26,11 +26,13 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #include "core/token_container.h"
+#include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "fsm/states.h"
 #include "scheduler/request_spec.h"
@@ -48,9 +50,9 @@ public:
     // one safe-step window up front, plus one more per retraction suffered
     // -- being retracted means the previous admission was still too
     // optimistic. Capped by the generation budget the request can STILL
-    // use, which makes the escalation terminate. Remaining, not declared:
-    // retraction rebases generated tokens into the prompt, so a readmission
-    // that reserved the full declared budget on top of them would demand
+    // use, which makes the escalation terminate. Remaining, not declared: a
+    // restore re-reserves on top of the tokens already generated, so a
+    // readmission that reserved the full declared budget would demand
     // prompt + generated + max_new -- more than the request can ever write,
     // and possibly more than the pool holds, leaving it Retracted forever.
     //
@@ -84,30 +86,34 @@ public:
         return max_new_tokens_ > 0 && safe_steps * (1 + retraction_count_) >= RemainingNewTokensAtAdmission();
     }
 
-    // Tokens generated so far / still permitted. Both survive retraction's
-    // RebasePrefill (which folds generated tokens into the prefill window):
-    // the comparison is against the SUBMITTED prompt, which rebasing cannot
-    // change.
+    // Tokens generated so far / still permitted. Both compare against the
+    // SUBMITTED prompt, which no retraction or restore changes.
     std::int32_t GeneratedTokens() const { return std::max(0, TokenSize() - submitted_prompt_size_); }
     std::int32_t RemainingNewTokens() const { return std::max(0, max_new_tokens_ - GeneratedTokens()); }
     bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
-    // The budget that was still open when the current admission was granted.
-    // Rebasing is the only thing that moves the prefill window and every
-    // retraction rebases, so PrefillSize() minus the submitted prompt is
-    // exactly what had been generated at that admission -- frozen for its
-    // whole life, where RemainingNewTokens() shrinks with every decode.
+    // The budget that was still open when the current admission was granted:
+    // stamped by the admission events (a first chunk, a restore), frozen for
+    // the admission's whole life where RemainingNewTokens() shrinks with
+    // every decode.
     std::int32_t RemainingNewTokensAtAdmission() const {
-        return std::max(0, max_new_tokens_ - (PrefillSize() - submitted_prompt_size_));
+        return std::max(0, max_new_tokens_ - generated_tokens_at_admission_);
     }
 
     // Longest prompt prefix the admission probe may claim from the prefix
     // cache (RequestSpec::max_cached_prefix_tokens); INT32_MAX means
-    // unbounded. A readmission after retraction relaxes it to the positions
-    // whose results had landed before (fsm::Retracted::LandedTokens).
+    // unbounded. Only a first admission probes: a restore copies the
+    // request's own image back and matches nothing.
     std::int32_t MaxCachedPrefixTokens() const { return max_cached_prefix_tokens_; }
 
     template <typename Event>
     void Apply(Event&& event) {
+        // An admission that secures headroom records the generation budget it
+        // saw, so the retraction exemption is judged against that budget and
+        // not today's remainder.
+        if constexpr (std::same_as<std::remove_cvref_t<Event>, fsm::SchedulePrefillFirstChunkEvent> ||
+                      std::same_as<std::remove_cvref_t<Event>, fsm::ScheduleRestoreEvent>) {
+            generated_tokens_at_admission_ = GeneratedTokens();
+        }
         state_ = std::visit(
             [&event](auto&& state) -> fsm::State { return fsm::ToState(std::forward<Event>(event)(std::move(state))); },
             std::move(state_));
@@ -129,7 +135,8 @@ public:
     }
 
     // True in every state that carries ForwardResources; Bootstrapping,
-    // Submitted, Retracted and Finished hold no pages.
+    // Submitted, Prefetching, Retracted and Finished hold no pages (Restoring
+    // does: its fresh pages are being filled).
     bool HoldsPages() const {
         return std::visit(Overloaded{
                               [](const fsm::HoldsForwardResources auto&) { return true; },
@@ -207,6 +214,18 @@ public:
     // admission time, and a state transition only moves them on.
     fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
 
+    // True from a restore's ACK until the first decode is scheduled: the
+    // device holds no in-flight capture for the request's next input, so that
+    // decode carries its token explicitly (fsm::RestoreMarker).
+    bool ResumedByRestore() const {
+        return std::visit(Overloaded{
+                              [](const fsm::PrefillDone& state) { return state.ResumedByRestore(); },
+                              [](const fsm::Decoding& state) { return state.ResumedByRestore(); },
+                              [](const auto&) { return false; },
+                          },
+                          state_);
+    }
+
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
             Overloaded{
@@ -226,12 +245,14 @@ public:
         return std::visit(Overloaded{
                               [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
                               [](const fsm::Submitted&) -> std::string { return "Submitted"; },
+                              [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
                               [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
                               [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
                               [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
+                              [](const fsm::Restoring&) -> std::string { return "Restoring"; },
                               [](const fsm::Finished&) -> std::string { return "Finished"; },
                           },
                           state_);
@@ -247,6 +268,8 @@ private:
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
+    // GeneratedTokens() when the current admission was granted.
+    std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
     std::int32_t prefix_granularity_{};
     fsm::State state_;

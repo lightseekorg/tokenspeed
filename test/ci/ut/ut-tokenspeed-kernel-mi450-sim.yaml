@@ -64,14 +64,16 @@ env:
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[1-1]
     tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_gluon_batched_replay_uneven_groups_match_per_layer_launches
     # DeepSeek V4.1 index top-k: CSA2 scoring, reindexing, missing and
-    # out-of-table latest pages, arena page strides.
+    # out-of-table latest pages, arena page strides, and raw gfx1250 logits.
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv41_index_topk/gluon_dsv41_index_topk_gfx1250@mi450]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_full_and_reindex_gluon[65-17-32]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_missing_latest_page[-1-gluon]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_missing_latest_page[3-gluon]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_latest_block_outside_table[320-31-gluon]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-1]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-2]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-arena]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-byte-strided]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-unaligned-pages]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_gfx1250_index_logits_match_reference[40-False]
     # DeepSeek V4.1 fused selected attention, with and without the global cache.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_gluon_is_selected_on_supported_amd
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_selected_attention_matches_gather_softmax[True-16]
@@ -157,12 +159,15 @@ env:
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-gluon_mm_mxfp8_ue8m0_gfx1250]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-True-gluon_mm_fp8_blockscale_gfx1250]
   ROCM_NIGHTLY_INDEX: https://nightly.repo.amd.com/rocm/whl-next/
-  ROCM_SDK_VERSION: 10.2.0a20260923
-  ROCM_SYSTEMS_REF: f9ba16bbe70e365b2f59b268e847bef19ad9db6e
-  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.2.0a20260923
+  # The PyTorch nightly requires this exact ROCm SDK build.
+  ROCM_SDK_VERSION: 10.2.0a20261010
+  # The rocm-systems revision that this ROCm SDK nightly was built from, as
+  # recorded in its share/therock/therock_manifest.json.
+  ROCM_SYSTEMS_REF: d5c528019d0fcfbbc32d96b53ac2c61df6d0e67d
+  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.2.0a20261010
   TORCH_INDEX_URL: https://nightly.repo.amd.com/rocm/whl-next/
-  TORCH_VERSION: 2.14.0+rocm10.2.0a20260923
-  TORCHVISION_VERSION: 0.29.0a0+rocm10.2.0a20260923
+  TORCH_VERSION: 2.14.0+rocm10.2.0a20261010
+  TORCHVISION_VERSION: 0.29.0+rocm10.2.0a20261010
 install:
   - bash test/ci_system/setup_mi450_sim.sh
   - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh

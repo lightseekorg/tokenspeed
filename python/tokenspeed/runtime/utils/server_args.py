@@ -146,22 +146,22 @@ def _nonempty_str(value: str) -> str:
     return value
 
 
-def validate_dcp_disaggregation_role(
-    *, has_dcp: bool, disaggregation_mode: str
+def validate_kvp_disaggregation_role(
+    *, has_kvp: bool, disaggregation_mode: str
 ) -> None:
-    """Reject DCP on PD roles whose transfer path cannot shard pages yet.
+    """Reject KVP on PD roles whose transfer path cannot shard pages yet.
 
     An aggregated engine and the prefill role may shard: the prefill sender
-    copies only the pages each rank owns and every rank of the DCP subgroup
+    copies only the pages each rank owns and every rank of the KVP subgroup
     serves every decode rank. The decode role receives into an unsharded
     cache only -- no receive path lands a block on its owner alone -- and the
     encode role has no KV cache to shard.
     """
-    if has_dcp and disaggregation_mode not in ("null", "prefill"):
+    if has_kvp and disaggregation_mode not in ("null", "prefill"):
         raise ValueError(
-            "--decode-context-parallel-size > 1 requires --disaggregation-mode "
+            "--kv-parallel-size > 1 requires --disaggregation-mode "
             f"null or prefill (got {disaggregation_mode!r}): only the prefill "
-            "side of a PD transfer can be DCP-sharded"
+            "side of a PD transfer can be KVP-sharded"
         )
 
 
@@ -187,7 +187,7 @@ def validate_qcp(
     attn_dp_size: int,
     dense_tp_size: int,
     moe_tp_ep_size: int,
-    dcp_size: int,
+    kvp_size: int,
     disaggregation_mode: str,
     disable_prefill_graph: bool,
     enable_mixed_batch: bool,
@@ -261,10 +261,10 @@ def validate_qcp(
             f"backend ({sorted(QCP_ATTENTION_BACKENDS)}), got "
             f"--attention-backend {attention_backend!r}"
         )
-    if dcp_size not in (1, qcp_size):
+    if kvp_size not in (1, qcp_size):
         raise ValueError(
-            "--decode-context-parallel-size must be 1 or equal to "
-            f"--prefill-context-parallel-size (got dcp={dcp_size}, qcp={qcp_size}): "
+            "--kv-parallel-size must be 1 or equal to "
+            f"--prefill-context-parallel-size (got kvp={kvp_size}, qcp={qcp_size}): "
             "the history gather splits by the page owners of the whole shard group"
         )
 
@@ -430,6 +430,32 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    # The L3 prefetch that fills a waiting request's Host pages before its
+    # admission: the shortest L3 prefix worth one (prefix pages), the lane's
+    # deadline (base + per_page * pages seconds) and its batch. Explicit with
+    # an L3 store, unset without one (see validate_l3_prefetch_options).
+    kvstore_prefetch_min_pages: int | None = None
+    kvstore_prefetch_timeout_base_s: float | None = None
+    kvstore_prefetch_timeout_per_page_s: float | None = None
+    kvstore_prefetch_batch_pages: int | None = None
+
+    # Retraction snapshot pool (pinned Host, per rank) and its slot-state
+    # arena rows: a retracted request is suspended with its image and
+    # resumed by restore; a victim whose image does not fit is aborted
+    # instead. Sized like the KVStore: an explicit size in gigabytes wins
+    # (0 = not set), else a ratio of this rank's Device KV capacity (an
+    # explicit 0 disables the pool: every capacity block then aborts its
+    # victim), else derived at device build -- 0.1 of the Device KV without
+    # L2, the tails of ``retraction_snapshot_max_requests`` images with L2
+    # (cache/l2/sizing.py). The request cap derives from --max-num-seqs per
+    # attention-DP rank when 0 (resolve_retraction_snapshot_options).
+    retraction_snapshot_host_gb: float = 0.0
+    retraction_snapshot_ratio: float | None = None
+    retraction_snapshot_max_requests: int = 0
+    # Test knob: every |N| plans the scheduler retracts the oldest quiescent
+    # Decoding (N > 0) or Prefilling (N < 0) request without capacity
+    # pressure, to exercise the suspend/restore path. 0 (off) in serving.
+    debug_force_retraction_interval: int = 0
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -460,8 +486,9 @@ class ServerArgs:
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
-    # DeepSeek V4
-    decode_context_parallel_size: int = 1
+    # KV parallelism: shard the full-history KV pages page-cyclically over a
+    # consecutive subgroup of attention TP (1 = off).
+    kv_parallel_size: int = 1
     # Query context parallelism on the PD prefill role: shard every extend
     # forward's rows over the attention TP group (1 = off).
     prefill_context_parallel_size: int = 1
@@ -944,7 +971,7 @@ class ServerArgs:
             world_size=world_size,
             attn_tp_size=attn_tp_size,
             attn_dp_size=attn_dp_size,
-            attn_dcp_size=self.decode_context_parallel_size,
+            attn_kvp_size=self.kv_parallel_size,
             attn_head_tp_size=self.attn_head_tp_size,
             lm_head_tp_size=self.lm_head_tp_size,
             attn_qcp_size=self.prefill_context_parallel_size,
@@ -964,8 +991,8 @@ class ServerArgs:
         )
 
         # Impl constraints:
-        validate_dcp_disaggregation_role(
-            has_dcp=self.mapping.attn.has_dcp,
+        validate_kvp_disaggregation_role(
+            has_kvp=self.mapping.attn.has_kvp,
             disaggregation_mode=self.disaggregation_mode,
         )
         validate_qcp(
@@ -974,7 +1001,7 @@ class ServerArgs:
             attn_dp_size=self.mapping.attn.dp_size,
             dense_tp_size=self.mapping.dense.tp_size,
             moe_tp_ep_size=self.mapping.moe.tp_ep_size,
-            dcp_size=self.mapping.attn.dcp_size,
+            kvp_size=self.mapping.attn.kvp_size,
             disaggregation_mode=self.disaggregation_mode,
             disable_prefill_graph=bool(self.disable_prefill_graph),
             enable_mixed_batch=self.enable_mixed_batch,
@@ -1117,7 +1144,96 @@ class ServerArgs:
     def resolve_cache(self):
         # Handle KVStore settings.
         self._handle_kvstore()
+        self.validate_l3_prefetch_options()
         self.validate_cache_options()
+        self.resolve_retraction_snapshot_options()
+
+    @property
+    def retracting_role(self) -> bool:
+        """Whether this engine can retract at all: the fused and decode roles."""
+        return self.disaggregation_mode not in ("prefill", "encode")
+
+    @property
+    def retraction_snapshot_pool_disabled(self) -> bool:
+        """Whether no image can ever be taken, so a capacity block aborts.
+
+        The one way to ask for that on a retracting role is
+        ``--retraction-snapshot-ratio 0`` without a size override; the roles
+        that never retract are resolved to the same knobs.
+        """
+        return (
+            self.retraction_snapshot_host_gb == 0
+            and self.retraction_snapshot_ratio == 0
+        )
+
+    def resolve_retraction_snapshot_options(self):
+        """Resolve the retraction snapshot pool's knobs the way the KVStore's are.
+
+        ``--retraction-snapshot-host-gb`` is the explicit size and wins when
+        set (0 = not set); ``--retraction-snapshot-ratio`` sizes the pool as
+        a fraction of this rank's Device KV capacity, an explicit 0 disabling
+        it; neither given means the device builder derives the size
+        (``cache/l2/sizing.py``). ``--retraction-snapshot-max-requests`` 0
+        derives to the rank's running requests (``--max-num-seqs`` over the
+        attention-DP ranks), the most that can ever need an image at once.
+        The prefill and encode roles never retract: their knobs are resolved
+        to no pool here with a log, as the KVStore's are off on the encode
+        role.
+        """
+        host_gb = self.retraction_snapshot_host_gb
+        ratio = self.retraction_snapshot_ratio
+        max_requests = self.retraction_snapshot_max_requests
+        if host_gb < 0 or max_requests < 0 or (ratio is not None and ratio < 0):
+            raise ValueError(
+                "--retraction-snapshot-host-gb, --retraction-snapshot-ratio and "
+                "--retraction-snapshot-max-requests must be non-negative"
+            )
+        if not self.retracting_role:
+            forced = self.debug_force_retraction_interval != 0
+            if host_gb > 0 or ratio is not None or max_requests > 0 or forced:
+                logger.info(
+                    f"{self.disaggregation_mode!s} instance never retracts; ignoring "
+                    "the retraction snapshot pool arguments"
+                    + (" and --debug-force-retraction-interval" if forced else "")
+                )
+            self.retraction_snapshot_host_gb = 0.0
+            self.retraction_snapshot_ratio = 0.0
+            self.retraction_snapshot_max_requests = 0
+            # The scheduler refuses the knob on a pool-less engine.
+            self.debug_force_retraction_interval = 0
+            return
+        if self.retraction_snapshot_pool_disabled:
+            if max_requests > 0:
+                raise ValueError(
+                    "--retraction-snapshot-ratio 0 disables the retraction snapshot "
+                    "pool; --retraction-snapshot-max-requests has no rows to size"
+                )
+            if self.debug_force_retraction_interval != 0:
+                raise ValueError(
+                    "--debug-force-retraction-interval forces retractions, which the "
+                    "pool --retraction-snapshot-ratio 0 disabled"
+                )
+            return
+        if max_requests == 0:
+            # The cap is max_num_seqs per attention-DP rank: __post_init__
+            # resolves both before the cache.
+            if self.mapping is None or self.max_num_seqs is None:
+                raise ValueError(
+                    "resolve_parallelism() and resolve_memory_and_scheduling() must "
+                    "run before resolve_cache(): the derived "
+                    "--retraction-snapshot-max-requests is max_num_seqs per "
+                    "attention-DP rank"
+                )
+            dp_size = max(self.mapping.attn.dp_size, 1)
+            self.retraction_snapshot_max_requests = self.max_num_seqs // dp_size
+            if self.retraction_snapshot_max_requests == 0:
+                raise ValueError(
+                    "the retraction snapshot pool derives its request cap from "
+                    f"--max-num-seqs ({self.max_num_seqs}) per attention-DP rank "
+                    f"({dp_size}), which is 0 here; raise --max-num-seqs to at "
+                    "least the attention-DP size or pass "
+                    "--retraction-snapshot-max-requests"
+                )
 
     def resolve_speculative_decoding(self):
         # Keep drafter backend consistent with the main model unless explicitly set.
@@ -1580,17 +1696,64 @@ class ServerArgs:
                 "unset --disable-kvstore"
             )
 
+    def validate_l3_prefetch_options(self):
+        """The L3 prefetch knobs: all four with an L3 store, none without.
+
+        An L3 hit is fetched into Host pages before the request is admitted,
+        on the Host cache executor's prefetch lane; these size that fetch.
+        None of them has a silent default: the threshold trades a short hit's
+        recompute against a round of admission latency, the deadline bounds
+        how long a request may wait on the store, and the batch is the
+        store's request granularity.
+        """
+        knobs = {
+            "--kvstore-prefetch-min-pages": self.kvstore_prefetch_min_pages,
+            "--kvstore-prefetch-timeout-base-s": self.kvstore_prefetch_timeout_base_s,
+            "--kvstore-prefetch-timeout-per-page-s": (
+                self.kvstore_prefetch_timeout_per_page_s
+            ),
+            "--kvstore-prefetch-batch-pages": self.kvstore_prefetch_batch_pages,
+        }
+        given = [name for name, value in knobs.items() if value is not None]
+        if self.kvstore_storage_backend is None:
+            if given:
+                raise ValueError(
+                    f"{', '.join(given)} belong to the L3 prefetch and need "
+                    "--kvstore-storage-backend"
+                )
+            return
+        missing = [name for name, value in knobs.items() if value is None]
+        if missing:
+            raise ValueError(
+                f"--kvstore-storage-backend needs the L3 prefetch knobs: {', '.join(missing)}"
+            )
+        if self.kvstore_prefetch_min_pages < 1:
+            raise ValueError("--kvstore-prefetch-min-pages must be at least 1 page")
+        if self.kvstore_prefetch_timeout_base_s <= 0:
+            raise ValueError("--kvstore-prefetch-timeout-base-s must be positive")
+        if self.kvstore_prefetch_timeout_per_page_s < 0:
+            raise ValueError("--kvstore-prefetch-timeout-per-page-s must be >= 0")
+        if self.kvstore_prefetch_batch_pages < 1:
+            raise ValueError("--kvstore-prefetch-batch-pages must be at least 1 page")
+
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
-        # The Host L2 copies address device pages by scheduler block ID with
-        # no ownership translation (cache/l2/executor.py), so a sharded group
-        # would read and write the wrong local pages.
-        if self.decode_context_parallel_size > 1 and self.enable_kvstore:
+        # Both Host tiers -- the L2 KVStore and the retraction snapshot pool --
+        # are legal under KV-page sharding (--kv-parallel-size):
+        # the scheduler allocates every Host block in its Device block's
+        # residue class and the executor translates ownership on both ends of
+        # every row (cache/transfer/ownership.py), so each rank copies the
+        # blocks it owns. L3 is not: its keys name content and position, but
+        # which rank owns a block is decided at allocation, so a rank cannot
+        # answer an existence probe for blocks it did not own when the object
+        # was written (docs/design/cache-concepts.md, the retraction image).
+        if self.kv_parallel_size > 1 and (self.kvstore_storage_backend is not None):
             raise ValueError(
-                "--decode-context-parallel-size > 1 does not yet support the Host "
-                "KVStore (L2 addresses device pages without DCP ownership "
-                "translation); pass --disable-kvstore."
+                "--kvstore-storage-backend (L3) is not supported under "
+                "--kv-parallel-size > 1: a page-cyclic sharded group "
+                "has no owner-stable L3 key. The Host KVStore itself and the "
+                "retraction snapshot pool are supported."
             )
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
@@ -2188,6 +2351,98 @@ class ServerArgs:
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
+        )
+        parser.add_argument(
+            "--kvstore-prefetch-min-pages",
+            type=int,
+            default=ServerArgs.kvstore_prefetch_min_pages,
+            help="L3 prefetch threshold, in prefix pages: a waiting request whose "
+            "L3-only prefix is at least this long has it fetched into Host pages "
+            "before admission (the request waits, holding no Device page); a "
+            "shorter one is simply computed. Required with "
+            "--kvstore-storage-backend, refused without it.",
+        )
+        parser.add_argument(
+            "--kvstore-prefetch-timeout-base-s",
+            type=float,
+            default=ServerArgs.kvstore_prefetch_timeout_base_s,
+            help="L3 prefetch deadline, base term in seconds: a prefetch stops "
+            "starting batches base + per-page * pages seconds after it began on "
+            "the prefetch lane and lands the prefix it has. The deadline is "
+            "checked between batches only -- a batch_get_into already issued "
+            "runs to completion (the store API has no timeout), so one batch may "
+            "overrun it and a hung store holds the lane and every later "
+            "prefetch. Positive; required with --kvstore-storage-backend.",
+        )
+        parser.add_argument(
+            "--kvstore-prefetch-timeout-per-page-s",
+            type=float,
+            default=ServerArgs.kvstore_prefetch_timeout_per_page_s,
+            help="L3 prefetch deadline, per-page term in seconds (0 for a fixed "
+            "deadline). Required with --kvstore-storage-backend.",
+        )
+        parser.add_argument(
+            "--kvstore-prefetch-batch-pages",
+            type=int,
+            default=ServerArgs.kvstore_prefetch_batch_pages,
+            help="Prefix pages per L3 get of a prefetch; the fetch stops at the "
+            "first batch with a missing page. Required with "
+            "--kvstore-storage-backend.",
+        )
+        # Retraction snapshot pool
+        parser.add_argument(
+            "--retraction-snapshot-host-gb",
+            type=float,
+            default=ServerArgs.retraction_snapshot_host_gb,
+            help="Per-rank pinned Host pool, in gigabytes, that images a retracted "
+            "request's unaligned tail pages, its groups Host L2 never holds, and "
+            "its slot state (the hash-complete blocks go to Host L2 and stay "
+            "pinned there until the request is restored; with --disable-kvstore "
+            "the pool must hold whole images). A retracted request is suspended "
+            "with its image and resumes exactly where it stopped once the image "
+            "is copied back; nothing is recomputed. A victim whose image does not "
+            "fit the Host (L2 pins, the pool or its rows) is aborted instead of "
+            "imaged and the client told why, so the pool bounds how much can be "
+            "suspended at once, never how long an admission waits. The explicit "
+            "size, overriding --retraction-snapshot-ratio when set; 0 (the "
+            "default) means not set. The prefill and encode roles never retract "
+            "and ignore it.",
+        )
+        parser.add_argument(
+            "--retraction-snapshot-ratio",
+            type=float,
+            default=ServerArgs.retraction_snapshot_ratio,
+            help="Size of the retraction snapshot pool as a fraction of this rank's "
+            "Device KV capacity (the base --kvstore-ratio uses). An explicit 0 "
+            "disables the pool: no image can be taken and every capacity block "
+            "aborts its victim -- the only way to get abort-only behaviour. "
+            "Unset (the default) derives the size: 0.1 of the Device KV without "
+            "the KVStore (whole images; an on-by-default pool must stay cheap to "
+            "pin -- pass 1 to make every resident suspendable), else the tails "
+            "of --retraction-snapshot-max-requests images (one page per group "
+            "that publishes to Host L2, a request's worst case for a group that "
+            "never does), the slot-state arena coming on top.",
+        )
+        parser.add_argument(
+            "--retraction-snapshot-max-requests",
+            type=int,
+            default=ServerArgs.retraction_snapshot_max_requests,
+            help="Slot-state image rows of the retraction snapshot pool, i.e. the "
+            "most requests suspended at once. 0 (the default) derives to this "
+            "rank's running requests, --max-num-seqs / attention-DP size, which "
+            "covers every resident; a victim that finds no free row is aborted "
+            "rather than imaged. Refused with --retraction-snapshot-ratio 0.",
+        )
+        parser.add_argument(
+            "--debug-force-retraction-interval",
+            type=int,
+            default=ServerArgs.debug_force_retraction_interval,
+            help="TEST ONLY. Every |N| scheduler plans retract the oldest quiescent "
+            "decoding request (N > 0) or the one prefilling request between its "
+            "chunks (N < 0) without capacity pressure, so the suspend/restore "
+            "path runs on every request of a test run. Refused with "
+            "--retraction-snapshot-ratio 0. 0 (the default) is off; never set it "
+            "in serving.",
         )
         # Mamba Cache
         parser.add_argument(
@@ -3090,13 +3345,17 @@ class ServerArgs:
             help="Specify tp size for attn part",
         )
         parser.add_argument(
-            "--decode-context-parallel-size",
+            "--kv-parallel-size",
             type=int,
-            default=ServerArgs.decode_context_parallel_size,
-            help="Shard full-history KV pages (MLA/DSA latent, DeepSeek V4 "
-            "compressed KV) cyclically over a consecutive subgroup of attention "
-            "TP. Allowed on aggregated engines and the PD prefill role; the "
-            "decode role and the Host KVStore are not supported yet.",
+            default=ServerArgs.kv_parallel_size,
+            help="KV parallelism (KVP): shard full-history KV pages (MLA/DSA "
+            "latent, DeepSeek V4 compressed KV) cyclically over a consecutive "
+            "subgroup of attention TP, each rank storing one shard of every "
+            "request's pages; decode attends the owned pages and merges the "
+            "partials (DCP). Allowed on aggregated engines and the PD prefill "
+            "role, with the Host KVStore and the retraction snapshot pool; the "
+            "decode role and L3 storage (--kvstore-storage-backend) are not "
+            "supported yet.",
         )
         parser.add_argument(
             "--attn-head-tp-size",
@@ -3146,7 +3405,7 @@ class ServerArgs:
             "computes a contiguous slice of the chunk's rows against the gathered "
             "KV history of its requests. Must equal --attn-tp-size and requires "
             "--disaggregation-mode prefill, --disable-prefill-graph, a DSA-family "
-            "attention backend and --decode-context-parallel-size 1 or equal. "
+            "attention backend and --kv-parallel-size 1 or equal. "
             "The attention weights are head-replicated unless --attn-head-tp-size "
             "equals it, which shards them over the shard group.",
         )

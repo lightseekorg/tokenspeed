@@ -28,7 +28,7 @@ BOT = "lightseek-bot"
 BOT_ID = 243258330
 REPO = "lightseekorg/tokenspeed"
 COMMAND = re.compile(
-    rf"\s*@lightseek-bot[ \t]+(watch|fix)"
+    rf"\s*@lightseek-bot[ \t]+(watch|fix|rerun)"
     rf"(?:[ \t]+https://github\.com/{re.escape(REPO)}/actions/runs/"
     r"(?P<run>[1-9][0-9]*)/job/(?P<job>[1-9][0-9]*)(?:\?pr=(?P<pr>[1-9][0-9]*))?)?\s*",
     re.IGNORECASE,
@@ -129,7 +129,7 @@ def record(comment: dict, kind: str) -> dict | None:
                 "target",
             }
             or type(data.get("command")) is not int
-            or data.get("action") not in {"watch", "fix"}
+            or data.get("action") not in {"watch", "fix", "rerun"}
             or data.get("phase")
             not in {
                 "watching",
@@ -144,7 +144,7 @@ def record(comment: dict, kind: str) -> dict | None:
         ):
             return None
         if "target" in data and (
-            data["action"] != "fix"
+            data["action"] not in {"fix", "rerun"}
             or not isinstance(data["target"], dict)
             or set(data["target"]) != {"run", "job"}
             or any(type(v) is not int or v < 1 for v in data["target"].values())

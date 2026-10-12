@@ -1296,6 +1296,9 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
             NUM_WARPS=stage1_warps,
             MASK_K_TAIL=packed_hidden % stage1_block_kb != 0,
             num_warps=stage1_warps,
+            # The FP32 dot products rely on FMA contraction; request it
+            # explicitly instead of depending on Triton's default.
+            enable_fp_fusion=True,
         )
 
     out = torch.empty_like(hidden_states) if routed_out is None else routed_out

@@ -62,7 +62,7 @@ def main():
         world_size=world,
         attn_tp_size=1,
         attn_dp_size=world,
-        attn_dcp_size=1,
+        attn_kvp_size=1,
         dense_tp_size=1,
         dense_dp_size=world,
         moe_tp_size=1,

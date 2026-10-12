@@ -22,8 +22,8 @@
 
 From the repository root, run with PYTHONPATH=. and
 python -m torch.distributed.run --standalone --nproc-per-node=4
-test/runtime/distributed/run_cutedsl_mla_dcp.py --dcp-size 2.
-Use --dcp-size 4 to cover a single DCP group across all four TP ranks.
+test/runtime/distributed/run_cutedsl_mla_dcp.py --kvp-size 2.
+Use --kvp-size 4 to cover a single KVP group across all four TP ranks.
 Covers BF16/FP8, decode/verify/draft, empty shards, eager/graph replay,
 and chunked prefill with owner-masked writes to a real cache pool.
 """
@@ -46,7 +46,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 def run_case(*, rank, mapping, context, dtype, queries, draft, block):
-    degree = mapping.dcp_size
+    degree = mapping.kvp_size
     device = torch.device("cuda", rank)
     heads, latent, dim, page, granularity = 16, 512, 576, 64, 128
     blocks = (context + granularity - 1) // granularity + 1
@@ -78,9 +78,9 @@ def run_case(*, rank, mapping, context, dtype, queries, draft, block):
         speculative_num_draft_tokens=spec_queries,
         is_draft=draft,
         draft_block_decode=block,
-        dcp_size=degree,
-        dcp_rank=mapping.dcp_rank,
-        dcp_group=mapping.dcp_group,
+        kvp_size=degree,
+        kvp_rank=mapping.kvp_rank,
+        kvp_group=mapping.kvp_group,
         components=(spec,),
     )
     # Skip unrelated prefill compilation. Decode, metadata kernels and
@@ -100,7 +100,7 @@ def run_case(*, rank, mapping, context, dtype, queries, draft, block):
     ).to(dtype)
     full_cache[0].zero_()
     local_cache = full_cache[
-        [0] + list(range(mapping.dcp_rank + 1, blocks + 1, degree))
+        [0] + list(range(mapping.kvp_rank + 1, blocks + 1, degree))
     ].contiguous()
     pool = SimpleNamespace(get_key_buffer=lambda layer_id: local_cache)
     layer = SimpleNamespace(
@@ -183,7 +183,7 @@ def run_case(*, rank, mapping, context, dtype, queries, draft, block):
     expected = reference()
     torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.03)
     assert not actual[-1].any()
-    if mapping.dcp_rank > 0:
+    if mapping.kvp_rank > 0:
         assert (
             leaf.forward_decode_metadata.dcp.local_seq_lens[num_extends + 1].item() == 0
         )
@@ -210,9 +210,9 @@ def run_case(*, rank, mapping, context, dtype, queries, draft, block):
         expected = reference()
         torch.testing.assert_close(replay_output, expected, atol=0.003, rtol=0.03)
     leaf._workspace_pool.unfreeze()
-    if mapping.dcp_rank == 0:
+    if mapping.kvp_rank == 0:
         print(
-            f"PASS group={mapping.dcp_group} dtype={dtype} context={context} Q={queries} draft={draft} "
+            f"PASS group={mapping.kvp_group} dtype={dtype} context={context} Q={queries} draft={draft} "
             f"block={block}",
             flush=True,
         )
@@ -234,7 +234,7 @@ def _make_prefill_backend(
     )
 
     device = torch.device("cuda", rank)
-    shards = mapping.dcp_size if sharded else 1
+    shards = mapping.kvp_size if sharded else 1
     plan = make_mla_memory_plan(
         size=blocks // shards * granularity,
         prefix_granularity=granularity,
@@ -271,9 +271,9 @@ def _make_prefill_backend(
         speculative_num_draft_tokens=1,
         is_draft=False,
         draft_block_decode=False,
-        dcp_size=shards,
-        dcp_rank=mapping.dcp_rank if sharded else 0,
-        dcp_group=mapping.dcp_group if sharded else (rank,),
+        kvp_size=shards,
+        kvp_rank=mapping.kvp_rank if sharded else 0,
+        kvp_group=mapping.kvp_group if sharded else (rank,),
         components=(spec,),
     )
     with patch.object(tokenspeed_mla, "warmup_compile_prefill", lambda **kw: None):
@@ -293,7 +293,7 @@ def run_prefill_case(*, rank, mapping, context, dtype):
     from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
 
     device = torch.device("cuda", rank)
-    degree = mapping.dcp_size
+    degree = mapping.kvp_size
     granularity, heads, latent, dim = 128, 16, 512, 576
     prefix = torch.tensor([context - 3, 128, 0], dtype=torch.int32)
     extend = torch.tensor([7, 5, 3], dtype=torch.int32)
@@ -381,7 +381,7 @@ def run_prefill_case(*, rank, mapping, context, dtype):
     new_latent = torch.randn(
         int(extend.sum()), dim, device=device, dtype=torch.bfloat16
     )
-    # TP projections/queries differ by rank; latent KV is shared across DCP.
+    # TP projections/queries differ by rank; latent KV is shared across the KVP group.
     torch.manual_seed(713 + rank)
     q = torch.randn(int(extend.sum()), heads * 192, device=device, dtype=torch.bfloat16)
     weight = (
@@ -441,23 +441,23 @@ def run_prefill_case(*, rank, mapping, context, dtype):
     # Compare every physical row after model-side writes, including untouched
     # reserve slots and null page: foreign writes must not corrupt local KV.
     full = reference_pool.get_key_buffer(0).view(blocks + 1, granularity, 1, dim)
-    expected_cache = full[[0] + list(range(mapping.dcp_rank + 1, blocks + 1, degree))]
+    expected_cache = full[[0] + list(range(mapping.kvp_rank + 1, blocks + 1, degree))]
     torch.testing.assert_close(
         pool.get_key_buffer(0).float(),
         expected_cache.reshape(-1, 1, dim).float(),
         atol=0,
         rtol=0,
     )
-    if mapping.dcp_rank == 0:
+    if mapping.kvp_rank == 0:
         print(
-            f"PASS prefill group={mapping.dcp_group} dtype={dtype} context={context} chunks={leaf.chunked_prefill_metadata.chunked_loop_num}",
+            f"PASS prefill group={mapping.kvp_group} dtype={dtype} context={context} chunks={leaf.chunked_prefill_metadata.chunked_loop_num}",
             flush=True,
         )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dcp-size", type=int, required=True)
+    parser.add_argument("--kvp-size", type=int, required=True)
     parser.add_argument("--contexts", type=int, nargs="+", default=[512, 65536])
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
@@ -469,12 +469,12 @@ def main():
         world_size=world_size,
         attn_tp_size=world_size,
         attn_dp_size=1,
-        attn_dcp_size=args.dcp_size,
+        attn_kvp_size=args.kvp_size,
     )
     process_group_manager.register_process_group(
         "nccl", mapping.world_group, dist.group.WORLD
     )
-    process_group_manager.init_process_group(mapping.attn.dcp_group, backend="nccl")
+    process_group_manager.init_process_group(mapping.attn.kvp_group, backend="nccl")
     global_server_args_dict.update(
         mapping=mapping,
         chunked_prefill_size=64,

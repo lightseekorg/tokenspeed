@@ -4,9 +4,15 @@ on:
   issue_comment:
     types: [created]
   workflow_run:
-    workflows: [PR CI Plan, Lint, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
+    # Wake only for assist-owned dispatches and the planner; native check
+    # completions are covered by the periodic sweep below instead.
+    workflows: [PR CI Plan, Slurm Dispatch, K8s Dispatch]
     types: [completed]
     branches-ignore: [main]
+  # Backstop sweep: reconcile active requests whose completions never fire a
+  # kept trigger (vendor CI, lost events, expired budgets).
+  schedule:
+    - cron: "13,33,53 * * * *"
   workflow_call:
   workflow_dispatch:
     inputs:
@@ -26,7 +32,8 @@ jobs:
        (github.event.issue.pull_request &&
         contains(github.event.comment.body, '@lightseek-bot') &&
         (contains(github.event.comment.body, 'watch') ||
-         contains(github.event.comment.body, 'fix')))) &&
+         contains(github.event.comment.body, 'fix') ||
+         contains(github.event.comment.body, 'rerun')))) &&
       (github.event_name != 'workflow_run' ||
        ((github.event.workflow_run.event == 'pull_request' ||
          github.event.workflow_run.event == 'workflow_dispatch') &&

@@ -108,6 +108,18 @@ def test_mamba2_component_maps_ssd_geometry_onto_the_linear_fields():
     assert mamba2.temporal_state_shape == (4, 4, 16)
 
 
+def test_mamba2_component_reads_a_1e30_dt_bound_as_unbounded():
+    config = _config(time_step_limit=(0.0, 1e30))
+    model_config = SimpleNamespace(hf_text_config=config)
+    server_args = SimpleNamespace(
+        mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=1))
+    )
+    assert Mamba2Config.generate(server_args, model_config).dt_limit == (
+        0.0,
+        float("inf"),
+    )
+
+
 def test_non_gated_expert_plan_loads_up_proj_as_all_of_w13():
     schema = ExpertCheckpointSchema(gate_proj_name=None)
     plan = _build_default_expert_plan(schema, num_experts=4, ep_rank=1, ep_size=2)
@@ -721,6 +733,36 @@ def test_quantized_fc2_sees_the_reduced_latent_and_counts_once(
         assert torch.equal(out, torch.full((2, 4), 3.0))
     else:
         assert out is None
+
+
+def test_moe_without_a_latent_runs_the_experts_on_the_input():
+    """Without ``moe_latent_size`` the routed experts take and return full-width rows."""
+    from tokenspeed.runtime.models import nemotron_h
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    seen = {}
+    moe = SimpleNamespace(
+        stream_fork=StreamFork(torch.cuda.Stream()),
+        gate=lambda x: x * 3,
+        shared_experts=lambda x: x * 2,
+        fc1_latent_proj=None,
+        _routed=lambda x, logits, latent, ctx: seen.setdefault("latent", latent),
+    )
+    hidden = torch.arange(8.0, device="cuda").view(2, 4)
+    routed, shared = nemotron_h.NemotronHMoE.forward(moe, hidden, None, None)
+    assert seen["latent"] is hidden and routed is hidden
+    assert torch.equal(shared, hidden * 2)
+
+    experts_out = torch.ones(2, 4)
+    moe = SimpleNamespace(
+        topk=lambda x, logits: None,
+        comm_manager=SimpleNamespace(get_num_tokens=lambda ctx: (2, 2)),
+        experts=lambda **kwargs: experts_out,
+        fc2_latent_proj=None,
+    )
+    assert (
+        nemotron_h.NemotronHMoE._routed(moe, hidden, None, hidden, None) is experts_out
+    )
 
 
 @pytest.mark.parametrize("graph_phase,capture", [(False, False), (True, True)])

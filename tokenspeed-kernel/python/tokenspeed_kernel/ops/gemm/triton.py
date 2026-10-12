@@ -1304,3 +1304,73 @@ def triton_mm_fp8_scaled(
         bias=bias,
         out=out,
     )
+
+
+# ---- AMD gfx950 skinny MXFP8 ----------------------------------------------
+
+
+if Platform.get().is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.skinny import (
+        launch_triton_mm_mxfp8_skinny_gfx950 as _mm_mxfp8_skinny_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.skinny import (
+        supports_mxfp8_skinny_shape as _supports_mxfp8_skinny_shape,
+    )
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="triton_mm_mxfp8_skinny_gfx950",
+        solution="triton",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    a=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_UE8M0_SCALE),
+                    b=tensor_format("mxfp8", _fp8_dtype, scale=_MXFP8_UE8M0_SCALE),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mxfp8_skinny_shape}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical"}),
+            "out_dtype": frozenset({torch.bfloat16, torch.float16}),
+            "out_inner_stride_one": frozenset({True}),
+        },
+    )
+    def triton_mm_mxfp8_skinny_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if A_scales is None or B_scales is None or block_size is None:
+            raise ValueError("gfx950 skinny MXFP8 GEMM requires scales and block_size")
+        return _mm_mxfp8_skinny_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            alpha=alpha,
+            block_size=block_size,
+            out=out,
+        )
+
+else:
+
+    def triton_mm_mxfp8_skinny_gfx950(**kwargs):
+        raise ImportError(
+            "triton_mm_mxfp8_skinny_gfx950 requires tokenspeed-kernel-amd"
+        )

@@ -20,9 +20,11 @@
 
 """Place virtual cache blocks, token slots and kernel pages on local ranks.
 
-One cyclic block-placement rule serves both position-preserving slot mapping
-and compact page tables with local token counts. These operations transform
-addresses only; KV payload reads/writes belong to their cache-layout kernels.
+Under KV parallelism (KVP) a sharded cache group deals its virtual blocks
+page-cyclically to the ranks of the KVP group; one cyclic block-placement rule
+serves both position-preserving slot mapping and compact page tables with
+local token counts. These operations transform addresses only; KV payload
+reads/writes belong to their cache-layout kernels.
 """
 
 from __future__ import annotations
@@ -80,8 +82,10 @@ def virtual_slots_to_local(
         rows_per_page: Unchanged physical rows per owned cache block. Use 1
             to translate a block table instead of row slots.
         virtual_block_count: Scheduler capacity including null block 0.
-        degree: Number of owners, or 1 for a replicated group.
-        rank: Owner index in [0, degree); replicated groups use 0.
+        degree: Number of owners (the KVP group width), or 1 for a
+            replicated group.
+        rank: Owner index in [0, degree) (the KVP rank); replicated groups
+            use 0.
         out: Optional contiguous output tensor with the same shape/dtype.
         owner_mask: Optional contiguous boolean output of the same shape.
 
@@ -179,7 +183,7 @@ def _compact_owned_pages(
     tl.store(LocalLens + row, count)
 
 
-def compact_dcp_pages(
+def compact_kvp_pages(
     table: torch.Tensor,
     lengths: torch.Tensor,
     *,
@@ -206,8 +210,8 @@ def compact_dcp_pages(
         page_size: Tokens per kernel page.
         block_granularity: Tokens per scheduler ownership block.
         virtual_block_count: Exclusive upper bound of scheduler block IDs.
-        degree: Number of context owners.
-        rank: Owner index within the context group.
+        degree: Number of page owners (the KVP group width).
+        rank: Owner index within the KVP group.
         out: Preallocated physical page table, with the same shape as table.
         local_lengths: Preallocated local token counts, shaped like lengths.
         page_prefix: Optional int32 output [batch, max_pages + 1], contiguous.
@@ -225,13 +229,13 @@ def compact_dcp_pages(
         or virtual_block_count <= 1
         or not 0 <= rank < degree
     ):
-        raise ValueError("invalid DCP page geometry")
+        raise ValueError("invalid KVP page geometry")
     if (
         table.ndim != 2
         or out.shape != table.shape
         or local_lengths.shape != lengths.shape
     ):
-        raise ValueError("DCP page buffers disagree")
+        raise ValueError("KVP page buffers disagree")
     out.zero_()
     if table.is_cuda:
         _compact_owned_pages[(table.shape[0],)](
@@ -308,7 +312,7 @@ def _local_visible_lengths(
         tl.store(tl.broadcast_to(LocalLens + row, (BLOCK,)), local, q == QUERIES - 1)
 
 
-def dcp_local_visible_lengths(
+def kvp_local_visible_lengths(
     page_prefix: torch.Tensor,
     visible_lengths: torch.Tensor,
     *,
@@ -320,7 +324,7 @@ def dcp_local_visible_lengths(
 
     Args:
         page_prefix: Exclusive owned-page counts [batch, max_pages + 1] from
-            compact_dcp_pages. Includes allocated reserve pages.
+            compact_kvp_pages. Includes allocated reserve pages.
         visible_lengths: Int32 global exclusive endpoints [batch, queries],
             each in [0, max_pages * page_size]. The last dimension is contiguous.
             Causal verify supplies one endpoint per query; noncausal draft may

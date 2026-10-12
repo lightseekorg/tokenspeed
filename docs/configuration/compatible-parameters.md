@@ -1,10 +1,10 @@
-# Compatible Parameters
+# Compatible parameters
 
 TokenSpeed keeps familiar serving parameter names when the operational meaning
 is the same. This makes recipes portable while still documenting
 TokenSpeed-specific behavior explicitly.
 
-## Directly Aligned
+## Directly aligned
 
 | Parameter | TokenSpeed behavior |
 | --- | --- |
@@ -30,7 +30,7 @@ TokenSpeed-specific behavior explicitly.
 | `--chat-template` | Chat template name or path. |
 | `--gpu-memory-utilization` | GPU memory fraction used for weights and KV cache. |
 | `--max-num-seqs` | Maximum concurrent sequences. |
-| `--block-size` | KV cache block size. |
+| `--block-size` | KV cache block size (deprecated alias of `--prefix-granularity`). |
 | `--enable-prefix-caching` | Enable prefix cache reuse. |
 | `--disable-prefix-caching` | Disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
@@ -44,7 +44,7 @@ TokenSpeed-specific behavior explicitly.
 | `--tool-call-parser` | OpenAI-compatible tool-call parser. |
 | `--reasoning-parser` | Reasoning-output parser. |
 
-## Similar But Not Identical
+## Similar but not identical
 
 | Recipe parameter | TokenSpeed parameter | Difference |
 | --- | --- | --- |
@@ -56,7 +56,7 @@ TokenSpeed-specific behavior explicitly.
 | `--moe-backend` | `--moe-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
 | `--quantization-param-path` | `--quantization-param-path` | KV caches run unscaled: under an FP8 KV cache the file is accepted only when every factor is 1.0 (other KV dtypes do not read it), and checkpoint KV-cache scales other than 1.0 are rejected at load. |
 
-## Recipe Translation Notes
+## Recipe translation notes
 
 - Use `tokenspeed serve` as the launcher.
 - Pass the model path positionally, then keep `--trust-remote-code`, `--max-model-len`, `--kv-cache-dtype`, `--gpu-memory-utilization`, `--max-num-seqs`, `--tensor-parallel-size`, `--reasoning-parser`, and `--tool-call-parser` when the model needs them.

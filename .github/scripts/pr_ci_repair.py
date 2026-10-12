@@ -1119,7 +1119,7 @@ def current_request(request: dict) -> dict:
             live[k] == state[k] for k in ("pr", "command", "head", "base", "action")
         )
         and state["phase"] == "repairing"
-        and state["action"] == "fix"
+        and state["action"] in {"fix", "rerun"}
         and state["head"] == pr["head"]["sha"]
         and state["base"] == pr["base"]["sha"]
     ):
@@ -1131,7 +1131,7 @@ def current_request(request: dict) -> dict:
         not live
         or live != state
         or state["phase"] != "repairing"
-        or state["action"] != "fix"
+        or state["action"] not in {"fix", "rerun"}
         or not pr_source_matches(state, pr, source=ROOT)
     ):
         raise ValueError("Repair authorization or source changed.")

@@ -376,7 +376,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         route = planner.plan_for_decode_rank(registration.decode_tp_rank)
         expected_decode_ranks = planner.decode_ranks_by_prefill_rank[local_tp_rank]
         if local_tp_rank in route.target_prefill_ranks:
-            # A DCP-sharded source is never idle: every rank of the chosen
+            # A KVP-sharded source is never idle: every rank of the chosen
             # subgroup serves the decode rank with the blocks it owns.
             fragments = route.fragments_by_prefill_rank[local_tp_rank]
             owner_filters = route.owner_filters_by_prefill_rank[local_tp_rank]
@@ -500,7 +500,7 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
         Args:
             owner_filters: The registration route's decision for every
-                DCP-sharded group of the layout (``validate_rank_owner_filters``
+                KVP-sharded group of the layout (``validate_rank_owner_filters``
                 checked it): the filter selecting the manifest blocks this
                 rank owns, copied from their local pages to the destination
                 blocks at the same manifest positions, or None when the route

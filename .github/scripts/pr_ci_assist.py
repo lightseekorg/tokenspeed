@@ -98,12 +98,17 @@ def pull(number: int) -> dict:
 
 def permitted(comment: dict) -> str | None:
     match = COMMAND.fullmatch(comment["body"] or "")
-    if not match or (match["job"] and match[1].lower() != "fix"):
+    if not match:
+        return None
+    action = match[1].lower()
+    if match["job"] and action not in {"fix", "rerun"}:
+        return None
+    if action == "rerun" and not match["job"]:
         return None
     permission = api(f"collaborators/{comment['user']['login']}/permission")[
         "permission"
     ]
-    return match[1].lower() if permission in {"admin", "maintain", "write"} else None
+    return action if permission in {"admin", "maintain", "write"} else None
 
 
 def command_target(comment: dict, number: int) -> dict | None:
@@ -122,6 +127,29 @@ def latest_command(comments: list[dict]) -> dict | None:
     return None
 
 
+def sweep():
+    """Return the open PR whose active request most needs a reconcile, if any."""
+    active = []
+    for pr in pages("pulls?state=open", None):
+        if (
+            not pr["head"]["repo"]
+            or pr["head"]["repo"]["full_name"] != REPO
+            or pr["base"]["ref"] != "main"
+        ):
+            continue
+        comments = pages(f"issues/{pr['number']}/comments", None)
+        comment = latest_state_comment(comments, pr["number"])
+        if not comment:
+            continue
+        try:
+            state = load_state(comments, pr)
+        except ValueError:
+            continue
+        if state and state["phase"] not in FINISHED_PHASES:
+            active.append((comment["updated_at"], pr["number"]))
+    return min(active)[1] if active else None
+
+
 def resolve():
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     name = os.environ["GITHUB_EVENT_NAME"]
@@ -137,6 +165,11 @@ def resolve():
         value = event["inputs"]["pr"]
         if re.fullmatch(r"[1-9][0-9]*", value):
             number = int(value)
+    elif name == "schedule":
+        number = sweep()
+        if number is None:
+            print("No active watch/fix/rerun request; skipping the sweep.")
+            return
     elif name == "workflow_run" and event["action"] == "completed":
         run = event["workflow_run"]
         if run["event"] not in {"pull_request", "workflow_dispatch"}:
@@ -262,7 +295,11 @@ def publish(state: dict, message: str):
         message = (
             "Monitoring the selected checks. Results or blockers will be reported here."
             if state["action"] == "watch"
-            else "Repair and validation are in progress. Results or blockers will be reported here."
+            else (
+                "Re-running the requested check. A pass is reported here; a failure starts the repair flow."
+                if state["action"] == "rerun"
+                else "Repair and validation are in progress. Results or blockers will be reported here."
+            )
         )
     # All editable text here is fixed, identifiers were validated against the
     # public catalog; do not copy API errors, task logs or model prose.
@@ -564,7 +601,10 @@ def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
                     # only the candidate's own run can validate its repair.
                     and (
                         p["base"]["sha"] == state["base"]
-                        or (state["action"] == "fix" and run["conclusion"] == "failure")
+                        or (
+                            state["action"] in {"fix", "rerun"}
+                            and run["conclusion"] == "failure"
+                        )
                     )
                     and p["base"]["ref"] == "main"
                     for p in run["pull_requests"]
@@ -821,6 +861,7 @@ def original_status(runs: list[dict], task: dict, state: dict) -> str:
                 "NVIDIA GB300 Tests",
                 "PR Test NVIDIA ARM",
                 "AMD Tests",
+                "AMD Kernel Benchmark",
             }
         ):
             continue
@@ -1037,7 +1078,7 @@ def control(number: int):
         and state
         and comment
         and state["command"] == comment["id"]
-        and state["action"] == "fix"
+        and state["action"] in {"fix", "rerun"}
         and state["phase"] in {"manual", "stale"}
         and (state["head"], state["base"]) == (pr["head"]["sha"], pr["base"]["sha"])
         and (
@@ -1074,7 +1115,12 @@ def control(number: int):
         target = command_target(comment, number)
         if target:
             state["target"] = target
-        if prior and (prior["head"], prior["base"]) == (state["head"], state["base"]):
+        # A rerun always re-dispatches; inherited submissions would suppress it.
+        if (
+            action != "rerun"
+            and prior
+            and (prior["head"], prior["base"]) == (state["head"], state["base"])
+        ):
             state["submitted"] = [
                 t
                 for t in prior["submitted"]
@@ -1242,7 +1288,7 @@ def control(number: int):
     native_statuses = [c["status"] for c in state["native_checks"]]
     if "candidate" in state and not retry:
         dispatch_native_checks(state)
-    requested_fix = state["action"] == "fix" and "candidate" not in state
+    requested_fix = state["action"] in {"fix", "rerun"} and "candidate" not in state
     lint = next(
         (
             r
@@ -1276,7 +1322,9 @@ def control(number: int):
             "Native checks need human intervention; no dispatch retry or PR update.",
         )
         return
-    if requested_fix and (pr["mergeable"] is False or state.get("target")):
+    if requested_fix and (
+        pr["mergeable"] is False or (state["action"] == "fix" and state.get("target"))
+    ):
         state["conflicts"] = pr["mergeable"] is False
         statuses = ["waiting"] * len(tasks)
     else:
@@ -1288,7 +1336,7 @@ def control(number: int):
     state["statuses"] = statuses
     if requested_fix and (
         retry
-        or state.get("target")
+        or (state["action"] == "fix" and state.get("target"))
         or lint_run
         or pr["mergeable"] is False
         or "failed" in statuses
