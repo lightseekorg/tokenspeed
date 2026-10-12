@@ -1082,3 +1082,31 @@ def test_gather_index_candidates_matches_tensor_reference(device):
     torch.testing.assert_close(
         scores, torch.where(valid, expected_scores, -float("inf"))
     )
+
+
+@pytest.mark.parametrize("cols", [32759, 32763, 32768, 32768 + 64])
+def test_large_padded_topk_uses_bounded_compilation(monkeypatch, cols):
+    from tokenspeed_kernel.ops.attention.dsa._triton import topk as impl
+
+    logits = torch.empty(1, cols)
+    result = torch.empty(1, 2048, dtype=torch.int32)
+
+    class RejectUnrolledKernel:
+        def __getitem__(self, grid):
+            raise AssertionError("large padded top-k must not unroll the full sort")
+
+    monkeypatch.setattr(impl, "_dsa_logits_topk_kernel", RejectUnrolledKernel())
+    monkeypatch.setattr(impl, "_radix_topk", lambda x, k: result)
+    assert impl._topk_with_padding(logits, 2048) is result
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize("cols", [32759, 32763, 32768, 32768 + 64, 32768 + 128])
+def test_topk_with_speculative_context_padding(cols):
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import triton_topk_from_logits
+
+    torch.manual_seed(7)
+    logits = torch.randint(-100, 100, (2, cols), device="cuda").float()
+    actual = triton_topk_from_logits(logits, 2048)
+    expected = torch.argsort(logits, dim=-1, descending=True, stable=True)[:, :2048]
+    torch.testing.assert_close(actual, expected.to(torch.int32), atol=0, rtol=0)
