@@ -61,8 +61,9 @@ def prepare_fp8_with_scale(
 
     Models quantize the input of an FP8 linear layer this way, computing one
     scale per ``group_size`` values of each row. As in the models, the call
-    passes no PDL request, and a case pins ``registration`` where the model
-    passes an exact override, as DeepSeek V4.1 does for its reference rounding.
+    passes no PDL request. Cases select by traits rather than pinning a
+    registration, so a faster registration with the same traits is compared
+    against the current one.
     """
 
     parameters = request.parameters
