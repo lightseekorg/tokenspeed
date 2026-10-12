@@ -70,6 +70,24 @@ def _get_thinker_config(config):
     return getattr(config, "thinker_config", config)
 
 
+def _ensure_layer_types(text_config) -> None:
+    """Give the thinker text config the ``layer_types`` the Qwen3 attention reads.
+
+    ``Qwen3OmniMoeTextConfig`` declares none; derive them as ``Qwen3Config``
+    does, with sliding attention only where ``use_sliding_window`` enables it.
+    """
+    if getattr(text_config, "layer_types", None) is not None:
+        return
+    sliding = getattr(text_config, "use_sliding_window", False) and (
+        getattr(text_config, "sliding_window", None) is not None
+    )
+    max_window_layers = getattr(text_config, "max_window_layers", 0)
+    text_config.layer_types = [
+        "sliding_attention" if sliding and i >= max_window_layers else "full_attention"
+        for i in range(text_config.num_hidden_layers)
+    ]
+
+
 def _shared_vision_config(vision_config) -> Qwen3VLVisionConfig:
     if not getattr(vision_config, "apply_vit_abs_pos_embed", True):
         raise ValueError("Qwen3-Omni without absolute vision positions is unsupported")
@@ -160,6 +178,7 @@ class Qwen3OmniMoeForConditionalGeneration(Qwen3MoeForCausalLM):
         self.omni_config = config
         self.thinker_config = _get_thinker_config(config)
         text_config = self.thinker_config.text_config
+        _ensure_layer_types(text_config)
         super().__init__(config=text_config, mapping=mapping, quant_config=quant_config)
 
         self.is_multimodal_active = is_multimodal_active
