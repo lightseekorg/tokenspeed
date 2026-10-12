@@ -780,12 +780,14 @@ def _store_state_rows_kernel(
     slab_stride_3,
     BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    offsets = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     row = offsets // state_width
     feature = offsets % state_width
     live = row < num_rows
     destination = tl.load(blocks + row, mask=live, other=-1).to(tl.int64)
     live = live & (destination >= 0)
+    # int64 element offsets: a slab block id times its stride, or a late row of
+    # a wide state, exceeds int32 on large pools.
     dim_1_index = feature // (state_dim_2 * state_dim_3)
     remainder = feature % (state_dim_2 * state_dim_3)
     dim_2_index = remainder // state_dim_3
