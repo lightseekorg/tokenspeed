@@ -81,7 +81,7 @@ def test_gluon_mhc_mixes_matches_reference(tokens: int, hidden: int) -> None:
         )
 
 
-def test_mhc_mixes_selects_gluon_and_graph_replays() -> None:
+def test_mhc_mixes_graph_replay_matches_eager() -> None:
     args = _mixes_args(32, 5120, seed=7)
     residual = args[0]
     mhc_mixes(*args)
