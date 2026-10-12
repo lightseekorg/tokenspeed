@@ -55,8 +55,8 @@ class AdmissionPlanner {
 public:
     AdmissionPlanner(const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
                      const BlockPool& pool, const BlockPool* host_pool, std::span<const GroupDemand> demands,
-                     std::optional<std::int32_t> num_computed_tokens, const CacheCoordinator::PrefixProbe& prefix,
-                     std::span<const PlannedShape> shapes,
+                     std::optional<std::int32_t> num_computed_tokens, const CompletedPages* completed,
+                     const CacheCoordinator::PrefixProbe& prefix, std::span<const PlannedShape> shapes,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
         : groups_{groups},
@@ -65,6 +65,7 @@ public:
           host_pool_{host_pool},
           demands_{demands},
           num_computed_tokens_{num_computed_tokens},
+          completed_{completed},
           prefix_{prefix},
           shapes_{shapes},
           claimed_{claimed},
@@ -163,7 +164,7 @@ private:
                 // An admission grows the live table densely; each Host hit
                 // lands on a fresh Device destination in the Host block's own
                 // bucket, exactly like a restored slot.
-                blocks_needed_[i] = geometry_[i].BlocksNeededFor(*demand.table, demand);
+                blocks_needed_[i] = geometry_[i].BlocksNeededFor(*demand.table, demand) + tailBlocksNeeded(i);
                 shape_need_[i].assign(buckets, 0);
                 if (!prefix_.host.per_group.empty()) {
                     collectHostHitBuckets(i, shape_need_[i]);
@@ -189,25 +190,66 @@ private:
         empty_parent_count_ = pool_.NumEmptyLcmBlocks();
     }
 
+    // Blocks a tail costs this group beyond the dense growth. A table never
+    // keeps a tail entry's block: the block holds the rows of a page that is
+    // later published under the page's own hash, and one block carries one
+    // key. So on a first admission every block of a Device tail becomes the
+    // hitter's own (a copy of the shared block, or a fresh block where the
+    // probe left a hole), and an owner that keeps writing past a published
+    // tail moves every published tail block to a fresh one. The dense growth
+    // then starts from the capacity the last tail block leaves, which the
+    // live table cannot show yet.
+    std::int64_t tailBlocksNeeded(std::size_t i) const {
+        const std::int32_t block_granularity = geometry_[i].BlockGranularity();
+        std::int64_t blocks = 0;
+        if (const auto& tail = prefix_.device.tail; tail && !tail->group_keys[i].empty()) {
+            const auto* dense = std::get_if<DenseGrowth>(&demands_[i].extent);
+            _assert(dense != nullptr, "a group matched by the probe grows densely");
+            const std::int32_t partial_rows = tail->tail_tokens % block_granularity;
+            const std::int32_t available = partial_rows == 0 ? 0 : block_granularity - partial_rows;
+            const std::int32_t growth = dense->num_tokens + demands_[i].reserve_tokens;
+            blocks += static_cast<std::int64_t>(tail->group_keys[i].size()) -
+                      geometry_[i].BlocksNeededFor(*demands_[i].table, growth) +
+                      geometry_[i].BlocksNeededBeyond(available, growth);
+        }
+        if (completed_ != nullptr && completed_->owner_continues && completed_->tail &&
+            groups_[i].Spec().kind != AttnKind::kMambaState && !groups_[i].Spec().replayable) {
+            blocks += (completed_->tail->tail_tokens + block_granularity - 1) / block_granularity;
+        }
+        return blocks;
+    }
+
     // A Host hit's Device destination must share the Host block's bucket, so
     // the copy's two ends have one owner under page-cyclic sharding. A hit
     // with no Host block yet (an L3 prefetch, replicated groups only) takes
-    // bucket 0, where its block will be allocated.
+    // bucket 0, where its block will be allocated. A Host tail's blocks land
+    // the same way, into the hitter's private pages.
     void collectHostHitBuckets(std::size_t group_index, std::vector<std::int64_t>& need) const {
         _assert(host_pool_ != nullptr, "Host prefix hits require a Host pool");
         const GroupPrefixProbe& probe = prefix_.host.per_group[group_index];
         const std::span<const CacheKey> keys = prefix_.group_keys[group_index];
-        const std::int32_t floor_pages = prefix_.device.num_common_tokens / geometry_[group_index].BlockGranularity();
+        const std::int32_t floor_pages = prefix_.device.full_page_tokens / geometry_[group_index].BlockGranularity();
         const GroupAllocator& allocator = groups_[group_index].Allocator();
+        const auto count_hit = [&](const CacheKey& key) {
+            const CacheBlockRef host_block = groups_[group_index].Index().Find(*host_pool_, key);
+            const std::int32_t bucket = host_block ? allocator.BucketOf(host_block->Location()) : 0;
+            ++need[static_cast<std::size_t>(bucket)];
+        };
         for (std::size_t hit_index = 0; hit_index < probe.hits.size(); ++hit_index) {
             if (probe.hits[hit_index] == 0) {
                 continue;
             }
             const std::size_t key_index = static_cast<std::size_t>(floor_pages) + hit_index;
             _assert(key_index < keys.size(), "host prefix hit is outside the probed key range");
-            const CacheBlockRef host_block = groups_[group_index].Index().Find(*host_pool_, keys[key_index]);
-            const std::int32_t bucket = host_block ? allocator.BucketOf(host_block->Location()) : 0;
-            ++need[static_cast<std::size_t>(bucket)];
+            count_hit(keys[key_index]);
+        }
+        if (const auto& tail = prefix_.host.tail; tail && !tail->group_keys[group_index].empty()) {
+            const GroupPrefixProbe& tail_probe = tail->per_group[group_index];
+            for (std::size_t j = 0; j < tail_probe.hits.size(); ++j) {
+                if (tail_probe.hits[j] != 0) {
+                    count_hit(tail->group_keys[group_index][j]);
+                }
+            }
         }
     }
 
@@ -252,6 +294,11 @@ private:
             const std::vector<CacheBlockLocation> hits = groups_[i].Index().MatchedLocations(
                 pool_, prefix_.group_keys[i], /*begin_blocks=*/0, prefix_.device.per_group[i]);
             protected_locations_.insert(hits.begin(), hits.end());
+            if (const auto& tail = prefix_.device.tail; tail && !tail->group_keys[i].empty()) {
+                const std::vector<CacheBlockLocation> tail_hits = groups_[i].Index().MatchedLocations(
+                    pool_, tail->group_keys[i], /*begin_blocks=*/0, tail->per_group[i]);
+                protected_locations_.insert(tail_hits.begin(), tail_hits.end());
+            }
         }
         for (const auto& [group_id, location] : claimed_) {
             (void)group_id;
@@ -418,6 +465,9 @@ private:
     const BlockPool* host_pool_;
     std::span<const GroupDemand> demands_;
     std::optional<std::int32_t> num_computed_tokens_;
+    // The publication this admission carries (nullptr when none): an owner
+    // that keeps writing past a tail needs a fresh block for it.
+    const CompletedPages* completed_;
     const CacheCoordinator::PrefixProbe& prefix_;
     std::span<const PlannedShape> shapes_;
     // Device-cached blocks a restore claims instead of copying: protected
@@ -442,15 +492,23 @@ private:
 std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
                                            std::span<const GroupGeometry> geometry, const BlockPool& pool,
                                            const BlockPool* host_pool, CacheCoordinator::PrefixProbe&& prefix,
-                                           std::span<const GroupDemand> demands,
-                                           std::optional<std::int32_t> num_computed_tokens,
+                                           std::span<const GroupDemand> demands, const RequestProgress& progress,
                                            std::span<const PlannedShape> shapes,
                                            std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups, geometry, pool,    host_pool, demands, num_computed_tokens,
-                             prefix, shapes,   claimed, victims};
+    AdmissionPlanner planner{groups,
+                             geometry,
+                             pool,
+                             host_pool,
+                             demands,
+                             progress.num_computed_tokens,
+                             progress.completed_pages ? &*progress.completed_pages : nullptr,
+                             prefix,
+                             shapes,
+                             claimed,
+                             victims};
     if (!planner.Plan()) {
         return std::nullopt;
     }
@@ -461,8 +519,13 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 
 bool CacheCoordinator::writableImageSlot(std::size_t group_index, const ImageTable& shape,
                                          std::int32_t slot_index) const {
-    (void)group_index;
-    return shape.available_tokens > 0 && slot_index == shape.num_blocks - 1;
+    // The tail's blocks: the slots of the page the computed frontier ends
+    // inside. The request writes the last of them and later publishes all of
+    // them under the page's hash, so none may stay the tail entry's block.
+    const std::int32_t block_granularity = geometry_[group_index].BlockGranularity();
+    const std::int32_t num_tokens = shape.num_blocks * block_granularity - shape.available_tokens;
+    const std::int32_t tail_start = (num_tokens - num_tokens % prefix_granularity_) / block_granularity;
+    return slot_index >= tail_start;
 }
 
 std::int32_t CacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix) const {
@@ -509,9 +572,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         demands = replayed;
     }
 
-    std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, pool_, host_pool_, std::move(prefix), demands, progress.num_computed_tokens,
-                      /*shapes=*/{}, /*claimed=*/{});
+    std::optional<AdmissionPlan> candidate = planAdmission(groups_, geometry_, pool_, host_pool_, std::move(prefix),
+                                                           demands, progress, /*shapes=*/{}, /*claimed=*/{});
     if (!candidate) {
         return std::nullopt;
     }
@@ -523,6 +585,11 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     }
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
     const std::int32_t promotion_boundary_tokens = PromotionBoundaryTokens(plan.prefix);
+    // The boundaries inside a block, per tier: the hitter's table ends in a
+    // private copy of the Device tail's partial block, or in a fresh page the
+    // Host tail is loaded into.
+    const std::int32_t device_tail_tokens = plan.prefix.device.tail ? plan.prefix.device.tail->tail_tokens : 0;
+    const std::int32_t host_tail_tokens = plan.prefix.host.tail ? plan.prefix.host.tail->tail_tokens : 0;
     AcquiredPrefix acquired_prefix = acquirePrefix(std::move(plan.prefix), access_epoch);
     AdmissionResult result{
         .device_prefix_tokens = acquired_prefix.device.num_common_tokens,
@@ -530,12 +597,44 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         .promotion_boundary_tokens = promotion_boundary_tokens,
         .access_epoch = access_epoch,
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
+        .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(groups_.size()),
     };
     if (acquired_prefix.device.num_common_tokens > 0) {
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             groups_[i].Allocator().ClaimHitBlocks(*demands[i].table, std::move(acquired_prefix.device.per_group[i]));
         }
     }
+    // The table slots a tail ending at `tokens` occupies in group i: the
+    // blocks of the page below the boundary, [first, past_end), and the
+    // capacity the last of them has left.
+    struct TailSlots {
+        std::int32_t first{0};
+        std::int32_t past_end{0};
+        std::int32_t available_tokens{0};
+    };
+    const auto tail_slots = [&](std::size_t i, std::int32_t tokens) {
+        const std::int32_t block_granularity = geometry_[i].BlockGranularity();
+        const std::int32_t page_tokens = tokens - tokens % prefix_granularity_;
+        const std::int32_t past_end = (tokens + block_granularity - 1) / block_granularity;
+        return TailSlots{.first = page_tokens / block_granularity,
+                         .past_end = past_end,
+                         .available_tokens = past_end * block_granularity - tokens};
+    };
+    // Gives the table a private block in `slot`: a copy of the block there
+    // (the hitter's copy-on-write, the owner's copy-in), or a fresh zeroed
+    // one where the slot was a hole.
+    const auto privatize_slot = [&](std::size_t i, BlockTable& table, std::int32_t slot,
+                                    std::int32_t available_tokens) {
+        GroupAllocator& allocator = groups_[i].Allocator();
+        const CacheBlockRef replaced = allocator.SwapInFreshBlock(pool_, table, slot, available_tokens);
+        const std::int32_t destination =
+            allocator.ResolveCacheBlockId(table.Blocks()[static_cast<std::size_t>(slot)]->Location());
+        if (replaced) {
+            result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(replaced->Location()), destination);
+        } else {
+            result.new_page_ids[i].push_back(destination);
+        }
+    };
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> prospective_victims;
     prospective_victims.reserve(plan.victims.size());
     // A reclaimable table block may still be pinned by both the request and
@@ -558,7 +657,6 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         }
     }
     if (progress.completed_pages) {
-        _assert(!progress.completed_pages->owner_continues, "copy-in publication is not supported yet");
         recordPublishedTail(*progress.completed_pages);
     }
     for (const auto& [group_id, location] : prospective_victims) {
@@ -569,9 +667,43 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
 
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupDemand& demand = demands[i];
+        BlockTable& table = *demand.table;
+        const CompletedPages* completed = progress.completed_pages ? &*progress.completed_pages : nullptr;
+        // An owner that keeps writing past the publication point moves off
+        // every block it just published: a published block is never written
+        // again and never carries a second key.
+        if (completed != nullptr && completed->owner_continues && completed->tail && progress.num_computed_tokens) {
+            const TailSlots slots = tail_slots(i, *progress.num_computed_tokens);
+            for (std::int32_t slot = slots.first; slot < std::min(slots.past_end, table.NumBlocks()); ++slot) {
+                if (groups_[i].Index().Contains(table.Blocks()[static_cast<std::size_t>(slot)])) {
+                    privatize_slot(i, table, slot, table.AvailableTokens());
+                }
+            }
+        }
+        // A first admission's table ends in the tail's blocks: shared full
+        // pages, then this request's own copies.
+        if (device_tail_tokens > 0 && table.NumBlocks() > 0) {
+            const TailSlots slots = tail_slots(i, acquired_prefix.device.num_common_tokens);
+            _assert(slots.past_end == table.NumBlocks(), "the Device tail's blocks end the claimed table");
+            for (std::int32_t slot = slots.first; slot < slots.past_end; ++slot) {
+                privatize_slot(i, table, slot, slots.available_tokens);
+            }
+        }
         if (!acquired_prefix.host.per_group.empty() && !acquired_prefix.host.per_group[i].blocks.empty()) {
+            const std::int32_t available =
+                host_tail_tokens > 0 ? tail_slots(i, acquired_prefix.host.num_common_tokens).available_tokens : 0;
             groups_[i].Allocator().AppendHostExtension(
-                pool_, *demand.table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs);
+                pool_, table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs, available);
+            // A Host tail block this group did not need (no lookback reaches
+            // it) is still a block the request writes.
+            if (host_tail_tokens > 0) {
+                const TailSlots slots = tail_slots(i, acquired_prefix.host.num_common_tokens);
+                for (std::int32_t slot = slots.first; slot < std::min(slots.past_end, table.NumBlocks()); ++slot) {
+                    if (!table.Blocks()[static_cast<std::size_t>(slot)]) {
+                        privatize_slot(i, table, slot, available);
+                    }
+                }
+            }
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
         const bool acquired =
@@ -630,9 +762,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         }
     }
 
-    std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, pool_, host_pool_, ProbePrefix({}), demands,
-                      /*num_computed_tokens=*/std::nullopt, shapes, protected_locations);
+    std::optional<AdmissionPlan> candidate = planAdmission(groups_, geometry_, pool_, host_pool_, ProbePrefix({}),
+                                                           demands, RequestProgress{}, shapes, protected_locations);
     if (!candidate) {
         return std::nullopt;
     }
@@ -648,6 +779,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     AdmissionResult result{
         .access_epoch = request_access_epoch,
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
+        .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(groups_.size()),
     };
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         GroupAllocator& allocator = groups_[i].Allocator();

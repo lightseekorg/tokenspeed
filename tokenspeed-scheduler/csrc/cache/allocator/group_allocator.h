@@ -21,6 +21,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -176,11 +177,37 @@ public:
         return true;
     }
 
+    // Swaps a fresh block into `slot`, in the bucket of the block it replaces
+    // (any bucket when the slot was a hole), and sets the table's unconsumed
+    // tail capacity. Returns the replaced block: a hitter's shared partial
+    // block or an owner's just-published one, which the caller copies into
+    // the fresh block; empty for a hole, which the caller zeroes instead.
+    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot,
+                                   std::int32_t available_tokens) {
+        _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
+        _assert(available_tokens >= 0, "tail capacity must be non-negative");
+        CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
+        std::vector<CacheBlockRef> fresh;
+        if (current) {
+            const std::array<std::int32_t, 1> bucket{BucketOf(current->Location())};
+            fresh = pool.AcquireBlocksInBuckets(group_id_, bucket);
+        } else {
+            fresh = pool.AcquireBlocks(group_id_, 1, BucketLoads(table));
+        }
+        FatalCheck(fresh.size() == 1, "admission plan no longer fits the block pool");
+        CacheBlockRef replaced = std::exchange(current, std::move(fresh.front()));
+        table.available_tokens_ = available_tokens;
+        return replaced;
+    }
+
     // Appends one Device destination per Host hit, each in its Host block's
     // bucket so the copy's two ends share an owner under page-cyclic sharding.
+    // tail_available_tokens is the capacity left in the last appended block
+    // when the Host hit ends inside it (0 on a block boundary).
     void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
-                             std::vector<BlockTransfer>& load_pairs) {
+                             std::vector<BlockTransfer>& load_pairs, std::int32_t tail_available_tokens) {
         _assert(table.available_tokens_ == 0, "host extension must append on a full-page boundary");
+        _assert(tail_available_tokens >= 0, "tail capacity must be non-negative");
         std::vector<std::int32_t> buckets;
         for (const CacheBlockRef& block_ref : host_block_refs) {
             if (block_ref) {
@@ -206,6 +233,7 @@ public:
             });
         }
         _assert(destination_it == destination_refs.end(), "unused host extension destination");
+        table.available_tokens_ = tail_available_tokens;
     }
 
     // Retention execution: the first num_expired_blocks table slots become

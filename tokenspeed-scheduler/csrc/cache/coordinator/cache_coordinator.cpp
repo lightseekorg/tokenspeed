@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -32,6 +33,7 @@
 #include <iterator>
 #include <utility>
 
+#include "cache/prefix/prefix_hasher.h"
 #include "cache/prefix/prefix_matcher.h"
 #include "utils.h"
 
@@ -361,6 +363,7 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
         }
     }
     out.num_common_tokens = boundary.common_tokens;
+    out.full_page_tokens = boundary.common_tokens;
     out.prefix_closed_tokens = boundary.prefix_closed_tokens;
     return out;
 }
@@ -377,30 +380,204 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
         const std::int32_t floor_pages = floor_tokens / geometry_[i].BlockGranularity();
         out.per_group[i] =
             groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch);
+        if (!probe.tail || probe.tail->group_keys[i].empty()) {
+            continue;
+        }
+        // The tail's blocks follow the full pages in the same table.
+        PrefixMatch tail_match = groups_[i].Index().AcquireMatched(pool, probe.tail->group_keys[i], /*begin_blocks=*/0,
+                                                                   probe.tail->per_group[i], access_epoch);
+        out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
+                                       std::make_move_iterator(tail_match.blocks.begin()),
+                                       std::make_move_iterator(tail_match.blocks.end()));
     }
     return out;
 }
 
-CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
-    _assert(content_hashes.size() <=
-                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / prefix_granularity_),
-            "prefix length exceeds int32 token range");
-    const std::int32_t num_prefix_pages = static_cast<std::int32_t>(content_hashes.size());
-    PrefixProbe out;
-    out.group_keys = buildGroupKeys(content_hashes);
-    out.device = probeTierWithKeys<CacheTier::kDevice>(out.group_keys, match_order_, num_prefix_pages,
-                                                       /*floor_tokens=*/0, /*with_storage_keys=*/false);
-    if (host_pool_ != nullptr) {
-        out.host = probeTierWithKeys<CacheTier::kHost>(out.group_keys, match_order_, num_prefix_pages,
-                                                       /*floor_tokens=*/out.device.num_common_tokens,
-                                                       /*with_storage_keys=*/false);
-        if (enable_l3_storage_) {
-            out.storage = probeTierWithKeys<CacheTier::kHost>(out.group_keys, match_order_, num_prefix_pages,
-                                                              /*floor_tokens=*/out.host.num_common_tokens,
-                                                              /*with_storage_keys=*/true);
+std::vector<CacheKey> CacheCoordinator::tailKeysForGroup(std::size_t i, const ContentHash& hash,
+                                                         std::int32_t tail_tokens) const {
+    std::vector<CacheKey> keys;
+    const std::int32_t blocks = TailBlocksFor(static_cast<std::int32_t>(i), tail_tokens);
+    keys.reserve(static_cast<std::size_t>(blocks));
+    for (std::int32_t offset = 0; offset < blocks; ++offset) {
+        keys.push_back(CacheKey{.group_id = groups_[i].Id(), .content_hash = hash, .page_offset = offset});
+    }
+    return keys;
+}
+
+template <CacheTier Tier>
+bool CacheCoordinator::groupHoldsTail(std::size_t i, std::span<const std::string> prefix_hashes,
+                                      std::int32_t full_tokens, std::int32_t tail_tokens, const ContentHash& hash,
+                                      std::span<const CacheKey> tail_keys, GroupPrefixProbe& hits) const {
+    (void)tail_tokens;
+    (void)hash;
+    const BlockPool& pool = tierPool<Tier>();
+    const CacheGroup& group = groups_[i];
+    const PrefixCacheIndex& index = group.Index();
+    hits.hits.assign(tail_keys.size(), 0);
+    if (group.Matcher().IsPrefixClosed()) {
+        for (std::size_t j = 0; j < tail_keys.size(); ++j) {
+            if (!index.Contains(pool, tail_keys[j])) {
+                return false;
+            }
+            hits.hits[j] = 1;
+        }
+        return true;
+    }
+    if (group.Spec().kind == AttnKind::kMambaState) {
+        return false;
+    }
+    // A sliding window resumes at T when the blocks covering its last W - 1
+    // tokens are cached: the tail's blocks and, below them, the page blocks.
+    const std::int32_t block_granularity = geometry_[i].BlockGranularity();
+    const std::int32_t blocks_per_page = prefix_granularity_ / block_granularity;
+    const std::int32_t full_blocks = full_tokens / block_granularity;
+    const std::int32_t boundary_block = full_blocks + static_cast<std::int32_t>(tail_keys.size());
+    const std::int32_t lookback = std::min(group.Matcher().BoundaryLookbackPages(), boundary_block);
+    for (std::int32_t block = boundary_block - lookback; block < boundary_block; ++block) {
+        if (block >= full_blocks) {
+            const auto j = static_cast<std::size_t>(block - full_blocks);
+            if (!index.Contains(pool, tail_keys[j])) {
+                return false;
+            }
+            hits.hits[j] = 1;
+            continue;
+        }
+        const CacheKey page_key{.group_id = group.Id(),
+                                .content_hash = prefix_hashes[static_cast<std::size_t>(block / blocks_per_page)],
+                                .page_offset = block % blocks_per_page};
+        if (!index.Contains(pool, page_key)) {
+            return false;
         }
     }
+    return true;
+}
+
+template <CacheTier Tier>
+std::optional<CacheCoordinator::PrefixProbe::TailHit> CacheCoordinator::probeTailWithKeys(
+    const PromptPrefix& prompt, std::span<const std::size_t> match_order, std::int32_t full_tokens,
+    bool claim_partial) const {
+    _assert(full_tokens % prefix_granularity_ == 0, "the tail phase starts at a page boundary");
+    if (prompt.tokens.empty() || full_tokens >= prompt.max_tokens || match_order.empty()) {
+        return std::nullopt;
+    }
+    const auto page = static_cast<std::size_t>(full_tokens / prefix_granularity_);
+    _assert(page <= prompt.prefix_hashes.size(), "the matched pages are hashed");
+    const ContentHash prior = page == 0 ? ContentHash{} : prompt.prefix_hashes[page - 1];
+    const std::span<const TailTable::Tail> published = tails_.Tails(prior);
+    std::vector<TailTable::Tail> candidates(published.begin(), published.end());
+    std::ranges::stable_sort(candidates, std::greater<>{}, &TailTable::Tail::tail_tokens);
+
+    ContentHash hash;
+    std::int32_t hashed_tokens = 0;
+    for (const TailTable::Tail& candidate : candidates) {
+        const std::int32_t boundary = full_tokens + candidate.tail_tokens;
+        if (boundary > prompt.max_tokens || static_cast<std::size_t>(boundary) > prompt.tokens.size()) {
+            continue;
+        }
+        if (candidate.tail_tokens != hashed_tokens) {
+            hash = HashPrefixPage(prompt.tokens.subspan(static_cast<std::size_t>(full_tokens),
+                                                        static_cast<std::size_t>(candidate.tail_tokens)),
+                                  prior);
+            hashed_tokens = candidate.tail_tokens;
+        }
+        if (hash != candidate.hash) {
+            continue;  // published by a prompt whose tokens diverge inside the page
+        }
+        PrefixProbe::TailHit hit{.tail_tokens = candidate.tail_tokens,
+                                 .hash = hash,
+                                 .group_keys = std::vector<std::vector<CacheKey>>(groups_.size()),
+                                 .per_group = std::vector<GroupPrefixProbe>(groups_.size())};
+        bool every_group_holds = true;
+        for (const std::size_t i : match_order) {
+            hit.group_keys[i] = tailKeysForGroup(i, hash, candidate.tail_tokens);
+            if (!groupHoldsTail<Tier>(i, prompt.prefix_hashes, full_tokens, candidate.tail_tokens, hash,
+                                      hit.group_keys[i], hit.per_group[i])) {
+                every_group_holds = false;
+                break;
+            }
+        }
+        if (!every_group_holds) {
+            continue;
+        }
+        if (!claim_partial) {
+            for (const std::size_t i : match_order) {
+                const std::int32_t block_granularity = geometry_[i].BlockGranularity();
+                if (candidate.tail_tokens % block_granularity != 0 && !hit.per_group[i].hits.empty()) {
+                    hit.per_group[i].hits.back() = 0;
+                }
+            }
+        }
+        return hit;
+    }
+    return std::nullopt;
+}
+
+CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const PromptPrefix& prompt,
+                                                                     std::span<const std::size_t> match_order,
+                                                                     bool claim_partial) const {
+    _assert(prompt.prefix_hashes.size() <=
+                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / prefix_granularity_),
+            "prefix length exceeds int32 token range");
+    _assert(static_cast<std::int64_t>(prompt.prefix_hashes.size()) * prefix_granularity_ <= prompt.max_tokens,
+            "the hashed pages lie inside the probe bound");
+    _assert(prompt.tokens.empty() || static_cast<std::int64_t>(prompt.tokens.size()) >= prompt.max_tokens,
+            "the probe bound lies inside the supplied tokens");
+    const std::int32_t num_prefix_pages = static_cast<std::int32_t>(prompt.prefix_hashes.size());
+    // Tails are probed only while every group's checkpoints are keyed by
+    // token position; a snapshot-state group still aligns its slots to the
+    // prefix page, so its presence keeps the boundary page-aligned.
+    const bool probe_tails = !HasMambaStateGroup();
+    PrefixProbe out;
+    out.group_keys = buildGroupKeys(prompt.prefix_hashes);
+    out.device = probeTierWithKeys<CacheTier::kDevice>(out.group_keys, match_order, num_prefix_pages,
+                                                       /*floor_tokens=*/0, /*with_storage_keys=*/false);
+    const std::int32_t device_full_tokens = out.device.num_common_tokens;
+    if (probe_tails) {
+        out.device.tail = probeTailWithKeys<CacheTier::kDevice>(prompt, match_order, device_full_tokens, claim_partial);
+        if (out.device.tail) {
+            out.device.num_common_tokens += out.device.tail->tail_tokens;
+        }
+    }
+    if (host_pool_ == nullptr) {
+        return out;
+    }
+    out.host = probeTierWithKeys<CacheTier::kHost>(out.group_keys, match_order, num_prefix_pages,
+                                                   /*floor_tokens=*/device_full_tokens, /*with_storage_keys=*/false);
+    const std::int32_t host_full_tokens = out.host.num_common_tokens;
+    std::optional<PrefixProbe::TailHit> host_tail;
+    if (probe_tails) {
+        host_tail = probeTailWithKeys<CacheTier::kHost>(prompt, match_order, host_full_tokens, claim_partial);
+    }
+    // Host coverage replaces the Device tail when it reaches further: by a
+    // whole page, or by a longer tail under the same last page.
+    const std::int32_t host_tokens = host_full_tokens + (host_tail ? host_tail->tail_tokens : 0);
+    if (host_tokens > out.device.num_common_tokens) {
+        out.device.tail.reset();
+        out.device.num_common_tokens = device_full_tokens;
+        out.host.tail = std::move(host_tail);
+        out.host.num_common_tokens = host_tokens;
+    } else {
+        out.host.num_common_tokens = out.device.num_common_tokens;
+        out.host.full_page_tokens = device_full_tokens;
+    }
+    if (enable_l3_storage_) {
+        out.storage = probeTierWithKeys<CacheTier::kHost>(out.group_keys, match_order, num_prefix_pages,
+                                                          /*floor_tokens=*/host_full_tokens,
+                                                          /*with_storage_keys=*/true);
+    }
     return out;
+}
+
+CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPrefix& prompt) const {
+    return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
+}
+
+CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std::string> content_hashes) const {
+    return ProbePromptPrefix(PromptPrefix{
+        .prefix_hashes = content_hashes,
+        .tokens = {},
+        .max_tokens = static_cast<std::int32_t>(content_hashes.size()) * prefix_granularity_,
+    });
 }
 
 std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(const PrefixProbe& probe,
@@ -409,7 +586,10 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
     if (!enable_l3_storage_ || host_pool_ == nullptr || probe.storage.per_group.empty()) {
         return std::nullopt;
     }
-    const std::int32_t floor_tokens = probe.host.num_common_tokens;
+    // The fill starts where the Host's full pages end; a Host tail beyond
+    // that is dropped once the pages behind it have landed and the request
+    // is probed again.
+    const std::int32_t floor_tokens = probe.host.full_page_tokens;
     const std::int32_t extension_pages = (probe.storage.num_common_tokens - floor_tokens) / prefix_granularity_;
     if (extension_pages < min_pages) {
         return std::nullopt;
@@ -495,12 +675,7 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
     return plan;
 }
 
-CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(
-    std::span<const std::string> content_hashes) const {
-    _assert(content_hashes.size() <=
-                static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / prefix_granularity_),
-            "prefix length exceeds int32 token range");
-    const std::int32_t num_prefix_pages = static_cast<std::int32_t>(content_hashes.size());
+CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const PromptPrefix& prompt) const {
     std::vector<std::size_t> history_match_order;
     history_match_order.reserve(match_order_.size());
     for (std::size_t group_index : match_order_) {
@@ -508,40 +683,45 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(
             history_match_order.push_back(group_index);
         }
     }
-
-    PrefixProbe out;
-    out.group_keys = buildGroupKeys(content_hashes);
-    const auto probe_device = [&](std::int32_t floor_tokens) {
-        PrefixProbe::Tier tier =
-            probeTierWithKeys<CacheTier::kDevice>(out.group_keys, history_match_order, num_prefix_pages, floor_tokens,
-                                                  /*with_storage_keys=*/false);
-        const std::int64_t covered_tokens =
-            static_cast<std::int64_t>(tier.num_common_tokens) - static_cast<std::int64_t>(floor_tokens);
-        _assert(covered_tokens >= 0, "decode destination state coverage is negative");
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            if (groups_[i].Spec().kind == AttnKind::kMambaState) {
-                const std::int64_t num_holes = covered_tokens / geometry_[i].BlockGranularity();
-                _assert(num_holes <= static_cast<std::int64_t>(out.group_keys[i].size()),
-                        "decode destination state hole count is outside the probed range");
-                const std::size_t hole_count = static_cast<std::size_t>(num_holes);
-                tier.per_group[i].hits.resize(hole_count);
-            }
+    // The D role probes the Device alone: the peer's transfer, not a Host
+    // load, fills what the Device lacks.
+    PrefixProbe probe;
+    probe.group_keys = buildGroupKeys(prompt.prefix_hashes);
+    probe.device = probeTierWithKeys<CacheTier::kDevice>(probe.group_keys, history_match_order,
+                                                         static_cast<std::int32_t>(prompt.prefix_hashes.size()),
+                                                         /*floor_tokens=*/0, /*with_storage_keys=*/false);
+    if (!HasMambaStateGroup()) {
+        probe.device.tail =
+            probeTailWithKeys<CacheTier::kDevice>(prompt, history_match_order, probe.device.num_common_tokens,
+                                                  /*claim_partial=*/false);
+        if (probe.device.tail) {
+            probe.device.num_common_tokens += probe.device.tail->tail_tokens;
         }
-        return tier;
-    };
-    out.device = probe_device(/*floor_tokens=*/0);
-    return out;
+    }
+    const std::int64_t covered_tokens = probe.device.num_common_tokens;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (groups_[i].Spec().kind == AttnKind::kMambaState) {
+            const std::int64_t num_holes = covered_tokens / geometry_[i].BlockGranularity();
+            _assert(num_holes <= static_cast<std::int64_t>(probe.group_keys[i].size()),
+                    "decode destination state hole count is outside the probed range");
+            probe.device.per_group[i].hits.resize(static_cast<std::size_t>(num_holes));
+        }
+    }
+    return probe;
 }
 
 CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
     AcquiredPrefix out;
+    // The Host floor is the Device's full-page coverage: a Device tail exists
+    // only when the Host tier adds nothing beyond it.
+    const std::int32_t device_full_tokens = probe.device.full_page_tokens;
     out.device = acquireTierWithKeys<CacheTier::kDevice>(probe.group_keys, /*floor_tokens=*/0, std::move(probe.device),
                                                          access_epoch);
     // The storage tier is never acquired: an admission loads Host entries
     // only, and PlanPrefetch is what turns L3 objects into Host entries first.
     if (host_pool_ != nullptr && !probe.host.per_group.empty()) {
-        out.host = acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, out.device.num_common_tokens,
-                                                         std::move(probe.host), access_epoch);
+        out.host = acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, device_full_tokens, std::move(probe.host),
+                                                         access_epoch);
     }
     return out;
 }
@@ -1097,12 +1277,17 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
     if (is_state && boundary_kind == CacheBoundaryKind::kChunk) {
         return ranges;
     }
-    // A sliding window resumes from the newest boundary -- the tail when the
-    // point is unaligned. State groups may have several materialized
-    // boundaries awaiting publication.
+    // A sliding window resumes from the newest page boundary and, at an
+    // unaligned point, from the tail as well: both need their lookback. State
+    // groups may have several materialized boundaries awaiting publication.
     std::vector<std::int32_t> boundary_blocks;
     if (!is_state) {
-        boundary_blocks.push_back(hashed_prefix_pages * pages_per_prefix_hash + tail_blocks);
+        if (completed.first_new_prefix_page < hashed_prefix_pages) {
+            boundary_blocks.push_back(hashed_prefix_pages * pages_per_prefix_hash);
+        }
+        if (tail_blocks > 0) {
+            boundary_blocks.push_back(hashed_prefix_pages * pages_per_prefix_hash + tail_blocks);
+        }
     } else {
         for (const std::int32_t boundary : completed.materialized_state_boundaries) {
             _assert(boundary > 0 && boundary % prefix_granularity_ == 0,

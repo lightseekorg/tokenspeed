@@ -98,6 +98,54 @@ TEST_F(SchedulerTestSuite, NoCacheOps_PlainRequestNoCacheHit) {
     EXPECT_TRUE(cache_ops.empty());
 }
 
+// A tail hit's copy source may be evicted by a later admission of the same
+// round, once the hitter's table holds the fresh copy and the source is
+// cache-only again. The plan then carries the pair in pages_to_copy and the
+// source in pages_to_zero: the runtime's copies-before-zeroing order is what
+// keeps the copy reading the old bytes.
+class CopySourceRegrantSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.disable_l2_cache = true;
+        cfg.host_allocator.total_pages = 0;
+        // 7 usable: r1 leaves 2 cached blocks; r2 claims one and needs 2
+        // (its copy and growth); r3 needs 4 and must evict r2's copy source.
+        cfg.device_allocator.total_pages = 8;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(CopySourceRegrantSuite, ACopySourceEvictedInTheSameRoundIsBothCopiedAndZeroed) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3}});
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();  // prompt end: tail [3] published, r1 moves to a copy
+    SendForwardDone("r1", {43});
+    SendFinish("r1");  // frontier 4: page [3 42] published, nothing new is a tail
+    PlanOnce();
+    ASSERT_EQ(scheduler_->TailEntries(), 1u);
+
+    Submit(RequestSpec{.request_id = "r2", .tokens = {1, 2, 3, 7}});
+    Submit(RequestSpec{.request_id = "r3", .tokens = {101, 102, 103, 104, 105, 106}});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"r2", "r3"}));
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 3) << "r2 resumes at the tail";
+    EXPECT_EQ(batch->extend_prefix_lens.at(1), 0);
+    const auto& copies = plan.pages_to_copy.at("full_attention");
+    ASSERT_EQ(copies.size(), 1u);
+    const auto [source, destination] = copies.front();
+    EXPECT_EQ(batch->block_tables.at("full_attention").at(0).at(1), destination);
+    const auto& zeroed = plan.pages_to_zero.at("full_attention");
+    EXPECT_NE(std::ranges::find(zeroed, source), zeroed.end()) << "r3 took the source once the copy left it cache-only";
+    EXPECT_EQ(std::ranges::find(zeroed, destination), zeroed.end()) << "the copy fills the destination whole";
+    EXPECT_EQ(scheduler_->TailEntries(), 0u) << "the tail left the index with its block";
+}
+
 class DisablePrefixCacheTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

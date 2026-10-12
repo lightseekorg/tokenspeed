@@ -4211,7 +4211,8 @@ TEST(DecodeDestinationTest, HistoryGroupsDeterminePrefixAndStateGetsAlignedHoles
 
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 0);
 
-    CacheCoordinator::PrefixProbe probe = coordinator.ProbeDecodeDevicePrefix(hashes);
+    CacheCoordinator::PrefixProbe probe = coordinator.ProbeDecodeDevicePrefix(
+        CacheCoordinator::PromptPrefix{.prefix_hashes = hashes, .tokens = {}, .max_tokens = 6});
     EXPECT_EQ(probe.device.num_common_tokens, 6);
     ASSERT_EQ(probe.device.per_group.size(), 2u);
     ASSERT_EQ(probe.device.per_group[0].hits.size(), 3u);

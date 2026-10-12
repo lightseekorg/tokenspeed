@@ -17,9 +17,13 @@ counting storage must not borrow one of these names.
 
 Two quantities anchor the vocabulary:
 
-* **`prefix_granularity`** — the granularity at which prefixes are hashed and
-  matched for cache reuse. It defines the *identity boundary* of cached
-  prefixes: two requests share cache only at multiples of this many tokens.
+* **`prefix_granularity`** — the granularity at which prefixes are hashed:
+  one chain hash per page of this many tokens. A reuse boundary `T` is any
+  token count at which some request published its state: every multiple of
+  `prefix_granularity` a request completed, plus the **tails** it published
+  at its prompt end and at its finish (`hash@T`, the same chained hash over
+  the page's first `T mod P` tokens). Two requests share cache below the
+  longest published boundary that is a prefix of both.
 * **`block_granularity`** — the number of tokens covered by one block-table
   slot (one `CacheBlock`) of a `history` group. This is the unit in which
   family-agnostic code (admission, capacity planning, PD slot selection)
@@ -635,10 +639,40 @@ clock, with each request carrying its issued epoch.
 
 Its responsibilities:
 
-* **Prefix probe and admission.** `ProbePrefix` is a read-only lookup of
-  prefix hits per group on both tiers, converged to the common prefix length
-  across the *matched* groups; `Admit` then allocates, pins the hit prefix,
-  and produces host→device `load_pairs` plus each group's fresh pages. A
+* **Prefix probe and admission.** `ProbePromptPrefix` is a read-only lookup
+  of prefix hits per group on both tiers, converged to the common boundary
+  across the *matched* groups, in two phases per tier: the chain walk over
+  the prompt's full pages (`FullAttnMatcher`, prefix-closed groups first,
+  then the window groups within that bound), then the **tail phase** -- for
+  each offset the `TailTable` lists under the last matched page's hash,
+  longest first, the probe hashes the prompt's own tokens up to it, skips a
+  candidate whose hash differs (the publisher diverged inside the page), and
+  takes the first `hash@T` every matched group holds (a closed group all of
+  its blocks below `T`; a sliding group the blocks covering its lookback
+  behind `T`). The Host tier runs the same two phases from the Device's
+  full-page coverage and wins when it reaches further by a page or a longer
+  tail; the storage tier (L3) matches full pages only. The probe is bounded
+  in tokens, not pages, so a hit may end exactly at the bound. `Admit` then
+  allocates, pins the hit prefix, and produces host→device `load_pairs`
+  plus each group's fresh pages and `pages_to_copy`. **A table never keeps a
+  tail entry's block**: the block holds rows of a page the request later
+  publishes under the page's own chain hash, and one block carries one key.
+  So every tail block a hit claims becomes the hitter's own -- a
+  Device→Device copy of the shared block (`AdmissionResult::pages_to_copy`,
+  `(source, destination)` virtual ids in one bucket, the destination in the
+  hitter's table and never zeroed) or a fresh block where the probe left a
+  hole -- and a Host tail is loaded into fresh private pages like any Host
+  hit and never republished on the Device. The owner's side of the same
+  rule is **copy-in**: an admission whose publication point the owner
+  keeps writing past (`CompletedPages::owner_continues`, the fused role's
+  prompt end) registers the owner's tail blocks under `hash@T` and swaps a
+  fresh copy of each into the table, so the published bytes are exactly
+  what the prefill forward wrote and nothing writes them again. Copies are
+  fire-and-forget: the runtime orders them on the forward thread's default
+  stream after the execution stream's in-flight forwards and before the
+  plan's zeroing, so a source another admission of the same round evicts
+  and re-grants is read before it is zeroed -- the argument the retraction
+  image's stream-ordered legs already rest on. A
   **replayable** group (`CacheGroupSpec::replayable`) is not matched
   at all: it never constrains the boundary and never claims a hit, so its
   table is empty at first admission and the scheduler materializes it as a
@@ -658,7 +692,9 @@ Its responsibilities:
   as an ordinary Host hit.
   `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
   pages are reused while final-state groups are restored from the remote
-  endpoint snapshot.
+  endpoint snapshot. Its tail phase leaves the partial block a hole: the
+  peer's transfer starts at the block containing `hit_tokens` and fills a
+  fresh page whole, so the D role never copies it.
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
   per group says what that group needs for the round ahead: an extent and a

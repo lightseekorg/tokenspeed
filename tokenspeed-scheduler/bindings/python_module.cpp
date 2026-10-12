@@ -23,6 +23,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/variant.h>
@@ -435,17 +436,40 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                          return nb::cast(*plan.remote_prefill, nb::rv_policy::copy);
                      })
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
-        .def("pages_to_zero_arrays", [](nb::handle self) {
-            // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
-            // (empty groups included); `self` keeps the ExecutionPlan alive
-            // for the lifetime of each ndarray. The list export builds one
-            // Python int per page, which for a long prompt's admission is
-            // thousands of objects on the forward thread's critical path.
+        .def("pages_to_zero_arrays",
+             [](nb::handle self) {
+                 // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
+                 // (empty groups included); `self` keeps the ExecutionPlan alive
+                 // for the lifetime of each ndarray. The list export builds one
+                 // Python int per page, which for a long prompt's admission is
+                 // thousands of objects on the forward thread's critical path.
+                 auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
+                 nb::dict out;
+                 for (auto& [gid, pages] : plan.pages_to_zero) {
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(pages.data(), {pages.size()}, self);
+                 }
+                 return out;
+             })
+        // Device -> Device whole-block copies per cache group, (source,
+        // destination) virtual block ids. The runtime runs them on the forward
+        // thread's default stream after the execution stream's in-flight
+        // forwards and before this plan's zeroing; destinations are never in
+        // pages_to_zero. No ACK.
+        .def_ro("pages_to_copy", &tokenspeed::ExecutionPlan::pages_to_copy)
+        .def("pages_to_copy_arrays", [](nb::handle self) {
+            // Zero-copy (n, 2) int32 views of pages_to_copy, one per cache
+            // group (empty groups included): column 0 the source, column 1
+            // the destination. std::pair<int32, int32> is two contiguous
+            // int32s, which the static_assert below holds the layout to.
+            static_assert(sizeof(std::pair<std::int32_t, std::int32_t>) == 2 * sizeof(std::int32_t),
+                          "a copy pair must be two contiguous int32 values");
             auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
             nb::dict out;
-            for (auto& [gid, pages] : plan.pages_to_zero) {
+            for (auto& [gid, pairs] : plan.pages_to_copy) {
+                const auto* data = pairs.empty() ? nullptr : reinterpret_cast<const std::int32_t*>(pairs.data());
                 out[nb::str(gid.c_str())] =
-                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(pages.data(), {pages.size()}, self);
+                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(data, {pairs.size(), 2}, self);
             }
             return out;
         });

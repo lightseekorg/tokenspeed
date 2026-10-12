@@ -162,7 +162,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
             .prefix_hashes = cache_progress.prefix_hashes,
             .first_new_prefix_page = first_new_prefix_page,
             .tail = tail,
-            .owner_continues = false,
+            .owner_continues = point == PublicationPoint::kOwnerContinues,
             .boundary_kind = consumeCompletedBoundaryKind(cache_progress, num_computed_tokens, request.PrefillSize()),
             .stream_completed_to_host = stream_completed_to_host,
             .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
@@ -214,11 +214,11 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // Only a first admission probes: a readmission copies the request's own
     // image back and matches nothing.
     _assert(request->Is<fsm::Submitted>(), "the admission probe is for a Submitted request");
-    const auto probe = [this](std::span<const std::string> hashes) {
+    const auto probe = [this](const CacheCoordinator::PromptPrefix& prompt) {
         if (config_.role == Role::kD) {
-            return coordinator_.ProbeDecodeDevicePrefix(hashes);
+            return coordinator_.ProbeDecodeDevicePrefix(prompt);
         }
-        return coordinator_.ProbePrefix(hashes);
+        return coordinator_.ProbePromptPrefix(prompt);
     };
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
     // The final prompt token is always recomputed to produce logits. Some
@@ -228,6 +228,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // will allocate private writable pages for the replayed suffix. A request
     // may tighten the bound further (RequestSpec::max_cached_prefix_tokens) so
     // the positions it needs logits for are recomputed rather than matched.
+    // The bound is in tokens: a hit may end at it exactly.
     const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
     const std::int32_t max_cacheable_tokens =
         std::max(std::min(request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens()), 0);
@@ -236,25 +237,42 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
     prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
     std::vector<std::string> hashes = ComputePrefixHashes(prefix_pages, "");
-    const auto probe_hashes = std::span<const std::string>(hashes).first(
-        std::min(hashes.size(), static_cast<std::size_t>(probe_prefix_pages)));
 
     AdmissionMatch match;
     match.candidate_prefix_hashes = hashes;
     if (config_.disable_prefix_cache) {
-        match.probe = probe({});
+        match.probe = probe(CacheCoordinator::PromptPrefix{});
         return match;
     }
-    match.probe = probe(probe_hashes);
+    match.probe = probe(CacheCoordinator::PromptPrefix{
+        .prefix_hashes = std::span<const std::string>(hashes).first(
+            std::min(hashes.size(), static_cast<std::size_t>(probe_prefix_pages))),
+        .tokens = request->TokenSlice(0, max_cacheable_tokens),
+        .max_tokens = max_cacheable_tokens,
+    });
+    // The chain progress counts full pages only; a tail is a boundary, not a
+    // hashed page.
     const std::int32_t hit_prefix_pages =
-        std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens) / prefix_granularity;
+        std::max(match.probe.device.full_page_tokens, match.probe.host.full_page_tokens) / prefix_granularity;
     match.prefix_hashes.assign(hashes.begin(), hashes.begin() + hit_prefix_pages);
 
     const std::int32_t extension_pages =
-        std::max(match.probe.host.num_common_tokens - match.probe.device.num_common_tokens, 0) / prefix_granularity;
-    const auto extension_begin = hashes.begin() + match.probe.device.num_common_tokens / prefix_granularity;
+        std::max(match.probe.host.full_page_tokens - match.probe.device.full_page_tokens, 0) / prefix_granularity;
+    const auto extension_begin = hashes.begin() + match.probe.device.full_page_tokens / prefix_granularity;
     match.extension_hashes.assign(extension_begin, extension_begin + extension_pages);
     return match;
+}
+
+void Scheduler::recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator::AdmissionResult& result) {
+    _assert(
+        result.new_page_ids.size() == cache_group_ids_.size() && result.pages_to_copy.size() == cache_group_ids_.size(),
+        "admission page groups must match scheduler config");
+    for (std::size_t i = 0; i < cache_group_ids_.size(); ++i) {
+        auto& pending = plan.pages_to_zero[cache_group_ids_[i]];
+        pending.insert(pending.end(), result.new_page_ids[i].begin(), result.new_page_ids[i].end());
+        auto& copies = plan.pages_to_copy[cache_group_ids_[i]];
+        copies.insert(copies.end(), result.pages_to_copy[i].begin(), result.pages_to_copy[i].end());
+    }
 }
 
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
@@ -268,14 +286,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
         feedback.admission_failed = true;
         return std::nullopt;
     }
-
-    _assert(result->new_page_ids.size() == cache_group_ids_.size(),
-            "admission fresh-page groups must match scheduler config");
-    for (std::size_t i = 0; i < result->new_page_ids.size(); ++i) {
-        auto& page_ids = result->new_page_ids[i];
-        auto& pending = plan.pages_to_zero[cache_group_ids_[i]];
-        pending.insert(pending.end(), page_ids.begin(), page_ids.end());
-    }
+    recordAdmittedPages(plan, *result);
     return result;
 }
 
@@ -288,7 +299,8 @@ bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback&
         registerKvEventPrefixPages(request, cache_progress.prefix_hashes,
                                    static_cast<std::int32_t>(cache_progress.prefix_hashes.size()));
     }
-    return admit(plan, feedback, coordinator_.ProbePrefix({}), demands, progress, cache_progress.access_epoch)
+    return admit(plan, feedback, coordinator_.ProbePrefix(std::span<const std::string>{}), demands, progress,
+                 cache_progress.access_epoch)
         .has_value();
 }
 
@@ -329,7 +341,6 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
     registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
 
-    _assert(match.probe.host.num_common_tokens % prefix_granularity == 0, "a Host hit ends on a prefix boundary");
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     const std::int32_t promotion_boundary_tokens = coordinator_.PromotionBoundaryTokens(match.probe);
     _assert(promotion_boundary_tokens == 0 ||
@@ -406,19 +417,14 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             "an admission claims exactly the prefix it probed");
     _assert(admission->promotion_boundary_tokens == promotion_boundary_tokens,
             "promotion boundary changed between probe and admission");
-    _assert(admission->new_page_ids.size() == cache_group_ids_.size(),
-            "admission fresh-page groups must match scheduler config");
-    for (std::size_t i = 0; i < admission->new_page_ids.size(); ++i) {
-        auto& page_ids = admission->new_page_ids[i];
-        auto& pending = plan.pages_to_zero[cache_group_ids_[i]];
-        pending.insert(pending.end(), page_ids.begin(), page_ids.end());
-    }
+    recordAdmittedPages(plan, *admission);
 
     if (!match.extension_hashes.empty()) {
-        // The Host-warm H2D destinations are filled on Host already; publish
-        // them on the Device now (the layer-wise load makes the bytes
-        // available before any forward reads them).
-        const std::int32_t first_extension_slot = admission->device_prefix_tokens / prefix_granularity;
+        // The Host-warm H2D destinations of full pages are filled on Host
+        // already; publish them on the Device now (the layer-wise load makes
+        // the bytes available before any forward reads them). A Host tail is
+        // loaded into the hitter's private page and stays unpublished.
+        const std::int32_t first_extension_slot = match.probe.device.full_page_tokens / prefix_granularity;
         for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
             coordinator_.CacheFullBlocks(tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1),
                                          admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i),
@@ -507,9 +513,16 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
             tables.front().NumBlocks() * coordinator_.GroupBlockGranularity(0) - tables.front().AvailableTokens();
         reserve_tokens = std::max(num_computed_tokens + pending_decode_tokens + decode_width - reserved_end, 0);
     }
-    const RequestProgress progress = AdvanceRequestProgress(
-        *request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-        config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>(), PublicationPoint::kChunk);
+    // The first decode on the fused role is the owner's prompt end: the
+    // partial page is published and the owner moves to a fresh block. The P
+    // and D roles publish at finish only -- the P never writes again, the
+    // D's prompt arrives by transfer.
+    const bool prompt_end = request->Is<fsm::PrefillDone>() && config_.role == Role::kFused &&
+                            !config_.disable_prefix_cache && !coordinator_.HasMambaStateGroup();
+    const RequestProgress progress =
+        AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+                               config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>(),
+                               prompt_end ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
 
     if (!progress.completed_pages &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
@@ -1062,12 +1075,7 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
         feedback.admission_failed = true;
         return false;
     }
-    _assert(result->new_page_ids.size() == cache_group_ids_.size(),
-            "restore fresh-page groups must match scheduler config");
-    for (std::size_t i = 0; i < result->new_page_ids.size(); ++i) {
-        auto& pending = build.plan.pages_to_zero[cache_group_ids_[i]];
-        pending.insert(pending.end(), result->new_page_ids[i].begin(), result->new_page_ids[i].end());
-    }
+    recordAdmittedPages(build.plan, *result);
     // The restore op owns the request-pool row it imports the blob into until
     // its ACK hands it to the resumed state (an abort meanwhile must not
     // re-grant a row still being written), and shares the blob slot.

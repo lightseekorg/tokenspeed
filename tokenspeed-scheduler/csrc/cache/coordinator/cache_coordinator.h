@@ -127,13 +127,41 @@ public:
                                                      count_uncached);
     }
 
+    // What a probe may match against: the chain hashes of the prompt's full
+    // pages below max_tokens, and the tokens themselves so tail hashes can be
+    // computed on demand (tokens.size() >= max_tokens). A probe without
+    // tokens matches full pages only.
+    struct PromptPrefix {
+        std::span<const std::string> prefix_hashes;
+        std::span<const std::int32_t> tokens;
+        std::int32_t max_tokens{0};
+    };
+
     struct PrefixProbe {
+        // A tail entry the tier matched: the boundary's offset inside its
+        // page, its hash, and per group the keys of its blocks below T with
+        // the hits over them (a hole marks a block the group does not need or
+        // does not hold; the D role leaves the partial block a hole so the
+        // peer's transfer fills a fresh page instead of a copy).
+        struct TailHit {
+            std::int32_t tail_tokens{0};
+            ContentHash hash;
+            std::vector<std::vector<CacheKey>> group_keys;
+            std::vector<GroupPrefixProbe> per_group;
+        };
         struct Tier {
+            // The boundary T this tier resumes at, in tokens.
             std::int32_t num_common_tokens{0};
+            // The full pages below it: num_common_tokens less the tail.
+            std::int32_t full_page_tokens{0};
             // Common coverage after all prefix-closed groups, before a
             // window/state group shortens the resumable boundary.
             std::int32_t prefix_closed_tokens{0};
+            // Hits over group_keys (the full pages), relative to the tier's
+            // floor.
             std::vector<GroupPrefixProbe> per_group;
+            // Present when T is not page-aligned.
+            std::optional<TailHit> tail;
         };
 
         std::vector<std::vector<CacheKey>> group_keys;
@@ -162,9 +190,15 @@ public:
         std::vector<BlockTransfer> snapshot_pairs;
         // Fresh device child pages appended by ordinary Acquire, aligned by
         // group_id, for the plan to zero. Cache hits and copy destinations
-        // (Host hits, a restore's rebuilt slots) are excluded: the copy fills
-        // them whole.
+        // (Host hits, a restore's rebuilt slots, the pairs below) are
+        // excluded: the copy fills them whole.
         std::vector<std::vector<std::int32_t>> new_page_ids;
+        // Device -> Device whole-block copies, aligned by group_id, as
+        // (source, destination) virtual block ids: a hitter's private copy of
+        // the partial block containing its boundary, or an owner's fresh
+        // block at a publication point it keeps writing past. Both ends share
+        // a bucket; the destination sits in the request's table.
+        std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
@@ -173,6 +207,8 @@ public:
     // A missing epoch starts a new request; a supplied epoch continues that
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
+    PrefixProbe ProbePromptPrefix(const PromptPrefix& prompt) const;
+    // Full pages only: a probe that enumerates no tails.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
 
     // One L3 object to fetch into a Host block, in prefix order. page_index
@@ -203,8 +239,9 @@ public:
     std::optional<PrefetchPlan> PlanPrefetch(const PrefixProbe& probe, std::int32_t min_pages);
     // Decode-side PD reuses local history pages, while final-state groups are
     // restored from the remote endpoint snapshot. Their aligned null holes do
-    // not count as cache hits.
-    PrefixProbe ProbeDecodeDevicePrefix(std::span<const std::string> content_hashes) const;
+    // not count as cache hits. The partial block of a tail hit is left a
+    // hole: the peer's transfer fills a fresh page whole.
+    PrefixProbe ProbeDecodeDevicePrefix(const PromptPrefix& prompt) const;
     std::int32_t PromotionBoundaryTokens(const PrefixProbe& prefix) const;
     // demands say what each group needs for the round ahead; progress says
     // what the request completed since its previous admission. Completed
@@ -443,6 +480,23 @@ private:
     PrefixProbe::Tier probeTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
                                         std::int32_t floor_tokens, bool with_storage_keys) const;
+    // The tail phase of a tier probe: the longest published tail under the
+    // last matched page (T_full) that every matched group holds, bounded by
+    // the prompt; nullopt when none. `claim_partial` false leaves the partial
+    // block a hole in the hits.
+    template <CacheTier Tier>
+    std::optional<PrefixProbe::TailHit> probeTailWithKeys(const PromptPrefix& prompt,
+                                                          std::span<const std::size_t> match_order,
+                                                          std::int32_t full_tokens, bool claim_partial) const;
+    // Whether group i can resume at the tail (full_tokens + tail_tokens) on
+    // this tier; on success fills `hits` over the tail's keys.
+    template <CacheTier Tier>
+    bool groupHoldsTail(std::size_t i, std::span<const std::string> prefix_hashes, std::int32_t full_tokens,
+                        std::int32_t tail_tokens, const ContentHash& hash, std::span<const CacheKey> tail_keys,
+                        GroupPrefixProbe& hits) const;
+    std::vector<CacheKey> tailKeysForGroup(std::size_t i, const ContentHash& hash, std::int32_t tail_tokens) const;
+    PrefixProbe probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
+                                     bool claim_partial) const;
     template <CacheTier Tier>
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
@@ -488,8 +542,9 @@ private:
     std::optional<CacheBlockLocation> deviceLocationOf(std::size_t group_index, const CacheKey& key) const;
     // Drops a tail hash from the tail table once no tier holds an entry for it.
     void pruneTailIfUnreferenced(const ContentHash& hash);
-    // Whether a restored request keeps writing this imaged slot: the partial
-    // block at its computed frontier. Every other data slot is immutable.
+    // Whether an imaged slot belongs to the page the computed frontier ends
+    // inside: the restored request writes and later republishes those blocks,
+    // so they are copied, never claimed. Every slot below is immutable.
     bool writableImageSlot(std::size_t group_index, const ImageTable& shape, std::int32_t slot_index) const;
     bool deviceCacheIsClearable() const;
     bool hostCacheIsClearable() const;

@@ -64,11 +64,16 @@ before it is admitted, holding no Device page meanwhile. The D role probes the
 Device alone (`ProbeDecodeDevicePrefix`) and never prefetches.
 
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
-probes the prefix cache for the prompt's leading pages. The probe is bounded
+probes the prefix cache for the prompt's leading pages and for a published
+tail inside the page after them (`CacheCoordinator::ProbePromptPrefix`, see
+[cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)):
+the hit boundary `T` is a token count, and `extend_prefix_lens` carries it
+as is. The probe is bounded
 in tokens, and the bound is the minimum of two rules: the configured replay
 tail (`prefix_replay_tokens`, at least the final prompt token, which is always
 recomputed to produce logits) and the request's own
-`RequestSpec::max_cached_prefix_tokens` (default `INT32_MAX`, no bound). The
+`RequestSpec::max_cached_prefix_tokens` (default `INT32_MAX`, no bound); a
+hit may end exactly at the bound. The
 per-request bound exists for prompt (input) logprobs: a request that returns
 them from position `s` needs logits for every position at or after `s`, and a
 cached position has none, so the runtime admits it with the bound set to `s`
@@ -961,9 +966,16 @@ lands in the same change as the pin, never a release apart.
   `onImageDoesNotFit` and nowhere else; the debug knob never aborts.
 - Freed capacity is granted to the request it was freed for in the same plan
   build whenever the round's grammar admits the grant (2); the image copies →
-  zero → load → forward order on the forward thread's stream is what makes
-  the immediate release safe, and changing `DeviceHandle.execute`'s ordering
-  breaks it.
+  page copies (`ExecutionPlan::pages_to_copy`) → zero → load → forward order
+  on the forward thread's stream is what makes the immediate release safe --
+  a tail hit's copy source may be evicted and re-granted by a later admission
+  of the same round -- and changing `DeviceHandle.execute`'s ordering breaks
+  it. A copy destination is never zeroed.
+- A published block is never written again: a tail's blocks are copied into
+  the hitter's table (or loaded from Host into private pages), an owner that
+  keeps writing past a publication point moves to fresh copies of the blocks
+  it published, and a restore copies the imaged tail blocks instead of
+  claiming them (1, cache-concepts.md).
 - A store either pins its Device sources until the ack or is stream-ordered;
   never neither (2). Only the two legs of a retraction image are
   stream-ordered — their sources are granted away in the same round — and

@@ -2161,7 +2161,20 @@ TEST_F(ForcedRetractionL2TailSuite, AVictimsPartialPageIsPublishedAndRestoredAsA
     Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3}});
     CompleteStores(PlanOnce());  // plan 1: prefill
     SendForwardDone("r1", {42});
-    CompleteStores(PlanOnce());  // plan 2: first decode, streams page [1 2]
+    // Plan 2: the first decode is the prompt end. Page [1 2] streams; the
+    // partial page [3] is published as a tail and r1 moves to a fresh copy
+    // of it in both groups, so the published block is never written again.
+    const ExecutionPlan first_decode = PlanOnce();
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+    ASSERT_EQ(first_decode.pages_to_copy.size(), 2u);
+    for (const auto& [group_id, pairs] : first_decode.pages_to_copy) {
+        ASSERT_EQ(pairs.size(), 1u) << group_id;
+        EXPECT_NE(pairs.front().first, pairs.front().second) << group_id;
+        const auto& zeroed = first_decode.pages_to_zero.at(group_id);
+        EXPECT_EQ(std::ranges::find(zeroed, pairs.front().second), zeroed.end())
+            << group_id << ": a copy destination is filled whole, never zeroed";
+    }
+    CompleteStores(first_decode);
     SendForwardDone("r1", {43});
     CompleteStores(PlanOnce());  // plan 3: decode
     SendForwardDone("r1", {44});
@@ -2177,7 +2190,7 @@ TEST_F(ForcedRetractionL2TailSuite, AVictimsPartialPageIsPublishedAndRestoredAsA
     ASSERT_NE(store, nullptr);
     EXPECT_TRUE(store->src_pages.at(0).empty()) << "every data slot is published; the pool carries the blob only";
     CompleteStores(retraction);
-    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+    EXPECT_EQ(scheduler_->TailEntries(), 2u) << "the prompt-end tail [3] and the retraction's tail [43]";
 
     const ExecutionPlan readmit = PlanOnce();
     const SnapshotRestoreBatch* restore = FindRestore(readmit);
@@ -2191,7 +2204,7 @@ TEST_F(ForcedRetractionL2TailSuite, AVictimsPartialPageIsPublishedAndRestoredAsA
         EXPECT_TRUE(hashes[i].empty()) << "the partial page's row is a private copy, not republished";
     }
     AckRestores(readmit);
-    EXPECT_EQ(scheduler_->TailEntries(), 1u) << "the published tail stays cached and enumerable";
+    EXPECT_EQ(scheduler_->TailEntries(), 2u) << "the published tails stay cached and enumerable";
     const ExecutionPlan decode = PlanOnce();
     ASSERT_NE(FindForwardBatch(decode), nullptr);
     EXPECT_EQ(FindForwardBatch(decode)->request_ids, std::vector<std::string>{"r1"});
@@ -6218,6 +6231,45 @@ protected:
         ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 12) << "both seeding requests fully retired";
     }
 };
+
+// A tail that survives only on Host is loaded straight into the hitter's
+// private pages: one unkeyed load row per tail block, no Device entry for
+// them, and the hitter resumes at the token the tail ends at.
+TEST_F(HostHitSuite, AHostTailLoadsIntoPrivatePagesWithoutRepublication) {
+    SeedHostThenEvictDevice();
+    // r1's stream was [1..8, 9001, 9002]; its finish published the tail [9001]
+    // at token 9. r2 repeats the nine tokens and diverges after them.
+    Submit(RequestSpec{.request_id = "r2", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9001, 77, 78}});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 9) << "the Host tail is the hit boundary";
+    EXPECT_EQ(op->input_lengths.at(0), 2);
+    auto lb = FindLoadBack(plan);
+    ASSERT_TRUE(lb.has_value());
+    EXPECT_EQ(lb->src_pages.at(0).size(), 8u) << "4 full + 2 SWA page blocks, plus the tail block in both groups";
+    EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "a Host tail is loaded, not copied";
+    const auto& full_row = op->block_tables.at("full").at(0);
+    EXPECT_EQ(lb->dst_pages.at(0).at(4), full_row.at(4)) << "the tail block lands in the hitter's own slot 4";
+    EXPECT_EQ(scheduler_->TailEntries(), 2u) << "r1's and the churn's tails stay enumerable while Host holds them";
+
+    SendLoadBackDone(lb->op_ids.at(0));
+    SendForwardDone("r2", {9003});
+    const ExecutionPlan first_decode = PlanOnce();
+    // r2's own prompt end publishes its tail at 11 and copies its partial
+    // pages; the loaded tail block of token 9 was never republished, so the
+    // page [9001 77] r2 completed is published under r2's own chain.
+    auto stream_wb = FindWriteBack(first_decode);
+    ASSERT_TRUE(stream_wb.has_value());
+    EXPECT_EQ(plan.pages_to_copy.at("full").size(), 0u);
+    EXPECT_EQ(first_decode.pages_to_copy.at("full").size(), 1u);
+    SendWriteBackDone(stream_wb->op_ids.at(0));
+    SendForwardDone("r2", {9004});
+    SendFinish("r2");
+    AckWriteBacks(PlanOnce());
+    PlanOnce();
+}
 
 TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();

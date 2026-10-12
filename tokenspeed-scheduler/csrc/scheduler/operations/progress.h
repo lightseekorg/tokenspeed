@@ -37,6 +37,10 @@ enum class PublicationPoint {
     // The frontier is final for the owner (finish, retraction): the partial
     // page is published in place as a tail.
     kFinal,
+    // The owner keeps writing past the frontier (a prompt end followed by
+    // decode): the partial page is published as a tail and the admission
+    // swaps a fresh block into the owner's table, copying the published rows.
+    kOwnerContinues,
 };
 
 // Hashes the full prefix pages num_computed_tokens has filled since the
