@@ -41,7 +41,6 @@ exec ts serve \
     --speculative-num-steps 3 \
     --hf-overrides '{"index_share_for_mtp_iteration":true}' \
     --drafter-attention-backend trtllm \
-    --disable-replay-ssm \
     --max-num-seqs 32 \
     --max-prefill-tokens 16384 \
     --chunked-prefill-size 16384 \
