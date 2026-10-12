@@ -658,8 +658,10 @@ the draft's attention to the full history.
 | `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
-| `--enable-metrics` | Enable metrics reporting. |
+| `--enable-metrics` | Enable metrics reporting and serve the engine's Prometheus metrics over HTTP (see "Prometheus metrics" below). |
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
+| `--metrics-port` | Port for the engine's `/metrics` HTTP endpoint. Defaults to an automatically allocated free port (logged at startup). |
+| `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
 
@@ -685,6 +687,29 @@ already-synchronized CPU result and does not add a GPU synchronization, but it
 is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
+
+### Prometheus metrics
+
+With `--enable-metrics`, every engine process on a node (scheduler ranks and
+the tokenizer manager) writes its metrics to a node-local
+`PROMETHEUS_MULTIPROC_DIR`, and the engine's main process aggregates and
+serves them as `GET /metrics` in Prometheus text format. Scrape it at
+`http://<metrics-host>:<metrics-port>/metrics`; the bound address is logged at
+startup. Scrape traffic shares nothing with the request path — a bind failure
+degrades to an error log and serving continues.
+
+Where the endpoint lives depends on the launch mode:
+
+- **Single node / `ts serve`**: the engine's main process serves `/metrics`
+  on `--metrics-port` (an allocated free port if unset). `ts serve` pins this
+  port itself and prints `engine metrics available at http://...` once ready.
+  The gateway's own router metrics are separate: smg serves them on its
+  `--prometheus-port`, which `ts serve` also allocates per launch.
+- **Multi-node**: the main node (`node_rank == 0`) behaves as above. Follower
+  nodes (`node_rank >= 1`) run no tokenizer manager; their dummy health-check
+  server exposes `/metrics` (plus `/health`) on the engine's `--host`/`--port`
+  instead. Scrape every node — the multiprocess directory is node-local, so no
+  single endpoint covers the whole cluster.
 
 ### Per-request stats
 

@@ -88,6 +88,7 @@ from tokenspeed.runtime.utils import (
     configure_logger,
     get_colorful_logger,
     launch_dummy_health_check_server,
+    launch_metrics_server,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -696,6 +697,10 @@ def _launch_subprocesses(
             )
         return None, None, None
 
+    # Follower nodes (node_rank >= 1) serve /metrics from the dummy
+    # health-check server above; the main node gets the dedicated endpoint.
+    launch_metrics_server(server_args)
+
     # Launch the main-process async frontend. The detokenizer runs
     # inline inside AsyncLLM — no separate subprocess.
     tokenizer_manager = AsyncLLM(server_args, port_args)
@@ -756,6 +761,9 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
 
     configure_logger(server_args)
     _set_envs_and_config(server_args)
+    # Headless runs no dummy health-check server on any node, so every node
+    # serves its own /metrics here.
+    launch_metrics_server(server_args)
 
     # PortArgs is still derived (nccl_port drives torch.distributed); the pickle
     # scheduler_input/tokenizer IPC names it carries are unused in msgpack mode.

@@ -558,6 +558,28 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
     return [*engine_args, "--rl-control-port", str(port)], (f"http://127.0.0.1:{port}")
 
 
+def _add_metrics_port(engine_args: list[str]) -> tuple[list[str], str | None]:
+    """Wire the engine's Prometheus /metrics port when metrics are enabled.
+
+    With ``--enable-metrics`` the engine serves /metrics from its main process
+    (see ``ServerArgs.metrics_port``). Pin a stable port — like
+    ``--rl-control-port`` — so the scrape target survives engine restarts and
+    can be printed at startup. An operator-pinned ``--metrics-port`` is
+    preserved untouched. Returns the scrape URL, or None when metrics are off.
+    """
+    if "--enable-metrics" not in engine_args:
+        return engine_args, None
+    host = _get_from_args(engine_args, "--metrics-host", "127.0.0.1")
+    pinned = _get_from_args(engine_args, "--metrics-port")
+    if pinned is not None:
+        return engine_args, f"http://{host}:{int(pinned)}/metrics"
+    port = _free_port_avoiding_ephemeral_range()
+    return (
+        [*engine_args, "--metrics-port", str(port)],
+        f"http://{host}:{port}/metrics",
+    )
+
+
 async def _start_control_server(
     *,
     gateway_url: str,
@@ -687,6 +709,9 @@ async def run_smg(
         # before spawn_engine.
         engine_args, rl_control_url = _add_rl_control_port(engine_args)
 
+        # Wire the engine metrics port (only with --enable-metrics).
+        engine_args, metrics_url = _add_metrics_port(engine_args)
+
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)
         engine_log = asyncio.create_task(_stream_to(engine, ENGINE_TAG))
 
@@ -741,6 +766,8 @@ async def run_smg(
                 f"http://{user_host}:{control_port} (port in use?); "
                 f"serving continues without it\n"
             )
+        if metrics_url is not None:
+            sys.stdout.write(f"engine metrics available at {metrics_url}\n")
         sys.stdout.flush()
 
         engine_wait = asyncio.create_task(engine.wait())
