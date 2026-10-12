@@ -45,7 +45,7 @@ PAGE = 16
 PROMPT = list(range(40))  # 2 hash-complete pages and an 8-token tail
 
 
-def _scheduler() -> ts.Scheduler:
+def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
     groups = [
         ts.CacheGroupConfig(
             group_id="history",
@@ -55,6 +55,16 @@ def _scheduler() -> ts.Scheduler:
             family=ts.CacheGroupFamily.History,
         )
     ]
+    if with_state:
+        groups.append(
+            ts.CacheGroupConfig(
+                group_id="state",
+                block_granularity=0,
+                total_pages=64 + 1,
+                retention=ts.CacheRetention.FullHistory,
+                family=ts.CacheGroupFamily.State,
+            )
+        )
     return ts.Scheduler(
         make_config(
             num_device_pages=64 + 1,
@@ -95,6 +105,10 @@ def _finish(scheduler: ts.Scheduler, forward_op) -> None:
     event = ts.ForwardEvent.Finish()
     event.request_id = rid
     advance_scheduler(scheduler, [event])
+
+
+def _state_row(forward_op) -> list[int]:
+    return [int(value) for value in forward_op.block_tables_arrays()["state"][0]]
 
 
 def _run_cold(scheduler: ts.Scheduler, rid: str, tokens: list[int]) -> int:
@@ -190,3 +204,80 @@ def test_pages_to_copy_arrays_are_int32_pairs_per_group() -> None:
     assert copies["history"].dtype == np.int32
     assert copies["history"].shape == (0, 2)
     assert plan.pages_to_copy == {"history": []}
+
+
+def test_a_state_group_hits_where_its_checkpoint_was_published() -> None:
+    """A hybrid's prefix hit needs the state of the same instant. The cold run
+    published two: the prompt-end block the first decode rotated out of the
+    live slot, and the live block at finish. A prompt sharing the prompt end
+    claims the state block into slot 0 (shared, never copied) beside the KV
+    page copy; a prompt diverging inside the page finds no state below its
+    boundary and starts from the zero state."""
+    scheduler = _scheduler(with_state=True)
+    _submit(scheduler, "a", PROMPT)
+    plan = scheduler.next_execution_plan()
+    (prefill,) = _forwards(plan)
+    cold_row = _state_row(prefill)
+    assert cold_row[0] == 0 and cold_row[1] > 0
+    _land(scheduler, prefill, 1000)
+    plan = scheduler.next_execution_plan()
+    (decode,) = _forwards(plan)
+    prompt_end_block = cold_row[1]
+    first_decode_row = _state_row(decode)
+    assert first_decode_row[0] == prompt_end_block
+    assert first_decode_row[1] > 0 and first_decode_row[1] != prompt_end_block
+    assert plan.pages_to_copy_arrays()["state"].shape == (0, 2)
+    assert plan.pages_to_copy_arrays()["history"].shape == (1, 2)
+    _land(scheduler, decode, 1001)
+    plan = scheduler.next_execution_plan()
+    (decode,) = _forwards(plan)
+    live_block = first_decode_row[1]
+    assert _state_row(decode) == [0, live_block]
+    _finish(scheduler, decode)
+
+    plan, prefill = _hit(scheduler, "b", PROMPT + [999])
+    assert list(prefill.extend_prefix_lens) == [40]
+    row = _state_row(prefill)
+    assert row[0] == prompt_end_block and row[1] > 0 and row[1] != row[0]
+    assert plan.pages_to_copy_arrays()["state"].shape == (0, 2)
+    assert plan.pages_to_copy_arrays()["history"].shape == (1, 2)
+    _land(scheduler, prefill, 2000)
+    plan = scheduler.next_execution_plan()
+    (decode,) = _forwards(plan)
+    _finish(scheduler, decode)
+
+    plan, prefill = _hit(scheduler, "c", PROMPT + [1000, 5, 6])
+    assert list(prefill.extend_prefix_lens) == [41]
+    row = _state_row(prefill)
+    assert row[0] == live_block and row[1] > 0 and row[1] != row[0]
+    _land(scheduler, prefill, 4000)
+    plan = scheduler.next_execution_plan()
+    (decode,) = _forwards(plan)
+    _finish(scheduler, decode)
+
+    # The KV pages reach 32 but no state does: the request starts from the
+    # zero state and the junction cut ends its first chunk at the KV hit, so
+    # that chunk's state block is published under page 2's hash and the next
+    # such prompt hits 32 with every group.
+    plan, prefill = _hit(scheduler, "d", PROMPT[:37] + [777, 778, 779])
+    assert list(prefill.extend_prefix_lens) == [0]
+    assert list(prefill.input_lengths) == [32]
+    row = _state_row(prefill)
+    assert row[0] == 0 and row[1] > 0
+    assert plan.pages_to_copy_arrays()["history"].shape == (0, 2)
+    junction_block = row[1]
+    advance_scheduler(scheduler, [make_extend_result_event("d", [])])
+    plan = scheduler.next_execution_plan()
+    (prefill,) = _forwards(plan)
+    assert list(prefill.extend_prefix_lens) == [32]
+    assert list(prefill.input_lengths) == [8]
+    assert _state_row(prefill)[0] == junction_block
+    _land(scheduler, prefill, 3000)
+    plan = scheduler.next_execution_plan()
+    (decode,) = _forwards(plan)
+    _finish(scheduler, decode)
+
+    plan, prefill = _hit(scheduler, "e", PROMPT[:37] + [888, 889, 890])
+    assert list(prefill.extend_prefix_lens) == [32]
+    assert list(prefill.input_lengths) == [8]
+    assert _state_row(prefill)[0] == junction_block

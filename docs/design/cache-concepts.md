@@ -222,10 +222,12 @@ the decode prep tape and `verify_state_blocks` spell the same `where`). A
 prefill chunk therefore reads one block and writes another ("write-to-new");
 at the next admission the scheduler **rotates**: slot 0 leaves the table
 (the prefix index keeps it alive if it was published), slot 1 moves to slot
-0, and a fresh block becomes slot 1. The first decode step still sees the
-prompt-end state in slot 0 and writes a fresh slot 1; from the second step on
-slot 0 is null and decode evolves slot 1 in place. Speculative verify commits
-the accepted state into slot 1 unconditionally (`commit_state_pages`).
+0, and a fresh block becomes slot 1. When the prompt end is published (the
+prefix cache is on), the first decode step still sees the prompt-end state in
+slot 0 and writes a fresh slot 1; from the second step on -- from the first,
+with nothing to publish -- slot 0 is null and decode evolves slot 1 in place.
+Speculative verify commits the accepted state into slot 1 unconditionally
+(`commit_state_pages`).
 
 A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode

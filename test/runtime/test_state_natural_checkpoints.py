@@ -128,13 +128,20 @@ def test_chunks_follow_the_budget_alone(
     assert forwards[0].num_extends() == 0
 
 
-def test_state_rows_rotate_between_chunks_and_into_the_first_decode() -> None:
+@pytest.mark.parametrize("disable_prefix_cache", [False, True])
+def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
+    disable_prefix_cache: bool,
+) -> None:
     """A state group's row is two slots: the first chunk reads the zero state
     (slot 0 null) and writes slot 1; each later chunk reads the previous live
-    block, rotated into slot 0, and writes a fresh slot 1; the first decode
-    reads the prompt-end block from slot 0 and writes a fresh live block, and
-    every later decode evolves that block in place with slot 0 released."""
-    scheduler = _scheduler(token_budget=300, with_state=True, disable_prefix_cache=True)
+    block, rotated into slot 0, and writes a fresh slot 1. With the prefix
+    cache on, the prompt-end block is published, so the first decode reads it
+    from slot 0 and writes a fresh live block; without it nothing is
+    published and decode evolves the live block in place from the first step.
+    Every later decode evolves the live block in place with slot 0 null."""
+    scheduler = _scheduler(
+        token_budget=300, with_state=True, disable_prefix_cache=disable_prefix_cache
+    )
     request = ts.RequestSpec()
     request.request_id = "r"
     request.tokens = list(range(700))
@@ -160,8 +167,13 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode() -> None:
     plan = scheduler.next_execution_plan()
     (decode,) = [op for op in plan.forward if op.request_ids]
     decode_row = _state_row(decode)
-    assert decode_row[0] == third[1] and decode_row[1] > 0
-    assert decode_row[1] != decode_row[0]
+    if disable_prefix_cache:
+        assert decode_row == [0, third[1]]
+    else:
+        assert decode_row[0] == third[1] and decode_row[1] > 0
+        assert decode_row[1] != decode_row[0]
+    # A state block is never copied; the prompt-end copy-in is the KV page's.
+    assert plan.pages_to_copy_arrays()["state"].shape == (0, 2)
     result = ts.ForwardEvent.ExtendResult()
     result.request_id = "r"
     result.tokens = [901]
