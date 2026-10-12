@@ -4,7 +4,22 @@ set -euo pipefail
 
 export TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4
 
-exec ts serve \
+# --grpc runs the engine behind a separately launched P/D gateway.
+if [[ "${1:-}" == "--grpc" ]]; then
+    shift
+    SERVER_CMD=(python3 -m smg_grpc_servicer.tokenspeed)
+else
+    SERVER_CMD=(ts serve
+        --policy round_robin
+        --dp-aware
+        --sticky-sessions
+        --reasoning-parser passthrough
+        --tool-call-parser passthrough
+        --engine-startup-timeout 7200
+    )
+fi
+
+exec "${SERVER_CMD[@]}" \
     --model nvidia/Kimi-K3-NVFP4 \
     --data-parallel-size 16 \
     --ep-size 16 \
@@ -27,11 +42,6 @@ exec ts serve \
     --speculative-eagle-topk 1 \
     --drafter-attention-backend tokenspeed_mla \
     --mm-encoder-tp-mode data \
-    --policy round_robin \
-    --dp-aware \
-    --sticky-sessions \
-    --reasoning-parser passthrough \
-    --tool-call-parser passthrough \
     --host 0.0.0.0 \
     --port 8000 \
-    --engine-startup-timeout 7200
+    "$@"

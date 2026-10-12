@@ -60,16 +60,16 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 [ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
     -O build_swe_smith_dataset.py
 
-# Replicated 69 conversations x 32 -> 2208
-[ -f agentic_dataset_x32.json ] || python3 build_swe_smith_dataset.py \
+# Replicated 69 conversations x 128 -> 8832
+[ -f agentic_dataset_x128.json ] || python3 build_swe_smith_dataset.py \
     --model-path moonshotai/Kimi-K3 \
     --first-turn-length 4000 \
     --subsequent-turn-length 800 \
     --min-turns 30 \
     --max-turns 50 \
     --number 128 \
-    --replicas 32 \
-    --output-path agentic_dataset_x32.json \
+    --replicas 128 \
+    --output-path agentic_dataset_x128.json \
     --num-workers 32
 '
 
@@ -162,7 +162,7 @@ wait_for_port_free() {
 client() {
     "${SRUN[@]}" --nodes=1 --ntasks=1 --nodelist="$HEAD" "${SRUN_ARGS[@]}" \
         python3 "${SCRIPT_DIR}/pd_client.py" --url "$URL" --model nvidia/Kimi-K3-NVFP4 \
-        --dataset agentic_dataset_x32.json "$@"
+        --dataset agentic_dataset_x128.json "$@"
 }
 
 trap stop_server EXIT  # safety net for Ctrl-C / errors

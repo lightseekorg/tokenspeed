@@ -9,16 +9,16 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 [ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
     -O build_swe_smith_dataset.py
 
-# Replicated 69 conversations x 32 -> 2208
-[ -f agentic_dataset_x32.json ] || python3 build_swe_smith_dataset.py \
+# Replicated 69 conversations x 128 -> 8832
+[ -f agentic_dataset_x128.json ] || python3 build_swe_smith_dataset.py \
     --model-path moonshotai/Kimi-K3 \
     --first-turn-length 4000 \
     --subsequent-turn-length 800 \
     --min-turns 30 \
     --max-turns 50 \
     --number 128 \
-    --replicas 32 \
-    --output-path agentic_dataset_x32.json \
+    --replicas 128 \
+    --output-path agentic_dataset_x128.json \
     --num-workers 32
 
 # Sweep configs
@@ -112,7 +112,7 @@ for CONFIG in "${CONFIGS[@]}"; do
         --url http://127.0.0.1:8000/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
-        --dataset-path agentic_dataset_x32.json \
+        --dataset-path agentic_dataset_x128.json \
         --max-tokens 500 \
         --multi-turn \
         --number 2 \
@@ -127,7 +127,7 @@ for CONFIG in "${CONFIGS[@]}"; do
         --url http://127.0.0.1:8000/v1/chat/completions \
         --api openai \
         --dataset swe_smith \
-        --dataset-path agentic_dataset_x32.json \
+        --dataset-path agentic_dataset_x128.json \
         --max-tokens 500 \
         --multi-turn \
         --number 4 8 8 16 32 64 128 \

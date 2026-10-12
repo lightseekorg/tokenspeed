@@ -27,7 +27,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--url", required=True, help="chat/completions endpoint")
     p.add_argument("--model", required=True, help="served model name")
-    p.add_argument("--dataset", required=True, help="agentic_dataset_x32.json")
+    p.add_argument("--dataset", required=True, help="agentic_dataset_x128.json")
     p.add_argument(
         "--phase",
         required=True,
