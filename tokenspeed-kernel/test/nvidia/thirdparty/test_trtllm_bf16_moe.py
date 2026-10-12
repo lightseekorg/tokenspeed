@@ -899,7 +899,9 @@ def _deepseek_v3_routing(logits, bias, top_k, n_group, topk_group, scale):
     return ids, weights / weights.sum(dim=-1, keepdim=True) * scale
 
 
-def _gpu_bf16_moe_layer(intermediate_size, num_experts=256, hidden=1024):
+def _gpu_bf16_moe_layer(
+    intermediate_size, num_experts=256, hidden=1024, ep_size=1, ep_rank=0
+):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
@@ -916,40 +918,72 @@ def _gpu_bf16_moe_layer(intermediate_size, num_experts=256, hidden=1024):
             torch.bfloat16
         )
 
+    local = num_experts // ep_size
     w = torch.nn.Module()
     w.w13_weight = torch.nn.Parameter(
-        randn(num_experts, 2 * intermediate_size, hidden, scale=hidden**-0.5),
+        randn(local, 2 * intermediate_size, hidden, scale=hidden**-0.5),
         requires_grad=False,
     )
     w.w2_weight = torch.nn.Parameter(
-        randn(num_experts, hidden, intermediate_size, scale=intermediate_size**-0.5),
+        randn(local, hidden, intermediate_size, scale=intermediate_size**-0.5),
         requires_grad=False,
     )
-    w.num_experts = w.num_local_experts = num_experts
-    w.top_k, w.intermediate_size, w.tp_size, w.ep_rank = 8, intermediate_size, 1, 0
+    w.num_experts, w.num_local_experts = num_experts, local
+    w.top_k, w.intermediate_size, w.tp_size, w.ep_rank = (
+        8,
+        intermediate_size,
+        1,
+        ep_rank,
+    )
     return w, randn(1, hidden, scale=1.0)
 
 
-# flashinfer-ai/flashinfer#5557's cases: bias steps below the BF16 spacing of
-# the bias, and logits whose tanh-form sigmoid is 0.
+# The kinds of case flashinfer-ai/flashinfer#5557 tests, at DeepSeek-V3's
+# bias sizes (its published e_score_correction_bias lies between about 2 and
+# 8): FP32 bias steps far below the BF16 spacing there (1/32 from 4 to 8),
+# an exactly representable BF16 bias spread over 2 to 8 (a control: BF16
+# loses nothing), and logits whose tanh-form sigmoid is 0.
 _BIAS_CASES = ["fp32-bias-steps", "bf16-bias-steps", "negative-logits"]
 
 
-def _routing_case(case, num_tokens):
-    expert = torch.arange(256, device="cuda", dtype=torch.float32)
+def _routing_case(case, num_tokens, device="cuda"):
+    expert = torch.arange(256, device=device, dtype=torch.float32)
     if case == "negative-logits":
-        return torch.full((num_tokens, 256), -20.0, device="cuda"), -expert / 8
+        return torch.full((num_tokens, 256), -20.0, device=device), -expert / 8
     logits = (-5 + expert * 0.00004).repeat(num_tokens, 1)
     if case == "fp32-bias-steps":
-        return logits, 20.14 - expert * 0.00002
-    return logits, (20.0 - expert * 0.125).to(torch.bfloat16)
+        return logits, 6.0 - expert * 0.00002
+    # 8.0 down to 4.03 in steps of 1/32, then 4.0 down to 2.02 in steps of
+    # 1/64: every value is a distinct BF16 number.
+    bias = torch.where(expert < 128, 8.0 - expert / 32, 6.0 - expert / 64)
+    return logits, bias.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("n_group,topk_group", [(8, 4), (1, 1)])
+def test_dsv3_sized_bias_cases_need_an_fp32_bias(n_group, topk_group):
+    """CPU check of the cases themselves: at DeepSeek-V3's bias sizes, a bias
+    rounded to BF16 picks other experts than the FP32 bias in the FP32 step
+    case, and the same experts in the BF16 control case."""
+    for case, differs in (("fp32-bias-steps", True), ("bf16-bias-steps", False)):
+        logits, bias = _routing_case(case, 4, device="cpu")
+        assert 2.0 <= bias.float().min() and bias.float().max() <= 8.0
+        assert bias.float().unique().numel() == 256
+        ids, _ = _deepseek_v3_routing(logits, bias, 8, n_group, topk_group, 2.5)
+        bf16_ids, _ = _deepseek_v3_routing(
+            logits, bias.to(torch.bfloat16), 8, n_group, topk_group, 2.5
+        )
+        same = torch.equal(ids.sort(dim=1).values, bf16_ids.sort(dim=1).values)
+        assert same is not differs, case
 
 
 @pytest.mark.parametrize("intermediate_size", [64, 128])
 @pytest.mark.parametrize("num_tokens", [1, 128, 1025])
 @pytest.mark.parametrize("case", _BIAS_CASES)
+@pytest.mark.parametrize(
+    "n_group,topk_group", [(8, 4), (1, 1)], ids=["8-groups", "one-group"]
+)
 def test_fp32_bias_routing_matches_the_fp32_reference(
-    case, num_tokens, intermediate_size
+    case, num_tokens, intermediate_size, n_group, topk_group
 ):
     w, x = _gpu_bf16_moe_layer(intermediate_size)
     from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as unquant
@@ -972,8 +1006,8 @@ def test_fp32_bias_routing_matches_the_fp32_reference(
         gemm2_weights=w.w2_weight,
         num_experts=256,
         top_k=8,
-        n_group=8,
-        topk_group=4,
+        n_group=n_group,
+        topk_group=topk_group,
         intermediate_size=intermediate_size,
         local_expert_offset=0,
         local_num_experts=256,
@@ -984,7 +1018,7 @@ def test_fp32_bias_routing_matches_the_fp32_reference(
     )
     if weights.dtype == torch.float32:
         weights = weights.view(torch.bfloat16).view(-1, 8)[:num_tokens]
-    ids, expected = _deepseek_v3_routing(logits, bias, 8, 8, 4, 2.5)
+    ids, expected = _deepseek_v3_routing(logits, bias, 8, n_group, topk_group, 2.5)
     order = replay.long().argsort(dim=1)
     assert torch.equal(replay.long().gather(1, order), ids.sort(dim=1).values)
     got = weights.float().gather(1, order)
@@ -995,11 +1029,18 @@ def test_fp32_bias_routing_matches_the_fp32_reference(
 
 
 @pytest.mark.parametrize("intermediate_size", [64, 128])
+@pytest.mark.parametrize(
+    "n_group,topk_group,ep_size,ep_rank",
+    [(8, 4, 1, 0), (1, 1, 1, 0), (8, 4, 4, 1), (8, 4, 4, 3)],
+    ids=["8-groups", "one-group", "ep4-rank1", "ep4-rank3"],
+)
 def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
-    monkeypatch, intermediate_size
+    monkeypatch, intermediate_size, n_group, topk_group, ep_size, ep_rank
 ):
-
-    w, x = _gpu_bf16_moe_layer(intermediate_size)
+    """The in-kernel FP32-bias plan and precomputed FP32 top-k give the same
+    layer output, also on an expert-parallel rank whose local experts start
+    at an offset (64 or 192 of 256) and with a single expert group."""
+    w, x = _gpu_bf16_moe_layer(intermediate_size, ep_size=ep_size, ep_rank=ep_rank)
     reached = []
     fp32_moe = adapter.trtllm_bf16_fp32_routing_bias_moe
     monkeypatch.setattr(
@@ -1014,8 +1055,8 @@ def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
     )
     w.routing_config = dict(
         routing_method_type=2,
-        n_group=8,
-        topk_group=4,
+        n_group=n_group,
+        topk_group=topk_group,
         routed_scaling_factor=2.5,
         correction_bias=bias,
     )
@@ -1025,7 +1066,7 @@ def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
             "unquant",
             input_dtype=torch.bfloat16,
             activation="silu",
-            ep_size=1,
+            ep_size=ep_size,
             ispp=intermediate_size,
             hidden=x.shape[1],
             swiglu_form=None,
@@ -1044,7 +1085,7 @@ def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
     kernel_moe_process_weights(in_kernel, w)
     hidden = torch.randn((37, x.shape[1]), device="cuda", generator=generator)
     hidden = hidden.to(torch.bfloat16)
-    ids, weights = _deepseek_v3_routing(logits, bias, 8, 8, 4, 2.5)
+    ids, weights = _deepseek_v3_routing(logits, bias, 8, n_group, topk_group, 2.5)
     got = kernel_moe_apply(in_kernel, hidden, w, logits)
     assert reached or adapter.stock_routing_keeps_fp32_bias()
     want = kernel_moe_apply(
