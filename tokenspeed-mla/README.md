@@ -141,6 +141,21 @@ using the shared kernel.
 
 The public wrapper uses FP32 for softmax exponentials and row sums. Packed
 FP16 softmax remains an explicit option for direct kernel construction.
+In the mixed-cluster kernel, both precisions handle each softmax group's
+final tile in the masked tail loop. This removes final-sum exchange branches
+from the full-tile loop while preserving causal masks and odd/even tile counts.
+Unsplit walks retain the normalization base for maximum increases of up to
+4 log2 units; split chunks use 8. This reduces PV rescaling and bounds the
+unnormalized probabilities by 16 and 256 respectively, within FP8 E4M3's range.
+The normalization base affects FP8 rounding, so output and LSE accuracy are
+checked against an FP32 reference.
+
+Automatic split-KV planning uses the capacity of full 4-CTA clusters, reserves
+`clusters // 16` slots, and targets one wave of work. The wrapper preserves
+an explicit `min_split_kv` and normalizes the result to nonempty partitions.
+This limits workspace traffic and reduction work, but can reduce parallelism
+too far for some shapes. The H96/B16/Q4 cases regress when the split count
+drops from three to one.
 
 FP8 output supports up to four M256 tiles per request. By default, `H` must
 divide 256 and `q_len` must be a multiple of `256 / H`;

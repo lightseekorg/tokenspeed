@@ -398,16 +398,16 @@ def test_sm107_workspace_uses_folded_rows_and_nonempty_splits():
 
 @pytest.mark.parametrize(
     "batch,q_tiles,expected_splits",
-    [(1, 2, 26), (1, 3, 17), (4, 2, 6), (4, 3, 4), (16, 2, 3), (16, 3, 1), (64, 3, 1)],
+    [(1, 2, 23), (1, 3, 15), (4, 2, 5), (4, 3, 3), (16, 2, 1), (16, 3, 1), (64, 3, 1)],
 )
 @pytest.mark.parametrize("kv_len", [65536, 131072])
-def test_sm107_split_selection_accounts_for_four_cta_waves(
+def test_sm107_split_selection_fills_one_wave_of_four_cta_clusters(
     batch, q_tiles, expected_splits, kv_len
 ):
     from tokenspeed_mla.mla_decode import _get_sm107_split_kv_and_workspace_size
 
     splits, size = _get_sm107_split_kv_and_workspace_size(
-        batch, q_tiles, 256, 512, 208, kv_len, 1
+        batch, q_tiles, 256, 512, 196, kv_len, 1
     )
     assert splits == expected_splits
     assert size == (batch * q_tiles * 256 * splits * 513 * 4 if splits > 1 else 0)
@@ -417,7 +417,7 @@ def test_sm107_split_minimum_is_preserved():
     from tokenspeed_mla.mla_decode import _get_sm107_split_kv_and_workspace_size
 
     splits, size = _get_sm107_split_kv_and_workspace_size(
-        16, 3, 256, 512, 208, 65536, 8
+        16, 3, 256, 512, 196, 65536, 8
     )
     assert splits == 8
     assert size == 16 * 3 * 256 * 8 * 513 * 4
@@ -971,14 +971,15 @@ def _check_sm107_fp8_out_gpu(
 
     q, kv, tables, lengths = _make_inputs(case, "fp8", variable_kv, "cuda")
     workspace = torch.zeros(256 * 1024**2, dtype=torch.int8, device="cuda")
-    out = torch.empty(
-        case.batch,
-        case.q_len,
-        case.heads,
-        512,
+    output_elements = case.batch * case.q_len * case.heads * 512
+    out_storage = torch.empty(
+        output_elements + 64,
         dtype=torch.float8_e4m3fn,
         device="cuda",
     )
+    # A partial M tile must not write beyond the caller's output tensor.
+    out_storage.view(torch.uint8).fill_(0xA5)
+    out = out_storage[:output_elements].view(case.batch, case.q_len, case.heads, 512)
     kwargs = dict(
         query=q,
         kv_cache=kv,
@@ -1031,6 +1032,7 @@ def _check_sm107_fp8_out_gpu(
             expected.square().mean().sqrt()
         )
         assert relative_rmse < 0.05, f"Relative RMSE too large: {relative_rmse:.6f}"
+        assert torch.all(out_storage.view(torch.uint8)[output_elements:] == 0xA5)
 
     _, lse = tokenspeed_mla_decode(**kwargs)
     torch.cuda.synchronize()
@@ -1046,7 +1048,7 @@ def _check_sm107_fp8_out_gpu(
     check(lse)
 
 
-def _check_sm107_retained_max_gpu(min_split_kv, fp16_softmax):
+def _check_sm107_retained_max_gpu(min_split_kv, fp16_softmax, tile_scores):
     import tokenspeed_mla.mla_decode as decode
 
     warnings.simplefilter("error")
@@ -1055,10 +1057,10 @@ def _check_sm107_retained_max_gpu(min_split_kv, fp16_softmax):
     q = torch.zeros((batch, q_len, heads, 576), device="cuda")
     q[..., 0] = 1.0
     kv = torch.zeros((batch, k_len, 576), device="cuda")
-    # The second and last tiles grow the maximum by less than 8 log2 units;
-    # tile 2 exceeds the threshold. The final tile must use the retained max
-    # for both P and LSE, including when it is the last tile of a split.
-    scores = torch.tensor([0.0, 4.0, 12.0, 16.0], device="cuda").repeat_interleave(128)
+    # The smaller steps retain the maximum at both 4 and 8 log2 units; the
+    # larger steps retain it only at 8. Tile 2 exceeds both thresholds.
+    # P and LSE must use the same normalization base on the final tile too.
+    scores = torch.tensor(tile_scores, device="cuda").repeat_interleave(128)
     kv[..., 0] = scores
     kv[..., 1:] = torch.linspace(-1.0, 1.0, k_len, device="cuda")[:, None]
     q, kv = q.to(torch.float8_e4m3fn), kv.to(torch.float8_e4m3fn)
@@ -1491,6 +1493,32 @@ class TestGPU:
             300,
         )
 
+    @pytest.mark.parametrize(
+        "case,causal_mask",
+        [
+            # Both groups reserve a complete, unmasked final tile.
+            (_Case(64, 768, 96, 8), False),
+            # Two masked tail tiles; the final tile has only one key.
+            (_Case(64, 641, 96, 8), True),
+            # An odd tile count makes group 0 perform the final sum merge.
+            (_Case(64, 769, 96, 8), True),
+            # Q > tile_N leaves multiple masked iterations in one group.
+            (_Case(64, 769, 2, 257), True),
+        ],
+        ids=lambda value: value.name if isinstance(value, _Case) else None,
+    )
+    def test_sm107_fp32_softmax_group_final_tiles(self, case, causal_mask):
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
+            10,
+            7,
+        ):
+            pytest.skip("Requires SM107")
+        _run_gpu_check(
+            _check_sm107_fp8_out_gpu,
+            (case, False, causal_mask, 1, False, True),
+            300,
+        )
+
     @pytest.mark.parametrize("fp16_softmax", [True, False])
     @pytest.mark.parametrize(
         "case,variable_kv,causal_mask,min_split_kv",
@@ -1576,13 +1604,22 @@ class TestGPU:
 
     @pytest.mark.parametrize("fp16_softmax", [True, False])
     @pytest.mark.parametrize("min_split_kv", [1, 2])
-    def test_sm107_retained_max_on_last_tile(self, min_split_kv, fp16_softmax):
+    @pytest.mark.parametrize(
+        "tile_scores", [(0.0, 2.0, 6.0, 8.0), (0.0, 4.0, 12.0, 16.0)]
+    )
+    def test_sm107_retained_max_on_last_tile(
+        self, min_split_kv, fp16_softmax, tile_scores
+    ):
         if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
             10,
             7,
         ):
             pytest.skip("Requires SM107")
-        _run_gpu_check(_check_sm107_retained_max_gpu, (min_split_kv, fp16_softmax), 300)
+        _run_gpu_check(
+            _check_sm107_retained_max_gpu,
+            (min_split_kv, fp16_softmax, tile_scores),
+            300,
+        )
 
     @pytest.mark.parametrize("kv_len,min_split_kv", [(8193, 64), (16385, 128)])
     def test_sm107_reducer_capacity(self, kv_len, min_split_kv):

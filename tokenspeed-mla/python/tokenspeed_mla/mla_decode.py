@@ -499,10 +499,10 @@ def _get_compiled_sm107_mla_kernel(
         mma_pv_tiler_mn=(SM107_MLA_M_TILE, 256),
         max_active_clusters=_get_sm107_max_active_clusters(),
         page_size=page_size,
-        # Retaining maxima benefits split chunks; long unsplit walks benchmark
-        # faster with zero threshold. Both cluster shapes decide before P,
-        # including the last tile, so retained-max P stays <= 256 < 448.
-        skip_correction_threshold=0.0 if is_workspace_size_zero else 8.0,
+        # Retain the normalization base for small maximum increases to skip
+        # PV rescaling. These log2 thresholds bound P by 16 for unsplit walks
+        # and 256 for split chunks, below the FP8 E4M3 maximum of 448.
+        skip_correction_threshold=4.0 if is_workspace_size_zero else 8.0,
         # Cluster launch control schedules the work, so the static
         # persistent-grid choice does not apply.
         is_persistent=False,
@@ -677,7 +677,7 @@ def _sm107_fp8_out_decode(
         ceil_div(q_len * H, SM107_MLA_M_TILE),
         SM107_MLA_M_TILE,
         kv_lora_rank,
-        _get_sm107_max_active_clusters() * 4,
+        get_max_active_clusters(4) * 4,
         max_seq_len,
         min_split_kv,
     )
