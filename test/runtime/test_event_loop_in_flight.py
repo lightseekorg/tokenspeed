@@ -169,6 +169,7 @@ def test_pp_broadcast_adopts_the_last_stage_tokens_candidates_logprobs_and_flags
         ["output logprobs"],
         ["prompt logprobs"],
         ["nan flags"],
+        [[-0.5, -2.0]],
     )
 
     def broadcast(payload, src, group):
@@ -183,6 +184,7 @@ def test_pp_broadcast_adopts_the_last_stage_tokens_candidates_logprobs_and_flags
         next_input_ids=None,
         output_logprobs=None,
         input_token_logprobs=None,
+        score_logprobs=None,
         output_nan_flags="this stage's clean flags",
         input_logprob_plan="this stage's plan",
     )
@@ -195,6 +197,7 @@ def test_pp_broadcast_adopts_the_last_stage_tokens_candidates_logprobs_and_flags
     assert results.output_logprobs == ["output logprobs"]
     assert results.input_token_logprobs == ["prompt logprobs"]
     assert results.output_nan_flags == ["nan flags"]
+    assert results.score_logprobs == [[-0.5, -2.0]]
     assert results.input_logprob_plan == "this stage's plan"
 
 
@@ -211,6 +214,7 @@ def test_pp_broadcast_sends_the_last_stage_results_unchanged(monkeypatch) -> Non
         next_input_ids="candidates",
         output_logprobs="output logprobs",
         input_token_logprobs="prompt logprobs",
+        score_logprobs=[[-0.5, -2.0]],
         output_nan_flags="nan flags",
     )
 
@@ -224,11 +228,13 @@ def test_pp_broadcast_sends_the_last_stage_results_unchanged(monkeypatch) -> Non
             "output logprobs",
             "prompt logprobs",
             "nan flags",
+            [[-0.5, -2.0]],
         )
     ]
     assert (results.output_tokens, results.next_input_ids) == ("sampled", "candidates")
     assert results.input_token_logprobs == "prompt logprobs"
     assert results.output_nan_flags == "nan flags"
+    assert results.score_logprobs == [[-0.5, -2.0]]
 
 
 def test_pp_broadcast_precedes_commit_post_processing() -> None:

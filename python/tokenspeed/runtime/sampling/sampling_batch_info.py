@@ -77,6 +77,14 @@ class SamplingBatchInfo:
     # offset — a MIXED round's verify() sees only the decode suffix.
     batch_row_offset: int = 0
 
+    # int64[num_extend_rows, max_labels] | None — padded score-label gather
+    # index for the Score API (see sampling/score_utils.py). Covers only the
+    # batch's extend rows (score requests never decode); rows without score
+    # labels are zero-filled. None on the standard hot path.
+    score_label_ids: torch.Tensor | None = None
+    # Host row indices avoid discovering scored rows through a CUDA nonzero.
+    score_row_indices: tuple[int, ...] = ()
+
     # Device
     device: str = "cuda"
 
@@ -96,6 +104,16 @@ class SamplingBatchInfo:
         def _slice(t):
             return t[s] if t is not None else None
 
+        score_rows = set(self.score_row_indices)
+        sliced_score_rows = (
+            tuple(
+                i
+                for i, row in enumerate(range(self.score_label_ids.shape[0])[s])
+                if row in score_rows
+            )
+            if self.score_label_ids is not None
+            else ()
+        )
         return dataclasses.replace(
             self,
             temperatures=_slice(self.temperatures),
@@ -105,5 +123,7 @@ class SamplingBatchInfo:
             req_pool_indices=_slice(self.req_pool_indices),
             vocab_mask=_slice(self.vocab_mask),
             grammars=_slice(self.grammars),
+            score_label_ids=_slice(self.score_label_ids),
+            score_row_indices=sliced_score_rows,
             batch_row_offset=self.batch_row_offset + (s.start or 0),
         )

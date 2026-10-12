@@ -160,6 +160,7 @@ def _batch_token_id_out(**overrides) -> BatchTokenIDOut:
         batch_accept_draft_tokens=[],
         output_extra_infos=[{"decode_prefix_len": 4}, {}],
         generated_time=12.5,
+        output_score_vals=[[0.8, 0.2], []],
     )
     fields.update(overrides)
     return BatchTokenIDOut(**fields)
@@ -292,6 +293,8 @@ def test_batch_token_id_out_field_values_roundtrip():
     ]
     assert rt.output_extra_infos == [{"decode_prefix_len": 4}, {}]
     assert rt.generated_time == pytest.approx(12.5)
+    assert rt.output_score_vals[0] == [pytest.approx(0.8), pytest.approx(0.2)]
+    assert rt.output_score_vals[1] == []
 
 
 def test_accept_draft_tokens_none_mid_stream_roundtrips():

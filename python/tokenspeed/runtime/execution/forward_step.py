@@ -185,7 +185,8 @@ class ForwardStepRunner:
 
     Callers always use the same interface::
 
-        output_tokens, output_lengths, output_logprobs = runner(
+        (output_tokens, output_lengths, output_logprobs,
+         input_token_logprobs, score_logprobs) = runner(
             bs, ctx, sampling_info,
             extend_with_prefix=..., extend_prefix_lens=..., ...,
             block_tables=block_tables,
@@ -1046,8 +1047,8 @@ class ForwardStepRunner:
         device.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
-        input_token_logprobs)``; the last is the prompt-logprob gather of an
-        extend/mixed forward (``ctx.input_logprob_rows``) and None otherwise.
+        input_token_logprobs, score_logprobs)``. Prompt and score readouts
+        are independent extend/mixed results; both are None on decode replay.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1167,13 +1168,13 @@ class ForwardStepRunner:
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
-            # A decode graph never gathers prompt logprobs (its captured
-            # fourth output is None).
+            # Decode captures carry no prompt or score readout.
             (
                 output_tokens,
                 output_lengths,
                 output_logprobs,
                 _input_token_logprobs,
+                _score_logprobs,
             ) = self.output_buffers[graph_key]
 
             result = (
@@ -1184,6 +1185,7 @@ class ForwardStepRunner:
                     if output_logprobs is not None
                     else None
                 ),
+                None,
                 None,
             )
         else:

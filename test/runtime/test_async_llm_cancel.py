@@ -25,10 +25,13 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 import asyncio  # noqa: E402
 import types  # noqa: E402
 from typing import Any, Dict  # noqa: E402
+from unittest.mock import AsyncMock  # noqa: E402
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM  # noqa: E402
 from tokenspeed.runtime.engine.collector import RequestOutputCollector  # noqa: E402
+from tokenspeed.runtime.engine.io_struct import AbortReq, GenerateReqInput  # noqa: E402
 from tokenspeed.runtime.engine.output_processor import ReqState  # noqa: E402
+from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
 
 class _FakeScheduler:
@@ -170,6 +173,146 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
             0,
             "normal finish should not schedule an AbortReq",
         )
+
+
+class TestBatchSetupCleanup(unittest.IsolatedAsyncioTestCase):
+    def _parallel_setup(self, *, missing_second_seed=False):
+        obj = GenerateReqInput(
+            text=["first", "second"], sampling_params={"max_new_tokens": 1, "n": 2}
+        )
+        obj.normalize_batch_and_arguments()
+        mgr = _StubAsyncLLM()
+        tokenized = [
+            types.SimpleNamespace(
+                created_time=0.0,
+                sampling_params=SamplingParams(
+                    max_new_tokens=1,
+                    seed=None if missing_second_seed and i == 1 else 7,
+                ),
+                multimodal_inputs=None,
+            )
+            for i in range(2)
+        ]
+        mgr.input_processor = types.SimpleNamespace(
+            tokenize_batch=AsyncMock(return_value=tokenized)
+        )
+        return mgr, obj
+
+    async def test_parallel_setup_failures_retire_submitted_requests(self):
+        for stage in ("warmup send", "replica send", "replica preparation"):
+            with self.subTest(stage=stage):
+                mgr, obj = self._parallel_setup(
+                    missing_second_seed=stage == "replica preparation"
+                )
+                send = mgr._send_one_request
+                replicas = []
+
+                def complete_warmups_or_fail(req, tokenized, created_time):
+                    send(req, tokenized, created_time)
+                    if tokenized.sampling_params.max_new_tokens == 0:
+                        if stage == "warmup send":
+                            raise OSError("warmup send failed")
+                        state = mgr.rid_to_state[req.rid]
+                        state.finished = True
+                        state.collector.put(
+                            {
+                                "text": "",
+                                "output_ids": [],
+                                "meta_info": {"id": req.rid, "finish_reason": None},
+                            },
+                            stream=False,
+                        )
+                        state.event.set()
+                    else:
+                        replicas.append(req.rid)
+                        if stage == "replica send" and len(replicas) == 2:
+                            raise OSError("replica send failed")
+
+                mgr._send_one_request = complete_warmups_or_fail
+                error = ValueError if stage == "replica preparation" else OSError
+                with self.assertRaises(error):
+                    await mgr._handle_batch_request(obj, created_time=0.0).__anext__()
+                self.assertEqual(mgr.rid_to_state, {})
+                aborted = [
+                    message.rid
+                    for message in mgr.engine_core_client.send_to_scheduler.aborts
+                    if isinstance(message, AbortReq)
+                ]
+                self.assertEqual(len(aborted), 1 if stage == "warmup send" else 2)
+                if replicas:
+                    self.assertEqual(aborted, replicas)
+
+    async def test_parallel_warmup_cancellation_retires_request(self):
+        mgr, obj = self._parallel_setup()
+        generator = mgr._handle_batch_request(obj, created_time=0.0)
+        task = asyncio.create_task(generator.__anext__())
+        await asyncio.sleep(0)
+        self.assertEqual(len(mgr.rid_to_state), 1)
+        rid = next(iter(mgr.rid_to_state))
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(mgr.rid_to_state, {})
+        aborted = [
+            message.rid
+            for message in mgr.engine_core_client.send_to_scheduler.aborts
+            if isinstance(message, AbortReq)
+        ]
+        self.assertEqual(aborted, [rid])
+
+    def _batch(self):
+        obj = GenerateReqInput(
+            text=["valid", "too long"],
+            sampling_params={
+                "max_new_tokens": 0,
+                "score_label_token_ids": [1],
+                "score_apply_softmax": False,
+            },
+        )
+        obj.normalize_batch_and_arguments()
+        obj.rid = ["first", "second"]
+        return obj
+
+    async def _assert_tokenization_failure_cleanup(self, error):
+        mgr = _StubAsyncLLM()
+        first = types.SimpleNamespace(rid="first", created_time=0.0)
+        mgr._tokenize_one_request = AsyncMock(side_effect=[first, error])
+        generator = mgr._handle_batch_request(self._batch(), created_time=0.0)
+        with self.assertRaises(type(error)):
+            await generator.__anext__()
+        self.assertEqual(mgr.rid_to_state, {})
+        sent = mgr.engine_core_client.send_to_scheduler.aborts
+        self.assertIs(sent[0], first)
+        aborts = [message for message in sent if isinstance(message, AbortReq)]
+        self.assertEqual([message.rid for message in aborts], ["first"])
+
+    async def test_late_tokenization_error_retires_earlier_child(self):
+        await self._assert_tokenization_failure_cleanup(ValueError("context exceeded"))
+
+    async def test_cancellation_during_batch_setup_retires_earlier_child(self):
+        await self._assert_tokenization_failure_cleanup(asyncio.CancelledError())
+
+    async def test_partial_send_failure_retires_registered_child(self):
+        mgr = _StubAsyncLLM()
+        first = types.SimpleNamespace(rid="first", created_time=0.0)
+        mgr._tokenize_one_request = AsyncMock(return_value=first)
+        send = mgr._send_one_request
+
+        def failed_send(*args):
+            send(*args)
+            raise OSError("send failed")
+
+        mgr._send_one_request = failed_send
+        generator = mgr._handle_batch_request(self._batch(), created_time=0.0)
+        with self.assertRaisesRegex(OSError, "send failed"):
+            await generator.__anext__()
+        self.assertEqual(mgr.rid_to_state, {})
+        aborts = [
+            message
+            for message in mgr.engine_core_client.send_to_scheduler.aborts
+            if isinstance(message, AbortReq)
+        ]
+        self.assertEqual([message.rid for message in aborts], ["first"])
 
 
 if __name__ == "__main__":

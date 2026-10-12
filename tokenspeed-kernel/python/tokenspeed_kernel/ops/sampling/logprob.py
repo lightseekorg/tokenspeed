@@ -81,7 +81,8 @@ def vocab_parallel_logprobs(
         logits: ``[rows, vocab]`` logits of the whole vocabulary (any float
             dtype; computed in fp32). ``vocab`` must be a multiple of
             ``vocab_block``.
-        target_ids: ``[rows]`` integer token ids.
+        target_ids: ``[rows]`` or ``[rows, labels]`` integer token ids. Multiple
+            labels share one vocab reduction per row.
         vocab_block: Width of the fixed ``sum(exp)`` blocks (the trainer uses
             32768); the fold across blocks is a fp32 left fold in block order.
         solution: Optional kernel solution for the block ``sum(exp)`` leaf;
@@ -91,16 +92,17 @@ def vocab_parallel_logprobs(
         override: Optional exact kernel-name or solution override.
 
     Returns:
-        ``[rows]`` fp32 log-probabilities, ``-(log(sum_exp) - target)`` with
+        fp32 log-probabilities shaped like ``target_ids``, ``-(log(sum_exp) - target)`` with
         ``target = logits[row, id] - max`` and ``sum_exp`` the fp32 left fold
         of the leaf's ``[rows, vocab // vocab_block]`` block partials.
     """
     if logits.ndim != 2:
         raise ValueError(f"logits must be [rows, vocab], got {tuple(logits.shape)}")
     rows, vocab = logits.shape
-    if target_ids.shape != (rows,):
+    if target_ids.ndim not in (1, 2) or target_ids.shape[0] != rows:
         raise ValueError(
-            f"target_ids must have shape {(rows,)}, got {tuple(target_ids.shape)}"
+            f"target_ids must have shape [rows] or [rows, labels] with rows={rows}, "
+            f"got {tuple(target_ids.shape)}"
         )
     if target_ids.dtype not in (torch.int32, torch.int64):
         raise ValueError(f"target_ids must be int32 or int64, got {target_ids.dtype}")
@@ -119,7 +121,9 @@ def vocab_parallel_logprobs(
     logits = logits.float()
     row_max = logits.max(dim=-1).values
     shifted = logits - row_max.unsqueeze(-1)
-    target = shifted.gather(1, target_ids.to(torch.int64).unsqueeze(-1)).squeeze(-1)
+    single_target = target_ids.ndim == 1
+    ids = target_ids.unsqueeze(-1) if single_target else target_ids
+    target = shifted.gather(1, ids.to(torch.int64))
     shape_params = {"rows": rows, "vocab": vocab, "vocab_block": vocab_block}
     ShapeCapture.get().record(
         "sampling", "block_sumexp", kernel.name, torch.float32, shape_params
@@ -137,4 +141,5 @@ def vocab_parallel_logprobs(
     for block in range(1, partials.shape[1]):
         sum_exp = sum_exp + partials[:, block]
     # Megatron returns the NLL; the log-probability is its exact negation.
-    return -(torch.log(sum_exp) - target)
+    result = -(torch.log(sum_exp).unsqueeze(-1) - target)
+    return result.squeeze(-1) if single_target else result
