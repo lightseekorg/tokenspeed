@@ -1830,6 +1830,15 @@ def execute_task(
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, declared_runner))
+    if setup_mode == "ci" and runner.startswith("b200v2-"):
+        # Use the same persistent root as package_cache.sh.
+        cache_root = env.get("CI_CACHE_ROOT") or str(
+            Path(env.get("FLASHINFER_CACHE_DIR") or "/raid/cache/flashinfer").parent
+        )
+        env.setdefault(
+            "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR",
+            os.path.join(cache_root, "tokenspeed", "flashinfer-autotune"),
+        )
     if task["type"] in SERVING_TASK_TYPES:
         # Only the task itself may relax the check; a value inherited from
         # the runner's environment must not.

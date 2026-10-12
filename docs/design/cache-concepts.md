@@ -1299,8 +1299,17 @@ require the full-attention backend to declare `supports_mla_dcp`; FlashMLA and
 TokenSpeed MLA (CuTe MLA) both declare this capability.
 Decode (DCP) gathers query heads, computes attention over owned history, and
 merges partials using FP32 natural-log LSE before restoring TP-local heads. MLA
-prefill reconstructs bounded history chunks with an owner-masked sum reduction;
-GPU DSA sparse prefill instead combines local sparse-attention partials.
+prefill reads its bounded prefix chunks through the backend
+(`read_prefix_history`), so the model never sees the sharding. The paged
+backend base reads a local cache in place and rebuilds one dealt over owners
+by all-gathering each owner's rows as raw cache-dtype bytes, bitwise the
+unsharded read; a leaf declaring `supports_mla_dcp` only hands it each
+prefill's prefix loops and host page table (`_prepare_prefix_history`), so
+planning the gathers never waits on the device. The gathers run on a named
+copy of the KVP group, whose communicators are apart from the attention TP
+collectives, one window of loops ahead, so each transfer runs under the compute
+before its layer instead of queueing with those collectives. GPU DSA sparse
+prefill instead combines local sparse-attention partials.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
 KVP does not make unsupported kernels portable. KVP excludes speculative
 decoding for every model on the ordinary MLA/DSA recipe, whichever dense

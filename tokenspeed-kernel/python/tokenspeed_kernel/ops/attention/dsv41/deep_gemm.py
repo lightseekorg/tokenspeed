@@ -39,7 +39,10 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _LAYOUTS,
     _finish_topk,
     _index_topk_outputs,
+    block_maxima,
+    block_maxima_with_lengths,
     candidate_scores,
+    clean_block_maxima,
     clean_logits,
     dense_ranges,
     gather_index_cache,
@@ -368,7 +371,9 @@ def _gather_index_fp8(cache, slots):
     return gathered.view(torch.float8_e4m3fn).contiguous(), row_scales.contiguous()
 
 
-def _hopper_dense_scores(queries, keys, weights, lengths, table, pages, capacity):
+def _hopper_dense_scores(
+    queries, keys, weights, lengths, table, pages, capacity, *, clean
+):
     starts, ends = dense_ranges(lengths, capacity)
     logits = _hopper_api(queries[0]).fp8_mqa_logits(
         q=queries[0],
@@ -379,10 +384,12 @@ def _hopper_dense_scores(queries, keys, weights, lengths, table, pages, capacity
         clean_logits=False,
         max_seqlen_k=capacity,
     )
-    return clean_logits(logits, ends, table, pages, capacity, 64)
+    return clean_logits(logits, ends, table, pages, capacity, 64) if clean else logits
 
 
-def _hopper_paged_scores(queries, cache, weights, block_table, valid_lengths, capacity):
+def _hopper_paged_scores(
+    queries, cache, weights, block_table, valid_lengths, capacity, *, clean
+):
     if cache.stride(0) >= 2**31 or cache.stride(0) % 16 or cache.data_ptr() % 16:
         raise ValueError(
             "DeepGEMM packed pages require aligned sub-2GiB strides; use the portable solution"
@@ -416,6 +423,8 @@ def _hopper_paged_scores(queries, cache, weights, block_table, valid_lengths, ca
         capacity,
         clean_logits=False,
     )
+    if not clean:
+        return logits.reshape(queries[0].shape[0], -1)[:, :capacity]
     return clean_logits(
         logits.reshape(queries[0].shape[0], -1)[:, :capacity],
         lengths,
@@ -427,21 +436,7 @@ def _hopper_paged_scores(queries, cache, weights, block_table, valid_lengths, ca
 
 
 def _block_maxima(logits, visible):
-    """Reduce rows to their 8-row block maximum, pinning the newest block."""
-    tokens, width = logits.shape
-    padded = (width + 7) // 8 * 8
-    if padded != width:
-        logits = torch.nn.functional.pad(
-            logits, (0, padded - width), value=-float("inf")
-        )
-    blocks = logits.reshape(tokens, -1, 8).amax(-1)
-    newest = ((visible.to(torch.int64) - 1) // 8).clamp(0, blocks.shape[1] - 1)
-    rows = torch.arange(tokens, device=blocks.device)
-    current = blocks[rows, newest]
-    blocks[rows, newest] = torch.where(
-        current > -float("inf"), torch.full_like(current, float("inf")), current
-    )
-    return blocks
+    return block_maxima(logits, visible)
 
 
 # V4.1 selects at most 512 rows and at most 2048 candidate blocks per query;
@@ -479,12 +474,16 @@ def _select(scores, k, capacity, destination, lengths, candidates=None, ends=Non
     _finish_topk(values, indices, destination, lengths, candidates)
 
 
-def _native_select(logits, visible, candidates, topk, candidate_topk, out, scores):
+def _native_select(
+    logits, visible, candidates, topk, candidate_topk, out, scores, block_stats=None
+):
     """Select rows, and blocks when this pass sources the candidate pool.
 
     ``scores`` is the candidate-compacted score matrix when it was produced
     directly, or None to gather it here from the dense ``logits``. A pass that
     sources candidates always needs the dense row, so it never supplies it.
+    ``block_stats`` optionally supplies maxima and valid block counts already
+    produced while cleaning logits; their unwritten tails are never selected.
     """
     rows, lengths, blocks, block_lengths = out
     if candidates is None:
@@ -496,12 +495,18 @@ def _native_select(logits, visible, candidates, topk, candidate_topk, out, score
             scores = candidate_scores(logits, candidates)
         _select(scores, topk, _ROW_CAPACITY, rows, lengths, candidates)
     if candidate_topk:
+        maxima, block_ends = (
+            block_maxima_with_lengths(logits, visible)
+            if block_stats is None
+            else block_stats
+        )
         _select(
-            _block_maxima(logits, visible),
+            maxima,
             candidate_topk,
             _BLOCK_CAPACITY,
             blocks,
             block_lengths,
+            ends=block_ends,
         )
     else:
         # Outputs may be uninitialized; a pass that sources no candidates still
@@ -619,6 +624,10 @@ def hopper_index_topk(
                 ),
             )
             continue
+        # Candidate gathering can read past visible into a partial block. Keep
+        # its fully initialized scores; only bounded selectors consume the
+        # partially initialized output of the fused cleaner.
+        bounded = bool(candidate_topk) and candidate_blocks is None
         if dense:
             logits = _hopper_dense_scores(
                 packed,
@@ -628,6 +637,7 @@ def hopper_index_topk(
                 page_table[begin:end],
                 index_cache.shape[0],
                 capacity,
+                clean=not bounded,
             )
         else:
             logits = _hopper_paged_scores(
@@ -637,7 +647,14 @@ def hopper_index_topk(
                 page_table[begin:end],
                 visible,
                 capacity,
+                clean=not bounded,
             )
+        block_stats = None
+        if bounded:
+            logits, maxima, block_ends = clean_block_maxima(
+                logits, visible, page_table[begin:end], index_cache.shape[0]
+            )
+            block_stats = (maxima, block_ends)
         candidates = None if candidate_blocks is None else candidate_blocks[begin:end]
         _native_select(
             logits,
@@ -647,5 +664,6 @@ def hopper_index_topk(
             candidate_topk,
             tuple(tensor[begin:end] for tensor in out),
             None,
+            block_stats=block_stats,
         )
     return out
