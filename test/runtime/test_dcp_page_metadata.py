@@ -18,10 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+import sys
 from dataclasses import replace
 
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPLayout,
@@ -311,8 +318,9 @@ def test_query_visibility_full_refresh_reuses_storage(device, queries):
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("block_size", [64, 128])
 def test_verify_query_lengths_cross_ownership_boundaries(device, block_size):
-    from tokenspeed.runtime.layers.attention.dcp.metadata import dcp_query_lengths
-
+    """A verify window's per-query endpoints, fed through the layout's
+    ``visible_lens``, map to the owned-token counts a brute-force scan of the
+    cyclic placement gives, across kernel-page and ownership-block edges."""
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
     blocks = torch.tensor([[2, 5, 8], [0, 0, 0]], dtype=torch.int32, device=device)
@@ -320,18 +328,12 @@ def test_verify_query_lengths_cross_ownership_boundaries(device, block_size):
     pages = (
         blocks[..., None] * subpages + torch.arange(subpages, device=device)
     ).reshape(2, -1)
+    offsets = torch.arange(-5, 1, dtype=torch.int32, device=device)
     for length in (1, block_size - 1, block_size + 2, 2 * block_size + 1):
         lens = torch.tensor([length, 0], dtype=torch.int32, device=device)
+        causal = (lens[:, None] + offsets).clamp_min(0)
+        noncausal = lens[:, None].expand(-1, 6).contiguous()
         for rank in range(4):
-            metadata = refresh_dcp_page_table_metadata(
-                page_table=pages,
-                virtual_block_count=10,
-                degree=4,
-                rank=rank,
-                layout=CompactDCPLayout(lens, 64, block_size),
-                previous=None,
-            )
-            actual = dcp_query_lengths(metadata, lens, query_width=6, causal=True)
             expected = [
                 sum(
                     (int(blocks[0, t // block_size]) - 1) % 4 == rank
@@ -339,6 +341,14 @@ def test_verify_query_lengths_cross_ownership_boundaries(device, block_size):
                 )
                 for i in range(6)
             ]
-            assert actual.tolist() == [expected, [0] * 6]
-            noncausal = dcp_query_lengths(metadata, lens, query_width=6, causal=False)
-            assert noncausal.tolist() == [[expected[-1]] * 6, [0] * 6]
+            for visible, rows in ((causal, expected), (noncausal, [expected[-1]] * 6)):
+                metadata = refresh_dcp_page_table_metadata(
+                    page_table=pages,
+                    virtual_block_count=10,
+                    degree=4,
+                    rank=rank,
+                    layout=CompactDCPLayout(lens, 64, block_size, visible),
+                    previous=None,
+                )
+                assert metadata.local_visible_lens.tolist() == [rows, [0] * 6]
+                assert metadata.local_seq_lens.tolist() == [expected[-1], 0]

@@ -1321,9 +1321,16 @@ KVP does not make unsupported kernels portable. Speculative decoding runs
 on sharded caches: `OrdinaryRecipe.groups()` shards a draft group like the
 target's, and the DeepSeek V4 and Kimi K3 recipes shard with their draft
 layers in the compressed-KV chains and the MLA history group respectively,
-each subject to its backend's `AttnConfig` gate. FlashMLA verify maps each
-query's causal bound to a local length (`dcp_query_lengths`) and runs one
-kernel row per query; GPU DSA selects causal Top-K before mapping cache slots.
+each subject to its backend's `AttnConfig` gate. A verify window's queries
+end at different global positions, and the kernel's multi-query causal mask
+would subtract a query's global offset from a *local* length, so FlashMLA
+and CuTe MLA feed every query's global endpoint through the compact layout
+(`CompactDCPLayout.visible_lens` -> `local_visible_lens`, one owned-page
+prefix lookup per query, refreshed in place with the table and by the
+drafter's seq_lens hooks) and FlashMLA runs one kernel row per query against
+its local length. Known cost: a width-`w` FlashMLA verify under KVP issues
+`bs * w` single-query rows and reads each request's owned pages `w` times
+instead of once. GPU DSA selects causal Top-K before mapping cache slots.
 Non-causal DSA block drafts remain unsupported (`AttnConfig` rejects
 `draft_block_decode` under GPU DSA KVP).
 
