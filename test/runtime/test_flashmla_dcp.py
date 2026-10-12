@@ -339,14 +339,19 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
 
     from cache_pool_test_utils import make_arena, make_mla_memory_plan, plan_group_specs
 
+    from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
     from tokenspeed.runtime.layers.attention.backends.paged import flashmla
-    from tokenspeed.runtime.layers.attention.dcp.cache import gather_mla_history
+    from tokenspeed.runtime.layers.attention.dcp import cache as dcp_cache
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        plan_prefix_history_gather,
+    )
     from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
     from tokenspeed.runtime.layers.attention.kv_cache import mla
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
+    from tokenspeed.runtime.utils.env import global_server_args_dict
 
     plan = make_mla_memory_plan(
         size=8,
@@ -440,24 +445,63 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     assert "kvp_group" not in vars(pool)
     assert "kvp_rank" not in vars(pool)
 
-    def gather_owner_rows(local, group):
-        assert group == (0, 1)
-        torch.testing.assert_close(local[0], values[0].float())
-        assert not local[1].any()
-        torch.testing.assert_close(local[2], values[2].float())
-        return values.float()
-
-    from tokenspeed.runtime.layers.attention.dcp import comm
-
-    monkeypatch.setattr(comm, "all_reduce", gather_owner_rows)
-    nope, rope = gather_mla_history(
-        pool,
-        layer,
-        loc,
-        dst_dtype=torch.float32,
+    # One request whose three rows sit on pages of virtual blocks 1, 2, 3:
+    # rank 0 owns rows 0 and 2, rank 1 owns row 1.
+    (window,) = plan_prefix_history_gather(
+        [loc],
+        page_table_cpu=torch.tensor([[4, 8, 12]], dtype=torch.int32),
+        prefix_lens_cpu=torch.tensor([3]),
+        chunk_len=3,
+        page_size=1,
         placement=backend.cache_placement(layer),
     )
-    torch.testing.assert_close(torch.cat((nope, rope), dim=-1), values.float())
+    assert window.owned_rows_per_rank == (2, 1)
+    assert window.send_rows == 2
+    assert window.gathered_index.tolist() == [0, 2, 1]
+    assert window.fetch_slots.tolist() == [4, 8]
+    assert window.loop_bounds == (0, 3)
+
+    class OwnerRows:
+        """Rank 0's view of the all-gather: rank 1 owns row 1."""
+
+        def all_gather_single_async(self, gathered, send, group):
+            assert group == (0, 1)
+            row_bytes = values.view(torch.uint8).view(3, 1, -1)
+            torch.testing.assert_close(send, row_bytes[[0, 2]], rtol=0, atol=0)
+            gathered[:2] = send
+            gathered[2] = row_bytes[1]
+            # Rank 1's padding row is never read.
+            gathered[3] = 0xFF
+            return SimpleNamespace(wait=lambda: None)
+
+    # The leaf's prefill metadata prepares the prefix it reads back; the
+    # gathers run on the named KVP history groups.
+    monkeypatch.setattr(
+        dcp_cache,
+        "get_global_backend",
+        lambda: SimpleNamespace(
+            for_named_groups={KVP_HISTORY_GROUP_NAME: OwnerRows()}.__getitem__
+        ),
+    )
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 3)
+    backend.kernel_page_size = 1
+    backend._prefix_history = None
+    loops = [loc]
+    backend._prepare_prefix_history(
+        loops,
+        page_table_cpu=torch.tensor([[4, 8, 12]], dtype=torch.int32),
+        prefix_lens_cpu=torch.tensor([3]),
+    )
+    ((nope, rope),) = backend.read_prefix_history(
+        pool, layer, loops, dst_dtype=torch.float32
+    )
+    torch.testing.assert_close(
+        torch.cat((nope, rope), dim=-1), values.float(), rtol=0, atol=0
+    )
+    # A sharded leaf never falls back to reading its own rows alone.
+    backend._prefix_history = None
+    with pytest.raises(NotImplementedError, match="prepared no prefix read"):
+        backend.read_prefix_history(pool, layer, loops, dst_dtype=torch.float32)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -586,33 +630,6 @@ def test_kimi_capacity_fits_physical_parents_with_state_reservations(degree):
         spec.shard_count == (degree if spec.group_id == "full_attention" else 1)
         for spec, _ in groups
     )
-
-
-@pytest.mark.parametrize("shape", [(3, 4), (3, 1, 8)])
-@pytest.mark.parametrize("group", [(0,), (0, 1)])
-def test_gather_owned_rows_masks_nan_and_preserves_order(monkeypatch, shape, group):
-    from tokenspeed.runtime.layers.attention.dcp import comm
-
-    values = torch.arange(
-        torch.tensor(shape).prod().item(), dtype=torch.float32
-    ).reshape(shape)
-    values[1] = float("nan")
-    owned = torch.tensor([True, False, True])
-    expected = values.clone()
-    expected[1] = 0
-
-    def reduce(rows, actual_group):
-        assert actual_group == group
-        torch.testing.assert_close(rows, expected)
-        rows[1] = 42
-        return rows
-
-    monkeypatch.setattr(comm, "all_reduce", reduce)
-    result = comm.gather_owned_rows(values, owned, group)
-    if len(group) > 1:
-        expected[1] = 42
-    torch.testing.assert_close(result, expected)
-    assert result.is_contiguous()
 
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])

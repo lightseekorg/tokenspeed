@@ -24,6 +24,7 @@ import torch
 
 from tokenspeed.runtime.distributed.comm_backend import set_global_backend
 from tokenspeed.runtime.distributed.comm_backend.emulated import EmulatedRankBackend
+from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -196,6 +197,12 @@ class DistributedInitializer:
         # group of one still is. init_process_group is idempotent and handles
         # size 1.
         pg_manager.init_process_group(config.mapping.attn.kvp_group)
+        if config.mapping.attn.has_kvp:
+            pg_manager.init_process_group(
+                config.mapping.attn.kvp_group,
+                backend=backend,
+                name=KVP_HISTORY_GROUP_NAME,
+            )
         # The query-context-parallel group of a sharded extend; equal to the
         # attention TP group while qcp == tp, so this is idempotent there.
         pg_manager.init_process_group(config.mapping.attn.qcp_group)

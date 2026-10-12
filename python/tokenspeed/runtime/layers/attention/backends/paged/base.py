@@ -35,6 +35,7 @@ groups existed, minus the scheduler-table gather the router now performs.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +49,8 @@ from tokenspeed.runtime.layers.attention.backends.support import (
     CudaGraphSupport,
     TreeSupport,
 )
+from tokenspeed.runtime.layers.attention.chunk import prefix_chunk_len
+from tokenspeed.runtime.layers.attention.dcp.cache import PrefixHistoryGather
 from tokenspeed.runtime.utils.common import ceil_div
 
 if TYPE_CHECKING:
@@ -151,6 +154,9 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self.tree_draft: TreeDraftInputs | None = None
         # Draft-tree verify: committed keys per request, the cascade's prefix.
         self.tree_prefix_lens_buf: torch.Tensor | None = None
+        # A cache dealt over owners: the prefill reads of its cached prefix,
+        # from the first _prepare_prefix_history; None reads this rank's cache.
+        self._prefix_history: PrefixHistoryGather | None = None
 
     def tree_support(self) -> TreeSupport:
         name = type(self).__name__
@@ -222,6 +228,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         self.seq_lens_buf = None
         self.tree_prefix_lens_buf = None
         self._decode_views_by_bs = {}
+        # Its gathers read the previous pool's layers.
+        self._prefix_history = None
 
     def configure_runtime(self, **kwargs) -> None:
         """Post-load configuration hook (e.g. sliding window sizes)."""
@@ -339,10 +347,12 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
                 :func:`reject_query_shard`.
             page_table_cpu: Host mirror of ``page_table``'s extend rows
                 (``[num_extends, cols]`` int32 kernel pages, unpadded) when the
-                forward is sharded, else ``None``. The only host-side table a
-                leaf sees: the sharded extend arm counts how many history rows
-                each page owner holds from it, so the gather's per-rank split
-                never waits on the device.
+                forward is sharded, or when it extends a prefix and this leaf's
+                group is KVP page-sharded; else ``None``. The only host-side
+                table a leaf sees: the sharded extend arm and the KVP
+                prefix-chunk gather count how many history rows each page owner
+                holds from it, so the gather's per-rank split never waits on the
+                device.
         """
 
     @abstractmethod
@@ -490,4 +500,70 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         """DeepSeek's chunked prefix replay (MLA family); others never call it."""
         raise NotImplementedError(
             f"{type(self).__name__} has no chunked prefix-replay prefill"
+        )
+
+    def _prepare_prefix_history(
+        self,
+        chunk_kv_indices_list: Sequence[torch.Tensor],
+        *,
+        page_table_cpu: torch.Tensor | None,
+        prefix_lens_cpu: torch.Tensor,
+    ) -> None:
+        """Record a prefill forward's prefix-chunk loops for
+        :meth:`read_prefix_history`.
+
+        A leaf declaring ``supports_mla_dcp`` calls this from its prefill metadata
+        init with the loops it cut (``chunk.build_chunked_prefill_metadata_arrays``);
+        while its cache is local this does nothing.
+
+        Args:
+            chunk_kv_indices_list: Each loop's ``[rows]`` virtual slots.
+            page_table_cpu: ``[requests, columns]`` host kernel-page table of
+                the extend requests; required when the cache is dealt over
+                owners and there are loops.
+            prefix_lens_cpu: ``[requests]`` host cached-prefix lengths of the
+                requests the loops were cut for.
+        """
+        if self._prefix_history is None:
+            # A leaf deals every layer's pages the same way.
+            placement = self.cache_placement(None)
+            if placement is None:
+                return
+            self._prefix_history = PrefixHistoryGather.on_history_groups(
+                placement, page_size=self.kernel_page_size
+            )
+        self._prefix_history.prepare(
+            chunk_kv_indices_list,
+            page_table_cpu=page_table_cpu,
+            prefix_lens_cpu=prefix_lens_cpu,
+            chunk_len=prefix_chunk_len(len(prefix_lens_cpu)),
+        )
+
+    def read_prefix_history(
+        self,
+        pool: CachePool,
+        layer: PagedAttention,
+        chunk_kv_indices_list: Sequence[torch.Tensor],
+        *,
+        dst_dtype: torch.dtype,
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """The latent and RoPE keys of ``layer`` at every prefix-chunk loop's
+        virtual slots (``chunked_prefill_metadata``), one pair per loop in
+        loop order, for DeepSeek's chunked prefix replay (MLA family).
+
+        A local cache is read in place; one dealt over owners is gathered
+        from them as :meth:`_prepare_prefix_history` recorded.
+        """
+        if self._prefix_history is not None:
+            return self._prefix_history.read(
+                pool, layer, chunk_kv_indices_list, dst_dtype=dst_dtype
+            )
+        if self.cache_placement(layer) is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} deals history pages over owners but "
+                "prepared no prefix read (_prepare_prefix_history)"
+            )
+        return (
+            pool.get_mla_kv_buffer(layer, slots, dst_dtype)
+            for slots in chunk_kv_indices_list
         )

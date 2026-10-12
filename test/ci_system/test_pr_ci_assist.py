@@ -324,7 +324,11 @@ def test_plan_source_only_activates_for_current_open_pr(monkeypatch, tmp_path):
     assist.plan_source()
     assert result.read_text() == "active=false\n"
     result.write_text("")
-    pr.update(state="open", head={**pr["head"], "sha": "c" * 40})
+    pr.update(state="open", base={**pr["base"], "ref": "feature"})
+    assist.plan_source()
+    assert result.read_text() == "active=false\n"
+    result.write_text("")
+    pr.update(base={**pr["base"], "ref": "main"}, head={**pr["head"], "sha": "c" * 40})
     assist.plan_source()
     assert result.read_text() == "active=false\n"
     result.write_text("")
