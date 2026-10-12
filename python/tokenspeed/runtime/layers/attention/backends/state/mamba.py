@@ -1748,6 +1748,11 @@ class MambaAttnBackend(AttentionBackend):
                 query_start_loc=query_start_loc,
                 prefill_metadata=self.forward_metadata.conv_prefill_metadata,
             ).transpose(0, 1)[:seq_len]
+            if extend_seq_lens_cpu is not None:
+                # The convolution allocates its output uninitialized and gives
+                # the padded rows no work, so the rows a capacity scan reads
+                # past the live tokens are zeroed again here.
+                self.forward_metadata.scrub_padding(mixed_qkv)
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size

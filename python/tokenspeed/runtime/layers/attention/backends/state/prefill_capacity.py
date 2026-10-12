@@ -190,8 +190,8 @@ def _refresh_capacity_metadata(target, source):
     target.query_start_loc[: actual_bs + 1].copy_(source.query_start_loc)
     target.query_start_loc[actual_bs + 1 :].fill_(live_total)
     # The scan needs a positive length per slot: each unused slot scans one
-    # padding row past the live tokens (zeroed by ``scrub_padding``; its
-    # output row and final state are dropped).
+    # padding row past the live tokens (zeroed by ``scrub_padding`` before
+    # and after the convolution; its output row and final state are dropped).
     for name in (
         "scan_query_start_loc",
         "query_start_loc_int64",
