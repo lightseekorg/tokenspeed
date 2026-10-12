@@ -18,7 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shim registering the AMD GFX950 Gluon QSA sparse attention kernel."""
+"""Shims for the AMD GFX950 Gluon QSA kernels.
+
+Sparse attention registers for kernel selection. The indexer's block scoring
+and top-k selection are called by ``qwen4_exp_qsa_block_topk`` on GFX950.
+"""
 
 from __future__ import annotations
 
@@ -33,8 +37,13 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.qsa import (
+        launch_gluon_qsa_block_scores_gfx950,
+        launch_gluon_qsa_block_topk_select_gfx950,
         launch_gluon_qsa_sparse_attention_gfx950,
     )
+
+    gluon_qsa_block_scores_gfx950 = launch_gluon_qsa_block_scores_gfx950
+    gluon_qsa_block_topk_select_gfx950 = launch_gluon_qsa_block_topk_select_gfx950
 
     @register_kernel(
         "attention",
@@ -65,6 +74,10 @@ if current_platform().is_amd:
     def gluon_qsa_sparse_attention_gfx950(*args, **kwargs):
         return launch_gluon_qsa_sparse_attention_gfx950(*args, **kwargs)
 
-    __all__ = ["gluon_qsa_sparse_attention_gfx950"]
+    __all__ = [
+        "gluon_qsa_block_scores_gfx950",
+        "gluon_qsa_block_topk_select_gfx950",
+        "gluon_qsa_sparse_attention_gfx950",
+    ]
 else:
     __all__ = []

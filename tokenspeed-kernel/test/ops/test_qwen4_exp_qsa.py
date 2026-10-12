@@ -973,13 +973,13 @@ def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
     table[1].zero_()
     complete[-widths[-1] :].zero_()
     scores = []
-    select = qsa_ops.triton_topk_from_logits
+    select = qsa_ops._topk_from_logits
 
     def record_scores(logits, topk, *, enable_pdl):
         scores.append(logits)
         return select(logits, topk, enable_pdl=enable_pdl)
 
-    monkeypatch.setattr(qsa_ops, "triton_topk_from_logits", record_scores)
+    monkeypatch.setattr(qsa_ops, "_topk_from_logits", record_scores)
     selected = []
     for width in (queries_per_request, None):
         selected.append(
@@ -1098,13 +1098,13 @@ def test_qwen4_exp_qsa_long_query_groups_match_independent_rows(
     complete = torch.arange(rows, device=device, dtype=torch.int32) % 577
     complete[width : width + 64] = 0
     scores = []
-    selector = qsa_ops.triton_topk_from_logits
+    selector = qsa_ops._topk_from_logits
 
     def record(logits, topk, *, enable_pdl):
         scores.append(logits)
         return selector(logits, topk, enable_pdl=enable_pdl)
 
-    monkeypatch.setattr(qsa_ops, "triton_topk_from_logits", record)
+    monkeypatch.setattr(qsa_ops, "_topk_from_logits", record)
     selected = []
     for query_width in (width, None):
         selected.append(
@@ -1261,6 +1261,7 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
         out.fill_(7)
 
     monkeypatch.setattr(qsa_ops, "_is_nvidia", True)
+    monkeypatch.setattr(qsa_ops, "_use_gluon_block_topk", False)
     monkeypatch.setattr(qsa_ops, "has_ragged_decode_topk", lambda: True)
     monkeypatch.setattr(qsa_ops, "ragged_decode_topk", fake_radix_topk)
     monkeypatch.setattr(

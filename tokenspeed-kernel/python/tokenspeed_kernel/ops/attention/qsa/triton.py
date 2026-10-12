@@ -38,6 +38,13 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _is_nvidia = current_platform().is_nvidia
+# GFX950 scores and selects QSA blocks with Gluon kernels.
+_use_gluon_block_topk = current_platform().is_cdna4
+if _use_gluon_block_topk:
+    from tokenspeed_kernel.ops.attention.qsa.gluon import (
+        gluon_qsa_block_scores_gfx950,
+        gluon_qsa_block_topk_select_gfx950,
+    )
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
 LOG2E = math.log2(math.e)
 
@@ -1857,7 +1864,8 @@ def _qwen4_exp_qsa_block_topk_logits(
     """Materialized path: score every block to FP32, then radix-select.
 
     Writes the ``[rows, num_blocks]`` score matrix (blocks at or beyond
-    ``complete_blocks`` are ``-inf``). On NVIDIA, a valid caller-owned
+    ``complete_blocks`` are ``-inf``). GFX950 scores and selects with Gluon
+    kernels that need no query grouping. On NVIDIA, a valid caller-owned
     workspace routes selection through the length-aware persistent CUDA radix
     kernel; ``complete_blocks`` prevents the selector from rescanning
     graph-padded columns. Other platforms and direct callers without a
@@ -1867,8 +1875,18 @@ def _qwen4_exp_qsa_block_topk_logits(
 
     rows = query.shape[0]
     num_blocks = page_table.shape[1] * page_size
-    logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
     use_pdl = _is_nvidia and enable_pdl
+    if _use_gluon_block_topk:
+        logits = gluon_qsa_block_scores_gfx950(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            page_size=page_size,
+        )
+        return _topk_from_logits(logits, block_topk, enable_pdl=use_pdl)
+    logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     block_h = triton.next_power_of_2(query.shape[1])
     # Long uniform runs reuse K across 32 queries. With four index heads this
@@ -1933,7 +1951,22 @@ def _qwen4_exp_qsa_block_topk_logits(
             max_seq_len=num_blocks,
         )
         return selected
-    return triton_topk_from_logits(logits, block_topk, enable_pdl=use_pdl)
+    return _topk_from_logits(logits, block_topk, enable_pdl=use_pdl)
+
+
+def _topk_from_logits(
+    logits: torch.Tensor, topk: int, *, enable_pdl: bool
+) -> torch.Tensor:
+    """Select per-row top-k block ids from materialized FP32 scores.
+
+    GFX950 uses the Gluon radix select (ids in increasing order); other
+    platforms the portable selection (ids by decreasing score). Both keep the
+    smaller id among equal scores, so the selected sets agree.
+    """
+
+    if _use_gluon_block_topk:
+        return gluon_qsa_block_topk_select_gfx950(logits, topk)
+    return triton_topk_from_logits(logits, topk, enable_pdl=enable_pdl)
 
 
 def qwen4_exp_qsa_block_topk(
