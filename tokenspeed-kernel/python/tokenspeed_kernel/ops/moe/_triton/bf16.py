@@ -435,5 +435,13 @@ def _moe(
         round_intermediates,
     )
     output = torch.empty_like(x)
-    _combine(route_output, topk_weights, output, round_intermediates, output_scale)
+    _combine(
+        route_output,
+        topk_weights,
+        output,
+        None,
+        0,
+        round_weighted_routes=round_intermediates,
+        output_scale=output_scale,
+    )
     return output

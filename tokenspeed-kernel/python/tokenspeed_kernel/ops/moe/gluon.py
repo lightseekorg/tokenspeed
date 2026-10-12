@@ -717,12 +717,8 @@ if platform.is_amd:
             intermediate,
             route_output,
         )
-        # Expert programs skip ids outside this rank; those rows stay uninitialized.
-        invalid = (validated_ids < 0) | (validated_ids >= num_experts)
-        route_output.view(invalid.shape[0], invalid.shape[1], -1).masked_fill_(
-            invalid.unsqueeze(-1), 0
-        )
-        _combine(route_output, validated_weights, output)
+        # Expert programs skip ids outside this rank and leave those rows unset.
+        _combine(route_output, validated_weights, output, validated_ids, num_experts)
         return output
 
 

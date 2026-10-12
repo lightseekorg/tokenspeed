@@ -445,7 +445,7 @@ def _triton_fp8_channel_moe_impl(
         num_warps=config["fc2_warps"],
         num_stages=config["fc2_stages"],
     )
-    _combine(route_output, topk_weights, output)
+    _combine(route_output, topk_weights, output, None, 0)
     return output
 
 
