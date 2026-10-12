@@ -56,10 +56,11 @@ CacheGroupConfig Sliding(const std::string& id, std::int32_t block_granularity, 
     };
 }
 
-CacheGroupConfig State(const std::string& id, std::int32_t block_granularity, std::int32_t packing) {
+// A State group declares no token span: two slots per request.
+CacheGroupConfig State(const std::string& id, std::int32_t packing) {
     return CacheGroupConfig{
         .group_id = id,
-        .block_granularity = block_granularity,
+        .block_granularity = 0,
         .cache_blocks_per_lcm_block = packing,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::State,
@@ -105,9 +106,9 @@ std::vector<SchedulerConfig> Sweep() {
     std::vector<SchedulerConfig> configs;
     const std::vector<std::vector<CacheGroupConfig>> group_sets = {
         {Full("full", 4, 1)},
-        {Full("full", 4, 2), State("state", 2, 1)},
+        {Full("full", 4, 2), State("state", 1)},
         {Full("full", 4, 3), Sliding("swa", 4, 5, 1), Sliding("tail", 2, 9, 2)},
-        {Sliding("swa", 4, 3, 1), State("state", 4, 1)},
+        {Sliding("swa", 4, 3, 1), State("state", 1)},
     };
     for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
         for (const std::int32_t chunk_tokens : {4, 8, 9, 16}) {
@@ -175,7 +176,7 @@ TEST(CapacityModelTest, ConcurrentDemandCoversEveryAdmissibleSingleRequest) {
 
 TEST(CapacityModelTest, ConcurrentDemandByRetention) {
     SchedulerConfig cfg = SizingConfig(Role::kFused, 64, 8192, /*decode_width=*/4, /*overlap_depth=*/1, false,
-                                       {Full("full", 64, 12), State("state", 64, 1), Sliding("swa", 64, 128, 3)});
+                                       {Full("full", 64, 12), State("state", 1), Sliding("swa", 64, 128, 3)});
     cfg.max_batch_size = 16;
     const CapacityModel model{cfg};
     const std::vector<std::int64_t> pages =
@@ -184,17 +185,18 @@ TEST(CapacityModelTest, ConcurrentDemandByRetention) {
     // Dense history, plus per request one unaligned tail page that the four
     // protected tokens may spill past: 1024 + 16 * ceil(67 / 64).
     EXPECT_EQ(pages[0], 1024 + 16 * 2);
-    // A state request peaks at the retained input checkpoint, the aligned
-    // checkpoint, and 1 + ceil((63 + max(64, 8)) / 64) suffix/growth blocks,
-    // whatever its history: four blocks, once per live request.
-    EXPECT_EQ(model.SingleRequestGroupPages(4096)[1], 4);
-    EXPECT_EQ(pages[1], 16 * 4);
+    // A State group is two slots per request -- the checkpoint the next
+    // forward reads and the block it writes -- whatever its history.
+    EXPECT_EQ(model.SingleRequestGroupPages(4096)[1], 2);
+    EXPECT_EQ(model.SingleRequestGroupPages(0)[1], 0);
+    EXPECT_EQ(pages[1], 16 * 2);
     // Each request retains ceil((127 + 4 + 4 + 63) / 64) window pages; one
     // in-flight chunk adds ceil(127 / 64) lookback pages and 8192 / 64 rows.
     EXPECT_EQ(pages[2], 16 * 4 + 2 + 128);
 
-    // The prefill role banks no decode growth: the state peak drops the
-    // reserve, and the full group's protected spill disappears.
+    // The prefill role protects no in-flight decode step: the full group's
+    // protected spill disappears; the State group's two slots hold on every
+    // role.
     SchedulerConfig prefill = cfg;
     prefill.role = Role::kP;
     for (CacheGroupConfig& group : prefill.cache_groups) {
@@ -203,12 +205,15 @@ TEST(CapacityModelTest, ConcurrentDemandByRetention) {
     }
     const std::vector<std::int64_t> prefill_pages = CapacityModel{prefill}.ConcurrentGroupPages(65536, 4096);
     EXPECT_EQ(prefill_pages[0], 1024 + 16 * 1);
-    EXPECT_EQ(prefill_pages[1], 16 * (1 + 1 + 1));
+    EXPECT_EQ(prefill_pages[1], 16 * 2);
+    SchedulerConfig decode = prefill;
+    decode.role = Role::kD;
+    EXPECT_EQ(CapacityModel{decode}.ConcurrentGroupPages(65536, 4096)[1], 16 * 2);
 }
 
 TEST(CapacityModelTest, FoldsGroupPagesIntoLcmBlocksByPacking) {
     const SchedulerConfig cfg =
-        SizingConfig(Role::kFused, 64, 8192, 1, 0, false, {Full("full", 64, 12), State("state", 64, 1)});
+        SizingConfig(Role::kFused, 64, 8192, 1, 0, false, {Full("full", 64, 12), State("state", 1)});
     const CapacityModel model{cfg};
     EXPECT_EQ(model.NumGroups(), 2);
     const std::vector<std::int64_t> pages{25, 3};

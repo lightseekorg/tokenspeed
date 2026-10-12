@@ -190,6 +190,9 @@ private:
     // is Prefetching; it is considered again once the fill landed), or
     // neither (feedback says whether capacity was the reason).
     struct FirstChunkOutcome {
+        // The D role: every State group's prompt-end checkpoint was claimed,
+        // so the peer omits the state transfer (PrefillOperation::state_prefix_cached).
+        bool state_prefix_cached{false};
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
         bool prefetching{false};
     };
@@ -281,7 +284,7 @@ private:
         // Budget the decode batch must leave untouched for a pending local
         // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
         // fused mixed mode only).
-        std::int32_t state_prefill_reserve{0};
+        std::int32_t pending_prefill_reserve{0};
         bool pushed_prefill{false};
         bool pushed_decode{false};
         bool Full(std::int32_t max_batch_size) const {

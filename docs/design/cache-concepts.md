@@ -21,9 +21,10 @@ Two quantities anchor the vocabulary:
   one chain hash per page of this many tokens. A reuse boundary `T` is any
   token count at which some request published its state: every multiple of
   `prefix_granularity` a request completed, plus the **tails** it published
-  at its prompt end and at its finish (`hash@T`, the same chained hash over
-  the page's first `T mod P` tokens). Two requests share cache below the
-  longest published boundary that is a prefix of both.
+  wherever it stopped writing — its prompt end, a junction cut, its finish or
+  retraction (`hash@T`, the same chained hash over the page's first `T mod P`
+  tokens). Two requests share cache below the longest published boundary that
+  is a prefix of both.
 * **`block_granularity`** — the number of tokens covered by one block-table
   slot (one `CacheBlock`) of a `history` group. This is the unit in which
   family-agnostic code (admission, capacity planning, PD slot selection)
@@ -403,9 +404,9 @@ is **split by publishability** (the C++ coordinator's `TakeImage` decides per
 slot; `scheduler.md` §2 and §4 describe the FSM side):
 
 * the **bulk** — every block the group publishes: those under a
-  hash-complete prefix page, the partial last page and the live state block
-  the retraction publishes as a tail, like a finish does — goes to Host L2
-  as today's stream-ordered retraction store (`WriteBackOp`,
+  hash-complete prefix page, plus the partial last page and the live state
+  block the retraction publishes as a tail, like a finish does — goes to Host
+  L2 as today's stream-ordered retraction store (`WriteBackOp`,
   `source_pinned=false`), and the `Retracted` request pins those Host
   entries until it is restored. The entries stay published, so other
   requests may hit them; they are merely unevictable for that span, so L2's
@@ -413,9 +414,9 @@ slot; `scheduler.md` §2 and §4 describe the FSM side):
   copy of it. A published block is never written again, so the restore
   copies the victim's tail blocks into fresh blocks instead of claiming them;
 * the **tail** — every block of a group L2 never holds (a drafter-private
-  group, a replayable group's private pages, a state group's input block
-  when nothing published it) and the request's slot-state blob — goes
-  to the **retraction snapshot pool**: a small, request-private, pinned pool
+  group, a replayable group's private pages, a state group's unpublished
+  slot 0, a partial page the index did not take) and the request's slot-state
+  blob — goes to the **retraction snapshot pool**: a small, request-private, pinned pool
   sized like the Host L2 tier (an explicit `--retraction-snapshot-host-gb`,
   else `--retraction-snapshot-ratio` of the Device KV, else derived: by
   default one tail per retractable request, `cache/l2/sizing.py`), never
@@ -581,14 +582,21 @@ Perception rules per directory:
   existing block for reuse; registration neither allocates nor copies physical
   storage.
 * **`PrefixMatcher`** (`prefix_matcher.h`) — the per-attention-kind match
-  policy, extracted from the old manager subclasses. `FullAttnMatcher` walks
-  left-to-right until the first miss (prefix-closed); `SwaMatcher` scans
-  right-to-left for a run backing a resumable boundary (non-closed). Mamba
-  needs no matcher of its own: it is `SwaMatcher` at window 2 — "keep the
-  live state page plus its snapshot". `Probe` takes the L3 hit set as a
-  required argument (`nullptr` when storage is unset) so Host-only matching
-  cannot be selected by omitting it. A matcher only *reads* the group's
-  index; it never touches allocation or physical placement.
+  policy. `FullAttnMatcher` walks left-to-right until the first miss
+  (prefix-closed); `SwaMatcher` scans right-to-left for a run backing a
+  resumable boundary (non-closed); `StateMatcher` answers one key per
+  boundary — a state checkpoint is a single block under the key of its token
+  count, with no run behind it. `Probe` takes the L3 hit set as a required
+  argument (`nullptr` when storage is unset) so Host-only matching cannot be
+  selected by omitting it. A matcher only *reads* the group's index; it never
+  touches allocation or physical placement.
+* **`TailTable`** (`tail_table.h`) — the per-group index of published tails:
+  under the chain hash of the last full page (the *prior*), the `(T mod P,
+  hash@T)` pairs published so far, newest last, capped at
+  `kMaxTailsPerPrior` (8) with a counter of the drops
+  (`Scheduler.tail_cap_evictions`). The probe enumerates it to find the
+  candidate boundaries inside a page; eviction of a tail's block removes its
+  entry.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 
@@ -608,9 +616,9 @@ The conversion is `GroupGeometry` in the coordinator layer:
   bookkeeping values the manager stores verbatim; the manager executes the
   plan without deriving anything.
 * `ExpiredBlocksAt(spec, num_computed_tokens)` is the retention *policy*
-  (full attention never expires; SWA and Mamba-at-window-2 slide out whole
-  pages); the manager only *executes* the resulting block count. This is
-  what dissolved the old `SwaManager`/`MambaStateManager` subclasses.
+  (full attention never expires; SWA slides whole pages out; a State group
+  has no token span and never expires — its two slots turn over by
+  `StateStep`); the manager only *executes* the resulting block count.
 
 Where reclaim needs to know whether a block is still cached, it takes the
 group's `PrefixCacheIndex` as an explicit read-only parameter — the
@@ -690,11 +698,14 @@ Its responsibilities:
   mid-page never leaves a half-fetched prefix page — and the request waits in
   `fsm::Prefetching` for the fill (see `scheduler.md` §1) before it is admitted
   as an ordinary Host hit.
-  `ProbeDecodeDevicePrefix` is the PD-decode variant: local history
-  pages are reused while final-state groups are restored from the remote
-  endpoint snapshot. Its tail phase leaves the partial block a hole: the
-  peer's transfer starts at the block containing `hit_tokens` and fills a
-  fresh page whole, so the D role never copies it.
+  `ProbeDecodeDevicePrefix` is the PD-decode variant: local history pages
+  are reused, and of a State group's checkpoints only the one at exactly the
+  prompt end counts (`PrefixProbe::state_at_prompt_end`, claimed as slot 0
+  so the peer omits the state transfer; any shorter checkpoint is ignored,
+  since this node runs no prefill that could continue from it). Its tail
+  phase leaves the partial block a hole: the peer's transfer starts at the
+  block containing `hit_tokens` and fills a fresh page whole, so the D role
+  never copies it ([Scheduler §3.2](scheduler.md#32-d--decode-worker)).
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
   per group says what that group needs for the round ahead: an extent and a
@@ -726,7 +737,7 @@ Its responsibilities:
   publish without admitting.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
   computed blocks into the prefix indexes for later requests. Prefix-closed
-  groups match first; non-closed groups (SWA, Mamba) match only within the
+  groups match first; non-closed groups (SWA, State) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
   A publication point is the request's computed frontier `T`
   (`Request::NumComputedTokens()`); when `T` is not a multiple of
@@ -754,10 +765,14 @@ Its responsibilities:
   only drops the op's pins. L3 objects become Host entries at the prefetch's
   ACK (`CompletePrefetch` -> `CacheHostBlock`), before any admission sees
   them, so there is no mixed Host/L3 hash to special-case.
-  For Mamba-state groups, `CacheCompletedBlocks` publishes only explicitly
-  listed materialized boundaries inside the newly hashed range; an empty list
-  publishes no state snapshots (see
-  [Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)).
+  A State group publishes its slot 1 — the state after exactly `T` tokens —
+  under the same key as the KV at `T` (the chain hash of the last page, or
+  `hash@T` for a tail), and only at a point where the owner stops writing it
+  (`CompletedPages::publish_state`: a prompt end, a junction cut, finish,
+  retraction); a chunk end or decode step publishes no state (see
+  [Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
+  Evicting a History block under a chain hash evicts the state checkpoints
+  under that hash as well, so a state never outlives the KV it continues.
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
@@ -767,16 +782,15 @@ Its responsibilities:
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
-  acquire/contains/pin queries. During prefill, each completed scheduling
-  boundary queues all newly published full-attention pages and any published
-  Endpoint/Promoted state checkpoints; the candidates are merged into a batched
-  writeback. The first decode admission from `PrefillDone` applies the same
-  policy to the final prompt boundary. Ordinary decode publishes history-cache
-  Device entries but no state entries; full-attention pages do not stream to
-  Host during decode. At finish, eligible non-state Device pages and the
-  newest existing prefill checkpoint per state group are queued before
-  request ownership is released. Ordinary sliding-window entries always
-  stream when published. The queue is drained by
+  acquire/contains/pin queries. During prefill, each chunk end queues the
+  full-attention pages it published; the prompt end (the first decode's
+  admission, or a junction cut) queues its tail and state checkpoint too;
+  the candidates are merged into a batched writeback. Ordinary decode
+  publishes history-cache Device entries but streams none of them and
+  publishes no state. At finish — and at the PD transfer ACK — every entry the
+  request published (pages, tail, state slot 1) is queued before request
+  ownership is released. Ordinary sliding-window entries always stream when
+  published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`, and every store it
   issues pins its Device sources until the ACK. A retraction does not use the
   queue: the scheduler publishes the victim's computed prefix the same way,
@@ -1245,8 +1259,8 @@ to the scheduler's own `CapacityModel` (`recipes/scheduler_bridge.py` →
 `csrc/scheduler/capacity_model.h`), whose `ConcurrentGroupPages` reports each
 group's demand at the configured concurrency and whose `LcmBlocksNeededFor`
 folds it by packing. The per-request working set — decode reservation,
-overlap-protected step, a state group's checkpoints and banked growth, a
-sliding group's lookback and resident window — is therefore defined once, in
+overlap-protected step, a State group's two slots, a sliding group's lookback
+and resident window — is therefore defined once, in
 C++, and the `Scheduler` bounds single requests against the pool with the
 same model (`docs/design/scheduler.md` §1.4). No recipe restates any of it.
 `scheduler_limits` is the single place a recipe reads the scheduler's
@@ -1583,8 +1597,9 @@ no known exception, and the exceptions that remain say so explicitly.
 
 `csrc/cache/prefix/` owns the concern: `prefix_index.h`
 (`PrefixCacheIndex`, the CacheKey → canonical CacheBlock index),
-`prefix_matcher.h` (`FullAttnMatcher`/`SwaMatcher` policy hierarchy; mamba is
-`SwaMatcher` at window 2), and `prefix_hasher.h` (moved from `scheduler/`).
+`prefix_matcher.h` (`FullAttnMatcher`/`SwaMatcher`/`StateMatcher` policy
+hierarchy), `tail_table.h` (the published tails under each last full page)
+and `prefix_hasher.h` (moved from `scheduler/`).
 `GroupAllocator` (`csrc/cache/allocator/`) is token-free physical placement
 only — `GroupGeometry` in the coordinator owns the token arithmetic — and
 `CacheGroup` pairs spec + allocator + matcher + index, the only place the

@@ -121,7 +121,7 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
         ),
         CacheGroupConfig(
             group_id="state",
-            block_granularity=64,
+            block_granularity=0,
             total_pages=4096,
             family=CacheGroupFamily.State,
         ),

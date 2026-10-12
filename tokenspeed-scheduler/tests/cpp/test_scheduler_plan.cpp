@@ -618,7 +618,7 @@ TEST_F(SchedulerTestSuite, SubmitRequestsValidatesWholeBatchBeforeInsertion) {
     EXPECT_NO_THROW(Submit(valid));
 }
 
-class HybridPrefixPromotionTestSuite : public SchedulerTestSuite {
+class HybridJunctionCutTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
@@ -628,6 +628,7 @@ protected:
             CacheGroupConfig state = cfg.cache_groups.front();
             state.group_id = "linear_attention_" + std::to_string(i);
             state.family = CacheGroupFamily::State;
+            state.block_granularity = 0;
             cfg.cache_groups.push_back(std::move(state));
         }
         SetTestSnapshotPool(cfg);
@@ -643,7 +644,11 @@ protected:
     }
 };
 
-TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) {
+// The seed publishes KV and state at its prompt end (11) only. The second
+// request shares the first 8 tokens: KV reaches 8, no state does, so its first
+// chunk is cut at the junction and publishes a state checkpoint there. The
+// third request then resumes from 8 in both families.
+TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint) {
     Submit(MakeHybridRequest("seed", 100));
     const ExecutionPlan seed_plan = PlanOnce();
     const ForwardBatch* seed = FindForwardBatch(seed_plan);
@@ -654,19 +659,19 @@ TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) 
     SendFinish("seed");
     PlanOnce();
 
-    Submit(MakeHybridRequest("promote", 200));
-    const ExecutionPlan promotion_plan = PlanOnce();
-    const ForwardBatch* promotion = FindForwardBatch(promotion_plan);
-    ASSERT_NE(promotion, nullptr);
-    ASSERT_EQ(promotion->request_ids, std::vector<std::string>{"promote"});
-    EXPECT_EQ(promotion->input_lengths, std::vector<std::int32_t>{8});
+    Submit(MakeHybridRequest("junction", 200));
+    const ExecutionPlan junction_plan = PlanOnce();
+    const ForwardBatch* junction = FindForwardBatch(junction_plan);
+    ASSERT_NE(junction, nullptr);
+    ASSERT_EQ(junction->request_ids, std::vector<std::string>{"junction"});
+    EXPECT_EQ(junction->input_lengths, std::vector<std::int32_t>{8});
     const ExecutionPlan remainder_plan = PlanOnce();
     const ForwardBatch* remainder = FindForwardBatch(remainder_plan);
     ASSERT_NE(remainder, nullptr);
     EXPECT_EQ(remainder->input_lengths, std::vector<std::int32_t>{3});
-    SendForwardDone("promote", {901});
+    SendForwardDone("junction", {901});
     PlanOnce();
-    SendFinish("promote");
+    SendFinish("junction");
     PlanOnce();
 
     Submit(MakeHybridRequest("reuse", 300));
@@ -675,6 +680,10 @@ TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) 
     ASSERT_NE(reuse, nullptr);
     ASSERT_EQ(reuse->request_ids, std::vector<std::string>{"reuse"});
     EXPECT_EQ(reuse->extend_prefix_lens, std::vector<std::int32_t>{8});
+    for (std::int32_t i = 0; i < 3; ++i) {
+        const auto& row = reuse->block_tables.at("linear_attention_" + std::to_string(i)).at(0);
+        EXPECT_GT(row.at(0), 0) << "the junction checkpoint is the chunk's input";
+    }
 }
 
 TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {

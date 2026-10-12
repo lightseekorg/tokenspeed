@@ -29,8 +29,8 @@
 namespace tokenspeed {
 
 // The per-request cache working-set model: the decode reservation, the
-// overlap-protected step, a snapshot-state group's checkpoints and banked
-// growth, a sliding group's lookback and resident window. Two callers must
+// overlap-protected step, a State group's two slots, a sliding group's
+// lookback and resident window. Two callers must
 // agree on it -- the Python recipes size a pool from it before any pool
 // exists, and the Scheduler bounds a single request against the pool they
 // sized -- so it lives here once and reads only SchedulerConfig fields that

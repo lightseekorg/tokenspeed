@@ -445,6 +445,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
     ++plan_calls_;
     ExecutionPlan plan;
+    // Every group is listed, empty or not, so the runtime indexes the maps
+    // without guarding for absent groups.
+    for (const std::string& group_id : cache_group_ids_) {
+        plan.pages_to_zero[group_id];
+        plan.pages_to_copy[group_id];
+    }
     BuiltOperations built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
 
     plan.With(ForwardBatch{std::move(built.forward)});

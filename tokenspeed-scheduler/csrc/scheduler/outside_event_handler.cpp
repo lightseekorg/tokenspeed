@@ -60,6 +60,12 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
+    // The transfer is done and the request leaves this engine: its computed
+    // frontier is final here, so it publishes like any finish -- the P's
+    // prompt-end state and partial page, the D's final state and tail.
+    if (auto store = publishCompletedPages(*request)) {
+        pending_write_back_operations_.push_back(std::move(*store));
+    }
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -106,7 +112,6 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
                                /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
     std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages) {
-        completed.completed_pages->boundary_kind = CacheBoundaryKind::kEndpoint;
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);
         coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), completed, progress.access_epoch);
         if (completed.completed_pages->tail) {
@@ -116,11 +121,9 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
+    // Every published entry of the request streams: its pages, its tail and
+    // the state checkpoint published with the frontier.
     coordinator_.QueueCachedBlocksForStore(store_hashes);
-    const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
-        std::min(progress.prefix_hashes.size(),
-                 static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));
-    coordinator_.QueueLatestSnapshotBlocksForStore(prefill_hashes);
     // The request's pages are released right after this (FinishEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);

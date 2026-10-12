@@ -80,9 +80,30 @@ public:
     }
 };
 
-// Sliding window (and, with window == 2, mamba state snapshots): non-closed --
-// shortening a match can cut its trailing run below the window, so match
-// bound-first.
+// A State group holds whole recurrent states at the boundaries requests
+// published them (prompt end, finish, retraction, a junction cut): one key per
+// boundary, no lookback, no run. The coordinator tests each candidate
+// boundary's key directly; Probe answers per key for the aligned candidates.
+class StateMatcher : public PrefixMatcher {
+public:
+    bool IsPrefixClosed() const override { return false; }
+    std::int32_t BoundaryLookbackPages() const override { return 0; }
+
+    GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
+                           std::int32_t begin_blocks, std::int32_t max_blocks,
+                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const override {
+        const std::int32_t end_blocks =
+            static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
+        GroupPrefixProbe probe;
+        for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
+            probe.hits.push_back(PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(j)], extra_hits) ? 1 : 0);
+        }
+        return probe;
+    }
+};
+
+// Sliding window: non-closed -- shortening a match can cut its trailing run
+// below the window, so match bound-first.
 class SwaMatcher : public PrefixMatcher {
 public:
     SwaMatcher(std::int32_t block_granularity, std::int32_t sliding_window)

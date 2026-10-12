@@ -29,7 +29,6 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/prefix/prefix_matcher.h"
 #include "scheduler/operations/cache.h"
-#include "scheduler/operations/group_demands.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -40,6 +39,10 @@ std::int64_t ceilDiv(std::int64_t value, std::int64_t divisor) {
     _assert(value >= 0 && divisor > 0, "ceilDiv requires non-negative value and positive divisor");
     return (value + divisor - 1) / divisor;
 }
+
+// A State group's table: the checkpoint the next forward reads and the
+// block it writes.
+constexpr std::int64_t kStateSlots = 2;
 
 }  // namespace
 
@@ -84,41 +87,19 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
     const std::int64_t max_prompt_tokens =
         std::max<std::int64_t>(static_cast<std::int64_t>(token_limit) - decode_width, 0);
     const std::int64_t chunk_tokens = config_.max_scheduled_tokens;
-    const std::int64_t prefix_granularity = config_.prefix_granularity;
-    // A final sub-page tail can follow the first aligned body, or a later body
-    // that also retains an input checkpoint. Bound both cases independently.
-    const auto max_tail_after = [&](std::int64_t minimum_body_end) {
-        return std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
-                                                   max_prompt_tokens - minimum_body_end}));
-    };
-    const std::int64_t max_first_chunk_tail_tokens = max_tail_after(prefix_granularity);
-    const std::int64_t max_later_chunk_tail_tokens = max_tail_after(2 * prefix_granularity);
 
     std::vector<std::int64_t> group_pages(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const CacheGroupConfig& group = config_.cache_groups[i];
+        if (group.Kind() == AttnKind::kMambaState) {
+            // Two slots on every role and in every phase: the checkpoint the
+            // next forward reads and the block it writes.
+            group_pages[i] = token_limit == 0 ? 0 : kStateSlots;
+            continue;
+        }
         const std::int64_t block_granularity = groups_[i].block_granularity;
         const std::int64_t lookback = groups_[i].lookback_pages;
-        const CacheGroupConfig& group = config_.cache_groups[i];
         const auto local_prefill_peak = [&] {
-            if (group.Kind() == AttnKind::kMambaState) {
-                if (token_limit == 0) return std::int64_t{0};
-                // Peak = retained input checkpoint (a later chunk's, or a prefix-cache hit)
-                // + aligned checkpoint + its materialized suffix/reserve. The
-                // forward holds both the final continuation and growth storage.
-                // P banks no decode growth; overlap keeps one more decode step live.
-                const auto output_blocks = [&](std::int64_t tail_tokens) {
-                    const std::int64_t reserve_tokens =
-                        config_.role == Role::kP
-                            ? 0
-                            : SnapshotStateReserveTokens(block_granularity, decode_width + protected_tokens);
-                    return 1 + ceilDiv(tail_tokens + reserve_tokens, block_granularity);
-                };
-                const std::int64_t first_chunk_peak =
-                    (config_.disable_prefix_cache ? 0 : lookback) + output_blocks(max_first_chunk_tail_tokens);
-                const std::int64_t later_chunk_peak =
-                    max_prompt_tokens > chunk_tokens ? lookback + output_blocks(max_later_chunk_tail_tokens) : 0;
-                return std::max(first_chunk_peak, later_chunk_peak);
-            }
             // Across every prompt up to max_prompt_tokens, retain the largest
             // resident window seen by either the first chunk or a later chunk.
             const std::int64_t first_prompt = std::min(max_prompt_tokens, chunk_tokens);
@@ -135,27 +116,15 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
         if (groups_[i].prefix_closed) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
-            if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
-                // Remote landing: endpoint snapshot + banked growth block. The
-                // D role never prefills locally -- a retracted request comes
-                // back by restoring its image, the same shape -- so no
-                // recovery chunk is charged.
-                child_pages = token_limit == 0 ? 0 : 2;
-            } else if (group.Kind() == AttnKind::kSlidingWindow) {
-                const std::int64_t dense_pages =
-                    ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
-                const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
-                                                              decode_width + protected_tokens + block_granularity - 1,
-                                                          block_granularity);
-                // A sliding prefix probe can retain one older lookback island
-                // across null holes while the remote prompt tail is restored at
-                // absolute slots. Bound both intervals, capped by a dense table.
-                child_pages = std::min<std::int64_t>(dense_pages, lookback + window_pages);
-            } else {
-                // Decode-only restores its destination in one admission, so a
-                // non-sparse group cannot slide old prompt pages first.
-                child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
-            }
+            const std::int64_t dense_pages =
+                ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
+            const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
+                                                          decode_width + protected_tokens + block_granularity - 1,
+                                                      block_granularity);
+            // A sliding prefix probe can retain one older lookback island
+            // across null holes while the remote prompt tail is restored at
+            // absolute slots. Bound both intervals, capped by a dense table.
+            child_pages = std::min<std::int64_t>(dense_pages, lookback + window_pages);
         } else {
             child_pages = local_prefill_peak();
         }
@@ -176,26 +145,29 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
     const std::int64_t decode_width = decodeWidth();
     const std::int64_t protected_tokens = protectedTokens();
     const std::int64_t chunk_tokens = config_.max_scheduled_tokens;
-    // A snapshot-state group's working set is per request and independent of
-    // how much history the request carries: its single-request peak, once
-    // per live request.
-    const std::vector<std::int64_t> single_request_pages = SingleRequestGroupPages(max_context_len);
 
     std::vector<std::int64_t> group_pages(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const CacheGroupConfig& group = config_.cache_groups[i];
+        if (group.Kind() == AttnKind::kMambaState) {
+            // A State group's working set is two slots per live request,
+            // whatever history the request carries.
+            group_pages[i] = live_requests * kStateSlots;
+            continue;
+        }
         const std::int64_t block_granularity = groups_[i].block_granularity;
         const std::int64_t lookback = groups_[i].lookback_pages;
-        const CacheGroupConfig& group = config_.cache_groups[i];
         // Dense history for every token, plus per request the page its
         // unaligned tail occupies and the protected tokens that may spill
         // past it: ceil((h + protected) / g) <= floor(h / g) + ceil((g - 1 +
         // protected) / g) for any history h, summed over the live requests.
+        // A hit's private copy of the block containing its boundary is that
+        // request's own tail page; an owner's copy-in at prompt end is one
+        // more block it holds while the published one is cache-only.
         const std::int64_t dense_pages =
             ceilDiv(max_total_tokens, block_granularity) +
             live_requests * ceilDiv(block_granularity - 1 + protected_tokens, block_granularity);
-        if (group.Kind() == AttnKind::kMambaState) {
-            group_pages[i] = live_requests * single_request_pages[i];
-        } else if (groups_[i].prefix_closed) {
+        if (groups_[i].prefix_closed) {
             group_pages[i] = dense_pages;
         } else {
             // A sliding request retains at most its window (or its whole

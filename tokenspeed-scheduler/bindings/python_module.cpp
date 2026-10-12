@@ -292,6 +292,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
         .def_ro("extend_replay_lens", &tokenspeed::ForwardBatch::extend_replay_lens)
+        // Per extend row (the D role's remote admission only): every State
+        // group's prompt-end checkpoint sits in slot 0, so the peer omits the
+        // latest-snapshot transfer.
+        .def_ro("state_prefix_cached", &tokenspeed::ForwardBatch::state_prefix_cached)
         .def_prop_ro(
             "prefill_lengths",
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },

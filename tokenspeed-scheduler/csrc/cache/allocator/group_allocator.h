@@ -236,6 +236,68 @@ public:
         table.available_tokens_ = tail_available_tokens;
     }
 
+    // --- two-slot State tables -------------------------------------------
+    // Slot 0 is the checkpoint the next forward reads, slot 1 the block it
+    // writes. The table has exactly two slots once shaped.
+
+    // Shapes a State table for its first admission: slot 0 the claimed hit
+    // block (or null until the admission installs one), slot 1 empty until
+    // AcquireStateLive.
+    void ShapeStateTable(BlockTable& table, CacheBlockRef input) {
+        _assert(table.blocks_.empty(), "ShapeStateTable requires a fresh (empty) table");
+        table.blocks_.push_back(std::move(input));
+        table.blocks_.emplace_back();
+        table.available_tokens_ = 0;
+        table.reclaimed_prefix_blocks_ = 0;
+    }
+    static void assertStateTable(const BlockTable& table) {
+        _assert(table.NumBlocks() == 2, "a State table has exactly two slots");
+    }
+    // Drops the table's reference to slot 0; the index keeps the block when
+    // it is published, otherwise it returns to the pool.
+    void ReleaseStateInput(BlockTable& table) {
+        assertStateTable(table);
+        table.blocks_[0].reset();
+    }
+    // Slot 0 receives a block the admission acquired: a Host checkpoint's
+    // fresh destination, or the zeroed block a prompt starts from.
+    void InstallStateInput(BlockTable& table, CacheBlockRef input) {
+        assertStateTable(table);
+        _assert(!table.blocks_[0], "the input slot is installed only when empty");
+        table.blocks_[0] = std::move(input);
+    }
+    // Slot 1 becomes slot 0 (the block the last forward wrote is the next
+    // one's input); slot 1 is left empty for AcquireStateLive.
+    void RotateState(BlockTable& table) {
+        assertStateTable(table);
+        table.blocks_[0] = std::exchange(table.blocks_[1], CacheBlockRef{});
+    }
+    bool AcquireStateLive(BlockPool& pool, BlockTable& table) {
+        assertStateTable(table);
+        _assert(!table.blocks_[1], "the live slot is acquired only once per step");
+        return acquireStateSlot(pool, table, 1);
+    }
+    // A fresh block for an empty slot 0: the zero state a prompt starts from.
+    bool AcquireStateInput(BlockPool& pool, BlockTable& table) {
+        assertStateTable(table);
+        _assert(!table.blocks_[0], "the input slot is acquired only when empty");
+        return acquireStateSlot(pool, table, 0);
+    }
+    // Slot 0's block when this step releases it and the table is its only
+    // owner besides the index (reclaimable by the admission that releases it).
+    std::optional<CacheBlockLocation> ReleasableStateInput(const PrefixCacheIndex& index, const BlockTable& table,
+                                                           const StateStep& step) const {
+        if (step.kind == StateStep::Kind::kKeep || table.NumBlocks() == 0 || !table.Blocks()[0]) {
+            return std::nullopt;
+        }
+        const CacheBlockRef& block = table.Blocks()[0];
+        const bool cached = index.Contains(block);
+        if ((cached && block.use_count() == 2) || (!cached && block.unique())) {
+            return block->Location();
+        }
+        return std::nullopt;
+    }
+
     // Retention execution: the first num_expired_blocks table slots become
     // null holes, so the table never shrinks and slot alignment stays stable.
     // How many blocks expired is retention policy (GroupGeometry).
@@ -301,6 +363,14 @@ public:
     }
 
 private:
+    bool acquireStateSlot(BlockPool& pool, BlockTable& table, std::size_t slot) {
+        std::vector<CacheBlockRef> fresh = pool.AcquireBlocks(group_id_, 1, BucketLoads(table));
+        if (fresh.size() != 1) {
+            return false;
+        }
+        table.blocks_[slot] = std::move(fresh.front());
+        return true;
+    }
     std::vector<std::int32_t> BucketLoads(const BlockTable& table) const {
         if (shard_count_ == 1) {
             return {};

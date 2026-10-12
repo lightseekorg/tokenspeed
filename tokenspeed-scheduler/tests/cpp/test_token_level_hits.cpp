@@ -131,7 +131,6 @@ protected:
         PlanOnce();
         return hit;
     }
-
 };
 
 TEST_F(TokenLevelHitSuite, RandomStreamsResumeAtTheLongestPublishedBoundary) {
@@ -208,7 +207,8 @@ TEST_F(TokenLevelHitSuite, RandomStreamsResumeAtTheLongestPublishedBoundary) {
                     const auto& row = batch->block_tables.at(group_id).at(0);
                     const std::int32_t first_slot = (expected - tail_tokens) / block_granularity;
                     for (std::int32_t j = 0; j < tail_blocks; ++j) {
-                        EXPECT_EQ(row.at(static_cast<std::size_t>(first_slot + j)), pairs[static_cast<std::size_t>(j)].second);
+                        EXPECT_EQ(row.at(static_cast<std::size_t>(first_slot + j)),
+                                  pairs[static_cast<std::size_t>(j)].second);
                         const auto& zeroed = plan.pages_to_zero.at(group_id);
                         EXPECT_EQ(std::ranges::find(zeroed, pairs[static_cast<std::size_t>(j)].second), zeroed.end());
                     }

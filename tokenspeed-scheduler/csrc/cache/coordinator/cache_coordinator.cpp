@@ -54,8 +54,12 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         _assert(groups_[i].Id() == static_cast<std::uint32_t>(i), "cache group id must equal its group index");
         const std::int32_t group_block_granularity = groups_[i].Spec().block_granularity;
-        _assert(group_block_granularity > 0 && prefix_granularity_ % group_block_granularity == 0,
-                "group block_granularity must be a positive divisor of the prefix granularity");
+        if (groups_[i].Spec().kind == AttnKind::kMambaState) {
+            _assert(group_block_granularity == 0, "a State group has no token span");
+        } else {
+            _assert(group_block_granularity > 0 && prefix_granularity_ % group_block_granularity == 0,
+                    "group block_granularity must be a positive divisor of the prefix granularity");
+        }
         _assert(groups_[i].Allocator().CacheBlocksPerLcmBlock() == groups_[i].Spec().cache_blocks_per_lcm_block,
                 "group allocator packing must match its group spec");
         _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
@@ -101,9 +105,13 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
     }
 }
 
-bool CacheCoordinator::HasMambaStateGroup() const {
-    return std::ranges::any_of(groups_,
-                               [](const CacheGroup& group) { return group.Spec().kind == AttnKind::kMambaState; });
+bool CacheCoordinator::GroupIsState(std::size_t i) const {
+    return groups_[i].Spec().kind == AttnKind::kMambaState;
+}
+
+std::int32_t CacheCoordinator::BlocksPerBoundary(std::int32_t i) const {
+    const auto index = static_cast<std::size_t>(i);
+    return GroupIsState(index) ? 1 : prefix_granularity_ / geometry_[index].BlockGranularity();
 }
 
 bool CacheCoordinator::deviceCacheIsClearable() const {
@@ -193,6 +201,9 @@ bool CacheCoordinator::ClearCache() {
 
 std::int32_t CacheCoordinator::TailBlocksFor(std::int32_t i, std::int32_t tail_tokens) const {
     _assert(tail_tokens > 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
+    if (GroupIsState(static_cast<std::size_t>(i))) {
+        return 1;
+    }
     const std::int32_t block_granularity = geometry_[static_cast<std::size_t>(i)].BlockGranularity();
     return (tail_tokens + block_granularity - 1) / block_granularity;
 }
@@ -209,7 +220,7 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
         }
         const std::int32_t pages_per_prefix_hash =
             tail_tokens ? TailBlocksFor(static_cast<std::int32_t>(group_index), *tail_tokens)
-                        : prefix_granularity_ / geometry_[group_index].BlockGranularity();
+                        : BlocksPerBoundary(static_cast<std::int32_t>(group_index));
         for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
             const CacheKey key{
                 .namespace_id = boundary.namespace_id,
@@ -230,8 +241,7 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
                                                      std::uint32_t group_id) const {
     _assert(group_id < groups_.size(), "cache key group id out of range");
-    const std::int32_t group_block_granularity = geometry_[group_id].BlockGranularity();
-    const std::int32_t pages_per_prefix_hash = prefix_granularity_ / group_block_granularity;
+    const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(group_id));
     _assert(content_hashes.size() <=
                 std::numeric_limits<std::size_t>::max() / static_cast<std::size_t>(pages_per_prefix_hash),
             "expanded cache key count exceeds size_t range");
@@ -251,31 +261,23 @@ std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string
 
 namespace {
 
-struct ConvergedBoundary {
-    std::int32_t common_tokens{0};
-    std::int32_t prefix_closed_tokens{0};
-};
-
-// Shared match skeleton: one ordered sweep (closed groups first), then re-match any window
-// group left above the settled bound -- with 2+ window groups a later group can shrink the
-// bound UNDER an earlier one's boundary-dependent match. A re-matched group lands at or
-// under the current bound and only a further bound drop can lift it back above, so
-// re-matches are finite; the result is the greatest boundary every group supports.
-//
-// Bounds align down to the shared prefix granularity.
+// Shared match skeleton over the token-spanned groups: one ordered sweep
+// (closed groups first), then re-match any window group left above the
+// settled bound -- with 2+ window groups a later group can shrink the bound
+// UNDER an earlier one's boundary-dependent match. A re-matched group lands at
+// or under the current bound and only a further bound drop can lift it back
+// above, so re-matches are finite; the result is the greatest page boundary
+// every group supports. Bounds align down to the shared prefix granularity;
+// the candidate phase that follows refines them to token boundaries.
 template <typename MatchGroup, typename ExtentTokens>
-ConvergedBoundary SweepThenConverge(std::span<const std::size_t> order, const std::vector<CacheGroup>& groups,
-                                    std::int32_t bound_tokens, std::int32_t align_tokens, const MatchGroup& match,
-                                    const ExtentTokens& extent) {
+std::int32_t SweepThenConverge(std::span<const std::size_t> order, const std::vector<CacheGroup>& groups,
+                               std::int32_t bound_tokens, std::int32_t align_tokens, const MatchGroup& match,
+                               const ExtentTokens& extent) {
     const auto align_down = [align_tokens](std::int32_t tokens) { return tokens - tokens % align_tokens; };
     bound_tokens = align_down(bound_tokens);
-    std::int32_t prefix_closed_tokens = 0;
     for (std::size_t i : order) {
         match(i, bound_tokens);
         bound_tokens = std::min(bound_tokens, align_down(extent(i)));
-        if (groups[i].Matcher().IsPrefixClosed()) {
-            prefix_closed_tokens = bound_tokens;
-        }
     }
     for (bool changed = true; changed;) {
         changed = false;
@@ -288,10 +290,7 @@ ConvergedBoundary SweepThenConverge(std::span<const std::size_t> order, const st
             changed = true;
         }
     }
-    return {
-        .common_tokens = bound_tokens,
-        .prefix_closed_tokens = prefix_closed_tokens,
-    };
+    return bound_tokens;
 }
 
 }  // namespace
@@ -322,10 +321,13 @@ const BlockPool& CacheCoordinator::tierPool() const {
     return *host_pool_;
 }
 
-// The one tier matcher: slots below floor_tokens are assumed valid in a lower tier; per_group
-// blocks are relative to the floor, num_common_tokens is the absolute converged boundary (in
-// TOKENS). num_prefix_pages = content_hashes.size() in prefix pages;
-// each group key vector is expanded to that group's block_granularity.
+// The aligned phase of one tier probe, over the token-spanned groups (closed
+// and sliding): slots below floor_tokens are assumed valid in a lower tier;
+// per_group blocks are relative to the floor, num_common_tokens is the
+// absolute converged page boundary in TOKENS. num_prefix_pages bounds the walk
+// in prefix pages; each group key vector is expanded to that group's
+// block_granularity. State groups take no part here: their boundaries are
+// candidates of the state phase (probeTierCandidates).
 template <CacheTier Tier>
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
     std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
@@ -334,13 +336,22 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
             "the storage shadow extends the Host tier, and only with L3 enabled");
     const BlockPool& pool = tierPool<Tier>();
     PrefixProbe::Tier out;
+    out.num_common_tokens = floor_tokens;
+    out.full_page_tokens = floor_tokens;
+    out.kv_tokens = floor_tokens;
     out.per_group.resize(groups_.size());
-    if (match_order.empty()) {
+    std::vector<std::size_t> spanned_order;
+    for (const std::size_t i : match_order) {
+        if (!GroupIsState(i)) {
+            spanned_order.push_back(i);
+        }
+    }
+    if (spanned_order.empty()) {
         return out;
     }
     const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits = with_storage_keys ? &storage_keys_ : nullptr;
-    const ConvergedBoundary boundary = SweepThenConverge(
-        match_order, groups_, num_prefix_pages * prefix_granularity_, prefix_granularity_,
+    const std::int32_t common_tokens = SweepThenConverge(
+        spanned_order, groups_, num_prefix_pages * prefix_granularity_, prefix_granularity_,
         [&](std::size_t i, std::int32_t bound_tokens) {
             const std::int32_t group_block_granularity = geometry_[i].BlockGranularity();
             out.per_group[i] = groups_[i].Matcher().Probe(groups_[i].Index(), pool, group_keys[i],
@@ -354,17 +365,16 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
 
     // A matcher can find a q-aligned resume point above the final P-aligned
     // boundary. Only acquire the CacheBlocks covered by the shared boundary.
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
+    for (const std::size_t i : spanned_order) {
         GroupPrefixProbe& probe = out.per_group[i];
-        const std::int32_t group_block_granularity = geometry_[i].BlockGranularity();
-        const std::int32_t covered_pages = (boundary.common_tokens - floor_tokens) / group_block_granularity;
+        const std::int32_t covered_pages = (common_tokens - floor_tokens) / geometry_[i].BlockGranularity();
         if (static_cast<std::int32_t>(probe.hits.size()) > covered_pages) {
             probe.hits.resize(static_cast<std::size_t>(covered_pages));
         }
     }
-    out.num_common_tokens = boundary.common_tokens;
-    out.full_page_tokens = boundary.common_tokens;
-    out.prefix_closed_tokens = boundary.prefix_closed_tokens;
+    out.num_common_tokens = common_tokens;
+    out.full_page_tokens = common_tokens;
+    out.kv_tokens = common_tokens;
     return out;
 }
 
@@ -377,7 +387,8 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
     out.num_common_tokens = probe.num_common_tokens;
     out.per_group.resize(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const std::int32_t floor_pages = floor_tokens / geometry_[i].BlockGranularity();
+        const std::int32_t floor_pages =
+            floor_tokens / (GroupIsState(i) ? prefix_granularity_ : geometry_[i].BlockGranularity());
         out.per_group[i] =
             groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch);
         if (!probe.tail || probe.tail->group_keys[i].empty()) {
@@ -404,42 +415,75 @@ std::vector<CacheKey> CacheCoordinator::tailKeysForGroup(std::size_t i, const Co
     return keys;
 }
 
+// Whether group i can resume at the boundary full_tokens + tail_tokens on
+// this tier, and the hits over the boundary's keys: a closed group needs
+// every block of the tail; a sliding group the blocks covering its lookback
+// behind the boundary (tail blocks, and page blocks above floor_tokens --
+// blocks below the floor are a lower tier's); a State group the one state
+// published at the boundary.
 template <CacheTier Tier>
-bool CacheCoordinator::groupHoldsTail(std::size_t i, std::span<const std::string> prefix_hashes,
-                                      std::int32_t full_tokens, std::int32_t tail_tokens, const ContentHash& hash,
-                                      std::span<const CacheKey> tail_keys, GroupPrefixProbe& hits) const {
-    (void)tail_tokens;
-    (void)hash;
+bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::string> prefix_hashes,
+                                            std::int32_t floor_tokens, std::int32_t full_tokens,
+                                            std::int32_t tail_tokens, std::span<const CacheKey> tail_keys,
+                                            GroupPrefixProbe& tail_hits, GroupPrefixProbe* page_hits) const {
     const BlockPool& pool = tierPool<Tier>();
     const CacheGroup& group = groups_[i];
     const PrefixCacheIndex& index = group.Index();
-    hits.hits.assign(tail_keys.size(), 0);
+    tail_hits.hits.assign(tail_keys.size(), 0);
+    if (GroupIsState(i)) {
+        if (tail_tokens > 0) {
+            _assert(tail_keys.size() == 1, "a State group has one key per boundary");
+            if (!index.Contains(pool, tail_keys[0])) {
+                return false;
+            }
+            tail_hits.hits[0] = 1;
+            return true;
+        }
+        // An aligned boundary is keyed by the chain hash of its last page.
+        _assert(full_tokens > floor_tokens && full_tokens % prefix_granularity_ == 0,
+                "a page boundary above the floor");
+        const auto page = static_cast<std::size_t>(full_tokens / prefix_granularity_) - 1;
+        const CacheKey key{.group_id = group.Id(), .content_hash = prefix_hashes[page], .page_offset = 0};
+        if (!index.Contains(pool, key)) {
+            return false;
+        }
+        if (page_hits != nullptr) {
+            const auto floor_pages = static_cast<std::size_t>(floor_tokens / prefix_granularity_);
+            page_hits->hits.assign(page + 1 - floor_pages, 0);
+            page_hits->hits.back() = 1;
+        }
+        return true;
+    }
     if (group.Matcher().IsPrefixClosed()) {
         for (std::size_t j = 0; j < tail_keys.size(); ++j) {
             if (!index.Contains(pool, tail_keys[j])) {
                 return false;
             }
-            hits.hits[j] = 1;
+            tail_hits.hits[j] = 1;
         }
         return true;
     }
-    if (group.Spec().kind == AttnKind::kMambaState) {
-        return false;
-    }
     // A sliding window resumes at T when the blocks covering its last W - 1
-    // tokens are cached: the tail's blocks and, below them, the page blocks.
+    // tokens are cached.
     const std::int32_t block_granularity = geometry_[i].BlockGranularity();
     const std::int32_t blocks_per_page = prefix_granularity_ / block_granularity;
+    const std::int32_t floor_blocks = floor_tokens / block_granularity;
     const std::int32_t full_blocks = full_tokens / block_granularity;
     const std::int32_t boundary_block = full_blocks + static_cast<std::int32_t>(tail_keys.size());
     const std::int32_t lookback = std::min(group.Matcher().BoundaryLookbackPages(), boundary_block);
+    if (page_hits != nullptr) {
+        page_hits->hits.assign(static_cast<std::size_t>(std::max(full_blocks - floor_blocks, 0)), 0);
+    }
     for (std::int32_t block = boundary_block - lookback; block < boundary_block; ++block) {
         if (block >= full_blocks) {
             const auto j = static_cast<std::size_t>(block - full_blocks);
             if (!index.Contains(pool, tail_keys[j])) {
                 return false;
             }
-            hits.hits[j] = 1;
+            tail_hits.hits[j] = 1;
+            continue;
+        }
+        if (block < floor_blocks) {
             continue;
         }
         const CacheKey page_key{.group_id = group.Id(),
@@ -448,68 +492,163 @@ bool CacheCoordinator::groupHoldsTail(std::size_t i, std::span<const std::string
         if (!index.Contains(pool, page_key)) {
             return false;
         }
+        if (page_hits != nullptr) {
+            page_hits->hits[static_cast<std::size_t>(block - floor_blocks)] = 1;
+        }
     }
     return true;
 }
 
-template <CacheTier Tier>
-std::optional<CacheCoordinator::PrefixProbe::TailHit> CacheCoordinator::probeTailWithKeys(
-    const PromptPrefix& prompt, std::span<const std::size_t> match_order, std::int32_t full_tokens,
-    bool claim_partial) const {
-    _assert(full_tokens % prefix_granularity_ == 0, "the tail phase starts at a page boundary");
-    if (prompt.tokens.empty() || full_tokens >= prompt.max_tokens || match_order.empty()) {
-        return std::nullopt;
-    }
-    const auto page = static_cast<std::size_t>(full_tokens / prefix_granularity_);
-    _assert(page <= prompt.prefix_hashes.size(), "the matched pages are hashed");
-    const ContentHash prior = page == 0 ? ContentHash{} : prompt.prefix_hashes[page - 1];
-    const std::span<const TailTable::Tail> published = tails_.Tails(prior);
-    std::vector<TailTable::Tail> candidates(published.begin(), published.end());
-    std::ranges::stable_sort(candidates, std::greater<>{}, &TailTable::Tail::tail_tokens);
-
-    ContentHash hash;
-    std::int32_t hashed_tokens = 0;
-    for (const TailTable::Tail& candidate : candidates) {
-        const std::int32_t boundary = full_tokens + candidate.tail_tokens;
-        if (boundary > prompt.max_tokens || static_cast<std::size_t>(boundary) > prompt.tokens.size()) {
-            continue;
-        }
-        if (candidate.tail_tokens != hashed_tokens) {
-            hash = HashPrefixPage(prompt.tokens.subspan(static_cast<std::size_t>(full_tokens),
-                                                        static_cast<std::size_t>(candidate.tail_tokens)),
-                                  prior);
-            hashed_tokens = candidate.tail_tokens;
-        }
-        if (hash != candidate.hash) {
-            continue;  // published by a prompt whose tokens diverge inside the page
-        }
-        PrefixProbe::TailHit hit{.tail_tokens = candidate.tail_tokens,
-                                 .hash = hash,
-                                 .group_keys = std::vector<std::vector<CacheKey>>(groups_.size()),
-                                 .per_group = std::vector<GroupPrefixProbe>(groups_.size())};
-        bool every_group_holds = true;
-        for (const std::size_t i : match_order) {
-            hit.group_keys[i] = tailKeysForGroup(i, hash, candidate.tail_tokens);
-            if (!groupHoldsTail<Tier>(i, prompt.prefix_hashes, full_tokens, candidate.tail_tokens, hash,
-                                      hit.group_keys[i], hit.per_group[i])) {
-                every_group_holds = false;
-                break;
-            }
-        }
-        if (!every_group_holds) {
-            continue;
-        }
-        if (!claim_partial) {
-            for (const std::size_t i : match_order) {
-                const std::int32_t block_granularity = geometry_[i].BlockGranularity();
-                if (candidate.tail_tokens % block_granularity != 0 && !hit.per_group[i].hits.empty()) {
-                    hit.per_group[i].hits.back() = 0;
+// The boundaries a tier may resume at, longest first: the tails published
+// inside each page under its prior and the page boundaries themselves, from
+// the page containing `from_tokens` down to the floor.
+template <typename Visit>
+void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std::int32_t floor_tokens,
+                                                std::int32_t from_tokens, const Visit& visit) const {
+    for (std::int32_t page = from_tokens / prefix_granularity_; page * prefix_granularity_ >= floor_tokens; --page) {
+        const std::int32_t page_tokens = page * prefix_granularity_;
+        if (static_cast<std::size_t>(page) <= prompt.prefix_hashes.size() && !prompt.tokens.empty()) {
+            const ContentHash prior =
+                page == 0 ? ContentHash{} : prompt.prefix_hashes[static_cast<std::size_t>(page) - 1];
+            const std::span<const TailTable::Tail> published = tails_.Tails(prior);
+            std::vector<TailTable::Tail> candidates(published.begin(), published.end());
+            std::ranges::stable_sort(candidates, std::greater<>{}, &TailTable::Tail::tail_tokens);
+            for (const TailTable::Tail& tail : candidates) {
+                const std::int32_t boundary = page_tokens + tail.tail_tokens;
+                if (boundary > from_tokens || boundary > prompt.max_tokens || boundary <= floor_tokens ||
+                    static_cast<std::size_t>(boundary) > prompt.tokens.size()) {
+                    continue;
+                }
+                if (!visit(page_tokens, tail.tail_tokens, tail.hash)) {
+                    return;
                 }
             }
         }
-        return hit;
+        if (page_tokens > floor_tokens && page_tokens <= from_tokens) {
+            if (!visit(page_tokens, 0, ContentHash{})) {
+                return;
+            }
+        }
+        if (page == 0) {
+            break;
+        }
     }
-    return std::nullopt;
+}
+
+// One tier of a probe: the aligned phase over the token-spanned groups, then
+// the candidate phase -- longest first, a tail inside the page after the
+// aligned coverage, the aligned coverage itself, then every published tail
+// and page boundary below -- until every matched group accepts one. Without
+// State groups the first candidate the KV groups accept wins and the walk
+// never descends below the aligned coverage; with them it descends to the
+// longest published state checkpoint. kv_tokens records the KV groups'
+// own boundary for the junction cut.
+template <CacheTier Tier>
+CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPrefix& prompt,
+                                                                std::span<const std::vector<CacheKey>> group_keys,
+                                                                std::span<const std::size_t> match_order,
+                                                                std::int32_t floor_tokens, bool claim_partial) const {
+    const std::int32_t num_prefix_pages =
+        std::min(static_cast<std::int32_t>(prompt.prefix_hashes.size()), prompt.max_tokens / prefix_granularity_);
+    PrefixProbe::Tier aligned = probeTierWithKeys<Tier>(group_keys, match_order, num_prefix_pages, floor_tokens,
+                                                        /*with_storage_keys=*/false);
+    PrefixProbe::Tier out = aligned;
+    out.num_common_tokens = floor_tokens;
+    out.full_page_tokens = floor_tokens;
+    out.kv_tokens = floor_tokens;
+    ContentHash hash;
+    std::int32_t hashed_page_tokens = -1;
+    std::int32_t hashed_tail_tokens = -1;
+    // Without a KV group there is no KV boundary to record: a junction
+    // exists only where cached KV outruns the state.
+    bool kv_settled = std::ranges::none_of(match_order, [&](std::size_t i) { return !GroupIsState(i); });
+    const auto visit = [&](std::int32_t page_tokens, std::int32_t tail_tokens, const ContentHash& published_hash) {
+        const std::int32_t boundary = page_tokens + tail_tokens;
+        if (tail_tokens > 0) {
+            if (page_tokens != hashed_page_tokens || tail_tokens != hashed_tail_tokens) {
+                const ContentHash prior =
+                    page_tokens == 0
+                        ? ContentHash{}
+                        : prompt.prefix_hashes[static_cast<std::size_t>(page_tokens / prefix_granularity_) - 1];
+                hash = HashPrefixPage(
+                    prompt.tokens.subspan(static_cast<std::size_t>(page_tokens), static_cast<std::size_t>(tail_tokens)),
+                    prior);
+                hashed_page_tokens = page_tokens;
+                hashed_tail_tokens = tail_tokens;
+            }
+            if (hash != published_hash) {
+                return true;  // published by a prompt whose tokens diverge inside the page
+            }
+        }
+        PrefixProbe::TailHit tail{.tail_tokens = tail_tokens,
+                                  .hash = tail_tokens > 0 ? hash : ContentHash{},
+                                  .group_keys = std::vector<std::vector<CacheKey>>(groups_.size()),
+                                  .per_group = std::vector<GroupPrefixProbe>(groups_.size())};
+        std::vector<GroupPrefixProbe> page_hits(groups_.size());
+        bool kv_accepts = true;
+        bool state_accepts = true;
+        for (const std::size_t i : match_order) {
+            if (tail_tokens > 0) {
+                tail.group_keys[i] = tailKeysForGroup(i, hash, tail_tokens);
+            }
+            const bool accepts =
+                groupAcceptsBoundary<Tier>(i, prompt.prefix_hashes, floor_tokens, page_tokens, tail_tokens,
+                                           tail.group_keys[i], tail.per_group[i], &page_hits[i]);
+            (GroupIsState(i) ? state_accepts : kv_accepts) = accepts && (GroupIsState(i) ? state_accepts : kv_accepts);
+        }
+        if (kv_accepts && !kv_settled) {
+            out.kv_tokens = boundary;
+            kv_settled = true;
+        }
+        if (!kv_accepts || !state_accepts) {
+            return true;
+        }
+        out.num_common_tokens = boundary;
+        out.full_page_tokens = page_tokens;
+        for (const std::size_t i : match_order) {
+            if (GroupIsState(i)) {
+                out.per_group[i] = tail_tokens > 0 ? GroupPrefixProbe{} : std::move(page_hits[i]);
+                continue;
+            }
+            if (groups_[i].Matcher().IsPrefixClosed()) {
+                // The aligned walk covered every page below the boundary.
+                const std::int32_t covered = (page_tokens - floor_tokens) / geometry_[i].BlockGranularity();
+                out.per_group[i].hits.resize(static_cast<std::size_t>(covered));
+            } else {
+                out.per_group[i] = std::move(page_hits[i]);
+            }
+        }
+        if (tail_tokens > 0) {
+            if (!claim_partial) {
+                for (const std::size_t i : match_order) {
+                    if (!GroupIsState(i) && tail_tokens % geometry_[i].BlockGranularity() != 0 &&
+                        !tail.per_group[i].hits.empty()) {
+                        tail.per_group[i].hits.back() = 0;
+                    }
+                }
+            }
+            out.tail = std::move(tail);
+        }
+        return false;
+    };
+    // Candidates start inside the page after the aligned coverage (a tail
+    // there extends it) and descend from the aligned coverage itself. With no
+    // token-spanned group the state checkpoints alone bound the probe.
+    bool spanned = false;
+    for (const std::size_t i : match_order) {
+        spanned = spanned || !GroupIsState(i);
+    }
+    const std::int32_t from_tokens =
+        spanned ? std::min(aligned.num_common_tokens + prefix_granularity_ - 1, prompt.max_tokens) : prompt.max_tokens;
+    forEachCandidateBoundary(prompt, floor_tokens, from_tokens, visit);
+    if (out.num_common_tokens == floor_tokens) {
+        // Nothing beyond the floor: no group claims anything on this tier.
+        for (GroupPrefixProbe& hits : out.per_group) {
+            hits.hits.clear();
+        }
+        out.tail.reset();
+    }
+    return out;
 }
 
 CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const PromptPrefix& prompt,
@@ -518,52 +657,40 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
     _assert(prompt.prefix_hashes.size() <=
                 static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / prefix_granularity_),
             "prefix length exceeds int32 token range");
-    _assert(static_cast<std::int64_t>(prompt.prefix_hashes.size()) * prefix_granularity_ <= prompt.max_tokens,
-            "the hashed pages lie inside the probe bound");
     _assert(prompt.tokens.empty() || static_cast<std::int64_t>(prompt.tokens.size()) >= prompt.max_tokens,
             "the probe bound lies inside the supplied tokens");
-    const std::int32_t num_prefix_pages = static_cast<std::int32_t>(prompt.prefix_hashes.size());
-    // Tails are probed only while every group's checkpoints are keyed by
-    // token position; a snapshot-state group still aligns its slots to the
-    // prefix page, so its presence keeps the boundary page-aligned.
-    const bool probe_tails = !HasMambaStateGroup();
     PrefixProbe out;
     out.group_keys = buildGroupKeys(prompt.prefix_hashes);
-    out.device = probeTierWithKeys<CacheTier::kDevice>(out.group_keys, match_order, num_prefix_pages,
-                                                       /*floor_tokens=*/0, /*with_storage_keys=*/false);
-    const std::int32_t device_full_tokens = out.device.num_common_tokens;
-    if (probe_tails) {
-        out.device.tail = probeTailWithKeys<CacheTier::kDevice>(prompt, match_order, device_full_tokens, claim_partial);
-        if (out.device.tail) {
-            out.device.num_common_tokens += out.device.tail->tail_tokens;
-        }
-    }
+    out.device = probeTier<CacheTier::kDevice>(prompt, out.group_keys, match_order, /*floor_tokens=*/0, claim_partial);
     if (host_pool_ == nullptr) {
         return out;
     }
-    out.host = probeTierWithKeys<CacheTier::kHost>(out.group_keys, match_order, num_prefix_pages,
-                                                   /*floor_tokens=*/device_full_tokens, /*with_storage_keys=*/false);
-    const std::int32_t host_full_tokens = out.host.num_common_tokens;
-    std::optional<PrefixProbe::TailHit> host_tail;
-    if (probe_tails) {
-        host_tail = probeTailWithKeys<CacheTier::kHost>(prompt, match_order, host_full_tokens, claim_partial);
-    }
-    // Host coverage replaces the Device tail when it reaches further: by a
-    // whole page, or by a longer tail under the same last page.
-    const std::int32_t host_tokens = host_full_tokens + (host_tail ? host_tail->tail_tokens : 0);
-    if (host_tokens > out.device.num_common_tokens) {
+    // The Host tier starts where the Device's full pages end and replaces the
+    // Device's result when it reaches further.
+    out.host =
+        probeTier<CacheTier::kHost>(prompt, out.group_keys, match_order, out.device.full_page_tokens, claim_partial);
+    if (out.host.num_common_tokens > out.device.num_common_tokens) {
+        // The Device keeps its full pages below the Host's floor; its tail and
+        // its state hit (a shorter checkpoint) give way to the Host's.
         out.device.tail.reset();
-        out.device.num_common_tokens = device_full_tokens;
-        out.host.tail = std::move(host_tail);
-        out.host.num_common_tokens = host_tokens;
+        out.device.num_common_tokens = out.device.full_page_tokens;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (GroupIsState(i)) {
+                out.device.per_group[i].hits.clear();
+            }
+        }
     } else {
+        out.host = PrefixProbe::Tier{};
+        out.host.per_group.resize(groups_.size());
         out.host.num_common_tokens = out.device.num_common_tokens;
-        out.host.full_page_tokens = device_full_tokens;
+        out.host.full_page_tokens = out.device.full_page_tokens;
+        out.host.kv_tokens = out.device.kv_tokens;
     }
     if (enable_l3_storage_) {
-        out.storage = probeTierWithKeys<CacheTier::kHost>(out.group_keys, match_order, num_prefix_pages,
-                                                          /*floor_tokens=*/host_full_tokens,
-                                                          /*with_storage_keys=*/true);
+        out.storage = probeTierWithKeys<CacheTier::kHost>(
+            out.group_keys, match_order,
+            std::min(static_cast<std::int32_t>(prompt.prefix_hashes.size()), prompt.max_tokens / prefix_granularity_),
+            /*floor_tokens=*/out.host.full_page_tokens, /*with_storage_keys=*/true);
     }
     return out;
 }
@@ -602,9 +729,8 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
     };
     std::vector<PageRows> pages(static_cast<std::size_t>(extension_pages));
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const std::int32_t block_granularity = geometry_[i].BlockGranularity();
-        const std::int32_t blocks_per_page = prefix_granularity_ / block_granularity;
-        const std::int32_t floor_blocks = floor_tokens / block_granularity;
+        const std::int32_t blocks_per_page = BlocksPerBoundary(static_cast<std::int32_t>(i));
+        const std::int32_t floor_blocks = floor_tokens / prefix_granularity_ * blocks_per_page;
         const GroupPrefixProbe& hits = probe.storage.per_group[i];
         for (std::int32_t page = 0; page < extension_pages; ++page) {
             for (std::int32_t b = page * blocks_per_page; b < (page + 1) * blocks_per_page; ++b) {
@@ -675,37 +801,60 @@ std::optional<CacheCoordinator::PrefetchPlan> CacheCoordinator::PlanPrefetch(con
     return plan;
 }
 
-CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const PromptPrefix& prompt) const {
+CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const PromptPrefix& prompt,
+                                                                        std::int32_t prompt_end_tokens) const {
+    _assert(prompt.tokens.empty() || prompt_end_tokens <= static_cast<std::int32_t>(prompt.tokens.size()),
+            "the prompt end lies inside the supplied tokens");
     std::vector<std::size_t> history_match_order;
     history_match_order.reserve(match_order_.size());
     for (std::size_t group_index : match_order_) {
-        if (groups_[group_index].Spec().kind != AttnKind::kMambaState) {
+        if (!GroupIsState(group_index)) {
             history_match_order.push_back(group_index);
         }
     }
     // The D role probes the Device alone: the peer's transfer, not a Host
-    // load, fills what the Device lacks.
+    // load, fills what the Device lacks. The partial block of a KV tail is
+    // left a hole for the transfer to fill whole.
     PrefixProbe probe;
     probe.group_keys = buildGroupKeys(prompt.prefix_hashes);
-    probe.device = probeTierWithKeys<CacheTier::kDevice>(probe.group_keys, history_match_order,
-                                                         static_cast<std::int32_t>(prompt.prefix_hashes.size()),
-                                                         /*floor_tokens=*/0, /*with_storage_keys=*/false);
-    if (!HasMambaStateGroup()) {
-        probe.device.tail =
-            probeTailWithKeys<CacheTier::kDevice>(prompt, history_match_order, probe.device.num_common_tokens,
-                                                  /*claim_partial=*/false);
-        if (probe.device.tail) {
-            probe.device.num_common_tokens += probe.device.tail->tail_tokens;
-        }
+    probe.device = probeTier<CacheTier::kDevice>(prompt, probe.group_keys, history_match_order, /*floor_tokens=*/0,
+                                                 /*claim_partial=*/false);
+    // The peer's final state supersedes any shorter checkpoint, so a State
+    // group's checkpoint counts only at exactly the prompt end: then the
+    // transfer omits the group and the D claims the checkpoint as slot 0.
+    PrefixProbe::TailHit state_hit{.tail_tokens = prompt_end_tokens % prefix_granularity_,
+                                   .group_keys = std::vector<std::vector<CacheKey>>(groups_.size()),
+                                   .per_group = std::vector<GroupPrefixProbe>(groups_.size())};
+    const std::int32_t page_tokens = prompt_end_tokens - state_hit.tail_tokens;
+    const auto pages = static_cast<std::size_t>(page_tokens / prefix_granularity_);
+    if (prompt.tokens.empty() || pages > prompt.prefix_hashes.size()) {
+        return probe;  // nothing to match: the prefix cache is off, or the last page is not hashed
     }
-    const std::int64_t covered_tokens = probe.device.num_common_tokens;
+    const ContentHash prior = pages == 0 ? ContentHash{} : prompt.prefix_hashes[pages - 1];
+    if (state_hit.tail_tokens > 0) {
+        state_hit.hash = HashPrefixPage(prompt.tokens.subspan(static_cast<std::size_t>(page_tokens),
+                                                              static_cast<std::size_t>(state_hit.tail_tokens)),
+                                        prior);
+    } else if (pages == 0) {
+        return probe;
+    } else {
+        state_hit.hash = prior;
+    }
+    bool every_state_group_holds = false;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        if (groups_[i].Spec().kind == AttnKind::kMambaState) {
-            const std::int64_t num_holes = covered_tokens / geometry_[i].BlockGranularity();
-            _assert(num_holes <= static_cast<std::int64_t>(probe.group_keys[i].size()),
-                    "decode destination state hole count is outside the probed range");
-            probe.device.per_group[i].hits.resize(static_cast<std::size_t>(num_holes));
+        if (!GroupIsState(i)) {
+            continue;
         }
+        state_hit.group_keys[i] = {
+            CacheKey{.group_id = groups_[i].Id(), .content_hash = state_hit.hash, .page_offset = 0}};
+        if (!groups_[i].Index().Contains(pool_, state_hit.group_keys[i].front())) {
+            return probe;
+        }
+        state_hit.per_group[i].hits = {1};
+        every_state_group_holds = true;
+    }
+    if (every_state_group_holds) {
+        probe.state_at_prompt_end = std::move(state_hit);
     }
     return probe;
 }
@@ -722,6 +871,18 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
     if (host_pool_ != nullptr && !probe.host.per_group.empty()) {
         out.host = acquireTierWithKeys<CacheTier::kHost>(probe.group_keys, device_full_tokens, std::move(probe.host),
                                                          access_epoch);
+    }
+    if (probe.state_at_prompt_end) {
+        out.state_at_prompt_end.resize(groups_.size());
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (probe.state_at_prompt_end->group_keys[i].empty()) {
+                continue;
+            }
+            PrefixMatch match = groups_[i].Index().AcquireMatched(
+                pool_, probe.state_at_prompt_end->group_keys[i],
+                /*begin_blocks=*/0, probe.state_at_prompt_end->per_group[i], access_epoch);
+            out.state_at_prompt_end[i] = std::move(match.blocks.front());
+        }
     }
     return out;
 }
@@ -833,8 +994,11 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
         return;  // hot decode rounds usually fill no page
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (GroupIsState(i)) {
+            continue;  // a state checkpoint is published by its natural point, never by slot
+        }
         std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[i].Id());
-        const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[i].BlockGranularity();
+        const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(i));
         cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_slot * pages_per_prefix_hash,
                                                     access_epoch, boundary_kind, /*stream_completed_to_host=*/false);
     }
@@ -845,31 +1009,10 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> co
         return;
     }
     for (const CacheGroup& group : groups_) {
-        if (group.Spec().kind == AttnKind::kMambaState) {
-            continue;
-        }
         // A tail hash holds fewer blocks than a page; Contains filters.
         for (CacheKey& key : keysForGroup(content_hashes, group.Id())) {
             if (group.Index().Contains(pool_, key)) {
                 pending_stores_.push_back(StoreCandidate{.key = std::move(key)});
-            }
-        }
-    }
-}
-
-void CacheCoordinator::QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes) {
-    if (host_pool_ == nullptr) {
-        return;
-    }
-    for (const CacheGroup& group : groups_) {
-        if (group.Spec().kind != AttnKind::kMambaState) {
-            continue;
-        }
-        std::vector<CacheKey> keys = keysForGroup(prefix_hashes, group.Id());
-        for (auto key = keys.rbegin(); key != keys.rend(); ++key) {
-            if (group.Index().Contains(pool_, *key)) {
-                pending_stores_.push_back(StoreCandidate{.key = std::move(*key)});
-                break;
             }
         }
     }
@@ -1145,6 +1288,18 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     }
     if (tails_.Contains(removed->content_hash)) {
         evictTailEntries(removed->content_hash);
+    } else if (!GroupIsState(group_id)) {
+        // A state checkpoint is matched only with the KV below it: a KV block
+        // of its page gone, it is dead weight and leaves too.
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (!GroupIsState(i)) {
+                continue;
+            }
+            const CacheKey key{.group_id = groups_[i].Id(), .content_hash = removed->content_hash, .page_offset = 0};
+            if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
+                evictCachedBlockAlone(groups_[i].Id(), *location);
+            }
+        }
     }
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
@@ -1213,7 +1368,7 @@ void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
         // The table has already forgotten the dropped hash, so every offset a
         // page can hold is tried; Find filters.
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            const std::int32_t blocks = prefix_granularity_ / geometry_[i].BlockGranularity();
+            const std::int32_t blocks = BlocksPerBoundary(static_cast<std::int32_t>(i));
             for (std::int32_t offset = 0; offset < blocks; ++offset) {
                 const CacheKey key{.group_id = groups_[i].Id(), .content_hash = *dropped, .page_offset = offset};
                 if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
@@ -1226,7 +1381,7 @@ void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
 
 CacheKey CacheCoordinator::historyBlockKey(std::size_t group_index, const CompletedPages& completed,
                                            std::int32_t block) const {
-    const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
+    const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(group_index));
     const std::int32_t full_blocks = static_cast<std::int32_t>(completed.prefix_hashes.size()) * pages_per_prefix_hash;
     if (block < full_blocks) {
         return CacheKey{
@@ -1248,7 +1403,7 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
     if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
         return ranges;
     }
-    const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
+    const std::int32_t pages_per_prefix_hash = BlocksPerBoundary(static_cast<std::int32_t>(group_index));
     const std::int32_t hashed_prefix_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
     const std::int32_t tail_blocks =
         completed.tail ? TailBlocksFor(static_cast<std::int32_t>(group_index), completed.tail->tail_tokens) : 0;
@@ -1268,45 +1423,35 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         }
         return ranges;
     }
-    // Ordinary state chunks remain request-owned. Retained state boundaries
-    // publish only proven prefill checkpoints in the newly hashed range;
-    // allocated slots and completed hashes are not evidence of written state.
-    const bool is_state = groups_[group_index].Spec().kind == AttnKind::kMambaState;
-    const CacheBoundaryKind boundary_kind =
-        is_state ? completed.state_boundary_kind.value_or(completed.boundary_kind) : completed.boundary_kind;
-    if (is_state && boundary_kind == CacheBoundaryKind::kChunk) {
+    if (GroupIsState(group_index)) {
+        // A natural checkpoint: slot 1 holds the state the forward that ended
+        // at this point wrote, keyed like the point itself.
+        if (!completed.publish_state || completed.prefix_hashes.empty() && !completed.tail) {
+            return ranges;
+        }
+        const ContentHash hash = completed.tail ? completed.tail->hash : completed.prefix_hashes.back();
+        ranges.push_back(PublishedRange{
+            .first_cache_block = 1,
+            .keys = {CacheKey{.group_id = groups_[group_index].Id(), .content_hash = hash, .page_offset = 0}},
+            .boundary_kind = completed.boundary_kind,
+        });
         return ranges;
     }
     // A sliding window resumes from the newest page boundary and, at an
-    // unaligned point, from the tail as well: both need their lookback. State
-    // groups may have several materialized boundaries awaiting publication.
+    // unaligned point, from the tail as well: both need their lookback.
     std::vector<std::int32_t> boundary_blocks;
-    if (!is_state) {
-        if (completed.first_new_prefix_page < hashed_prefix_pages) {
-            boundary_blocks.push_back(hashed_prefix_pages * pages_per_prefix_hash);
-        }
-        if (tail_blocks > 0) {
-            boundary_blocks.push_back(hashed_prefix_pages * pages_per_prefix_hash + tail_blocks);
-        }
-    } else {
-        for (const std::int32_t boundary : completed.materialized_state_boundaries) {
-            _assert(boundary > 0 && boundary % prefix_granularity_ == 0,
-                    "materialized state boundary must be positive and prefix-aligned");
-            const std::int32_t boundary_prefix_pages = boundary / prefix_granularity_;
-            if (boundary_prefix_pages > completed.first_new_prefix_page &&
-                boundary_prefix_pages <= hashed_prefix_pages) {
-                boundary_blocks.push_back(boundary_prefix_pages * pages_per_prefix_hash);
-            }
-        }
+    if (completed.first_new_prefix_page < hashed_prefix_pages) {
+        boundary_blocks.push_back(hashed_prefix_pages * pages_per_prefix_hash);
+    }
+    if (tail_blocks > 0) {
+        boundary_blocks.push_back(hashed_prefix_pages * pages_per_prefix_hash + tail_blocks);
     }
     for (const std::int32_t boundary_block : boundary_blocks) {
         const std::int32_t lookback = std::min(groups_[group_index].Matcher().BoundaryLookbackPages(), boundary_block);
         if (lookback == 0) {
             continue;
         }
-        PublishedRange range = history_range(boundary_block - lookback, boundary_block);
-        range.boundary_kind = boundary_kind;
-        ranges.push_back(std::move(range));
+        ranges.push_back(history_range(boundary_block - lookback, boundary_block));
     }
     return ranges;
 }
@@ -1336,6 +1481,9 @@ void CacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t
 void CacheCoordinator::ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (GroupIsState(i)) {
+            continue;  // a decode step writes the live slot in place
+        }
         groups_[i].Allocator().ConsumeReservedTokens(tables[i], num_tokens);
     }
 }
@@ -1351,8 +1499,13 @@ namespace {
 
 // Slots covering [0, num_tokens) of a table and the capacity left inside the
 // last of them. The computed tokens always lie inside the table: the
-// admission that scheduled them acquired their blocks first.
-CacheCoordinator::DataSpan dataSpan(const BlockTable& table, std::int32_t block_granularity, std::int32_t num_tokens) {
+// admission that scheduled them acquired their blocks first. A State table's
+// two slots are both data.
+CacheCoordinator::DataSpan dataSpan(const BlockTable& table, const GroupGeometry& geometry, std::int32_t num_tokens) {
+    if (!geometry.HasTokenSpan()) {
+        return CacheCoordinator::DataSpan{.blocks = table.NumBlocks(), .tail_tokens = 0};
+    }
+    const std::int32_t block_granularity = geometry.BlockGranularity();
     const std::int32_t covering = (num_tokens + block_granularity - 1) / block_granularity;
     _assert(covering <= table.NumBlocks(), "snapshot token count exceeds the table's logical fill");
     return CacheCoordinator::DataSpan{.blocks = covering, .tail_tokens = covering * block_granularity - num_tokens};
@@ -1366,7 +1519,7 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlots(std::sp
     _assert(num_tokens >= 0, "snapshot token count must be non-negative");
     std::vector<std::vector<ImageSlot>> published(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const DataSpan span = dataSpan(tables[i], geometry_[i].BlockGranularity(), num_tokens);
+        const DataSpan span = dataSpan(tables[i], geometry_[i], num_tokens);
         const std::span<const CacheBlockRef> blocks = tables[i].Blocks();
         for (std::int32_t slot = 0; slot < span.blocks; ++slot) {
             const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)];
@@ -1405,7 +1558,7 @@ std::optional<CacheCoordinator::SnapshotPoolPlan> CacheCoordinator::planSnapshot
     std::int64_t parents_needed = 0;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupAllocator& allocator = groups_[i].Allocator();
-        plan.spans[i] = dataSpan(tables[i], geometry_[i].BlockGranularity(), num_tokens);
+        plan.spans[i] = dataSpan(tables[i], geometry_[i], num_tokens);
         std::vector<std::uint8_t> served(static_cast<std::size_t>(plan.spans[i].blocks), 0);
         for (const ImageSlot& slot : host_served_slots[i]) {
             _assert(slot.InHostCache(), "a Host-served snapshot slot carries the key it is published under");
@@ -1452,7 +1605,7 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlotsAfter(st
         if (ranges.empty()) {
             continue;
         }
-        const DataSpan span = dataSpan(tables[i], geometry_[i].BlockGranularity(), num_tokens);
+        const DataSpan span = dataSpan(tables[i], geometry_[i], num_tokens);
         const std::span<const CacheBlockRef> blocks = tables[i].Blocks();
         std::vector<ImageSlot>& slots = published[i];
         for (const PublishedRange& range : ranges) {
@@ -1698,13 +1851,15 @@ std::vector<CacheKey> CacheCoordinator::ExpandPrefixKeys(std::span<const std::st
 }
 
 std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
-    _assert(spec.block_granularity > 0, "group block_granularity must be > 0");
     switch (spec.kind) {
         case AttnKind::kFull:
+            _assert(spec.block_granularity > 0, "group block_granularity must be > 0");
             return std::make_unique<FullAttnMatcher>();
         case AttnKind::kMambaState:
-            return std::make_unique<SwaMatcher>(spec.block_granularity, GroupGeometry::kMambaStateWindow);
+            _assert(spec.block_granularity == 0, "a State group has no token span");
+            return std::make_unique<StateMatcher>();
         case AttnKind::kSlidingWindow:
+            _assert(spec.block_granularity > 0, "group block_granularity must be > 0");
             _assert(spec.sliding_window > 0, "sliding window group requires a positive window");
             return std::make_unique<SwaMatcher>(spec.block_granularity, spec.sliding_window);
         default:
@@ -1726,8 +1881,12 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         const CacheGroupSpec& spec = specs[i];
         const std::uint32_t group_id = static_cast<std::uint32_t>(i);
         _assert(spec.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        _assert(spec.block_granularity > 0 && prefix_granularity % spec.block_granularity == 0,
-                "group block_granularity must be a positive divisor of the prefix granularity");
+        if (spec.kind == AttnKind::kMambaState) {
+            _assert(spec.block_granularity == 0, "a State group has no token span");
+        } else {
+            _assert(spec.block_granularity > 0 && prefix_granularity % spec.block_granularity == 0,
+                    "group block_granularity must be a positive divisor of the prefix granularity");
+        }
         auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count);
         groups.emplace_back(spec, std::move(allocator), MakePrefixMatcher(spec));
     }
