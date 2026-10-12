@@ -60,7 +60,10 @@ from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     TokenizedGenerateReqInput,
     ipc_message_union,
 )
-from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len  # noqa: E402
+from tokenspeed.runtime.engine.logprobs import (  # noqa: E402
+    LogprobsProcessor,
+    resolve_logprob_start_len,
+)
 from tokenspeed.runtime.engine.request_handler import RequestHandler  # noqa: E402
 from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
     UNBOUNDED_CACHED_PREFIX_TOKENS,
@@ -777,6 +780,52 @@ def test_top_k_of_a_request_without_prompt_rows_is_the_sampled_tokens():
     assert state.input_top_logprobs_val == [None]
     assert state.output_top_logprobs_val == [[-0.5]]
     assert sender.items[0].output_top_logprobs_idx == [[[30]]]
+
+
+_TOP_K_COLUMNS = (
+    "input_top_logprobs_val",
+    "input_top_logprobs_idx",
+    "output_top_logprobs_val",
+    "output_top_logprobs_idx",
+)
+
+
+def test_a_frame_without_top_k_requests_ships_the_top_k_columns_empty():
+    """The default path: no request of the frame asked for top-k, so the four
+    columns stay [] for the whole frame instead of holding a [] per request,
+    and the frontend still reads no alternatives for each request."""
+    sender = _Sender()
+    processor = _processor(sender)
+    states = {"a": _state([5, 6, 7]), "b": _state([5, 6, 7], return_logprob=False)}
+    processor.rid_to_state.update(states)
+    op = _Op(["a", "b"], [3, 3], [0, 0], 2)
+    processor.post_process_forward_op(op, _Result([77, 78]), is_prefill_instance=False)
+    [out] = sender.items
+    assert out.rids == ["a", "b"]
+    assert out.output_token_logprobs_val == [[-0.5], []]
+    for column in _TOP_K_COLUMNS:
+        assert getattr(out, column) == []
+        assert [LogprobsProcessor._row(out, column, i) for i in range(2)] == [[], []]
+
+
+def test_a_frame_with_a_top_k_request_ships_an_entry_per_request():
+    """One request of the frame asked for top-k: every request gets an entry,
+    so each row lines up with its rid, and the others' entries are []."""
+    sender = _Sender()
+    processor = _processor(sender)
+    states = {"a": _state([5, 6, 7]), "b": _state([5, 6, 7], top_k=1)}
+    processor.rid_to_state.update(states)
+    op = _Op(["a", "b"], [3, 3], [0, 0], 2)
+    processor.post_process_forward_op(
+        op,
+        _Result([77, 78], output_top=_top_rows([30, 40], k=1)),
+        is_prefill_instance=False,
+    )
+    [out] = sender.items
+    assert out.input_top_logprobs_val == [[], [None]]
+    assert out.output_top_logprobs_val == [[], [[-0.5]]]
+    assert out.output_top_logprobs_idx == [[], [[40]]]
+    assert LogprobsProcessor._row(out, "output_top_logprobs_idx", 1) == [[40]]
 
 
 def test_a_token_without_the_alternatives_its_request_asked_for_ends_it():

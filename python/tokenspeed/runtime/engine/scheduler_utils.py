@@ -195,9 +195,14 @@ def sampled_top_k_for_forward(forward_op, rid_to_state: Mapping) -> int:
     The ingress takes a top-k request only when each of its tokens is sampled
     in a prefill (``max_new_tokens <= 1``), so decode rows never need one.
     """
+    num_extends = forward_op.num_extends()
+    if num_extends == 0:
+        return 0
+    # One read: each read of the binding's ``request_ids`` builds a new list.
+    request_ids = forward_op.request_ids
     top_k = 0
-    for i in range(forward_op.num_extends()):
-        state = rid_to_state.get(forward_op.request_ids[i])
+    for i in range(num_extends):
+        state = rid_to_state.get(request_ids[i])
         if state is not None and state.return_logprob:
             top_k = max(top_k, state.top_logprobs_num)
     return top_k

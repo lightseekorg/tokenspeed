@@ -1381,6 +1381,13 @@ class OutputProcesser:
         input_top_logprobs_idx: list[list] = []
         output_top_logprobs_val: list[list[list[float]]] = []
         output_top_logprobs_idx: list[list[list[int]]] = []
+        # The top-k columns get one entry per request only in a frame where a
+        # request asked for top-k. Otherwise they stay [] for the whole
+        # frame, which the frontend reads as no alternatives for every
+        # request, so the default path adds no per-request list to the frame.
+        ships_top_logprobs = any(
+            rs.output_top_logprobs_val is not None for rs in output_states
+        )
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -1459,33 +1466,40 @@ class OutputProcesser:
             else:
                 output_token_logprobs_val.append([])
                 output_token_logprobs_idx.append([])
-            if rs.output_top_logprobs_val is not None:
-                # One entry per generated token, shipped with its logprob.
-                n_new = rs.output_length - send_token_offset
-                output_top_logprobs_val.append(
-                    rs.output_top_logprobs_val[-n_new:] if n_new > 0 else []
-                )
-                output_top_logprobs_idx.append(
-                    rs.output_top_logprobs_idx[-n_new:] if n_new > 0 else []
-                )
-            else:
-                output_top_logprobs_val.append([])
-                output_top_logprobs_idx.append([])
-
             # Prompt logprobs ship once, on the first frame after the prompt's
             # final chunk committed; later frames (and a decode-role request,
             # which never finalizes) carry [] and the frontend keeps the lists.
-            if rs.input_token_logprobs_val is not None and not rs.input_logprob_sent:
+            ships_prompt_logprobs = (
+                rs.input_token_logprobs_val is not None and not rs.input_logprob_sent
+            )
+            if ships_prompt_logprobs:
                 rs.input_logprob_sent = True
                 input_token_logprobs_val.append(rs.input_token_logprobs_val)
                 input_token_logprobs_idx.append(rs.input_token_logprobs_idx)
-                input_top_logprobs_val.append(rs.input_top_logprobs_val or [])
-                input_top_logprobs_idx.append(rs.input_top_logprobs_idx or [])
             else:
                 input_token_logprobs_val.append([])
                 input_token_logprobs_idx.append([])
-                input_top_logprobs_val.append([])
-                input_top_logprobs_idx.append([])
+
+            if ships_top_logprobs:
+                # The prompt's alternatives ride with its logprobs.
+                if ships_prompt_logprobs and rs.input_top_logprobs_val is not None:
+                    input_top_logprobs_val.append(rs.input_top_logprobs_val)
+                    input_top_logprobs_idx.append(rs.input_top_logprobs_idx)
+                else:
+                    input_top_logprobs_val.append([])
+                    input_top_logprobs_idx.append([])
+                if rs.output_top_logprobs_val is not None:
+                    # One entry per generated token, shipped with its logprob.
+                    n_new = rs.output_length - send_token_offset
+                    output_top_logprobs_val.append(
+                        rs.output_top_logprobs_val[-n_new:] if n_new > 0 else []
+                    )
+                    output_top_logprobs_idx.append(
+                        rs.output_top_logprobs_idx[-n_new:] if n_new > 0 else []
+                    )
+                else:
+                    output_top_logprobs_val.append([])
+                    output_top_logprobs_idx.append([])
 
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
