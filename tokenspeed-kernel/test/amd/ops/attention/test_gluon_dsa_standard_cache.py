@@ -725,18 +725,20 @@ def test_standard_prefill_logits_fold_64_heads_in_logical_order() -> None:
     assert (expected > 0).all()
 
 
-@pytest.mark.skipif(not is_cdna5(), reason="GFX1250 memory layouts")
-@pytest.mark.parametrize("heads", (32, 64))
-@pytest.mark.parametrize("q_dtype", (torch.bfloat16, torch.float8_e4m3fn))
+# Launcher-level tests cover head counts and query dtypes on the buffer path.
+# This one adds the global-memory path, which only very large caches select,
+# and graph replay with refreshed inputs. 64 FP8 heads exercise both head
+# groups and the query scales.
+@pytest.mark.skipif(not is_cdna5(), reason="GFX1250 memory paths")
 @pytest.mark.parametrize("use_buffer", (False, True))
-def test_standard_prefill_logits_graph_refresh_and_memory_paths(
-    heads: int, q_dtype: torch.dtype, use_buffer: bool
+def test_standard_prefill_graph_replay_on_buffer_and_global_paths(
+    use_buffer: bool,
 ) -> None:
-    generator = _generator(821 + heads)
-    rows, width = 4, 641
+    generator = _generator(885)
+    rows, heads, width = 4, 64, 641
     keys = torch.randn((704, _HEAD_DIM), device=_DEVICE, generator=generator) * 0.15
-    cache, key_reference, _, _ = _pack_standard_cache(keys)
-    query, scales, _ = _prepared_query(rows, heads, q_dtype, generator)
+    cache, _, _, _ = _pack_standard_cache(keys)
+    query, scales, _ = _prepared_query(rows, heads, torch.float8_e4m3fn, generator)
     weights = _noncompact_weights(rows, heads, torch.float32, generator)
     slots = ((torch.arange(width, device=_DEVICE) * 37 + 41) % 704).long()
     starts = torch.tensor((0, 7, 63, 64), device=_DEVICE, dtype=torch.int32)
@@ -761,45 +763,36 @@ def test_standard_prefill_logits_graph_refresh_and_memory_paths(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         invoke()
-    for changed in (False, True):
-        if changed:
-            replacement, replacement_scales, _ = _prepared_query(
-                rows, heads, q_dtype, _generator(1921 + heads)
-            )
-            query.copy_(replacement)
-            if scales is not None:
-                scales.copy_(replacement_scales)
-            weights.mul_(-0.75)
-            slots.copy_(slots.flip(0))
-            ends.copy_(torch.maximum(starts, ends - 13))
-            replacement_keys = (
-                torch.randn((704, _HEAD_DIM), device=_DEVICE, generator=generator)
-                * 0.15
-            )
-            replacement_cache, key_reference, _, _ = _pack_standard_cache(
-                replacement_keys
-            )
-            cache.copy_(replacement_cache)
-        logits.fill_(float("nan"))
-        graph.replay()
-        observed = logits.clone()
-        invoke()
-        query_reference = query.float()
-        if scales is not None:
-            query_reference = query_reference * scales[..., None]
-        for row in range(rows):
-            start, end = int(starts[row]), int(ends[row])
-            expected = _weighted_relu_scores(
-                query_reference[row], weights[row], key_reference[slots[start:end]]
-            )
-            torch.testing.assert_close(
-                observed[row, start:end], logits[row, start:end], atol=0, rtol=0
-            )
-            torch.testing.assert_close(
-                observed[row, start:end], expected, atol=0.02, rtol=0.02
-            )
-            assert observed[row, :start].isnan().all()
-            assert observed[row, end:].isnan().all()
+    # Refresh every input in place; the replay must read the new values.
+    replacement, replacement_scales, query_reference = _prepared_query(
+        rows, heads, torch.float8_e4m3fn, _generator(1985)
+    )
+    query.copy_(replacement)
+    scales.copy_(replacement_scales)
+    weights.mul_(-0.75)
+    slots.copy_(slots.flip(0))
+    ends.copy_(torch.maximum(starts, ends - 13))
+    replacement_keys = (
+        torch.randn((704, _HEAD_DIM), device=_DEVICE, generator=generator) * 0.15
+    )
+    replacement_cache, key_reference, _, _ = _pack_standard_cache(replacement_keys)
+    cache.copy_(replacement_cache)
+    logits.fill_(float("nan"))
+    graph.replay()
+    observed = logits.clone()
+    invoke()
+
+    for row in range(rows):
+        start, end = int(starts[row]), int(ends[row])
+        expected = _weighted_relu_scores(
+            query_reference[row], weights[row], key_reference[slots[start:end]]
+        )
+        assert torch.equal(observed[row, start:end], logits[row, start:end])
+        torch.testing.assert_close(
+            observed[row, start:end], expected, atol=0.02, rtol=0.02
+        )
+        assert observed[row, :start].isnan().all()
+        assert observed[row, end:].isnan().all()
 
 
 @pytest.mark.skipif(not is_cdna5(), reason="GFX1250 column splits")

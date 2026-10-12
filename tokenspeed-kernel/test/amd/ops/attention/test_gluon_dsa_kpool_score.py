@@ -500,35 +500,34 @@ def test_kpool_prefill_logits_preserve_nonfinite_visible_scores(
         assert torch.isposinf(actual).all()
 
 
-@pytest.mark.parametrize("planned", (False, True))
-@pytest.mark.parametrize("ordered_head_fold", (False, True))
-def test_kpool_head_fold_graph_refreshes_keys_and_bounds(
-    planned: bool, ordered_head_fold: bool
+# The flag selects a different head reduction only on GFX950. The top-level op
+# captures only the planned scorer; the page-table path is eager-only.
+@pytest.mark.parametrize("ordered_head_fold", (False, True) if is_cdna4() else (True,))
+def test_kpool_plan_graph_replay_reads_refreshed_inputs(
+    ordered_head_fold: bool,
 ) -> None:
     generator = _generator(2201)
     pages, tokens, width, pool_offset = 14, 4, 173, 13
-    cache, keys = _packed_cache(
+    cache, _ = _packed_cache(
         pages, padding_bytes=192, as_rows=False, generator=generator
     )
     q, weights = _strided_inputs(tokens, torch.float32, generator)
-    table = torch.arange(pages - 1, -1, -1, device=_DEVICE, dtype=torch.int32)[None]
-    ids = torch.zeros(tokens, device=_DEVICE, dtype=torch.int32)
-    causal = torch.tensor((0, 65, 160, 200), device=_DEVICE, dtype=torch.int32) * 4
+    table = torch.arange(pages - 1, -1, -1, device=_DEVICE)
     logical = torch.arange(pages * _PAGE_SIZE, device=_DEVICE)
-    slots = table[0, logical // _PAGE_SIZE].long() * _PAGE_SIZE + logical % _PAGE_SIZE
-    starts = torch.zeros_like(ids)
-    ends = causal // _POOL_SIZE
+    slots = table[logical // _PAGE_SIZE] * _PAGE_SIZE + logical % _PAGE_SIZE
+    starts = torch.zeros((tokens,), device=_DEVICE, dtype=torch.int32)
+    ends = torch.tensor((0, 65, 160, 200), device=_DEVICE, dtype=torch.int32)
     out = torch.empty((tokens, width), device=_DEVICE)
-    local_ends = torch.empty_like(ids)
+    local_ends = torch.empty_like(starts)
 
     def invoke() -> None:
-        launcher = _kpool_prefill_plan_logits if planned else _kpool_prefill_logits
-        metadata = (slots, starts, ends) if planned else (causal, ids, table)
-        launcher(
+        _kpool_prefill_plan_logits(
             q,
             cache,
             weights,
-            *metadata,
+            slots,
+            starts,
+            ends,
             pool_size=_POOL_SIZE,
             page_size=_PAGE_SIZE,
             pool_offset=pool_offset,
@@ -543,50 +542,30 @@ def test_kpool_head_fold_graph_refreshes_keys_and_bounds(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         invoke()
-    for changed in (False, True):
-        if changed:
-            replacement_q, replacement_weights = _strided_inputs(
-                tokens, torch.float32, _generator(2202)
-            )
-            q.copy_(replacement_q)
-            weights.copy_(replacement_weights)
-            replacement_cache, keys = _packed_cache(
-                pages, padding_bytes=192, as_rows=False, generator=_generator(2203)
-            )
-            cache.copy_(replacement_cache)
-            causal.sub_(8).clamp_min_(0)
-            ends.copy_(causal // _POOL_SIZE)
-            table.copy_(table.flip(1))
-            slots.copy_(
-                table[0, logical // _PAGE_SIZE].long() * _PAGE_SIZE
-                + logical % _PAGE_SIZE
-            )
-        out.fill_(float("nan"))
-        local_ends.fill_(-1)
-        graph.replay()
-        observed = out.clone()
-        observed_ends = local_ends.clone()
-        invoke()
-        expected, expected_ends = _reference(
-            q,
-            keys,
-            weights,
-            causal,
-            ids,
-            table,
-            pool_offset=pool_offset,
-            window_cols=width,
-        )
-        torch.testing.assert_close(observed_ends, expected_ends, atol=0, rtol=0)
-        for row, end_tensor in enumerate(expected_ends):
-            end = int(end_tensor)
-            torch.testing.assert_close(
-                observed[row, :end], out[row, :end], atol=0, rtol=0
-            )
-            torch.testing.assert_close(
-                observed[row, :end], expected[row], atol=0.02, rtol=0.02
-            )
-            assert observed[row, end:].isnan().all()
+    # Refresh every input in place. The replay must read the new values, so it
+    # matches an eager run on them bit for bit. Eager accuracy is covered above.
+    replacement_q, replacement_weights = _strided_inputs(
+        tokens, torch.float32, _generator(2202)
+    )
+    q.copy_(replacement_q)
+    weights.copy_(replacement_weights)
+    cache.copy_(
+        _packed_cache(
+            pages, padding_bytes=192, as_rows=False, generator=_generator(2203)
+        )[0]
+    )
+    slots.copy_(slots.flip(0))
+    ends.sub_(2).clamp_min_(0)
+    out.fill_(float("nan"))
+    local_ends.fill_(-1)
+    graph.replay()
+    observed, observed_ends = out.clone(), local_ends.clone()
+    invoke()
+
+    assert torch.equal(observed_ends, local_ends)
+    for row, end in enumerate(observed_ends.tolist()):
+        assert torch.equal(observed[row, :end], out[row, :end])
+        assert observed[row, end:].isnan().all()
 
 
 @pytest.mark.skipif(not is_cdna5(), reason="GFX1250 column splits")
