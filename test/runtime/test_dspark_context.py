@@ -63,7 +63,7 @@ def test_pipeline_projection_matches_concatenated_reference(stage_taps, with_tap
             return F.linear(norms[index](rows), weights[index])
 
         def write(rows, pos, loc, pool, *, attn_backend):
-            assert pool == "last-stage-cache"
+            assert pool == "last-stage-cache" and attn_backend == "last-stage-backend"
             writes.append((rows, pos, loc))
 
         model = SimpleNamespace(
@@ -79,7 +79,9 @@ def test_pipeline_projection_matches_concatenated_reference(stage_taps, with_tap
         producer = DSparkContextProducer(
             model,
             "last-stage-cache" if model.mapping.is_last_pp_rank else None,
-            attn_backend=None,
+            attn_backend=(
+                "last-stage-backend" if model.mapping.is_last_pp_rank else None
+            ),
         )
         accumulator = producer.begin_stage(hidden[0], accumulator)
         for index in owned:
@@ -107,7 +109,7 @@ def test_context_accumulators_do_not_alias_between_inflight_chunks():
         hidden_size=4,
         mapping=SimpleNamespace(is_first_pp_rank=True, is_last_pp_rank=True),
     )
-    producer = DSparkContextProducer(model, object(), attn_backend=None)
+    producer = DSparkContextProducer(model, object(), attn_backend=object())
     first = producer.begin_stage(torch.ones(3, 6), None)
     second = producer.begin_stage(torch.ones(3, 6), None)
     first.fill_(7)

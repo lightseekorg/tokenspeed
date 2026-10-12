@@ -659,7 +659,12 @@ class DFlash(BaseDrafter):
             self._kv_fork_event = torch.cuda.Event()
             self._kv_join_event = torch.cuda.Event()
         if self.draft_model_runner.mapping.attn.kvp_size > 1:
-            # The fused scatter accepts physical slots without an ownership mask.
+            # The fused scatter takes physical slots and has no ownership
+            # mask; the per-layer writer translates through the placement.
+            logger.info(
+                "DFLASH fused KV materialization disabled: the draft cache is "
+                "page-sharded (--kv-parallel-size > 1)."
+            )
             return
         try:
             layers = self.draft_model_runner.model.layers

@@ -480,14 +480,11 @@ class DFlash2DraftModel(DFlashDraftModel):
             attn = layer.self_attn
             latent = attn.project_latent_kv(ctx_hidden)
             latent = attn.apply_latent_rope(positions, latent)
-            # Context injection writes the same sharded cache as attention.
+            # Context injection writes the same sharded cache as attention:
+            # the backend's placement (None for a replicated group) decides
+            # which rows this rank stores and where.
             local_locs, write_mask = resolve_cache_slots(
-                cache_locs,
-                (
-                    attn_backend.cache_placement(attn.attn_mqa)
-                    if attn_backend is not None
-                    else None
-                ),
+                cache_locs, attn_backend.cache_placement(attn.attn_mqa)
             )
             token_to_kv_pool.set_mla_kv_buffer(
                 attn.attn_mqa,

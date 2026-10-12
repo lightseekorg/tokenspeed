@@ -80,10 +80,18 @@ class DSparkContextProducer:
     ) -> None:
         self.model = model
         self.token_to_kv_pool = token_to_kv_pool
+        # The draft attention backend owns the cache placement the writes
+        # translate through (``cache_placement``); a stage that writes the
+        # cache must have it, so a sharded cache is never written as if
+        # replicated.
         self.attn_backend = attn_backend
         if bool(model.mapping.is_last_pp_rank) != (token_to_kv_pool is not None):
             raise ValueError(
                 "Only the final pipeline stage may own the draft context cache"
+            )
+        if (attn_backend is None) != (token_to_kv_pool is None):
+            raise ValueError(
+                "The draft context cache and its attention backend go together"
             )
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
