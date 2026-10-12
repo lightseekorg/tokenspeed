@@ -1254,10 +1254,7 @@ def build_device_side(
     """
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
-    from tokenspeed.runtime.engine.scheduler_utils import (
-        aligned_max_scheduled_tokens,
-        log_gpu_memory_summary,
-    )
+    from tokenspeed.runtime.engine.scheduler_utils import log_gpu_memory_summary
     from tokenspeed.runtime.execution.factory import (
         ModelExecutorConfig,
         _eagle_aux_layer_ids,
@@ -1361,22 +1358,6 @@ def build_device_side(
         reuse_draft_backend=None,
     )
     views = pool_views(attention)
-    # Lowering the limit is safe; a configured chunk smaller than one
-    # state checkpoint block is rejected by aligned_max_scheduled_tokens
-    # instead of silently increasing a frozen buffer limit.
-    if server_args.enable_prefix_caching:
-        aligned = aligned_max_scheduled_tokens(
-            server_args.chunked_prefill_size, views.cache_groups
-        )
-        if aligned != server_args.chunked_prefill_size:
-            logger.warning(
-                f"chunked_prefill_size={server_args.chunked_prefill_size!s} is not a "
-                "multiple of the "
-                f"state-snapshot checkpoint grain; using {aligned!s} so recurrent-state"
-                " "
-                "pages can register for prefix-cache reuse.",
-            )
-            server_args.chunked_prefill_size = aligned
 
     # On CUDA, what startup keeps resident after the probe build joins the reserve.
     startup_memory = (
