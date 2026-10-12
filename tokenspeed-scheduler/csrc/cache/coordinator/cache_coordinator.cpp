@@ -1032,8 +1032,9 @@ void CacheCoordinator::validateProgress(const RequestProgress& progress) const {
     const auto hashed_pages = static_cast<std::int32_t>(completed.prefix_hashes.size());
     _assert(completed.first_new_prefix_page >= 0 && completed.first_new_prefix_page <= hashed_pages,
             "completed page range lies inside the hashed prefix");
-    _assert(completed.first_new_prefix_page < hashed_pages || completed.tail.has_value(),
-            "a publication point without new pages publishes a tail");
+    _assert(completed.first_new_prefix_page < hashed_pages || completed.tail.has_value() ||
+                (completed.publish_state && hashed_pages > 0),
+            "a publication point without new pages publishes a tail or a state checkpoint");
     if (completed.tail) {
         _assert(completed.tail->tail_tokens > 0 && completed.tail->tail_tokens < prefix_granularity_,
                 "a tail lies strictly inside a prefix page");

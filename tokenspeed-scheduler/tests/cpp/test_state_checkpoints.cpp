@@ -138,7 +138,6 @@ protected:
         PlanOnce();
         return resume;
     }
-
 };
 
 TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDecodes) {
@@ -244,7 +243,8 @@ TEST_F(StateCheckpointSuite, SpeculativeDecodeWritesTheLiveSlotInPlace) {
         }
         SendForwardDone("r", tokens);
         ExecutionEvent reserve;
-        reserve.With(forward::UpdateReserveNumTokens{.request_id = "r", .reserve_num_tokens_in_next_schedule_event = 3});
+        reserve.With(
+            forward::UpdateReserveNumTokens{.request_id = "r", .reserve_num_tokens_in_next_schedule_event = 3});
         scheduler_->Advance(reserve);
         EXPECT_EQ(PlanAndStateRow("r"), (std::vector<std::int32_t>{0, first[1]}))
             << "verify widths grow the KV table, never the state table";
@@ -356,8 +356,9 @@ TEST_F(StateCapacitySuite, PromptsFillingThePoolNeverWedgeAtTheirFirstDecode) {
     constexpr std::int32_t kMaxNewTokens = 4;
     std::vector<RequestSpec> specs;
     for (std::int32_t i = 0; i < kRequests; ++i) {
-        specs.push_back(RequestSpec{
-            .request_id = "r" + std::to_string(i), .tokens = MakeTokens(kP, 100 * (i + 1)), .max_new_tokens = kMaxNewTokens});
+        specs.push_back(RequestSpec{.request_id = "r" + std::to_string(i),
+                                    .tokens = MakeTokens(kP, 100 * (i + 1)),
+                                    .max_new_tokens = kMaxNewTokens});
     }
     Submit(specs);
     std::map<std::string, std::int32_t> generated;

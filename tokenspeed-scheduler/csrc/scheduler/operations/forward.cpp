@@ -120,7 +120,12 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
             cache_progress.prefix_hashes.empty() ? std::string{} : cache_progress.prefix_hashes.back();
         tail = request.TailPublicationAt(num_computed_tokens, prior);
     }
-    if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) || tail) {
+    // A final point publishes the frontier's state even when its pages were
+    // all published by an earlier step (a D request leaving at a page-aligned
+    // frontier): the checkpoint is keyed by the last page's chain hash.
+    const bool state_only = point != PublicationPoint::kChunk && !tail && !cache_progress.prefix_hashes.empty() &&
+                            num_computed_tokens == filled_prefix_pages * prefix_granularity;
+    if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) || tail || state_only) {
         progress.completed_pages = CompletedPages{
             .prefix_hashes = cache_progress.prefix_hashes,
             .first_new_prefix_page = first_new_prefix_page,
@@ -195,7 +200,12 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
     const std::int32_t max_cacheable_tokens =
         std::max(std::min(request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens()), 0);
-    const std::int32_t candidate_prefix_pages = std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
+    // The last token is recomputed, so a page the prompt fills exactly can
+    // never be hit -- except on the D role, whose prompt-end state check
+    // needs the prompt's last page hashed when the prompt ends on it.
+    const std::int32_t candidate_prefix_pages = config_.role == Role::kD
+                                                    ? request->PrefillSize() / prefix_granularity
+                                                    : std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
     std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
     prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
     std::vector<std::string> hashes = ComputePrefixHashes(prefix_pages, "");

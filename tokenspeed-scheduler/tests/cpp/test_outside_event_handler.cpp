@@ -1056,14 +1056,14 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     EXPECT_EQ(destination2->input_lengths, (std::vector<std::int32_t>{1}));
     EXPECT_EQ(destination2->state_prefix_cached, std::vector<bool>{false});
     EXPECT_EQ(destination2->block_tables.at("state").at(0).at(0), 0);
-    EXPECT_TRUE(plan2.pages_to_copy.at("full").empty()) << "the D role never copies";
+    EXPECT_TRUE(plan2.pages_to_copy.at("full").empty()) << "the hit's only tail block is the partial one";
     const auto& full2 = destination2->block_tables.at("full").at(0);
     ASSERT_EQ(full2.size(), 6u);  // five prompt pages and the decode reserve
     EXPECT_EQ(std::ranges::count(plan2.pages_to_zero.at("full"), full2.at(4)), 1)
         << "the block containing token 9 is a fresh page";
 }
 
-TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLandsTheStateFresh) {
+TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndClaimsAPageAlignedPromptEndState) {
     Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r0");
     PlanOnce();
@@ -1074,16 +1074,18 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLandsTheStateFres
     succeeded.With(pd::SucceededEvent{"r0"});
     scheduler_->Advance(succeeded);
 
-    // r1 repeats r0's prompt: the history pages are reused, but r0's final
-    // state (published at its 8-token frontier) is not r1's prompt end, so
-    // the peer lands r1's state into a fresh slot 1.
+    // r1 repeats r0's prompt: the history pages are reused up to the probe
+    // bound (the last token is recomputed), and r0's final state -- published
+    // at its 8-token frontier, a page boundary -- is exactly r1's prompt end,
+    // so it is claimed as slot 0 and the peer omits the state transfer.
     Submit({MakeRequestSpec("r1", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r1");
     const ExecutionPlan plan = PlanOnce();
     const ForwardBatch* destination = FindRemoteAdmission(plan);
     ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{6}));
     EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{2}));
-    EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{false});
+    EXPECT_EQ(destination->state_prefix_cached, std::vector<bool>{true});
 
     const auto& full = destination->block_tables.at("full").at(0);
     ASSERT_EQ(full.size(), 5u);
@@ -1091,8 +1093,9 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndLandsTheStateFres
 
     const auto& state = destination->block_tables.at("state").at(0);
     ASSERT_EQ(state.size(), 2u);
-    EXPECT_EQ(state[0], 0);
+    EXPECT_GT(state[0], 0) << "the page-aligned prompt-end checkpoint";
     EXPECT_GT(state[1], 0);
+    EXPECT_NE(state[0], state[1]);
 }
 
 TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMaterializingRemoteTail) {
