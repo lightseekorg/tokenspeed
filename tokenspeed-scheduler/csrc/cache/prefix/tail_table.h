@@ -42,7 +42,8 @@ namespace tokenspeed {
 // entries were evicted is a stale hint that costs one hash and a miss, so
 // pruning is lazy (the coordinator removes a hash when its last Device entry
 // leaves and no Host entry remains). Per prior at most kMaxTailsPerPrior
-// tails are kept, newest publication wins.
+// tails are kept in least-recently-used order: a publication or a hit moves
+// a tail to the back, the cap drops the front.
 class TailTable {
 public:
     static constexpr std::int32_t kMaxTailsPerPrior = 8;
@@ -52,13 +53,13 @@ public:
         ContentHash hash{};           // hash@T
     };
 
-    // Records a published tail. A hash already recorded is left in place.
-    // Returns the hash the per-prior cap dropped, if any; the caller evicts
-    // its entries.
-    std::optional<ContentHash> Add(const ContentHash& prior, std::int32_t tail_tokens, const ContentHash& hash) {
+    // Records a published tail; a hash already recorded becomes the most
+    // recently used. Returns the tail the per-prior cap dropped, if any; the
+    // caller evicts its entries.
+    std::optional<Tail> Add(const ContentHash& prior, std::int32_t tail_tokens, const ContentHash& hash) {
         _assert(tail_tokens > 0, "a tail boundary lies strictly inside a prefix page");
         _assert(!hash.empty(), "a tail is published under a content hash");
-        if (prior_of_.contains(hash)) {
+        if (Touch(hash)) {
             return std::nullopt;
         }
         std::vector<Tail>& tails = tails_by_prior_[prior];
@@ -67,11 +68,25 @@ public:
         if (static_cast<std::int32_t>(tails.size()) <= kMaxTailsPerPrior) {
             return std::nullopt;
         }
-        ContentHash dropped = std::move(tails.front().hash);
+        Tail dropped = std::move(tails.front());
         tails.erase(tails.begin());
-        prior_of_.erase(dropped);
+        prior_of_.erase(dropped.hash);
         ++cap_evictions_;
         return dropped;
+    }
+
+    // A hit on a recorded tail makes it the most recently used of its prior.
+    // Returns whether the hash was recorded.
+    bool Touch(const ContentHash& hash) {
+        const auto prior_it = prior_of_.find(hash);
+        if (prior_it == prior_of_.end()) {
+            return false;
+        }
+        std::vector<Tail>& tails = tails_by_prior_.at(prior_it->second);
+        const auto it = std::ranges::find(tails, hash, &Tail::hash);
+        _assert(it != tails.end(), "a recorded tail hash is in its prior's list");
+        std::rotate(it, it + 1, tails.end());
+        return true;
     }
 
     void Remove(const ContentHash& hash) {
@@ -88,7 +103,7 @@ public:
         prior_of_.erase(prior_it);
     }
 
-    // The tails published under `prior`, in publication order.
+    // The tails published under `prior`, least recently used first.
     std::span<const Tail> Tails(const ContentHash& prior) const {
         const auto it = tails_by_prior_.find(prior);
         return it == tails_by_prior_.end() ? std::span<const Tail>{} : std::span<const Tail>{it->second};

@@ -3411,7 +3411,8 @@ TEST(BoundedReplayCoordinator, ReplayableGroupNeverPublishesOrStreams) {
 
     // Residency of the boundary counts the closed group only: kComplete, not
     // permanently kPartial because of the replayable group.
-    EXPECT_EQ(coord.DeviceBoundaryResidency(Key(hashes[3], 0)), CacheCoordinator::BoundaryResidency::kComplete);
+    EXPECT_EQ(coord.DeviceBoundaryResidency(Key(hashes[3], 0), /*tail_tokens=*/0),
+              CacheCoordinator::BoundaryResidency::kComplete);
 }
 
 TEST(BoundedReplayCoordinator, RetentionStillReclaimsReplayablePages) {
@@ -3948,7 +3949,8 @@ TEST_F(TailPublicationTest, PublishesThePartialPageUnderHashAtT) {
     EXPECT_TRUE(Cached(0, hashes_[1], 1)) << "the full pages are published as before";
     EXPECT_EQ(coordinator_.TailBlocksFor(0, 3), 2);
     EXPECT_EQ(coordinator_.TailBlocksFor(1, 3), 1);
-    EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(tail.hash, 0)), CacheCoordinator::BoundaryResidency::kPartial)
+    EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(tail.hash, 0), tail.tail_tokens),
+              CacheCoordinator::BoundaryResidency::kPartial)
         << "the sliding group holds one of its two tail blocks";
     coordinator_.Free(tables);
 }
@@ -3985,7 +3987,8 @@ TEST_F(TailPublicationTest, EvictingOneTailBlockTakesItsCompanionsAndPrunesTheTa
     EXPECT_FALSE(Cached(2, tail.hash, 1));
     EXPECT_EQ(coordinator_.NumTailEntries(), 0u) << "no tier holds the hash any more";
     EXPECT_TRUE(Cached(0, hashes_[1], 0)) << "the full pages stay";
-    EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(tail.hash, 0)), CacheCoordinator::BoundaryResidency::kNone);
+    EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(tail.hash, 0), tail.tail_tokens),
+              CacheCoordinator::BoundaryResidency::kNone);
 }
 
 // A sliding group's acceptance is not monotone in T: it can hold the lookback
@@ -4023,26 +4026,36 @@ TEST_F(TailPublicationTest, ASlidingGroupMissingThePageLookbackStillResumesAtThe
     EXPECT_EQ(below.device.num_common_tokens, 0);
 }
 
-TEST_F(TailPublicationTest, CapDropsTheOldestTailUnderOnePriorWithItsBlocks) {
+TEST_F(TailPublicationTest, CapDropsTheLeastRecentlyUsedTailUnderOnePriorWithItsBlocks) {
     // Nine requests sharing page 0 and ending at nine different offsets of
-    // page 1 publish nine tails under the same prior.
+    // page 1 publish nine tails under the same prior; the first tail is hit
+    // by a probe before the ninth arrives.
     std::vector<std::vector<BlockTable>> tables;
     std::vector<TailPublication> tails;
+    std::vector<std::vector<std::int32_t>> streams;
     for (std::int32_t extra = 1; extra <= TailTable::kMaxTailsPerPrior + 1; ++extra) {
         std::vector<std::int32_t> tokens = MakeTokens(kP);
         for (std::int32_t i = 0; i < 3; ++i) {
             tokens.push_back(1000 * extra + i);
         }
+        if (extra == TailTable::kMaxTailsPerPrior + 1) {
+            const auto hit = CacheCoordinatorTestAccess::MatchPromptPrefix(
+                coordinator_, CacheCoordinator::PromptPrefix{
+                                  .prefix_hashes = hashes_, .tokens = streams.front(), .max_tokens = kP + 3});
+            ASSERT_EQ(hit.device.num_common_tokens, kP + 3) << "the first tail is a hit";
+        }
         tables.emplace_back(3);
         tails.push_back(PublishFinal(tables.back(), tokens, /*num_computed_tokens=*/kP + 3));
+        streams.push_back(std::move(tokens));
         coordinator_.Free(tables.back());
     }
     EXPECT_EQ(coordinator_.NumTailEntries(), static_cast<std::size_t>(TailTable::kMaxTailsPerPrior));
     EXPECT_EQ(coordinator_.TailCapEvictions(), 1);
-    EXPECT_FALSE(Cached(0, tails.front().hash, 0)) << "the oldest tail's blocks left the index";
-    EXPECT_FALSE(Cached(1, tails.front().hash, 0));
-    EXPECT_FALSE(Cached(2, tails.front().hash, 1));
-    for (std::size_t i = 1; i < tails.size(); ++i) {
+    EXPECT_TRUE(Cached(0, tails.front().hash, 0)) << "the hit kept the first tail";
+    EXPECT_FALSE(Cached(0, tails[1].hash, 0)) << "the least recently used tail's blocks left the index";
+    EXPECT_FALSE(Cached(1, tails[1].hash, 0));
+    EXPECT_FALSE(Cached(2, tails[1].hash, 1));
+    for (std::size_t i = 2; i < tails.size(); ++i) {
         EXPECT_TRUE(Cached(0, tails[i].hash, 0)) << "tail " << i;
     }
 }

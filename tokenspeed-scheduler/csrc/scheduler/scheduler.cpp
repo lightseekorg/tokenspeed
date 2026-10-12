@@ -158,7 +158,11 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
                    "KV event boundary marked for reconcile lost its token descriptor");
         KvEventBoundary& event_boundary = it->second;
         event_boundary.needs_reconcile = false;
-        const CacheCoordinator::BoundaryResidency residency = coordinator_.DeviceBoundaryResidency(boundary);
+        // A tail's descriptor carries fewer tokens than a page.
+        const auto descriptor_tokens = static_cast<std::int32_t>(event_boundary.stored.token_ids.size());
+        const std::int32_t tail_tokens = descriptor_tokens < config_.prefix_granularity ? descriptor_tokens : 0;
+        const CacheCoordinator::BoundaryResidency residency =
+            coordinator_.DeviceBoundaryResidency(boundary, tail_tokens);
         const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
         if (complete && !event_boundary.published) {
             stored.emplace_back(event_boundary.depth, event_boundary.stored);

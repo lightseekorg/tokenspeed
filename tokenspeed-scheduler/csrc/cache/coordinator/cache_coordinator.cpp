@@ -208,10 +208,11 @@ std::int32_t CacheCoordinator::TailBlocksFor(std::int32_t i, std::int32_t tail_t
     return (tail_tokens + block_granularity - 1) / block_granularity;
 }
 
-CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary) const {
+CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary,
+                                                                              std::int32_t tail_tokens) const {
+    _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
     std::int32_t cached = 0;
     std::int32_t total = 0;
-    const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(boundary.content_hash);
     for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
         // A replayable group never holds an entry, so it would keep every
         // boundary permanently partial.
@@ -219,8 +220,8 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
             continue;
         }
         const std::int32_t pages_per_prefix_hash =
-            tail_tokens ? TailBlocksFor(static_cast<std::int32_t>(group_index), *tail_tokens)
-                        : BlocksPerBoundary(static_cast<std::int32_t>(group_index));
+            tail_tokens > 0 ? TailBlocksFor(static_cast<std::int32_t>(group_index), tail_tokens)
+                            : BlocksPerBoundary(static_cast<std::int32_t>(group_index));
         for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
             const CacheKey key{
                 .namespace_id = boundary.namespace_id,
@@ -870,6 +871,12 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
     // The Host floor is the Device's full-page coverage: a Device tail exists
     // only when the Host tier adds nothing beyond it.
     const std::int32_t device_full_tokens = probe.device.full_page_tokens;
+    // A hit keeps its tail young under the per-prior cap.
+    for (const PrefixProbe::Tier* tier : {&probe.device, &probe.host}) {
+        if (tier->tail && tier->tail->tail_tokens > 0) {
+            tails_.Touch(tier->tail->hash);
+        }
+    }
     out.device = acquireTierWithKeys<CacheTier::kDevice>(probe.group_keys, /*floor_tokens=*/0, std::move(probe.device),
                                                          access_epoch);
     // The storage tier is never acquired: an admission loads Host entries
@@ -1293,8 +1300,8 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
     }
-    if (tails_.Contains(removed->content_hash)) {
-        evictTailEntries(removed->content_hash);
+    if (const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(removed->content_hash)) {
+        evictTailEntries(removed->content_hash, *tail_tokens);
     } else if (!GroupIsState(group_id)) {
         // A state checkpoint is matched only with the KV below it: a KV block
         // of its page gone, it is dead weight and leaves too.
@@ -1329,13 +1336,9 @@ std::optional<CacheBlockLocation> CacheCoordinator::deviceLocationOf(std::size_t
     return block ? std::optional<CacheBlockLocation>{block->Location()} : std::nullopt;
 }
 
-void CacheCoordinator::evictTailEntries(const ContentHash& hash) {
-    const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(hash);
-    if (!tail_tokens) {
-        return;
-    }
+void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens) {
     for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const std::int32_t blocks = TailBlocksFor(static_cast<std::int32_t>(i), *tail_tokens);
+        const std::int32_t blocks = TailBlocksFor(static_cast<std::int32_t>(i), tail_tokens);
         for (std::int32_t offset = 0; offset < blocks; ++offset) {
             const CacheKey key{.group_id = groups_[i].Id(), .content_hash = hash, .page_offset = offset};
             // A companion still pinned by a request table stays indexed; it
@@ -1370,19 +1373,9 @@ void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
         return;
     }
     const ContentHash prior = completed.prefix_hashes.empty() ? ContentHash{} : completed.prefix_hashes.back();
-    if (const std::optional<ContentHash> dropped =
+    if (const std::optional<TailTable::Tail> dropped =
             tails_.Add(prior, completed.tail->tail_tokens, completed.tail->hash)) {
-        // The table has already forgotten the dropped hash, so every offset a
-        // page can hold is tried; Find filters.
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            const std::int32_t blocks = BlocksPerBoundary(static_cast<std::int32_t>(i));
-            for (std::int32_t offset = 0; offset < blocks; ++offset) {
-                const CacheKey key{.group_id = groups_[i].Id(), .content_hash = *dropped, .page_offset = offset};
-                if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
-                    evictCachedBlockAlone(groups_[i].Id(), *location);
-                }
-            }
-        }
+        evictTailEntries(dropped->hash, dropped->tail_tokens);
     }
 }
 

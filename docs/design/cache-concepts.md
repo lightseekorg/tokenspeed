@@ -590,9 +590,10 @@ Perception rules per directory:
   argument (`nullptr` when storage is unset) so Host-only matching cannot be
   selected by omitting it. A matcher only *reads* the group's index; it never
   touches allocation or physical placement.
-* **`TailTable`** (`tail_table.h`) — the per-group index of published tails:
-  under the chain hash of the last full page (the *prior*), the `(T mod P,
-  hash@T)` pairs published so far, newest last, capped at
+* **`TailTable`** (`tail_table.h`) — the coordinator's index of published
+  tails: under the chain hash of the last full page (the *prior*), the
+  `(T mod P, hash@T)` pairs published so far in least-recently-used order
+  — a publication or a hit moves a tail to the back — capped at
   `kMaxTailsPerPrior` (8) with a counter of the drops
   (`Scheduler.tail_cap_evictions`). The probe enumerates it to find the
   candidate boundaries inside a page; eviction of a tail's block removes its
@@ -751,8 +752,10 @@ Its responsibilities:
   block is final for its owner, so it passes to the index like a completed
   page. The coordinator keeps a `TailTable` (`cache/prefix/tail_table.h`)
   of the offsets published under each last-full-page hash, capped at eight
-  newest per prior (the dropped tail's blocks are evicted;
-  `Scheduler::TailCapEvictions` counts them), so a probe can enumerate the
+  per prior in least-recently-used order — a hit or a republication keeps a
+  tail young, so a hot shared tail outlives any number of one-off prompts
+  ending in the same page (the dropped tail's blocks are evicted;
+  `Scheduler::TailCapEvictions` counts them) — so a probe can enumerate the
   candidate `T`s without knowing them. A tail's blocks are usable only
   together: evicting one Device block of a tail hash evicts every group's
   entries under it (`evictCachedBlock`), and the table forgets a hash once no

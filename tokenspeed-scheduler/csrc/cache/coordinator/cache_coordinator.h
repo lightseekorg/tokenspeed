@@ -450,12 +450,13 @@ public:
     void SetCacheMutationSink(CacheMutationSink sink) { cache_mutation_sink_ = std::move(sink); }
     // Device residency of one scheduler-level prefix boundary: the child
     // entries every group holds for that content hash -- one per group block
-    // within the prefix granularity for a chain hash, one per group block
-    // below T for a tail hash, one per state group. The boundary key's group
-    // and offset are ignored; only its namespace and content hash identify
-    // the boundary.
+    // within the prefix granularity for a chain hash (tail_tokens 0), one per
+    // group block below T for a tail hash (tail_tokens = T mod P, which the
+    // caller knows from its own publication record), one per state group. The
+    // boundary key's group and offset are ignored; only its namespace and
+    // content hash identify the boundary.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
-    BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary) const;
+    BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
 
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped.
@@ -560,7 +561,7 @@ private:
     void recordPublishedTail(const CompletedPages& completed);
     // Evicts every group's Device entries under a tail hash: a tail's blocks
     // are usable only together, so they leave together.
-    void evictTailEntries(const ContentHash& hash);
+    void evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens);
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
     // Device eviction of one entry without the tail cascade; the cascade
     // calls it for the companions of the block that left.

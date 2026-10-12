@@ -55,8 +55,29 @@ TEST(TailTableTest, SameOffsetDifferentTokensAreTwoTails) {
     table.Add("p", 3, "a");
     table.Add("p", 3, "b");
     EXPECT_EQ(table.Tails("p").size(), 2u);
-    EXPECT_FALSE(table.Add("p", 3, "a").has_value()) << "re-publishing a hash is idempotent";
+    EXPECT_FALSE(table.Add("p", 3, "a").has_value()) << "re-publishing a hash adds nothing";
     EXPECT_EQ(table.Tails("p").size(), 2u);
+    EXPECT_EQ(table.Tails("p").back().hash, "a") << "but makes it the most recently used";
+}
+
+TEST(TailTableTest, AHitOrARepublicationOutlivesEightNewerTails) {
+    // The hot tail "h" is touched before each newcomer, so the cap drops the
+    // newcomers in turn and never "h"; untouched, it would have gone first.
+    TailTable table;
+    table.Add("p", 1, "h");
+    for (std::int32_t t = 2; t <= TailTable::kMaxTailsPerPrior + 3; ++t) {
+        EXPECT_TRUE(table.Touch("h"));
+        const auto dropped = table.Add("p", t, "n" + std::to_string(t));
+        if (t <= TailTable::kMaxTailsPerPrior) {
+            EXPECT_FALSE(dropped.has_value());
+        } else {
+            ASSERT_TRUE(dropped.has_value());
+            EXPECT_EQ(dropped->hash, "n" + std::to_string(t - TailTable::kMaxTailsPerPrior + 1));
+            EXPECT_EQ(dropped->tail_tokens, t - TailTable::kMaxTailsPerPrior + 1);
+        }
+    }
+    EXPECT_TRUE(table.Contains("h"));
+    EXPECT_FALSE(table.Touch("unknown"));
 }
 
 TEST(TailTableTest, RemoveForgetsTheHashAndEmptiesThePrior) {
@@ -81,7 +102,8 @@ TEST(TailTableTest, CapKeepsTheNewestEightPerPriorAndReportsTheDropped) {
     EXPECT_EQ(table.CapEvictions(), 0);
     const auto dropped = table.Add("p", 9, "h9");
     ASSERT_TRUE(dropped.has_value());
-    EXPECT_EQ(*dropped, "h1") << "the oldest publication goes first";
+    EXPECT_EQ(dropped->hash, "h1") << "the least recently used goes first";
+    EXPECT_EQ(dropped->tail_tokens, 1);
     EXPECT_FALSE(table.Contains("h1"));
     EXPECT_EQ(table.Tails("p").size(), static_cast<std::size_t>(TailTable::kMaxTailsPerPrior));
     EXPECT_EQ(table.CapEvictions(), 1);

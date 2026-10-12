@@ -37,6 +37,11 @@ struct CacheCoordinatorTestAccess {
     static auto MatchPrefix(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
         return coordinator.acquirePrefix(coordinator.ProbePrefix(content_hashes), ++coordinator.next_access_epoch_);
     }
+    // A probe over the prompt's tokens too (tails included), acquired as an
+    // admission would.
+    static auto MatchPromptPrefix(CacheCoordinator& coordinator, const CacheCoordinator::PromptPrefix& prompt) {
+        return coordinator.acquirePrefix(coordinator.ProbePromptPrefix(prompt), ++coordinator.next_access_epoch_);
+    }
 
     static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
 
