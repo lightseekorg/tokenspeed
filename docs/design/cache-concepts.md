@@ -706,23 +706,26 @@ Its responsibilities:
   since this node runs no prefill that could continue from it). Its tail
   phase leaves the partial block a hole: the peer's transfer starts at the
   block containing `hit_tokens` and fills a fresh page whole, so the D role
-  never copies it ([Scheduler §3.2](scheduler.md#32-d--decode-worker)).
+  never copies it; a tail's full blocks below that page are copied like on
+  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)).
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
   per group says what that group needs for the round ahead: an extent and a
-  reserve beyond it. The extent is one of two shapes in different reference
-  frames — `DenseGrowth` appends tokens relative to the table's current fill,
-  `SparseSuffix` names an absolute token extent and the first slot to
-  materialize, leaving the slots below as null holes — so the bounded-replay
-  rewrite in `Admit` is a visible conversion from one to the other (hit plus
-  growth becomes the absolute extent), not an arithmetic side effect. One
+  reserve beyond it. The extent is one of three shapes — `DenseGrowth`
+  appends tokens relative to the table's current fill, `SparseSuffix` names an
+  absolute token extent and the first slot to materialize, leaving the slots
+  below as null holes, and `StateStep` names what a State group's two slots
+  do (rotate, release, keep, land) — so the bounded-replay rewrite in `Admit`
+  is a visible conversion from the first to the second (hit plus growth
+  becomes the absolute extent), not an arithmetic side effect. One
   `RequestProgress` per
   request says what the request has done since the coordinator's previous
-  transaction for it: the prefix pages it completed (`CompletedPages`, present
-  only when the newly hashed range is non-empty, so "new hashes without a
-  boundary kind" cannot be expressed) and its computed-token count for
-  retention. Publication fields are request-scoped and therefore live on the
-  progress, not replicated onto every group's demand.
+  transaction for it: what it completed (`CompletedPages`, present only when
+  there is something to publish -- newly hashed pages, a tail, or at a final
+  point the frontier's state -- so "new hashes without a boundary kind"
+  cannot be expressed) and its computed-token count for retention.
+  Publication fields are request-scoped and therefore live on the progress,
+  not replicated onto every group's demand.
 
   Publication rides inside `Admit` on purpose. "Completed" means scheduled
   stream order for prefill (`NumComputedTokens` is the scheduled window end;

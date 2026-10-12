@@ -303,11 +303,12 @@ nothing.
 
 Budget: `SchedulerConfig::Validate` requires `max_scheduled_tokens ≥ W +
 max(W, P)` — a hit chunk re-feeds up to `W` and must still carry the prompt's
-final window whole, or advance by at least a prefix page of new tokens — the
-first chunk spends the hit window before sizing its new tokens (and waits for
-a fresher budget when none is left), and in fused mixed mode the decode batch
-leaves that same amount for a pending local prefill
-(`MinPrefillChunkTokens`). Replay is derived at admission only: a retracted
+final window whole, and keeps at least a prefix page of new tokens when the
+window is smaller than a page (a junction cut may shorten a chunk to any
+positive count, so it imposes no minimum of its own) — the first chunk spends
+the hit window before sizing its new tokens (and waits for a fresher budget
+when none is left), and in fused mixed mode the decode batch leaves that same
+amount for a pending local prefill (`MinPrefillChunkTokens`). Replay is derived at admission only: a retracted
 request's replayable pages are imaged with every other group's, and the chunk
 it resumes has `replay = 0` by construction, so nothing is re-derived at
 restore (§4). Replayable groups combine freely with State groups: a junction
@@ -668,9 +669,10 @@ claimed by an extend forward, and the capacity model charges no prefill peak
 Device cache (`CacheCoordinator::ProbeDecodeDevicePrefix`) so the peer
 transfers only what is missing. For the token-spanned groups it is the
 ordinary probe: `extend_prefix_lens` is the hit `T`, page-aligned or a
-published tail, and the partial page of an unaligned hit is left a hole for
-the peer to fill whole (the D never copies, `pages_to_copy` stays empty on
-this role). For the State groups only one checkpoint counts: the one at
+published tail, and the block containing an unaligned `T` is left a hole for
+the peer to fill whole; the tail's full blocks below it, when a group's
+blocks are smaller than a page, are the hitter's own copies like on every
+role (`pages_to_copy`). For the State groups only one checkpoint counts: the one at
 **exactly the prompt end** (`PrefixProbe::state_at_prompt_end`). When every
 State group holds it, the admission claims it as slot 0 and reports
 `state_prefix_cached` on the `PrefillOperation` (per extend row on the
@@ -840,7 +842,12 @@ harmless.
 **KV-event descriptors.** With `enable_kv_cache_events`, every Device
 publication is a mutation of a boundary that must already have its token
 descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
-descriptor of a boundary with no cached child. Retraction publishes twice
+descriptor of a boundary with no cached child. A boundary is `BlockStored`
+only while every group holds its child -- the State groups included, whose
+checkpoint exists only at a natural point -- so a hybrid model emits
+`BlockStored` for its prompt end, its finish and its junction cuts, never
+for an interior chunk end's chain hash; a tail's descriptor carries the
+rows below `T` and the residency check counts a tail's blocks from it. Retraction publishes twice
 without an admission: `retractVictim` registers the newly hashed pages before
 `CacheCompletedBlocks` (as the finish-time publication does), and the
 `RestoreDone` handler registers the restored request's whole prefix chain

@@ -58,8 +58,8 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
 
 // Budget a fused mixed-mode decode batch leaves untouched so a pending local
 // prefill can still advance: for replayable groups the replay window plus the
-// larger of another window (a final chunk) and one prefix page; 0 otherwise.
-// SchedulerConfig::Validate holds max_scheduled_tokens to it.
+// larger of another window (a final chunk carried whole) and one prefix page;
+// 0 otherwise. SchedulerConfig::Validate holds max_scheduled_tokens to it.
 std::int32_t MinPrefillChunkTokens(const CacheCoordinator& coordinator);
 
 }  // namespace tokenspeed

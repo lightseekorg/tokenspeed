@@ -65,8 +65,8 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
 
 std::int32_t MinPrefillChunkTokens(const CacheCoordinator& coordinator) {
     // A hit chunk re-feeds up to one replay window and then still needs room
-    // to advance: every new token when fewer than a window remain, or one
-    // prefix page when a junction cut shortens it.
+    // to carry the prompt's final window whole, or at least a prefix page of
+    // new tokens when the window is smaller than a page.
     const std::int32_t window = coordinator.ReplayWindowTokens();
     return window > 0 ? window + std::max(window, coordinator.PrefixGranularity()) : 0;
 }

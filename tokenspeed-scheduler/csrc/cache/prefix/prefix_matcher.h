@@ -52,6 +52,8 @@ public:
     // probe.hits[i] marks keys[begin_blocks + i]; holes are 0.
     // extra_hits is the L3 storage index (keys known to exist below Host).
     // Pass nullptr when L3 is unset; omitting it would silently skip L3 hits.
+    // The page walk of the probe's aligned phase; a matcher the coordinator
+    // judges per candidate boundary alone has no walk.
     virtual GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
                                    std::int32_t begin_blocks, std::int32_t max_blocks,
                                    const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const = 0;
@@ -83,22 +85,18 @@ public:
 // A State group holds whole recurrent states at the boundaries requests
 // published them (prompt end, finish, retraction, a junction cut): one key per
 // boundary, no lookback, no run. The coordinator tests each candidate
-// boundary's key directly; Probe answers per key for the aligned candidates.
+// boundary's key directly and never walks a State group's pages.
 class StateMatcher : public PrefixMatcher {
 public:
     bool IsPrefixClosed() const override { return false; }
     std::int32_t BoundaryLookbackPages() const override { return 0; }
 
-    GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                           std::int32_t begin_blocks, std::int32_t max_blocks,
-                           const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const override {
-        const std::int32_t end_blocks =
-            static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
-        GroupPrefixProbe probe;
-        for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
-            probe.hits.push_back(PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(j)], extra_hits) ? 1 : 0);
-        }
-        return probe;
+    GroupPrefixProbe Probe(const PrefixCacheIndex& /*index*/, const BlockPool& /*pool*/,
+                           std::span<const CacheKey> /*keys*/, std::int32_t /*begin_blocks*/,
+                           std::int32_t /*max_blocks*/,
+                           const std::unordered_set<CacheKey, CacheKeyHash>* /*extra_hits*/) const override {
+        FatalCheck(false, "a State group's boundaries are judged per candidate, never walked");
+        return {};
     }
 };
 
