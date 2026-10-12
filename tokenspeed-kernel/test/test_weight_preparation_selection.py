@@ -193,7 +193,7 @@ def test_explicit_override_keeps_compatibility_bypass(h100_platform):
         )
 
 
-def test_legacy_preprocessor_requires_initialization_or_pinned_execution(h100_platform):
+def test_callable_preprocessor_preserves_signature_based_selection(h100_platform):
     _register("legacy", SOURCE, weight_preprocessor=_prepare)
     assert (
         select_kernel(
@@ -201,8 +201,10 @@ def test_legacy_preprocessor_requires_initialization_or_pinned_execution(h100_pl
         ).name
         == "legacy"
     )
-    with pytest.raises(NoKernelFoundError):
-        select_kernel("test_weight", "apply", SOURCE, platform=h100_platform)
+    assert (
+        select_kernel("test_weight", "apply", SOURCE, platform=h100_platform).name
+        == "legacy"
+    )
     assert (
         select_kernel(
             "test_weight", "apply", SOURCE, platform=h100_platform, override="legacy"

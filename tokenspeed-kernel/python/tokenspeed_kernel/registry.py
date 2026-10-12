@@ -195,10 +195,6 @@ class KernelSpec:
     def supports_format_signature(
         self, format_signature: FormatSignature, *, ignore_layout: bool = False
     ) -> bool:
-        # Unmigrated preprocessors still require their pinned execution path;
-        # their implicit canonical signatures do not describe prepared storage.
-        if not ignore_layout and callable(self.weight_preprocessor):
-            return False
         return any(
             signature.roles == format_signature.roles
             and (ignore_layout or format_signature.layouts.issubset(signature.layouts))
