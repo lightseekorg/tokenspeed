@@ -162,6 +162,23 @@ class RequestState:
         self.input_token_logprobs_val: list[float | None] | None = None
         self.input_token_logprobs_idx: list[int] | None = None
         self.input_logprob_sent: bool = False
+        # Top-k alternatives (``top_logprobs_num``, ``return_logprob``'s
+        # dialect): one ``(values, ids)`` per scored prompt position, beside
+        # ``input_token_logprobs`` and finalized into ``[None] + rows``; and
+        # one ``values`` / ``ids`` list per generated token. None when the
+        # request asks for none.
+        self.input_top_logprobs: list[tuple[list[float], list[int]] | None] | None = (
+            [None] * len(self.input_token_logprobs)
+            if self.input_token_logprobs is not None and top_logprobs_num > 0
+            else None
+        )
+        self.input_top_logprobs_val: list[list[float] | None] | None = None
+        self.input_top_logprobs_idx: list[list[int] | None] | None = None
+        wants_top = return_logprob and top_logprobs_num > 0
+        self.output_top_logprobs_val: list[list[float]] | None = (
+            [] if wants_top else None
+        )
+        self.output_top_logprobs_idx: list[list[int]] | None = [] if wants_top else None
         # The NaN guard flagged this request on a prefill chunk that owed no
         # token yet (a NaN prompt logprob, or NaN logits of the chunk's last
         # row). The abort is issued when the prompt completes, like a flag on
@@ -275,8 +292,15 @@ class RequestState:
             and self.logprob_start_len < self.input_length - 1
         )
 
-    def record_input_token_logprobs(self, start: int, logprobs: list[float]) -> None:
-        """Store one chunk's prompt logprobs for positions ``[start, start+n)``."""
+    def record_input_token_logprobs(
+        self,
+        start: int,
+        logprobs: list[float],
+        top: tuple[list[list[float]], list[list[int]]] | None = None,
+    ) -> None:
+        """Store one chunk's prompt logprobs for positions ``[start, start+n)``,
+        and their top-k alternatives (``top``: per-row values and ids, most
+        likely first) cut to the request's ``top_logprobs_num``."""
         if self.input_token_logprobs is None:
             raise RuntimeError("prompt logprobs recorded for a request that wants none")
         offset = start - self.logprob_start_len
@@ -286,6 +310,18 @@ class RequestState:
                 f"[{self.logprob_start_len}, {self.input_length - 1})"
             )
         self.input_token_logprobs[offset : offset + len(logprobs)] = logprobs
+        if self.input_top_logprobs is not None:
+            if top is None:
+                raise RuntimeError(
+                    "prompt logprobs recorded without the top-k alternatives the "
+                    "request asked for"
+                )
+            k = self.top_logprobs_num
+            values, ids = top
+            self.input_top_logprobs[offset : offset + len(logprobs)] = [
+                (row_values[:k], row_ids[:k])
+                for row_values, row_ids in zip(values, ids)
+            ]
 
     def finalize_input_token_logprobs(self) -> None:
         """Assemble the SGLang lists once the prompt's final chunk committed.
@@ -321,6 +357,22 @@ class RequestState:
                 f"for {len(self.input_token_logprobs_idx)} tokens"
             )
         self.input_token_logprobs = None
+        if self.top_logprobs_num > 0:
+            tops = (
+                list(self.input_top_logprobs)
+                if self.input_top_logprobs is not None
+                else []
+            )
+            if len(tops) != len(logprobs) or any(top is None for top in tops):
+                raise RuntimeError(
+                    "prompt top-k logprobs incomplete: "
+                    f"{sum(top is not None for top in tops)} of {len(logprobs)} "
+                    "positions have alternatives"
+                )
+            # Element 0 has no alternatives, like its value.
+            self.input_top_logprobs_val = [None] + [top[0] for top in tops]
+            self.input_top_logprobs_idx = [None] + [top[1] for top in tops]
+            self.input_top_logprobs = None
 
     def add_computed_length(self, incr: int):
         self.computed_length += incr
@@ -795,6 +847,19 @@ class OutputProcesser:
         )
         output_lengths_list = model_execution_results.output_lengths.tolist()
         output_tokens_list = model_execution_results.output_tokens.tolist()
+        # The prefill rows' sampled-token alternatives, in prefill output
+        # order: extend slot i's rows start where its tokens do (``pt``).
+        output_top_val_list = output_top_idx_list = None
+        if (
+            getattr(model_execution_results, "output_top_logprobs_val", None)
+            is not None
+        ):
+            output_top_val_list = (
+                model_execution_results.output_top_logprobs_val.tolist()
+            )
+            output_top_idx_list = (
+                model_execution_results.output_top_logprobs_idx.tolist()
+            )
         self._record_input_token_logprobs(forward_op, model_execution_results)
         # Per-slot total prefill length as the OP sees it (C++
         # Request::PrefillSize()): the prompt length. A capacity retraction
@@ -812,6 +877,14 @@ class OutputProcesser:
                 else None
             )
             is_decode_slot = i >= num_extends
+            model_output_top = (
+                (
+                    output_top_val_list[pt : pt + output_length],
+                    output_top_idx_list[pt : pt + output_length],
+                )
+                if output_top_val_list is not None and not is_decode_slot
+                else None
+            )
             if self.spec_num_tokens is not None and is_decode_slot:
                 pt += self.spec_num_tokens
             else:
@@ -941,6 +1014,27 @@ class OutputProcesser:
                         model_output_logprobs[j]
                     )
                     request_state.output_token_logprobs_idx.append(model_output_id)
+                if request_state.output_top_logprobs_val is not None:
+                    if model_output_top is None or j >= len(model_output_top[0]):
+                        # The ingress takes a top-k request only when every
+                        # token of it is sampled in a prefill, which reports
+                        # the alternatives; end the request rather than ship
+                        # a token without them.
+                        if not request_state.finished:
+                            request_state.finished_reason = FINISH_ABORT(
+                                message=(
+                                    "top-k logprobs are not computed for this "
+                                    "step (decode steps return none)"
+                                ),
+                            )
+                    else:
+                        k = request_state.top_logprobs_num
+                        request_state.output_top_logprobs_val.append(
+                            model_output_top[0][j][:k]
+                        )
+                        request_state.output_top_logprobs_idx.append(
+                            model_output_top[1][j][:k]
+                        )
                 if term_idx == j:
                     # Grammar termination takes precedence over
                     # length/EOS/stop_str at the same step (matching
@@ -1059,6 +1153,10 @@ class OutputProcesser:
                 f"prompt logprob result has {len(values)} rows for a plan of "
                 f"{plan.num_rows}"
             )
+        top_values = top_ids = None
+        if getattr(model_execution_results, "input_top_logprobs_val", None) is not None:
+            top_values = model_execution_results.input_top_logprobs_val.tolist()
+            top_ids = model_execution_results.input_top_logprobs_idx.tolist()
         cursor = 0
         for i, count in enumerate(plan.counts):
             if count == 0:
@@ -1066,7 +1164,16 @@ class OutputProcesser:
             state = self.rid_to_state.get(forward_op.request_ids[i])
             if state is not None and state.input_token_logprobs is not None:
                 state.record_input_token_logprobs(
-                    plan.position_starts[i], values[cursor : cursor + count]
+                    plan.position_starts[i],
+                    values[cursor : cursor + count],
+                    (
+                        (
+                            top_values[cursor : cursor + count],
+                            top_ids[cursor : cursor + count],
+                        )
+                        if top_values is not None
+                        else None
+                    ),
                 )
             cursor += count
 
@@ -1270,6 +1377,10 @@ class OutputProcesser:
         output_token_logprobs_idx: list[list[int]] = []
         input_token_logprobs_val: list[list[float | None]] = []
         input_token_logprobs_idx: list[list[int]] = []
+        input_top_logprobs_val: list[list] = []
+        input_top_logprobs_idx: list[list] = []
+        output_top_logprobs_val: list[list[list[float]]] = []
+        output_top_logprobs_idx: list[list[list[int]]] = []
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -1348,6 +1459,18 @@ class OutputProcesser:
             else:
                 output_token_logprobs_val.append([])
                 output_token_logprobs_idx.append([])
+            if rs.output_top_logprobs_val is not None:
+                # One entry per generated token, shipped with its logprob.
+                n_new = rs.output_length - send_token_offset
+                output_top_logprobs_val.append(
+                    rs.output_top_logprobs_val[-n_new:] if n_new > 0 else []
+                )
+                output_top_logprobs_idx.append(
+                    rs.output_top_logprobs_idx[-n_new:] if n_new > 0 else []
+                )
+            else:
+                output_top_logprobs_val.append([])
+                output_top_logprobs_idx.append([])
 
             # Prompt logprobs ship once, on the first frame after the prompt's
             # final chunk committed; later frames (and a decode-role request,
@@ -1356,9 +1479,13 @@ class OutputProcesser:
                 rs.input_logprob_sent = True
                 input_token_logprobs_val.append(rs.input_token_logprobs_val)
                 input_token_logprobs_idx.append(rs.input_token_logprobs_idx)
+                input_top_logprobs_val.append(rs.input_top_logprobs_val or [])
+                input_top_logprobs_idx.append(rs.input_top_logprobs_idx or [])
             else:
                 input_token_logprobs_val.append([])
                 input_token_logprobs_idx.append([])
+                input_top_logprobs_val.append([])
+                input_top_logprobs_idx.append([])
 
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
@@ -1383,10 +1510,10 @@ class OutputProcesser:
             input_token_logprobs_idx=input_token_logprobs_idx,
             output_token_logprobs_val=output_token_logprobs_val,
             output_token_logprobs_idx=output_token_logprobs_idx,
-            input_top_logprobs_val=[],
-            input_top_logprobs_idx=[],
-            output_top_logprobs_val=[],
-            output_top_logprobs_idx=[],
+            input_top_logprobs_val=input_top_logprobs_val,
+            input_top_logprobs_idx=input_top_logprobs_idx,
+            output_top_logprobs_val=output_top_logprobs_val,
+            output_top_logprobs_idx=output_top_logprobs_idx,
             input_token_ids_logprobs_val=[],
             input_token_ids_logprobs_idx=[],
             output_token_ids_logprobs_val=[],

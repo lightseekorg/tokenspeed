@@ -215,7 +215,17 @@ scheduler drive (SMG) carries sampled-token logprobs only: it refuses a
 `logprob_start_len` that would produce prompt logprobs rather than compute
 and drop them.
 
-`top_logprobs_num > 0` and `token_ids_logprob` are not supported yet.
+`top_logprobs_num=k` (1 to 20) adds each position's `k` most likely tokens,
+most likely first, as `(logprob, token_id, text|null)` triples:
+`meta_info["input_top_logprobs"]` beside the prompt logprobs (`null` for the
+first position, like its value) and `meta_info["output_top_logprobs"]`
+beside the sampled token. They come from the same fp32 log-softmax as the
+values. The engine computes them where the forward runs eagerly, so the
+ingress takes `top_logprobs_num` only for a request whose every token is
+sampled in its prefill (`max_new_tokens` 0 or 1, as an `echo` scoring request
+sends) and with `--logprob-order torch`; a longer generation, pipeline
+parallelism and disaggregated prefill and decode get a 400, and the direct
+msgpack scheduler drive refuses it. `token_ids_logprob` is not supported yet.
 
 This runtime requires a `tokenspeed-scheduler` build that has
 `RequestSpec.max_cached_prefix_tokens` (the admission-probe bound; see

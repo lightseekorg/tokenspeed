@@ -704,8 +704,13 @@ def test_grammar_mask_producers_walk_only_original_decode_candidates(
 
 
 def test_drafter_future_inputs_keep_original_request_rows():
+    from tokenspeed.runtime.execution.types import ForwardLogprobs
+
     forward = load_symbol(
-        RUNTIME + "execution/model_executor.py", "_forward_step", owner="ModelExecutor"
+        RUNTIME + "execution/model_executor.py",
+        "_forward_step",
+        owner="ModelExecutor",
+        ForwardLogprobs=ForwardLogprobs,
     )
     future_inputs = torch.full((6, 3), 77, dtype=torch.int32)
     draft_tokens = torch.tensor(

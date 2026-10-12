@@ -497,9 +497,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # SGLang dialect: prompt (input) logprobs are returned for positions
     # ``[logprob_start_len, len(input_ids))``; -1 selects the last prompt
     # token only (no prompt logits needed). The ingress resolves -1 and
-    # rejects starts past the prompt. Output top-k and token-id logprobs are
-    # not supported: InputProcessor keeps top_logprobs_num=0 and
-    # token_ids_logprob=None.
+    # rejects starts past the prompt. Top-k logprobs (``top_logprobs_num``)
+    # are taken only for a request whose tokens are all sampled in its
+    # prefill (see InputProcessor); token-id logprobs are not supported:
+    # InputProcessor keeps token_ids_logprob=None.
     logprob_start_len: int = -1
     top_logprobs_num: int = 0
     token_ids_logprob: list[int] | None = None

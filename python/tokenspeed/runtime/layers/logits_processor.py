@@ -165,11 +165,20 @@ class LogitsProcessorOutput:
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     next_token_token_ids_logprobs_val: list | None = None
     next_token_token_ids_logprobs_idx: list | None = None
+    # Eager prefills only (``ForwardContext.sampled_top_k``): the most likely
+    # tokens of each prefill row's sampled position, fp32 log-softmax values
+    # and int64 ids, set by the executor after sampling. shape: [#prefill rows, k]
+    sampled_top_logprobs_val: torch.Tensor | None = None
+    sampled_top_logprobs_idx: torch.Tensor | None = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
     # The logprobs of the prompt rows the forward's ``InputLogprobPlan``
     # named, fp32 in plan order, whole on every rank.  shape: [#rows]
     input_token_logprobs: torch.Tensor | None = None
+    # With the plan's ``top_k``: each row's most likely next tokens, fp32
+    # values and int64 ids, most likely first.  shape: [#rows, k]
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
 
 
 @dataclasses.dataclass
@@ -618,9 +627,9 @@ class LogitsProcessor(nn.Module):
         # Prompt logprobs read the [num_input_rows, hidden] activations this
         # rank holds, so they are scored before the sampled-row selection
         # below (on a shard: before the sampled rows leave it).
-        input_token_logprobs = None
+        input_token_logprobs = input_top = None
         if logits_metadata.input_logprob_rows is not None:
-            input_token_logprobs = self.compute_input_token_logprobs(
+            input_token_logprobs, input_top = self.compute_input_token_logprobs(
                 hidden_states, lm_head, logits_metadata, shard
             )
 
@@ -716,6 +725,8 @@ class LogitsProcessor(nn.Module):
             hidden_states=hidden_states_to_store,
             logits_layout_plan=logits_layout_plan,
             input_token_logprobs=input_token_logprobs,
+            input_top_logprobs_val=None if input_top is None else input_top[0],
+            input_top_logprobs_idx=None if input_top is None else input_top[1],
         )
 
     def _query_shard(self, logits_metadata: LogitsMetadata) -> QueryShardPlan | None:
@@ -752,7 +763,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         shard: QueryShardPlan | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         """Logprob of each named prompt row's next token, position-chunked.
 
         The rows (``logits_metadata.input_logprob_rows``) are pushed through the
@@ -790,8 +801,18 @@ class LogitsProcessor(nn.Module):
                 (``_query_shard``): the plan whose rows ``hidden_states`` are,
                 ``None`` when they are the whole forward's.
 
+        With the plan's ``top_k`` each chunk's fp32 log-softmax is computed
+        once: the targets are gathered from it (the arithmetic of
+        ``gather_token_logprobs_torch``, so a target's value equals its own
+        top-k entry bit for bit) and its ``top_k`` largest values are kept.
+        Top-k is taken in torch's logprob order only (the ingress refuses it
+        otherwise).
+
         Returns:
-            fp32 ``[plan rows]`` logprobs in row order, the whole plan's.
+            fp32 ``[plan rows]`` logprobs in row order, the whole plan's, and
+            with a ``top_k`` the ``([plan rows, top_k]`` fp32 values,
+            ``[plan rows, top_k]`` int64 ids``) of each row's most likely next
+            tokens, most likely first; None without one.
 
         Raises:
             ValueError: The model narrowed its logits rows (``hidden_states``
@@ -848,7 +869,23 @@ class LogitsProcessor(nn.Module):
             raise ValueError(
                 f"{num_rows} prompt-logprob targets for {staged_rows} rows"
             )
+        top_k = plan.top_k
+        if top_k > 0 and self.logprob_order != "torch":
+            raise ValueError(
+                "top-k prompt logprobs need --logprob-order torch, not "
+                f"{self.logprob_order}"
+            )
         out = torch.empty(num_rows, dtype=torch.float32, device=hidden_states.device)
+        top = None
+        if top_k > 0:
+            top = (
+                torch.empty(
+                    (num_rows, top_k), dtype=torch.float32, device=hidden_states.device
+                ),
+                torch.empty(
+                    (num_rows, top_k), dtype=torch.int64, device=hidden_states.device
+                ),
+            )
         for begin in range(0, num_rows, plan.chunk_tokens):
             end = min(begin + plan.chunk_tokens, num_rows)
             rows = source[begin:end] if index is None else source[index[begin:end]]
@@ -859,11 +896,21 @@ class LogitsProcessor(nn.Module):
                 plan=None,
                 require_full_vocab=True,
             )
-            out[begin:end] = gather_token_logprobs(
-                logits, plan.targets[begin:end], logprob_order=self.logprob_order
-            )
+            if top is None:
+                out[begin:end] = gather_token_logprobs(
+                    logits, plan.targets[begin:end], logprob_order=self.logprob_order
+                )
+            else:
+                logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float32)
+                out[begin:end] = logprobs.gather(
+                    -1, plan.targets[begin:end].unsqueeze(-1)
+                ).squeeze(-1)
+                values, ids = logprobs.topk(top_k, dim=-1)
+                top[0][begin:end] = values
+                top[1][begin:end] = ids
+                del logprobs, values, ids
             del logits
-        return out
+        return out, top
 
     def _lm_head_tp_row_counts(
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
