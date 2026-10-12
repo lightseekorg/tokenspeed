@@ -1,130 +1,82 @@
-# PD-disaggregation simulation bench
+# Kimi-K3 P/D benchmarks
 
-Measure prefill request capacity and decode token throughput separately for
-Kimi-K3. `p_bench.slurm` runs one prefill conversation workload;
-`d_bench.slurm` sweeps cached-prompt decode concurrency. The shared client is
-`pd_client.py`. Its `TARGET_RESPONSE_TOKENS` constant (500) sets both P's
-synthetic assistant length and the target output length used to normalize D
-request throughput.
+Measure prefill and decode capacity separately, or run a complete 1P1D
+benchmark with KV transfer.
 
-## Data
+| Script | Workload | Nodes (4 GPUs each) |
+| --- | --- | --- |
+| `agentic_bench.slurm` | 1P1D, both ADP16/EP16 | 8 |
+| `p_bench.slurm` | Prefill simulation, ADP16/EP16 | 4 |
+| `d_bench.slurm` | Decode simulation, ADP16/EP16 then ADP32/EP32 | 8 |
 
-Both scripts use the SWE-smith dataset with 4,000-token first turns,
-800-token user increments and 30–50 turns. The current build has 69 source
-conversations; 32 replicas produce 2,208 conversations in
-`agentic_dataset_x32.json`. Each replica has a distinct `[rid:<hash>]` prefix.
-Existing dataset files are reused, so regenerate both files when changing
-the dataset settings.
+## Running
 
-The dataset stores user-message increments, without assistant responses.
-P inserts synthetic assistant text to model the work from previous decode
-outputs. D concatenates the original user messages into one representative
-long prompt, approximately 27K–43K tokens. These are workload approximations:
-synthetic text can change MoE routing, and D does not replay real assistant
-history.
-
-## Routing and placement
-
-Every request carries `rid=pdsim-conv-<index>`. The gateway uses
-`--dp-aware --sticky-sessions --policy round_robin` to preserve rank-local
-prefix reuse. Server steps select the first four allocated nodes for DP16,
-or the first eight for DP32, with four GPU workers per node. Dataset
-preparation and clients run on the selected head node.
-
-## P: conversation replay
-
-`p_bench.slurm` uses DP16/EP16. It warms up with 16 concurrent conversations
-from indices 1024–1039, then measures 1,024 conversations from indices
-0–1023 at concurrency 512.
-
-Each worker sends one turn at a time with `max_tokens=1`, appends a prepared
-500-token synthetic assistant response locally, and advances to the next
-user turn. A finished conversation is immediately replaced by another from
-the pool. First turns are cold; subsequent turns reuse the accumulated
-prefix and normally add roughly 500 assistant tokens plus 800 user tokens,
-subject to chat formatting and cache block boundaries.
-
-Synthetic responses are seeded by conversation index, exclude special token
-IDs, and are validated to re-encode to 500 tokens. All responses are prepared
-before timing. P never generates or separately primes those 500 tokens.
-
-The primary capacity is **mu_P = completed turn requests / wall time** for
-the entire engine. The summary also reports computed tokens/s, cache-hit
-rate and mean/p50/p99 request latency. Latency includes queueing at this
-load and must not be substituted for queue-free prefill processing time.
-Check batch occupancy and client/server load before treating requests/s as
-saturated capacity.
-
-## D: cached-prompt decode
-
-Each concurrency point has a separate prime/measure sequence:
-
-1. Concatenate all user turns for each selected conversation and prime that
-   prompt with `max_tokens=1` at concurrency 16.
-2. Settle for 10 seconds to allow host cache writebacks to complete.
-3. Replay the identical prompts and conversation IDs with `max_tokens=2000`
-   and `ignore_eos`, issuing one wave of requests at the target concurrency.
-
-The ladder is 16/32/64/128/256/384/512. Report output tokens/s/GPU, equivalent
-requests/s at the target OSL, cache-hit rate and TPOT p50/p99. Concurrency is the client setting; actual
-GPU batches can vary during admission and completion. Each point is primed
-again because generated-token checkpoints can evict prefixes needed later.
-
-This simulation substitutes prefix-cache reuse for real KV transfer. Its
-reported TPOT divides full request latency by output length, amortizing the
-cache load and first-token work over 2,000 output tokens.
-
-## P:D sizing
-
-`collect_outputs.py` prints `Requests/s @ target OSL` and `Target Response
-Tokens` in both tables. P uses its measured request rate; D uses output
-tokens/s divided by the target response length. For example, 8,760 output
-tokens/s gives 17.52 equivalent requests/s at OSL=500, while the measured
-2,000-token request rate is 4.38 requests/s. Summary JSON retains the raw
-measured `Requests/s` and records `Target Response Tokens` for both phases.
-
-The sizing helper pairs P and D measurements with the same engine
-configuration and target OSL. It consumes the displayed rates directly and
-reports `ideal n_P = mu_D / mu_P` with one D instance. The ratio is fractional
-and excludes real KV-transfer costs. Integer allocation and end-to-end
-performance still need validation.
-
-## Server settings
-
-The current config uses `--max-num-seqs 512`, 4,096-token prefill chunks,
-`--gpu-memory-utilization 0.9`, and `--kvstore-size 80` GB per rank. Sampling
-is greedy. The host KV tier stores finished contexts, so a reported cache
-hit may involve a host-to-device load rather than an already resident GPU
-prefix. Server logs are written to
-`/tmp/tokenspeed_server_disagg_<config>_<sweep-ts>.log`.
-
-## Running on Slurm
-
-Use an existing allocation with initialized containers. P currently needs
-four nodes; the D config list includes DP32 and therefore needs eight.
-Run each wrapper once, with the scripts' container settings:
+From this directory, use an existing allocation with initialized `ts`
+containers. Run one launcher at a time:
 
 ```bash
-SLURM_JOB_ID=<jobid> CONTAINER_IMAGE=<sqsh-or-ref> \
-    bash test/agentic_benchmark/kimi_k3/tokenspeed_disagg/p_bench.slurm
-SLURM_JOB_ID=<jobid> CONTAINER_IMAGE=<sqsh-or-ref> \
-    bash test/agentic_benchmark/kimi_k3/tokenspeed_disagg/d_bench.slurm
-python3 test/agentic_benchmark/kimi_k3/tokenspeed_disagg/collect_outputs.py \
-    test/agentic_benchmark/kimi_k3/tokenspeed_disagg/outputs/p_<ts> \
-    test/agentic_benchmark/kimi_k3/tokenspeed_disagg/outputs/d_<ts>
+SLURM_JOB_ID="$JOBID" \
+CONTAINER_IMAGE=/path/to/tokenspeed-dev.sqsh \
+./agentic_bench.slurm
 ```
 
-Warmup is excluded from collected results. Failed requests stop the run;
-cache-hit rates are reported for the user to assess without filtering.
+Use the same invocation with `p_bench.slurm` or `d_bench.slurm` for the
+separate simulations. Server settings live in `configs/`. `CONTAINER_NAME`
+and `CONTAINER_MOUNTS` override the container name and mounts; the defaults
+are `ts` and `/data:/data`. For 1P1D, set `DISAGGREGATION_IB_DEVICE` if
+Mooncake needs an explicit NIC list.
 
-## Layout
+## Dataset
 
+The scripts install a pinned EvalScope revision and use its SWE-smith
+builder to create `agentic_dataset_x128.json`: 4,000-token first turns,
+800-token user increments, 30–50 turns, and 128 replicas. Replicas have
+unique prompt prefixes and conversation IDs. The file is reused on later
+runs; regenerate it when changing dataset settings.
+
+## End-to-end 1P1D
+
+`agentic_bench.slurm` launches prefill on the first four nodes and decode
+on the next four. Both use `configs/attn_dp16_moe_ep16.sh --grpc`, with
+Slurm step topology detected automatically. Mooncake transfers KV caches
+between them. One SMG gateway uses DP-aware sticky sessions with
+`min_load` assignment and EvalScope conversation IDs.
+
+After a separate 16-conversation warmup, the client sweeps concurrency
+16/32/64/128/256/384/512 with two conversations per slot. Each turn generates
+500 tokens with greedy sampling. Results and P/D/gateway logs are under
+`outputs/pd_1p1d_<timestamp>/`, in `benchmark/`, `warmup/`, and `logs/`.
+Normalize throughput by **32 GPUs**. Total token throughput includes cached
+input tokens; distinguish it from output-only throughput.
+
+## Separate P/D simulations
+
+`pd_client.py` uses `TARGET_RESPONSE_TOKENS=500` for synthetic assistant
+responses and decode request-rate normalization. Both simulations use
+sticky conversation IDs for prefix reuse.
+
+- **Prefill:** warm up with 16 conversations, then replay 1,024 conversations
+  at concurrency 512. Each turn generates one token; the client appends
+  500 synthetic assistant tokens before the next user turn.
+- **Decode:** sweep concurrency 16/32/64/128/256/384/512. At each point,
+  concatenate all stored user turns, prime those prompts at concurrency 16,
+  wait 10 seconds, then generate 2,000 tokens per request in one wave.
+  Assistant responses are not included in these prompts.
+
+These simulations exclude real KV-transfer costs. Prefill latency includes
+queueing; decode TPOT divides full request latency by output length and
+therefore includes cache loading. Cache hits can involve the host KV tier.
+
+Results are under `outputs/p_<timestamp>/` and `outputs/d_<timestamp>/`;
+server logs are `/tmp/tokenspeed_server_disagg_<config>_<timestamp>.log`.
+Collect both sweeps together:
+
+```bash
+python3 collect_outputs.py outputs/p_<timestamp> outputs/d_<timestamp>
 ```
-configs/attn_dp16_moe_ep16.sh   # the serve config (gateway flags included)
-duplicate_agentic_dataset.py    # cache-bust replicas of the source conversations
-p_bench.slurm                   # P run: boot -> warmup -> conversation replay -> stop
-d_bench.slurm                   # D sweep: boot -> per rung (prime -> settle -> measure) -> kill
-pd_client.py                    # phased client shared by both sweeps
-collect_outputs.py              # tables + P:D sizing; accepts multiple sweep dirs
-outputs/p_<ts>/, outputs/d_<ts>/   # per-sweep artifacts (gitignored)
-```
+
+The collector excludes warmup and reports cache-hit rates without filtering.
+`Requests/s @ target OSL` is the measured P request rate or D output tokens/s
+divided by 500. For matching configs, it estimates `n_P = mu_D / mu_P` with
+one D instance. This fractional ratio excludes transfer costs. The collector
+handles the simulations only; use EvalScope reports for the 1P1D benchmark.
