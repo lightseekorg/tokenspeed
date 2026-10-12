@@ -120,12 +120,12 @@ def _run_case(
 ) -> None:
     operator_inputs = _slice_kda_prefill_inputs(call_tokens, *packed_inputs)
     result = kda_paged_prefill(
-        capacity=None,
-        inputs_packed=False,
         *operator_inputs,
         *parameters,
         initial_state=recurrent_state,
         cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens.to("cpu", torch.int64),
+        capacity=None,
         lower_bound=LOWER_BOUND,
         solution="flashkda",
     )

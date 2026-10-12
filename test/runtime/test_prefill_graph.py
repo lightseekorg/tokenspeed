@@ -258,49 +258,49 @@ class KdaPrefillFallbackTest(unittest.TestCase):
         ):
             scan.return_value = output
             for bs, bucket in ((1, 128), (2, 2048), (4, 4096), (1, 8192)):
-                for checkpoint in (None, object()):
-                    live = SimpleNamespace(prefill_checkpoint_batch=checkpoint)
-                    backend.forward_metadata = live
+                # The live (uncaptured) metadata the fallback must keep serving.
+                live = SimpleNamespace()
+                backend.forward_metadata = live
 
-                    def forward():
-                        results.append(
-                            backend.forward_extend(
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                bs,
-                                ForwardMode.EXTEND,
-                                save_kv_cache=True,
-                                layer_id=0,
-                                seq_len=bucket,
-                            )
+                def forward():
+                    results.append(
+                        backend.forward_extend(
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            bs,
+                            ForwardMode.EXTEND,
+                            save_kv_cache=True,
+                            layer_id=0,
+                            seq_len=bucket,
                         )
+                    )
 
-                    capture.segments = [forward]
-                    for iteration in range(3):
-                        with self.subTest(bs=bs, bucket=bucket, iteration=iteration):
-                            scan.reset_mock()
-                            capture.replay(valid_rows=bucket - 1)
-                            scan.assert_called_once_with(
-                                backend,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                bs,
-                                ForwardMode.EXTEND,
-                                save_kv_cache=True,
-                                layer_id=0,
-                                seq_len=bucket,
-                            )
-                            self.assertIs(results[-1], output)
-                            self.assertIs(backend.forward_metadata, live)
-                            self.assertFalse(backend.prefill_metadata_is_capture_ready)
+                capture.segments = [forward]
+                for iteration in range(3):
+                    with self.subTest(bs=bs, bucket=bucket, iteration=iteration):
+                        scan.reset_mock()
+                        capture.replay(valid_rows=bucket - 1)
+                        scan.assert_called_once_with(
+                            backend,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            bs,
+                            ForwardMode.EXTEND,
+                            save_kv_cache=True,
+                            layer_id=0,
+                            seq_len=bucket,
+                        )
+                        self.assertIs(results[-1], output)
+                        self.assertIs(backend.forward_metadata, live)
+                        self.assertFalse(backend.prefill_metadata_is_capture_ready)
             graph.assert_not_called()
-        self.assertEqual(len(results), 24)
+        self.assertEqual(len(results), 12)
 
 
 def _spec(
