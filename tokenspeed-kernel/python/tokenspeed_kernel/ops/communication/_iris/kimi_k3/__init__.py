@@ -225,7 +225,7 @@ def prepare_k3_communication(
     device: torch.device,
     all_reduce: "IrisAllReduce | None",
 ) -> K3IrisState:
-    """Reserve and create a group's combined K3 buffers before graph capture.
+    """Prepare a group's combined K3 buffers before graph capture.
 
     Capacities are elements except the explicitly named row capacities. Zero
     omits that path. ``all_reduce`` shares an already prepared generic operation,
@@ -235,7 +235,7 @@ def prepare_k3_communication(
         HEAP_HEADROOM_BYTES,
         MIN_HEAP_BYTES,
         IrisGroup,
-        reserve_heap,
+        get_or_create_context,
     )
     from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerLamport
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
@@ -302,8 +302,7 @@ def prepare_k3_communication(
         else 0
     )
     # Preserve the base heap's headroom for other collective operations.
-    ctx = reserve_heap(
-        total_bytes + sharded_bytes,
+    ctx = get_or_create_context(
         heap_size=max(MIN_HEAP_BYTES, total_bytes + HEAP_HEADROOM_BYTES)
         + sharded_bytes,
     )

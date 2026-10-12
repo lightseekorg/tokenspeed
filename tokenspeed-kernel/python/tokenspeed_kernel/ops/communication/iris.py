@@ -286,15 +286,23 @@ def create_iris_state(
     assert dist.is_initialized() and _platform.is_amd
     if min(staged_max_numel, producer_direct_max_numel) < 0:
         raise ValueError("Iris all-reduce capacities must be non-negative")
-    from tokenspeed_kernel.ops.communication._iris import IrisGroup, reserve_heap
+    from tokenspeed_kernel.ops.communication._iris import (
+        HEAP_HEADROOM_BYTES,
+        MIN_HEAP_BYTES,
+        IrisGroup,
+        get_or_create_context,
+    )
 
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
-    ctx = reserve_heap(
-        IrisAllReduce.heap_bytes(
-            staged_max_numel, producer_direct_max_numel, group.size(), dtype
-        ),
-        heap_size=heap_size,
-    )
+    if heap_size is None:
+        heap_size = max(
+            MIN_HEAP_BYTES,
+            IrisAllReduce.heap_bytes(
+                staged_max_numel, producer_direct_max_numel, group.size(), dtype
+            )
+            + HEAP_HEADROOM_BYTES,
+        )
+    ctx = get_or_create_context(heap_size=heap_size)
     peers = IrisGroup(ctx, group, rank_in_group, device)
     state = IrisAllReduce(peers, staged_max_numel, producer_direct_max_numel, dtype)
     peers.finish_prepare()
@@ -364,14 +372,9 @@ class IrisAllReduceResidualRMSNorm(object):
             buf_bytes = max_token_num * hidden_dim * dtype.itemsize
             heap_size = max(1 << 28, 4 * buf_bytes + (16 << 20))
         free_gpu_memory_begin = _get_available_gpu_memory(torch.cuda.current_device())
-        from tokenspeed_kernel.ops.communication._iris import (
-            allocation_bytes,
-            reserve_heap,
-        )
+        from tokenspeed_kernel.ops.communication._iris import get_or_create_context
 
-        self._ctx = reserve_heap(
-            allocation_bytes((max_token_num, hidden_dim), dtype), heap_size=heap_size
-        )
+        self._ctx = get_or_create_context(heap_size=heap_size)
         self._input_buf = self._ctx.zeros((max_token_num, hidden_dim), dtype=dtype)
         free_gpu_memory_after = _get_available_gpu_memory(torch.cuda.current_device())
         logger.info(

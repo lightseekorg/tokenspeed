@@ -32,7 +32,6 @@ with redirect_triton_to_tokenspeed_triton():
 MIN_HEAP_BYTES = 256 << 20
 HEAP_HEADROOM_BYTES = 16 << 20
 _context = None
-_reserved_bytes = 0
 _heap_size: int | None = None
 _allocator_type: str | None = None
 
@@ -54,32 +53,23 @@ def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None
 
 
 def allocation_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
-    """Account for Iris's 1024-byte symmetric suballocation alignment."""
+    """Estimate storage using Iris's Torch allocator's 1024-byte alignment."""
     return (math.prod(shape) * dtype.itemsize + 1023) // 1024 * 1024
 
 
-def reserve_heap(num_bytes: int, *, heap_size: int | None):
-    """Reserve new operations' combined storage before any graph captures it."""
-    global _context, _reserved_bytes
+def get_or_create_context(*, heap_size: int):
+    """Create the shared context at its initial capacity, or return it unchanged.
+
+    Configured heap capacity takes precedence over the caller's initial size.
+    Iris enforces capacity as states allocate their buffers.
+    """
+    global _context
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Prepare Iris communication buffers before graph capture")
-    required = _reserved_bytes + num_bytes
     if _context is None:
         size = _heap_size if _heap_size is not None else heap_size
-        if size is None:
-            size = max(MIN_HEAP_BYTES, required + HEAP_HEADROOM_BYTES)
-        if size < required:
-            raise ValueError(
-                "Iris heap is smaller than the prepared communication buffers"
-            )
         options = {} if _allocator_type is None else {"allocator_type": _allocator_type}
         _context = iris.iris(heap_size=size, **options)
-    elif required > _context.heap_size:
-        raise RuntimeError(
-            f"Iris's {_context.heap_size}-byte heap cannot hold {required} bytes; "
-            "configure the combined capacity before first preparation"
-        )
-    _reserved_bytes = required
     return _context
 
 

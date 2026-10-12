@@ -315,7 +315,7 @@ def _ar_worker_main(
             )
 
         # These dtype checks only use the small shape. Their states share the
-        # fixed heap, so do not reserve another full BF16 prefill capacity.
+        # fixed heap, so do not allocate another full BF16 prefill capacity.
         other_dtype_max_numel = 16 * (7168 + 3584)
         fp16_state = create_iris_state(
             group=dist.group.WORLD,

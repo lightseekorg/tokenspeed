@@ -5,6 +5,9 @@ prepared operation retains its buffers; execution never searches for a suitable
 state. Allocate in the same order on participating ranks before graph capture;
 prepared capacities and addresses stay fixed.
 
+The first preparation sizes the shared heap. Later states allocate from that
+same fixed heap; Iris's allocator enforces capacity.
+
 - **State:** the persistent buffers and references needed by an operation.
 - **Epoch:** a GPU counter that distinguishes successive uses of synchronization
   flags, including graph replays.
