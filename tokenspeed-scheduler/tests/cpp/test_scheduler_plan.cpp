@@ -240,7 +240,7 @@ class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
-        cfg.device_allocator.total_pages = 3;
+        cfg.device_allocator.total_pages = 5;  // four usable: two one-page prompts with their decode slots
         cfg.disable_l2_cache = true;
         cfg.enable_kv_cache_events = true;
         SetTestSnapshotPool(cfg);
@@ -274,7 +274,12 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock)
     ASSERT_EQ(stored.size(), 1u);
     const std::uint64_t stored_hash = std::get<KvBlockStoredEvent>(stored[0]).block_hashes.front();
 
-    Submit(MakeRequestSpec("replacement", 1, 100));
+    // The filler takes two of the three free blocks; the replacement's
+    // admission then evicts the seed's page for its second.
+    Submit(MakeRequestSpec("filler", 1, 100));
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+    Submit(MakeRequestSpec("replacement", 1, 200));
     PlanOnce();
 
     std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
@@ -311,10 +316,13 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFini
     EXPECT_NE(tail.block_hashes.front(), page.block_hashes.front());
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 
-    // A prompt sharing nothing floods the pool (3 pages plus the decode
-    // reserve take all 4 blocks): both boundaries leave, the tail (deeper)
-    // first.
-    Submit(MakeRequestSpec("replacement", 3, 100));
+    // Two prompts sharing nothing fill the pool: the first takes the two
+    // free blocks, the second's admission evicts both boundaries, the tail
+    // (deeper) first.
+    Submit(MakeRequestSpec("filler", 1, 100));
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+    Submit(MakeRequestSpec("replacement", 1, 200));
     PlanOnce();
     std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
     ASSERT_EQ(removed.size(), 2u);

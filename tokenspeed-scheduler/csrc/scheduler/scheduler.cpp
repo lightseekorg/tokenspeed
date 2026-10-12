@@ -336,7 +336,8 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
         }
         if (token_limit > max_single_request_tokens_) {
-            throw std::invalid_argument("Scheduler: request token limit exceeds cache capacity");
+            throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +
+                                        " exceeds cache capacity " + std::to_string(max_single_request_tokens_));
         }
         pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
     }

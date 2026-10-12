@@ -330,8 +330,8 @@ regeneration anywhere.
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over
 `CapacityModel::SingleRequestGroupPages` (`csrc/scheduler/capacity_model.h`):
 the largest prompt whose worst-case working set — dense or sliding history
-with its decode reserve and overlap-depth protection, two slots per State
-group — fits the pool.
+with its decode reserve and overlap-depth protection, the blocks a tail
+handover holds for one admission, two slots per State group — fits the pool.
 It is not a live check against currently free capacity; a prompt within the
 bound can still fail admission right now and waits.
 
@@ -361,6 +361,18 @@ protected tokens that may spill past it; a sliding group, per request,
 `ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
 pages, plus one in-flight prefill chunk behind its lookback (or, on the
 decode role, the landing bound `min(dense, lookback + window)` per request).
+With the prefix cache on, every token-spanned group adds per request the
+blocks a **tail handover** holds for the length of one admission
+(`tailHandoverBlocks`): a hitter copies a tail's full blocks out of shared
+entries that stay pinned as sources until the copies land, and a fused or P
+owner that keeps writing past its prompt end moves off every published tail
+block — the partial one included — into fresh copies while the published
+blocks are still in its table. A tail is at most `P − 1` tokens, so that is
+`ceil((P − 1) / g)` blocks on a role that prefills locally and
+`floor((P − 1) / g)` on the D role (its partial block is a fresh page, not a
+copy); a sliding group caps it at its lookback. Without the charge a pool
+sized exactly for a request wedges at its first decode: the copy-in needs a
+block and nothing in the pool is evictable.
 
 Speculative decode admission grows from the committed token frontier plus the verify
 spans still in flight and the span being scheduled. Already reserved slots

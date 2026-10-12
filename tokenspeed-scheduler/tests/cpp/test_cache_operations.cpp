@@ -547,7 +547,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
 TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeTokens) {
     SchedulerConfig config;
     config.prefix_granularity = 2;
-    config.device_allocator.total_pages = 4;
+    config.device_allocator.total_pages = 5;
     config.host_allocator.total_pages = 10;
     config.max_scheduled_tokens = 8;
     config.max_batch_size = 2;
@@ -555,13 +555,15 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
         .block_granularity = 2,
-        .total_pages = 4,
+        .total_pages = 5,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
     SetTestSnapshotPool(config);
     Scheduler scheduler{std::move(config)};
+    // Four usable blocks: three for the prompt and the decode width the P
+    // reserves for its drafter, one for a tail changing hands.
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
     RequestSpec spec{
         .request_id = "prefill-only-capacity",

@@ -78,6 +78,26 @@ std::int64_t CapacityModel::protectedTokens() const {
     return static_cast<std::int64_t>(config_.overlap_schedule_depth) * decodeWidth();
 }
 
+std::int64_t CapacityModel::tailHandoverBlocks(std::size_t group_index) const {
+    // Blocks a request's table holds beyond its history while a published
+    // tail changes hands, one admission long: a hitter copies the tail's
+    // full blocks out of the shared entries, which stay pinned as sources
+    // until the copies land; an owner that keeps writing past its prompt end
+    // (the fused and P roles' local prefill) moves off every published tail
+    // block, the partial one included, into fresh copies. A tail holds at
+    // most P - 1 tokens; the D role lands the partial block as a fresh page
+    // instead and never continues past a publication. A sliding group
+    // publishes only its lookback behind the boundary.
+    if (config_.disable_prefix_cache) {
+        return 0;
+    }
+    const Group& group = groups_[group_index];
+    const std::int64_t tail_tokens = static_cast<std::int64_t>(config_.prefix_granularity) - 1;
+    const std::int64_t blocks = config_.role == Role::kD ? tail_tokens / group.block_granularity
+                                                         : ceilDiv(tail_tokens, group.block_granularity);
+    return group.prefix_closed ? blocks : std::min(blocks, group.lookback_pages);
+}
+
 std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t token_limit) const {
     _assert(token_limit >= 0, "single-request token limit must be non-negative");
     const std::int64_t decode_width = decodeWidth();
@@ -112,9 +132,9 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
             }
             return pages;
         };
-        std::int64_t child_pages = 0;
+        std::int64_t child_pages = token_limit == 0 ? 0 : tailHandoverBlocks(i);
         if (groups_[i].prefix_closed) {
-            child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
+            child_pages += ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
             const std::int64_t dense_pages =
                 ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
@@ -124,9 +144,9 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
             // A sliding prefix probe can retain one older lookback island
             // across null holes while the remote prompt tail is restored at
             // absolute slots. Bound both intervals, capped by a dense table.
-            child_pages = std::min<std::int64_t>(dense_pages, lookback + window_pages);
+            child_pages += std::min<std::int64_t>(dense_pages, lookback + window_pages);
         } else {
-            child_pages = local_prefill_peak();
+            child_pages += local_prefill_peak();
         }
         group_pages[i] = child_pages;
     }
@@ -160,15 +180,15 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
         // Dense history for every token, plus per request the page its
         // unaligned tail occupies and the protected tokens that may spill
         // past it: ceil((h + protected) / g) <= floor(h / g) + ceil((g - 1 +
-        // protected) / g) for any history h, summed over the live requests.
-        // A hit's private copy of the block containing its boundary is that
-        // request's own tail page; an owner's copy-in at prompt end is one
-        // more block it holds while the published one is cache-only.
+        // protected) / g) for any history h, summed over the live requests;
+        // plus per request the blocks a tail handover holds for one
+        // admission.
         const std::int64_t dense_pages =
             ceilDiv(max_total_tokens, block_granularity) +
             live_requests * ceilDiv(block_granularity - 1 + protected_tokens, block_granularity);
+        const std::int64_t handover_pages = live_requests * tailHandoverBlocks(i);
         if (groups_[i].prefix_closed) {
-            group_pages[i] = dense_pages;
+            group_pages[i] = dense_pages + handover_pages;
         } else {
             // A sliding request retains at most its window (or its whole
             // context when shorter), the next decode input and the protected
@@ -179,12 +199,12 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
                 ceilDiv(resident_tokens + decode_width + protected_tokens + block_granularity - 1, block_granularity);
             if (config_.role == Role::kD) {
                 // The single-request landing bound, once per live request.
-                group_pages[i] = std::min(dense_pages, live_requests * (lookback + window_pages));
+                group_pages[i] = std::min(dense_pages, live_requests * (lookback + window_pages)) + handover_pages;
             } else {
                 // Every live request's resident window, plus one in-flight
                 // prefill chunk behind its lookback before those rows slide.
                 group_pages[i] = live_requests * window_pages + lookback +
-                                 ceilDiv(std::min(chunk_tokens, max_total_tokens), block_granularity);
+                                 ceilDiv(std::min(chunk_tokens, max_total_tokens), block_granularity) + handover_pages;
             }
         }
     }

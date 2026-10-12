@@ -183,16 +183,18 @@ TEST(CapacityModelTest, ConcurrentDemandByRetention) {
         model.ConcurrentGroupPages(/*max_total_tokens=*/65536, /*max_context_len=*/4096);
     ASSERT_EQ(pages.size(), 3u);
     // Dense history, plus per request one unaligned tail page that the four
-    // protected tokens may spill past: 1024 + 16 * ceil(67 / 64).
-    EXPECT_EQ(pages[0], 1024 + 16 * 2);
+    // protected tokens may spill past and one block a tail handover holds
+    // for an admission: 1024 + 16 * (ceil(67 / 64) + ceil(63 / 64)).
+    EXPECT_EQ(pages[0], 1024 + 16 * (2 + 1));
     // A State group is two slots per request -- the checkpoint the next
     // forward reads and the block it writes -- whatever its history.
     EXPECT_EQ(model.SingleRequestGroupPages(4096)[1], 2);
     EXPECT_EQ(model.SingleRequestGroupPages(0)[1], 0);
     EXPECT_EQ(pages[1], 16 * 2);
-    // Each request retains ceil((127 + 4 + 4 + 63) / 64) window pages; one
-    // in-flight chunk adds ceil(127 / 64) lookback pages and 8192 / 64 rows.
-    EXPECT_EQ(pages[2], 16 * 4 + 2 + 128);
+    // Each request retains ceil((127 + 4 + 4 + 63) / 64) window pages plus
+    // the one lookback block a tail handover holds; one in-flight chunk adds
+    // ceil(127 / 64) lookback pages and 8192 / 64 rows.
+    EXPECT_EQ(pages[2], 16 * (4 + 1) + 2 + 128);
 
     // The prefill role protects no in-flight decode step: the full group's
     // protected spill disappears; the State group's two slots hold on every
@@ -204,11 +206,55 @@ TEST(CapacityModelTest, ConcurrentDemandByRetention) {
                                                                       : CacheTransferPolicy::FullSuffix;
     }
     const std::vector<std::int64_t> prefill_pages = CapacityModel{prefill}.ConcurrentGroupPages(65536, 4096);
-    EXPECT_EQ(prefill_pages[0], 1024 + 16 * 1);
+    EXPECT_EQ(prefill_pages[0], 1024 + 16 * (1 + 1));
     EXPECT_EQ(prefill_pages[1], 16 * 2);
     SchedulerConfig decode = prefill;
     decode.role = Role::kD;
     EXPECT_EQ(CapacityModel{decode}.ConcurrentGroupPages(65536, 4096)[1], 16 * 2);
+}
+
+// The startup bound charges the block a request's table holds beyond its
+// history while a tail changes hands: here the fused owner's copy-in at an
+// unaligned prompt end, when the published partial block is still in the
+// table and the admission needs its fresh copy.
+class TailHandoverBoundSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg =
+            SizingConfig(Role::kFused, /*prefix_granularity=*/4, /*chunk_tokens=*/16, /*decode_width=*/1,
+                         /*overlap_depth=*/0, /*disable_prefix_cache=*/false, {Full("full", 4, 1)});
+        // The pool the model sizes for one 12-token request: ceil(12 / 4)
+        // history blocks and one for the handover.
+        const CapacityModel model{cfg};
+        const std::int64_t usable = model.LcmBlocksNeededFor(model.SingleRequestGroupPages(12));
+        return SizedConfig(cfg, static_cast<std::int32_t>(usable));
+    }
+};
+
+TEST_F(TailHandoverBoundSuite, AnUnalignedPromptAtTheBoundReachesItsFirstDecode) {
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 4);
+    EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 12);
+    EXPECT_EQ(Scheduler{SizedConfig(config_, /*usable_lcm_blocks=*/3)}.MaxSingleRequestTokens(), 8)
+        << "without the handover block an eleven-token prompt is refused";
+
+    // Eleven prompt tokens and one generated (a twelve-token limit): the
+    // prompt end at 11 publishes the partial block [8, 11) and the first
+    // decode's admission moves off it.
+    Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(11), .max_new_tokens = 1});
+    const ExecutionPlan prefill = PlanOnce();
+    const ForwardBatch* chunk = FindForwardBatch(prefill);
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_EQ(chunk->input_lengths, std::vector<std::int32_t>{11});
+    SendForwardDone("r", {101});
+    const ExecutionPlan first_decode = PlanOnce();
+    const ForwardBatch* decode = FindForwardBatch(first_decode);
+    ASSERT_NE(decode, nullptr) << "the pool holds the copy-in beside the published block";
+    EXPECT_EQ(decode->request_ids, std::vector<std::string>{"r"});
+    EXPECT_EQ(first_decode.pages_to_copy.at("full").size(), 1u);
+    SendForwardDone("r", {102});
+    SendFinish("r");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
 TEST(CapacityModelTest, FoldsGroupPagesIntoLcmBlocksByPacking) {

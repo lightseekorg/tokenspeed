@@ -1855,7 +1855,7 @@ TEST_F(ImageFollowsCanonicalHostEntrySuite, ARedirectedStoreAckRePointsTheImageT
     SendFinish("r3");
     AckWriteBacks(PlanOnce());
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6) << "the image's six pins remain";
-    Submit(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
+    Submit(MakeRequestSpec("churn", /*num_pages=*/4, /*start=*/501));
     const ExecutionPlan churn = PlanOnce();
     ASSERT_EQ(FindForwardBatch(churn)->request_ids, std::vector<std::string>{"churn"});
     AckWriteBacks(churn);
@@ -3285,9 +3285,10 @@ TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
     Scheduler scheduler{std::move(cfg)};
 
     // W=4, q=2 and a one-token decode reserve can require two cached
-    // lookback pages plus a three-page phase-shifted remote tail. The dense
-    // cap makes eight the exact maximum with four available child pages.
-    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 8);
+    // lookback pages plus a three-page phase-shifted remote tail, capped by
+    // a dense table; one more child page is pinned while the hit's full tail
+    // block is copied. Six is the exact maximum with four child pages.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 6);
 }
 
 TEST_F(RetractExactFitSuite, ReserveRefundBalances) {
@@ -4812,20 +4813,22 @@ TEST_F(PrefixHitSmallWindowSuite, SwaGroupHitRespectsWindow) {
 // placements for the fresh suffix and decode reservation.
 class PrefixHitTightPoolSuite : public PrefixHitSuite {
 protected:
-    std::int32_t TotalPages() const override { return 11; }
+    // Twelve usable parents: the startup bound admits an eight-token prompt
+    // (five blocks plus a tail handover per group).
+    std::int32_t TotalPages() const override { return 13; }
 };
 
 TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
-    ASSERT_EQ(free_at_start, 10);
+    ASSERT_EQ(free_at_start, 12);
 
-    // r1 leaves 4 cached, evictable parents plus 6 empty parents. The capacity
-    // metric reports all 10 as available, but only the latter are unbound.
+    // r1 leaves 4 cached, evictable parents plus 8 empty parents. The capacity
+    // metric reports all 12 as available, but only the latter are unbound.
     RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/2));
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
-    // r3 holds 1 prefill page plus 1 decode-reserve page per group: 10 -> 6.
-    Submit(MakeRequestSpec("r3", /*num_pages=*/1, /*start=*/501));
+    // r3 holds 2 prefill pages plus 1 decode-reserve page per group: 12 -> 6.
+    Submit(MakeRequestSpec("r3", /*num_pages=*/2, /*start=*/501));
     ExecutionPlan r3_prefill = PlanOnce();
     ASSERT_NE(FindForwardBatch(r3_prefill), nullptr);
     ASSERT_EQ(FindForwardBatch(r3_prefill)->request_ids.size(), 1u);
@@ -4837,7 +4840,7 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 6);
 
     // r2: 8 tokens, first 4 == r1's. The 4 cached hit parents are protected.
-    // Its suffix and reserve need 6 empty parents, but r3 pins 4 and leaves only
+    // Its suffix and reserve need 6 empty parents, but r3 pins 6 and leaves only
     // 2 empty, so the whole admission defers without acquiring the hits.
     std::vector<std::int32_t> r2_tokens =
         MakeAlignedTokens(/*num_pages=*/2, PrefixGranularity());  // tokens 1..4 == r1's
@@ -4852,8 +4855,9 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r2 stays intact in the waiting set";
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6) << "a deferred first chunk must not touch the pool";
 
-    // r3 finishes -> 10 available parents. r2 protects 4 hit parents and
-    // acquires 4 fresh plus 2 physically reserved parents: exact fit.
+    // r3 finishes -> 12 available parents, 6 of them r3's cached blocks. r2
+    // protects 4 hit parents and acquires 4 fresh plus 2 physically reserved
+    // parents: the 2 empty ones and 4 evicted from r3, leaving 2 of r3's.
     SendForwardDone("r3", {600});
     SendFinish("r3");
     ExecutionPlan plan2 = PlanOnce();
@@ -4864,14 +4868,14 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
     EXPECT_EQ(op2->input_lengths.at(0), 4) << "only the 4-token remainder is computed";
     EXPECT_EQ(op2->extend_prefix_lens.at(0), 4);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
 
-    // r2's finalize consumes the existing reservation, so capacity stays 0.
+    // r2's finalize consumes the existing reservation, so capacity stays put.
     SendForwardDone("r2", {699});
     ExecutionPlan decode = PlanOnce();
     ASSERT_NE(FindForwardBatch(decode), nullptr);
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
 
     SendForwardDone("r2", {700});
     SendFinish("r2");
@@ -5385,10 +5389,13 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StreamingSinkSuite::MakeConfig();
         cfg.disable_prefix_cache = false;
-        // 13 device pages -> 12 free (page 0 is null): the 5-page churn request's peak
-        // (10 prefill + 2 reserve) spans the whole free list, recycling r1's 6 cached pages.
-        cfg.device_allocator.total_pages = 13;
-        cfg.host_allocator.total_pages = 33;  // ample (+null page 0): r1's 6 + the churn's 7 entries fit un-evicted
+        // 15 device pages -> 14 free (page 0 is null): a 5-page churn request's
+        // peak (10 prefill + 2 reserve) takes 12 of them, and the startup bound
+        // keeps one block per group for a tail handover; two churns in a row
+        // recycle every one of r1's cached pages.
+        cfg.device_allocator.total_pages = 15;
+        cfg.host_allocator.total_pages =
+            49;  // ample (+null page 0): r1's, both churns' and a filler's entries fit un-evicted
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
@@ -5422,9 +5429,10 @@ protected:
     }
 
     // r1 (tokens 1..8, two generated) indexes 8 host entries (4 Full + 2 SWA
-    // at finalize, the one-token tail in both groups at finish); the churn
-    // request then floods the free list so r1's pages survive ONLY on the
-    // host tier.
+    // at finalize, the one-token tail in both groups at finish); two churn
+    // requests then flood the free list so r1's pages survive ONLY on the
+    // host tier (one churn evicts six of r1's eight; the second, finding the
+    // pool full, evicts the oldest entries first: r1's last two).
     void SeedHostThenEvictDevice() {
         auto wb1 = RunSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
         ASSERT_EQ(wb1.size(), 2u);
@@ -5433,15 +5441,17 @@ protected:
         }
         ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
         // Host cache entries retain their host blocks until host eviction.
-        ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 24);
+        ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 40);
 
-        auto wb3 = RunSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
-        ASSERT_EQ(wb3.size(), 2u);
-        for (const auto& wb : wb3) {
-            SendWriteBackDone(wb.op_ids.at(0));
+        for (const auto& [id, start] : {std::pair{"churn", 501}, std::pair{"churn2", 801}}) {
+            auto wb3 = RunSinkLifecycle(MakeRequestSpec(id, /*num_pages=*/5, start));
+            ASSERT_EQ(wb3.size(), 2u);
+            for (const auto& wb : wb3) {
+                SendWriteBackDone(wb.op_ids.at(0));
+            }
         }
-        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 17) << "5 Full + 2 SWA + the churn's tail in both groups";
-        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 12) << "both seeding requests fully retired";
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 26) << "per churn 5 Full + 2 SWA + its tail in both groups";
+        ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "every seeding request fully retired";
     }
 };
 
@@ -5466,7 +5476,7 @@ TEST_F(HostHitSuite, AHostTailLoadsIntoPrivatePagesWithoutRepublication) {
     EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "a Host tail is loaded, not copied";
     const auto& full_row = op->block_tables.at("full").at(0);
     EXPECT_EQ(lb->dst_pages.at(0).at(4), full_row.at(4)) << "the tail block lands in the hitter's own slot 4";
-    EXPECT_EQ(scheduler_->TailEntries(), 2u) << "r1's and the churn's tails stay enumerable while Host holds them";
+    EXPECT_EQ(scheduler_->TailEntries(), 3u) << "r1's and the churns' tails stay enumerable while Host holds them";
 
     SendLoadBackDone(lb->op_ids.at(0));
     SendForwardDone("r2", {9003});
@@ -5487,7 +5497,7 @@ TEST_F(HostHitSuite, AHostTailLoadsIntoPrivatePagesWithoutRepublication) {
 
 TEST_F(HostHitSuite, HostHitLoadsBackAfterDeviceEviction) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
-    ASSERT_EQ(free_at_start, 12);
+    ASSERT_EQ(free_at_start, 14);
     SeedHostThenEvictDevice();
 
     // r2 extends r1 by one page, so r1's 8-token endpoint is a matchable boundary:
@@ -5558,16 +5568,16 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     SeedHostThenEvictDevice();
 
-    // Filler: 5 pages -> 10 prefill + 2 reserve = the whole pool while it decodes.
+    // Filler: 5 pages -> 10 prefill + 2 reserve = all but two parents while it decodes.
     Submit(MakeRequestSpec("filler", /*num_pages=*/5, /*start=*/701));
     PlanOnce();
     SendForwardDone("filler", {9001});
-    ExecutionPlan filler_finalize = PlanOnce();  // finalization slides three expired SWA pages: free = 3
+    ExecutionPlan filler_finalize = PlanOnce();  // finalization slides three expired SWA pages: free = 5
     auto filler_wb = FindWriteBack(filler_finalize);
     ASSERT_TRUE(filler_wb.has_value());
-    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 3);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 5);
 
-    // r2's host match takes 6 pins, but the gate needs 4 + 6 ext > 3 free: the
+    // r2's host match takes 6 pins, but the gate needs 4 + 6 ext > 5 free: the
     // abandoning return must give the pins back.
     Submit(MakeRequestSpec("r2", /*num_pages=*/5));
     ExecutionPlan blocked = PlanOnce();

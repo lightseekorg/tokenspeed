@@ -1259,8 +1259,9 @@ to the scheduler's own `CapacityModel` (`recipes/scheduler_bridge.py` →
 `csrc/scheduler/capacity_model.h`), whose `ConcurrentGroupPages` reports each
 group's demand at the configured concurrency and whose `LcmBlocksNeededFor`
 folds it by packing. The per-request working set — decode reservation,
-overlap-protected step, a State group's two slots, a sliding group's lookback
-and resident window — is therefore defined once, in
+overlap-protected step, the blocks a tail handover holds for one admission, a
+State group's two slots, a sliding group's lookback and resident window — is
+therefore defined once, in
 C++, and the `Scheduler` bounds single requests against the pool with the
 same model (`docs/design/scheduler.md` §1.4). No recipe restates any of it.
 `scheduler_limits` is the single place a recipe reads the scheduler's
