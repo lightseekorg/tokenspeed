@@ -32,6 +32,10 @@ from tokenspeed_kernel.ops.moe._triton.fp8 import (
     _triton_fp8_moe_impl,
     _validate_fp8_moe,
 )
+from tokenspeed_kernel.ops.moe._triton.fp8_channel import (
+    _triton_fp8_channel_moe_impl,
+    _validate_fp8_channel_moe,
+)
 from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
     kimi3_sigmoid_bias_topk,
 )
@@ -591,6 +595,91 @@ def triton_fp8_block_precomputed_moe_apply(
         plan, x, w, topk_weights, topk_ids, do_finalize
     )
     return _triton_fp8_moe_impl(x, w, topk_weights, topk_ids)
+
+
+# ===-----------------------------------------------------------------------===#
+# FP8 per-channel experts (NVIDIA SM90-SM103)
+# ===-----------------------------------------------------------------------===#
+
+
+@register_kernel(
+    "moe",
+    "apply",
+    name="triton_fp8_channel_precomputed_moe_apply",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=ArchVersion(10, 3),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={
+        "weight_dtype": frozenset({"fp8_channel"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "swiglu_form": frozenset({"standard"}),
+        "activation_clamped": frozenset({False}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False, True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({32}),
+        "hidden_alignment": frozenset({128}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "supports_bias": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_fp8_channel_precomputed_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor,
+    topk_weights: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    num_tokens_global: int | None = None,
+    max_num_tokens_per_gpu: int | None = None,
+    do_finalize: bool = True,
+    enable_pdl: bool = False,
+) -> torch.Tensor:
+    """Apply FP8 per-output-channel experts with dynamic per-token activations.
+
+    Args:
+        plan: MoE plan for standard SiLU/SwiGLU. The rounding points are
+            those of the ``_triton/fp8_channel.py`` docstring; fold any routed
+            scale into ``topk_weights``.
+        x: Contiguous BF16 hidden states ``[tokens, hidden]``.
+        w: Module with contiguous FP8 E4M3 ``w13_weight`` ``[E, 2I, H]`` (gate
+            rows, then up rows), FP32 ``w13_weight_scale`` ``[E, 2I]``, FP8
+            E4M3 ``w2_weight`` ``[E, H, I]`` and FP32 ``w2_weight_scale``
+            ``[E, H]``; ``E`` is the local expert count. Under expert
+            parallelism ``ep_rank`` places the local experts at global ids
+            ``[ep_rank * E, (ep_rank + 1) * E)``.
+        router_logits: Unused because routing must be precomputed.
+        topk_weights: FP32 route weights ``[tokens, top_k]``.
+        topk_ids: Global expert ids ``[tokens, top_k]``. Ids outside this
+            rank's experts contribute zero, so each rank's output sums its
+            local routes only.
+        num_tokens_global: Unused; there is no all-to-all.
+        max_num_tokens_per_gpu: Unused token-capacity hint.
+        do_finalize: Must be true.
+        enable_pdl: Unused launch hint.
+
+    Returns:
+        Finalized BF16 hidden states ``[tokens, hidden]``.
+    """
+    expert_offset = _validate_fp8_channel_moe(
+        plan, x, w, topk_weights, topk_ids, do_finalize
+    )
+    return _triton_fp8_channel_moe_impl(
+        x,
+        w.w13_weight,
+        w.w13_weight_scale,
+        w.w2_weight,
+        w.w2_weight_scale,
+        topk_weights,
+        topk_ids,
+        expert_offset,
+    )
 
 
 # ===-----------------------------------------------------------------------===#
