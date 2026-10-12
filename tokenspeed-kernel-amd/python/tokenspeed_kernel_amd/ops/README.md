@@ -209,6 +209,67 @@ arrival counter, and a reduction in split order by the last arrival, so
 results are deterministic and the launch is HIP-graph safe. An XCD remap
 keeps the M tiles that share a weight tile on one XCD's L2.
 
+### gfx950 dense MXFP4 linear (dynamic MXFP4 activations)
+
+`gluon_mxfp4_linear_gfx950` and `gluon_mxfp4_swiglu_linear_gfx950` run the
+dense layers (for example MoE shared experts) of MXFP4 checkpoints whose
+activations are quantized to MXFP4 at runtime, from decode to prefill batch
+sizes.
+
+#### Contract
+
+- `mxfp4_linear` computes `mxfp4(x) @ W.T` from a BF16 `x [M, K]` with unit
+  inner stride and a packed E2M1 weight `[N, K/2]` (low nibble first) with
+  uint8 UE8M0 scales `[N, K/32]` (unit inner stride). `N % 16 == 0`,
+  `K % 64 == 0`, `N * K < 2**31`. Output is BF16 `[M, N]`; a caller-owned
+  output may have a padded row stride.
+- `mxfp4_swiglu_linear` takes a weight that stacks the gate rows `[0, N/2)`
+  over the up rows `[N/2, N)` (`N % 32 == 0`) and returns BF16 `[M, N/2]`
+  `silu(gate) * up`.
+- The weight is stored in 16x16 MFMA-tile order (`preshuffle_mxfp4_weight`,
+  the same order as the MoE `(16, 16)` tiles), prepared once at load by
+  `prepare_mxfp4_linear`; the registry trait `weight_layout` keeps the
+  prepared layout and the selected kernel consistent.
+- Numerics match quantize-then-GEMM bit for bit up to FP32 summation order:
+  each 32-value group of `x` gets the `mxfp4_quantize` scale (amax rounded up
+  at the third mantissa bit, minus two exponents, clamped to `[0, 254]`) and
+  round-to-nearest-even E2M1 values. The SwiGLU epilogue rounds gate and up
+  to BF16, computes `gate * (1 / (1 + exp(-gate))) * up` in FP32 (the
+  `silu_and_mul` order) and rounds to BF16; the down projection quantizes
+  that output on load, as the unfused path did.
+- `M` is a runtime argument and is not specialized. The tile configuration
+  comes from the smallest M bucket covering `M`: measured per bucket for
+  tuned `(N, K)` shapes, a heuristic otherwise. `N`, `K` and the weight-scale
+  row stride are compile-time model constants.
+
+#### Algorithm
+
+Each program owns a `BLOCK_M x BLOCK_N` output tile and one K slice. A SwiGLU
+tile holds `BLOCK_N / 2` gate columns and the matching up columns, so the
+epilogue pairs them in registers; a ragged last tile clamps its weight rows
+and masks its stores. Program ids put the N tile fastest, so the programs
+that read the same activation rows are adjacent and share an XCD's L2 after
+the XCD remap.
+
+The K loop double-buffers in registers: the next tile's loads are issued
+before the current tile is consumed, and the loop body handles two tiles so
+the buffers swap roles instead of being copied. Activations load coalesced,
+eight BF16 values per lane with consecutive lanes on consecutive 16-byte
+runs and rows spread over all warps, so no warp repeats another's
+quantization work. A group's amax is a packed 16-bit integer max of the
+sign-cleared BF16 bits across the four lanes holding it (`v_pk_max_u16`,
+two DPP steps), and `v_cvt_scalef32_pk_fp4_bf16` divides by the scale,
+rounds and packs. The packed tile and its scales then move through LDS into
+the scaled-MFMA operand layouts. The preshuffled weight feeds the B operand
+directly from global memory, one contiguous KiB per warp load.
+`v_mfma_scale_f32_16x16x128_f8f6f4` accumulates in FP32.
+
+Activation rows past `M` are clamped to the last row instead of masked (the
+epilogue drops them), and a K tail zero-fills both operands. Small batches
+split K with the MXFP8 decode protocol (write-through FP32 partials, a
+relaxed arrival counter, reduction in split order by the last arrival), so
+results are deterministic and the launch is HIP-graph safe.
+
 ### gfx1250 MXFP8 decode projection
 
 The gfx1250 package provides decode-oriented MXFP8 projections for DeepSeek V4
