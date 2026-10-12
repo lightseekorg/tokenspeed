@@ -52,6 +52,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
@@ -107,7 +108,9 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     runner.gpu_id = 0
     runner.checkpoint_load_group = None
     runner._disk_reload_shapes = None
-    runner.model_config = SimpleNamespace(model_path=str(booted_from))
+    runner.model_config = SimpleNamespace(
+        model_path=str(booted_from), mapping=Mapping(rank=0)
+    )
     runner.server_args = SimpleNamespace(
         load_format="auto",
         download_dir=None,
@@ -716,9 +719,11 @@ class TestReloadMatchesStartupLoad(unittest.TestCase):
         real = loader_module.DefaultModelLoader._get_weights_iterator
         groups = []
 
-        def spy(loader, source, weight_name_filter, checkpoint_load_group):
+        def spy(loader, source, weight_name_filter, checkpoint_load_group, mapping):
             groups.append(checkpoint_load_group)
-            return real(loader, source, weight_name_filter, checkpoint_load_group)
+            return real(
+                loader, source, weight_name_filter, checkpoint_load_group, mapping
+            )
 
         with mock.patch.object(
             loader_module.DefaultModelLoader, "_get_weights_iterator", spy

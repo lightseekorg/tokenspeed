@@ -44,7 +44,10 @@ from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -427,7 +430,7 @@ class DefaultModelLoader(BaseModelLoader):
         model: nn.Module,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         yield from self.get_checkpoint_weights(
-            model_config.model_path, model_config.revision, model
+            model_config.model_path, model_config.revision, model, model_config.mapping
         )
 
     def get_checkpoint_weights(
@@ -435,6 +438,7 @@ class DefaultModelLoader(BaseModelLoader):
         model_path: str,
         revision: str | None,
         model: nn.Module,
+        mapping: Mapping,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Stream the checkpoint at ``model_path`` the way ``load_model`` does.
 
@@ -470,7 +474,7 @@ class DefaultModelLoader(BaseModelLoader):
             primary_weights,
             weight_name_filter,
             checkpoint_load_group,
-            model_config.mapping,
+            mapping,
         )
 
         secondary_weights = cast(
@@ -478,7 +482,7 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._get_weights_iterator(
-                source, weight_name_filter, checkpoint_load_group, model_config.mapping
+                source, weight_name_filter, checkpoint_load_group, mapping
             )
 
     def download_model(self, model_config: ModelConfig) -> None:

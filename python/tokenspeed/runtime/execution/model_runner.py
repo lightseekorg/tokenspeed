@@ -578,7 +578,9 @@ class ModelRunner:
             shapes, problem = self._check_disk_reload(loader, model_path)
             if problem is not None:
                 return False, f"{problem}; nothing was written"
-            weights = loader.get_checkpoint_weights(model_path, None, self.model)
+            weights = loader.get_checkpoint_weights(
+                model_path, None, self.model, self.model_config.mapping
+            )
 
             def _counted():
                 nonlocal consumed
