@@ -321,13 +321,13 @@ const BlockPool& CacheCoordinator::tierPool() const {
     return *host_pool_;
 }
 
-// The aligned phase of one tier probe, over the token-spanned groups (closed
-// and sliding): slots below floor_tokens are assumed valid in a lower tier;
+// The aligned phase of one tier probe, over the token-spanned groups of
+// match_order: slots below floor_tokens are assumed valid in a lower tier;
 // per_group blocks are relative to the floor, num_common_tokens is the
 // absolute converged page boundary in TOKENS. num_prefix_pages bounds the walk
 // in prefix pages; each group key vector is expanded to that group's
 // block_granularity. State groups take no part here: their boundaries are
-// candidates of the state phase (probeTierCandidates).
+// candidates of probeTier's candidate phase.
 template <CacheTier Tier>
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTierWithKeys(
     std::span<const std::vector<CacheKey>> group_keys, std::span<const std::size_t> match_order,
@@ -535,14 +535,17 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
     }
 }
 
-// One tier of a probe: the aligned phase over the token-spanned groups, then
+// One tier of a probe: the aligned phase over the prefix-closed groups, then
 // the candidate phase -- longest first, a tail inside the page after the
-// aligned coverage, the aligned coverage itself, then every published tail
-// and page boundary below -- until every matched group accepts one. Without
-// State groups the first candidate the KV groups accept wins and the walk
-// never descends below the aligned coverage; with them it descends to the
-// longest published state checkpoint. kv_tokens records the KV groups'
-// own boundary for the junction cut.
+// closed coverage, the closed coverage itself, then every published tail and
+// page boundary below -- until every matched group accepts one. A closed
+// group's acceptance is monotone in T, so its page walk bounds the candidates;
+// a sliding group's is not (it can hold the lookback behind one boundary and
+// miss it behind the one below), so sliding and State groups are judged per
+// candidate by groupAcceptsBoundary. Without State groups the first candidate
+// the KV groups accept wins; with them the walk descends to the longest
+// published state checkpoint. kv_tokens records the KV groups' own boundary
+// for the junction cut.
 template <CacheTier Tier>
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPrefix& prompt,
                                                                 std::span<const std::vector<CacheKey>> group_keys,
@@ -550,7 +553,13 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
                                                                 std::int32_t floor_tokens, bool claim_partial) const {
     const std::int32_t num_prefix_pages =
         std::min(static_cast<std::int32_t>(prompt.prefix_hashes.size()), prompt.max_tokens / prefix_granularity_);
-    PrefixProbe::Tier aligned = probeTierWithKeys<Tier>(group_keys, match_order, num_prefix_pages, floor_tokens,
+    std::vector<std::size_t> closed_order;
+    for (const std::size_t i : match_order) {
+        if (!GroupIsState(i) && groups_[i].Matcher().IsPrefixClosed()) {
+            closed_order.push_back(i);
+        }
+    }
+    PrefixProbe::Tier aligned = probeTierWithKeys<Tier>(group_keys, closed_order, num_prefix_pages, floor_tokens,
                                                         /*with_storage_keys=*/false);
     PrefixProbe::Tier out = aligned;
     out.num_common_tokens = floor_tokens;
@@ -631,15 +640,12 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
         }
         return false;
     };
-    // Candidates start inside the page after the aligned coverage (a tail
-    // there extends it) and descend from the aligned coverage itself. With no
-    // token-spanned group the state checkpoints alone bound the probe.
-    bool spanned = false;
-    for (const std::size_t i : match_order) {
-        spanned = spanned || !GroupIsState(i);
-    }
+    // Candidates start inside the page after the closed groups' coverage (a
+    // tail there extends it) and descend from that coverage itself. With no
+    // closed group every published boundary below the bound is a candidate.
     const std::int32_t from_tokens =
-        spanned ? std::min(aligned.num_common_tokens + prefix_granularity_ - 1, prompt.max_tokens) : prompt.max_tokens;
+        closed_order.empty() ? prompt.max_tokens
+                             : std::min(aligned.num_common_tokens + prefix_granularity_ - 1, prompt.max_tokens);
     forEachCandidateBoundary(prompt, floor_tokens, from_tokens, visit);
     if (out.num_common_tokens == floor_tokens) {
         // Nothing beyond the floor: no group claims anything on this tier.

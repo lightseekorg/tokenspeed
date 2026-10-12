@@ -198,15 +198,17 @@ private:
         empty_parent_count_ = pool_.NumEmptyLcmBlocks();
     }
 
-    // Blocks a tail costs this group beyond the dense growth. A table never
+    // Blocks a tail costs this group beyond the growth demand. A table never
     // keeps a tail entry's block: the block holds the rows of a page that is
     // later published under the page's own hash, and one block carries one
     // key. So on a first admission every block of a Device tail becomes the
     // hitter's own (a copy of the shared block, or a fresh block where the
     // probe left a hole), and an owner that keeps writing past a published
-    // tail moves every published tail block to a fresh one. The dense growth
+    // tail moves every published tail block to a fresh one. A dense growth
     // then starts from the capacity the last tail block leaves, which the
-    // live table cannot show yet.
+    // live table cannot show yet; a sparse suffix (the D role's landing of a
+    // sliding window) starts at an absolute block past the tail and is
+    // costed whole by BlocksNeededFor.
     std::int64_t tailBlocksNeeded(std::size_t i) const {
         if (!geometry_[i].HasTokenSpan()) {
             return 0;  // a State group's step is costed by BlocksNeededFor
@@ -214,14 +216,18 @@ private:
         const std::int32_t block_granularity = geometry_[i].BlockGranularity();
         std::int64_t blocks = 0;
         if (const auto& tail = prefix_.device.tail; tail && !tail->group_keys[i].empty()) {
-            const auto* dense = std::get_if<DenseGrowth>(&demands_[i].extent);
-            _assert(dense != nullptr, "a group matched by the probe grows densely");
-            const std::int32_t partial_rows = tail->tail_tokens % block_granularity;
-            const std::int32_t available = partial_rows == 0 ? 0 : block_granularity - partial_rows;
-            const std::int32_t growth = dense->num_tokens + demands_[i].reserve_tokens;
-            blocks += static_cast<std::int64_t>(tail->group_keys[i].size()) -
-                      geometry_[i].BlocksNeededFor(*demands_[i].table, growth) +
-                      geometry_[i].BlocksNeededBeyond(available, growth);
+            blocks += static_cast<std::int64_t>(tail->group_keys[i].size());
+            if (const auto* dense = std::get_if<DenseGrowth>(&demands_[i].extent)) {
+                const std::int32_t partial_rows = tail->tail_tokens % block_granularity;
+                const std::int32_t available = partial_rows == 0 ? 0 : block_granularity - partial_rows;
+                const std::int32_t growth = dense->num_tokens + demands_[i].reserve_tokens;
+                blocks += geometry_[i].BlocksNeededBeyond(available, growth) -
+                          geometry_[i].BlocksNeededFor(*demands_[i].table, growth);
+            } else {
+                const auto* sparse = std::get_if<SparseSuffix>(&demands_[i].extent);
+                _assert(sparse != nullptr && sparse->first_block * block_granularity >= tail->tail_tokens,
+                        "a sparse suffix lands past the hit's tail blocks");
+            }
         }
         if (completed_ != nullptr && completed_->owner_continues && completed_->tail &&
             groups_[i].Spec().kind != AttnKind::kMambaState && !groups_[i].Spec().replayable) {

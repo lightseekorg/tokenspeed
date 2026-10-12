@@ -350,15 +350,20 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     ReservePrefillDemands(demands, config_.cache_groups, reserve);
 
     if (source == fsm::PrefillSource::kRemote) {
+        // The peer's retained window lands as a sparse suffix behind the
+        // hit: the first landed block is the one after the hit's last block
+        // (a partial tail block is already the hitter's own fresh page), or
+        // the window's first block when that is later.
         for (std::size_t i = 0; i < demands.size(); ++i) {
             const CacheGroupConfig& group = config_.cache_groups[i];
             if (group.Kind() == AttnKind::kSlidingWindow) {
                 const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
+                const std::int32_t hit_blocks = (hit_tokens + block_granularity - 1) / block_granularity;
                 const std::int32_t retained_begin =
                     std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
                 demands[i].extent = SparseSuffix{
                     .extent_tokens = request->PrefillSize(),
-                    .first_block = std::max(hit_tokens / block_granularity, retained_begin / block_granularity),
+                    .first_block = std::max(hit_blocks, retained_begin / block_granularity),
                 };
             }
         }

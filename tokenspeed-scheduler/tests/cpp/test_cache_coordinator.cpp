@@ -3988,6 +3988,41 @@ TEST_F(TailPublicationTest, EvictingOneTailBlockTakesItsCompanionsAndPrunesTheTa
     EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(tail.hash, 0)), CacheCoordinator::BoundaryResidency::kNone);
 }
 
+// A sliding group's acceptance is not monotone in T: it can hold the lookback
+// behind a tail while the lookback behind the page boundary below it is gone.
+// The probe judges it per candidate, so the tail stays resumable.
+TEST_F(TailPublicationTest, ASlidingGroupMissingThePageLookbackStillResumesAtTheTail) {
+    std::vector<BlockTable> tables(3);
+    const std::vector<std::int32_t> tokens = MakeTokens(12);
+    const TailPublication tail = PublishFinal(tables, tokens, /*num_computed_tokens=*/11);
+    coordinator_.Free(tables);
+    // The sliding group (W=3 over 2-token blocks) looks back one block: behind
+    // the tail at 11 that is [10, 11), behind the page boundary 8 it is
+    // [6, 8). Evict the latter alone.
+    CacheBlockLocation location{};
+    {
+        const CacheBlockRef victim = coordinator_.GroupPrefixIndex(2).Find(pool_, Key(hashes_[1], 2, 1));
+        ASSERT_TRUE(static_cast<bool>(victim));
+        location = victim->Location();
+    }
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, 2, location));
+    EXPECT_TRUE(Cached(2, tail.hash, 1));
+
+    const CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(
+        CacheCoordinator::PromptPrefix{.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 11});
+    EXPECT_EQ(probe.device.num_common_tokens, 11);
+    ASSERT_TRUE(probe.device.tail.has_value());
+    EXPECT_EQ(probe.device.tail->hash, tail.hash);
+    EXPECT_EQ(probe.device.tail->per_group[2].hits, (std::vector<std::uint8_t>{0, 1}));
+
+    // Below the tail the page boundary 8 is not resumable for the sliding
+    // group, and a sliding group publishes only its newest boundary's
+    // lookback, so nothing below 8 is resumable either.
+    const CacheCoordinator::PrefixProbe below = coordinator_.ProbePromptPrefix(
+        CacheCoordinator::PromptPrefix{.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 10});
+    EXPECT_EQ(below.device.num_common_tokens, 0);
+}
+
 TEST_F(TailPublicationTest, CapDropsTheOldestTailUnderOnePriorWithItsBlocks) {
     // Nine requests sharing page 0 and ending at nine different offsets of
     // page 1 publish nine tails under the same prior.

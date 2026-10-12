@@ -127,7 +127,9 @@ public:
 private:
     std::int32_t sparseSuffixBlocks(const BlockTable& table, const SparseSuffix& sparse,
                                     std::int32_t reserve_tokens) const {
-        _assert(table.AvailableTokens() == 0, "sparse suffix materialization requires a page boundary");
+        // The extent is absolute, so spare rows in the table's last block (a
+        // hit's partial tail block the suffix continues right after) do not
+        // carry over; a suffix landing beyond the table leaves holes.
         _assert(table.NumBlocks() <= sparse.first_block, "sparse suffix overlaps the existing block table");
         _assert(sparse.extent_tokens > 0 && reserve_tokens >= 0,
                 "sparse suffix materialization requires a positive extent");

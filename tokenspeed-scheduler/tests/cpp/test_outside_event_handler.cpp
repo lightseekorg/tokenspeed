@@ -805,6 +805,101 @@ protected:
     }
 };
 
+// A D role whose model has a sliding-window group (W=4) with blocks half a
+// prefix page (g=2, P=4): a tail hit lands the peer's retained window as a
+// sparse suffix behind the hit's privatized tail blocks.
+class PdSlidingWindowTailTestSuite : public DisaggDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = 65;
+        cfg.host_allocator.total_pages = 65;
+        cfg.max_scheduled_tokens = 4;
+        cfg.max_batch_size = 4;
+        cfg.disable_prefix_cache = false;
+
+        CacheGroupConfig full = cfg.cache_groups.front();
+        full.block_granularity = 4;
+        full.total_pages = cfg.device_allocator.total_pages;
+        CacheGroupConfig swa = full;
+        swa.group_id = "swa";
+        swa.block_granularity = 2;
+        swa.total_pages = 1 + 64 * 2;
+        swa.cache_blocks_per_lcm_block = 2;
+        swa.retention = CacheGroupConfig::Retention::SlidingWindow;
+        swa.sliding_window_tokens = 4;
+        cfg.cache_groups = {full, swa};
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    // Lands `tokens` as a remote prompt, decodes once and finishes, so the
+    // frontier (the prompt plus one generated token) is published.
+    void SeedAndFinish(const std::string& id, std::vector<std::int32_t> tokens, std::int32_t bootstrap_token) {
+        Submit({RequestSpec{.request_id = id, .tokens = std::move(tokens), .max_new_tokens = 4}});
+        SendBootstrapped(id);
+        ASSERT_NE(FindRemoteAdmission(PlanOnce()), nullptr) << id;
+        SendRemotePrefillDone(id, bootstrap_token);
+        ASSERT_NE(FindForwardBatch(PlanOnce().Operations()), nullptr) << id;
+        SendForwardDone(id, {bootstrap_token + 1});
+        SendFinish(id);
+        PlanOnce();
+    }
+};
+
+TEST_F(PdSlidingWindowTailTestSuite, AnUnalignedHitLandsTheWindowBehindThePrivatizedTail) {
+    // The seed lands ten prompt tokens and finishes after one decode: its
+    // frontier of eleven tokens publishes pages [0,4) and [4,8) of both
+    // groups and the tail at 11 -- for the sliding group blocks [8,10) (full)
+    // and [10,11) (partial), for the full group the partial block [8,11).
+    SeedAndFinish("seed", MakeTokens(10), /*bootstrap_token=*/11);
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+
+    // r2 shares eleven tokens: the hit is the tail at 11, which the sliding
+    // group's two-token blocks do not divide. Its full tail block becomes
+    // the hitter's copy, the partial one a fresh page the peer fills whole,
+    // and the retained window lands behind them as a sparse suffix.
+    RequestSpec r2{.request_id = "r2", .tokens = MakeTokens(11), .max_new_tokens = 4};
+    r2.tokens.push_back(77);
+    r2.tokens.push_back(78);
+    Submit({r2});
+    SendBootstrapped("r2");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* destination = FindRemoteAdmission(plan);
+    ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{11}));
+    EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{2}));
+    const auto& swa = destination->block_tables.at("swa").at(0);
+    // Seven two-token blocks cover the 13-token prompt and the decode slot.
+    ASSERT_EQ(swa.size(), 7u);
+    for (std::size_t slot = 0; slot < 4; ++slot) {
+        EXPECT_EQ(swa.at(slot), 0) << "slot " << slot << " is below the window";
+    }
+    for (std::size_t slot = 4; slot < swa.size(); ++slot) {
+        EXPECT_GT(swa.at(slot), 0) << "slot " << slot;
+    }
+    ASSERT_EQ(plan.pages_to_copy.at("swa").size(), 1u) << "the full tail block [8, 10) is the hitter's own copy";
+    EXPECT_EQ(plan.pages_to_copy.at("swa").front().second, swa.at(4));
+    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(5)), 1)
+        << "the block containing token 11 is a fresh page the peer fills whole";
+    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(6)), 1) << "the landing's own block";
+    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(4)), 0) << "a copy destination is never zeroed";
+    const auto& full = destination->block_tables.at("full").at(0);
+    ASSERT_GE(full.size(), 3u);  // the prompt, the decode slot and the D's admission headroom
+    EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "the full group's only tail block is the partial one";
+    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), full.at(2)), 1);
+    SendRemotePrefillDone("r2", /*bootstrap_token=*/79);
+    const ExecutionPlan decode_plan = PlanOnce();
+    const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
+    ASSERT_NE(decode, nullptr);
+    // The first decode reads the window behind the 13 landed tokens, so the
+    // copied block [8, 10) has already slid out.
+    std::vector<std::int32_t> after_landing = swa;
+    after_landing.at(4) = 0;
+    EXPECT_EQ(decode->block_tables.at("swa").at(0), after_landing);
+}
+
 class PdDecodeCapacityTestSuite : public PdSparseDecodeAdmissionTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
