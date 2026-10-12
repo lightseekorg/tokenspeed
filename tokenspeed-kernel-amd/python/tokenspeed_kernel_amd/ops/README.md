@@ -221,28 +221,58 @@ until the first call in an unwarmed range.
 
 ### gfx1250 standard-cache DSA and KPool scoring
 
-Each program scores 32 or 64 heads of one query row against key tiles with
-WMMA. One layout conversion then gives each lane all heads of one output
-column, and the lane adds the weighted ReLU scores in logical head order with
-register adds. This beats the cross-lane tree reduction of `gl.sum`, so every
-path uses it and the scores are deterministic. The KPool `ordered_head_fold`
-argument therefore selects nothing on gfx1250; it remains for the stage
-interface shared with gfx950.
+`standard_cache_logits.py` scores index queries against FP8 index keys with
+WMMA for standard-cache DSA prefill and decode and for GLM KPool prefill. The
+DSA launchers then select top-k candidates with the radix top-k kernel; the
+KPool launchers return the scores for the caller's selection.
+
+#### Contract
+
+- Each score is `softmax_scale * sum_h w[h] * relu(q[h] . k)` over the index
+  heads, with `q` and `k` dequantized and NaN propagated. Heads are added in
+  FP32 in logical order, so scores are deterministic.
+- Each cache page holds `page_size` rows of 128 FP8 E4M3 key bytes followed by
+  their `page_size` FP32 scales. Page strides and the storage offset are
+  4-byte aligned; pages may be padded.
+- Standard-cache DSA: queries are `[tokens, 32 | 64, 128]`, BF16 or FP8 E4M3
+  with FP32 per-head `q_scales`; weights are BF16 or FP32 `[tokens, heads]`;
+  `page_size` is 64; `topk` is 512, 1024, or 2048. Prefill scores the
+  workspace rows `[row_starts, row_ends)` of `kv_workspace_slots` and returns
+  workspace row ids. Decode scores each request's block table up to its
+  sequence length, minus the later tokens of a `q_len_per_req` group (1 to
+  6), and returns global slots. Both pad with -1 and return the valid count.
+- KPool: queries are BF16 `[tokens, 32, 128]`, weights BF16 or FP32,
+  `pool_size` 4 and `page_size` 16. The page-table form sees
+  `causal_lens // pool_size` pools of each token's request; the planned form
+  sees the physical slots `[row_starts, row_ends)` of `pool_workspace_slots`.
+  Output column `c` holds visible pool `pool_offset + c` for `window_cols`
+  columns, `row_ends_out` holds each row's valid column count, and later
+  columns are not written. `ordered_head_fold` selects nothing on gfx1250.
+
+#### Algorithm
+
+A program owns one query row and a span of its candidate columns. It loads
+the row's queries once, per 32-head group, in the WMMA A-operand layout, with
+the weights already multiplied by the query scales. It then walks the span in
+column tiles: 256 columns on eight waves for DSA prefill, 128 on four waves
+for KPool, and one 64-column tile on four waves per decode program.
+
+For each tile, the program looks up the candidates' cache slots, from the
+workspace or plan slots or through the block table, and loads their keys.
+DSA prefill loads eight adjacent key bytes per lane and KPool sixteen, then
+converts the tile through LDS to the WMMA B-operand layout; decode loads the
+operand layout directly. FP8 queries use FP8 WMMA; BF16 queries upcast the
+keys to BF16. Each head group's WMMA result goes through ReLU and the head
+weights, then one layout conversion gives each lane all 32 heads of one
+column. The lane adds them in head order with register adds; a second head
+group continues the same sum. The column's key scale and `softmax_scale`
+apply last.
 
 Prefill and KPool launches split each row's columns over a second grid
-dimension so that short batches still give every compute unit about four
-programs; large batches keep one program per row. The split span is a runtime
-argument, so batch-size changes do not recompile the scorer.
-
-Standard-cache DSA prefill loads eight adjacent FP8 key bytes per lane and
-KPool loads sixteen. Both convert the keys to the WMMA operand layout before
-arithmetic. Standard decode keeps loading in the operand layout, since the
-conversion did not improve that path.
-
-The cache format, query scaling, weighted ReLU, row bounds, and top-k
-contracts are unchanged. Tests cover BF16/FP8 queries, both head counts,
-buffer/global memory paths, ragged windows, padded KPool pages, and CUDA graph
-replay after changing inputs.
+dimension so that the grid has about four programs per compute unit; with
+enough rows, each row stays in one program. The span is a multiple of the
+tile and a runtime argument, so batch-size changes do not recompile the
+scorer. Only the first program of a KPool row writes its `row_ends_out`.
 
 ### DeepSeek V4 attention
 
