@@ -1969,8 +1969,9 @@ class ModelExecutor:
         A PD decode destination never executes the prompt locally, so no
         forward of its own can establish these lengths — they come from the
         complete remotely-computed prompt instead, before the first local
-        decode. The cache-transfer path additionally selects the transferred
-        recurrent-state snapshot block from the resulting sequence length.
+        decode. The transferred recurrent state needs no length: it lands in
+        the live slot of the request's state row, which the first decode reads
+        and evolves in place.
         """
         num_extends = forward_op.num_extends()
         if num_extends <= 0:
