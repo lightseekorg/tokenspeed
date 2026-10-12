@@ -244,9 +244,9 @@ boundary or not. No forward computes an interior checkpoint, no scan is split
 into body and tail, and no state group declares a token span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
 tail of the same instant in the history groups
-(`scheduler.md` for the rotation, publication and eviction mechanics; the
-state block and its KV tail are evicted together, so a stale state is never
-matched). Resuming a chunked recurrent kernel at a `T` that is not a multiple
+([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)
+for the rotation, publication and eviction mechanics; the state block and
+its KV tail are evicted together, so a stale state is never matched). Resuming a chunked recurrent kernel at a `T` that is not a multiple
 of its kernel chunk regroups a floating-point reduction; `numerics.md`
 ("Prefix hits resume at any token") states the tolerance and the oracle.
 
