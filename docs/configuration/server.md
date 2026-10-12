@@ -695,6 +695,56 @@ tokens, and their position-wise matches.
 | `tokenspeed:inter_token_latency_seconds` | Per-token interval between output frames, measured by frontend wall clock. |
 | `tokenspeed:scheduler_inter_token_latency_seconds` | Per-token interval between output frames, measured by scheduler timestamps. |
 
+`tokenspeed:time_to_first_token_seconds` and
+`tokenspeed:e2e_request_latency_seconds` carry a `stream` label
+(`"true"`/`"false"`, the request's streaming flag) in addition to the base
+labels.
+
+### Request counters, token distributions, and preemptions
+
+The request counters `tokenspeed:num_requests_total` (every finished request)
+and `tokenspeed:request_success_total` (finished without an abort) carry two
+labels beyond the base `model_name`/`app_key`:
+
+| Label | Values |
+| --- | --- |
+| `finish_reason` | `stop`, `length`, `abort`, `abort:transfer_failed`, `abort:unknown_error`, `abort:numerical_error`, `abort:capacity_abort`, `unknown`. The finish-reason type (`BaseFinishReason.to_json()`), with the bounded `ABORT_CODE` subclass folded in as `abort:<code>`; an abort with an unrecognized `err_type` stays plain `abort`. Unbounded payloads (abort message, matched stop string) are never labels. |
+| `stream` | `"true"` / `"false"` — the request's streaming flag. |
+
+Two per-request histograms (same `stream` label, observed once at request
+finish) use a 1-2-5 bucket grid (1, 2, 5, 10, …) capped at the model's
+context length:
+
+| Metric | Semantics |
+| --- | --- |
+| `tokenspeed:request_prompt_tokens` | Prompt token count per finished request. |
+| `tokenspeed:request_generation_tokens` | Generation token count per finished request. |
+
+The scheduler process exports `tokenspeed:num_preemptions_total`: requests
+preempted by a capacity retraction — suspended
+with their pages imaged to the Host snapshot pool (they resume by restore;
+nothing is recomputed) to free Device pages for a blocked admission. One
+increment per retraction victim, counted from the plan's snapshot-store ops;
+forced retractions from `--debug-force-retraction-interval` count too. A
+retraction whose victim cannot be imaged aborts it instead — those are
+`tokenspeed:num_capacity_aborted_requests`, never preemptions.
+
+The cached/uncached token split (the billing split Baseten/Fireworks-style
+dashboards show) derives from existing counters, no dedicated metric needed:
+
+```promql
+cached_prompt_tokens   = tokenspeed:prefix_cache_hits_total
+uncached_prompt_tokens = tokenspeed:prompt_tokens_total - tokenspeed:prefix_cache_hits_total
+```
+
+**Wire-compatibility note.** Adding `finish_reason` to
+`tokenspeed:num_requests_total` / `tokenspeed:request_success_total` and
+`stream` to `tokenspeed:time_to_first_token_seconds` /
+`tokenspeed:e2e_request_latency_seconds` changes those metrics' series
+identity: the pre-change series (without the new labels) stop updating, and
+queries pinning an exact label set must include the new labels. Aggregate
+queries (`sum by (...)` that drops them) are unaffected.
+
 ### Per-request stats
 
 `--enable-log-request-stats` enriches the scheduler's per-request finish line for

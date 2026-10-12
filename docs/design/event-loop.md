@@ -107,7 +107,10 @@ Consequences:
   `Cache.SnapshotOp` / `Cache.RestoreOp` become one per-request `SnapshotOp`
   / `RestoreOp` (`cache/transfer/ops.py`) each -- the executor's unit of
   work, one slot exported or imported, one ACK. `CacheOpHooks.count_plan_ops`
-  counts through the same adapter, so what is counted is what is submitted.
+  counts through the same adapter, so what is counted is what is submitted;
+  its return value — the plan's per-request `SnapshotOp` count, one per
+  retraction victim — is the round's preemption count, exported as
+  `tokenspeed:num_preemptions_total`.
   The `EXPERT_LOAD` profile activity adds two more named operations,
   `reset_expert_load` and `dump_expert_load`: the routing kernels bump the
   expert placement's load counters on the execution stream, so zeroing and

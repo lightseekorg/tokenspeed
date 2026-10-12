@@ -437,8 +437,11 @@ def test_count_plan_ops_counts_each_request_of_a_snapshot_or_restore_batch():
             RestoreOp=_RestoreBatch,
         ),
     ):
-        hooks.count_plan_ops(plan)
+        num_retracted = hooks.count_plan_ops(plan)
     assert hooks._num_inflight == 3
+    # The return counts retraction victims only: one per snapshot-store
+    # request, restores excluded — it feeds the preemption counter.
+    assert num_retracted == 2
 
 
 # ----------------------------------------------------------------------
