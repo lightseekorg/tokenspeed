@@ -135,8 +135,9 @@ def qsa_sparse_attention(
     The SM100/SM103 CuTe DSL implementation is preferred when its specialization
     matches a uniform decode. Prefill and mixed/ragged queries use FlashInfer
     FA2 on supported NVIDIA architectures; other decode geometries retain
-    the registered fallback. Kernel selection preserves this distinction
-    before adapting ragged inputs to independent one-token query rows.
+    the registered fallback. AMD GPUs use the portable Triton kernel. Kernel
+    selection preserves this distinction before adapting ragged inputs to
+    independent one-token query rows.
     """
 
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:

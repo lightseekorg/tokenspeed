@@ -67,6 +67,10 @@ tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
 
+The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
+GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
+unquantized.
+
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
 invalid TPOT fails collection instead of producing a zero-throughput report.
@@ -157,6 +161,11 @@ the jobs create the two directories beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
+
+B200v2 CI stores FlashInfer tactics under `tokenspeed/flashinfer-autotune`
+in the same persistent root as the package cache: an explicit `CI_CACHE_ROOT`,
+the parent of `FLASHINFER_CACHE_DIR`, or `/raid/cache`. An explicit
+`TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR` takes precedence.
 
 CI runner images are expected to provide `ninja`. Runner setup checks for the
 executable and only refreshes apt metadata and installs `ninja-build` when it is

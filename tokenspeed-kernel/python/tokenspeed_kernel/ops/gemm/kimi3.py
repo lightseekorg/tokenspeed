@@ -590,7 +590,7 @@ def kimi3_mla_qkv_gate_projection(
             Platform.get().is_cdna5
             and hidden_states.is_cuda
             and weight.is_cuda
-            and m in {2, 4, 8, 16, 32}
+            and 2 <= m <= 64
             and input_width == KIMI3_HIDDEN_SIZE
             and qkv_width == 2112
             and output_width - qkv_width == 1536
@@ -631,7 +631,7 @@ def kimi3_mla_qkv_gate_projection(
     if solution == "gluon_wmma_gfx1250":
         if not (
             Platform.get().is_cdna5
-            and m in {2, 4, 8, 16, 32}
+            and 2 <= m <= 64
             and input_width == KIMI3_HIDDEN_SIZE
             and qkv_width == 2112
             and output_width - qkv_width == 1536
@@ -642,8 +642,7 @@ def kimi3_mla_qkv_gate_projection(
         ):
             raise ValueError(
                 "Kimi K3 gfx1250 MLA WMMA projection requires contiguous BF16 "
-                "A [M,7168] for M in {2,4,8,16,32}, weight [3648,7168], "
-                "and qkv_width=2112"
+                "A [M,7168] for M in 2-64, weight [3648,7168], and qkv_width=2112"
             )
         from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
             gluon_wmma_tdm_mla_qkv_gate_gfx1250,
@@ -818,7 +817,8 @@ def kimi3_latent_projection_add3(
         solution: ``"auto"`` selects the dual-residual skinny epilogue where
             it holds a measured win (sm103, M <= 2), the fused row-CTA GEMV
             for other one-token execution, the fused MFMA epilogue for CDNA4
-            decode batches (2 <= M <= 32), and otherwise composes the
+            decode batches (2 <= M <= 32), the fused WMMA epilogue for CDNA5
+            batches of 2 to 64 rows, and otherwise composes the
             registered projection and add kernels. ``"rowcta_gemv"``, ``"skinny_add3"``,
             ``"gluon_mfma_add3"``, ``"gluon_wmma_add3"``,
             ``"triton_wmma_add3"``, and ``"composed"`` force an implementation.
@@ -936,7 +936,7 @@ def kimi3_latent_projection_add3(
             solution = "gluon_mfma_add3"
         elif (
             Platform.get().is_cdna5
-            and m == 16
+            and 2 <= m <= 64
             and (k, n) == (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             and specialized
         ):
@@ -996,19 +996,23 @@ def kimi3_latent_projection_add3(
     if solution == "gluon_wmma_add3":
         if (
             not Platform.get().is_cdna5
-            or m != 16
+            or not 2 <= m <= 64
             or (k, n) != (KIMI3_LATENT_SIZE, KIMI3_HIDDEN_SIZE)
             or not specialized
         ):
             raise ValueError(
-                "gluon_wmma_add3 projection-add3 requires 16 contiguous CUDA "
-                "BF16 rows with the K3 3584->7168 shape on CDNA5"
+                "gluon_wmma_add3 projection-add3 requires 2-64 contiguous "
+                "CUDA BF16 rows with the K3 3584->7168 shape on CDNA5"
             )
         from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+            gluon_wmma_tdm_add3_gfx1250,
             gluon_wmma_tdm_add3_m16_gfx1250,
         )
 
-        return gluon_wmma_tdm_add3_m16_gfx1250(
+        add3 = (
+            gluon_wmma_tdm_add3_m16_gfx1250 if m == 16 else gluon_wmma_tdm_add3_gfx1250
+        )
+        return add3(
             hidden_states,
             weight,
             prefix,
@@ -1408,7 +1412,7 @@ def kimi3_qkvfab_projection(
             Platform.get().is_cdna5
             and hidden_states.is_cuda
             and weight.is_cuda
-            and m in {2, 4, 8, 16, 32}
+            and 2 <= m <= 64
             and input_width == KIMI3_HIDDEN_SIZE
             and output_width == KIMI3_QKVFAB_SIZE
             and hidden_states.dtype == torch.bfloat16
@@ -1451,7 +1455,7 @@ def kimi3_qkvfab_projection(
     if solution == "gluon_wmma_gfx1250":
         if not (
             Platform.get().is_cdna5
-            and m in {2, 4, 8, 16, 32}
+            and 2 <= m <= 64
             and input_width == KIMI3_HIDDEN_SIZE
             and output_width == KIMI3_QKVFAB_SIZE
             and hidden_states.dtype == torch.bfloat16
@@ -1462,8 +1466,7 @@ def kimi3_qkvfab_projection(
         ):
             raise ValueError(
                 "Kimi K3 gfx1250 QKVFAB WMMA projection requires contiguous "
-                "BF16 A [M,7168] for M in {2,4,8,16,32} and weight "
-                "[6288,7168]"
+                "BF16 A [M,7168] for M in 2-64 and weight [6288,7168]"
             )
         from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
             gluon_wmma_tdm_kda_qkvfab_gfx1250,

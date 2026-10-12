@@ -255,6 +255,19 @@ def test_qk_rmsnorm_gemma_weight_strided_qkv_split(device: str) -> None:
     )
 
 
+def test_rmsnorm_reads_strided_rows_in_place(device: str) -> None:
+    # A column slice of a fused projection, as V4.1 attention norms its
+    # q/kv parts, must match the contiguous copy bit for bit.
+    fused = torch.randn(9, 1792, device=device, dtype=torch.bfloat16)
+    part = fused[:, 1280:]
+    weight = torch.randn(512, device=device, dtype=torch.float32)
+    out = rmsnorm(part, weight, 1e-6)
+    assert out.is_contiguous()
+    torch.testing.assert_close(
+        out, rmsnorm(part.contiguous(), weight, 1e-6), rtol=0, atol=0
+    )
+
+
 def test_rmsnorm_inplace(device: str) -> None:
     num_tokens = 7
     hidden_size = 128

@@ -28,14 +28,14 @@ if not is_cdna5():
     pytest.skip("AMD CDNA5 is required", allow_module_level=True)
 
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
-    _wmma_tdm_dense_m16_kernel,
+    _wmma_tdm_dense_kernel,
     gluon_wmma_tdm_dense_gfx1250,
     gluon_wmma_tdm_kda_qkvfab_gfx1250,
 )
 
 
 @pytest.mark.parametrize("split_k", [1, 2, 4, 8, None])
-@pytest.mark.parametrize("m,n", [(1, 80), (17, 128), (17, 7168)])
+@pytest.mark.parametrize("m,n", [(1, 80), (16, 7168), (17, 128), (64, 128)])
 def test_dense_split_k_strided_output_and_replay(split_k, m, n):
     torch.manual_seed(1250)
     k = 8192
@@ -88,7 +88,7 @@ def test_dense_short_k_drains_tdm(k):
 def test_dense_batch_sizes_reuse_compilation(kda):
     k, n = (7168, 6288) if kda else (1024, 128)
     torch.manual_seed(1250)
-    a = torch.randn(32, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    a = torch.randn(64, k, device="cuda", dtype=torch.bfloat16) / k**0.5
     b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
 
     def project(rows):
@@ -96,8 +96,10 @@ def test_dense_batch_sizes_reuse_compilation(kda):
             return gluon_wmma_tdm_kda_qkvfab_gfx1250(a[:rows], b)
         return gluon_wmma_tdm_dense_gfx1250(a[:rows], b, split_k=2)
 
+    # One 16-row chunk binary and one 64-row tile binary serve every batch.
     project(2)
-    with assert_no_triton_compile(_wmma_tdm_dense_m16_kernel):
-        for rows in (1, 4, 8, 16, 32):
+    project(40)
+    with assert_no_triton_compile(_wmma_tdm_dense_kernel):
+        for rows in (1, 4, 8, 16, 32, 64):
             actual = project(rows)
             torch.testing.assert_close(actual, a[:rows] @ b.T, atol=1e-2, rtol=1e-2)

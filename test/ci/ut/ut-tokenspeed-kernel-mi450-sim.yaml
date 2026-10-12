@@ -116,7 +116,7 @@ env:
     # Kimi K3 BF16 GEMMs: M=16 add3 in Gluon and Triton, strided shared-down,
     # dense-M16 TDM through the M=17 decode GEMV, large-M o_proj. QKV-gate and
     # 512-token latent projections reuse these kernels and stay on hardware.
-    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_m16_add3_auto_matches_composed_and_captures
+    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_add3_auto_fuses_matches_composed_and_captures[16]
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_output_contract
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_inputs_use_torch
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches
