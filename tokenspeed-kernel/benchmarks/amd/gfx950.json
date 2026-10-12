@@ -18,6 +18,7 @@
     "gfx950/dsv41_flash/gemm.json",
     "gfx950/dsv41_flash/attention.json",
     "gfx950/dsv41_flash/moe.json",
+    "gfx950/dsv41_flash/quantization.json",
     "gfx950/dsv41_flash/residual.json",
     "gfx950/kimi_k3/moe.json",
     "gfx950/kimi_k3/mla.json",

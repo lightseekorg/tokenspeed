@@ -1,0 +1,227 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "granularity": "token_group",
+    "group_size": 32,
+    "scale_encoding": "ue8m0",
+    "dtype": "bfloat16"
+  },
+  "cases": [
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/hidden-decode-k5120-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": [6, 192],
+          "K": 5120
+        },
+        "cold_cache": true,
+        "seed": 5601
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/hidden-prefill-m8192-k5120-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": 8192,
+          "K": 5120
+        },
+        "cold_cache": true,
+        "seed": 5602
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/q_lora-decode-k1280-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": [6, 192],
+          "K": 1280
+        },
+        "cold_cache": true,
+        "seed": 5603
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/q_lora-prefill-m8192-k1280-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": 8192,
+          "K": 1280
+        },
+        "cold_cache": true,
+        "seed": 5604
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/tp4-wo_b-decode-k2048-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": [6, 192],
+          "K": 2048
+        },
+        "cold_cache": true,
+        "seed": 5605
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/tp4-wo_b-prefill-m8192-k2048-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": 8192,
+          "K": 2048
+        },
+        "cold_cache": true,
+        "seed": 5606
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/tp4-shared_down-decode-k576-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": [6, 192],
+          "K": 576
+        },
+        "cold_cache": true,
+        "seed": 5607
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/tp4-shared_down-prefill-m8192-k576-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": 8192,
+          "K": 576
+        },
+        "cold_cache": true,
+        "seed": 5608
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/tp8-wo_b-decode-k1024-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": [6, 192],
+          "K": 1024
+        },
+        "cold_cache": true,
+        "seed": 5609
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/tp8-wo_b-prefill-m8192-k1024-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": 8192,
+          "K": 1024
+        },
+        "cold_cache": true,
+        "seed": 5610
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/tp8-shared_down-decode-k288-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": [6, 192],
+          "K": 288
+        },
+        "cold_cache": true,
+        "seed": 5611
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "dsv41_flash.quantization.fp8_with_scale/tp8-shared_down-prefill-m8192-k288-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "quantization",
+        "mode": "fp8_with_scale",
+        "parameters": {
+          "M": 8192,
+          "K": 288
+        },
+        "cold_cache": true,
+        "seed": 5612
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    }
+  ]
+}

@@ -156,6 +156,8 @@ from tokenspeed_kernel.ops.moe.triton import (
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
+from tokenspeed_kernel.ops.residual import mhc_apply_pre as kernel_mhc_apply_pre
+from tokenspeed_kernel.ops.residual import mhc_mixes as kernel_mhc_mixes
 from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
 from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
@@ -349,6 +351,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd_available",
         "gated_residual_combine",
         "gated_residual_mix",
+        "mhc_apply_pre",
         "mhc_fused_hc",
         "mhc_mixes",
         "mhc_post",
@@ -364,6 +367,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd",
         "hyperconnection_combine",
         "hyperconnection_mix",
+        "mhc_apply_pre",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
@@ -2941,6 +2945,28 @@ def _mhc_post() -> object:
     post = torch.empty((1, 4, 1), dtype=torch.float32)
     comb = torch.empty((1, 4, 4), dtype=torch.float32)
     return kernel_mhc_post(hidden_states, residual, post, comb)
+
+
+def _mhc_mixes() -> object:
+    # The gfx950 projection is specialized to model hidden sizes.
+    residual = torch.empty((1, 4, 4096), dtype=torch.bfloat16)
+    weight = torch.empty((24, 4 * 4096), dtype=torch.float32)
+    scale = torch.empty((3,), dtype=torch.float32)
+    base = torch.empty((24,), dtype=torch.float32)
+    return kernel_mhc_mixes(residual, weight, scale, base, 1e-6, 1e-6, 2)
+
+
+def _mhc_apply_pre() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=None, norm_eps=None)
+
+
+def _mhc_apply_pre_fused_norm() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    norm_weight = torch.empty((16,), dtype=torch.bfloat16)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=1e-6)
 
 
 def _attention_gdn_chunk_prefill() -> object:
@@ -6249,8 +6275,33 @@ _CASES = [
         "cdna4",
         "residual",
         "mhc_post",
-        "triton_mhc_post",
+        "gluon_mhc_post_gfx950",
         _mhc_post,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_mixes",
+        "gluon_mhc_mixes_gfx950",
+        _mhc_mixes,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre_fused_norm,
+        id_suffix="fused_norm",
     ),
     _case(
         _is_cdna4,
