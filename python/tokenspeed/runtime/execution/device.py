@@ -327,6 +327,10 @@ class DeviceHandle:
         # The transfer peer's submissions, settled at the next round's
         # execute (see ``_settle``).
         self._transfer_submissions: deque = deque()
+        # The plan's page copies, settled likewise: a copy has no ACK, so a
+        # submission that raised would otherwise vanish with the hitter's
+        # block left unfilled.
+        self._copy_submissions: deque = deque()
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -349,7 +353,11 @@ class DeviceHandle:
         forward thread's default stream before anything else of the plan is
         enqueued; a pinned write-back -- an ordinary publication, whose
         sources the scheduler holds until the ACK -- rides the write stream
-        and fences nothing), then page zeroing (the new owner's
+        and fences nothing), then the Device-to-Device block copies
+        (``pages_to_copy``: a prefix hit's private copy of the block holding
+        its boundary, an owner's move off the block it just published; the
+        source may be re-granted by this very plan, so the copy precedes the
+        zeroing), then page zeroing (the new owner's
         sanitization), then the L3 prefetches (``PrefetchOp``: a waiting
         request's Host pages filled from L3 on a CPU lane -- no stream, no
         Device page, acknowledged after the replica converges on the landed
@@ -391,6 +399,11 @@ class DeviceHandle:
             "PD transfer submission failed on the data plane; it produces no "
             "transfer event, so its request would hang silently",
         )
+        _settle(
+            self._copy_submissions,
+            "page copy submission failed on the data plane; it has no "
+            "completion event, so the destination block would stay unfilled",
+        )
 
         executor = self._executor
         cache_ops = cache_ops_from_plan(execution_plan)
@@ -409,6 +422,19 @@ class DeviceHandle:
                         fence_stream=executor.default_stream,
                     )
                 )
+            )
+        # Between the stores and the zeroing: a copy's source may be a block
+        # this plan re-grants (and zeroes); its destination is already in the
+        # hitter's table and is never zeroed. Stream order on the default
+        # stream, behind the execution stream, is the whole argument.
+        copies = {
+            group_id: pairs
+            for group_id, pairs in execution_plan.pages_to_copy_arrays().items()
+            if len(pairs)
+        }
+        if copies:
+            self._copy_submissions.append(
+                self._thread.submit(lambda: executor.copy_cache_pages(copies))
             )
         pages = execution_plan.pages_to_zero
         zero_future = (

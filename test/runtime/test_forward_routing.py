@@ -104,6 +104,7 @@ def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None
     """A round's ExecutionPlan as execute() reads it."""
     return SimpleNamespace(
         pages_to_zero=list(pages_to_zero),
+        pages_to_copy_arrays=dict,
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,

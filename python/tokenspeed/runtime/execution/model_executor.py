@@ -102,6 +102,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
+    local_page_pairs_by_group,
     local_pages_by_group,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -1832,6 +1833,37 @@ class ModelExecutor:
             exporters.append(self.drafter)
         exporters.append(self.sampling_backend)
         return tuple(exporters)
+
+    def copy_cache_pages(self, pairs: Mapping[str, Sequence[Sequence[int]]]) -> None:
+        """Copy cached blocks whole onto newly granted blocks of the same group.
+
+        A prefix hit that ends inside a block takes a private copy of that
+        block (copy-on-write); a request that keeps writing past its prompt
+        end moves to a copy so the block it published stays immutable. Runs
+        on ``default_stream`` behind the forwards in flight on
+        ``execution_stream`` -- the source may have been written by the
+        previous forward -- and ahead of this plan's zeroing: a source may be
+        re-granted and zeroed in the same plan, and the next forward's prologue
+        waits on the default stream.
+
+        Args:
+            pairs: Scheduler (virtual) ``(source, destination)`` block ids per
+                cache group id. Under KVP a rank copies only the pairs it owns
+                (both ends share one owner by construction); a replicated
+                group copies every pair.
+        """
+        local_pairs = {
+            group_id: local
+            for group_id, local in local_page_pairs_by_group(
+                pairs, contract=self._cache_runtime_contract, rank=self._cache_kvp_rank
+            ).items()
+            if len(local)
+        }
+        if not local_pairs:
+            return
+        self.default_stream.wait_stream(self.execution_stream)
+        with nvtx_range("copy_cache_pages", color="purple"):
+            self.token_to_kv_pool.arena.copy_blocks(local_pairs)
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.

@@ -22,11 +22,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import zero_page_fields
+from tokenspeed_kernel.ops.kvcache.triton import copy_page_fields, zero_page_fields
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
@@ -71,9 +71,10 @@ class CacheArena:
         self.plan = plan
         self.device = device
         # Materialize immutable byte geometry at setup, not on first hand-out.
-        # zero_blocks ships only page ids per call; each group's field table
-        # (page-0 offset, page stride, payload bytes) lives on the device.
-        # The kernel trusts these ranges, so their bound is checked once here.
+        # zero_blocks and copy_blocks ship only page ids per call; each group's
+        # field table (page-0 offset, page stride, payload bytes) lives on the
+        # device. The kernels trust these ranges, so their bound is checked
+        # once here.
         # A group may have no fields on this rank: pipeline parallelism keeps
         # every group but drops the fields of layers another stage owns.
         self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
@@ -242,6 +243,50 @@ class CacheArena:
     def field_block_byte_offset(self, field_id: str, block_id: int) -> int:
         return self.plan.field_page_byte_offset(field_id, block_id)
 
+    def _validate_block_ids(
+        self, group_id: str, ids: np.ndarray, *, expected_ndim: int
+    ) -> bool:
+        """Check one group's local block ids; False when this rank holds no bytes."""
+        page_count, fields, _ = self._zero_field_tables[group_id]
+        if (
+            not isinstance(ids, np.ndarray)
+            or ids.ndim != expected_ndim
+            or ids.dtype.kind not in "iu"
+        ):
+            raise TypeError(
+                f"block IDs for group {group_id!r} must be a {expected_ndim}-D "
+                "integer array"
+            )
+        if ids.size == 0:
+            return False
+        low, high = int(ids.min()), int(ids.max())
+        if low < 0 or high >= page_count:
+            raise IndexError(
+                f"local block ID {low if low < 0 else high} outside "
+                f"[0, {page_count}) for group {group_id!r}"
+            )
+        # Validated, but this rank may hold none of the group's bytes.
+        return fields.shape[0] > 0
+
+    def _upload_block_ids(
+        self, arrays: Sequence[np.ndarray], *, columns: int
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Stage every group's ids through one pinned copy, 16-byte aligned spans."""
+        spans: list[int] = []
+        total = 0
+        for ids in arrays:
+            spans.append(total)
+            # Each group's span starts 16-byte aligned, as the kernels require
+            # of the pointer they receive.
+            total += -(-ids.shape[0] * columns // 4) * 4
+        # The caching host allocator tracks the pinned block's pending copy,
+        # so the next call cannot overwrite it early.
+        staging = torch.empty(total, dtype=torch.int32, pin_memory=True)
+        host = staging.numpy()
+        for start, ids in zip(spans, arrays, strict=True):
+            host[start : start + ids.size] = ids.reshape(-1)
+        return staging.to(self.buffer.device, non_blocking=True), spans
+
     def zero_blocks(self, block_ids_by_group: Mapping[str, np.ndarray]) -> None:
         """Clear local physical blocks after validating every group's IDs.
 
@@ -259,49 +304,69 @@ class CacheArena:
             IndexError: A block ID is outside its group's physical range.
             TypeError: A group's IDs are not a 1-D integer array.
         """
-        spans: list[tuple[str, int, int]] = []
+        groups: list[str] = []
         arrays: list[np.ndarray] = []
-        total = 0
         for group_id, ids in block_ids_by_group.items():
-            page_count, fields, _ = self._zero_field_tables[group_id]
-            if (
-                not isinstance(ids, np.ndarray)
-                or ids.ndim != 1
-                or ids.dtype.kind not in "iu"
-            ):
-                raise TypeError(
-                    f"block IDs for group {group_id!r} must be a 1-D integer array"
-                )
-            if ids.size == 0:
-                continue
-            low, high = int(ids.min()), int(ids.max())
-            if low < 0 or high >= page_count:
-                raise IndexError(
-                    f"local block ID {low if low < 0 else high} outside "
-                    f"[0, {page_count}) for group {group_id!r}"
-                )
-            if fields.shape[0] == 0:
-                # Validated, but this rank holds none of the group's bytes.
-                continue
-            spans.append((group_id, total, ids.size))
-            arrays.append(ids)
-            # Each group's span starts 16-byte aligned, as the kernel requires
-            # of the pointer it receives.
-            total += -(-ids.size // 4) * 4
-        if total == 0:
+            if self._validate_block_ids(group_id, ids, expected_ndim=1):
+                groups.append(group_id)
+                arrays.append(ids)
+        if not arrays:
             return
-        # The caching host allocator tracks the pinned block's pending copy,
-        # so the next call cannot overwrite it early.
-        staging = torch.empty(total, dtype=torch.int32, pin_memory=True)
-        host = staging.numpy()
-        for (_, start, count), ids in zip(spans, arrays, strict=True):
-            host[start : start + count] = ids
-        pages = staging.to(self.buffer.device, non_blocking=True)
-        for group_id, start, count in spans:
+        pages, spans = self._upload_block_ids(arrays, columns=1)
+        for group_id, start, ids in zip(groups, spans, arrays, strict=True):
             _, fields, max_field_bytes = self._zero_field_tables[group_id]
             zero_page_fields(
                 self.buffer,
-                pages[start : start + count],
+                pages[start : start + ids.size],
+                fields,
+                max_field_bytes=max_field_bytes,
+            )
+
+    def copy_blocks(self, block_pairs_by_group: Mapping[str, np.ndarray]) -> None:
+        """Copy local physical blocks whole onto other blocks of their group.
+
+        The same O(pages) path as :meth:`zero_blocks`: one pinned upload of
+        the ``(source, destination)`` pairs, one page x field expansion per
+        group in the kernel. Pairs of one group copy in parallel, so no
+        destination may be another pair's source.
+
+        Args:
+            block_pairs_by_group: Local ``[n, 2]`` integer arrays per group of
+                ``(source, destination)`` block IDs, each in
+                [0, group.page_count).
+
+        Raises:
+            IndexError: A block ID is outside its group's physical range.
+            TypeError: A group's pairs are not an ``[n, 2]`` integer array.
+            ValueError: A pair copies a block onto itself, or a destination is
+                another pair's source.
+        """
+        groups: list[str] = []
+        arrays: list[np.ndarray] = []
+        for group_id, pairs in block_pairs_by_group.items():
+            if not self._validate_block_ids(group_id, pairs, expected_ndim=2):
+                continue
+            if pairs.shape[1] != 2:
+                raise TypeError(
+                    f"block pairs for group {group_id!r} must be an [n, 2] array"
+                )
+            if (pairs[:, 0] == pairs[:, 1]).any() or np.isin(
+                pairs[:, 1], pairs[:, 0]
+            ).any():
+                raise ValueError(
+                    f"block pairs for group {group_id!r} chain a destination "
+                    "into a source; the copies run in parallel"
+                )
+            groups.append(group_id)
+            arrays.append(pairs)
+        if not arrays:
+            return
+        pairs, spans = self._upload_block_ids(arrays, columns=2)
+        for group_id, start, ids in zip(groups, spans, arrays, strict=True):
+            _, fields, max_field_bytes = self._zero_field_tables[group_id]
+            copy_page_fields(
+                self.buffer,
+                pairs[start : start + ids.size].view(-1, 2),
                 fields,
                 max_field_bytes=max_field_bytes,
             )

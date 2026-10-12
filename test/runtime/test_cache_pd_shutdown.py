@@ -43,7 +43,9 @@ class _SchedulerHarness:
 
     def next_execution_plan(self):
         self._trace.append("next_plan")
-        return SimpleNamespace(pages_to_zero=(), cache=(), aborts=())
+        return SimpleNamespace(
+            pages_to_zero=(), pages_to_copy_arrays=dict, cache=(), aborts=()
+        )
 
 
 class _DeviceHarness:
