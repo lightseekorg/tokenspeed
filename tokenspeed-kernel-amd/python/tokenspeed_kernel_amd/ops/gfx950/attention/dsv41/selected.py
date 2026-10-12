@@ -550,12 +550,7 @@ def gluon_dsv41_selected_attention_gfx950(
                     TILE_K,
                     mfma,
                 )
-                s_values, s_scales, s_valid, s_score = (
-                    n_values,
-                    n_scales,
-                    n_valid,
-                    n_score,
-                )
+                s_values, s_scales, s_score = n_values, n_scales, n_score
                 n_slot, n_valid, n_score = nn_slot, nn_valid, nn_score
             if HAS_GLOBAL:
                 n_slot, n_valid = _tile_slots(
@@ -627,12 +622,7 @@ def gluon_dsv41_selected_attention_gfx950(
                             mfma,
                         )
                     )
-                    g_values, g_scales, g_valid, g_score = (
-                        n_values,
-                        n_scales,
-                        n_valid,
-                        n_score,
-                    )
+                    g_values, g_scales, g_score = n_values, n_scales, n_score
                     n_slot, n_valid, n_score = nn_slot, nn_valid, nn_score
 
             if active:
