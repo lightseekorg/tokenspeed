@@ -32,7 +32,7 @@
 #include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
 #include "scheduler/outside_events/inc.h"
-#include "cache/prefix/prefix_hasher.h"
+#include "scheduler/operations/progress.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -97,39 +97,26 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 }
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
-    const std::vector<std::span<const std::int32_t>> stable_prefix_pages = request.FullPrefixPages(true);
     fsm::CacheProgress progress = request.CacheProgress();
-    const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(progress.prefix_hashes.size());
-    const std::int32_t num_stable_prefix_pages = static_cast<std::int32_t>(stable_prefix_pages.size());
-    _assert(first_new_prefix_page <= num_stable_prefix_pages, "cache progress exceeds completed request pages");
-    if (first_new_prefix_page != num_stable_prefix_pages) {
-        const std::string previous_hash =
-            progress.prefix_hashes.empty() ? std::string{} : progress.prefix_hashes.back();
-        std::vector<std::string> new_hashes =
-            AdvancePrefixHashes(stable_prefix_pages, first_new_prefix_page, previous_hash, num_stable_prefix_pages);
-        progress.prefix_hashes.insert(progress.prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
-                                      std::make_move_iterator(new_hashes.end()));
-
-        registerKvEventPrefixPages(request, progress.prefix_hashes, first_new_prefix_page);
-        coordinator_.CacheCompletedBlocks(
-            request.BlockTablesRef(),
-            RequestProgress{
-                .completed_pages =
-                    CompletedPages{
-                        .prefix_hashes = progress.prefix_hashes,
-                        .first_new_prefix_page = first_new_prefix_page,
-                        .boundary_kind = CacheBoundaryKind::kEndpoint,
-                        .stream_completed_to_host = false,
-                        .materialized_state_boundaries = progress.materialized_state_boundaries,
-                    },
-                .num_computed_tokens = request.TokenSize() - 1,
-            },
-            progress.access_epoch);
+    // Every token but the last is computed; the last is the sampled token no
+    // forward consumed.
+    const std::int32_t num_computed_tokens = request.NumComputedTokens();
+    RequestProgress completed =
+        AdvanceRequestProgress(request, progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
+    std::vector<std::string> store_hashes = progress.prefix_hashes;
+    if (completed.completed_pages) {
+        completed.completed_pages->boundary_kind = CacheBoundaryKind::kEndpoint;
+        registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);
+        coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), completed, progress.access_epoch);
+        if (completed.completed_pages->tail) {
+            store_hashes.push_back(completed.completed_pages->tail->hash);
+        }
     }
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
-    coordinator_.QueueCachedBlocksForStore(progress.prefix_hashes);
+    coordinator_.QueueCachedBlocksForStore(store_hashes);
     const auto prefill_hashes = std::span<const std::string>{progress.prefix_hashes}.first(
         std::min(progress.prefix_hashes.size(),
                  static_cast<std::size_t>(request.PrefillSize() / coordinator_.PrefixGranularity())));

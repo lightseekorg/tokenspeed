@@ -127,14 +127,36 @@ struct GroupDemand {
     std::int32_t reserve_tokens{0};
 };
 
-// Prefix pages a request completed since the coordinator last saw it, ready to
+// A publication point that is not page-aligned: the partial page holding rows
+// [kP, T) of the request's tokens, published under hash@T so a later prompt
+// sharing exactly those tokens resumes at T instead of at kP.
+struct TailPublication {
+    // T mod prefix_granularity, in (0, P).
+    std::int32_t tail_tokens{0};
+    // HashPrefixPage(tokens[kP, T), prior) with prior = the chain hash of
+    // page k - 1 (prefix_hashes.back(), or "" for k = 0).
+    ContentHash hash{};
+};
+
+// What a request completed since the coordinator last saw it, ready to
 // publish. prefix_hashes is the request's cumulative completed prefix-page
-// history; the pages from first_new_prefix_page on are the new ones, and this
-// struct exists only when that range is non-empty. The request owns the
-// storage behind both spans.
+// history; the pages from first_new_prefix_page on are the new ones. The
+// struct exists only when there is something to publish: a non-empty page
+// range, a tail, or a state checkpoint. The request owns the storage behind
+// the spans.
 struct CompletedPages {
     std::span<const std::string> prefix_hashes{};
     std::int32_t first_new_prefix_page{0};
+    // The partial page at this publication point, absent when the point is
+    // page-aligned (T = prefix_hashes.size() * P).
+    std::optional<TailPublication> tail{};
+    // The owner keeps writing the partial page after this publication (a
+    // prompt end followed by decode, a junction-cut chunk end): the admission
+    // swaps a fresh block into the table slot and copies the published bytes
+    // into it. False at finish and retraction, where the block is final and
+    // is published in place. Only an admission may set it: the copy needs the
+    // transaction's capacity.
+    bool owner_continues{false};
     // Which kind of resumable boundary the newly completed range ends on.
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     // State may retain an aligned checkpoint before an unaligned endpoint.

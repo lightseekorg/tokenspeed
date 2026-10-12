@@ -490,6 +490,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "suspended request's image).")
         .def("host_pool_pinned_blocks", &tokenspeed::Scheduler::HostPoolPinnedBlocks,
              "Host L2 entries pinned by a request -- a suspended request's image, or an in-flight transfer.")
+        .def("tail_entries", &tokenspeed::Scheduler::TailEntries,
+             "Published partial-page boundaries (hash@T) the prefix probe can resume at.")
+        .def("tail_cap_evictions", &tokenspeed::Scheduler::TailCapEvictions,
+             "Tails dropped because more than eight were published under one prior page.")
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)

@@ -37,6 +37,7 @@
 #include "cache/coordinator/group_geometry.h"
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
+#include "cache/prefix/tail_table.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -271,8 +272,10 @@ public:
     // reserve) inside the same AdmissionPlanner pass, so cache-only blocks
     // are evicted exactly as for an admission and a failed restore leaves
     // nothing allocated. load_pairs carries the Host L2 -> Device copies
-    // (keyed, like an ordinary prefix load-back), snapshot_pairs the snapshot
-    // pool -> Device copies, new_page_ids only the reserve pages appended
+    // (keyed and republished at the ACK, except the row of the partial page
+    // the request keeps writing, which stays its private copy),
+    // snapshot_pairs the snapshot pool -> Device copies, new_page_ids only
+    // the reserve pages appended
     // beyond the imaged shape (the copies fill their destinations whole, so
     // the plan zeroes nothing it restores). request_access_epoch is the
     // request's first-admission epoch, carried on.
@@ -339,9 +342,10 @@ public:
         std::vector<CacheBlockRef> blocks;
         HostAllocationStats stats;
     };
-    // Queue every already-published non-state Device cache entry for D2H Store.
+    // Queue every already-published non-state Device cache entry under these
+    // content hashes (chain hashes and tail hashes alike) for D2H Store.
     // Missing keys and an absent Host tier are silently skipped.
-    void QueueCachedBlocksForStore(std::span<const std::string> prefix_hashes);
+    void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
     // Queue the newest already-published Device checkpoint from each state group.
     void QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
@@ -390,11 +394,21 @@ public:
     // folds the per-group mutations into one externally visible prefix event.
     void SetCacheMutationSink(CacheMutationSink sink) { cache_mutation_sink_ = std::move(sink); }
     // Device residency of one scheduler-level prefix boundary: the child
-    // entries every group holds for that content hash (one per group page
-    // within the prefix granularity). The boundary key's group and offset are
-    // ignored; only its namespace and content hash identify the boundary.
+    // entries every group holds for that content hash -- one per group block
+    // within the prefix granularity for a chain hash, one per group block
+    // below T for a tail hash, one per state group. The boundary key's group
+    // and offset are ignored; only its namespace and content hash identify
+    // the boundary.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary) const;
+
+    // Published tail boundaries the probe can enumerate, and how many the
+    // per-prior cap has dropped.
+    std::size_t NumTailEntries() const { return tails_.Size(); }
+    std::int64_t TailCapEvictions() const { return tails_.CapEvictions(); }
+    // Group blocks a tail entry holds in group i: every block of the page
+    // below T, the last one partial unless T is a multiple of the block span.
+    std::int32_t TailBlocksFor(std::int32_t i, std::int32_t tail_tokens) const;
 
 private:
     friend struct CacheCoordinatorTestAccess;
@@ -437,28 +451,49 @@ private:
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
-    // One run of cache blocks a publication registers in a group, and the
-    // boundary kind it registers them under.
+    // One run of table slots a publication registers in a group, the key of
+    // each (keys[j] is slot first_cache_block + j), and the boundary kind it
+    // registers them under.
     struct PublishedRange {
         std::int32_t first_cache_block{0};
-        std::int32_t num_blocks{0};
+        std::vector<CacheKey> keys;
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     };
     // What publishing `completed` covers in one group -- every newly hashed
-    // page of a prefix-closed group, the lookback behind the newest boundary
-    // of a sliding group, the lookback behind each materialized checkpoint
-    // of a state group, nothing for a replayable one. The one source for
-    // cacheCompletedBlocksForGroup and for PublishedDataSlotsAfter.
+    // page plus the tail's blocks of a prefix-closed group, the lookback
+    // behind the newest boundary of a sliding group, the lookback behind each
+    // materialized checkpoint of a state group, nothing for a replayable one.
+    // The one source for cacheCompletedBlocksForGroup and for
+    // PublishedDataSlotsAfter.
     std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
+    // The key of table slot `block` of a History group at a publication point:
+    // its page's chain hash below the full pages, the tail hash from there on.
+    CacheKey historyBlockKey(std::size_t group_index, const CompletedPages& completed, std::int32_t block) const;
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                       std::uint64_t access_epoch);
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                             std::uint64_t access_epoch);
+    // Records a published tail in the tail table and evicts the tail the
+    // per-prior cap dropped.
+    void recordPublishedTail(const CompletedPages& completed);
+    // Evicts every group's Device entries under a tail hash: a tail's blocks
+    // are usable only together, so they leave together.
+    void evictTailEntries(const ContentHash& hash);
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    // Device eviction of one entry without the tail cascade; the cascade
+    // calls it for the companions of the block that left.
+    bool evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location);
+    bool evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    std::optional<CacheBlockLocation> deviceLocationOf(std::size_t group_index, const CacheKey& key) const;
+    // Drops a tail hash from the tail table once no tier holds an entry for it.
+    void pruneTailIfUnreferenced(const ContentHash& hash);
+    // Whether a restored request keeps writing this imaged slot: the partial
+    // block at its computed frontier. Every other data slot is immutable.
+    bool writableImageSlot(std::size_t group_index, const ImageTable& shape, std::int32_t slot_index) const;
     bool deviceCacheIsClearable() const;
     bool hostCacheIsClearable() const;
-    static void validateProgress(const RequestProgress& progress);
+    void validateProgress(const RequestProgress& progress) const;
     std::int32_t groupExpiredBlocksAt(std::int32_t i, std::int32_t num_computed_tokens) const {
         return geometry_[static_cast<std::size_t>(i)].ExpiredBlocksAt(groups_[static_cast<std::size_t>(i)].Spec(),
                                                                       num_computed_tokens);
@@ -478,6 +513,7 @@ private:
     std::int32_t prefix_granularity_{0};
     std::int32_t replay_window_tokens_{0};
     std::uint64_t next_access_epoch_{0};
+    TailTable tails_;
     std::vector<StoreCandidate> pending_stores_;
     std::unordered_set<CacheKey, CacheKeyHash> storage_keys_;
     std::deque<CacheKey> storage_key_order_;

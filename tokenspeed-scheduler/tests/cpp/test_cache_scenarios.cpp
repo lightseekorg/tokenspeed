@@ -330,9 +330,11 @@ TEST(MambaStateCheckpointTest, KeepsAlignedDecodeEndpointWorkingOnlyUnderWideVer
             finish.With(forward::Finish{.request_id = "parent"});
             scheduler.Advance(std::move(finish));
             scheduler.NextExecutionPlan();
-            EXPECT_EQ(scheduler.EmptyLcmBlocks(),
-                      initially_empty - (static_cast<std::int32_t>(tokens.size()) - 1) / cfg.prefix_granularity)
-                << "Finish retains complete history pages, but no generated state";
+            const std::int32_t computed = static_cast<std::int32_t>(tokens.size()) - 1;
+            EXPECT_EQ(scheduler.EmptyLcmBlocks(), initially_empty - computed / cfg.prefix_granularity -
+                                                      (computed % cfg.prefix_granularity == 0 ? 0 : 1))
+                << "Finish retains complete history pages and the partial page at the frontier, but no generated "
+                   "state";
             tokens.insert(tokens.end(), 11, 4);
             scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
             const ExecutionPlan resumed = scheduler.NextExecutionPlan();
@@ -406,9 +408,11 @@ TEST(MambaStateCheckpointTest, ReclaimsWorkingStateAtExactAcceptedFrontier) {
                     ExpectDecodeWorkingState(scheduler, *current, static_cast<std::int32_t>(tokens.size()) - 1,
                                              cfg.prefix_granularity, cfg.device_allocator.NumUsableBlocks());
                 } else {
-                    EXPECT_EQ(scheduler.EmptyLcmBlocks(),
-                              cfg.device_allocator.NumUsableBlocks() -
-                                  (static_cast<std::int32_t>(tokens.size()) - 1) / cfg.prefix_granularity);
+                    const std::int32_t computed = static_cast<std::int32_t>(tokens.size()) - 1;
+                    EXPECT_EQ(scheduler.EmptyLcmBlocks(), cfg.device_allocator.NumUsableBlocks() -
+                                                              computed / cfg.prefix_granularity -
+                                                              (computed % cfg.prefix_granularity == 0 ? 0 : 1))
+                        << "finish keeps the full history pages and the partial page at the frontier";
                 }
                 // Diverge immediately after the boundary under test: reusing
                 // the whole prefix could hide its loss behind a newer hit.
@@ -1589,7 +1593,7 @@ protected:
         SchedulerConfig cfg{};
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 13;
-        cfg.host_allocator.total_pages = 14;  // 13 usable + the null placeholder (page 0)
+        cfg.host_allocator.total_pages = 16;  // 15 usable + the null placeholder (page 0): 12 pages + a tail per group
         cfg.max_scheduled_tokens = 4;         // 4-token prefill chunks
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -1654,7 +1658,7 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     // for the ACK -- and waits, rather than retracting anyone (least of all
     // itself) for capacity that the ACK is about to return.
     config_.disable_l2_cache = false;
-    config_.host_allocator.total_pages = 13;
+    config_.host_allocator.total_pages = 15;  // 12 streamed pages plus the finish-time tail in both groups
     scheduler_ = std::make_unique<Scheduler>(config_);
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 12);
@@ -1706,12 +1710,17 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
 
     SendForwardDone("r1", {100});
     SendFinish("r1");
-    PlanOnce();
+    ExecutionPlan finish = PlanOnce();  // the partial page at token 13 streams as a tail (full + swa)
+    auto wb4 = ExtractCacheOpsOfKind<WriteBackBatch>(finish);
+    ASSERT_EQ(wb4.size(), 1u);
+    const auto op4 = std::get<WriteBackBatch>(wb4.front());
+    EXPECT_EQ(op4.src_pages.at(0).size(), 2u);
     EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start)
-        << "op2/op3 still pin their sources: the pool does not balance before their ACKs";
+        << "op2/op3/op4 still pin their sources: the pool does not balance before their ACKs";
     SendWriteBackDone(op2.op_ids.at(0));
     SendWriteBackDone(op3.op_ids.at(0));
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 12);
+    SendWriteBackDone(op4.op_ids.at(0));
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 14);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACKs return every pinned source";
 }
 
@@ -2076,6 +2085,9 @@ protected:
         SchedulerConfig cfg = CapacityBlockSuite::MakeConfig();
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = false;
+        // Room for a finished request's partial page in both groups beside
+        // the pinned image and the streamed prompt pages.
+        cfg.host_allocator.total_pages = 16;
         SetTestSnapshotPool(cfg);
         return cfg;
     }
@@ -2125,6 +2137,65 @@ TEST_F(FusedRetractionL2TestSuite, RetractionStoresTheLatestCompletedBoundary) {
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 10) << "the ACK publishes the new entries";
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6) << "the suspended request pins every Host entry of its image";
     EXPECT_FALSE(scheduler_->CanClearCache()) << "pinned entries refuse a flush";
+}
+
+// A victim whose frontier is not page-aligned publishes its partial page as a
+// tail: the image's L2 leg carries it, and the restore copies it back into a
+// fresh private block -- never claiming the published block the victim will
+// keep writing -- on an unkeyed row, while the full pages are claimed.
+class ForcedRetractionL2TailSuite : public FusedRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = FusedRetractionL2TestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 33;  // no capacity pressure: the knob alone retracts
+        for (auto& g : cfg.cache_groups) {
+            g.total_pages = cfg.device_allocator.total_pages;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.debug_force_retraction_interval = 4;
+        return cfg;
+    }
+};
+
+TEST_F(ForcedRetractionL2TailSuite, AVictimsPartialPageIsPublishedAndRestoredAsAPrivateCopy) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3}});
+    CompleteStores(PlanOnce());  // plan 1: prefill
+    SendForwardDone("r1", {42});
+    CompleteStores(PlanOnce());  // plan 2: first decode, streams page [1 2]
+    SendForwardDone("r1", {43});
+    CompleteStores(PlanOnce());  // plan 3: decode
+    SendForwardDone("r1", {44});
+    // Plan 4 retracts r1 = [1 2 3 42 43 44]: 5 computed tokens, pages [1 2]
+    // [3 42] and the partial page [43].
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    const auto write_backs = ExtractCacheOpsOfKind<WriteBackBatch>(retraction);
+    ASSERT_EQ(write_backs.size(), 1u);
+    const auto& l2_leg = std::get<WriteBackBatch>(write_backs.front());
+    EXPECT_EQ(l2_leg.src_pages.at(0).size(), 4u) << "page [3 42] and the tail [43], in both groups";
+    const SnapshotStoreBatch* store = FindSnapshotStore(retraction);
+    ASSERT_NE(store, nullptr);
+    EXPECT_TRUE(store->src_pages.at(0).empty()) << "every data slot is published; the pool carries the blob only";
+    CompleteStores(retraction);
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+
+    const ExecutionPlan readmit = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(readmit);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"r1"});
+    const auto& hashes = restore->content_hashes.at(0);
+    const auto& tiers = restore->source_tiers.at(0);
+    ASSERT_EQ(hashes.size(), 2u) << "the full pages are still Device-cached and claimed; only the tail is copied";
+    for (std::size_t i = 0; i < hashes.size(); ++i) {
+        EXPECT_EQ(tiers[i], static_cast<std::uint8_t>(HostTier::kL2));
+        EXPECT_TRUE(hashes[i].empty()) << "the partial page's row is a private copy, not republished";
+    }
+    AckRestores(readmit);
+    EXPECT_EQ(scheduler_->TailEntries(), 1u) << "the published tail stays cached and enumerable";
+    const ExecutionPlan decode = PlanOnce();
+    ASSERT_NE(FindForwardBatch(decode), nullptr);
+    EXPECT_EQ(FindForwardBatch(decode)->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(scheduler_->RequestTokenSize("r1"), 6);
 }
 
 TEST_F(FusedRetractionL2TestSuite, AReadmissionThatDoesNotFitWaitsWithoutRetracting) {
@@ -2224,6 +2295,7 @@ TEST_F(FusedRetractionL2TestSuite, ADecodingVictimResumesDecodingWithoutRecomput
     AckRestores(readmit);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the restore released the pins";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 10) << "the entries stay cached for ordinary reuse";
+    CompleteStores(readmit);
 
     const ExecutionPlan decode = PlanOnce();
     const ForwardBatch* op = FindForwardBatch(decode);
@@ -2237,7 +2309,7 @@ TEST_F(FusedRetractionL2TestSuite, ADecodingVictimResumesDecodingWithoutRecomput
     // six tokens hits all three.
     SendForwardDone("r1", {45});
     SendFinish("r1");
-    PlanOnce();
+    CompleteStores(PlanOnce());  // r1's finish stores its tail; the ACK unpins the Device sources
     Submit(RequestSpec{.request_id = "r3", .tokens = {1, 2, 3, 4, 42, 43, 7, 8}});
     const ExecutionPlan hit = PlanOnce();
     const ForwardBatch* hit_op = FindForwardBatch(hit);
@@ -2598,16 +2670,21 @@ TEST_F(SharedImagePagesSuite, VictimsPinAnInFlightStoresBlocksAndWaitForItsAck) 
     SendForwardDone("r1", {43});
 
     // Plan 3 retracts r1 (quiescent). Its prompt pages are travelling on the
-    // pinned store, so the image pins that store's Host blocks and its own
-    // L2 leg carries nothing; the unaligned tail page rides the snapshot pool.
-    // r2, sharing r1's prompt, hits those pages on Device.
+    // pinned store, so the image pins that store's Host blocks; the partial
+    // page with token 42 is published as a tail by the retraction and is the
+    // only block its own L2 leg copies, so the snapshot pool carries the blob
+    // alone. r2, sharing r1's prompt, hits those pages on Device.
     Submit(MakeRequestSpec("r2", /*num_pages=*/2));
     const ExecutionPlan p3 = PlanOnce();
     ASSERT_EQ(scheduler_->RetractedSize(), 1u);
-    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(p3).empty()) << "nothing to copy that is not already on its way";
+    const auto p3_stores = ExtractCacheOpsOfKind<WriteBackBatch>(p3);
+    ASSERT_EQ(p3_stores.size(), 1u);
+    const auto& r1_l2_leg = std::get<WriteBackBatch>(p3_stores.front());
+    EXPECT_EQ(r1_l2_leg.src_pages.at(0).size(), 2u) << "the tail page with token 42, in both groups";
+    EXPECT_EQ(r1_l2_leg.source_pinned, std::vector<bool>{false}) << "an image leg is stream-ordered";
     const SnapshotStoreBatch* r1_tail = FindSnapshotStore(p3);
     ASSERT_NE(r1_tail, nullptr);
-    EXPECT_EQ(r1_tail->src_pages.at(0).size(), 2u) << "the tail page with token 5, in both groups";
+    EXPECT_TRUE(r1_tail->src_pages.at(0).empty()) << "every data slot is published: the pool carries the blob only";
     const ForwardBatch* r2_prefill = FindForwardBatch(p3);
     ASSERT_EQ(r2_prefill->request_ids, std::vector<std::string>{"r2"});
     EXPECT_EQ(r2_prefill->extend_prefix_lens.at(0), 2) << "r2 hits r1's first page (the second is the replay tail)";
@@ -5938,11 +6015,19 @@ TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
 
     ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4));  // identical tokens
     EXPECT_FALSE(FindWriteBack(finalize2).has_value()) << "already-indexed keys must not re-emit a write-back";
+    // r1's finish found the Host pool fully in flight, so its tail never
+    // reached Host; r2's identical tail is the first store of that key and
+    // replaces two committed, unpinned entries in the 6-page pool.
     ExecutionPlan finish2 = FinishAndReap("r2");
-    EXPECT_FALSE(FindWriteBack(finish2).has_value()) << "finish must also dedupe already-indexed keys";
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start)
-        << "duplicate candidates are unpinned at drain, pool back to baseline";
+    auto finish_wb2 = FindWriteBack(finish2);
+    ASSERT_TRUE(finish_wb2.has_value());
+    EXPECT_EQ(finish_wb2->src_pages.at(0).size(), 2u) << "the tail with token 9001, in both groups";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 2)
+        << "duplicate candidates are unpinned at drain; only the tail's sources are pinned";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+    SendWriteBackDone(finish_wb2->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 
 TEST_F(StreamingSinkSuite, HostPoolExhaustionSkipsSilently) {
@@ -6009,15 +6094,20 @@ TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
     EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 6) << "duplicates must not consume extra host pages";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
 
-    EXPECT_FALSE(FindWriteBack(FinishAndReap("r1")).has_value());
+    // Both prompts end with the same generated tokens, so their tails share
+    // one hash: r1's finish stores it, r2's finds it in flight and drops it.
+    auto tail_wb = FindWriteBack(FinishAndReap("r1"));
+    ASSERT_TRUE(tail_wb.has_value());
+    EXPECT_EQ(tail_wb->src_pages.at(0).size(), 2u);
     EXPECT_FALSE(FindWriteBack(FinishAndReap("r2")).has_value()) << "same-round duplicates must be dropped";
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 6)
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 8)
         << "one pinned source per emitted key; the dropped duplicates pin nothing";
 
     SendWriteBackDone(stream_wb->op_ids.at(0));
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
-    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 6) << "the six cached host pages remain occupied";
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACK returns the pinned sources";
+    SendWriteBackDone(tail_wb->op_ids.at(0));
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), 4) << "the eight cached host pages remain occupied";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "the ACKs return the pinned sources";
 }
 
 TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
@@ -6090,7 +6180,8 @@ protected:
     }
 
     // Full sink lifecycle: completed Full+SWA pages stream at finalize; finish
-    // only emits leftover decode pages or latest snapshots.
+    // emits leftover decode pages, the partial page at the computed frontier
+    // (both groups) and latest snapshots.
     std::vector<WriteBackBatch> RunSinkLifecycle(const RequestSpec& spec) {
         ExecutionPlan finalize = RunToFinalize(spec);
         ExecutionPlan finish = FinishAndReap(spec.request_id);
@@ -6104,24 +6195,26 @@ protected:
         return write_backs;
     }
 
-    // r1 (tokens 1..8) indexes 6 host entries (4 Full + 2 SWA); the churn request
-    // then floods the free list so r1's pages survive ONLY on the host tier.
+    // r1 (tokens 1..8, two generated) indexes 8 host entries (4 Full + 2 SWA
+    // at finalize, the one-token tail in both groups at finish); the churn
+    // request then floods the free list so r1's pages survive ONLY on the
+    // host tier.
     void SeedHostThenEvictDevice() {
         auto wb1 = RunSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
-        ASSERT_EQ(wb1.size(), 1u);
+        ASSERT_EQ(wb1.size(), 2u);
         for (const auto& wb : wb1) {
             SendWriteBackDone(wb.op_ids.at(0));
         }
-        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
         // Host cache entries retain their host blocks until host eviction.
-        ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 26);
+        ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 24);
 
         auto wb3 = RunSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/5, /*start=*/501));
-        ASSERT_EQ(wb3.size(), 1u);
+        ASSERT_EQ(wb3.size(), 2u);
         for (const auto& wb : wb3) {
             SendWriteBackDone(wb.op_ids.at(0));
         }
-        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 13);
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 17) << "5 Full + 2 SWA + the churn's tail in both groups";
         ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 12) << "both seeding requests fully retired";
     }
 };
@@ -6354,6 +6447,9 @@ protected:
         // 21 -> 20 free: r2's first chunk holds 10 (6 ext + 4 fresh) and its second
         // chunk charges 6 with zero slide credit (ticket-held punches don't count).
         cfg.device_allocator.total_pages = 21;
+        // 36 usable: both seeding requests' pages and tails stay Host-resident
+        // (32 entries) with room for r2's own streams.
+        cfg.host_allocator.total_pages = 37;
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
@@ -6376,14 +6472,15 @@ protected:
         AckWriteBacks(FinishAndReap(spec.request_id));
     }
 
-    // r1 (4 pages) indexes 8 host entries over 2 chunks; the churn request must pop
-    // 22 free-list entries (full 10 + swa 10 + reserve 2) = the 12 fresh blocks
-    // still unused plus ALL 10 of r1's cached blocks, so r1 survives host-only.
+    // r1 (4 pages) indexes 8 host entries over 2 chunks plus its tail in both
+    // groups at finish; the churn request must pop 22 free-list entries (full
+    // 10 + swa 10 + reserve 2) = the 10 fresh blocks still unused plus ALL 12
+    // of r1's cached blocks, so r1 survives host-only.
     void SeedHostThenEvictDeviceChunked() {
         RunChunkedSinkLifecycle(MakeRequestSpec("r1", /*num_pages=*/4), /*prefill_rounds=*/2);
-        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 10);
         RunChunkedSinkLifecycle(MakeRequestSpec("churn", /*num_pages=*/10, /*start=*/501), /*prefill_rounds=*/5);
-        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 28);
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 32);
         ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 20) << "both seeding requests fully retired";
     }
 };

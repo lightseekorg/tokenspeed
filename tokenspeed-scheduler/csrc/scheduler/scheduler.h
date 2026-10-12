@@ -106,6 +106,10 @@ public:
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
+    // Published tail boundaries the probe can enumerate, and how many the
+    // per-prior cap has dropped since start.
+    std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }
+    std::int64_t TailCapEvictions() const { return coordinator_.TailCapEvictions(); }
     // Empty parents of the request-private snapshot pool: every block of it
     // belongs to some retracted request's image, so a request that finished
     // or aborted while retracted must have returned its share (leak check).
@@ -214,6 +218,11 @@ private:
                                   const RequestProgress& progress);
     void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
+    // The descriptors a publication mutates: its newly hashed full pages and,
+    // at a tail, the partial page under its tail hash (token_ids = the rows
+    // below T, parent = the last full page).
+    void registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+                                    const CompletedPages& completed);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
 

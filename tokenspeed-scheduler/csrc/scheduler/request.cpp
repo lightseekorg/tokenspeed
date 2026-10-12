@@ -22,6 +22,7 @@
 
 #include <stdexcept>
 
+#include "cache/prefix/prefix_hasher.h"
 #include "fsm/forward_events.h"
 
 namespace tokenspeed {
@@ -50,6 +51,20 @@ PrefillInfo Request::CurrentPrefillInfo() const {
             },
         },
         state_);
+}
+
+std::optional<TailPublication> Request::TailPublicationAt(std::int32_t num_computed_tokens,
+                                                          const std::string& prior) const {
+    _assert(num_computed_tokens >= 0 && num_computed_tokens <= TokenSize(),
+            "the computed frontier lies inside the request's tokens");
+    const std::int32_t tail_tokens = num_computed_tokens % prefix_granularity_;
+    if (tail_tokens == 0) {
+        return std::nullopt;
+    }
+    return TailPublication{
+        .tail_tokens = tail_tokens,
+        .hash = HashPrefixPage(TokenSlice(num_computed_tokens - tail_tokens, tail_tokens), prior),
+    };
 }
 
 std::int32_t Request::NumComputedTokens() const {

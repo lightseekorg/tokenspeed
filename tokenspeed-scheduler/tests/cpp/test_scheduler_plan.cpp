@@ -235,6 +235,47 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock)
     EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes, std::vector<std::uint64_t>{stored_hash});
 }
 
+// A finish whose frontier is not page-aligned publishes the partial page as a
+// tail: one more BlockStored whose token_ids are the rows below T (shorter
+// than block_size), chained to the last full page, and removed with it.
+TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFinish) {
+    config_.device_allocator.total_pages = 5;
+    config_.cache_groups.front().total_pages = config_.device_allocator.total_pages;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const RequestSpec spec{.request_id = "r1", .tokens = {1, 2, 3}};
+    Submit(spec);
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    SendFinish("r1");  // computed tokens [1 2 3]: page [1 2] and the tail [3]
+
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[1]));
+    const auto& page = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& tail = std::get<KvBlockStoredEvent>(events[1]);
+    EXPECT_EQ(page.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_FALSE(page.parent_block_hash.has_value());
+    EXPECT_EQ(tail.token_ids, (std::vector<std::int32_t>{3}));
+    EXPECT_EQ(tail.parent_block_hash, page.block_hashes.front()) << "the tail chains to the last full page";
+    EXPECT_EQ(tail.block_size, PrefixGranularity());
+    EXPECT_NE(tail.block_hashes.front(), page.block_hashes.front());
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    // A prompt sharing nothing floods the pool (3 pages plus the decode
+    // reserve take all 4 blocks): both boundaries leave, the tail (deeper)
+    // first.
+    Submit(MakeRequestSpec("replacement", 3, 100));
+    PlanOnce();
+    std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
+    ASSERT_EQ(removed.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[0]));
+    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[1]));
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes, tail.block_hashes);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[1]).block_hashes, page.block_hashes);
+}
+
 class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

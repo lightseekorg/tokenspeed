@@ -43,6 +43,11 @@ struct CacheCoordinatorTestAccess {
     static std::size_t NumStorageKeyOrder(const CacheCoordinator& coordinator) {
         return coordinator.storage_key_order_.size();
     }
+
+    // The planner's Device eviction of one entry, with its tail cascade.
+    static bool EvictCachedBlock(CacheCoordinator& coordinator, std::uint32_t group_id, CacheBlockLocation location) {
+        return coordinator.evictCachedBlock(group_id, location);
+    }
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {

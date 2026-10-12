@@ -42,6 +42,7 @@
 #include "prefix_test_group.h"
 #include "cache_test_access.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "unit_test_helper.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -5164,6 +5165,152 @@ TEST(RetractionImageTest, HostAllocationFollowsTheSourceBucket) {
     EXPECT_EQ(coordinator.NumHostCachedBlocks(), 2) << "only bucket-1 entries were evicted";
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-0", 0)));
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("old-2", 0)));
+}
+
+// ---------------------------------------------------------------------------
+// Tail publication: the partial page at a final frontier is published under
+// hash@T beside the full pages, and the entries of one tail live and die as
+// a unit across groups.
+// ---------------------------------------------------------------------------
+class TailPublicationTest : public ::testing::Test {
+protected:
+    static constexpr std::int32_t kP = 4;
+    // Group 0: full attention with 2-token blocks (two blocks per page);
+    // group 1: full attention with 4-token blocks; group 2: a sliding window
+    // of 3 tokens over 2-token blocks (lookback of one block).
+    TailPublicationTest()
+        : pool_(/*num_lcm_blocks=*/64, {1, 1, 1}),
+          coordinator_{MakeCoordinator(
+              std::vector<CacheGroupSpec>{
+                  CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+                  CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+                  CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+                                 .sliding_window = 3,
+                                 .cache_blocks_per_lcm_block = 1,
+                                 .block_granularity = 2},
+              },
+              kP, pool_, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+              /*stream_device_cache_to_host=*/false)} {}
+
+    // Admits a request over `tokens` and publishes everything below
+    // num_computed_tokens as a final frontier. Returns the tail published.
+    TailPublication PublishFinal(std::vector<BlockTable>& tables, const std::vector<std::int32_t>& tokens,
+                                 std::int32_t num_computed_tokens) {
+        EXPECT_TRUE(AdmitForTest(coordinator_, tables, static_cast<std::int32_t>(tokens.size())));
+        const std::int32_t full_pages = num_computed_tokens / kP;
+        std::vector<std::vector<std::int32_t>> pages;
+        for (std::int32_t page = 0; page < full_pages; ++page) {
+            pages.emplace_back(tokens.begin() + page * kP, tokens.begin() + (page + 1) * kP);
+        }
+        hashes_ = ContentHashes(pages);
+        const std::int32_t tail_tokens = num_computed_tokens - full_pages * kP;
+        TailPublication tail{
+            .tail_tokens = tail_tokens,
+            .hash = HashPrefixPage(token_span(tokens.data() + full_pages * kP, static_cast<std::size_t>(tail_tokens)),
+                                   hashes_.empty() ? std::string{} : hashes_.back()),
+        };
+        const RequestProgress progress{
+            .completed_pages =
+                CompletedPages{
+                    .prefix_hashes = hashes_, .first_new_prefix_page = 0, .tail = tail, .owner_continues = false},
+            .num_computed_tokens = num_computed_tokens,
+        };
+        coordinator_.CacheCompletedBlocks(tables, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+        return tail;
+    }
+
+    bool Cached(std::uint32_t group, const std::string& hash, std::int32_t offset) const {
+        return coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(group))
+            .Contains(pool_, Key(hash, group, offset));
+    }
+
+    BlockPool pool_;
+    CacheCoordinator coordinator_;
+    std::vector<std::string> hashes_;
+};
+
+TEST_F(TailPublicationTest, PublishesThePartialPageUnderHashAtT) {
+    std::vector<BlockTable> tables(3);
+    // 11 computed tokens: two full pages, then rows [8, 11) of page 2.
+    const TailPublication tail = PublishFinal(tables, MakeTokens(12), /*num_computed_tokens=*/11);
+    ASSERT_EQ(tail.tail_tokens, 3);
+    ASSERT_EQ(hashes_.size(), 2u);
+    EXPECT_EQ(coordinator_.NumTailEntries(), 1u);
+    // Group 0 (g = 2): blocks [8,10) and the partial [10,11) -> offsets 0, 1.
+    EXPECT_TRUE(Cached(0, tail.hash, 0));
+    EXPECT_TRUE(Cached(0, tail.hash, 1));
+    EXPECT_FALSE(Cached(0, tail.hash, 2));
+    // Group 1 (g = 4): the single partial block.
+    EXPECT_TRUE(Cached(1, tail.hash, 0));
+    EXPECT_FALSE(Cached(1, tail.hash, 1));
+    // Group 2 (sliding, lookback 1 block): the block containing T only.
+    EXPECT_TRUE(Cached(2, tail.hash, 1));
+    EXPECT_FALSE(Cached(2, tail.hash, 0));
+    EXPECT_TRUE(Cached(0, hashes_[1], 1)) << "the full pages are published as before";
+    EXPECT_EQ(coordinator_.TailBlocksFor(0, 3), 2);
+    EXPECT_EQ(coordinator_.TailBlocksFor(1, 3), 1);
+    EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(tail.hash, 0)), CacheCoordinator::BoundaryResidency::kPartial)
+        << "the sliding group holds one of its two tail blocks";
+    coordinator_.Free(tables);
+}
+
+TEST_F(TailPublicationTest, AnAlignedFrontierPublishesNoTail) {
+    std::vector<BlockTable> tables(3);
+    ASSERT_TRUE(AdmitForTest(coordinator_, tables, 8));
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+    CacheCompletedBlocksForTest(coordinator_, tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/8, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*materialized_state_boundaries=*/{});
+    EXPECT_EQ(coordinator_.NumTailEntries(), 0u);
+    coordinator_.Free(tables);
+}
+
+TEST_F(TailPublicationTest, EvictingOneTailBlockTakesItsCompanionsAndPrunesTheTable) {
+    std::vector<BlockTable> tables(3);
+    const TailPublication tail = PublishFinal(tables, MakeTokens(12), /*num_computed_tokens=*/11);
+    coordinator_.Free(tables);  // cache-only: every tail block is evictable
+    ASSERT_EQ(coordinator_.NumTailEntries(), 1u);
+
+    // Evicting group 1's partial block through the planner's path takes group
+    // 0's two blocks and the sliding group's block with it: a tail is usable
+    // only whole.
+    CacheBlockLocation location{};
+    {
+        const CacheBlockRef victim = coordinator_.GroupPrefixIndex(1).Find(pool_, Key(tail.hash, 1, 0));
+        ASSERT_TRUE(static_cast<bool>(victim));
+        location = victim->Location();
+    }
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, 1, location));
+    EXPECT_FALSE(Cached(0, tail.hash, 0));
+    EXPECT_FALSE(Cached(0, tail.hash, 1));
+    EXPECT_FALSE(Cached(2, tail.hash, 1));
+    EXPECT_EQ(coordinator_.NumTailEntries(), 0u) << "no tier holds the hash any more";
+    EXPECT_TRUE(Cached(0, hashes_[1], 0)) << "the full pages stay";
+    EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(tail.hash, 0)), CacheCoordinator::BoundaryResidency::kNone);
+}
+
+TEST_F(TailPublicationTest, CapDropsTheOldestTailUnderOnePriorWithItsBlocks) {
+    // Nine requests sharing page 0 and ending at nine different offsets of
+    // page 1 publish nine tails under the same prior.
+    std::vector<std::vector<BlockTable>> tables;
+    std::vector<TailPublication> tails;
+    for (std::int32_t extra = 1; extra <= TailTable::kMaxTailsPerPrior + 1; ++extra) {
+        std::vector<std::int32_t> tokens = MakeTokens(kP);
+        for (std::int32_t i = 0; i < 3; ++i) {
+            tokens.push_back(1000 * extra + i);
+        }
+        tables.emplace_back(3);
+        tails.push_back(PublishFinal(tables.back(), tokens, /*num_computed_tokens=*/kP + 3));
+        coordinator_.Free(tables.back());
+    }
+    EXPECT_EQ(coordinator_.NumTailEntries(), static_cast<std::size_t>(TailTable::kMaxTailsPerPrior));
+    EXPECT_EQ(coordinator_.TailCapEvictions(), 1);
+    EXPECT_FALSE(Cached(0, tails.front().hash, 0)) << "the oldest tail's blocks left the index";
+    EXPECT_FALSE(Cached(1, tails.front().hash, 0));
+    EXPECT_FALSE(Cached(2, tails.front().hash, 1));
+    for (std::size_t i = 1; i < tails.size(); ++i) {
+        EXPECT_TRUE(Cached(0, tails[i].hash, 0)) << "tail " << i;
+    }
 }
 
 }  // namespace

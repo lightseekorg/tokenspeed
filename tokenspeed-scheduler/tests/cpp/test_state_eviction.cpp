@@ -234,7 +234,9 @@ TEST_F(StatePublicationSuite, FinalPrefillBoundarySurvivesAlignedAndUnalignedEnd
         SendFinish("source");
         PlanOnce();
 
-        EXPECT_EQ(ResidentBlocks(), length / 4 + 3);
+        // Finish publishes the partial page at the computed frontier beside
+        // the full pages and the three state checkpoints.
+        EXPECT_EQ(ResidentBlocks(), length / 4 + 3 + (length % 4 == 0 ? 0 : 1));
         ExpectReplay("earlier_chunk", MakeTokens(9, 1), 0);
         auto replay_tokens = request.tokens;
         replay_tokens.push_back(999);
@@ -257,7 +259,7 @@ TEST_F(StatePublicationSuite, HostStoresOnlyFinalPrefillSnapshotIncludingShortTa
             state_stores += StateStoreCount(plan);
         }
         EXPECT_EQ(state_stores, 3) << "ordinary computed Chunks must not be queued for L2";
-        EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), length / 4 + 3);
+        EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), length / 4 + 3 + 1) << "full pages, states and the tail";
         ASSERT_TRUE(scheduler_->ClearL1Cache());
         auto replay_tokens = request.tokens;
         replay_tokens.push_back(999);
@@ -275,10 +277,10 @@ TEST_F(StatePublicationSuite, DecodeAndFinishKeepOnlyThePrefillStateBoundary) {
         PlanOnce();
     }
     // The last schedule has already hashed the completed prefix pages;
-    // Finish adds no hash and must not supplement a state snapshot.
+    // Finish adds the one-token tail and must not supplement a state snapshot.
     SendFinish("source");
     PlanOnce();
-    EXPECT_EQ(ResidentBlocks(), 3 + 3);
+    EXPECT_EQ(ResidentBlocks(), 3 + 1 + 3);
     ExpectReplay("old_boundary", ConversationPrefix(8), 4);
     ExpectReplay("generated_boundary", ConversationPrefix(12), 4);
 }
@@ -300,7 +302,7 @@ TEST_F(StatePublicationSuite, FinishAddsHistoryButNoDecodeStateToHost) {
     const ExecutionPlan finish = PlanOnce();
     EXPECT_EQ(StateStoreCount(finish), 0) << "finish does not create a decode Endpoint";
     AckWriteBacks(finish);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6) << "three history pages plus the prefill state";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 7) << "three history pages, the tail and the prefill state";
     ASSERT_TRUE(scheduler_->ClearL1Cache());
     ExpectReplay("old_host_boundary", ConversationPrefix(8), 4);
     ExpectReplay("generated_host_boundary", ConversationPrefix(12), 4);

@@ -93,19 +93,26 @@ TEST_F(FinishOnlyWriteBackTestSuite, PrefillStreamsMlaPagesDecodeDefersUntilFini
     ASSERT_EQ(finish_stores.size(), 1u);
     const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
     ASSERT_EQ(finish_write_back.group_ids.size(), 1u);
-    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0}))
-        << "finish writes only the new decode MLA page";
+    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 0}))
+        << "finish writes the new decode MLA page and the partial page at the computed frontier (7 tokens: page "
+           "2 plus a one-token tail)";
     SendWriteBackDone(finish_write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
 }
 
-TEST_F(FinishOnlyWriteBackTestSuite, FinishWithoutEligiblePageEmitsNoStore) {
+TEST_F(FinishOnlyWriteBackTestSuite, FinishStoresTheTailOfAOneTokenPrompt) {
     Submit(RequestSpec{.request_id = "r0", .tokens = {1}});
     PlanOnce();
     SendForwardDone("r0", {42});
     SendFinish("r0");
 
-    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
+    // One computed token: no full page, but the partial page [0, 1) is a
+    // resumable boundary for any prompt starting with that token.
+    const std::vector<CacheOperation> finish_stores = ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce());
+    ASSERT_EQ(finish_stores.size(), 1u);
+    const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
+    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0}));
+    EXPECT_EQ(finish_write_back.page_offsets.front(), (std::vector<std::int32_t>{0}));
 }
 
 TEST_F(FinishOnlyWriteBackTestSuite, AbortEmitsNoStore) {
@@ -164,10 +171,10 @@ TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesWithoutNewK
     ASSERT_EQ(finish_stores.size(), 1u);
     const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
     ASSERT_EQ(finish_write_back.group_ids.size(), 1u);
-    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0}))
-        << "finish writes decode MLA pages but no decode KDA snapshot";
+    EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 0}))
+        << "finish writes the decode MLA page and the MLA tail but no decode KDA snapshot";
     SendWriteBackDone(finish_write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 7);
 }
 
 class LoadBackDoneTestSuite : public SchedulerTestSuite {

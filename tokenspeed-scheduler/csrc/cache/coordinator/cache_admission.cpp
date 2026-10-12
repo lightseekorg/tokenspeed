@@ -459,6 +459,12 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
 
 }  // namespace
 
+bool CacheCoordinator::writableImageSlot(std::size_t group_index, const ImageTable& shape,
+                                         std::int32_t slot_index) const {
+    (void)group_index;
+    return shape.available_tokens > 0 && slot_index == shape.num_blocks - 1;
+}
+
 std::int32_t CacheCoordinator::PromotionBoundaryTokens(const PrefixProbe& prefix) const {
     const std::int32_t matched_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
     const std::int32_t prefix_closed_tokens =
@@ -551,6 +557,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 pool_, table, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *progress.num_computed_tokens));
         }
     }
+    if (progress.completed_pages) {
+        _assert(!progress.completed_pages->owner_continues, "copy-in publication is not supported yet");
+        recordPublishedTail(*progress.completed_pages);
+    }
     for (const auto& [group_id, location] : prospective_victims) {
         if (!evictCachedBlock(group_id, location)) {
             FatalCheck(!pool_.IsOccupied(location), "admission victim changed before acquisition");
@@ -592,6 +602,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     // table already pointed at). Those blocks are protected from the planner's
     // eviction like prefix hits; every other slot is a bucket-constrained
     // fresh block.
+    // A published slot the resumed request will never write again is claimed
+    // from the Device index when its key is still cached there; the slot it
+    // keeps writing -- the partial page at its computed frontier -- always
+    // gets a fresh copy, so the published block stays immutable.
+    const auto claimable = [&](std::size_t i, const ImageTable& shape, const ImageSlot& slot) {
+        return slot.InHostCache() && !writableImageSlot(i, shape, slot.slot_index);
+    };
     std::vector<PlannedShape> shapes(groups_.size());
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> protected_locations;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
@@ -604,7 +621,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         for (const ImageSlot& slot : shape.slots) {
             _assert(static_cast<bool>(slot.block), "image slot lost its block");
             const CacheBlockRef canonical =
-                slot.InHostCache() ? groups_[i].Index().Find(pool_, slot.key) : CacheBlockRef{};
+                claimable(i, shape, slot) ? groups_[i].Index().Find(pool_, slot.key) : CacheBlockRef{};
             if (canonical) {
                 protected_locations.emplace_back(groups_[i].Id(), canonical->Location());
                 continue;
@@ -620,9 +637,12 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         return std::nullopt;
     }
     // Nothing is published or reclaimed here, so every planned victim is a
-    // cache-only block the planner saw as evictable.
+    // cache-only block the planner saw as evictable (or a tail companion an
+    // earlier victim's eviction already took).
     for (const auto& [group_id, location] : candidate->victims) {
-        FatalCheck(evictCachedBlock(group_id, location), "restore victim changed before acquisition");
+        if (!evictCachedBlock(group_id, location)) {
+            FatalCheck(!pool_.IsOccupied(location), "restore victim changed before acquisition");
+        }
     }
 
     AdmissionResult result{
@@ -636,7 +656,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         std::vector<CacheBlockRef> claimed(shape.slots.size());
         for (std::size_t j = 0; j < shape.slots.size(); ++j) {
             const ImageSlot& slot = shape.slots[j];
-            if (!slot.InHostCache() || !groups_[i].Index().Find(pool_, slot.key)) {
+            if (!claimable(i, shape, slot) || !groups_[i].Index().Find(pool_, slot.key)) {
                 continue;
             }
             // The planner protected this entry; claim it like a prefix hit.
@@ -652,11 +672,14 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
             if (slot.InHostCache() && groups_[i].Index().Contains(destination)) {
                 continue;  // claimed: already the published Device block, nothing to copy
             }
+            // The writable slot's row is unkeyed: its destination is the
+            // request's private copy and must not be republished at the ACK.
+            const bool republish = claimable(i, shape, slot);
             BlockTransfer transfer{
                 .group_id = groups_[i].Id(),
                 .source = slot.block,
                 .destination = destination,
-                .key = slot.key,
+                .key = republish ? slot.key : CacheKey{},
                 .logical_block_index = slot.logical_block_index,
                 .boundary_kind = slot.boundary_kind,
             };

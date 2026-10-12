@@ -692,6 +692,26 @@ Its responsibilities:
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, Mamba) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
+  A publication point is the request's computed frontier `T`
+  (`Request::NumComputedTokens()`); when `T` is not a multiple of
+  `prefix_granularity` the partial page holding rows `[kP, T)` is published
+  too, as a **tail**: every History group registers its blocks below `T`
+  (`ceil((T mod P) / block_granularity)` of them, the last one partial) under
+  `hash@T = HashPrefixPage(tokens[kP, T), H_{k-1})` -- the same chained page
+  hash over fewer tokens; its `token_count` frame keeps it distinct from the
+  page's chain hash and from every other offset. Finish and retraction publish
+  the tail in place (`CompletedPages::tail`, `PublicationPoint::kFinal`): the
+  block is final for its owner, so it passes to the index like a completed
+  page. The coordinator keeps a `TailTable` (`cache/prefix/tail_table.h`)
+  of the offsets published under each last-full-page hash, capped at eight
+  newest per prior (the dropped tail's blocks are evicted;
+  `Scheduler::TailCapEvictions` counts them), so a probe can enumerate the
+  candidate `T`s without knowing them. A tail's blocks are usable only
+  together: evicting one Device block of a tail hash evicts every group's
+  entries under it (`evictCachedBlock`), and the table forgets a hash once no
+  tier holds an entry for it. A published partial page is never written
+  again: a restore copies a victim's partial page into a fresh block (an
+  unkeyed L2 row, not republished) instead of claiming the published one.
   Host-warm first-chunk extensions call `CacheFullBlocks` at admit (the
   layer-wise load makes the bytes available before any forward reads them);
   a load-back's `BlockTransfer.key` is therefore empty and `CompleteLoadBack`

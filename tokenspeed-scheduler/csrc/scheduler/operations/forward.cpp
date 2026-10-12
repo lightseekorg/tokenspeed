@@ -45,6 +45,7 @@
 #include "scheduler/operations/forward.h"
 #include "scheduler/operations/group_demands.h"
 #include "scheduler/operations/prefill_chunk.h"
+#include "scheduler/operations/progress.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "scheduler/request.h"
 #include "utils.h"
@@ -139,22 +140,29 @@ void recordPrefillStateCheckpoint(fsm::CacheProgress& cache_progress, fsm::Prefi
     }
 }
 
-// Hashes the prefix pages that num_computed_tokens has filled since the
-// previous admission and states the request's progress for the coordinator.
-// The returned spans view cache_progress, which must outlive their use.
-RequestProgress advanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
+}  // namespace
+
+RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
-                                       bool stream_completed_to_host) {
+                                       bool stream_completed_to_host, PublicationPoint point) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
         appendCompletedPrefixHashes(cache_progress.prefix_hashes, request.FullPrefixPages(false), filled_prefix_pages);
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
-    if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
+    std::optional<TailPublication> tail;
+    if (point != PublicationPoint::kChunk) {
+        const std::string& prior =
+            cache_progress.prefix_hashes.empty() ? std::string{} : cache_progress.prefix_hashes.back();
+        tail = request.TailPublicationAt(num_computed_tokens, prior);
+    }
+    if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) || tail) {
         progress.completed_pages = CompletedPages{
             .prefix_hashes = cache_progress.prefix_hashes,
             .first_new_prefix_page = first_new_prefix_page,
+            .tail = tail,
+            .owner_continues = false,
             .boundary_kind = consumeCompletedBoundaryKind(cache_progress, num_computed_tokens, request.PrefillSize()),
             .stream_completed_to_host = stream_completed_to_host,
             .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
@@ -163,6 +171,8 @@ RequestProgress advanceRequestProgress(const Request& request, fsm::CacheProgres
     }
     return progress;
 }
+
+namespace {
 
 template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
@@ -272,10 +282,12 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
 bool Scheduler::admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
                                          const fsm::CacheProgress& cache_progress, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress) {
-    const std::int32_t first_new_prefix_page = progress.completed_pages
-                                                   ? progress.completed_pages->first_new_prefix_page
-                                                   : static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
-    registerKvEventPrefixPages(request, cache_progress.prefix_hashes, first_new_prefix_page);
+    if (progress.completed_pages) {
+        registerKvEventPublication(request, cache_progress.prefix_hashes, *progress.completed_pages);
+    } else {
+        registerKvEventPrefixPages(request, cache_progress.prefix_hashes,
+                                   static_cast<std::int32_t>(cache_progress.prefix_hashes.size()));
+    }
     return admit(plan, feedback, coordinator_.ProbePrefix({}), demands, progress, cache_progress.access_epoch)
         .has_value();
 }
@@ -458,8 +470,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         .reserve_snapshot_state_growth = config_.role != Role::kP && completes_prefill,
     };
     const RequestProgress progress =
-        advanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost());
+        AdvanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
+                               config_.StreamsDeviceCacheToHost(), PublicationPoint::kChunk);
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     std::vector<GroupDemand> demands = MakeGroupDemands(tables, GroupDemand{.extent = DenseGrowth{prefill_tokens}});
@@ -495,9 +507,9 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
             tables.front().NumBlocks() * coordinator_.GroupBlockGranularity(0) - tables.front().AvailableTokens();
         reserve_tokens = std::max(num_computed_tokens + pending_decode_tokens + decode_width - reserved_end, 0);
     }
-    const RequestProgress progress =
-        advanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>());
+    const RequestProgress progress = AdvanceRequestProgress(
+        *request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+        config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>(), PublicationPoint::kChunk);
 
     if (!progress.completed_pages &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
@@ -651,16 +663,16 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
     fsm::CacheProgress cache_progress = victim.CacheProgress();
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
     RequestProgress progress =
-        advanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false);
+        AdvanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
     if (progress.completed_pages) {
         classifyCompletedStateBoundaries(*progress.completed_pages, num_computed_tokens,
                                          coordinator_.PrefixGranularity());
         // A publication is a KV-event mutation: the newly hashed pages (decode
-        // pages no admission has registered yet) need their token descriptors
-        // first, exactly as publishCompletedPages registers before it caches.
-        registerKvEventPrefixPages(victim, cache_progress.prefix_hashes,
-                                   progress.completed_pages->first_new_prefix_page);
+        // pages no admission has registered yet) and the tail need their token
+        // descriptors first, exactly as publishCompletedPages registers before
+        // it caches.
+        registerKvEventPublication(victim, cache_progress.prefix_hashes, *progress.completed_pages);
         coordinator_.CacheCompletedBlocks(victim.BlockTablesRef(), progress, cache_progress.access_epoch);
     }
     cache_progress.DiscardHashedStateBoundaries(coordinator_.PrefixGranularity());
@@ -682,8 +694,8 @@ bool Scheduler::imageFits(const Request& request) const {
     fsm::CacheProgress cache_progress = request.CacheProgress();
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
     RequestProgress progress =
-        advanceRequestProgress(request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false);
+        AdvanceRequestProgress(request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
+                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
     if (progress.completed_pages) {
         classifyCompletedStateBoundaries(*progress.completed_pages, num_computed_tokens,
                                          coordinator_.PrefixGranularity());

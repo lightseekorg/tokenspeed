@@ -272,6 +272,34 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
     }
 }
 
+void Scheduler::registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+                                           const CompletedPages& completed) {
+    registerKvEventPrefixPages(request, prefix_hashes, completed.first_new_prefix_page);
+    if (!config_.enable_kv_cache_events || !completed.tail) {
+        return;
+    }
+    const auto full_pages = static_cast<std::int32_t>(prefix_hashes.size());
+    const KvEventHashProgress& progress = kv_event_hash_progress_.at(request.Id());
+    _assert(progress.block_hashes.size() == prefix_hashes.size(), "the tail's parent page has its KV event hash");
+    const std::optional<std::uint64_t> parent_hash =
+        full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes.back()};
+    const std::span<const std::int32_t> tail_tokens =
+        request.TokenSlice(full_pages * config_.prefix_granularity, completed.tail->tail_tokens);
+    const CacheKey key{.content_hash = completed.tail->hash};
+    KvBlockStoredEvent event{
+        .block_hashes = {HashKvBlock(tail_tokens, parent_hash)},
+        .parent_block_hash = parent_hash,
+        .token_ids = std::vector<std::int32_t>(tail_tokens.begin(), tail_tokens.end()),
+        .block_size = config_.prefix_granularity,
+    };
+    const auto [it, inserted] =
+        kv_event_boundaries_.try_emplace(key, KvEventBoundary{.stored = std::move(event), .depth = full_pages});
+    FatalCheck(inserted || (it->second.stored.block_hashes.front() == HashKvBlock(tail_tokens, parent_hash) &&
+                            it->second.depth == full_pages),
+               "one cache content hash mapped to different KV event blocks");
+    markKvEventBoundaryForReconcile(key);
+}
+
 void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
     // Descriptors are erased only by DrainKvEvents, so every cache mutation of
     // a registered boundary finds one here.
