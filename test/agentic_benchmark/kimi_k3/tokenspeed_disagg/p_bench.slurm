@@ -53,27 +53,23 @@ SRUN_ARGS=(
 "${SRUN[@]}" --nodes=1 --ntasks=1 --nodelist="$HEAD" "${SRUN_ARGS[@]}" bash -c '
 set -euo pipefail
 
-EVALSCOPE_COMMIT=acd09b44384d53174768bb1063f675420f76fae9
+EVALSCOPE_COMMIT=40395b16ba51731bfda6f099c1ded902303b56c0
 pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@${EVALSCOPE_COMMIT}"
 
 [ -f build_swe_smith_dataset.py ] || wget https://raw.githubusercontent.com/modelscope/evalscope/${EVALSCOPE_COMMIT}/examples/perf/build_swe_smith_dataset.py \
     -O build_swe_smith_dataset.py
 
-# Note: Only 69 conversations can be built
-[ -f agentic_dataset.json ] || python3 build_swe_smith_dataset.py \
+# Replicated 69 conversations x 32 -> 2208
+[ -f agentic_dataset_x32.json ] || python3 build_swe_smith_dataset.py \
     --model-path moonshotai/Kimi-K3 \
     --first-turn-length 4000 \
     --subsequent-turn-length 800 \
     --min-turns 30 \
     --max-turns 50 \
     --number 128 \
-    --output-path agentic_dataset.json \
+    --replicas 32 \
+    --output-path agentic_dataset_x32.json \
     --num-workers 32
-
-[ -f agentic_dataset_x32.json ] || python3 duplicate_agentic_dataset.py \
-    --input agentic_dataset.json \
-    --output agentic_dataset_x32.json \
-    --replicas 32
 '
 
 server_steps() {
