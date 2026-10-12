@@ -346,7 +346,7 @@ def test_tail_is_one_page_per_published_group_plus_a_replayable_groups_worst_cas
     assert tail_lcm_blocks_per_request(
         model, specs, 4096
     ) == model.lcm_blocks_needed_for([1, worst_case[1]])
-    # A state group checkpoints to L2 like the full group: one page each.
+    # A state group publishes to L2 like the full group: one page each.
     specs = (FULL, STATE)
     model = _model(specs, {"full": 1, "state": 1})
     assert tail_lcm_blocks_per_request(

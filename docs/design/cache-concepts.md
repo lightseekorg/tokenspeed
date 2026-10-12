@@ -390,16 +390,18 @@ is **split by publishability** (the C++ coordinator's `TakeImage` decides per
 slot; `scheduler.md` §2 and §4 describe the FSM side):
 
 * the **bulk** — every block the group publishes: those under a
-  hash-complete prefix page and the partial last page the retraction
-  publishes as a tail, like a finish does — goes to Host L2 as today's
-  stream-ordered retraction store (`WriteBackOp`, `source_pinned=false`),
-  and the `Retracted` request pins those Host entries until it is restored.
-  The entries stay published, so other requests may hit them; they are merely
-  unevictable for that span, so L2's evictable capacity shrinks only by the
-  retracted set, never by a separate copy of it;
+  hash-complete prefix page, the partial last page and the live state block
+  the retraction publishes as a tail, like a finish does — goes to Host L2
+  as today's stream-ordered retraction store (`WriteBackOp`,
+  `source_pinned=false`), and the `Retracted` request pins those Host
+  entries until it is restored. The entries stay published, so other
+  requests may hit them; they are merely unevictable for that span, so L2's
+  evictable capacity shrinks only by the retracted set, never by a separate
+  copy of it. A published block is never written again, so the restore
+  copies the victim's tail blocks into fresh blocks instead of claiming them;
 * the **tail** — every block of a group L2 never holds (a drafter-private
-  group, a state group's live block, a replayable group's private pages) and
-  the request's slot-state blob — goes
+  group, a replayable group's private pages, a state group's input block
+  when nothing published it) and the request's slot-state blob — goes
   to the **retraction snapshot pool**: a small, request-private, pinned pool
   sized like the Host L2 tier (an explicit `--retraction-snapshot-host-gb`,
   else `--retraction-snapshot-ratio` of the Device KV, else derived: by

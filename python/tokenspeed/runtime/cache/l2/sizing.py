@@ -129,11 +129,12 @@ NO_POOL = RetractionPoolSizing(0, 0, "--retraction-snapshot-ratio 0")
 def tail_lcm_blocks_per_request(model, specs: Sequence, token_limit: int) -> int:
     """LCM blocks one request's image tail needs beside Host L2.
 
-    Per group: one page when the group publishes to L2 (its last, unaligned
-    page -- a state group's live block), else the group's single-request
-    worst-case pages at ``token_limit`` (a replayable group is never
-    published, so every page of it is tail). Both counts and the fold to LCM
-    blocks come from the scheduler's ``CapacityModel``.
+    Per group: one page when the group publishes to L2 (a state group's
+    input slot when it holds a chunk output nothing published; a history
+    group's margin for a published page L2 could not take), else the group's
+    single-request worst-case pages at ``token_limit`` (a replayable group
+    is never published, so every page of it is tail). Both counts and the
+    fold to LCM blocks come from the scheduler's ``CapacityModel``.
 
     Args:
         model: The ``CapacityModel`` over the engine's cache groups.
