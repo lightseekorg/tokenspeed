@@ -273,6 +273,11 @@ def main() -> None:
     backend.kvp_rank = rank
     backend.kvp_block_granularity = 64
     backend.kvp_virtual_block_count = pages
+    # Each rank holds the attention-TP head slice (two heads); the sparse
+    # decode gathers them over the KVP group and reduces in selection order.
+    backend.num_local_heads = 2
+    backend.num_attention_heads = 2 * len(group)
+    backend.slot_order = "selection"
     end_length = torch.tensor([129], device="cuda", dtype=torch.int32)
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
@@ -330,13 +335,9 @@ def main() -> None:
         )
         output = backend.forward_sparse_decode(
             q=all_q[:, rank * 2 : (rank + 1) * 2].contiguous(),
-            k=None,
-            v=None,
             layer=layer,
-            out_cache_loc=torch.empty(0, device="cuda", dtype=torch.int64),
             token_to_kv_pool=pool,
             bs=1,
-            save_kv_cache=False,
             topk_indices=virtual_slots,
             topk_lens=lens,
         ).reshape(3, 2, 128)

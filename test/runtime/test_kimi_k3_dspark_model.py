@@ -10,11 +10,18 @@ the exact set of checkpoint keys the loader must route, skip, or reject.
 from __future__ import annotations
 
 import copy
+import os
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     K3_DSPARK_SKIPPED_WEIGHT_PREFIXES,
