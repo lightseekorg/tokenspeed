@@ -326,8 +326,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             "promotion boundary must be page-aligned and inside the unmatched prompt");
 
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
-    const std::int32_t tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
-                                                              unscheduled, remaining, promotion_boundary_tokens);
+    // Remote transfers land the whole suffix; local promotion boundaries cannot split them.
+    const std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
+                                               ? unscheduled
+                                               : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
+                                                                    unscheduled, remaining, promotion_boundary_tokens);
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }

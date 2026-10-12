@@ -20,6 +20,7 @@
 
 """Tests for PD Python bindings."""
 
+import pytest
 from tokenspeed_scheduler import (
     PD,
     CacheGroupConfig,
@@ -161,3 +162,75 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
     completing_chunk = scheduler.next_execution_plan().forward[0]
     assert list(completing_chunk.input_lengths) == [4]
     assert held_pages(completing_chunk) == 6, "tokens 0..7 plus a 3-token window"
+
+
+@pytest.mark.parametrize("decode_input_tokens", [1, 4])
+@pytest.mark.parametrize("max_new_tokens", [0, 32])
+def test_remote_prefill_crosses_partial_prefix_promotion(
+    decode_input_tokens, max_new_tokens
+):
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.D
+    cfg.prefix_granularity = 128
+    cfg.max_scheduled_tokens = 1024
+    cfg.max_batch_size = 2
+    cfg.num_device_pages = 129
+    cfg.num_snapshot_pages = 1  # never retracts
+    cfg.decode_input_tokens = decode_input_tokens
+    cfg.overlap_schedule_depth = 0
+    cfg.disable_l2_cache = True
+    cfg.enable_l3_storage = False
+    cfg.disable_prefix_cache = False
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=64,
+            total_pages=257,
+            cache_blocks_per_lcm_block=2,
+            family=CacheGroupFamily.History,
+            retention=CacheRetention.FullHistory,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+        ),
+        CacheGroupConfig(
+            group_id="window",
+            block_granularity=32,
+            total_pages=129,
+            cache_blocks_per_lcm_block=1,
+            family=CacheGroupFamily.History,
+            retention=CacheRetention.SlidingWindow,
+            sliding_window_tokens=513,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+        ),
+    ]
+    scheduler = Scheduler(cfg)
+    tokens = list(range(769))
+    for request_id, prompt in (
+        ("cold", tokens),
+        ("warm", tokens),
+        ("partial", tokens[:640] + list(range(10000, 10129))),
+    ):
+        request = make_spec(request_id, prompt)
+        request.max_new_tokens = max_new_tokens
+        scheduler.submit_requests([request])
+        scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent(request_id)))
+        remote = scheduler.next_execution_plan().remote_prefill
+        assert remote is not None
+        prefix = remote.extend_prefix_lens[0]
+        assert prefix == (768 if request_id == "warm" else 0)
+        assert prefix + remote.input_lengths[0] == len(prompt)
+        tables = dict(remote.block_tables)
+        assert all(page > 0 for page in tables["history"][0][:13])
+        assert len(tables["history"][0]) >= 13
+        assert all(page > 0 for page in tables["window"][0][8:25])
+        assert len(tables["window"][0]) >= 25
+        scheduler.advance(
+            ExecutionEvent().add_event(PD.RemotePrefillDoneEvent(request_id, 9001))
+        )
+        assert scheduler.next_execution_plan().forward
+        finish = ForwardEvent.Finish()
+        finish.request_id = request_id
+        scheduler.advance(ExecutionEvent().add_event(finish))
+        scheduler.next_execution_plan()
+        assert scheduler.active_lcm_blocks() == scheduler.pd_transfer_size() == 0
+    scheduler.clear_cache()
+    assert scheduler.empty_lcm_blocks() == 128
