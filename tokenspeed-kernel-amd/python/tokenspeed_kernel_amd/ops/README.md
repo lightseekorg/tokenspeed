@@ -908,6 +908,34 @@ apart, so no tile holds both.
 
 Both kernels mask partial row tiles, so they accept any token count.
 
+### gfx950 softmax top-k routing
+
+`gluon_softmax_topk_gfx950` serves `moe_topk(score_function="softmax")`
+(the Qwen3.5/3.8 router) in one launch, replacing `torch.topk`, the bitonic
+sort, a softmax and two casts.
+
+#### Contract
+
+- FP16, BF16 or FP32 logits `[tokens, experts]` with a contiguous expert
+  dimension, at most 1024 experts and top-k at most 32. Returns FP32 weights
+  and INT32 or INT64 ids `[tokens, topk]`, ordered by descending logit.
+- Ties select the lowest expert id first (`-0.0` ties with `+0.0`), as the
+  NVIDIA Triton kernel does; PyTorch leaves the order unspecified.
+- With `renormalize` the weights are a softmax over the selected logits,
+  which equals the full softmax renormalized over the selection; otherwise
+  they are the full-row softmax probabilities. Both are scaled by
+  `routed_scaling_factor`, a runtime argument.
+- The token count is a runtime argument; one binary serves every batch.
+
+#### Algorithm
+
+One wave owns one token row and holds its logits as integer keys: the
+order-preserving bits of the value above the inverted expert id (32-bit keys
+for 16-bit logits, 64-bit for FP32). Keys are unique, so each of the `topk`
+rounds is one wave max reduction followed by clearing the winning key. The
+selected logits come back exactly from the key bits, so no second gather is
+needed.
+
 ### MXFP4 sorted experts
 
 The gfx950 block-sorted path uses native scaled matrix instructions for MXFP4
