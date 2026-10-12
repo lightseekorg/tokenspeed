@@ -893,8 +893,8 @@ def test_local_transfer_pages_preserves_paired_positions(
                 group_id="history",
                 source_layout=_latent_layout(shard_count=source_degree),
                 destination_layout=_latent_layout(shard_count=destination_degree),
-                source_tp_rank=source_rank + source_degree,
-                destination_tp_rank=destination_rank + destination_degree,
+                source_owner_rank=source_rank,
+                destination_owner_rank=destination_rank,
             )
             assert src_pages.dtype == dst_pages.dtype == np.dtype(np.int64)
             assert (
@@ -915,8 +915,8 @@ def test_local_transfer_pages_rejects_invalid_blocks(source, destination):
             group_id="history",
             source_layout=_latent_layout(shard_count=2),
             destination_layout=_latent_layout(shard_count=4),
-            source_tp_rank=1,
-            destination_tp_rank=3,
+            source_owner_rank=1,
+            destination_owner_rank=3,
         )
 
 
@@ -928,8 +928,8 @@ def test_local_transfer_pages_rejects_unpaired_blocks():
             group_id="history",
             source_layout=_latent_layout(shard_count=1),
             destination_layout=_latent_layout(shard_count=1),
-            source_tp_rank=0,
-            destination_tp_rank=0,
+            source_owner_rank=0,
+            destination_owner_rank=0,
         )
 
 

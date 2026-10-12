@@ -68,14 +68,15 @@ def local_transfer_pages(
     group_id: str,
     source_layout: CacheTransferContract,
     destination_layout: CacheTransferContract,
-    source_tp_rank: int,
-    destination_tp_rank: int,
+    source_owner_rank: int,
+    destination_owner_rank: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Resolve paired logical positions to pages owned by this transfer edge.
 
     Block IDs are independently allocated by P and D, not comparable between
-    peers. The input order pairs the same logical positions. Rank coordinates
-    are attention TP ranks, containing consecutive KVP subgroups.
+    peers. The input order pairs the same logical positions. The owner ranks
+    are the two ends' positions inside their KVP subgroups (``kvp_rank``,
+    0 for a replicated group), the ``CachePageOwnerFilter`` coordinate.
     Returns equally sized source/destination physical-page int64 arrays; an edge
     with no owned pairs returns empty arrays and still participates in ACKs.
     """
@@ -88,19 +89,17 @@ def local_transfer_pages(
         raise UnsupportedPDLayoutError(
             "Cache transfer block is outside the virtual address space"
         )
-    source_degree = source_layout.shard_count(group_id)
-    destination_degree = destination_layout.shard_count(group_id)
     try:
         source_owned, source_pages = owned_local_pages(
             source,
-            shard_count=source_degree,
-            rank=source_tp_rank % source_degree,
+            shard_count=source_layout.shard_count(group_id),
+            rank=source_owner_rank,
             virtual_block_count=source_layout.virtual_block_count(group_id),
         )
         destination_owned, destination_pages = owned_local_pages(
             destination,
-            shard_count=destination_degree,
-            rank=destination_tp_rank % destination_degree,
+            shard_count=destination_layout.shard_count(group_id),
+            rank=destination_owner_rank,
             virtual_block_count=destination_layout.virtual_block_count(group_id),
         )
     except IndexError as exc:
@@ -126,9 +125,10 @@ class CachePageOwnerFilter:
     ranks; the rank with ``owner_rank`` holds block ``v`` when
     ``(v - 1) % owner_count == owner_rank`` (block 0 is the null block). The
     sender keeps only those blocks of a manifest, translated to its local
-    pages, and the matching destination subsequence. The same placement the
-    runtime's zeroing and device translation use; see
-    ``kv_cache/virtual_blocks.py``.
+    pages, and of the destination blocks at the same manifest positions the
+    ones the receiving rank owns under its own group's sharding
+    (``local_transfer_pages``). The same placement the runtime's zeroing and
+    device translation use; see ``kv_cache/virtual_blocks.py``.
     """
 
     owner_rank: int

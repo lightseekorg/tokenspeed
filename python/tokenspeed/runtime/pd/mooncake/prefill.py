@@ -547,23 +547,25 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 if block_selection is not None
                 else dst_group.block_ids
             )
-            if (
-                group_spec.shard_count > 1
-                and owner_filters[group_spec.group_id] is None
-            ):
-                continue
+            if group_spec.shard_count > 1:
+                owner_filter = owner_filters[group_spec.group_id]
+                if owner_filter is None:
+                    continue
+                source_owner_rank = owner_filter.owner_rank
+            else:
+                source_owner_rank = 0
+            # KVP subgroups are aligned runs of consecutive attention-TP
+            # ranks, so the destination's owner coordinate is its TP rank
+            # modulo its group's shard count (1 for a replicated group).
             src_pages, dst_pages = local_transfer_pages(
                 source_block_ids,
                 destination_block_ids,
                 group_id=group_spec.group_id,
                 source_layout=layout,
                 destination_layout=dst_cache_layout,
-                source_tp_rank=(
-                    owner_filters[group_spec.group_id].owner_rank
-                    if group_spec.shard_count > 1
-                    else 0
-                ),
-                destination_tp_rank=dst_tp_rank,
+                source_owner_rank=source_owner_rank,
+                destination_owner_rank=dst_tp_rank
+                % dst_cache_layout.shard_count(group_spec.group_id),
             )
             if src_pages.size:
                 group_transfers.append(
