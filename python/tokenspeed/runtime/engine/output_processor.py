@@ -356,7 +356,7 @@ class OutputProcessor:
                     interval,
                     num_new_tokens,
                 )
-                self.engine.metrics.observe_inter_token_latency(
+                self.engine.metrics.observe_scheduler_inter_token_latency(
                     pure_interval, num_new_tokens
                 )
                 state.last_pure_time = recv_obj.generated_time
@@ -386,9 +386,9 @@ class OutputProcessor:
                 )
             )
             if (completion_tokens - state.first_completion_tokens) > 0:
-                self.engine.metrics.observe_inter_token_latency(
-                    state.finished_time - state.first_token_time,
-                    completion_tokens - state.first_completion_tokens,
+                self.engine.metrics.observe_decode_time_per_output_token(
+                    (state.finished_time - state.first_token_time)
+                    / (completion_tokens - state.first_completion_tokens)
                 )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
