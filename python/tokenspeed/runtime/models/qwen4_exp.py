@@ -331,7 +331,7 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
             hidden_states, residual, input_ids, ctx
         )
         attention_output = (
-            mixed if ctx.forward_mode.is_idle() else self.linear_attn(mixed, ctx)
+            mixed if ctx.forward_mode.is_idle() else self.linear_attn(mixed, None, ctx)
         )
         mixed, residuals = self._finish_attention(attention_output, residuals, ctx)
         return self._run_mlp(mixed, residuals, ctx)

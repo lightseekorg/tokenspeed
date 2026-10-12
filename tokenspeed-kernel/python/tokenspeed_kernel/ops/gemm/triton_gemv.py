@@ -23,6 +23,15 @@
 Eligible small-M BF16 projections use FlashInfer joint runner/tactic selection.
 The registry keeps the architecture-specific and portable fallbacks, while the
 row-CTA implementation also provides the independent fused add3 epilogue.
+
+BF16 activations against an FP32 weight give an FP32 result. Torch widens the
+activations first. A layer that keeps the weight split from
+:func:`decode_gemv_weight_split` passes it to :func:`decode_gemv`, and the
+registry can then run the product on BF16 tensor cores
+(``triton_bf16x3_gemm_fp32``). From 17 to 96 rows, for weights of up to 256
+rows (a multiple of 4) with K a multiple of 512 up to 8192, the registry runs
+it on CUDA cores from the FP32 weight instead, with or without the split
+(``gluon_simt_gemm_fp32``).
 """
 
 from __future__ import annotations
@@ -38,6 +47,11 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
     flashinfer_bf16_gemm,
     flashinfer_joint_bf16_supported,
 )
+from tokenspeed_kernel.ops.gemm.triton_bf16x3 import (
+    BF16X3_MIN_M,
+    split_fp32_weight_bf16x3,
+    triton_bf16x3_gemm_fp32,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -47,7 +61,12 @@ from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
 from tokenspeed_kernel.selection import spec_matches_shape_traits, spec_matches_traits
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["decode_gemv", "triton_rowcta_gemv", "use_decode_gemv"]
+__all__ = [
+    "decode_gemv",
+    "decode_gemv_weight_split",
+    "triton_rowcta_gemv",
+    "use_decode_gemv",
+]
 
 
 @triton.jit
@@ -130,6 +149,29 @@ _BF16_SIG = frozenset(
         )
     }
 )
+_FP32_SIG = frozenset(
+    {
+        format_signature(
+            x=dense_tensor_format(torch.float32),
+            weight=dense_tensor_format(torch.float32),
+        )
+    }
+)
+# BF16 activations against an FP32 weight, with an FP32 result.
+_BF16_FP32_SIG = frozenset(
+    {
+        format_signature(
+            x=dense_tensor_format(torch.bfloat16),
+            weight=dense_tensor_format(torch.float32),
+        )
+    }
+)
+# Registry signature of each served (x dtype, weight dtype) pair.
+_SIGNATURES = {
+    (torch.bfloat16, torch.bfloat16): next(iter(_BF16_SIG)),
+    (torch.float32, torch.float32): next(iter(_FP32_SIG)),
+    (torch.bfloat16, torch.float32): next(iter(_BF16_FP32_SIG)),
+}
 
 
 @register_kernel(
@@ -217,7 +259,7 @@ def gluon_wmma_dense_gemv_gfx1250(
     "decode_gemv",
     name="torch_decode_gemv",
     solution="torch",
-    signatures=_BF16_SIG,
+    signatures=_BF16_SIG | _FP32_SIG | _BF16_FP32_SIG,
     traits={},
     priority=Priority.PORTABLE,
 )
@@ -226,22 +268,37 @@ def torch_decode_gemv(
     weight: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if x.dtype == torch.bfloat16 and weight.dtype == torch.float32:
+        x = x.float()
     if out is not None:
         return torch.mm(x, weight.t(), out=out)
     return x @ weight.t()
 
 
 @functools.lru_cache(maxsize=64)
-def _select(m: int, n: int, k: int, on_cuda: bool):
-    if not on_cuda:
+def _select(
+    m: int,
+    n: int,
+    k: int,
+    on_cuda: bool,
+    x_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    weight_split: bool,
+):
+    signature = _SIGNATURES.get((x_dtype, weight_dtype))
+    if not on_cuda or signature is None:
         return torch_decode_gemv
 
     reg = KernelRegistry.get()
-    # Honor each registered implementation's architecture gate before its shape
-    # traits, including the specialized CDNA5 kernels.
-    traits = {"m": m, "n": n, "k": k}
+    # Honor each registered implementation's architecture gate and dtype
+    # signature before its shape traits, including the specialized CDNA5
+    # kernels. Kernels that take a split weight declare the weight_split trait.
+    traits = {"m": m, "n": n, "k": k, "weight_split": weight_split}
     for spec in reg.get_for_operator(
-        "gemm", "decode_gemv", platform=current_platform()
+        "gemm",
+        "decode_gemv",
+        platform=current_platform(),
+        format_signature=signature,
     ):
         if spec_matches_traits(spec, traits) and spec_matches_shape_traits(
             spec, traits
@@ -279,29 +336,46 @@ def use_decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
         return False
     m, k = x.shape
     platform = current_platform()
+    n = weight.shape[0]
     if platform.is_cdna4:
-        return m >= 2 and _select(m, weight.shape[0], k, True) is not torch_decode_gemv
+        return m >= 2 and _select(m, n, k, True, x.dtype, weight.dtype, False) is not (
+            torch_decode_gemv
+        )
     if not platform.is_cdna5 or k < 256:
         return False
-    return _select(m, weight.shape[0], k, True) is not torch_decode_gemv
+    return _select(m, n, k, True, x.dtype, weight.dtype, False) is not torch_decode_gemv
 
 
 def decode_gemv(
     x: torch.Tensor,
     weight: torch.Tensor,
     out: torch.Tensor | None = None,
+    *,
+    weight_split: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``x @ weight.T`` through joint FI tuning or the ordinary registry fallback.
 
     FlashInfer owns runner/tactic selection on the supported BF16 range.
-    The registry retains other architectures and unsupported input layouts.
+    The registry retains other architectures, unsupported input layouts and
+    FP32 weights, which also take BF16 activations and return FP32.
+    Noncontiguous inputs and other dtypes take Torch.
+
+    Args:
+        x: ``[M, K]`` activations.
+        weight: ``[N, K]`` weight.
+        out: optional ``[M, N]`` destination in the promoted dtype.
+        weight_split: the weight's :func:`decode_gemv_weight_split`, for an
+            FP32 weight; ``None`` keeps the kernels that read ``weight``.
+
+    Returns:
+        ``[M, N]`` output in the promoted dtype of ``x`` and ``weight``.
     """
 
     expected = (x.shape[0], weight.shape[0])
     if out is not None:
         if (
             tuple(out.shape) != expected
-            or out.dtype != x.dtype
+            or out.dtype != torch.promote_types(x.dtype, weight.dtype)
             or out.device != x.device
             or out.stride(-1) != 1
         ):
@@ -318,11 +392,63 @@ def decode_gemv(
         if is_serving():
             return torch_decode_gemv(x, weight, out)
         return flashinfer_bf16_gemm(x, weight, out)
-    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+    if not x.is_contiguous() or not weight.is_contiguous():
         return torch_decode_gemv(x, weight, out)
-    return _select(x.shape[0], weight.shape[0], weight.shape[1], x.is_cuda)(
-        x, weight, out
+    impl = _select(
+        x.shape[0],
+        weight.shape[0],
+        weight.shape[1],
+        x.is_cuda,
+        x.dtype,
+        weight.dtype,
+        weight_split is not None,
     )
+    if impl is triton_bf16x3_gemm_fp32:
+        return impl(x, weight_split, out)
+    return impl(x, weight, out)
+
+
+def decode_gemv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
+    """Split an FP32 weight for the tensor-core path of :func:`decode_gemv`.
+
+    The layer that owns the weight calls this once after loading it and
+    passes the result as ``decode_gemv(..., weight_split=...)``. The split
+    takes 1.5x the FP32 weight's memory, so it is only made where the
+    registration of ``triton_bf16x3_gemm_fp32`` takes this weight on this
+    device. The kernel the registry prefers at one row count does not decide
+    it: a kernel registered ahead of the split kernel for some row counts
+    serves those rows from ``weight``, and the split serves the others.
+
+    Args:
+        weight: ``[N, K]`` weight.
+
+    Returns:
+        ``[3, N, K]`` BF16 pieces, or ``None`` when the split kernel does not
+        take ``weight`` on this device.
+    """
+    if not weight.is_cuda or weight.ndim != 2 or not weight.is_contiguous():
+        return None
+    signature = _SIGNATURES.get((torch.bfloat16, weight.dtype))
+    if signature is None:
+        return None
+    n, k = weight.shape
+    # _select()'s filters on the split kernel's own registration, at its
+    # first row count.
+    traits = {"m": BF16X3_MIN_M, "n": n, "k": k, "weight_split": True}
+    reg = KernelRegistry.get()
+    if not any(
+        reg.get_impl(spec.name) is triton_bf16x3_gemm_fp32
+        and spec_matches_traits(spec, traits)
+        and spec_matches_shape_traits(spec, traits)
+        for spec in reg.get_for_operator(
+            "gemm",
+            "decode_gemv",
+            platform=current_platform(),
+            format_signature=signature,
+        )
+    ):
+        return None
+    return split_fp32_weight_bf16x3(weight)
 
 
 def rowcta_gemv_add3(

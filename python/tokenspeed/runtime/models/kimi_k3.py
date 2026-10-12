@@ -73,7 +73,6 @@ from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.flashinfer import get_flashinfer_moe_alltoall
 from tokenspeed_kernel.ops.gemm import (
-    fp8_linear,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
     kimi3_router_projection,
@@ -82,9 +81,6 @@ from tokenspeed_kernel.ops.gemm import (
     linear_attnres_partials,
     linear_attnres_partials_available,
     mm,
-)
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    decode_gemv,
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
@@ -122,6 +118,7 @@ from tokenspeed.runtime.layers.layernorm import (
 )
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
+    DPRowParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -173,13 +170,19 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
-    DeepseekV3FusedQkvAProjWithMqa,
     _prepare_mla_kv_b_proj_weights,
 )
 from tokenspeed.runtime.models.kimi_k3_comm import (
     K3_SHARED_RS_MAX_TOKENS,
     K3AttnComm,
     K3MoeTailComm,
+)
+from tokenspeed.runtime.models.kimi_k3_projection import (
+    KimiKDAColumnProj,
+    KimiMLAColumnProj,
+    KimiMLAReplicatedProj,
+    validate_projection_quantization,
+    validate_projection_settings,
 )
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
 from tokenspeed.runtime.multimodal.embedder import (
@@ -381,8 +384,21 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         prefix: str = "",
         reduce_attn_results: bool = True,
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        qkv_parallel: DenseLayerMapping | None,
+        output_parallel: DenseLayerMapping | None,
         **kwargs,
     ) -> None:
+        # The parent factories construct the final modules once, without a
+        # transient replicated weight allocation for every sharded layer.
+        self.qkv_parallel = qkv_parallel
+        self.output_parallel = output_parallel
+        self.use_output_gate = config.mla_use_output_gate
+        # Without Q-LoRA the parent skips the factory that builds the gate.
+        if self.use_output_gate and q_lora_rank is None:
+            raise ValueError("Gated MLA requires Q-LoRA (q_lora_rank must not be None)")
+        if qkv_parallel is not None and not self.use_output_gate:
+            raise ValueError("MLA QKV TP requires the gated q-lora projection")
         super().__init__(
             config=config,
             mapping=mapping,
@@ -403,16 +419,23 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             alt_stream=alt_stream,
             skip_rope=True,  # K3 MLA is NoPE (mla_use_nope=True)
         )
-        self.use_output_gate = config.mla_use_output_gate
+
+    def _make_qkv_a_projection(
+        self, *, quant_config: QuantizationConfig | None, prefix: str
+    ) -> nn.Module:
+        """Build the gated QKV-A layout directly, replicated or column-sharded."""
         if self.use_output_gate:
-            assert q_lora_rank is not None, "gated MLA assumes the q-lora path"
             # The gate projection shares its input with the a-projections, so
             # its per-rank shard rides the same GEMV: one weight laid out as
             # [q_a | kv_a+rope | g_shard] x hidden. (The dsv3 min-latency
             # kernel is shape-locked to 2112 rows and measures below nvjet's
             # effective bandwidth here anyway.)
-            self._qkv_a_width = q_lora_rank + kv_lora_rank + qk_rope_head_dim
-            self._gate_width = num_heads * v_head_dim // mapping.attn.tp_size
+            self._qkv_a_width = (
+                self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+            )
+            self._gate_width = (
+                self.num_heads * self.v_head_dim // self.mapping.attn.tp_size
+            )
             fused_prefix = add_prefix("fused_qkv_a_proj_with_mqa", prefix)
             fused_out = self._qkv_a_width + self._gate_width
             # FP8_PB_WO (w8a8) fused projection: pad the output rows to the
@@ -432,13 +455,56 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 self._fused_qkv_a_pad_rows = padded_out - fused_out
                 self._fused_qkv_a_fp8_layout = True
                 fused_out = padded_out
-            self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
-                hidden_size,
+            if self.qkv_parallel is not None:
+                projection = KimiMLAColumnProj(
+                    hidden=self.hidden_size,
+                    rows=self._qkv_a_width + self._gate_width,
+                    parallel=self.qkv_parallel,
+                    block_fp8=self._fused_qkv_a_fp8_layout,
+                    prefix=fused_prefix,
+                )
+                method = (
+                    quant_config.get_quant_method(projection, fused_prefix)
+                    if quant_config is not None
+                    else None
+                )
+                validate_projection_quantization(projection, method, fused_prefix)
+                return projection
+            return KimiMLAReplicatedProj(
+                self.hidden_size,
                 fused_out,
                 bias=False,
                 quant_config=quant_config,
                 prefix=fused_prefix,
             )
+        return super()._make_qkv_a_projection(quant_config=quant_config, prefix=prefix)
+
+    def _make_output_projection(
+        self,
+        *,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        reduce_attn_results: bool,
+    ) -> nn.Module:
+        """Shard only the projection; attention heads and caches retain their mapping."""
+        if self.output_parallel is not None:
+            projection = DPRowParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                parallel=self.output_parallel,
+                params_dtype=torch.get_default_dtype(),
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
+            validate_projection_quantization(
+                projection, projection.quant_method, add_prefix("o_proj", prefix)
+            )
+            return projection
+        return super()._make_output_projection(
+            quant_config=quant_config,
+            prefix=prefix,
+            reduce_attn_results=reduce_attn_results,
+        )
 
     def _split_fused_qkv_a(
         self, qkv_gate: torch.Tensor
@@ -493,33 +559,32 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             gate: Local output-gate shard.
             absorbed_query: Optional decode query projected into latent key space.
         """
-        if block_scale is not None:
-            qkv_gate = self.fused_qkv_a_proj_with_mqa(
-                hidden_states, block_scale, torch.bfloat16
+        dp_or_empty = self.qkv_parallel is not None or hidden_states.shape[0] == 0
+        if (
+            dp_or_empty
+            or block_scale is not None
+            or self.fused_qkv_a_proj_with_mqa.weight.dtype in _FP8_WEIGHT_DTYPES
+        ):
+            # Sharded and quantized weights must go through the Linear module,
+            # not the raw-BF16 producer fusions below. Keep standalone partials
+            # after the prequantized GEMM, and before it on the other paths.
+            prequantized = block_scale is not None and not dp_or_empty
+            if attnres_partial_args is not None and not prequantized:
+                attnres_partial_dual(*attnres_partial_args)
+            qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(
+                hidden_states,
+                block_scale,
+                torch.bfloat16 if prequantized else None,
+                ctx=ctx,
             )
-            if attnres_partial_args is not None:
+            if attnres_partial_args is not None and prequantized:
                 attnres_partial_dual(*attnres_partial_args)
-            if self._fused_qkv_a_pad_rows:
-                # Drop the zero pad rows of the 128-aligned FP8 projection
-                # before anything consumes the output.
+            if dp_or_empty or self._fused_qkv_a_pad_rows:
                 qkv_gate = qkv_gate[..., : self._qkv_a_width + self._gate_width]
-            qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
-            q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
-        elif self.fused_qkv_a_proj_with_mqa.weight.dtype in _FP8_WEIGHT_DTYPES:
-            # FP8-resident fused projection (FP8_PB_WO w8a8): the bf16 fast
-            # kernels below cannot consume the quantized weight, so run the
-            # quantized module GEMM and keep any hoisted dual-partials as a
-            # standalone kernel — the same recipe as the block_scale branch.
-            # (can_fuse_attnres_partials already returns False for FP8
-            # weights, so args are normally None here.)
-            if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args)
-            qkv_gate = self.fused_qkv_a_proj_with_mqa(hidden_states)
-            if self._fused_qkv_a_pad_rows:
-                # Drop the zero pad rows of the 128-aligned FP8 projection
-                # before anything consumes the output.
-                qkv_gate = qkv_gate[..., : self._qkv_a_width + self._gate_width]
-            qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
+            # DP Linear already restores complete local rows. Empty owners
+            # likewise skip the ordinary attention communication.
+            if not dp_or_empty:
+                qkv_gate = comm_manager.pre_attn_comm(qkv_gate, ctx)
             q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
         elif attnres_partial_args is not None:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
@@ -566,6 +631,14 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 )
                 gate = projection.gate
         kv_a = latent_cache[..., : self.kv_lora_rank]
+        if q_a.shape[0] == 0:
+            # Empty owners joined QKV but have no local norm or attention work.
+            return (
+                hidden_states.new_empty((0, self.q_b_proj.output_size_per_partition)),
+                latent_cache,
+                gate,
+                None,
+            )
         if self.q_b_proj.weight.dtype in _FP8_WEIGHT_DTYPES:
             # FP8-resident q_b (FP8_PB_WO w8a8): mla_normalize_project_query
             # consumes a raw bf16 weight, so fall back to the unfused parent
@@ -597,6 +670,8 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         hidden_states: torch.Tensor,
         args: tuple,
     ) -> bool:
+        if self.qkv_parallel is not None:
+            return False
         projection = getattr(self, "fused_qkv_a_proj_with_mqa", None)
         if projection is None:
             return False
@@ -623,24 +698,31 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         *,
         projection_out: torch.Tensor | None,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        if self.use_output_gate:
-            q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
-                hidden_states,
-                ctx,
-                comm_manager,
-                block_scale,
-                attnres_partial_args,
-            )
-        else:
-            if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args)
-            q, latent_cache = self._project_q_latent(
-                hidden_states, ctx, comm_manager, block_scale
-            )
-            gate = None
-            absorbed_query = None
+        has_tokens = hidden_states.shape[0] > 0
+        # Empty owners need QKV only when peers share its projection weights.
+        if has_tokens or self.qkv_parallel is not None:
+            if self.use_output_gate:
+                q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
+                    hidden_states,
+                    ctx,
+                    comm_manager,
+                    block_scale,
+                    attnres_partial_args,
+                )
+            else:
+                if attnres_partial_args is not None:
+                    attnres_partial_dual(*attnres_partial_args)
+                q, latent_cache = self._project_q_latent(
+                    hidden_states, ctx, comm_manager, block_scale
+                )
+                gate = None
+                absorbed_query = None
+        if not has_tokens:
+            # Finish any O collective after QKV, without local attention work.
+            if self.output_parallel is None:
+                return hidden_states
+            empty = hidden_states.new_empty((0, self.num_local_heads * self.v_head_dim))
+            return self.o_proj(empty, ctx=ctx)[0]
         fuse_value_gate = (
             gate is not None
             and ctx.num_extends == 0
@@ -663,7 +745,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         if projection_out is not None:
             # K3AttnComm supplies this only for the unbiased BF16 TP shard.
             return mm(attn_output, self.o_proj.weight, bias=None, out=projection_out)
-        output, _ = self.o_proj(attn_output)
+        output, _ = self.o_proj(attn_output, ctx=ctx)
         return output
 
 
@@ -965,6 +1047,7 @@ class KimiKDAMergedProj(nn.Module):
         self.tp_rank = tp_rank
         self.fp8_block_quant = fp8_block_quant
         self.fp8_channel_quant = fp8_channel_quant
+        self.quant_method: Fp8LinearMethod | None = None
         p = self.proj_local
         self._offsets = {
             "q": 0,
@@ -1003,8 +1086,6 @@ class KimiKDAMergedProj(nn.Module):
                 requires_grad=False,
             )
             self.weight_scale_inv.weight_loader = self._load_scale
-            # flashinfer MN-major prepacked scales, prepared post-load.
-            self._flashinfer_scales_mn: torch.Tensor | None = None
             # Zero-initialized buffers make a missing shard silently read as
             # zeros; track loads explicitly and verify at post_load_weights.
             self._loaded_weight_shards: set[str] = set()
@@ -1104,28 +1185,30 @@ class KimiKDAMergedProj(nn.Module):
             )
 
     def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.fp8_block_quant or self.fp8_channel_quant:
-            # Fail fast instead of feeding FP8 codes to the bf16 GEMV:
-            # FP8-resident KDA projections must run through the quantized
-            # w8a8 branch of kimi3_qkvfab_projection (KimiLinearKDA
-            # _project_qkvfab), which consumes the weight + scale directly.
-            raise RuntimeError(
-                "KimiKDAMergedProj.forward does not support the FP8-resident "
-                "buffer; use kimi3_qkvfab_projection with weight_scale."
+        self, x: torch.Tensor, *, ctx: ForwardContext | None
+    ) -> tuple[torch.Tensor, None]:
+        """Return the fused local projection, matching the DP Linear interface."""
+        if x.shape[0] == 0:
+            return x.new_empty((0, self.used_rows)), None
+        if self.fp8_channel_quant:
+            output = w8a8_fp8_per_channel_mm(
+                x, self.weight.t(), self.weight_scale, x.dtype
             )
-        # Registry-dispatched: rowcta at M=1, cublasLt otherwise.
-        out = decode_gemv(x, self.weight)
-        p = self.proj_local
-        mixed_qkv = out[:, : 3 * p]
-        f_a_end = 4 * p + self.head_dim
-        return (
-            mixed_qkv,
-            out[:, 3 * p : 4 * p],
-            out[:, 4 * p : f_a_end],
-            out[:, f_a_end : f_a_end + self.local_num_heads],
-        )
+        elif self.quant_method is not None:
+            output = self.quant_method.apply(
+                self,
+                x,
+                bias=None,
+                block_scale=None,
+                output_dtype=x.dtype,
+            )
+        else:
+            output = kimi3_qkvfab_projection(
+                x,
+                self.weight,
+                weight_scale=self.weight_scale_inv if self.fp8_block_quant else None,
+            )
+        return output, None
 
 
 class KimiLinearKDA(nn.Module):
@@ -1152,11 +1235,16 @@ class KimiLinearKDA(nn.Module):
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        qkv_parallel: DenseLayerMapping | None,
+        output_parallel: DenseLayerMapping | None,
     ) -> None:
         super().__init__()
         self.config = config
         self.mapping = mapping
         self.layer_id = layer_id
+        self.qkv_parallel = qkv_parallel
+        self.output_parallel = output_parallel
 
         la = config.linear_attn_config
         if not la.get("use_full_rank_gate", False):
@@ -1209,16 +1297,37 @@ class KimiLinearKDA(nn.Module):
             isinstance(quant_config, Mxfp4Config)
             and quant_config.fp8_override_route(add_prefix("q_proj", prefix)) == "w8a8"
         )
-        self.qkvgb_proj = KimiKDAMergedProj(
-            hidden_size=hidden,
-            proj=proj,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            fp8_block_quant=merged_fp8,
-            fp8_channel_quant=merged_fp8_channel,
-        )
+        if qkv_parallel is None:
+            self.qkvgb_proj = KimiKDAMergedProj(
+                hidden_size=hidden,
+                proj=proj,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                fp8_block_quant=merged_fp8,
+                fp8_channel_quant=merged_fp8_channel,
+            )
+        else:
+            if merged_fp8_channel:
+                raise ValueError("KDA QKV TP supports BF16 or 128x128 block FP8")
+            self.qkvgb_proj = KimiKDAColumnProj(
+                hidden=hidden,
+                proj=proj,
+                heads=self.num_heads,
+                head_dim=self.head_dim,
+                parallel=qkv_parallel,
+                block_fp8=merged_fp8,
+                prefix=add_prefix("qkvgb_proj", prefix),
+            )
+            for name in ("q_proj", "k_proj", "v_proj", "g_proj", "f_a_proj", "b_proj"):
+                source_prefix = add_prefix(name, prefix)
+                method = (
+                    quant_config.get_quant_method(self.qkvgb_proj, source_prefix)
+                    if quant_config is not None
+                    else None
+                )
+                validate_projection_quantization(self.qkvgb_proj, method, source_prefix)
         # Decay-gate up projection (f_a and beta ride in the merged GEMM).
         self.f_b_proj = _col(self.head_dim, proj, "f_b_proj")
 
@@ -1254,20 +1363,34 @@ class KimiLinearKDA(nn.Module):
         self.conv_weights: torch.Tensor | None = None
 
         self.o_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.o_proj = RowParallelLinear(
-            proj,
-            hidden,
-            bias=False,
-            reduce_results=False,  # layer-level fused AR+residual owns the reduce
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
-        )
+        if output_parallel is None:
+            self.o_proj = RowParallelLinear(
+                proj,
+                hidden,
+                bias=False,
+                reduce_results=False,  # layer-level fused AR+residual owns the reduce
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                tp_group=tp_group,
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
+        else:
+            self.o_proj = DPRowParallelLinear(
+                proj,
+                hidden,
+                parallel=output_parallel,
+                params_dtype=torch.get_default_dtype(),
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
+            validate_projection_quantization(
+                self.o_proj, self.o_proj.quant_method, add_prefix("o_proj", prefix)
+            )
 
         if (
             merged_fp8
+            and qkv_parallel is None
             and global_server_args_dict["dense_gemm_backend"] == "trtllm_cutedsl"
         ):
             # The merged buffer is not a LinearBase. Register the ordinary
@@ -1299,43 +1422,20 @@ class KimiLinearKDA(nn.Module):
     def _project_qkvfab(
         self,
         hidden_states: torch.Tensor,
+        ctx: ForwardContext | None,
         attnres_partial_args: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project every KDA hidden-state consumer."""
         proj_local = self.local_num_heads * self.head_dim
-        if self.qkvgb_proj.fp8_channel_quant:
-            if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args)
-            output = w8a8_fp8_per_channel_mm(
-                hidden_states,
-                self.qkvgb_proj.weight.t(),
-                self.qkvgb_proj.weight_scale,
-                hidden_states.dtype,
-            )
-        elif isinstance(
-            getattr(self.qkvgb_proj, "quant_method", None),
-            Fp8LinearMethod,
+        if attnres_partial_args is not None and (
+            self.qkvgb_proj.fp8_channel_quant
+            or self.qkvgb_proj.fp8_block_quant
+            or self.qkv_parallel is not None
         ):
-            if attnres_partial_args is not None:
-                attnres_partial_dual(*attnres_partial_args)
-            output = fp8_linear(
-                self.qkvgb_proj._prepared_fp8_linear,
-                hidden_states,
-                self.qkvgb_proj.weight,
-                self.qkvgb_proj.weight_scale_inv,
-                input_scales=None,
-                bias=None,
-                out_dtype=hidden_states.dtype,
-            )
-        elif attnres_partial_args is None:
-            output = kimi3_qkvfab_projection(
-                hidden_states,
-                self.qkvgb_proj.weight,
-                weight_scale=getattr(self.qkvgb_proj, "weight_scale_inv", None),
-                prepacked_scales=getattr(
-                    self.qkvgb_proj, "_flashinfer_scales_mn", None
-                ),
-            )
+            attnres_partial_dual(*attnres_partial_args)
+            attnres_partial_args = None
+        if attnres_partial_args is None:
+            output, _ = self.qkvgb_proj(hidden_states, ctx=ctx)
         else:
             blocks, weight_a, weight_b, eps, scratch_a, scratch_b = attnres_partial_args
             output = linear_attnres_partials(
@@ -1362,6 +1462,8 @@ class KimiLinearKDA(nn.Module):
         hidden_states: torch.Tensor,
         args: tuple,
     ) -> bool:
+        if self.qkv_parallel is not None:
+            return False
         blocks, weight_a, weight_b, eps, scratch_a, scratch_b = args
         return linear_attnres_partials_available(
             hidden_states,
@@ -1385,7 +1487,11 @@ class KimiLinearKDA(nn.Module):
         *,
         projection_out: torch.Tensor | None,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
+        if (
+            hidden_states.shape[0] == 0
+            and self.qkv_parallel is None
+            and self.output_parallel is None
+        ):
             return hidden_states
 
         h = hidden_states
@@ -1403,8 +1509,14 @@ class KimiLinearKDA(nn.Module):
         # cache (``KdaAttnBackend``). g_raw is the raw decay-gate
         # input, beta the per-head logits (sigmoid applied in-kernel).
         mixed_qkv, out_gate, f_a_out, beta = self._project_qkvfab(
-            h, attnres_partial_args
+            h, ctx, attnres_partial_args
         )
+        if num_tokens == 0:
+            # Empty owners participate in QKV above and O below, but own no
+            # convolution, recurrent-state update, gate or norm work.
+            if self.output_parallel is not None:
+                return self.o_proj(h.new_empty((0, hn * hd)), ctx=ctx)[0]
+            return h
         # Prefill consumes compact QKV; perform this copy in the captured
         # projection segment rather than inside the eager attention break.
         if not ctx.forward_mode.is_decode():
@@ -1460,7 +1572,7 @@ class KimiLinearKDA(nn.Module):
             )
         if projection_out is not None:
             return mm(core_out, self.o_proj.weight, bias=None, out=projection_out)
-        output, _ = self.o_proj(core_out)
+        output, _ = self.o_proj(core_out, ctx=ctx)
         return output
 
 
@@ -2691,6 +2803,9 @@ class KimiLinearDecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        qkv_parallel: DenseLayerMapping | None,
+        output_parallel: DenseLayerMapping | None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -2701,7 +2816,13 @@ class KimiLinearDecoderLayer(nn.Module):
         attn_prefix = add_prefix("self_attn", prefix)
         if config.is_kda_layer(layer_id):
             self.self_attn = KimiLinearKDA(
-                config, mapping, layer_id, quant_config, attn_prefix
+                config,
+                mapping,
+                layer_id,
+                quant_config,
+                attn_prefix,
+                qkv_parallel=qkv_parallel,
+                output_parallel=output_parallel,
             )
         else:
             self.self_attn = KimiLinearMLAAttention(
@@ -2720,6 +2841,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 prefix=attn_prefix,
                 reduce_attn_results=False,  # layer fused AR+residual reduces
                 alt_stream=alt_stream,
+                qkv_parallel=qkv_parallel,
+                output_parallel=output_parallel,
             )
 
         # --- FFN: dense MLP (first_k_dense_replace) or MoE block ---
@@ -3285,11 +3408,17 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
 
-        # Agree on raw settings before any shared-expert subgroup is created.
-        shared_value = envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
-        shared_parallel = validate_shared_expert_settings(mapping, shared_value)
+        # Agree on parsed sizes before any shared-expert subgroup is created.
+        shared_size = envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
+        shared_parallel = validate_shared_expert_settings(mapping, shared_size)
         if shared_parallel is not None:
             initialize_shared_expert_group(shared_parallel)
+
+        qkv_parallel, output_parallel = validate_projection_settings(
+            mapping,
+            envs.TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE.get(),
+            envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
+        )
 
         alt_stream = (
             torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
@@ -3323,6 +3452,8 @@ class KimiLinearModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
+                qkv_parallel=qkv_parallel,
+                output_parallel=output_parallel,
             )
 
         self.layers = make_layers(
@@ -3826,7 +3957,11 @@ class KimiLinearForCausalLM(BaseCausalLM):
             }
             fused_w, fused_s = _assemble_fp8_fused_qkv_a(
                 [ordered[leaf] for leaf in _FP8_FUSED_QKV_A_ORDER],
-                total_rows=weight_param.shape[0],
+                # Assemble the full padded layout before the ordinary column
+                # loader intersects it with this projection rank's row shard.
+                total_rows=self.get_submodule(
+                    f"{base}.fused_qkv_a_proj_with_mqa"
+                ).output_size,
             )
             weight_param.weight_loader(weight_param, fused_w)
             scale_param = params_dict[
@@ -3997,41 +4132,14 @@ class KimiLinearForCausalLM(BaseCausalLM):
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
                 merged = self_attn.qkvgb_proj
+                if self_attn.qkv_parallel is not None:
+                    merged.verify_load_complete()
+                    # The ordinary DP Linear quant method owns GEMM preparation.
+                    continue
                 if merged.fp8_channel_quant:
                     merged.verify_fp8_load_complete()
                 elif getattr(merged, "fp8_block_quant", False):
                     merged.verify_fp8_load_complete()
-                    if isinstance(
-                        getattr(merged, "quant_method", None),
-                        Fp8LinearMethod,
-                    ):
-                        # The loader prepares this plan with the other FP8
-                        # linears after assembly. Do not cache stale FI scales.
-                        continue
-                    # Prepack the block scales for the flashinfer w8a8 GEMM
-                    # (the same preparation Fp8LinearMethod does for
-                    # LinearBase layers); rows are 128-padded at construction
-                    # so the shape gate always holds on this path.
-                    from tokenspeed_kernel.ops.gemm.flashinfer import (
-                        has_flashinfer_fp8_blockscale,
-                        prepare_flashinfer_fp8_blockscale_weight_scales,
-                    )
-
-                    n_rows, n_cols = merged.weight.shape
-                    if (
-                        merged._flashinfer_scales_mn is None
-                        and has_flashinfer_fp8_blockscale is not None
-                        and has_flashinfer_fp8_blockscale()
-                        and n_rows % 128 == 0
-                        and n_cols % 128 == 0
-                    ):
-                        # Build once: rebinding after a refit would leave any
-                        # captured CUDA graph holding the stale buffer.
-                        merged._flashinfer_scales_mn = (
-                            prepare_flashinfer_fp8_blockscale_weight_scales(
-                                merged.weight_scale_inv.data
-                            )
-                        )
 
         # Fold the AttnRes rms_w * res_w products once; the split kernels take a single wp pointer.
         for layer in self.model.layers:

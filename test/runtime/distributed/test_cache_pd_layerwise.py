@@ -708,7 +708,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     events = []
     backend = object.__new__(dsa_backend.DSABackend)
     backend.index_topk = 2
-    backend.dcp_group = (0,)
+    backend.kvp_group = (0,)
     backend.v_head_dim = 1
     backend.data_type = torch.bfloat16
     backend.qk_nope_head_dim = 1

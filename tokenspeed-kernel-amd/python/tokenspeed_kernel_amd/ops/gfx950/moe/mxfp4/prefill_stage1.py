@@ -780,11 +780,6 @@ def gluon_mxfp4_moe_stage1_e4m3_async_kernel(
             b_format="e2m1",
             acc=acc,
         )
-        # All N-partitioned waves must finish reading the current A slot
-        # before the next iteration reuses it as the async-copy destination.
-        # load_shared_relaxed opts out of the compiler's async-copy hazard
-        # tracking, so this write-after-read barrier stays explicit.
-        gl.barrier()
 
     last_tile: gl.constexpr = NUM_K_TILES - 1
     last_slot: gl.constexpr = last_tile % NUM_BUFFERS

@@ -117,6 +117,17 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
         storage = self._kpool_tail_workspace.storage
         return index_k, storage[row, 0], storage[row, 1]
 
+    def kpool_tail_slot_rows(self, slot: int) -> list[torch.Tensor]:
+        """One request slot's KPool tail (keys and gates of every DSA layer).
+
+        The tail holds the index rows of a pool not yet complete enough to
+        live in an index page, so a retraction snapshot images it with the
+        pages. The workspace is one arena-shared allocation covering the
+        target's and the draft's DSA layers, so one view per slot is the
+        whole tail.
+        """
+        return [self._kpool_tail_workspace.storage[:, :, slot]]
+
     @torch.no_grad()
     @override
     def clear_kv_buffers(self) -> None:

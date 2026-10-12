@@ -107,9 +107,11 @@ def qsa_sparse_attention(
     Args:
         q: Query tensor shaped ``[tokens, query_heads, head_dim]``.
         k_cache: Flattened key cache shaped
-            ``[cache_slots, kv_heads, head_dim]``.
+            ``[cache_slots, kv_heads, head_dim]``. Slot 1 must contain finite
+            values for masked reads; slot 0 may contain NaN/Inf.
         v_cache: Flattened value cache shaped
-            ``[cache_slots, kv_heads, value_head_dim]``.
+            ``[cache_slots, kv_heads, value_head_dim]`` with the same slot 1
+            requirement. Both caches must have at least two slots.
         selected_slots: Physical cache slots shaped ``[tokens, budget]``;
             non-positive values are ignored.
         scale: Softmax scale applied to query-key scores.
@@ -148,6 +150,8 @@ def qsa_sparse_attention(
         raise ValueError("QSA query rows must be divisible by max_seqlen_q")
     if q.shape[0] == 0:
         return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
+    if k_cache.shape[0] < 2 or v_cache.shape[0] < 2:
+        raise ValueError("QSA caches must include slot 1 for masked reads")
     traits = {
         "batch_size": q.shape[0] // query_width,
         "q_len": query_width,

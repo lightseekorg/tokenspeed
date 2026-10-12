@@ -1718,11 +1718,6 @@ def _route_next_pow2(value: int) -> int:
 
 
 @gluon.jit
-def _route_prefix_add_gfx1250(a, b):
-    return a + b
-
-
-@gluon.jit
 def _precomputed_topk_route_m1_canonical_gfx1250_kernel(
     topk_ids_ptr,
     topk_weights_ptr,
@@ -1895,7 +1890,7 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     )
     gl.store(slice_sizes_ptr + expert_offset, histogram, mask=expert_mask)
 
-    inclusive = gl.associative_scan(histogram, 0, _route_prefix_add_gfx1250)
+    inclusive = gl.cumsum(histogram, 0)
     exclusive = inclusive - histogram
     last_expert = expert_offset == (E - 1)
     gl.store(slice_offsets_ptr + expert_offset, exclusive, mask=expert_mask)
@@ -1934,11 +1929,7 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
         # supported block size produces the same one-block-per-active-expert
         # schedule. Build that prefix once rather than repeating four scans.
         expert_blocks = (histogram > 0).to(gl.int32)
-        block_inclusive = gl.associative_scan(
-            expert_blocks,
-            0,
-            _route_prefix_add_gfx1250,
-        )
+        block_inclusive = gl.cumsum(expert_blocks, 0)
         block_exclusive = block_inclusive - expert_blocks
         active_blocks = gl.sum(expert_blocks, axis=0)
         route_block = gl.gather(block_exclusive, safe_expert, axis=0)
@@ -1969,11 +1960,7 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
             expert_blocks = (histogram + (16 << block_size_index) - 1) // (
                 16 << block_size_index
             )
-            block_inclusive = gl.associative_scan(
-                expert_blocks,
-                0,
-                _route_prefix_add_gfx1250,
-            )
+            block_inclusive = gl.cumsum(expert_blocks, 0)
             block_exclusive = block_inclusive - expert_blocks
             active_blocks = gl.sum(expert_blocks, axis=0)
             gl.store(
@@ -2121,6 +2108,9 @@ def _precomputed_topk_route_small_m_gfx1250(
 
 _LARGE_ROUTE_CHUNK = 128
 _LARGE_ROUTE_NUM_WARPS = 8
+_LARGE_ROUTE_HISTOGRAM_NUM_WARPS = 4
+_LARGE_ROUTE_SCAN_EXPERTS = 8
+_LARGE_ROUTE_SCAN_NUM_WARPS = 4
 
 
 @gluon.jit
@@ -2151,19 +2141,26 @@ def _precomputed_topk_route_large_stage1_gfx1250_kernel(
     route_mask = (route < TOKENS_PER_PROGRAM) & (idx < G)
     expert = gl.load(topk_ids_ptr + idx, mask=route_mask, other=0).to(gl.int32)
     valid = route_mask & (expert >= 0) & (expert < E)
-    safe_expert = gl.where(valid, expert, 0)
-    histogram = gl.histogram(
-        safe_expert,
-        EP,
-        mask=valid,
-        layout=expert_layout,
-    ).to(gl.int32)
-    expert_offset = gl.arange(0, EP, layout=expert_layout)
-    gl.store(
-        chunk_offsets_ptr + pid * E + expert_offset,
-        histogram,
-        mask=expert_offset < E,
-    )
+    # The 1024-bin lowering gives atomic updates a 128-byte lane stride,
+    # aliasing LDS atomic resources. Smaller histograms reduce that contention.
+    HISTOGRAM_BINS: gl.constexpr = min(EP, 256)
+    for first_expert in gl.static_range(0, EP, HISTOGRAM_BINS):
+        local_expert = expert - first_expert
+        local_valid = valid & (local_expert >= 0) & (local_expert < HISTOGRAM_BINS)
+        histogram = gl.histogram(
+            gl.where(local_valid, local_expert, 0),
+            HISTOGRAM_BINS,
+            mask=local_valid,
+            layout=expert_layout,
+        ).to(gl.int32)
+        expert_offset = first_expert + gl.arange(
+            0, HISTOGRAM_BINS, layout=expert_layout
+        )
+        gl.store(
+            chunk_offsets_ptr + pid * E + expert_offset,
+            histogram,
+            mask=expert_offset < E,
+        )
 
     # Stage 4 overwrites the compact valid prefix. The remaining capacity is
     # deliberately safe and zero weighted.
@@ -2192,25 +2189,25 @@ def _precomputed_topk_route_large_stage2_gfx1250_kernel(
     E: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     SCAN_BLOCK: gl.constexpr,
+    EXPERT_BLOCK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
     """Turn per-chunk counts into exclusive per-expert chunk offsets."""
-    expert = gl.program_id(0)
-    layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
-    rows = gl.arange(0, SCAN_BLOCK, layout=layout)
-    mask = rows < NUM_PROGRAMS
-    counts = gl.load(
-        chunk_offsets_ptr + rows * E + expert,
-        mask=mask,
-        other=0,
+    # Adjacent lanes cover adjacent experts in the row-major count buffer.
+    # Scan only the row axis so each expert retains its independent prefix.
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [32 // EXPERT_BLOCK, EXPERT_BLOCK], [NUM_WARPS, 1], [1, 0]
     )
-    inclusive = gl.associative_scan(counts, 0, _route_prefix_add_gfx1250)
-    gl.store(
-        chunk_offsets_ptr + rows * E + expert,
-        inclusive - counts,
-        mask=mask,
+    rows = gl.arange(0, SCAN_BLOCK, layout=gl.SliceLayout(1, layout))
+    experts = gl.program_id(0) * EXPERT_BLOCK + gl.arange(
+        0, EXPERT_BLOCK, layout=gl.SliceLayout(0, layout)
     )
-    gl.store(expert_totals_ptr + expert, gl.sum(counts))
+    mask = (rows[:, None] < NUM_PROGRAMS) & (experts[None, :] < E)
+    offsets = rows[:, None] * E + experts[None, :]
+    counts = gl.load(chunk_offsets_ptr + offsets, mask=mask, other=0)
+    inclusive = gl.cumsum(counts, 0)
+    gl.store(chunk_offsets_ptr + offsets, inclusive - counts, mask=mask)
+    gl.store(expert_totals_ptr + experts, gl.sum(counts, 0), mask=experts < E)
 
 
 @gluon.jit
@@ -2230,7 +2227,7 @@ def _precomputed_topk_route_large_stage3_gfx1250_kernel(
     expert = gl.arange(0, EP, layout=layout)
     expert_mask = expert < E
     counts = gl.load(expert_totals_ptr + expert, mask=expert_mask, other=0)
-    inclusive = gl.associative_scan(counts, 0, _route_prefix_add_gfx1250)
+    inclusive = gl.cumsum(counts, 0)
     exclusive = inclusive - counts
     last_expert = expert == (E - 1)
     gl.store(slice_sizes_ptr + expert, counts, mask=expert_mask)
@@ -2245,11 +2242,7 @@ def _precomputed_topk_route_large_stage3_gfx1250_kernel(
         expert_blocks = (counts + (16 << block_size_index) - 1) // (
             16 << block_size_index
         )
-        block_inclusive = gl.associative_scan(
-            expert_blocks,
-            0,
-            _route_prefix_add_gfx1250,
-        )
+        block_inclusive = gl.cumsum(expert_blocks, 0)
         block_exclusive = block_inclusive - expert_blocks
         gl.store(
             block_offsets_ptr + block_size_index * stride_bo + expert,
@@ -2441,18 +2434,21 @@ def _precomputed_topk_route_large_m_gfx1250(
         ROUTE_BLOCK=route_block,
         MAX_BLOCKS=max_blocks,
         NB=_ROUTE_NB,
-        NUM_WARPS=_LARGE_ROUTE_NUM_WARPS,
+        NUM_WARPS=_LARGE_ROUTE_HISTOGRAM_NUM_WARPS,
         stride_bs=block_schedule.stride(0),
-        num_warps=_LARGE_ROUTE_NUM_WARPS,
+        num_warps=_LARGE_ROUTE_HISTOGRAM_NUM_WARPS,
     )
-    _precomputed_topk_route_large_stage2_gfx1250_kernel[(num_experts,)](
+    _precomputed_topk_route_large_stage2_gfx1250_kernel[
+        (triton.cdiv(num_experts, _LARGE_ROUTE_SCAN_EXPERTS),)
+    ](
         chunk_offsets,
         expert_totals,
         E=num_experts,
         NUM_PROGRAMS=num_programs,
         SCAN_BLOCK=_route_next_pow2(num_programs),
-        NUM_WARPS=_LARGE_ROUTE_NUM_WARPS,
-        num_warps=_LARGE_ROUTE_NUM_WARPS,
+        EXPERT_BLOCK=_LARGE_ROUTE_SCAN_EXPERTS,
+        NUM_WARPS=_LARGE_ROUTE_SCAN_NUM_WARPS,
+        num_warps=_LARGE_ROUTE_SCAN_NUM_WARPS,
     )
     _precomputed_topk_route_large_stage3_gfx1250_kernel[(1,)](
         expert_totals,

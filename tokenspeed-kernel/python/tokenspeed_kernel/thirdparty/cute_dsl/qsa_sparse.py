@@ -58,6 +58,8 @@ _HEAD_DIM = 256
 _GROUPED_HEAD_TILE = 8
 _CONVERT_WARPGROUPS = 2
 _SELECTED_WIDTH = 2051
+# Slot 0 receives padding writes; callers keep slot 1 finite for masked reads.
+_PADDING_READ_SLOT = 1
 _SMALL_MAX_CLUSTERS = 8
 _SMALL_NUM_SPLITS = 8
 _WIDE_NUM_SPLITS = 16
@@ -137,7 +139,8 @@ def _select_launch_config(
                 ) * head_tiles_per_row
                 if candidate_rows <= num_rows and ctas * 2 >= sm_count * 3:
                     query_rows_per_cta = candidate_rows
-        return query_rows_per_cta, splits, 2, True
+        # Three shared K/V buffers let copies run ahead of the QK/PV consumers.
+        return query_rows_per_cta, splits, 3, True
     splits = _num_splits(output_tiles, wide_cluster_capacity)
     return 1, splits, 3 if splits == _WIDE_NUM_SPLITS else 1, False
 
@@ -274,7 +277,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             row = vector // 8
             col = (vector - row * 8) * 16
             selected_idx = selected_tile * 128 + row
-            slot = cutlass.Int32(0)
+            slot = cutlass.Int32(_PADDING_READ_SLOT)
             if lane_idx % 8 == 0 and selected_idx < selected_slots.shape[1]:
                 candidate = selected_slots[batch_idx, selected_idx]
                 if candidate > 0:
@@ -315,7 +318,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             (warpgroup_tidx // warp_threads) * 2 + lane_idx % 2 + (lane_idx // 2) * 8
         )
         index_column = selected_tile * 128 + index_row
-        lane_slot = cutlass.Int32(0)
+        lane_slot = cutlass.Int32(_PADDING_READ_SLOT)
         if index_column < selected_slots.shape[1]:
             candidate = selected_slots[batch_idx, index_column]
             if candidate > 0:
@@ -459,7 +462,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             cache_iter = v_iter
             selected_tile = kv_split_idx + (stream_item // 2 - 1) * kv_splits
         selected_idx = selected_tile * 128 + warpgroup_tidx
-        slot = cutlass.Int32(0)
+        slot = cutlass.Int32(_PADDING_READ_SLOT)
         if selected_idx < selected_slots.shape[1]:
             candidate = selected_slots[row_idx, selected_idx]
             if candidate > 0:
@@ -796,7 +799,11 @@ class MixedInputFusedMultiHeadAttentionDecode:
         softmax_nbar = pipeline.NamedBarrier(
             barrier_id=1, num_threads=warpgroup_threads
         )
-        mma_kq_nbar = pipeline.NamedBarrier(barrier_id=2, num_threads=64)
+        # QK can announce K0 and K1 before its first VP wait. Give the two
+        # S/P stages separate barriers; later reuse is ordered by the VP wait.
+        # IDs 4 and 5 belong to the FP8 conversion warpgroups.
+        mma_kq_even_nbar = pipeline.NamedBarrier(barrier_id=2, num_threads=64)
+        mma_kq_odd_nbar = pipeline.NamedBarrier(barrier_id=6, num_threads=64)
         mma_vp_nbar = pipeline.NamedBarrier(barrier_id=3, num_threads=64)
 
         # Alias thread cooperatives
@@ -1380,7 +1387,10 @@ class MixedInputFusedMultiHeadAttentionDecode:
                                 cute.arch.fence_view_async_shared()
                             # Signal BMM2 to start
                             if is_last_iter:
-                                mma_kq_nbar.arrive()
+                                if s & 1:
+                                    mma_kq_odd_nbar.arrive()
+                                else:
+                                    mma_kq_even_nbar.arrive()
                             for mma_k in cutlass.range_constexpr(
                                 cute.size(tAtK_cvt, mode=[2])
                             ):
@@ -1421,7 +1431,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     # Advance and wait for BMM1
                     for _ in cutlass.range_constexpr(tiles_dk):
                         cvt_consumer.advance()
-                    mma_kq_nbar.arrive_and_wait()
+                    mma_kq_even_nbar.arrive_and_wait()
 
                     # Sequence loop
                     p_token = False
@@ -1431,7 +1441,11 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         if s < iters_s - 1:
                             for _ in cutlass.range_constexpr(tiles_dk):
                                 cvt_consumer.advance()
-                            mma_kq_nbar.arrive_and_wait()
+                            # V_s follows K_{s+1} in the shared K/V stream.
+                            if (s + 1) & 1:
+                                mma_kq_odd_nbar.arrive_and_wait()
+                            else:
+                                mma_kq_even_nbar.arrive_and_wait()
                             p_token = p_consumer.try_wait()
 
                         # BMM2
@@ -1562,9 +1576,9 @@ class MixedInputFusedMultiHeadAttentionDecode:
                         cute.arch.fence_view_async_tmem_load()
                         s_handle.release()
 
-                        # Gather4 maps invalid sparse entries to slot zero for memory
-                        # safety.  Mask those logits again here so slot zero never
-                        # contributes to the softmax.
+                        # Invalid entries load slot 1, which the caller keeps finite.
+                        # Mask their logits using the original selection so
+                        # they never contribute to the softmax.
                         tSrValid = cute.make_rmem_tensor(tSrS.shape, cutlass.Int32)
                         selected_tile = kv_split_idx + s * kv_splits
                         for i in cutlass.range_constexpr(cute.size(tSrS)):

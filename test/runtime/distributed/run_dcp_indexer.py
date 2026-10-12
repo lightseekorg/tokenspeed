@@ -24,6 +24,8 @@ Run with torchrun --standalone --nproc-per-node=2 (or 4/8) and this file.
 Exercises the production collectives, candidate selection and attention merge.
 """
 
+from tokenspeed_kernel.ops.quantization import quantize_fp8
+
 
 def main() -> None:
     import os
@@ -31,7 +33,6 @@ def main() -> None:
     import torch
     import torch.distributed as dist
     from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-    from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 
     from tokenspeed.runtime.distributed.comm_backend.registry import (
         initialize_comm_backend,
@@ -65,7 +66,7 @@ def main() -> None:
     torch.manual_seed(912)
     page_size, topk, pages = 64, 512, 17
     keys = torch.randn(pages * page_size, 128, device="cuda", dtype=torch.bfloat16)
-    values, scales = quantize_fp8_with_scale(
+    values, scales = quantize_fp8(
         keys, granularity="token_group", group_size=128, scale_encoding="float32"
     )
     full = torch.zeros(pages * page_size, 132, device="cuda", dtype=torch.uint8)

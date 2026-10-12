@@ -521,12 +521,17 @@ def _assert_gfx1250_large_route(
         assert torch.all(metadata.block_schedule(block_size)[num_blocks:] == -1)
 
 
-def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64() -> None:
+@pytest.mark.parametrize(
+    ("tokens", "topk", "experts"),
+    [(37, 7, 11), (1024, 16, 257), (1024, 16, 896), (8192, 16, 896)],
+)
+def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64(
+    tokens: int, topk: int, experts: int
+) -> None:
     if not is_cdna5():
         pytest.skip("gfx1250 is required for the CDNA5 fused route")
 
     torch.manual_seed(43)
-    tokens, topk, experts = 37, 7, 11
     ids = (
         torch.arange(tokens * topk, device="cuda", dtype=torch.int32).reshape(
             tokens, topk

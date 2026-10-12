@@ -31,6 +31,7 @@ import-guarded on missing optional backend packages are skipped.
 
 from __future__ import annotations
 
+import builtins
 import importlib
 import inspect
 import sys
@@ -77,7 +78,6 @@ import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
 import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
-import tokenspeed_kernel.ops.gemm.deep_gemm as _gemm_deep_gemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
@@ -112,6 +112,9 @@ import tokenspeed_kernel.ops.residual.triton as _residual_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
+import tokenspeed_kernel.ops.transform as _transform_pkg
+import tokenspeed_kernel.ops.transform.gluon as _transform_gluon
+import tokenspeed_kernel.ops.transform.triton as _transform_triton
 import torch
 from tokenspeed_kernel.ops.attention.dsa import triton as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.dsv4 import triton as _attention_triton_dsv4
@@ -151,13 +154,16 @@ from tokenspeed_kernel.ops.moe.triton import (
     kimi3_sigmoid_topk as _moe_triton_kimi3_sigmoid_topk,
 )
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
-from tokenspeed_kernel.ops.quantization import (
-    fp8_quantize_dequantize as kernel_fp8_quantize_dequantize,
-)
+from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
+from tokenspeed_kernel.ops.residual import mhc_apply_pre as kernel_mhc_apply_pre
+from tokenspeed_kernel.ops.residual import mhc_mixes as kernel_mhc_mixes
 from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
 from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
+from tokenspeed_kernel.ops.transform import (
+    hadamard_transform as kernel_hadamard_transform,
+)
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
@@ -211,7 +217,6 @@ _RELOAD_MODULES = [
     # GEMM registration modules.
     _gemm_reference,
     _gemm_cuda,
-    _gemm_deep_gemm,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
@@ -269,6 +274,10 @@ _RELOAD_MODULES = [
     _sampling_cute_dsl,
     _sampling_gluon,
     _sampling_pkg,
+    # Transform registration modules.
+    _transform_gluon,
+    _transform_triton,
+    _transform_pkg,
 ]
 
 
@@ -285,12 +294,64 @@ def test_attention_api_ownership_and_result_type_identity_are_stable():
     assert _attention_kda_pkg.KdaPrefillResult is KdaPrefillResult
 
 
+@pytest.mark.parametrize("platform_fixture", ["h100_platform", "mi350_platform"])
+def test_hadamard_gluon_registration_uses_amd_backend_only(
+    platform_fixture: str,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _transform_gluon.__file__.endswith("/transform/gluon.py")
+    assert _transform_triton.__file__.endswith("/transform/triton.py")
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    host_registry = KernelRegistry.get()
+    imports = []
+    calls = []
+    real_import = builtins.__import__
+
+    def launch(x, *, scale):
+        calls.append((x, scale))
+        return x
+
+    def import_backend(name, *args, **kwargs):
+        if name == "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard":
+            imports.append(name)
+            assert platform.is_amd
+            return SimpleNamespace(launch_gluon_hadamard_transform_128_gfx950=launch)
+        return real_import(name, *args, **kwargs)
+
+    try:
+        Platform.override(platform)
+        KernelRegistry.reset()
+        with monkeypatch.context() as patch:
+            patch.setattr(builtins, "__import__", import_backend)
+            importlib.reload(_transform_gluon)
+            implementation = KernelRegistry.get().get_impl(
+                "gluon_hadamard_transform_128_gfx950"
+            )
+            if platform.is_amd:
+                x = torch.empty((1, 128), dtype=torch.bfloat16, device="meta")
+                assert implementation(x, scale=0.25) is x
+                assert calls == [(x, 0.25)]
+                assert imports == [
+                    "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard"
+                ]
+            else:
+                assert implementation is None
+                assert not imports
+    finally:
+        Platform.override(host_platform)
+        KernelRegistry._instance = host_registry
+        importlib.reload(_transform_gluon)
+
+
 def test_residual_family_exports_and_modes():
     expected_exports = {
         "attn_res_fwd",
         "attn_res_fwd_available",
         "gated_residual_combine",
         "gated_residual_mix",
+        "mhc_apply_pre",
         "mhc_fused_hc",
         "mhc_mixes",
         "mhc_post",
@@ -306,6 +367,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd",
         "hyperconnection_combine",
         "hyperconnection_mix",
+        "mhc_apply_pre",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
@@ -474,21 +536,34 @@ def _quantize_mxfp8() -> tuple[torch.Tensor, torch.Tensor]:
     return kernel_quantize_mxfp8(x)
 
 
-def _fp8_quantize_dequantize() -> torch.Tensor:
+def _quantize_fp8() -> torch.Tensor:
     x = torch.empty((4, 128), dtype=torch.bfloat16)
-    return kernel_fp8_quantize_dequantize(
+    output, _ = kernel_quantize_fp8(
         x,
+        granularity="token_group",
         group_size=128,
         scale_encoding="ue8m0",
-        override=None,
-        solution=None,
+        dequantize=True,
     )
+    return output
 
 
 def _mm_dense() -> torch.Tensor:
     a = torch.empty((4, 16), dtype=torch.bfloat16)
     b = torch.empty((32, 16), dtype=torch.bfloat16)
     return kernel_mm(a, b)
+
+
+def _hadamard_transform(
+    *,
+    contiguous: bool,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if contiguous:
+        x = torch.empty((8_192, 32, 128), dtype=dtype, device="meta")
+    else:
+        x = torch.empty((8_192, 32, 256), dtype=dtype, device="meta")[..., ::2]
+    return kernel_hadamard_transform(x, scale=128**-0.5)
 
 
 def _mm_dense_cdna4_aligned() -> torch.Tensor:
@@ -509,10 +584,10 @@ def _dsv4_linear_fp32() -> torch.Tensor:
     return kernel_dsv4_linear_fp32(hidden_states, weight)
 
 
-def _mm_mxfp8() -> torch.Tensor:
-    a = torch.empty((4, 128), dtype=_fp8_dtype())
+def _mm_mxfp8(m: int) -> torch.Tensor:
+    a = torch.empty((m, 128), dtype=_fp8_dtype())
     b = torch.empty((128, 128), dtype=_fp8_dtype())
-    a_scales = torch.empty((4, 1), dtype=torch.float32)
+    a_scales = torch.empty((m, 1), dtype=torch.float32)
     b_scales = torch.empty((1, 1), dtype=torch.float32)
     return kernel_mm(
         a,
@@ -523,6 +598,41 @@ def _mm_mxfp8() -> torch.Tensor:
         block_size=[128, 128],
         quant="mxfp8",
     )
+
+
+def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
+    """True MXFP8: E4M3 operands with one UE8M0 scale byte per 32 K values."""
+    a = torch.empty((m, k), dtype=_fp8_dtype())
+    b = torch.empty((n, k), dtype=_fp8_dtype())
+    a_scales = torch.empty((m, k // 32), dtype=torch.uint8)
+    b_scales = torch.empty((n, k // 32), dtype=torch.uint8)
+    return kernel_mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.bfloat16,
+        block_size=[1, 32],
+        quant="mxfp8",
+    )
+
+
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.uint8])
+@pytest.mark.parametrize("batched", [False, True])
+def test_mxfp8_online_scale_signature_matches_weight_encoding(
+    scale_dtype: torch.dtype, batched: bool
+) -> None:
+    batch = (2,) if batched else ()
+    signature = _gemm_pkg._gemm_format_signature(
+        torch.empty((*batch, 4, 128), dtype=torch.bfloat16),
+        torch.empty((*batch, 128, 128), dtype=_fp8_dtype()),
+        None,
+        torch.empty((*batch, 128, 4), dtype=scale_dtype),
+        torch.bfloat16,
+        "mxfp8",
+        [1, 32],
+    )
+    assert signature.format_for("a").scale.storage_dtype == scale_dtype
 
 
 def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None:
@@ -597,11 +707,11 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         def fake_online_quantize_mxfp8(
             activation: torch.Tensor,
             selected_block_size: list[int],
-            kernel_name: str,
+            scale_encoding: str,
             enable_pdl: bool,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             assert selected_block_size == block_size
-            assert kernel_name == expected_name
+            assert scale_encoding == ("ue8m0" if contract == "ue8m0" else "float32")
             assert not enable_pdl
             return (
                 torch.empty_like(activation, dtype=_fp8_dtype()),
@@ -647,6 +757,8 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         registry.clear_cache()
 
     assert calls == [expected_name]
+    kernel_name = calls[0]
+    assert kernel_name == expected_name
     assert actual.shape == (m, n)
 
 
@@ -866,12 +978,7 @@ def test_gemm_quantized_reference_dispatches_fp8_inputs() -> None:
 
 
 @pytest.mark.parametrize("b_layout", ["KN", "NK"])
-def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> None:
-    monkeypatch.setattr(
-        _gemm_pkg,
-        "select_kernel",
-        partial(_gemm_pkg.select_kernel, solution="reference"),
-    )
+def test_mm_fp8_reference_selection_follows_b_layout(b_layout) -> None:
     gen = torch.Generator().manual_seed(0)
     a = torch.randn((4, 256), generator=gen).to(_fp8_dtype())
     b_kn = torch.randn((256, 128), generator=gen).to(_fp8_dtype())
@@ -879,7 +986,13 @@ def test_mm_fp8_reference_selection_follows_b_layout(monkeypatch, b_layout) -> N
     scale = torch.ones((1,), dtype=torch.float32)
 
     out = kernel_mm(
-        a, b, A_scales=scale, B_scales=scale, out_dtype=torch.float32, quant="fp8"
+        a,
+        b,
+        A_scales=scale,
+        B_scales=scale,
+        out_dtype=torch.float32,
+        quant="fp8",
+        solution="reference",
     )
 
     torch.testing.assert_close(out, a.float() @ b_kn.float())
@@ -2514,6 +2627,21 @@ def test_workspace_rows_fail_at_selection_without_a_declaring_leaf(
                 solution="triton",
                 slot_order="selection",
             )
+        with pytest.raises(kernel_NoKernelFoundError):
+            _attention_dsa_pkg.dsa_prefill_topk(
+                torch.empty((1, 32, 128), dtype=torch.bfloat16),
+                torch.empty((1, 32), dtype=torch.float32),
+                torch.arange(16, dtype=torch.int64),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([16], dtype=torch.int32),
+                topk=512,
+                softmax_scale=1.0,
+                batch_invariant=False,
+                index_k_fp8=torch.empty((16, 128), dtype=torch.float8_e4m3fn),
+                index_k_scale=torch.ones((16, 1), dtype=torch.float32),
+                solution="triton",
+                slot_order="selection",
+            )
     finally:
         Platform.override(real_platform)
 
@@ -2717,6 +2845,53 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
     assert selected["solution"] == "legacy_solution"
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (64, "gluon_mhc_pre_gfx950"),
+        (65, "triton_mhc_pre"),
+        (256, "triton_mhc_pre"),
+        (257, "gluon_mhc_prefill_gfx950"),
+        (1025, "gluon_mhc_prefill_gfx950"),
+        (8193, "gluon_mhc_prefill_gfx950"),
+        (131072, "triton_mhc_pre"),
+    ],
+)
+def test_mhc_prefill_selects_gfx950_projection(
+    mi350_platform: PlatformInfo, num_tokens: int, expected: str
+) -> None:
+    registry = KernelRegistry.get()
+    if registry.get_by_name("gluon_mhc_prefill_gfx950") is None:
+        pytest.skip("optional AMD kernel package is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        selected = select_kernel(
+            "residual",
+            "mhc_pre",
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                fn=dense_tensor_format(torch.float32),
+                hc_scale=dense_tensor_format(torch.float32),
+                hc_base=dense_tensor_format(torch.float32),
+            ),
+            traits={
+                "num_tokens": num_tokens,
+                "buffer_offsets_fit_int32": num_tokens * 4 * 4096 < 2**31,
+                "hc_mult": 4,
+                "hidden_size": 4096,
+                "sinkhorn_iters": 20,
+            },
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert selected.name == expected
+
+
 def test_mhc_normalization_contract_is_explicit() -> None:
     parameters = inspect.signature(kernel_mhc_pre).parameters
 
@@ -2770,6 +2945,28 @@ def _mhc_post() -> object:
     post = torch.empty((1, 4, 1), dtype=torch.float32)
     comb = torch.empty((1, 4, 4), dtype=torch.float32)
     return kernel_mhc_post(hidden_states, residual, post, comb)
+
+
+def _mhc_mixes() -> object:
+    # The gfx950 projection is specialized to model hidden sizes.
+    residual = torch.empty((1, 4, 4096), dtype=torch.bfloat16)
+    weight = torch.empty((24, 4 * 4096), dtype=torch.float32)
+    scale = torch.empty((3,), dtype=torch.float32)
+    base = torch.empty((24,), dtype=torch.float32)
+    return kernel_mhc_mixes(residual, weight, scale, base, 1e-6, 1e-6, 2)
+
+
+def _mhc_apply_pre() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=None, norm_eps=None)
+
+
+def _mhc_apply_pre_fused_norm() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    norm_weight = torch.empty((16,), dtype=torch.bfloat16)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=1e-6)
 
 
 def _attention_gdn_chunk_prefill() -> object:
@@ -3071,6 +3268,8 @@ def test_gluon_dsa_prefill_topk_rejects_unsupported_page_size() -> None:
     if registry.get_by_name("gluon_dsa_prefill_topk_fp8_gfx950") is None:
         pytest.skip("Gluon DSA top-k is AMD-only")
 
+    with pytest.raises(kernel_NoKernelFoundError, match="traits"):
+        _attention_dsa_prefill_topk(page_size=32, solution="gluon")
     with pytest.raises(kernel_NoKernelFoundError, match="traits"):
         _attention_dsa_prefill_topk(page_size=32, solution="gluon")
 
@@ -4074,6 +4273,14 @@ def test_mxfp4_w4a8_needs_the_swiglu_clamp() -> None:
             solution=None,
             activation_clamped=False,
         )
+    with pytest.raises(kernel_NoKernelFoundError):
+        _moe_apply_mxfp4_plan(
+            activation="swiglu",
+            ispp=2304,
+            internal_activation_dtype="fp8",
+            solution=None,
+            activation_clamped=False,
+        )
     plan = _moe_apply_mxfp4_plan(
         activation="swiglu",
         ispp=2304,
@@ -4090,6 +4297,13 @@ def test_mxfp4_fp8_activation_fails_closed_on_backends_without_a_w4a8_kernel() -
     if not _is_hopper(Platform.get()):
         pytest.skip("Hopper registrations only")
     for solution in ("marlin", "triton"):
+        with pytest.raises(kernel_NoKernelFoundError):
+            _moe_apply_mxfp4_plan(
+                activation="swiglu",
+                ispp=2304,
+                internal_activation_dtype="fp8",
+                solution=solution,
+            )
         with pytest.raises(kernel_NoKernelFoundError):
             _moe_apply_mxfp4_plan(
                 activation="swiglu",
@@ -4606,6 +4820,62 @@ def _case(
 
 
 _CASES = [
+    # Only contiguous BF16 on GFX950 uses Gluon; other AMD inputs retain Triton.
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "gluon_hadamard_transform_128_gfx950",
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
+        id_suffix="bf16-contiguous",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=False, dtype=torch.bfloat16),
+        id_suffix="bf16-strided-fallback",
+    ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "transform",
+            "hadamard_transform",
+            "triton_hadamard_transform_128",
+            partial(_hadamard_transform, contiguous=True, dtype=dtype),
+            id_suffix=f"{dtype}-fallback",
+        )
+        for dtype in (torch.float16, torch.float32)
+    ],
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
+        id_suffix="bf16-architecture-fallback",
+    ),
+    *[
+        _case(
+            _is_blackwell_sm100,
+            "blackwell-sm100",
+            "gemm",
+            "mm",
+            (
+                "triton_mm_fp8_blockscale"
+                if 17 <= m <= 32
+                else "flashinfer_mm_fp8_blockscale"
+            ),
+            partial(_mm_mxfp8, m),
+            id_suffix=f"fp8-rows-{m}",
+        )
+        for m in (16, 17, 24, 32, 33)
+    ],
     # Attention API x architecture golden cases.
     _case(
         _is_cdna4,
@@ -5600,8 +5870,8 @@ _CASES = [
         "hopper",
         "gemm",
         "mm",
-        "deep_gemm_mm_fp8_blockscale",
-        _mm_mxfp8,
+        "triton_mm_fp8_blockscale",
+        lambda: _mm_mxfp8(4),
     ),
     _case(
         _is_blackwell_sm100,
@@ -5609,7 +5879,7 @@ _CASES = [
         "gemm",
         "mm",
         "flashinfer_mm_fp8_blockscale",
-        _mm_mxfp8,
+        lambda: _mm_mxfp8(4),
     ),
     _case(
         _is_blackwell_sm100,
@@ -5678,8 +5948,33 @@ _CASES = [
         "gemm",
         "mm",
         "triton_mm_fp8_blockscale",
-        _mm_mxfp8,
+        lambda: _mm_mxfp8(4),
     ),
+    # DeepSeek V4.1 MXFP8 projections on gfx950: the weight-streaming decode
+    # kernel through 256 rows (ahead of the skinny kernel's 64-row range),
+    # the large-tile kernel beyond, and from 64 rows on for 2**26-element
+    # weights.
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "gemm",
+            "mm",
+            expected,
+            partial(_mm_mxfp8_ue8m0, m, n, k),
+            id_suffix=f"mxfp8-ue8m0-m{m}-n{n}-k{k}",
+        )
+        for m, n, k, expected in (
+            (1, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
+            (64, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
+            (65, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (192, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (256, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (257, 5120, 2048, "gluon_mm_mxfp8_gfx950"),
+            (65, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+            (256, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+        )
+    ],
     _case(
         _is_hopper_plus,
         "hopper-plus",
@@ -5693,9 +5988,9 @@ _CASES = [
         _is_supported_gpu,
         "supported-gpu",
         "quantization",
-        "fp8_quantize_dequantize",
-        "triton_fp8_quantize_dequantize",
-        _fp8_quantize_dequantize,
+        "fp8",
+        "triton_quantize_fp8_roundtrip",
+        _quantize_fp8,
     ),
     _case(
         _is_hopper,
@@ -5980,8 +6275,33 @@ _CASES = [
         "cdna4",
         "residual",
         "mhc_post",
-        "triton_mhc_post",
+        "gluon_mhc_post_gfx950",
         _mhc_post,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_mixes",
+        "gluon_mhc_mixes_gfx950",
+        _mhc_mixes,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre_fused_norm,
+        id_suffix="fused_norm",
     ),
     _case(
         _is_cdna4,
@@ -6137,6 +6457,9 @@ def selected_kernel_spy(monkeypatch):
             return torch.empty(
                 (logits.shape[0],), dtype=torch.int64, device=logits.device
             )
+
+        if case.family == "transform":
+            return torch.empty_like(args[0])
 
         if case.family == "moe":
             if case.mode == "topk":

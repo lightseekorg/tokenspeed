@@ -33,6 +33,14 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.slot_state import (
+    PREPARED_MARKER_BYTES,
+    pack_slot_rows,
+    read_prepared_marker,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+    write_prepared_marker,
+)
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     dspark_greedy_workspace,
     sample_dspark_block_greedy,
@@ -199,6 +207,46 @@ class DeepseekV4DSpark(BaseDrafter):
         self.target_model = target_model
         self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # The request-persistent context windows and their lengths: the state
+        # ``dspark_prefix_replay_tokens`` exists to regenerate from a prefix.
+        if not 0 <= slot < self.first_padding_slot:
+            raise ValueError(
+                f"DSPARK slot {slot} is outside the persistent state domain "
+                f"[0, {self.first_padding_slot})"
+            )
+        return [self.kv_windows[slot], self.context_lengths[slot]]
+
+    def slot_state_bytes(self) -> int:
+        return PREPARED_MARKER_BYTES + slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # The windows are ``request_id``'s only once ``prepare_request_state``
+        # ran a forward for it in this slot; before that they are a previous
+        # occupant's and the image carries the marker alone.
+        prepared = self._request_by_pool_slot[slot] == request_id
+        write_prepared_marker(out, prepared)
+        if prepared:
+            pack_slot_rows(
+                self.slot_state_rows(slot), out[PREPARED_MARKER_BYTES:], stream
+            )
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        if read_prepared_marker(src):
+            unpack_slot_rows(
+                self.slot_state_rows(slot), src[PREPARED_MARKER_BYTES:], stream
+            )
+            # Imported windows belong to ``request_id``: ``prepare_request_state``
+            # must not reset them as a previous occupant's at the first forward.
+            self._request_by_pool_slot[slot] = request_id
+        else:
+            # Nobody's until the first forward prepares it for the request.
+            self._request_by_pool_slot[slot] = None
 
     def prepare_request_state(
         self,

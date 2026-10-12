@@ -10,11 +10,16 @@
     "replay_warmup_iterations": 3,
     "measurement_blocks": 30
   },
+  "min_regression_absolute_us": 1.0,
   "case_files": [
     "gfx950/glm53_flash/kda.json",
     "gfx950/glm53_flash/dsa.json",
     "gfx950/glm53_flash/moe.json",
     "gfx950/dsv41_flash/gemm.json",
+    "gfx950/dsv41_flash/attention.json",
+    "gfx950/dsv41_flash/moe.json",
+    "gfx950/dsv41_flash/quantization.json",
+    "gfx950/dsv41_flash/residual.json",
     "gfx950/kimi_k3/moe.json",
     "gfx950/kimi_k3/mla.json",
     "gfx950/kimi_k3/gemm.json",

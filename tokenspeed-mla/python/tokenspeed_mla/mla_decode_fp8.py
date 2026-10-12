@@ -4695,10 +4695,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 stride=(split_kv, 1, H * split_kv, H * split_kv * S),
             )
             # the partial block is a multiple of 1 KB; say so or LSE loads drop to 16-bit halves
+            # Convert bits to bytes before multiplying the Int32 element count.
             acc_lse_iter = cute.recast_ptr(
                 workspace.iterator
                 + cute.assume(
-                    cute.cosize(acc_o_layout) * self.partial_dtype.width // 8, 32
+                    cute.cosize(acc_o_layout) * (self.partial_dtype.width // 8), 32
                 ),
                 dtype=acc_dtype,
             )

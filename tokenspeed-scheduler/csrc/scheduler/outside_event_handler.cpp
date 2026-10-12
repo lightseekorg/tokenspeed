@@ -26,6 +26,8 @@
 #include <utility>
 #include <vector>
 
+#include <spdlog/spdlog.h>
+
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
@@ -159,23 +161,77 @@ void Scheduler::handleEvent(const forward::Abort& event) {
     }
 }
 
-void Scheduler::handleEvent(const forward::Retract& event) {
-    Request* request = findRequest(event.request_id);
-    if (request == nullptr || request->Is<fsm::Finished>() || request->Is<fsm::Retracted>()) {
-        return;
-    }
-    // Snapshot-less: dest pages were not filled. Publishing would cache empty
-    // KV. The request re-prefills through ordinary admission.
-    request->Apply(fsm::RetractEvent{&coordinator_, next_retraction_epoch_++, /*has_recoverable_snapshot=*/false,
-                                     request->HasGeneratedOutput()});
-}
-
 void Scheduler::handleEvent(const cache::WriteBackDone& event) {
-    tier_transfers_.CompleteWriteBack(event.op_id);
+    const std::vector<HostPublication> published = tier_transfers_.CompleteWriteBack(event.op_id);
+    // A retraction image's L2 leg: every suspended request waiting for this
+    // store (its own, or an earlier one carrying one of its keys) notes it
+    // and follows the Host entries as published, which may differ from the
+    // ticket's blocks it pinned when the index redirected a key to an entry
+    // an L3 prefetch landed first.
+    for (const std::unique_ptr<Request>& request : requests_) {
+        const auto* retracted = request->GetIf<fsm::Retracted>();
+        if (retracted != nullptr && retracted->WaitsForStore(event.op_id)) {
+            request->Apply(fsm::StoreLandedEvent{event.op_id, published});
+        }
+    }
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
-    tier_transfers_.CompleteLoadBack(event.op_id, event.success);
+    tier_transfers_.CompleteLoadBack(event.op_id);
+}
+
+void Scheduler::handleEvent(const cache::PrefetchDone& event) {
+    std::optional<TierTransferManager::PrefetchCompleted> done =
+        tier_transfers_.CompletePrefetch(event.op_id, event.landed_pages);
+    if (!done) {
+        return;  // unknown or duplicate ACK
+    }
+    // The objects that did not land are forgotten; a later probe may find
+    // them again and register them afresh.
+    coordinator_.UnregisterStorageKeys(done->unlanded);
+    Request* request = findRequest(done->request_id);
+    const auto* prefetching = request == nullptr ? nullptr : request->GetIf<fsm::Prefetching>();
+    if (prefetching == nullptr || prefetching->prefetch_op != event.op_id) {
+        return;  // aborted while prefetching: the landed entries stay published, now evictable
+    }
+    spdlog::info("[Scheduler] prefetch: request {} landed {} of its L3 page(s); admissible again", request->Id(),
+                 event.landed_pages);
+    request->Apply(fsm::PrefetchDoneEvent{std::move(done->published)});
+}
+
+void Scheduler::handleEvent(const cache::SnapshotDone& event) {
+    const std::optional<std::string> request_id = tier_transfers_.CompleteSnapshotStore(event.op_id);
+    if (!request_id) {
+        return;  // unknown or duplicate ACK
+    }
+    Request* request = findRequest(*request_id);
+    if (request != nullptr && request->Is<fsm::Retracted>()) {
+        request->Apply(fsm::StoreLandedEvent{event.op_id, /*published=*/{}});
+    }
+}
+
+void Scheduler::handleEvent(const cache::RestoreDone& event) {
+    const std::optional<std::string> request_id = tier_transfers_.SnapshotRestoreRequest(event.op_id);
+    if (!request_id) {
+        return;  // unknown or duplicate ACK
+    }
+    Request* request = findRequest(*request_id);
+    const fsm::Restoring* restoring = request == nullptr ? nullptr : request->GetIf<fsm::Restoring>();
+    // Finished or aborted while restoring: the ACK only drops the pins.
+    const bool resumes = restoring != nullptr && restoring->restore_op == event.op_id;
+    if (resumes) {
+        // The ACK republishes the L2-tier destinations into the Device index,
+        // a KV-event mutation of boundaries whose descriptors DrainKvEvents
+        // dropped when the victim's pages left the Device: register them
+        // again first, as a first chunk does for the load-backs it issues.
+        registerKvEventPrefixPages(*request, restoring->resources.cache_progress.prefix_hashes, 0);
+    }
+    ReqPoolIndex request_pool_index = tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
+    if (resumes) {
+        request->Apply(fsm::RestoreDoneEvent{std::move(request_pool_index)});
+    }
+    // Otherwise the row and the blob slot return with the ticket: the request
+    // that would have used them is gone.
 }
 
 }  // namespace tokenspeed

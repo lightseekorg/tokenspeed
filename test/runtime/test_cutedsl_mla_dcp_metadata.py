@@ -61,9 +61,9 @@ def make_leaf(monkeypatch):
             speculative_num_draft_tokens=queries,
             is_draft=draft,
             draft_block_decode=block,
-            dcp_size=degree,
-            dcp_rank=rank,
-            dcp_group=tuple(range(degree)),
+            kvp_size=degree,
+            kvp_rank=rank,
+            kvp_group=tuple(range(degree)),
             components=(spec,),
         )
         leaf = tokenspeed_mla.CuteDSLMLABackend(config, spec, kernel_page_size=64)

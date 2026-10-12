@@ -12,7 +12,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     situ_and_mul,
     swiglu_oai,
 )
-from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from utils import assert_no_triton_compile
 
@@ -541,7 +541,7 @@ def test_relu2_fp8_quantizes_the_bf16_square(pdl: bool, device: str) -> None:
     for fp8_scale in (scale, torch.ones(1, device=device)):
         out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
         relu2(x, out, fp8_scale=fp8_scale)
-        expected, _ = static_quant_fp8(torch.relu(x).square(), fp8_scale)
+        expected, _ = quantize_fp8(torch.relu(x).square(), scale=fp8_scale)
         torch.cuda.synchronize()
         assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
 

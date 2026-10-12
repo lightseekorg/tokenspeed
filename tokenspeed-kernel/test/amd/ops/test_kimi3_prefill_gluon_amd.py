@@ -76,6 +76,49 @@ def _bf16_add_rne(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     return (lhs.float() + rhs.float()).to(torch.bfloat16)
 
 
+@pytest.mark.parametrize("tokens", [2, 256])
+@pytest.mark.parametrize("score_scale", [0.0, 0.01, 1.0])
+def test_attn_res_full_history_score_ranges(tokens: int, score_scale: float) -> None:
+    """Exercise uniform, blended, and concentrated weights across all snapshots."""
+    hidden, valid_blocks = 7168, 11
+    generator = torch.Generator(device="cuda").manual_seed(901 + tokens)
+    layer = torch.randn(
+        tokens, hidden, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    history = torch.randn(
+        valid_blocks,
+        tokens,
+        hidden,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).transpose(0, 1)
+    res_weight = torch.randn(hidden, device="cuda", generator=generator) * score_scale
+    score_weight = torch.randn(hidden, device="cuda", generator=generator)
+    output_weight = torch.randn(hidden, device="cuda", generator=generator)
+    actual = attn_res_rmsnorm_amd(
+        layer_residual=layer,
+        block_residual=history,
+        res_weight=res_weight,
+        score_rms_weight=score_weight,
+        score_eps=1e-6,
+        output_rms_weight=output_weight,
+        output_eps=2e-6,
+        num_valid_blocks=valid_blocks,
+    )
+    expected = _attn_res_reference(
+        layer,
+        history,
+        res_weight,
+        score_weight,
+        output_weight,
+        valid_blocks,
+        1e-6,
+        2e-6,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=1.6e-2)
+
+
 def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
     tokens, valid_blocks = 256, 8
     score_eps, output_eps = 1e-6, 2e-6

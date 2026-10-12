@@ -41,6 +41,7 @@ def make_scheduler() -> Scheduler:
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
     cfg.num_device_pages = 1024
+    cfg.num_snapshot_pages = 1  # never retracts
     cfg.cache_groups = [
         CacheGroupConfig(
             group_id="full_attention",
@@ -92,6 +93,7 @@ def test_pd_counters_follow_request_state():
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
     cfg.num_device_pages = 64
+    cfg.num_snapshot_pages = 1  # never retracts
     cfg.disable_l2_cache = True
     cfg.cache_groups = [
         CacheGroupConfig(
@@ -131,6 +133,7 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
     cfg.max_scheduled_tokens = 4
     cfg.max_batch_size = 1
     cfg.num_device_pages = 17
+    cfg.num_snapshot_pages = 1  # the P role never retracts
     cfg.disable_l2_cache = True
     cfg.decode_input_tokens = 3
     cfg.cache_groups = [
@@ -172,6 +175,7 @@ def test_remote_admission_passes_partial_prefix_promotion_and_reserves_decode(
     cfg.max_scheduled_tokens = 16
     cfg.max_batch_size = 1
     cfg.num_device_pages = 128
+    cfg.num_snapshot_pages = 1  # never retracts
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = 1
     cfg.disable_l2_cache = True

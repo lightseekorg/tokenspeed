@@ -183,8 +183,12 @@ def gluon_latent_input_largem_gfx1250(
     b = b_smem.index(last % NUM_BUFFERS).permute([1, 0]).load(layout=dot_layout_b)
     acc = gl.amd.cdna5.wmma(a, b, acc)
 
-    rows = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, wmma_layout))
-    cols = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, wmma_layout))
+    # Write adjacent output columns together instead of retaining the WMMA
+    # lane mapping. Eight BF16 values per lane give contiguous 16-byte stores.
+    store_layout: gl.constexpr = gl.BlockedLayout([1, 8], [2, 16], [8, 1], [1, 0])
+    acc = gl.convert_layout(acc, store_layout)
+    rows = off_m + gl.arange(0, BLOCK_M, gl.SliceLayout(1, store_layout))
+    cols = off_n + gl.arange(0, BLOCK_N, gl.SliceLayout(0, store_layout))
     live = rows[:, None] < M
 
     # One masked store per region. A tile can straddle a boundary, because the

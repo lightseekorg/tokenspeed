@@ -657,6 +657,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
     )
     tokens = torch.tensor([11, 21, 22, 23, 31, 32, 33])
     lengths = torch.tensor([1, 0, 2, 1])
+    drafted: list[int] = []
     executor = SimpleNamespace(
         tree_spec=None,
         capturable_grammar=None,
@@ -666,7 +667,11 @@ def test_drafter_future_inputs_keep_original_request_rows():
         ),
         config=SimpleNamespace(pp_size=1),
         nan_guard=NanGuard(4, "cpu"),
-        runtime_states=SimpleNamespace(future_input_map=future_inputs, vocab_size=64),
+        runtime_states=SimpleNamespace(
+            future_input_map=future_inputs,
+            mark_spec_candidates_drafted=lambda rows: drafted.extend(rows.tolist()),
+            vocab_size=64,
+        ),
         input_buffers=SimpleNamespace(
             state_write_req_pool_indices_buf=torch.tensor([4, 2, 5, 1])
         ),
@@ -687,6 +692,9 @@ def test_drafter_future_inputs_keep_original_request_rows():
         [11, 12, 13],
         [21, 22, 23],
     ]
+    # The rows the drafter wrote now hold real candidates; the skipped row
+    # (its request produced no output) is not marked.
+    assert sorted(drafted) == [1, 4, 5]
 
 
 @pytest.mark.parametrize(

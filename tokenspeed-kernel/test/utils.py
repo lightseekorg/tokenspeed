@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import patch
 
 import torch
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -186,15 +187,12 @@ def make_fp8_per_channel_gemm_operands(m: int, n: int, k: int, seed: int):
     ``[m, 1]`` scales and ``b`` is ``[n, k]`` E4M3 with FP32 ``[n, 1]`` scales.
     The weights are scaled so outputs have roughly unit variance.
     """
-    from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-
     generator = torch.Generator(device="cuda").manual_seed(seed)
     a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, generator=generator)
     b = torch.randn(n, k, device="cuda", generator=generator) / k**0.5
     b_scales = b.abs().amax(dim=1, keepdim=True) / 448.0
     b_fp8 = (b / b_scales).to(torch.float8_e4m3fn)
-    # One quantization group spanning the row is per-token scaling.
-    a_fp8, a_scales = per_token_group_quant_fp8(a, k)
+    a_fp8, a_scales = quantize_fp8(a, granularity="token")
     return a_fp8, a_scales, b_fp8, b_scales
 
 

@@ -176,6 +176,9 @@ class Nvfp4LinearMethod(QuantizeMethodBase):
             )
             del layer.weight_scale
 
+    def nvfp4_global_scale(self, layer: torch.nn.Module) -> torch.Tensor | None:
+        return layer.input_scale_inv
+
     def apply(self, layer, x, bias=None):
         """Forward pass: quantize input to FP4, run FP4 GEMM.
 

@@ -265,7 +265,7 @@ def test_dp_linears(size, backend_name, tmp_path):
 
 
 def _fp8_worker(rank, size, rendezvous):
-    from tokenspeed_kernel.ops.gemm.fp8_utils import per_block_quant_fp8
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
 
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
@@ -306,7 +306,9 @@ def _fp8_worker(rank, size, rendezvous):
         )
         weight = torch.randn(stored_n, k, device=device, dtype=torch.bfloat16) / k**0.5
         weight[n:] = 0
-        quantized, scales = per_block_quant_fp8(weight, (128, 128), 1e-10)
+        quantized, scales = quantize_fp8(
+            weight, granularity="block", block_size=(128, 128)
+        )
         with torch.device(device):
 
             def make_linear():

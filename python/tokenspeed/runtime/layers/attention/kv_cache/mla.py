@@ -222,16 +222,23 @@ class MLATokenToKVPool(CachePool):
             cache_k_rope = (k_rope * k_scale).to(dst_dtype).contiguous()
             return cache_k_nope, cache_k_rope
 
-        kv_buffer = self.get_key_buffer(layer_id)
+        return self.read_latent_rows(self.get_key_buffer(layer_id), loc, dst_dtype)
+
+    def read_latent_rows(
+        self, rows: torch.Tensor, loc: torch.Tensor, dst_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split rows ``loc`` of a ``[slots, 1, kv_cache_dim]`` latent plane in
+        the cache dtype -- this pool's own, or rows gathered from page owners
+        -- into ``dst_dtype`` latent and RoPE keys."""
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
             dtype=dst_dtype,
-            device=kv_buffer.device,
+            device=rows.device,
         )
         cache_k_rope = torch.empty(
             (loc.shape[0], 1, self.qk_rope_head_dim),
             dtype=dst_dtype,
-            device=kv_buffer.device,
+            device=rows.device,
         )
-        get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        get_mla_kv_buffer_triton(rows, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope

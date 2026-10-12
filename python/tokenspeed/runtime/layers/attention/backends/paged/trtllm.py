@@ -45,6 +45,9 @@ from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeCascadeRows,
+)
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
@@ -158,8 +161,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # Padded decode requests have seq_len=1; with q_len=spec_num_tokens
         # they'd hit an empty causal span and the kernel returns NaN.
         self.spec_cache_seqlens_buf: torch.Tensor | None = None
-        # Draft-tree verify: committed keys per request, the cascade's prefix.
-        self.tree_prefix_lens_buf: torch.Tensor | None = None
         # Pure aranges per bs: pool-independent, so a rebind keeps them.
         self._cu_seqlens_by_bs: dict[int, torch.Tensor] = {}
         self._verify_views_by_bs: dict[int, TRTLLMMHAMetadata] = {}
@@ -169,7 +170,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         self.forward_prefill_metadata = None
         self.forward_decode_metadata = None
         self.spec_cache_seqlens_buf = None
-        self.tree_prefix_lens_buf = None
         self._verify_views_by_bs = {}
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
@@ -247,9 +247,6 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
         self.spec_cache_seqlens_buf = torch.zeros(
-            (max_bs,), dtype=torch.int32, device=self.device
-        )
-        self.tree_prefix_lens_buf = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
         self._cu_seqlens_by_bs = {}
@@ -339,12 +336,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 self.spec_num_tokens,
                 out=self.spec_cache_seqlens_buf[:bs],
             )
-            if self.tree_verify is not None:
-                torch.sub(
-                    self.spec_cache_seqlens_buf[:bs],
-                    self.tree_verify.num_nodes,
-                    out=self.tree_prefix_lens_buf[:bs],
-                )
+            self._refresh_tree_prefix(bs, self.spec_cache_seqlens_buf)
             self.forward_prefill_metadata = self._verify_views(bs)
 
     # ------------------------------------------------------------------
@@ -413,19 +405,10 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         bs: int,
         **kwargs,
     ) -> torch.Tensor:
-        if self.tree_lane_step_active:
-            lanes = self.tree_draft
+        lanes = self._tree_lane_rows(bs)
+        if lanes is not None:
             return self._tree_cascade(
-                q,
-                layer,
-                token_to_kv_pool,
-                page_table=self.page_table_buf[:bs],
-                seq_lens=lanes.window_seq_lens[:bs],
-                prefix_lens=lanes.frontier[:bs],
-                mask=lanes.lane_mask[: bs * lanes.topk],
-                rows=lanes.topk,
-                window=lanes.num_slots,
-                sinks=kwargs.get("sinks"),
+                q, layer, token_to_kv_pool, lanes, sinks=kwargs.get("sinks")
             )
         if self.block_decode_active:
             # DFLASH draft block: metadata is expanded to bs*spec_num_tokens
@@ -443,19 +426,15 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
                 else self.forward_decode_metadata
             )
 
-        if self.tree_verify is not None and metadata.max_seq_len_q > 1:
-            nodes = self.tree_verify.num_nodes
+        tree = self._tree_verify_rows(
+            bs,
+            metadata.max_seq_len_q,
+            metadata.page_table,
+            metadata.cache_seqlens_int32,
+        )
+        if tree is not None:
             return self._tree_cascade(
-                q,
-                layer,
-                token_to_kv_pool,
-                page_table=metadata.page_table,
-                seq_lens=metadata.cache_seqlens_int32,
-                prefix_lens=self.tree_prefix_lens_buf[:bs],
-                mask=self.tree_verify.mask[: bs * nodes],
-                rows=nodes,
-                window=nodes,
-                sinks=kwargs.get("sinks"),
+                q, layer, token_to_kv_pool, tree, sinks=kwargs.get("sinks")
             )
         q = self._prepare_q(q, layer)
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
@@ -498,13 +477,8 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         q: torch.Tensor,
         layer: PagedAttention,
         token_to_kv_pool,
+        tree: TreeCascadeRows,
         *,
-        page_table: torch.Tensor,
-        seq_lens: torch.Tensor,
-        prefix_lens: torch.Tensor,
-        mask: torch.Tensor,
-        rows: int,
-        window: int,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
         """Draft-tree attention (verify nodes or drafting lanes): trtllm-gen's causal
@@ -523,13 +497,13 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             query=self._prepare_q(q, layer),
             kv_cache=(k_cache, v_cache),
             workspace_buffer=self.workspace_buffer,
-            block_tables=page_table,
-            seq_lens=prefix_lens,
+            block_tables=tree.page_table,
+            seq_lens=tree.prefix_lens,
             max_seq_len=self.max_context_len,
             bmm1_scale=layer.scaling,
             bmm2_scale=1.0,
             out_dtype=self.dtype,
-            q_len_per_req=rows,
+            q_len_per_req=tree.rows,
             return_lse=True,
         )
         kv_heads, dim = layer.tp_k_head_num, layer.head_dim
@@ -538,13 +512,13 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             q.contiguous().view(-1, layer.tp_q_head_num, dim),
             k_rows.view(-1, kv_heads, dim),
             v_rows.view(-1, kv_heads, dim),
-            page_table,
-            seq_lens,
-            mask,
+            tree.page_table,
+            tree.seq_lens,
+            tree.mask,
             prefix_out,
             prefix_lse,
-            rows_per_req=rows,
-            window=window,
+            rows_per_req=tree.rows,
+            window=tree.window,
             page_size=self.kernel_page_size,
             sm_scale=layer.scaling,
         )

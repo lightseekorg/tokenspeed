@@ -50,10 +50,16 @@ from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+    TreeCascadeRows,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (
     TRTLLMMLAChunkedPrefillMetadata,
     calc_padded_blocks,
+    finish_mla_tree,
+    mla_tree_support,
 )
+from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
 )
@@ -241,8 +247,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # consumed within each op and never zero-initialized, so sharing the
         # block is safe. Warm to the verify-path peak now: graph capture runs
         # the decode forward with the pool frozen.
-        self.dcp_group = tuple(config.dcp_group)
-        self.dcp_rank = config.dcp_rank
+        self.kvp_group = tuple(config.kvp_group)
+        self.kvp_rank = config.kvp_rank
         self._num_heads_per_tp = spec.num_attention_heads // spec.attn_tp_size
         self._workspace_pool = workspace_pool(config.device)
         self.cutedsl_workspace = self._cutedsl_workspace(
@@ -291,15 +297,15 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         **kwargs,
     ) -> None:
         super().configure_runtime(**kwargs)
-        if shard_count != len(self.dcp_group):
-            raise ValueError("CuTe MLA cache and DCP topology disagree")
+        if shard_count != len(self.kvp_group):
+            raise ValueError("CuTe MLA cache and KVP topology disagree")
         self._dcp = (
             _DCPDecodeState(
                 CachePlacement(
                     block_granularity,
                     virtual_block_count,
-                    self.dcp_group,
-                    self.dcp_rank,
+                    self.kvp_group,
+                    self.kvp_rank,
                 )
             )
             if shard_count > 1
@@ -311,7 +317,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         required = (
             get_num_sm(self.device)
             * self._num_heads_per_tp
-            * len(self.dcp_group)
+            * len(self.kvp_group)
             * q_len_capacity
             * (self.kv_lora_rank + 1)
             * 4
@@ -350,7 +356,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         **kwargs,
     ):
         reject_query_shard(query_shard, "CuteDSLMLABackend")
-        del page_table_cpu
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "tokenspeed_mla decode metadata goes through "
@@ -361,6 +366,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             self._init_prefill_metadata(
                 seq_lens[:num_extends],
                 page_table=page_table[:num_extends],
+                page_table_cpu=page_table_cpu,
                 extend_prefix_lens=extend_prefix_lens[:num_extends],
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
                 extend_seq_lens=extend_seq_lens[:num_extends],
@@ -393,6 +399,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
+        *,
+        page_table_cpu: torch.Tensor | None,
     ):
         # Worst-case bound to avoid GPU->CPU sync from seq_lens.max().item().
         # TODO: track a loose CPU upper bound (advance by chunked_prefill_size /
@@ -429,6 +437,11 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             extend_prefix_lens_cpu,
             page_table,
             self.kernel_page_size,
+        )
+        self._prepare_prefix_history(
+            chunk_kv_indices_list,
+            page_table_cpu=page_table_cpu,
+            prefix_lens_cpu=extend_prefix_lens_cpu,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,
@@ -616,6 +629,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             return
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
+        self._refresh_tree_prefix(bs, self.seq_lens_buf)
         # The persistent buffer is padded to the fused-kernel block constraint;
         # columns past the router table's width stay 0 (never read: the kernel
         # bounds access by seq_lens). Padded (and idle) requests are already
@@ -647,8 +661,19 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         # q is the absorbed query [T, H, head_dim]; the prologue wrote the latent cache.
+        lanes = self._tree_lane_rows(bs)
+        if lanes is not None:
+            return self._tree_cascade(q, layer, token_to_kv_pool, lanes)
         metadata = self.forward_decode_metadata
         num_extends = metadata.num_extends
+        tree = self._tree_verify_rows(
+            bs,
+            q.shape[0] // bs if bs > 0 else 1,
+            metadata.page_table[num_extends:],
+            metadata.seq_lens_k[num_extends:],
+        )
+        if tree is not None:
+            return self._tree_cascade(q, layer, token_to_kv_pool, tree)
         window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
         causal_mask = True
         if self.block_decode_active:
@@ -703,7 +728,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 else local.local_visible_lens
             )
             query = gather_query_heads(
-                query.reshape(-1, layer.tp_q_head_num, layer.head_dim), self.dcp_group
+                query.reshape(-1, layer.tp_q_head_num, layer.head_dim), self.kvp_group
             ).view(bs, query.shape[1], -1, layer.head_dim)
 
         # Prepare KV cache: [num_pages, page_size, kv_cache_dim] (3D for CuteDSL)
@@ -742,13 +767,63 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             raw_out = combine_attention_partials(
                 partial.flatten(0, 1),
                 lse_log2.flatten(0, 1) * math.log(2),
-                group=self.dcp_group,
-                rank=self.dcp_rank,
+                group=self.kvp_group,
+                rank=self.kvp_rank,
                 sink=None,
                 keep_all_heads=False,
             )
 
         return raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def tree_support(self) -> TreeSupport:
+        support = mla_tree_support(
+            type(self).__name__, self.data_type, self.q_data_type
+        )
+        if len(self.kvp_group) == 1:
+            return support
+        reason = f"{type(self).__name__} has no draft-tree path under KV parallelism"
+        return TreeSupport(verify_blocker=reason, draft_blocker=reason)
+
+    def _tree_cascade(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        tree: TreeCascadeRows,
+    ) -> torch.Tensor:
+        """Draft-tree attention (verify nodes or drafting lanes): the CuTe
+        causal ``rows``-token MLA decode over the committed prefix, with its
+        base-2 log-sum-exp, then the tree window merged in (``finish_mla_tree``)."""
+        if layer.sliding_window_size >= 0:
+            raise NotImplementedError("draft trees have no sliding-window path yet")
+        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.data_type != k_cache.dtype:
+            k_cache = k_cache.to(self.data_type)
+        query = q.view(-1, tree.rows, layer.tp_q_head_num, layer.head_dim)
+        self.cutedsl_workspace = self._cutedsl_workspace(tree.rows)
+        prefix_out, prefix_lse = tokenspeed_mla_decode(
+            query=query.to(self.data_type),
+            kv_cache=k_cache.view(-1, self.kernel_page_size, self.kv_cache_dim),
+            workspace_buffer=self.cutedsl_workspace,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=tree.page_table,
+            seq_lens=tree.prefix_lens,
+            max_seq_len=self.max_context_len,
+            softmax_scale=layer.scaling,
+            causal_mask=True,
+            return_lse=True,
+        )
+        return finish_mla_tree(
+            q,
+            layer,
+            k_cache,
+            tree,
+            prefix_out,
+            prefix_lse,
+            page_size=self.kernel_page_size,
+            query_dtype=self.q_data_type,
+        )
 
     # ---- Forward: Extend/Prefill ----
 

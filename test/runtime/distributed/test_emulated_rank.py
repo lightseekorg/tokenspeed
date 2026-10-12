@@ -124,6 +124,8 @@ def test_one_process_world_backs_every_logical_group(emulated_manager):
     group = emulated_manager.get_process_group("gloo", TP8)
     assert group.size() == 1
     assert emulated_manager.get_process_group("gloo", (0, 2, 4, 6)) is group
+    emulated_manager.init_process_group(TP8, name="copy")
+    assert emulated_manager.get_process_group("gloo", TP8, name="copy") is group
 
     tensor = torch.ones(4)
     dist.all_reduce(tensor, group=group)
@@ -133,7 +135,7 @@ def test_one_process_world_backs_every_logical_group(emulated_manager):
 def test_shared_expert_check_is_sized_by_its_process_group(emulated_manager):
     mapping = SimpleNamespace(world_size=8, world_group=TP8)
     with mock.patch.object(shared_expert_tp, "pg_manager", emulated_manager):
-        assert shared_expert_tp.validate_shared_expert_settings(mapping, "1") is None
+        assert shared_expert_tp.validate_shared_expert_settings(mapping, 1) is None
 
 
 def test_grammar_sync_is_sized_by_its_process_group():

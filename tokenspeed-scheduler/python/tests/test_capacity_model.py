@@ -34,6 +34,7 @@ def _sizing_config(
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_l2_cache = True
+    cfg.num_snapshot_pages = 1  # never retracts
     cfg.cache_groups = groups
     return cfg
 

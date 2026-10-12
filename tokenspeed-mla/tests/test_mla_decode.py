@@ -567,14 +567,17 @@ class TestCompile:
         assert "Warning:" not in result.stderr, result.stderr
 
 
-def _check_decode_gpu(case, variable_kv, dtype, partial_fp16):
+def _check_decode_gpu(case, variable_kv, dtype, partial_fp16, min_split_kv):
     import tokenspeed_mla.mla_decode as decode
     from tokenspeed_mla import tokenspeed_mla_decode
 
     decode._FP16_PARTIALS = partial_fp16
 
     q, kv, tables, lengths = _make_inputs(case, dtype, variable_kv, "cuda")
-    workspace = torch.zeros(256 * 1024**2, dtype=torch.int8, device="cuda")
+    workspace_bytes = max(
+        256 * 1024**2, case.batch * case.q_len * case.heads * min_split_kv * 513 * 4
+    )
+    workspace = torch.zeros(workspace_bytes, dtype=torch.int8, device="cuda")
     out = torch.empty(
         case.batch,
         case.q_len,
@@ -610,6 +613,7 @@ def _check_decode_gpu(case, variable_kv, dtype, partial_fp16):
         cp_world=1,
         cp_rank=0,
         enable_packed_q=False,
+        min_split_kv=min_split_kv,
     )
     tokenspeed_mla_decode(**kwargs)
     torch.cuda.synchronize()
@@ -1415,28 +1419,39 @@ class TestGPU:
         )
 
     @pytest.mark.parametrize(
-        "case,variable_kv",
+        "case,variable_kv,min_split_kv",
         [
-            (_Case(1, 1024, heads, q_len), False)
+            (_Case(1, 1024, heads, q_len), False, 1)
             for heads, q_len in itertools.product((6, 12, 24, 48, 96, 128), (1, 4, 8))
         ]
         + [
-            (_Case(4, 1024, 12, 8), False),
-            (_Case(1, 1024, 128, 2), False),
-            (_Case(10, 385, 96, 8), True),
-            (_Case(128, 384, 96, 1), False),
+            (_Case(4, 1024, 12, 8), False, 1),
+            (_Case(1, 1024, 128, 2), False, 1),
+            (_Case(10, 385, 96, 8), True, 1),
+            (_Case(128, 384, 96, 1), False, 1),
             # Exercise all reducer bands and both static capacities (32 and 64).
-            (_Case(1, 16384, 48, 1), False),
-            (_Case(1, 16384, 96, 1), False),
-            (_Case(1, 16512, 6, 1), False),
+            (_Case(1, 16384, 48, 1), False, 1),
+            (_Case(1, 16384, 96, 1), False, 1),
+            (_Case(1, 16512, 6, 1), False, 1),
             # Normalizing to one split must take the workspace-free kernel path.
-            (_Case(1, 128, 96, 1), False),
+            (_Case(1, 128, 96, 1), False, 1),
+            # FP32 partial outputs occupy 240/480 MiB. Multiplying their
+            # element count by 32 bits overflows Int32 above 256 MiB.
+            (_Case(32, 1024, 96, 5), False, 8),
+            (_Case(64, 1024, 96, 5), False, 8),
+            (_Case(64, 1024, 96, 5), False, 1),
         ],
         ids=lambda value: value.name if isinstance(value, _Case) else None,
     )
     @pytest.mark.parametrize("partial_fp16", [False, True])
-    def test_fp8_decode_accuracy_and_cuda_graph(self, case, variable_kv, partial_fp16):
-        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "fp8", partial_fp16), 180)
+    def test_fp8_decode_accuracy_and_cuda_graph(
+        self, case, variable_kv, min_split_kv, partial_fp16
+    ):
+        _run_gpu_check(
+            _check_decode_gpu,
+            (case, variable_kv, "fp8", partial_fp16, min_split_kv),
+            180,
+        )
 
     @pytest.mark.parametrize(
         "case,variable_kv",
@@ -1451,7 +1466,7 @@ class TestGPU:
     )
     def test_bf16_decode_accuracy_and_cuda_graph(self, case, variable_kv):
         # BF16 partials are always acc_dtype; the fp16 flag is FP8-only.
-        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "bf16", False), 180)
+        _run_gpu_check(_check_decode_gpu, (case, variable_kv, "bf16", False, 1), 180)
 
     def test_packed_q_outputs_lse_tails_and_legacy_paths(self):
         _run_gpu_check(_check_packed_gpu, (), 600)

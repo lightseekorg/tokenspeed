@@ -78,6 +78,19 @@ def write_task(
     return relative.as_posix()
 
 
+def test_run_slurm_without_user(monkeypatch):
+    for name in ("USER", "TS_CI_ARTIFACT_ROOT", "TS_CI_CACHE_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    script = Path(__file__).resolve().parents[1] / "ci" / "run_slurm.sh"
+    result = subprocess.run(
+        ["bash", str(script), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "usage: slurm_submit.py" in result.stdout
+
+
 def test_gpu_count():
     assert gpu_count("gb200-4gpu") == 4
     with pytest.raises(ValueError):

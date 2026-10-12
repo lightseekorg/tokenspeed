@@ -1095,7 +1095,7 @@ class Release:
                 {"nightly": False, "publish_github": True, "prerelease": False},
                 event="workflow_dispatch",
             )
-            for variant, count in (("cu129", 8), ("cu130", 8), ("rocm72", 4)):
+            for variant, count in (("cu129", 6), ("cu130", 6), ("rocm72", 3)):
                 self.wheelhouse(f"tokenspeed-kernel-v{version}-{variant}", sha, count)
         else:
             workflow = "release-pypi.yml"
@@ -1188,9 +1188,9 @@ class Release:
             command("git", "reset", "--hard", "origin/gh-pages", cwd=root)
             paths = {"index.html"}
             for variant, suffix, count in (
-                ("cu129", "cu129", 8),
-                ("cu130", "cu130", 8),
-                ("rocm7.2", "rocm72", 4),
+                ("cu129", "cu129", 6),
+                ("cu130", "cu130", 6),
+                ("rocm7.2", "rocm72", 3),
             ):
                 paths.add(f"{variant}/index.html")
                 for stage, tag, wheel_count in (
@@ -1374,7 +1374,7 @@ class Release:
             self.state["stages"]["tokenspeed"]["sha"],
             1,
         )
-        for variant, count in (("cu129", 8), ("cu130", 8), ("rocm72", 4)):
+        for variant, count in (("cu129", 6), ("cu130", 6), ("rocm72", 3)):
             self.wheelhouse(
                 f"tokenspeed-kernel-v{versions['tokenspeed-kernel']}-{variant}",
                 self.state["stages"]["kernel"]["sha"],

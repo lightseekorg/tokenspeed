@@ -62,13 +62,20 @@ public:
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();
-    // Same in-flight and pin checks as ClearCache, with no mutation. Weight
-    // updates MIN-reduce this across the replica before any rank clears.
+    // Same in-flight, pin and suspended-request checks as ClearCache, with no
+    // mutation. Weight updates MIN-reduce this across the replica before any
+    // rank clears. Every flush refuses while RetractedSize() > 0: a
+    // suspended request's image would otherwise resume old KV under a flushed
+    // (re-weighted) engine, and its snapshot-pool leg is visible through no
+    // pin.
     bool CanClearCache() const;
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
-    // Submitted plus Retracted requests waiting for admission/readmission.
+    // Requests waiting for an admission: Submitted, Prefetching (their L3
+    // prefix is being fetched into Host first), plus the suspended ones --
+    // Retracted (waiting to be restored) and Restoring (their copy back is in
+    // flight) -- which hold no schedulable work until they resume.
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
@@ -99,19 +106,23 @@ public:
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
+    // Empty parents of the request-private snapshot pool: every block of it
+    // belongs to some retracted request's image, so a request that finished
+    // or aborted while retracted must have returned its share (leak check).
+    std::int32_t SnapshotPoolFreeBlocks() const { return coordinator_.NumFreeSnapshotLcmBlocks(); }
+    // Requests suspended with an image: Retracted (waiting to be restored)
+    // and Restoring (their copy back is in flight). A weight update must not
+    // restore an image of old-weight KV under new weights, so the runtime
+    // refuses to flush while this is non-zero.
+    std::size_t RetractedSize() const;
 
-    // L3 storage (Mooncake Store, etc.) sits below Host. Python queries the
-    // backend for existing objects, then registers the matching CacheKeys so
-    // ProbePrefix can treat them as Host hits that require prefetch.
+    // L3 storage (Mooncake Store, etc.) sits below Host. At submit the
+    // runtime asks the backend which of a prompt's objects exist and
+    // registers the matching CacheKeys; an admission that finds registered
+    // keys beyond its Host hit issues a pre-admission prefetch of them
+    // (PrefetchOperation, fsm::Prefetching) and admits them as a Host hit
+    // once they landed. Admission itself never fetches from L3.
     std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
-    // Prefix hashes of Submitted/Retracted requests the scheduler can admit
-    // this round. The event loop revalidates these against L3 immediately
-    // before NextExecutionPlan so a queued hit cannot survive deletion.
-    // Requests that cannot take a batch slot (full decode batch, HOL
-    // incomplete prefill) or cannot obtain Device pages (pool exhausted)
-    // are skipped so a long waiter is not rehashed and remotely probed on
-    // every decode step.
-    std::vector<std::string> WaitingPrefixHashes() const;
     std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
         return coordinator_.ExpandPrefixKeys(content_hashes);
     }
@@ -147,15 +158,40 @@ private:
         // never recorded here: when it needs a victim, the two simply do not
         // fit together, and swapping them is pure thrash.
         Request* capacity_blocker{nullptr};
+        // Every candidate whose admission failed for capacity this round, in
+        // phase order (the blocker first). When the victim turns out to be
+        // the blocker itself, the next of these is who its pages serve.
+        std::vector<Request*> capacity_blocked;
+
+        void NoteCapacityBlocked(Request* request) {
+            if (capacity_blocker == nullptr) {
+                capacity_blocker = request;
+            }
+            capacity_blocked.push_back(request);
+        }
     };
 
-    std::pair<std::vector<ForwardOperation>, std::vector<LoadBackOperation>> buildForwardOperations(
-        ExecutionPlan& plan, std::vector<Request*> candidates, std::vector<WriteBackOperation>& write_back_operations);
-    std::optional<fsm::SchedulePrefillFirstChunkEvent> schedulePrefillFirstChunk(ExecutionPlan& plan,
-                                                                                 AdmissionFeedback& feedback,
-                                                                                 Request* request,
-                                                                                 std::int32_t remaining,
-                                                                                 std::int32_t decode_input_tokens);
+    // What one plan-building pass emits beside the ExecutionPlan's own fields.
+    struct BuiltOperations {
+        std::vector<ForwardOperation> forward;
+        std::vector<LoadBackOperation> load_backs;
+        std::vector<PrefetchOperation> prefetches;
+        std::vector<SnapshotStoreOperation> snapshot_stores;
+        std::vector<SnapshotRestoreOperation> snapshot_restores;
+    };
+    BuiltOperations buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
+                                           std::vector<WriteBackOperation>& write_back_operations);
+    // What considering a Submitted request for admission produced: the
+    // first-chunk event (admitted), or a prefetch issued instead (the request
+    // is Prefetching; it is considered again once the fill landed), or
+    // neither (feedback says whether capacity was the reason).
+    struct FirstChunkOutcome {
+        std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
+        bool prefetching{false};
+    };
+    FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
+                                                std::int32_t remaining, std::int32_t decode_input_tokens,
+                                                std::vector<PrefetchOperation>& prefetches);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event);
@@ -193,13 +229,15 @@ private:
 
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
+    void handleEvent(const cache::PrefetchDone& event);
+    void handleEvent(const cache::SnapshotDone& event);
+    void handleEvent(const cache::RestoreDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);
     void handleEvent(const pd::RemotePrefillDoneEvent& event);
     void handleEvent(const forward::ExtendResult& event);
     void handleEvent(const forward::Abort& event);
-    void handleEvent(const forward::Retract& event);
     void handleEvent(const forward::Finish& event);
     void handleEvent(const forward::UpdateReserveNumTokens& event);
 
@@ -217,6 +255,12 @@ private:
         std::vector<ForwardOperation> remote_decode;
         std::vector<ForwardOperation> remote_prefill;
         std::vector<LoadBackOperation> load_backs;
+        // Pre-admission L3 fills issued this round (fsm::Prefetching).
+        std::vector<PrefetchOperation> prefetches;
+        // A retraction's tail-leg store (its L2 leg joins the write-backs) and
+        // a readmission's restore: cache ops riding beside the batch.
+        std::vector<SnapshotStoreOperation> snapshot_stores;
+        std::vector<SnapshotRestoreOperation> snapshot_restores;
         // A round schedules each request at most once, whatever states it
         // moves through while the phases run (a prompt completed by the
         // prefill phase is PrefillDone by the time the decode phase walks
@@ -261,23 +305,41 @@ private:
         build.operations.push_back(std::move(operation));
     }
 
+    // What scheduling one prefill-work candidate produced: the chunk to run
+    // this round, or none when a Submitted request was sent to prefetch its
+    // L3 prefix instead (fsm::Prefetching; the round carries only its
+    // PrefetchOperation and the request is considered again once it landed).
+    struct PrefillAdmission {
+        std::optional<PrefillOperation> operation;
+    };
     // Admission for one prefill-work candidate: a resumed chunk for a
-    // Prefilling request, the first chunk otherwise. Returns the built
-    // operation, or nullopt when admission fails (feedback.admission_failed
-    // says whether capacity was the reason).
-    std::optional<PrefillOperation> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
+    // Prefilling request, the first chunk (or a prefetch) otherwise. nullopt
+    // when admission fails (feedback.admission_failed says whether capacity
+    // was the reason).
+    std::optional<PrefillAdmission> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t token_budget,
                                                              std::int32_t decode_reserve,
-                                                             std::vector<LoadBackOperation>& load_backs);
+                                                             std::vector<LoadBackOperation>& load_backs,
+                                                             std::vector<PrefetchOperation>& prefetches);
 
-    // The readmission this round may schedule, or nullptr: among the
-    // retracted requests holding a recoverable snapshot, decode-origin
-    // victims first, then oldest retraction epoch. Derived from the states
-    // themselves, so a request that finishes or aborts while retracted
-    // simply stops qualifying. A snapshot-less retraction is not in this
-    // ordering at all -- it re-prefills through the ordinary admission path
-    // (admitsLikeNewPrompt).
-    static Request* nextReadmission(std::span<Request* const> candidates);
+    // The readmissions this round may restore, in rank order: among the
+    // retracted requests whose image has landed, victims with generated
+    // output first (they resume a generation a client is reading), then
+    // oldest retraction epoch. Derived from the states themselves, so a
+    // request that finishes or aborts while retracted simply stops qualifying.
+    static std::vector<Request*> rankedReadmissions(std::span<Request* const> candidates);
+    // Allocates fresh Device pages for the whole image plus the reserve the
+    // resumed state needs, issues the restore op beside the batch and moves
+    // the request to Restoring. False when it does not fit (feedback says
+    // whether capacity was the reason): the readmission waits and is never
+    // recorded as the capacity blocker.
+    bool scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, Request* request);
+    // The restore phase of the D and fused grammars: tries the ranked
+    // readmissions in order, a bounded number of them, until one restores
+    // (one per round). Returns whether new-prompt admission is sealed this
+    // round: true once any landed image waited for Device pages, so a
+    // newcomer cannot take the pages it is waiting for.
+    bool scheduleReadmission(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     // The capacity-retraction entry shared by the D and fused grammars:
     // fires only when no prefill progressed and admission failed. Retracts
@@ -286,8 +348,46 @@ private:
     // free page waiting for whoever asks first next round.
     void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
-    Request* chooseVictim(std::span<Request* const> candidates) const;
-    void retractVictim(Request& victim, std::vector<WriteBackOperation>& write_back_operations);
+    // Who gives way, and whether it can be imaged. `victim` is nullptr when
+    // nobody can (every resident is exempt or there is no resident); with
+    // image_fits false it is the newest retractable resident, to be aborted
+    // because no candidate's image fits the host budgets.
+    struct VictimChoice {
+        Request* victim{nullptr};
+        bool image_fits{false};
+    };
+    VictimChoice chooseVictim(std::span<Request* const> candidates) const;
+    // The first half of a retraction: publishes the pages the victim completed
+    // since its last admission (see forward.cpp).
+    void publishCompletedPrefix(Request& victim);
+    // Whether the host budgets hold the request's image right now: a blob
+    // slot is free and the snapshot pool holds everything the L2 leg would
+    // not carry once the retraction has published the request's completed
+    // pages (projected, nothing mutated). An L2 allocation shortfall can still
+    // send published slots to the pool at retraction time, where the image can
+    // then turn out not to fit.
+    bool imageFits(const Request& request) const;
+    // Why a victim could not be imaged: no snapshot pool at all (the null
+    // page alone is configured, so nothing is ever imaged), no blob slot
+    // free, or a pool too small for the image.
+    enum class ImageShortfall { kNoPool, kBlobSlot, kSnapshotPool };
+    // Images the victim (Host L2 for its published pages, the snapshot pool
+    // for the rest), issues both store legs and suspends it. Returns the
+    // shortfall -- with nothing changed but Host entries evicted for the
+    // attempt -- when the image cannot be held or no blob slot is free.
+    std::optional<ImageShortfall> retractVictim(Request& victim, PlanBuild& build,
+                                                std::vector<WriteBackOperation>& write_back_operations);
+    // The one site of the last-resort policy: a capacity retraction whose
+    // victim cannot be imaged aborts that victim instead -- its pages and
+    // slot return in this very round and the blocked grant proceeds as after
+    // a retraction -- and records it on the plan for the runtime to fail the
+    // request toward its client.
+    void onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build);
+    // The debug_force_retraction_interval knob: arms the oldest Decoding
+    // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
+    // the batch until it is quiescent, then retracts it.
+    void maybeForceRetraction(PlanBuild& build, std::span<Request* const> candidates,
+                              std::vector<WriteBackOperation>& write_back_operations);
 
     // One plan-building grammar per engine role: the roles share the
     // scheduling mechanism (schedulePrefill / scheduleDecode / admission)
@@ -302,15 +402,19 @@ private:
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                         std::vector<WriteBackOperation>& write_back_operations);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                                  Request* readmission, std::int32_t decode_reserve);
+                                  bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
+    // One slot per retracted request: the index of its slot-state blob in
+    // the runtime's arena, released by the FSM transition that drops the image.
+    SnapshotSlotAllocator snapshot_slots_;
 
     // Pools outlive every CacheBlockRef stored below.
     BlockPool block_pool_;
     BlockPool host_pool_;
+    BlockPool snapshot_pool_;
     CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
     std::vector<WriteBackOperation> pending_write_back_operations_;
@@ -318,8 +422,13 @@ private:
     std::int32_t max_single_request_tokens_{0};
 
     // Stamped onto each retraction; the readmission order lives on the
-    // Retracted states themselves (nextReadmission).
+    // Retracted states themselves (rankedReadmissions).
     std::int64_t next_retraction_epoch_{1};
+    // The forced-retraction knob's clock and the request it has armed (empty
+    // when none): kept out of every batch until it is quiescent, then
+    // retracted.
+    std::int64_t plan_calls_{0};
+    std::string forced_victim_id_;
 
     // Submission order -- the FIFO every scheduling phase walks, identical
     // on every rank because the mirrored schedulers receive identical

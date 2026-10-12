@@ -146,11 +146,14 @@ VENDOR_CONTENT_MARKERS = {
     "nvidia": re.compile(r"\bis_nvidia\b|\bis_hopper\w*|\bis_blackwell\w*|\"nvidia\""),
 }
 VENDOR_WORKFLOWS = {
-    "amd": ".github/workflows/amd-tests.yml",
-    "nvidia-arm": ".github/workflows/pr-test-nvidia-arm.yml",
-    "nvidia-gb200-slurm": ".github/workflows/nvidia-gb200-tests.yml",
-    "nvidia-gb300-slurm": ".github/workflows/nvidia-gb300-tests.yml",
-    "nvidia-x86": ".github/workflows/nvidia-b200-tests.yml",
+    "amd": (
+        ".github/workflows/amd-tests.yml",
+        ".github/workflows/amd-kernel-benchmark.yml",
+    ),
+    "nvidia-arm": (".github/workflows/pr-test-nvidia-arm.yml",),
+    "nvidia-gb200-slurm": (".github/workflows/nvidia-gb200-tests.yml",),
+    "nvidia-gb300-slurm": (".github/workflows/nvidia-gb300-tests.yml",),
+    "nvidia-x86": (".github/workflows/nvidia-b200-tests.yml",),
 }
 
 
@@ -281,7 +284,7 @@ def path_requires_group(path: str, runner_group: str, repo_root: Path) -> bool:
         return True
     if any(is_in_directory(path, directory) for directory in SHARED_DIRECTORIES):
         return True
-    return path == VENDOR_WORKFLOWS[runner_group]
+    return path in VENDOR_WORKFLOWS[runner_group]
 
 
 def should_run(

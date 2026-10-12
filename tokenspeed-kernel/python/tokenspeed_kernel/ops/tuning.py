@@ -47,6 +47,7 @@ __all__ = [
     "save_autotune_cache",
     "set_autotune_max_num_tokens",
     "set_autotune_process_group",
+    "untuned",
 ]
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,24 @@ def autotune(
     with cache, candidates, _autotuner.autotune(
         tune_mode, tuning_buckets=tuning_buckets, round_up=round_up
     ):
+        yield
+
+
+@contextlib.contextmanager
+def untuned(*ops: str) -> Generator[None]:
+    """Use cached or heuristic tactics for ``ops`` in the block, even inside an
+    enclosing tuning block (FlashInfer ``custom_op`` names).
+
+    Args:
+        ops: Operations that must not be profiled here.
+
+    Yields:
+        ``None``; the enclosing tuning mode applies again on exit.
+    """
+    if _autotuner is None:
+        yield
+        return
+    with _autotuner.autotune(False, skip_ops=set(ops)):
         yield
 
 

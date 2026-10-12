@@ -108,6 +108,41 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     assert executor.runtime_states.valid_cache_lengths[13].item() == 13
 
 
+def test_remote_slot_preparation_orders_behind_the_default_stream(monkeypatch):
+    """The slot a remote admission is granted may be the one a retraction in
+    the same plan imaged: the snapshot store reads it on the write stream and
+    fences the default stream, so the backend write must order behind that
+    stream before anything of the slot changes."""
+    trace = []
+
+    class _Stream:
+        def wait_stream(self, stream):
+            trace.append(("wait", stream))
+
+    class _Backend:
+        def prepare_remote_cache_slots(self, slots):
+            trace.append(("prepare", slots))
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device_module = torch.cuda
+    executor.default_stream = "default"
+    executor.execution_stream = _Stream()
+    executor.attn_backend = _Backend()
+    monkeypatch.setattr(
+        torch.cuda,
+        "stream",
+        lambda stream: (trace.append(("on", stream)), nullcontext())[1],
+    )
+
+    executor.prepare_remote_cache_slots([3, 5])
+
+    assert trace == [
+        ("wait", "default"),
+        ("on", executor.execution_stream),
+        ("prepare", [3, 5]),
+    ]
+
+
 def test_draft_final_step_follows_the_complete_drafter_run():
     events = []
 
@@ -137,6 +172,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
+        mark_spec_candidates_drafted=lambda _rows: events.append("candidates-real"),
         vocab_size=32,
     )
     executor.nan_guard = SimpleNamespace(
@@ -171,6 +207,7 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         "draft-write-1",
         "draft-return",
         "future-input",
+        "candidates-real",
         "draft-final",
     ]
 

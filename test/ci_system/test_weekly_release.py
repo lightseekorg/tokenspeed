@@ -734,6 +734,8 @@ def test_stable_index_retries_after_concurrent_nightly_push(
     )
 
     def wheelhouse(tag, sha, count):
+        if tag.startswith("tokenspeed-kernel-v"):
+            assert count == (3 if tag.endswith("-rocm72") else 6)
         name = f"{tag}-py3-none-any.whl"
         return {
             "assets": [

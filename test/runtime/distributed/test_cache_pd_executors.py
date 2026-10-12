@@ -1626,7 +1626,7 @@ if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 
 
-# ---- DCP page-sharded prefill: owner filtering in the sender ----
+# ---- KVP page-sharded prefill: owner filtering in the sender ----
 
 
 def _sharded_history_layout(shard_count: int) -> CacheTransferContract:

@@ -4,9 +4,15 @@ on:
   issue_comment:
     types: [created]
   workflow_run:
-    workflows: [PR CI Plan, 'Scheduler C\+\+ Test', Scheduler Python Test, NVIDIA Kernel Library Tests, NVIDIA B200 Tests, NVIDIA GB200 Tests, NVIDIA GB300 Tests, PR Test NVIDIA ARM, AMD Tests, Slurm Dispatch, K8s Dispatch]
+    # Wake only for assist-owned dispatches and the planner; native check
+    # completions are covered by the periodic sweep below instead.
+    workflows: [PR CI Plan, Slurm Dispatch, K8s Dispatch]
     types: [completed]
     branches-ignore: [main]
+  # Backstop sweep: reconcile active requests whose completions never fire a
+  # kept trigger (vendor CI, lost events, expired budgets).
+  schedule:
+    - cron: "13,33,53 * * * *"
   workflow_call:
   workflow_dispatch:
     inputs:
@@ -26,10 +32,13 @@ jobs:
        (github.event.issue.pull_request &&
         contains(github.event.comment.body, '@lightseek-bot') &&
         (contains(github.event.comment.body, 'watch') ||
-         contains(github.event.comment.body, 'fix')))) &&
+         contains(github.event.comment.body, 'fix') ||
+         contains(github.event.comment.body, 'rerun')))) &&
       (github.event_name != 'workflow_run' ||
-       github.event.workflow_run.event == 'pull_request' ||
-       github.event.workflow_run.event == 'workflow_dispatch')
+       ((github.event.workflow_run.event == 'pull_request' ||
+         github.event.workflow_run.event == 'workflow_dispatch') &&
+        (github.event.workflow_run.path != '.github/workflows/pr-ci-plan.yml' ||
+         github.event.workflow_run.conclusion != 'skipped')))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -37,7 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
       - id: resolve
         env:
@@ -57,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - run: python3 -m pip install pyyaml
@@ -72,17 +81,16 @@ jobs:
         with:
           name: repair-request
           path: ${{ runner.temp }}/pr-ci-assist/request.json
-          retention-days: 1
 
   repair:
     needs: control
     if: needs.control.outputs.repair == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
@@ -93,7 +101,10 @@ jobs:
         with:
           node-version: '24'
       - run: npm install --global @moonshot-ai/kimi-code@2.1.1
-      - run: python3 -m pip install pyyaml
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install pyyaml ruff
       - name: Prepare provider configuration
         env:
           GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
@@ -115,11 +126,11 @@ jobs:
   check:
     needs: repair
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
@@ -129,7 +140,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: python3 -m pip install pre-commit pyyaml
+      - run: python3 -m pip install pre-commit pyyaml ruff
       - name: Check repair without publishing credentials
         run: python3 .github/scripts/pr_ci_repair.py check
       - uses: actions/upload-artifact@v4
@@ -152,7 +163,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
@@ -180,7 +191,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:

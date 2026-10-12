@@ -117,7 +117,6 @@ from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
-    warmup_prepared_fp8_linears,
 )
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
@@ -2513,7 +2512,7 @@ class DeepseekV4Indexer(nn.Module):
                     head_scale=self.n_head**-0.5,
                 )
 
-        if metadata.cache.dcp_size > 1:
+        if metadata.cache.kvp_size > 1:
             return self._forward_sharded_indexer(
                 packed_index_q,
                 packed_weights,
@@ -2521,7 +2520,7 @@ class DeepseekV4Indexer(nn.Module):
                 indexer_block_size,
                 positions,
                 metadata,
-                tuple(ctx.attn_backend.dcp_group),
+                tuple(ctx.attn_backend.kvp_group),
             )
 
         empty_cpu = torch.empty(0, dtype=torch.int32, device="cpu")
@@ -2722,7 +2721,7 @@ class DeepseekV4Indexer(nn.Module):
                 is_valid_token=valid_token,
                 indexer=True,
             )
-        if cache_metadata.dcp_size > 1:
+        if cache_metadata.kvp_size > 1:
             compressed_slots = cache_metadata.local_indexer_write_slots(
                 compressed_slots, indexer_block_size
             )
@@ -2880,9 +2879,6 @@ class DeepseekV4Attention(nn.Module):
             output_dim=self.o_lora_rank,
             block_size=wo_a_quant_config.weight_block_size,
             scale_format=getattr(wo_a_quant_config, "scale_fmt", None),
-        )
-        self.wo_a._dsv4_grouped_output_projection_plan = (
-            self._wo_a_output_projection_plan
         )
         self.wo_b = RowParallelLinear(
             self.o_groups * self.o_lora_rank,
@@ -3824,9 +3820,6 @@ class DeepseekV4ForCausalLM(BaseCausalLM):
     def post_quant_warmup(self) -> None:
         """Called by the weight loader after all quant process_weights_after_loading."""
         dsv4_grouped_output_projection_warmup_model(
-            self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
-        )
-        warmup_prepared_fp8_linears(
             self, max_tokens=_deepseek_v4_mega_moe_max_num_tokens()
         )
 
