@@ -149,7 +149,6 @@ def kda_paged_prefill(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
     capacity: KdaPrefillCapacity | None,
-    inputs_packed: bool,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -172,8 +171,6 @@ def kda_paged_prefill(
             chunk pipeline's stages).
         capacity: Explicit CuTeDSL graph planning bounds, or None for exact
             live-length planning. Live boundaries retain their normal meaning.
-        inputs_packed: The checkpoint packer produced contiguous Q/K/V and
-            beta with zero padding. Gate padding still requires initialization.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
@@ -213,7 +210,6 @@ def kda_paged_prefill(
             raise ValueError("KDA capacity planning requires explicit cutedsl_kda")
         capacity.validate(cu_seqlens_cpu, q.shape[1])
         capacity_kwargs["capacity"] = capacity
-        capacity_kwargs["inputs_packed"] = inputs_packed
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",
