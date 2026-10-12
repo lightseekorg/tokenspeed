@@ -42,9 +42,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 FP8 = torch.float8_e4m3fn
-# Decode-sized projections of a hidden-4,096 model (fused Q/K/V, output,
-# gate/up, down) and a shape with a partial last weight block.
-SHAPES = [(1536, 4096), (4096, 768), (4096, 4096), (4096, 2048), (200, 384)]
+# (N, K) 8-way tensor-parallel shards of public configs' dense projections:
+# Llama-3.1-8B fused Q/K/V, output, gate/up and down; Qwen3-30B-A3B fused
+# Q/K/V and output; Llama-3.3-70B down. They cover both weight-row tiles
+# (N up to 2,048 and above, N = 2,048 itself) and every K tile (512 for K a
+# multiple of 512 from 2,048 on, K = 2,048 itself; 256 for K = 512 and 1,792).
+# (200, 384) adds a partial last weight block and K tiles of 128.
+SHAPES = [
+    (768, 4096),
+    (4096, 512),
+    (3584, 4096),
+    (4096, 1792),
+    (640, 2048),
+    (2048, 512),
+    (8192, 3584),
+    (200, 384),
+]
 
 
 def _weight(n, k, seed):
@@ -93,7 +106,7 @@ def test_fp8_rows_match_the_fp64_product(m, n, k):
 @pytest.mark.parametrize("b_layout", ["N1", "tensor"])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_scale_layouts(a_layout, b_layout, out_dtype):
-    m, n, k = 12, 1536, 4096
+    m, n, k = 12, 768, 4096
     w8, w_scales = _weight(n, k, seed=1)
     if b_layout == "tensor":
         w_scales = w_scales.max().reshape(1)
@@ -157,7 +170,7 @@ def test_the_quantizer_agrees_with_trtllm():
 
 
 def test_out_buffer_and_strided_rows():
-    m, n, k = 5, 1536, 4096
+    m, n, k = 5, 768, 4096
     w8, w_scales = _weight(n, k, seed=7)
     wide = torch.zeros(m, k + 256, device="cuda", dtype=FP8)
     a8, a_scales = fp8_quantize_per_token(_rows(m, k, seed=8))
@@ -182,7 +195,7 @@ def test_mm_quantizes_online(m):
     quantizer and the small-M GEMM up to 64 rows (exactly the GEMM of
     fp8_quantize_per_token's codes), another kernel after the TRT-LLM quantizer
     from 65; both within FP8_DYNAMIC's activation error of the FP64 product."""
-    n, k = 1536, 4096
+    n, k = 768, 4096
     w8, w_scales = _weight(n, k, seed=9)
     x = _rows(m, k, seed=10)
     out = kernel_mm(x, w8.t(), B_scales=w_scales, out_dtype=torch.bfloat16, quant="fp8")
@@ -195,7 +208,7 @@ def test_mm_quantizes_online(m):
 
 
 def test_row_counts_do_not_recompile():
-    n, k = 1536, 4096
+    n, k = 768, 4096
     w8, w_scales = _weight(n, k, seed=11)
 
     def run(m):

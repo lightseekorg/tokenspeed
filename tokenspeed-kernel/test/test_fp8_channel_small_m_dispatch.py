@@ -117,7 +117,7 @@ def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
     calls, quantized = [], []
     _stand_in_quantizer(monkeypatch, quantized)
     _recording_kernels(monkeypatch, calls)
-    weight, scales = _weight(1536, 4096)
+    weight, scales = _weight(768, 4096)
     x = torch.randn(m, 4096).to(torch.bfloat16)
     gemm.mm(x, weight, B_scales=scales, out_dtype=torch.bfloat16, quant="fp8")
     (call,) = calls
@@ -142,7 +142,7 @@ def test_other_kernels_receive_rows_quantized_per_token(
     calls, quantized = [], []
     _stand_in_quantizer(monkeypatch, quantized)
     _recording_kernels(monkeypatch, calls)
-    weight, scales = _weight(1536, k)
+    weight, scales = _weight(768, k)
     x = torch.randn(m, k).to(torch.bfloat16)
     gemm.mm(x, weight, B_scales=scales, out_dtype=torch.bfloat16, quant="fp8")
     (call,) = calls
@@ -168,7 +168,7 @@ def test_prequantized_rows_keep_their_scales(arch, monkeypatch):
     calls, quantized = [], []
     _stand_in_quantizer(monkeypatch, quantized)
     _recording_kernels(monkeypatch, calls)
-    weight, scales = _weight(1536, 4096)
+    weight, scales = _weight(768, 4096)
     codes = torch.zeros(4, 4096, dtype=FP8)
     a_scales = torch.ones(4, 1)
     gemm.mm(
@@ -219,7 +219,12 @@ class _LaunchRecorder:
         (64, "M", "N1"),
     ],
 )
-@pytest.mark.parametrize("n,k", [(1536, 4096), (4096, 768), (1024, 4096), (200, 384)])
+# (N, K): 8-way tensor-parallel shards of Llama-3.1-8B (fused Q/K/V, output,
+# gate/up) and Qwen3-30B-A3B (output, N = 2,048), and a synthetic partial
+# block.
+@pytest.mark.parametrize(
+    "n,k", [(768, 4096), (4096, 512), (3584, 4096), (2048, 512), (200, 384)]
+)
 def test_launch_arguments(arch, monkeypatch, m, a_layout, b_layout, n, k):
     """Scale layouts become the per-row / per-column constexprs; BLOCK_M
     buckets M to 16, 32 or 64; the tile is the measured table's for the
@@ -262,18 +267,24 @@ def test_tiles_follow_the_rule_unless_measured(monkeypatch):
     """The rule fitted to the GB200 sweep (1-16 | 32 | 64 rows), and a
     measured ``_SMALL_M_TILES`` entry taking precedence for its shape."""
     config = triton_fp8_channel._small_m_config
-    assert config(1, 1536, 4096) == (16, 16, 512, 4, 4)
-    assert config(32, 1536, 4096) == (32, 16, 512, 4, 3)
-    assert config(64, 1536, 4096) == (64, 64, 256, 8, 3)
-    assert config(8, 4096, 768) == (16, 64, 256, 4, 4)
-    assert config(17, 4096, 4096) == (32, 64, 512, 4, 3)
+    # Llama-3.1-8B shards at 8-way tensor parallelism: Q/K/V (768, 4096),
+    # output (4096, 512), gate/up (3584, 4096), down (4096, 1792).
     assert config(1, 768, 4096) == (16, 16, 512, 4, 4)
+    assert config(32, 768, 4096) == (32, 16, 512, 4, 3)
+    assert config(64, 768, 4096) == (64, 64, 256, 8, 3)
+    assert config(8, 4096, 512) == (16, 64, 256, 4, 4)
+    assert config(17, 3584, 4096) == (32, 64, 512, 4, 3)
+    assert config(1, 4096, 1792) == (16, 64, 256, 4, 4)
+    # Qwen3-30B-A3B shards (same parallelism) at the rule's edges: K = 2,048
+    # takes K tiles of 512, N = 2,048 keeps 16 weight rows per program.
+    assert config(1, 640, 2048) == (16, 16, 512, 4, 4)
+    assert config(1, 2048, 512) == (16, 16, 256, 4, 4)
     assert config(40, 4096, 384) == (64, 64, 128, 8, 3)
     monkeypatch.setitem(
-        triton_fp8_channel._SMALL_M_TILES, (1536, 4096, 16), (16, 256, 4, 3)
+        triton_fp8_channel._SMALL_M_TILES, (768, 4096, 16), (16, 256, 4, 3)
     )
-    assert config(1, 1536, 4096) == (16, 16, 256, 4, 3)
-    assert config(32, 1536, 4096) == (32, 16, 512, 4, 3)
+    assert config(1, 768, 4096) == (16, 16, 256, 4, 3)
+    assert config(32, 768, 4096) == (32, 16, 512, 4, 3)
 
 
 @pytest.mark.parametrize(
