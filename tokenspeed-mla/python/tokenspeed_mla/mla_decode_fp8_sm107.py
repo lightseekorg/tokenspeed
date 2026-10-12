@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MLA decode with FP8 input and FP8 output for SM107, written in CuTe DSL.
+"""MLA decode with FP8 input and FP8/BF16 output for SM107, written in CuTe DSL.
 
 Based on FlashInfer PR #6177:
 https://github.com/flashinfer-ai/flashinfer/pull/6177
@@ -136,8 +136,8 @@ def _store_empty_output(
     thread = tidx % threads
     for offset in range(thread, rows * 512, threads):
         if first_row + offset // 512 < valid_rows:
-            mO[first_row + offset // 512, offset % 512, tile, batch] = (
-                cutlass.Float8E4M3FN(0.0)
+            mO[first_row + offset // 512, offset % 512, tile, batch] = mO.element_type(
+                0.0
             )
     if thread < rows and first_row + thread < valid_rows:
         mLSE[first_row + thread, tile, batch] = -cutlass.Float32.inf
@@ -4358,7 +4358,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         """Merge split-KV partials with vector loads issued ahead of the LSE work.
 
         One CTA owns a real packed query row. Partials already include
-        output_scale; the reducer combines them in FP32 before the FP8 store.
+        output_scale; the reducer combines them in FP32 before the output store.
         """
         bidx, _, batch = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -7331,7 +7331,10 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         """
         if latent_dim != 512 or rope_dim != 64:
             return False
-        if in_dtype != cutlass.Float8E4M3FN or out_dtype != cutlass.Float8E4M3FN:
+        if in_dtype != cutlass.Float8E4M3FN or out_dtype not in (
+            cutlass.Float8E4M3FN,
+            cutlass.BFloat16,
+        ):
             return False
         if num_heads <= 0 or seq_len_q <= 0:
             return False
@@ -8341,7 +8344,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
             return False
         if in_dtype not in [cutlass.Float8E4M3FN]:
             return False
-        if out_dtype not in [cutlass.Float8E4M3FN]:
+        if out_dtype not in [cutlass.Float8E4M3FN, cutlass.BFloat16]:
             return False
         if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
             return False
