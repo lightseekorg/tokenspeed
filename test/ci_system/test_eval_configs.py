@@ -44,7 +44,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 6,
+        "count": 7,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -189,6 +189,25 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
     assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "16"
     assert "--disable-kvstore" not in server_tokens
     assert flag_value(eval_tokens, "--model") == "Qwen/Qwen3.8-Flash-Next-FP8"
+    assert flag_value(eval_tokens, "--datasets") == "gsm8k"
+    assert task["score_threshold"] == 0.96
+
+
+def test_qwen38_flash_next_mxfp4_runs_gsm8k_on_amd_tp2():
+    path = EVAL_CONFIG_DIR / "qwen3.8-flash-next-mxfp4-evalscope-gsm8k-amd.yaml"
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server_tokens = shlex.split(task["server"]["command"])
+    eval_tokens = shlex.split(task["eval"]["command"])
+
+    assert task["runner"]["labels"] == ["amd-mi35x-2gpu-test"]
+    assert task["install"] == ["bash test/ci_system/install_deps_rocm.sh"]
+    model = "amd/Qwen3.8-Flash-Next-Quark-MXFP4"
+    assert flag_value(server_tokens, "--model") == model
+    assert flag_value(server_tokens, "--tensor-parallel-size") == "2"
+    assert flag_value(server_tokens, "--quantization") == "mxfp4"
+    assert flag_value(server_tokens, "--speculative-algorithm") == "MTP"
+    assert flag_value(server_tokens, "--speculative-num-steps") == "3"
+    assert flag_value(eval_tokens, "--model") == model
     assert flag_value(eval_tokens, "--datasets") == "gsm8k"
     assert task["score_threshold"] == 0.96
 

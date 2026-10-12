@@ -67,6 +67,10 @@ tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
 
+The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
+GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
+unquantized.
+
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
 invalid TPOT fails collection instead of producing a zero-throughput report.

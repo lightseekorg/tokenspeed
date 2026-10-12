@@ -750,6 +750,7 @@ query heads, 1/2/4 KV heads, and a selected-slot width of 2051. This applies to
 ordinary decode and MTP verification under CUDA Graph. Prefill and mixed queries,
 including one-token prefill, and other supported NVIDIA shapes and architectures
 use the FlashInfer FA2 fallback.
+AMD GPUs run QSA sparse attention with a portable Triton kernel.
 
 The decoder passes ordinary sublayer-output tensors and residual tuples between
 layers. At adjacent HC boundaries, it explicitly calls the consuming mixer's
@@ -764,6 +765,21 @@ ts serve \
     --tensor-parallel-size 4 \
     --quantization fp8 \
     --moe-backend flashinfer_trtllm \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3
+```
+
+On AMD MI35x (gfx950), serve the
+[AMD Quark MXFP4](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4)
+checkpoint, which quantizes the routed and shared experts to MXFP4 and keeps
+the rest, including the MTP layer, in BF16:
+
+```bash
+ts serve \
+    --model amd/Qwen3.8-Flash-Next-Quark-MXFP4 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --quantization mxfp4 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3
 ```
