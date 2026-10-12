@@ -197,20 +197,24 @@ def _padded_query(tokens, real_heads, heads, device, seed):
     return q.to(device), sink.to(device)
 
 
-@pytest.mark.parametrize("tokens", [6, 192])
-@pytest.mark.parametrize("real_heads", [16, 64])
-def test_fused_selected_attention_decode_shapes(tokens, real_heads):
+@pytest.mark.parametrize(
+    ("tokens", "real_heads", "heads"),
+    [(6, 16, 64), (6, 64, 64), (192, 16, 64), (192, 64, 64), (6, 16, 128)],
+)
+def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads):
     """Split (6 rows) and single-workgroup (192 rows) paths at decode widths.
 
     Padded zero-query heads take the row-sum shortcut and must still match the
-    softmax over their (all-zero) scores.
+    softmax over their (all-zero) scores. 128 heads span two head blocks, so
+    the split reduce maps active groups per block and both blocks write the
+    shared row sum.
     """
     platform = current_platform()
     if not (platform.is_cdna4 or platform.is_cdna5):
         pytest.skip("AMD fused selected attention")
     device = torch.device("cuda:0")
     segments = _decode_inputs(tokens, device, 7)
-    q, sink = _padded_query(tokens, real_heads, 64, device, 11)
+    q, sink = _padded_query(tokens, real_heads, heads, device, 11)
     expected = _gather_softmax(q, sink, segments).bfloat16()
     (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
     out = dsv41.selected_attention(
