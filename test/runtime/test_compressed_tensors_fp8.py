@@ -689,5 +689,94 @@ def test_scales_must_be_present_finite_and_positive(platform, value):
         layer.quant_method.process_weights_after_loading(layer)
 
 
+# quantization_config fields of mconcat/GLM-5.1-FP8-Dynamic's config.json: every
+# Linear but the routers, norms and lm_head is FP8, kv_b_proj included.
+GLM_5_1_FP8_DYNAMIC = {
+    "quant_method": "compressed-tensors",
+    "quantization_status": "compressed",
+    "format": "float-quantized",
+    "config_groups": {
+        "group_fp8": {
+            "format": "float-quantized",
+            "targets": ["Linear"],
+            "weights": {
+                "num_bits": 8,
+                "type": "float",
+                "symmetric": True,
+                "strategy": "channel",
+                "dynamic": False,
+            },
+            "input_activations": {
+                "num_bits": 8,
+                "type": "float",
+                "symmetric": True,
+                "strategy": "token",
+                "dynamic": True,
+            },
+        }
+    },
+    "ignore": [
+        "lm_head",
+        "model.embed_tokens",
+        "re:.*\\.mlp\\.gate$",
+        "re:.*norm.*",
+        "re:.*layernorm.*",
+        "re:.*\\.indexer\\.k_norm.*",
+    ],
+}
+
+
+def _mla_attention(config, q_lora_rank):
+    """A tiny DeepSeek-V3-shaped MLA attention layer (q_lora_rank None is the
+    Moonlight layout: q_proj and kv_a_proj_with_mqa instead of the fused
+    q/kv latent projection)."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
+
+    return DeepseekV3AttentionMLA(
+        config=SimpleNamespace(rms_norm_eps=1e-6),
+        mapping=Mapping(rank=0, world_size=1),
+        hidden_size=64,
+        num_heads=4,
+        qk_nope_head_dim=16,
+        qk_rope_head_dim=8,
+        v_head_dim=16,
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=32,
+        quant_config=config,
+        layer_id=0,
+        prefix="model.layers.0.self_attn",
+        reduce_attn_results=False,
+    )
+
+
+@pytest.mark.parametrize("q_lora_rank", [32, None], ids=["dsv3", "moonlight"])
+@pytest.mark.parametrize(
+    "raw",
+    [GLM_5_1_FP8_DYNAMIC, CHANNEL_DYNAMIC, TENSOR_STATIC],
+    ids=["glm-5.1-fp8-dynamic", "fp8-dynamic", "fp8-static"],
+)
+def test_mla_kv_b_proj_in_fp8_is_refused(platform, monkeypatch, raw, q_lora_rank):
+    """MLA models absorb kv_b_proj into w_kc/w_vc while loading, before the
+    FP8 scales are applied, so an FP8 kv_b_proj is refused when the layer is
+    built. A checkpoint that keeps kv_b_proj unquantized still builds, with
+    the other projections on the FP8 scheme."""
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "tp_batch_invariant", "none")
+    with pytest.raises(
+        ValueError,
+        match="model.layers.0.self_attn.kv_b_proj: compressed-tensors FP8 weights "
+        "on an MLA kv_b_proj are not supported",
+    ):
+        _mla_attention(_parse(raw), q_lora_rank)
+    keep = dict(raw, ignore=[*raw["ignore"], "re:.*kv_b_proj$"])
+    attn = _mla_attention(_parse(keep), q_lora_rank)
+    assert type(attn.kv_b_proj.quant_method) is UnquantizedLinearMethod
+    first = attn.q_b_proj if q_lora_rank else attn.q_proj
+    assert type(first.quant_method) is ct.CompressedTensorsLinearMethod
+    assert first.weight.dtype == FP8
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

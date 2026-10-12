@@ -135,6 +135,19 @@ class CompressedTensorsConfig(QuantizationConfig):
         scheme = self.get_scheme(layer, layer_name=prefix)
         if scheme is None:
             return UnquantizedLinearMethod()
+        if isinstance(scheme, CompressedTensorsW8A8Fp8) and prefix.endswith(
+            "kv_b_proj"
+        ):
+            # MLA models absorb kv_b_proj into w_kc/w_vc in post_load_weights,
+            # which runs inside load_weights: before this scheme's
+            # process_weights_after_loading, and without its weight_scale.
+            raise ValueError(
+                f"{prefix}: compressed-tensors FP8 weights on an MLA kv_b_proj are "
+                "not supported yet. The model absorbs kv_b_proj into its "
+                "attention weights while loading, before the FP8 weight scales "
+                "are applied, so it would read raw FP8 codes. Checkpoints whose "
+                "quantization_config.ignore keeps kv_b_proj unquantized load."
+            )
         layer.scheme = scheme
         return CompressedTensorsLinearMethod(self)
 
