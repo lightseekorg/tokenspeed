@@ -483,7 +483,7 @@ class WrapperForwardsTheExtendBundleTest(_TorchCase):
         wrapper = InklingAttnBackend.__new__(InklingAttnBackend)
         wrapper.inner = Mock()
         wrapper._pfg_seq_idx = None
-        wrapper.conv_columns = {"group_block_tokens": {"conv": 4}}
+        wrapper.conv_columns = {"groups": ("conv",), "pd_endpoint_snapshots": False}
         counts = torch.tensor([3], dtype=torch.int32)
         prefix = torch.tensor([0], dtype=torch.int32)
         bundle = dict(
