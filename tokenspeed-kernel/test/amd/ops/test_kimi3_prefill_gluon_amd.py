@@ -34,10 +34,6 @@ if not (is_cdna4() or is_cdna5()):
 
 
 import tokenspeed_kernel.ops.residual as residual_ops  # noqa: E402
-from tokenspeed_kernel.ops.moe.sigmoid_topk import _gluon_eligible  # noqa: E402
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
-    _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
-)
 from tokenspeed_kernel.ops.residual import (  # noqa: E402
     attn_res_fwd,
     attn_res_fwd_available,
@@ -78,6 +74,49 @@ def _attn_res_reference(
 def _bf16_add_rne(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     """Match the fused kernel's FP32 add followed by BF16 rounding."""
     return (lhs.float() + rhs.float()).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("tokens", [2, 256])
+@pytest.mark.parametrize("score_scale", [0.0, 0.01, 1.0])
+def test_attn_res_full_history_score_ranges(tokens: int, score_scale: float) -> None:
+    """Exercise uniform, blended, and concentrated weights across all snapshots."""
+    hidden, valid_blocks = 7168, 11
+    generator = torch.Generator(device="cuda").manual_seed(901 + tokens)
+    layer = torch.randn(
+        tokens, hidden, device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    history = torch.randn(
+        valid_blocks,
+        tokens,
+        hidden,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    ).transpose(0, 1)
+    res_weight = torch.randn(hidden, device="cuda", generator=generator) * score_scale
+    score_weight = torch.randn(hidden, device="cuda", generator=generator)
+    output_weight = torch.randn(hidden, device="cuda", generator=generator)
+    actual = attn_res_rmsnorm_amd(
+        layer_residual=layer,
+        block_residual=history,
+        res_weight=res_weight,
+        score_rms_weight=score_weight,
+        score_eps=1e-6,
+        output_rms_weight=output_weight,
+        output_eps=2e-6,
+        num_valid_blocks=valid_blocks,
+    )
+    expected = _attn_res_reference(
+        layer,
+        history,
+        res_weight,
+        score_weight,
+        output_weight,
+        valid_blocks,
+        1e-6,
+        2e-6,
+    )
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=1.6e-2)
 
 
 def test_attn_res_public_block_major_dispatch_matches_reference() -> None:
@@ -475,65 +514,3 @@ def test_attn_res_model_update_modes_graph_replay(
     expected_block = updated_prefix if write_block else original_blocks[valid_blocks]
     torch.testing.assert_close(blocks[valid_blocks], expected_block, rtol=0, atol=0)
     torch.testing.assert_close(actual, expected, rtol=5e-3, atol=1.6e-2)
-
-
-@pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
-@pytest.mark.parametrize("tokens", [1, 17, 8192])
-def test_kimi_topk_prefill_matches_reference(tokens: int) -> None:
-    generator = torch.Generator(device="cuda").manual_seed(41 + tokens)
-    logits = torch.randn(tokens, 896, device="cuda", generator=generator)
-    bias = torch.randn(896, device="cuda", generator=generator) * 0.1
-    scores = logits.sigmoid()
-    _, expected_ids = torch.topk(scores + bias, 16, dim=-1, sorted=True)
-    expected_weights = scores.gather(1, expected_ids)
-    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
-
-    actual_weights, actual_ids = moe_sigmoid_bias_topk(
-        logits,
-        bias,
-        16,
-        routed_scaling_factor=1.0,
-        normalize_topk_weights=True,
-    )
-    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
-    torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-6, atol=2e-7)
-
-
-@pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_kimi_topk_prefill_scales_beyond_8k(dtype: torch.dtype) -> None:
-    tokens = 16384
-    generator = torch.Generator(device="cuda").manual_seed(73)
-    logits = torch.randn(tokens, 896, device="cuda", dtype=dtype, generator=generator)
-    bias = torch.randn(896, device="cuda", generator=generator) * 0.1
-    scores = logits.float().sigmoid().to(dtype)
-    _, expected_ids = torch.topk(scores.float() + bias, 16, dim=-1, sorted=True)
-    expected_weights = scores.gather(1, expected_ids)
-    expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
-
-    assert _gluon_eligible(logits, bias, 16)
-    actual_weights, actual_ids = moe_sigmoid_bias_topk(
-        logits,
-        bias,
-        16,
-        routed_scaling_factor=1.0,
-        normalize_topk_weights=True,
-    )
-
-    torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
-    torch.testing.assert_close(
-        actual_weights,
-        expected_weights.float(),
-        rtol=5e-3,
-        atol=5e-4,
-    )
-
-
-@pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
-def test_kimi_topk_prefill_ties_choose_smaller_expert_id() -> None:
-    logits = torch.zeros(3, 896, device="cuda")
-    bias = torch.zeros(896, device="cuda")
-    weights, ids = moe_sigmoid_bias_topk(logits, bias, 16)
-    expected_ids = torch.arange(16, device="cuda", dtype=torch.int32).expand(3, -1)
-    assert torch.equal(ids, expected_ids)
-    torch.testing.assert_close(weights, torch.full_like(weights, 1 / 16))

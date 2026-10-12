@@ -536,7 +536,7 @@ def zero_page_fields(
 # -----------------------------------------------------------------------------
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows_per_layer"])
 def _copy_state_rows_kernel(
     src_addresses_ptr,
     dst_addresses_ptr,
@@ -666,7 +666,7 @@ def copy_state_rows(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["batch_size"])
 def _state_verify_commit_rows_kernel(
     accepted_ptr,
     pages_ptr,

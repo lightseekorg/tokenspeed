@@ -430,7 +430,6 @@ def test_qwen4_exp_qsa_backend_resolution_pins_sparse_dispatch() -> None:
             is_kda=False,
             is_dsa=False,
             is_qsa=True,
-            has_cache_plan=True,
         )
         == "qsa"
     )
@@ -440,7 +439,6 @@ def test_qwen4_exp_qsa_backend_resolution_pins_sparse_dispatch() -> None:
             is_kda=False,
             is_dsa=False,
             is_qsa=True,
-            has_cache_plan=True,
         )
         == "qsa"
     )
@@ -2267,7 +2265,9 @@ def test_ngram_ids_anchor_rewrite_matches_legacy(ngram_size) -> None:
 )
 @pytest.mark.parametrize("ngram_size", [2, 3, 4])
 @pytest.mark.parametrize("heads_per_ngram", [1, 3, 8])
-@pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0]])
+@pytest.mark.parametrize(
+    "lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0], [1476], [1620]]
+)
 def test_ngram_ids_flat_kernel_matches_legacy(
     ngram_size, heads_per_ngram, lengths
 ) -> None:

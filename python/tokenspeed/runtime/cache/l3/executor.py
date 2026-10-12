@@ -75,8 +75,9 @@ class L3StoreStatsSnapshot:
 class L3StoreStats:
     """Thread-safe cumulative exists/GET/PUT counters for one ``L3HostStore``.
 
-    Backups run on the L2 executor's L3 worker thread while exists/prefetch
-    run on the control plane, so recording is serialized here.
+    Backups and prefetches run on the Host executor's separate CPU lanes
+    while exists probes run on the control plane, so recording is serialized
+    here.
     """
 
     def __init__(self) -> None:
@@ -202,7 +203,7 @@ class L3HostStore:
         elapsed = time.monotonic() - started
         hits = sum(1 for present in results if present)
         self._stats.record_exists(keys=len(keys), hits=hits, seconds=elapsed)
-        # Per-round revalidation makes this the hottest L3 call: DEBUG only.
+        # Existence probes are on the admission path: DEBUG only.
         logger.debug(
             f"[L3] exists keys={len(keys)} hits={hits} "
             f"elapsed_ms={elapsed * 1e3:.2f}"

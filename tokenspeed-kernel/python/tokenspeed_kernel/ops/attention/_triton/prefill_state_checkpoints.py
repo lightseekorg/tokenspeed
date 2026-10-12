@@ -43,7 +43,10 @@ class PackedPrefillCheckpointInputs:
     beta_raw: torch.Tensor | None
 
 
-@triton.jit(do_not_specialize=["num_rows", "num_channels", "state_len"])
+@triton.jit(
+    do_not_specialize=["num_rows", "num_channels", "state_len"],
+    do_not_specialize_on_alignment=["sequence_starts"],
+)
 def _write_prefill_conv_checkpoints_kernel(
     raw_inputs,
     conv_states,
@@ -211,7 +214,10 @@ def write_prefill_conv_checkpoints(
     )
 
 
-@triton.jit(do_not_specialize=["num_tokens", "num_rows"])
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_rows"],
+    do_not_specialize_on_alignment=["token_indices"],
+)
 def _pack_prefill_recurrent_inputs_kernel(
     token_indices,
     rows,
@@ -596,7 +602,7 @@ def pack_prefill_recurrent_checkpoint_inputs(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"], do_not_specialize_on_alignment=["indices"])
 def _scatter_checkpoint_output_kernel(
     source,
     indices,
@@ -621,7 +627,10 @@ def _scatter_checkpoint_output_kernel(
     tl.store(output + destination * WIDTH + offset % WIDTH, value, live)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["BODY_TOKENS", "TAIL_TOKENS", "TOKENS"],
+    do_not_specialize_on_alignment=["sources"],
+)
 def _gather_checkpoint_output_kernel(
     body,
     tail,

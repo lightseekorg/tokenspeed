@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
 HIDDEN = 256
 ISPP = 256
@@ -162,9 +163,8 @@ def test_bf16_relu2_kernel_routing_matches_sigmoid_bias_top22(num_tokens):
 @requires_relu2
 @pytest.mark.parametrize("routing_mode", [None, "precomputed_topk"])
 def test_moe_plan_selects_the_bf16_relu2_kernels(routing_mode):
-    import tokenspeed_kernel
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "unquant",
         input_dtype=torch.bfloat16,
         activation="relu2",

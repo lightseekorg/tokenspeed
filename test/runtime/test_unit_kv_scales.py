@@ -181,6 +181,7 @@ def test_a_checkpoint_load_rejects_a_non_unit_kv_scale(tmp_path):
     from safetensors.torch import save_file
 
     from tokenspeed.runtime.configs.load_config import LoadConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
 
     save_file(
@@ -192,7 +193,9 @@ def test_a_checkpoint_load_rejects_a_non_unit_kv_scale(tmp_path):
     )
     loader = DefaultModelLoader(LoadConfig())
     model = SimpleNamespace(fall_back_to_pt_during_load=False, secondary_weights=())
-    model_config = SimpleNamespace(model_path=str(tmp_path), revision=None)
+    model_config = SimpleNamespace(
+        model_path=str(tmp_path), revision=None, mapping=Mapping(rank=0)
+    )
     with pytest.raises(ValueError, match="k_proj.k_scale"):
         list(loader._get_all_weights(model_config, model))
 

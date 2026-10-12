@@ -24,8 +24,7 @@ from unittest import mock
 
 import pytest
 import torch
-from tokenspeed_kernel import gated_residual_mix
-from tokenspeed_kernel.ops.residual import cute_fused
+from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 

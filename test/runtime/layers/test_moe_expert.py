@@ -33,7 +33,7 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
         calls.append({"router_logits": args[3], **kwargs})
         return args[1]
 
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_apply", fake_moe_apply)
+    monkeypatch.setattr(expert_module, "kernel_moe_apply", fake_moe_apply)
 
     hidden_states = torch.empty((2, 4), dtype=torch.bfloat16)
     router_logits = torch.empty((2, 8))
@@ -128,7 +128,7 @@ def test_moe_layer_builds_ep8_local_expert_partition(
         "mapping",
         SimpleNamespace(moe=SimpleNamespace(ep_group=ep_group)),
     )
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_moe_plan)
     monkeypatch.setattr(
         expert_module, "create_layer_weights", fake_create_layer_weights
     )
@@ -202,7 +202,7 @@ def test_moe_layer_uses_mixed_fp8_block_scale_child_config(
 
     trtllm_backend = type("TrtllmBackend", (), {"value": "flashinfer_trtllm"})()
     monkeypatch.setattr(expert_module, "get_moe_backend", lambda: trtllm_backend)
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_moe_plan)
     quant_config = ModelOptMixedConfig(
         quantized_layers={
             "mtp.layers.0.mlp.experts": "FP8_BLOCK_SCALES",
@@ -246,7 +246,7 @@ def test_moe_layer_applies_outer_mixed_exclusion(
 
     auto_backend = type("AutoBackend", (), {"value": "auto"})()
     monkeypatch.setattr(expert_module, "get_moe_backend", lambda: auto_backend)
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_moe_plan)
     monkeypatch.setattr(
         expert_module, "create_layer_weights", lambda *args, **kwargs: None
     )
@@ -299,7 +299,7 @@ def test_moe_layer_requests_dynamic_mxfp4_activations(
 
     auto_backend = type("AutoBackend", (), {"value": "auto"})()
     monkeypatch.setattr(expert_module, "get_moe_backend", lambda: auto_backend)
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_moe_plan)
     monkeypatch.setattr(
         expert_module, "create_layer_weights", lambda *args, **kwargs: None
     )
@@ -327,7 +327,7 @@ def test_kernel_routing_rejects_missing_logits(monkeypatch) -> None:
     apply = mock.Mock(
         side_effect=AssertionError("kernel launched without router logits")
     )
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_apply", apply)
+    monkeypatch.setattr(expert_module, "kernel_moe_apply", apply)
     with pytest.raises(ValueError, match="requires router logits"):
         layer(
             torch.ones(1, 4),

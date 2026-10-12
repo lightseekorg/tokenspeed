@@ -58,11 +58,11 @@ def install_jit_compile_check() -> None:
 
 
 def mark_jit_compile_serving() -> None:
-    """End startup: from here on a Triton compilation is a serving stall."""
+    """End startup: from here on a compilation is a serving stall."""
+    mark_serving()
     stats = compile_stats()
     if stats is None:
         return
-    mark_serving()
     logger.info(
         f"Startup compiled {stats.startup_compiles:d} Triton kernels in "
         f"{stats.startup_seconds:.1f} s; compilations while serving are reported "

@@ -36,6 +36,10 @@ from tokenspeed.runtime.execution.weight_update_group import (
     _assert_not_split,
     _no_default_group_split,
 )
+from tokenspeed.runtime.layers.linear import (
+    prepare_dp_linear_communication,
+    release_dp_linear_communication,
+)
 from tokenspeed.runtime.layers.moe.utils import initialize_moe_config
 from tokenspeed.runtime.model_loader.weight_utils import (
     non_unit_kv_scale_message,
@@ -281,10 +285,22 @@ class ModelRunner:
             placement.reserve_load_rows(
                 self.server_args.mapping.moe.tp_ep_size * max_num_tokens
             )
+        prepared = prepare_dp_linear_communication(
+            self.model, max_num_tokens, self.model_config.dtype, backend=None
+        )
         prepare = getattr(self.model, "prepare_communication_runtime", None)
         if prepare is None:
-            return False
-        return bool(prepare(max_num_tokens))
+            return prepared
+        return bool(prepare(max_num_tokens)) or prepared
+
+    def release_dp_linear_communication(self) -> None:
+        """Collectively release this model's DP projection communication only.
+
+        Drain forwards and destroy referencing graphs first; keep process groups
+        alive until release finishes on every peer. Cache re-capture retains
+        these resources, so graph release alone must not call this method.
+        """
+        release_dp_linear_communication(self.model)
 
     @staticmethod
     def _forward_accepts_kwarg(model, name: str) -> bool:

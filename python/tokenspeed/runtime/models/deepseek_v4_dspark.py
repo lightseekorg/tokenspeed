@@ -13,7 +13,7 @@ import re
 from collections.abc import Iterable
 
 import torch
-from tokenspeed_kernel import mhc_fused_hc, mhc_post, mhc_pre
+from tokenspeed_kernel.ops.residual import mhc_fused_hc, mhc_post, mhc_pre
 from torch import nn
 from transformers import PretrainedConfig
 

@@ -35,7 +35,7 @@ namespace tokenspeed {
 // suffix for groups whose absolute slots below stay holes) and the reserve it
 // holds beyond the tokens it computes. The forward planner states the round
 // once (tokens, PrefillReserve) and these helpers derive each group's share
-// by its retention and family; replayable groups are shaped by
+// by its kind (CacheGroupConfig::Kind); replayable groups are shaped by
 // CacheCoordinator::Admit itself.
 
 // One demand per table, all copies of `prototype` bound to their table.
@@ -69,7 +69,7 @@ struct PrefillReserve {
 std::int64_t SnapshotStateReserveTokens(std::int64_t block_granularity, std::int64_t decode_tokens);
 
 // Sets every group's reserve_tokens from the round's PrefillReserve, by
-// retention: full-history groups hold every token the round is accountable
+// kind: full-history groups hold every token the round is accountable
 // for, including the prepaid prompt headroom; sliding-window groups recycle
 // slid-out pages and hold only the decode slot; snapshot-state groups bank
 // one growth block (SnapshotStateReserveTokens) on the admission that

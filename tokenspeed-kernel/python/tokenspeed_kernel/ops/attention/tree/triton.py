@@ -26,7 +26,9 @@ tree window at the end of its keys; row ``r`` sees window key ``j`` when bit
 (trtllm-gen, with its log-sum-exp) covers keys ``[0, P - R + 1 + r)`` of row
 ``r``; ``triton_tree_window_attention`` attends the rest (the prefix tail and
 the window) and merges both in one kernel. Target verify (``R == W == N``) and
-draft lanes (``R == K``, ``W == (S - 1) * K``) both use it.
+draft lanes (``R == K``, ``W == (S - 1) * K``) both use it. MLA keys are wider
+than values: a key row is the value (the latent) followed by ``ROPE_DIM``
+rotary channels, scored as a second product.
 """
 
 from __future__ import annotations
@@ -35,16 +37,20 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 __all__ = ["triton_tree_window_attention"]
 
 
 @triton.jit
 def _tree_window_merge_kernel(
-    q_ptr,  # [bs * R, Hq, D]
-    k_ptr,  # [slots, Hkv, D] token rows of the paged cache
-    v_ptr,
+    q_ptr,  # [bs * R, Hq, D + ROPE_DIM]
+    k_ptr,  # [slots, Hkv, D + ROPE_DIM] token rows of the paged cache
+    v_ptr,  # [slots, Hkv, D]
     table_ptr,  # [bs, max_pages] int32
     seq_lens_ptr,  # [bs] int32, including the W window keys
     mask_ptr,  # [bs * R] int64
@@ -74,6 +80,7 @@ def _tree_window_merge_kernel(
     W: tl.constexpr,
     GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
     PAGE: tl.constexpr,
     ROWS_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -84,7 +91,8 @@ def _tree_window_merge_kernel(
     row_ok = rows < R * GROUP
     node = rows // GROUP
     head = kv_head * GROUP + rows % GROUP
-    token = req * R + node
+    # Wide MLA rows put a large token stride on every offset below.
+    token = req.to(tl.int64) * R + node
     dims = tl.arange(0, HEAD_DIM)
     q = tl.load(
         q_ptr
@@ -94,6 +102,16 @@ def _tree_window_merge_kernel(
         mask=row_ok[:, None],
         other=0.0,
     )
+    if ROPE_DIM > 0:
+        rope_dims = HEAD_DIM + tl.arange(0, ROPE_DIM)
+        q_rope = tl.load(
+            q_ptr
+            + token[:, None] * stride_qt
+            + head[:, None] * stride_qh
+            + rope_dims[None, :] * stride_qd,
+            mask=row_ok[:, None],
+            other=0.0,
+        )
     bits = tl.load(mask_ptr + token, mask=row_ok, other=0)
 
     # Row r's partial covers keys [0, prefix - R + 1 + r); attend the prefix tail and the window.
@@ -133,7 +151,7 @@ def _tree_window_merge_kernel(
             + dims[None, :] * stride_kd,
             mask=col_ok[:, None],
             other=0.0,
-        )
+        ).to(q.dtype)
         v = tl.load(
             v_ptr
             + slot[:, None] * stride_vt
@@ -141,8 +159,19 @@ def _tree_window_merge_kernel(
             + dims[None, :] * stride_vd,
             mask=col_ok[:, None],
             other=0.0,
-        )
-        scores = tl.dot(q, tl.trans(k)) * sm_scale_log2
+        ).to(q.dtype)
+        scores = tl.dot(q, tl.trans(k))
+        if ROPE_DIM > 0:
+            k_rope = tl.load(
+                k_ptr
+                + slot[:, None] * stride_kt
+                + kv_head * stride_kh
+                + rope_dims[None, :] * stride_kd,
+                mask=col_ok[:, None],
+                other=0.0,
+            ).to(q.dtype)
+            scores += tl.dot(q_rope, tl.trans(k_rope))
+        scores *= sm_scale_log2
         in_window = col >= R - 1
         bit = (
             (bits[:, None] >> tl.maximum(col - (R - 1), 0).to(tl.int64)[None, :]) & 1
@@ -180,9 +209,18 @@ def _tree_window_merge_kernel(
     solution="triton",
     # Its prefix partial comes from trtllm-gen, so trees run it on NVIDIA only.
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    # An FP8 KV cache is unscaled (every factor 1.0): its K/V widen to the query dtype.
     signatures=format_signatures(
         ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
-    ),
+    )
+    | {
+        format_signature(
+            q=dense_tensor_format(dtype),
+            k_cache=dense_tensor_format(torch.float8_e4m3fn),
+            v_cache=dense_tensor_format(torch.float8_e4m3fn),
+        )
+        for dtype in (torch.float16, torch.bfloat16)
+    },
     priority=Priority.PORTABLE,
 )
 def triton_tree_window_attention(
@@ -200,14 +238,16 @@ def triton_tree_window_attention(
     page_size: int,
     sm_scale: float,
 ) -> torch.Tensor:
-    num_rows, num_q_heads, head_dim = q.shape
-    num_kv_heads = k_cache.shape[1]
+    num_rows, num_q_heads, _ = q.shape
+    num_kv_heads, head_dim = v_cache.shape[1:]
     group = num_q_heads // num_kv_heads
     bs = num_rows // rows_per_req
-    out = torch.empty_like(q)
+    out = q.new_empty(num_rows, num_q_heads, head_dim)
     if bs == 0:
         return out
     rows_block = 16
+    # A 512-wide MLA latent row needs the larger CTA and a narrower key tile to stay in registers.
+    wide = head_dim > 256
     _tree_window_merge_kernel[
         (bs, num_kv_heads, triton.cdiv(rows_per_req * group, rows_block))
     ](
@@ -232,9 +272,10 @@ def triton_tree_window_attention(
         W=window,
         GROUP=group,
         HEAD_DIM=head_dim,
+        ROPE_DIM=q.shape[2] - head_dim,
         PAGE=page_size,
         ROWS_BLOCK=rows_block,
-        BLOCK=32,
-        num_warps=4,
+        BLOCK=16 if wide else 32,
+        num_warps=8 if wide else 4,
     )
     return out

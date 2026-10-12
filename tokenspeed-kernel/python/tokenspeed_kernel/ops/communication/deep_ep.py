@@ -28,6 +28,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
@@ -436,15 +437,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     hidden_states, _FP8_BLOCK
                 )
             else:
-                from tokenspeed_kernel.ops.gemm.fp8_utils import (
-                    per_token_group_quant_fp8,
+                quantized, scales = quantize_fp8(
+                    hidden_states,
+                    granularity="token_group",
+                    group_size=_FP8_BLOCK,
                 )
-
-                quantized, scales = per_token_group_quant_fp8(hidden_states, _FP8_BLOCK)
-                # The quantizer hands back scales as [hidden / block, tokens]
-                # (block major, what the GEMMs want); DeepEP requires the
-                # token-major [tokens, hidden / block] and asserts on size(0).
-                hidden_states = (quantized, scales.t().contiguous())
+                hidden_states = (quantized, scales)
         topk_idx = topk_idx.to(torch.int64)
         topk_weights = topk_weights.to(torch.float32)
         previous_event = Buffer.capture() if self.async_finish else None

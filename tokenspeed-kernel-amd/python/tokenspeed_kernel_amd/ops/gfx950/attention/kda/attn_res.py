@@ -40,16 +40,19 @@ def _attn_res_accumulate(
     H: gl.constexpr,
     SCORE_EPS: gl.constexpr,
 ):
-    """Fold one candidate into the online softmax over candidate scores."""
+    """Fold one candidate into a normalized online softmax mixture."""
     square_sum = gl.sum(value * value, axis=0)
     dot = gl.sum(value * scorer, axis=0)
     score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
-    next_max = gl.maximum(max_logit, score)
-    old_scale = gl.exp(max_logit - next_max)
-    candidate_scale = gl.exp(score - next_max)
+    score_delta = score - max_logit
+    relative_scale = gl.exp2(-gl.abs(score_delta) * 1.4426950408889634)
+    candidate_is_max = score_delta > 0.0
+    old_scale = gl.where(candidate_is_max, relative_scale, 1.0)
+    candidate_scale = gl.where(candidate_is_max, 1.0, relative_scale)
     denominator = denominator * old_scale + candidate_scale
-    mixed = mixed * old_scale + candidate_scale * value
-    return next_max, denominator, mixed
+    candidate_weight = candidate_scale / denominator
+    mixed += candidate_weight * (value - mixed)
+    return gl.maximum(max_logit, score), denominator, mixed
 
 
 @gluon.jit
@@ -80,9 +83,12 @@ def _attn_res_mix_gfx950(
         scorer *= cdna4.buffer_load(
             score_rms_weight, hidden.to(gl.int32), mask=hidden_mask, other=0.0
         ).to(gl.float32)
-        max_logit = -float("inf")
-        denominator = 0.0
-        mixed = gl.full(prefix.shape, 0.0, gl.float32, prefix.type.layout)
+        # Consume the resident prefix first so it becomes the running mixture.
+        mixed = prefix
+        square_sum = gl.sum(prefix * prefix, axis=0)
+        dot = gl.sum(prefix * scorer, axis=0)
+        max_logit = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
+        denominator = 1.0
         # A runtime loop keeps one block snapshot live at a time; unrolling
         # lets the compiler hoist every snapshot load and halves occupancy.
         for candidate in range(N - 1):
@@ -96,10 +102,6 @@ def _attn_res_mix_gfx950(
             max_logit, denominator, mixed = _attn_res_accumulate(
                 value, scorer, max_logit, denominator, mixed, H, SCORE_EPS
             )
-        max_logit, denominator, mixed = _attn_res_accumulate(
-            prefix, scorer, max_logit, denominator, mixed, H, SCORE_EPS
-        )
-        mixed /= denominator
     mixed = mixed.to(gl.bfloat16).to(gl.float32)
     inverse_rms = gl.rsqrt(gl.sum(mixed * mixed, axis=0) / H + OUTPUT_EPS)
     output_weight = cdna4.buffer_load(

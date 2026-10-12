@@ -2,10 +2,10 @@ from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
+from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from utils import (
     is_amd,
     is_cdna4,
@@ -27,9 +27,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     gluon_mxfp_fused_moe as _gfx950_static_moe,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (  # noqa: E402
-    gluon_a16w4_situ_warp_decode_ep_gfx950,
-)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx950_moe_weights,
 )
@@ -48,9 +45,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (  # n
 
 
 def _dequantize_dynamic_mxfp4(x: torch.Tensor) -> torch.Tensor:
-    packed, scale = tokenspeed_kernel.quantize_mxfp4(
-        x, scale_layout="linear", solution="triton"
-    )
+    packed, scale = kernel_quantize_mxfp4(x, scale_layout="linear", solution="triton")
     return dequantize_mxfp4(packed, scale).to(torch.bfloat16)
 
 
@@ -266,80 +261,6 @@ def test_dynamic_mxfp4_activation_moe(
             ).float()
 
     torch.testing.assert_close(actual.float(), expected, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4])
-def test_bf16_activation_situ_moe(num_tokens: int) -> None:
-    if not is_cdna4():
-        pytest.skip("BF16 SiTU activation is unavailable on this GPU")
-
-    num_experts = 2
-    hidden_size = 3584
-    intermediate_size = 3072
-    top_k = 2
-    hidden_states = torch.randn(
-        num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda"
-    )
-    w13_weight = torch.zeros(
-        num_experts,
-        2 * intermediate_size,
-        hidden_size // 2,
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    w13_scale = torch.full(
-        (num_experts, 2 * intermediate_size, hidden_size // 32),
-        127,
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    w2_weight = torch.zeros(
-        num_experts,
-        hidden_size,
-        intermediate_size // 2,
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    w2_scale = torch.full(
-        (num_experts, hidden_size, intermediate_size // 32),
-        127,
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    topk_weights = torch.full(
-        (num_tokens, top_k), 1.0 / top_k, dtype=torch.float32, device="cuda"
-    )
-    topk_ids = torch.tensor([[0, 1]] * num_tokens, dtype=torch.int32, device="cuda")
-    shared_input = torch.randn(num_tokens, 768, dtype=torch.bfloat16, device="cuda")
-    shared_weight = torch.randn(7168, 768, dtype=torch.bfloat16, device="cuda")
-
-    actual = gluon_a16w4_situ_warp_decode_ep_gfx950(
-        hidden_states,
-        w13_weight,
-        w13_scale,
-        w2_weight,
-        w2_scale,
-        topk_weights,
-        topk_ids,
-        situ_beta=4.0,
-        situ_linear_beta=25.0,
-        linear_weights=True,
-        w13_interleaved=True,
-        shared_input=shared_input,
-        shared_weight=shared_weight,
-    )
-
-    torch.cuda.synchronize()
-    assert isinstance(actual, tuple)
-    routed, shared = actual
-    assert routed.shape == hidden_states.shape
-    torch.testing.assert_close(routed, torch.zeros_like(routed), atol=0, rtol=0)
-    torch.testing.assert_close(
-        shared,
-        torch.nn.functional.linear(shared_input, shared_weight),
-        atol=2e-2,
-        rtol=2e-2,
-    )
 
 
 def test_static_fp8_activation_moe_gfx950_smoke() -> None:
@@ -600,12 +521,17 @@ def _assert_gfx1250_large_route(
         assert torch.all(metadata.block_schedule(block_size)[num_blocks:] == -1)
 
 
-def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64() -> None:
+@pytest.mark.parametrize(
+    ("tokens", "topk", "experts"),
+    [(37, 7, 11), (1024, 16, 257), (1024, 16, 896), (8192, 16, 896)],
+)
+def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64(
+    tokens: int, topk: int, experts: int
+) -> None:
     if not is_cdna5():
         pytest.skip("gfx1250 is required for the CDNA5 fused route")
 
     torch.manual_seed(43)
-    tokens, topk, experts = 37, 7, 11
     ids = (
         torch.arange(tokens * topk, device="cuda", dtype=torch.int32).reshape(
             tokens, topk

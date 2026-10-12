@@ -442,29 +442,3 @@ def test_mxfp8_split_k_launch_metadata_models_partials() -> None:
         "flops32": m * n * (split_k - 1),
         "bytes": split_k * m * n * 4 + m * n * 2,
     }
-
-
-@pytest.mark.parametrize(
-    "kwargs,match",
-    [
-        ({"alpha": torch.tensor(1.0)}, "does not support alpha"),
-        ({"block_size": [128, 128]}, "requires block_size"),
-    ],
-)
-def test_mxfp8_ue8m0_gemv_rejects_unsupported_arguments(kwargs, match: str) -> None:
-    m, n, k = 1, 128, 256
-    a = _random_fp8((m, k))
-    b = _random_fp8((n, k))
-    a_scales = torch.full((m, k // 32), 127, device="cuda", dtype=torch.uint8)
-    b_scales = torch.full((n, k // 32), 127, device="cuda", dtype=torch.uint8)
-    call_kwargs = {"block_size": [1, 32], **kwargs}
-
-    with pytest.raises(ValueError, match=match):
-        launch_gluon_mm_mxfp8_ue8m0_gfx1250(
-            a,
-            b,
-            a_scales,
-            b_scales,
-            torch.bfloat16,
-            **call_kwargs,
-        )

@@ -1065,9 +1065,12 @@ class KimiKDAMergedProjTests(unittest.TestCase):
             for sid, w in ws.items():
                 m.weight.weight_loader(m.weight, w, sid)
             x = torch.randn(3, hidden, dtype=torch.bfloat16)
-            mixed_qkv, gate, f_a_out, beta = m(x)
             pl = proj // tp
             hl = num_heads // tp
+            packed, _ = m(x, ctx=None)
+            mixed_qkv, gate, f_a_out, beta = packed[:, : m.used_rows].split(
+                [3 * pl, pl, head_dim, hl], dim=-1
+            )
 
             def ref(w, rows, rk=rank):
                 return x @ w[rk * rows : (rk + 1) * rows].t()
@@ -1102,7 +1105,8 @@ class KimiKDAMergedProjTests(unittest.TestCase):
             fp8_channel_quant=False,
         )
         torch.nn.init.normal_(m.weight)
-        mixed, gate, _, _ = m(torch.randn(1, 8, dtype=torch.bfloat16))
+        packed, _ = m(torch.randn(1, 8, dtype=torch.bfloat16), ctx=None)
+        mixed, gate = packed[:, :24], packed[:, 24:32]
         # [1, 3p] slice of a [1, total] row is already contiguous: no copy.
         self.assertTrue(mixed.is_contiguous())
         self.assertEqual(

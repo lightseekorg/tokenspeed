@@ -75,7 +75,7 @@ from setuptools.command.editable_wheel import editable_wheel
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
-BASE_VERSION = "0.1.3"
+BASE_VERSION = "0.1.4"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
@@ -1040,8 +1040,21 @@ setup(
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
-        "tokenspeed_kernel.ops.communication": ["_cuda/*.cu", "README.md"],
-        "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        "tokenspeed_kernel.ops.communication": [
+            "_cuda/*.cu",
+            "_cuda/*.cuh",
+        ],
+        "tokenspeed_kernel.thirdparty.cuda": [
+            "objs/**/*.so",
+            # Vendored Lamport protocol and FFI headers for the optional JIT extension.
+            "csrc/tvm_ffi_utils.h",
+            "csrc/include/**/*.h",
+            "csrc/include/**/*.cuh",
+        ],
+        # Optional JIT adapter for fused AllGather quantization.
+        "tokenspeed_kernel.thirdparty.flashinfer": [
+            "allgather_quant.cu",
+        ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.
         "tokenspeed_kernel.thirdparty.msa": [

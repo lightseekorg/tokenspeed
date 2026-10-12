@@ -1,4 +1,5 @@
 name: K8s Dispatch
+run-name: "K8s ${{ inputs.commit || inputs.pr || github.sha }} | ${{ inputs.match }} | ${{ inputs.runner }}"
 
 on:
   workflow_dispatch:
@@ -22,10 +23,6 @@ on:
           - all
           - test/ci/eval/deepseek-v4.1-flash-dspark-evalscope-gsm8k-amd.yaml
           - test/ci/eval/deepseek-v4.1-flash-dspark-evalscope-gsm8k.yaml
-          - test/ci/eval/deepseek-v4-flash-evalscope-gsm8k.yaml
-          - test/ci/eval/deepseek-v4-flash-dcp4-mtp-evalscope-gsm8k.yaml
-          - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k-amd.yaml
-          - test/ci/eval/deepseek-v4-flash-mtp-evalscope-gsm8k.yaml
           - test/ci/eval/glm-5.2-nvfp4-mtp-evalscope-aime26.yaml
           - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26.yaml
           - test/ci/eval/glm-5.3-flash-fp8-mtp-evalscope-aime26-amd.yaml
@@ -67,7 +64,8 @@ on:
           - test/ci/ut/ut-runtime-2gpu.yaml
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml
-          - test/ci/ut/ut-tokenspeed-kernel.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
       runner_pool:
         description: "Runner pool selected from the YAML labels"
         required: true
@@ -79,6 +77,11 @@ on:
           - gb200
           - b300
           - all
+      runner:
+        description: "Optional exact runner label within the selected pool"
+        required: false
+        default: ""
+        type: string
       task_types:
         description: "Comma-separated task types"
         required: true
@@ -107,7 +110,7 @@ on:
           - per-commit
 
 concurrency:
-  group: k8s-dispatch-${{ inputs.commit || inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runner_pool }}-${{ inputs.match }}
+  group: k8s-dispatch-${{ inputs.commit || inputs.pr || 'main' }}-${{ inputs.yaml }}-${{ inputs.runner_pool }}-${{ inputs.runner }}-${{ inputs.match }}
   cancel-in-progress: false
 
 jobs:
@@ -229,6 +232,7 @@ jobs:
         id: matrix
         env:
           YAML_SELECTION: ${{ inputs.yaml }}
+          EXACT_RUNNER: ${{ inputs.runner }}
           RUNNER_POOL: ${{ inputs.runner_pool }}
           TASK_TYPES: ${{ inputs.task_types }}
           MATCH: ${{ inputs.match }}
@@ -277,6 +281,8 @@ jobs:
               searchable = f"{task['name']} {task['config']}".lower()
               runner = task["runner"]
               if runner.startswith("slurm-"):
+                  continue
+              if os.environ["EXACT_RUNNER"] and runner != os.environ["EXACT_RUNNER"]:
                   continue
               pool = os.environ["RUNNER_POOL"]
               runner_families = {

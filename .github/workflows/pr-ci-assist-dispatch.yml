@@ -1,0 +1,18 @@
+name: PR CI Assist Dispatch
+
+on:
+  workflow_run:
+    workflows: [PR CI Plan, Slurm Dispatch, K8s Dispatch]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  assist:
+    if: >-
+      github.repository == 'lightseekorg/tokenspeed' &&
+      github.event.workflow_run.event == 'workflow_dispatch'
+    uses: ./.github/workflows/pr-ci-assist.yml
+    secrets: inherit

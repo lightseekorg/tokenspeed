@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,21 @@
 #include "unit_test_helper.h"
 
 namespace tokenspeed::test {
+
+// Retraction capacity for a test config that does not exercise image-fit
+// refusals: a snapshot pool as large as the Device pool and one blob slot per
+// request slot on the retracting roles, so any resident request can be
+// imaged; none on the P role, which never retracts. Suites that test a
+// refusal size the pool themselves instead of calling this.
+inline void SetTestSnapshotPool(SchedulerConfig& cfg) {
+    if (cfg.role == Role::kP) {
+        cfg.snapshot_allocator.total_pages = 1;
+        cfg.max_retracted_requests = 0;
+        return;
+    }
+    cfg.snapshot_allocator.total_pages = cfg.device_allocator.total_pages;
+    cfg.max_retracted_requests = std::max(cfg.max_batch_size, 1);
+}
 
 class SchedulerTestSuite : public ::testing::Test {
 protected:
@@ -56,6 +72,7 @@ protected:
             .retention = CacheGroupConfig::Retention::FullHistory,
             .family = CacheGroupFamily::History,
         });
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -122,10 +139,29 @@ protected:
         }
     }
 
-    void SendLoadBackDone(std::uint32_t op_id, bool success) {
+    void SendLoadBackDone(std::uint32_t op_id) {
         ExecutionEvent event;
-        event.With(cache::LoadBackDone(op_id, success));
+        event.With(cache::LoadBackDone{.op_id = op_id});
         scheduler_->Advance(std::move(event));
+    }
+
+    // A pre-admission L3 prefetch finished with its first landed_pages prefix
+    // pages fetched.
+    void SendPrefetchDone(std::uint32_t op_id, std::int32_t landed_pages) {
+        ExecutionEvent event;
+        event.With(cache::PrefetchDone(op_id, landed_pages));
+        scheduler_->Advance(std::move(event));
+    }
+
+    static const PrefetchBatch* FindPrefetch(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (const auto* prefetch = std::get_if<PrefetchBatch>(cache_op)) {
+                    return prefetch;
+                }
+            }
+        }
+        return nullptr;
     }
 
     // Send ExtendResult to the scheduler: the forward landed. `tokens` are
@@ -156,10 +192,57 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
-    void SendRetractEvent(const std::string& request_id) {
+    void SendSnapshotDone(std::uint32_t op_id) {
         ExecutionEvent event;
-        event.With(forward::Retract{.request_id = request_id});
+        event.With(cache::SnapshotDone{.op_id = op_id});
         scheduler_->Advance(std::move(event));
+    }
+
+    void SendRestoreDone(std::uint32_t op_id) {
+        ExecutionEvent event;
+        event.With(cache::RestoreDone{.op_id = op_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    // Acknowledges both legs of every retraction image the plan stores: the
+    // L2 write-backs and the snapshot stores.
+    void AckImageStores(const ExecutionPlan& plan) {
+        AckWriteBacks(plan);
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<SnapshotStoreBatch>(plan)) {
+            for (std::uint32_t id : std::get<SnapshotStoreBatch>(op).op_ids) {
+                SendSnapshotDone(id);
+            }
+        }
+    }
+
+    void AckRestores(const ExecutionPlan& plan) {
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<SnapshotRestoreBatch>(plan)) {
+            for (std::uint32_t id : std::get<SnapshotRestoreBatch>(op).op_ids) {
+                SendRestoreDone(id);
+            }
+        }
+    }
+
+    static const SnapshotStoreBatch* FindSnapshotStore(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (const auto* store = std::get_if<SnapshotStoreBatch>(cache_op)) {
+                    return store;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    static const SnapshotRestoreBatch* FindRestore(const ExecutionPlan& plan) {
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
+                if (const auto* restore = std::get_if<SnapshotRestoreBatch>(cache_op)) {
+                    return restore;
+                }
+            }
+        }
+        return nullptr;
     }
 
     SchedulerConfig config_{};
@@ -235,6 +318,7 @@ protected:
             group.family = i == 0 ? CacheGroupFamily::History : CacheGroupFamily::State;
             cfg.cache_groups.push_back(std::move(group));
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 

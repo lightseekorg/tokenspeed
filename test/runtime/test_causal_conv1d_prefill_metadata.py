@@ -144,5 +144,51 @@ def test_conv_metadata_and_consumer_cuda_graph():
         assert torch.equal(state, reference_state)
 
 
+def test_conv_compiles_once_across_prefill_shapes():
+    """Token totals, chunk-map offsets and output strides vary per prefill; none keys a binary."""
+    from unittest.mock import patch
+
+    from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
+        _causal_conv1d_fwd_kernel,
+    )
+
+    channels, width = 16, 48
+    weight = torch.randn(channels, 4, dtype=torch.bfloat16, device="cuda") * 0.1
+
+    def run(lengths):
+        lens = torch.tensor(lengths, dtype=torch.int32)
+        bounds = torch.cat([torch.zeros(1, dtype=torch.int32), lens.cumsum(0)]).to(
+            device="cuda", dtype=torch.int32
+        )
+        metadata = build_causal_conv1d_prefill_metadata(
+            bounds, lens, CAUSAL_CONV1D_BLOCK_M
+        )
+        indices = torch.arange(1, len(lengths) + 1, dtype=torch.int32, device="cuda")
+        history = indices % 2 == 0
+        # A slice of a wider projection; one token keeps its stride in the output.
+        x = torch.randn(sum(lengths), width, dtype=torch.bfloat16, device="cuda")
+        x = x[:, :channels].T
+        # The state pool keeps one size for the server's lifetime.
+        state = torch.randn(8, channels, 3, dtype=torch.bfloat16, device="cuda")
+        reference_state = state.clone()
+        reference = _reference_metadata(lengths, "cuda")
+        expected = _conv(
+            x, weight, reference_state, bounds, indices, history, reference
+        )
+        actual = _conv(x, weight, state, bounds, indices, history, metadata)
+        assert torch.equal(actual, expected)
+        assert torch.equal(state, reference_state)
+
+    run([9, 7])
+    with patch.object(
+        _causal_conv1d_fwd_kernel,
+        "_do_compile",
+        wraps=_causal_conv1d_fwd_kernel._do_compile,
+    ) as compiles:
+        for lengths in ([1], [16], [17], [1, 1], [33, 15], [64] * 3, [5, 1, 300]):
+            run(lengths)
+    assert compiles.call_count == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

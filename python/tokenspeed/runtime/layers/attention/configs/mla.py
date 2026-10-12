@@ -64,9 +64,6 @@ class MLAConfig(SoftmaxAttnConfig):
     v_head_dim: int
     scaling: float
     kv_cache_dim: int
-    # DeepSeek V4 stamps its window here post-construction (declared so the
-    # write is a real field, not a __dict__ stowaway).
-    sliding_window_tokens: int | None = None
 
     @classmethod
     def _spec_kwargs(

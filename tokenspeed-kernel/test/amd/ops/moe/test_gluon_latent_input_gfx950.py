@@ -53,15 +53,6 @@ def test_split_k_covers_every_tile(hidden_size: int) -> None:
     assert (hidden_size // latent_input_small_batch._BLOCK_K) % split_k == 0
 
 
-def test_split_k_does_not_drop_k_tiles() -> None:
-    assert (
-        latent_input_small_batch._split_k(
-            tokens=2, total_n=6016, hidden=192, block_m=16
-        )
-        == 1
-    )
-
-
 @pytest.mark.parametrize(
     ("tokens", "expected"),
     [

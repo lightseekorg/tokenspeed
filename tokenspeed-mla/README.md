@@ -16,16 +16,17 @@ Speed-of-light TokenSpeed MLA kernels for `SM100/SM103/SM107` with:
 This package includes performance-oriented optimizations for latency-sensitive
 serving workloads, especially coding agent style use cases with high request
 concurrency, short decode steps, and strict time-to-first-token/next-token
-requirements. For MLA decode kernel, small `q_len * num_heads`
+requirements. For the MLA decode kernel, small `q_len * num_heads`
 configurations can fold a query-token group (`fold_sq_factor`) into heads for
-better tile utilization; remaining query groups are scheduled across the query
-sequence dimension.
+better tile utilization; the scheduler places remaining query groups across
+the query sequence dimension.
 
 SM107 support requires CuTe DSL 4.8.0 or newer and a compatible CUDA toolkit.
+Decode compilation and GPU regression tests also reject CuTe DSL warnings.
 
-## Performance Numbers
+## Performance numbers
 
-### Prefill Performance
+### Prefill performance
 ![Prefill Latency Comparison](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comp_prefill.png)
 
 Where:
@@ -37,11 +38,11 @@ use case 4: batch_size = 4, seqlen_qo = 512,      seqlen_kv = 80 * 1024
 use case 5: batch_size = 4, seqlen_qo = 1024,     seqlen_kv = 80 * 1024
 ```
 
-The prefill comparison above includes historical results from an AOT
+The preceding prefill comparison includes historical results from an AOT
 implementation. Current releases ship the public CuTe DSL JIT implementation;
 the historical AOT backend is not included in the package.
 
-The performance numbers can be collected using the following command line:
+Collect the performance numbers with this command line:
 ```
 python ./tokenspeed-mla/python/tokenspeed_mla/fmha.py \
   --is_causal \
@@ -55,12 +56,12 @@ python ./tokenspeed-mla/python/tokenspeed_mla/fmha.py \
   --skip_ref_check
 ```
 
-### Decode Performance
+### Decode performance
 
 ![Decode Latency Comparison for num_heads=16](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comparison_numHead16.png)
 ![Decode Latency Comparison for num_heads=32](https://raw.githubusercontent.com/lightseekorg/tokenspeed/main/tokenspeed-mla/assets/latency_comparison_numHead32.png)
 
-In the above test cases, `q_seqlen = 4` and `kv_seqlen = 80K`.
+In these test cases, `q_seqlen = 4` and `kv_seqlen = 80K`.
 
 TensorRT-LLM uses a single kernel for MLA decode, which appears to adopt a swap-AB strategy in the tested cases. In contrast, TokenSpeed’s MLA decode kernel uses a two-kernel implementation: one kernel computes the MLA decode with split-KV, and a second kernel performs the reduction of the split-KV partial results.
 
@@ -78,10 +79,10 @@ The folded execution shape becomes:
 - `q_seqlen_eff = q_seqlen / F`
 
 This improves BMM1 `M`-dimension utilization and reduces tile waste in small-head
-decode scenarios, especially token-by-token agent traffic. Example:
-`num_heads=64, q_seqlen=4` chooses `F=2`, so two query tokens are folded into
-`M` (`H_eff=128`) and the remaining two query groups are scheduled on the
-scheduler second dimension (`q_seqlen_eff=2`).
+decode scenarios, especially token-by-token agent traffic. Example: with
+`num_heads=64, q_seqlen=4`, the runtime chooses `F=2`, so the kernel folds two
+query tokens into `M` (`H_eff=128`) and schedules the remaining two query
+groups on the scheduler second dimension (`q_seqlen_eff=2`).
 
 The public `tokenspeed_mla_decode` also accepts `enable_packed_q=True` to
 opt into continuous query/head packing on the FP8 and FP16/BF16 M128 paths, adapted from
@@ -89,7 +90,7 @@ FlashInfer PR #4178. The default is **False**, preserving the folded-query
 implementation. M64 and token-gapped Q/output views continue to
 use that implementation even when the option is enabled.
 
-Packed rows are ordered as `query_token * num_heads + head`. Each 2-CTA
+The packing orders rows as `query_token * num_heads + head`. Each 2-CTA
 group owns 128 consecutive rows, including across query boundaries. Thus
 H96/Sq4 uses three query tiles instead of four, and H96/Sq8 uses six
 instead of eight. Only the final tile may contain padding. This is a tensor
@@ -118,7 +119,7 @@ From the repository root, select this checkout's sources explicitly:
 PYTHONPATH=tokenspeed-mla/python python -m pytest -q tokenspeed-mla/tests/test_mla_decode.py
 ```
 
-GPU cases require SM100, SM103 or SM107 and are skipped on other devices.
+GPU cases require SM100, SM103 or SM107; pytest skips them on other devices.
 Add `-k 'not TestGPU and not TestCompile'` for CPU checks, `-k TestCompile`
 for compilation checks across all three architectures, or `-k TestGPU` for
 GPU checks. Compilation checks require a CuTe DSL and CUDA toolchain that
@@ -132,6 +133,30 @@ wrapper selects the architecture from `query.device` and includes it in the
 compile cache key and compiler target. Direct kernel construction requires
 an explicit `compute_capability=(10, 0)`, `(10, 3)` or `(10, 7)`.
 
+On SM107, an `out` tensor with dtype `torch.float8_e4m3fn` selects
+[`mla_decode_fp8_sm107.py`](python/tokenspeed_mla/mla_decode_fp8_sm107.py).
+The kernel packs query/head rows into M256 tiles and uses 4-CTA clusters
+to separate QK/softmax from PV, with a 2-CTA fallback. BF16 output keeps
+using the shared kernel.
+
+The public wrapper uses FP32 for softmax exponentials and row sums. Packed
+FP16 softmax remains an explicit option for direct kernel construction.
+
+FP8 output supports up to four M256 tiles per request. By default, `H` must
+divide 256 and `q_len` must be a multiple of `256 / H`;
+`enable_packed_q=True` accepts other shapes such as H96 and partial tiles.
+The kernel supports causal/non-causal attention, split-KV, LSE, PDL and CUDA
+graphs; it does not support sliding windows, DCP, or `local_visible_lens`.
+Rows with no visible keys produce zero output and `-inf` LSE.
+
+SM107 FP8-output compilation and GPU regression tests reject CuTe DSL warnings.
+The mixed-cluster kernel issues CLC queries directly and owns its unswizzled
+grid and response decoding, avoiding the deprecated example scheduler classes.
+
+H96/Q4 fills 75% of M256 tiles; H96/Q8 fills them completely. M128 packing
+fills three and six tiles respectively, so relative performance depends on
+tile utilization as well as batch size and split-KV scheduling.
+
 Other optimizations include:
 
 - FP8 split-KV candidates are normalized to nonempty K partitions before
@@ -141,12 +166,12 @@ Other optimizations include:
   split-KV and reducer optimizations from FlashInfer PR #4178 to TokenSpeed's
   folded-query layout; both reducer settings are included in the compile cache.
 - Using 2CTA UTCMMA instruction to reduce shared memory usage.
-- Try to use as less mbarrier as possible.
-- Split kv loading warp to get more latency hiding ability. After loading K, V is already in the L2 cache. Loading K of next tile will not have to wait for the completion of V loading.
-- Using multiple stage (sub-tiling) for STG in epilogue.
+- Try to use as few mbarriers as possible.
+- Split the KV loading warp to get more latency-hiding ability. After loading K, V is already in the L2 cache. Loading K of the next tile does not have to wait for the completion of V loading.
+- Using multiple stages (sub-tiling) for STG in the epilogue.
 
 
-The performance numbers can be collected using the following command line:
+Collect the performance numbers with this command line:
 ```
 python ./tokenspeed-mla/python/tokenspeed_mla/mla_decode_fp8.py \
   --batch_size 4 \
@@ -162,7 +187,63 @@ python ./tokenspeed-mla/python/tokenspeed_mla/mla_decode_fp8.py \
   --skip_ref_check
 ```
 
-## Kernel Capability Summary
+### MLA 2 decode benchmarks
+
+The [MLA 2 benchmark article](https://lightseek.org/blog/tokenspeed-mla-2.html)
+compares the M256, four-CTA MLA 2 implementation for NVIDIA Vera Rubin with
+MLA 1, the Blackwell M128 implementation. The 16 workloads use 96 query heads
+(H96), 4 or 8 query tokens (Q4 or Q8), batch sizes 1, 4, 16, and 64, and KV
+context lengths of 65,536 or 131,072 tokens (KV64K or KV128K).
+Speedup is baseline latency divided by MLA 2 latency for the same workload;
+summary values are geometric means, while peaks are individual results.[^mla2-benchmark]
+
+#### Same-GPU comparisons
+
+Both comparisons below run on the same NVIDIA Vera Rubin GPU with FP8 inputs
+and outputs; they do not measure the default BF16-output path.
+
+| Baseline | Overall speedup | Q4 speedup | Q8 speedup |
+| --- | --- | --- | --- |
+| MLA 1 recompiled for NVIDIA Vera Rubin | 1.142× | 1.027× | 1.271× |
+| Adapted FlashInfer | 1.327× | 1.227× | 1.434× |
+
+MLA 2 has lower median latency than recompiled MLA 1 in 13 of 16 workloads,
+including all eight Q8 workloads. Three Q4 workloads are slower. Native Q8
+packing fills three M256 tiles, while Q4 fills only 75% of two tiles.
+
+![MLA 2 versus recompiled MLA 1 on the same GPU across 16 H96 FP8 workloads](https://lightseek.org/blog/images/202610/tokenspeed-mla-2-recompiled-mla-1.png)
+
+The FlashInfer comparison uses the benchmarked
+[PR #6177](https://github.com/flashinfer-ai/flashinfer/pull/6177) implementation
+with an H96-to-H128 adapter that splits Q8 into two Q4 requests. Timing includes
+query packing and output unpacking. It compares native H96 support and tuning
+against that adapted baseline, not native H128 performance or current
+FlashInfer releases.
+
+![MLA 2 versus adapted FlashInfer on the same GPU across 16 H96 FP8 workloads](https://lightseek.org/blog/images/202610/tokenspeed-mla-2-adapted-flashinfer.png)
+
+#### Cross-hardware comparison
+
+Across the same 16 workloads, MLA 2 on NVIDIA Vera Rubin achieves:
+
+| Baseline | Geometric mean speedup | Peak speedup |
+| --- | --- | --- |
+| MLA 1 on NVIDIA B200 | 2.62× | 3.44× |
+| MLA 1 on NVIDIA GB200 | 2.05× | 2.84× |
+
+Both peaks occur at batch size 16, Q8, and KV64K. Each run uses one GPU.
+Hardware, power, clocks, and implementations differ, so these ratios include
+both hardware and software changes and do not isolate architectural gains.
+These are kernel-latency results, not end-to-end serving results.
+
+![TokenSpeed MLA across B200, B300, GB200, GB300, and NVIDIA Vera Rubin, normalized to B200](https://lightseek.org/blog/images/202610/tokenspeed-mla-2-cross-gpu-speedup.png)
+
+The chart normalizes every series to B200 at 1×. For a comparison with GB200,
+divide the NVIDIA Vera Rubin ratio by the GB200 ratio for the same workload.
+Cross-hardware ratios are separate comparisons, not additional factors to
+multiply by the same-GPU speedups.
+
+## Kernel capability summary
 
 ### MLA Prefill (`tokenspeed_mla_prefill`)
 
@@ -176,16 +257,17 @@ What it supports:
 - Causal and non-causal execution
 - Optional LSE return (`return_lse=True`)
 - PDL enable/disable (`enable_pdl`)
-- Kernel compile cache keyed by static config (`dtype`, `d_qk`, `d_v`, causal, LSE, PDL, etc.)
-- Skip-correction is enabled in the wrapped FMHA path.
+- Kernel compile cache keyed by static config (such as `dtype`, `d_qk`, `d_v`,
+  causal, LSE, and PDL)
+- The wrapped FMHA path enables skip-correction.
 - ex2-emulation (disabled by default on B200, and not supported on B300)
 - CuTe DSL JIT backend
 
 Input/output dtype behavior:
 
-- CuTe DSL backend accepts input dtypes supported :
+- The CuTe DSL backend accepts these input dtypes:
   - `torch.float16`, `torch.bfloat16`, `torch.float8_e4m3fn`, `torch.float8_e5m2`
-  - MLA Prefill only support `torch.float8_e4m3fn`
+  - MLA Prefill supports only `torch.float8_e4m3fn`
 - Prefill output tensor is BF16 (`torch.bfloat16`)
 - Optional LSE output is FP32
 
@@ -198,10 +280,11 @@ What it supports:
   - 3D: `[num_pages, page_size, D_total]`
   - 4D accepted and normalized internally
 - Auto `split_kv` + workspace sizing and caching
-- Supports FP16/BF16/FP8; FP8 path writes BF16 output.
+- Supports FP16/BF16/FP8; FP8 path writes BF16 output, or FP8 output on
+  SM107 when `out` is FP8 (see [SM107 decode](#sm107-decode)).
 - Supports `H <= 128` and `1 <= q_len <= 4`; for example,
   `H=64, q_len=4` is supported.
-- `split_kv` and `workspace_size` are computed and cached from runtime shape/device info.
+- The wrapper computes and caches `split_kv` and `workspace_size` from runtime shape/device info.
 - `is_var_seq`, `is_persistent`, and `enable_pdl` affect scheduling/compile variants.
 - `causal_mask` supports causal and non-causal execution on FP16/BF16/FP8 paths.
 - `window_left` bounds each block row's history: row `i` sees keys
@@ -212,7 +295,7 @@ What it supports:
 - Optional `out` tensor reuse
 - `is_var_seq` and `enable_pdl` controls
 
-## Minimal Usage
+## Minimal usage
 
 ### 1) Decode
 
@@ -308,3 +391,12 @@ partial storage. Accumulation and log-sum-exp remain FP32; the reducer applies
 `output_scale` after combining normalized partials. Direct FP8 kernel callers
 must explicitly specify `partial_fp16` and a `reducer_max_splits` capacity that
 covers every split in their launches.
+
+[^mla2-benchmark]: The same-GPU tests use FP8 queries, KV data, and outputs;
+    64-token pages; a cold L2 cache through KV rotation; and disabled programmatic
+    dependent launch (PDL). Latency is the median of 15 repeats of 20 CUDA graph
+    iterations, including split-KV reduction and, for adapted FlashInfer, query
+    packing and output unpacking. MLA 1 is recompiled with four key and four value
+    stages. Overall geometric means weight all 16 workloads equally; Q4 and Q8
+    means each cover eight workloads. See the linked article for the full
+    benchmark context.

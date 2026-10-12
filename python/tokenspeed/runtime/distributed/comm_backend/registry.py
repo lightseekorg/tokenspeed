@@ -46,6 +46,12 @@ def initialize_comm_backend(use_pynccl: bool = False) -> CommBackend:
     return _global_backend
 
 
+def set_global_backend(backend: CommBackend) -> None:
+    """Install ``backend`` as the global CommBackend."""
+    global _global_backend
+    _global_backend = backend
+
+
 def get_global_backend() -> CommBackend:
     """Get the global CommBackend, creating AutoBackend if not initialized."""
     global _global_backend

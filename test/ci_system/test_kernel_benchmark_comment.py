@@ -586,9 +586,16 @@ def test_comment_workflow_has_a_minimal_trusted_contract():
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     triggers = workflow.get("on") or workflow.get(True)
 
+    # Trigger on the benchmark's own workflow so the comment does not wait for
+    # unrelated test stages.
+    benchmark = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/amd-kernel-benchmark.yml").read_text(
+            encoding="utf-8"
+        )
+    )
     assert triggers == {
         "workflow_run": {
-            "workflows": ["AMD Tests"],
+            "workflows": [benchmark["name"]],
             "types": ["completed"],
         }
     }

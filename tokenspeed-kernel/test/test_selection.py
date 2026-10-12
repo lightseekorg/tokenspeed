@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
 from unittest import mock
 
@@ -1077,6 +1079,77 @@ class TestKernelOverride:
             )
             assert impl3() == "reference_decode"
 
+    def test_verbose_logs_an_override_once_per_kernel(
+        self, sample_specs, h100_platform, monkeypatch, caplog
+    ):
+        """The override path bypasses the selection cache, so the verbose log
+        names each overriding kernel once; the ranked line is unchanged."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        monkeypatch.setenv("TOKENSPEED_KERNEL_VERBOSE", "1")
+
+        def select():
+            return select_kernel(
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+            )
+
+        with caplog.at_level(logging.INFO, logger="tokenspeed_kernel.selection"):
+            ranked = select()
+            select()  # cache hit: not logged
+            with kernel_override("attention", "decode", "reference_decode"):
+                for _ in range(3):
+                    select()
+            with kernel_override("attention", "decode", "triton"):
+                select()
+            with kernel_override("attention", "decode", "reference_decode"):
+                select()  # already logged
+
+        arch = h100_platform.arch
+        messages = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "tokenspeed_kernel.selection"
+        ]
+        assert len(messages) == 3
+        assert f"attention.decode({ATTN_DECODE_BF16}) -> {ranked.name} (ora=" in (
+            messages[0]
+        )
+        assert messages[1].endswith(
+            f"-> reference_decode (override reference_decode, {arch})"
+        )
+        assert messages[2].endswith(f"-> triton_decode (override triton, {arch})")
+
+    def test_override_log_waits_for_verbose(
+        self, sample_specs, h100_platform, monkeypatch, caplog
+    ):
+        """Without verbose mode an override is neither logged nor remembered,
+        so enabling verbose mode later still logs it once."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        monkeypatch.delenv("TOKENSPEED_KERNEL_VERBOSE", raising=False)
+
+        def select():
+            return select_kernel(
+                "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+            )
+
+        def messages():
+            return [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == "tokenspeed_kernel.selection"
+            ]
+
+        with (
+            caplog.at_level(logging.INFO, logger="tokenspeed_kernel.selection"),
+            kernel_override("attention", "decode", "reference_decode"),
+        ):
+            select()
+            assert messages() == []
+            monkeypatch.setenv("TOKENSPEED_KERNEL_VERBOSE", "1")
+            select()
+            select()
+        assert len(messages()) == 1
+        assert "-> reference_decode (override reference_decode, " in messages()[0]
+
 
 class TestSetPolicy:
     def test_set_policy_clears_cache(self, sample_specs, h100_platform):
@@ -1103,7 +1176,9 @@ class TestExplainSelection:
         )
         assert "attention.decode" in explanation
         assert "NVIDIA H100" in explanation
+        assert "Override: none" in explanation
         assert "[SELECTED]" in explanation
+        assert "[SELECTED (override)]" not in explanation
         assert "Candidates" in explanation
 
     def test_filtered_out_section(self, sample_specs, h100_platform):
@@ -1127,6 +1202,122 @@ class TestExplainSelection:
             platform=h100_platform,
         )
         assert "0 matched" in explanation
+
+    @pytest.mark.parametrize(
+        ("env", "context", "argument", "expected"),
+        [
+            (
+                None,
+                None,
+                "reference_decode",
+                "reference_decode (explicit override= argument)",
+            ),
+            (
+                None,
+                "triton",
+                "reference_decode",
+                "triton (kernel_override())",
+            ),
+            (
+                "triton_decode",
+                "reference_decode",
+                "flashinfer_decode",
+                "triton_decode (env TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE)",
+            ),
+        ],
+        ids=["argument", "context", "env"],
+    )
+    def test_reports_the_override_select_kernel_honours(
+        self,
+        sample_specs,
+        h100_platform,
+        monkeypatch,
+        env,
+        context,
+        argument,
+        expected,
+    ):
+        """The Override line follows select_kernel's precedence (environment,
+        then kernel_override(), then the argument) and marks the kernel that
+        select_kernel forces instead of the ranking's first entry."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        ranked = select_kernel(
+            "attention", "decode", ATTN_DECODE_BF16, platform=h100_platform
+        ).name
+        env_key = "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DECODE"
+        if env:
+            monkeypatch.setenv(env_key, env)
+        else:
+            monkeypatch.delenv(env_key, raising=False)
+
+        scope = (
+            kernel_override("attention", "decode", context)
+            if context
+            else contextlib.nullcontext()
+        )
+        with scope:
+            explanation = explain_selection(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                override=argument,
+            )
+            forced = select_kernel(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                platform=h100_platform,
+                override=argument,
+            ).name
+
+        assert f"Override: {expected}" in explanation
+        assert f"{forced}  [SELECTED (override)]" in explanation
+        assert f"{ranked}  [SELECTED]" not in explanation
+        assert "not among the matched" not in explanation
+
+    @pytest.mark.parametrize(
+        ("target", "features", "notes"),
+        [
+            (
+                "nonexistent_kernel",
+                None,
+                ["Override does not resolve: Override 'nonexistent_kernel'"],
+            ),
+            (
+                "triton_decode",
+                frozenset({"unpaged"}),
+                [
+                    "Override does not resolve: Override 'triton_decode'",
+                    "required feature(s) ['unpaged']",
+                ],
+            ),
+            (
+                "aiter_decode",
+                None,
+                ["Override selects aiter_decode, which is not among the matched"],
+            ),
+        ],
+        ids=["unknown", "missing-feature", "filtered-out"],
+    )
+    def test_reports_an_unresolved_or_filtered_override(
+        self, sample_specs, h100_platform, target, features, notes
+    ):
+        """An override select_kernel would refuse is reported as unresolved; one
+        that bypasses filtering (here an AMD-only kernel on H100) is named."""
+        register_all_samples(KernelRegistry.get(), sample_specs)
+        with kernel_override("attention", "decode", target):
+            explanation = explain_selection(
+                "attention",
+                "decode",
+                ATTN_DECODE_BF16,
+                features=features,
+                platform=h100_platform,
+            )
+        assert f"Override: {target} (kernel_override())" in explanation
+        for note in notes:
+            assert note in explanation
+        assert "[SELECTED" not in explanation
 
 
 class TestWarmupSelection:

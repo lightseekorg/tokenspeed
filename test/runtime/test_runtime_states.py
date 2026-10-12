@@ -39,7 +39,7 @@ def test_reset_states_preserves_unselected_rows(device, rows):
         pytest.skip("requires CUDA")
     states = RuntimeStates(4, 32, 2, device)
     states.valid_cache_lengths.fill_(7)
-    states.remote_spec_candidate_ready.fill_(True)
+    states.spec_candidates_ready.fill_(True)
     states.future_input_map.fill_(11)
     indices = torch.tensor(rows, dtype=torch.int64, device=device)
     lengths = torch.full((len(rows),), 100, dtype=torch.int32, device=device)
@@ -49,9 +49,7 @@ def test_reset_states_preserves_unselected_rows(device, rows):
     assert states.valid_cache_lengths.tolist() == [
         100 if i in rows else 7 for i in range(5)
     ]
-    assert states.remote_spec_candidate_ready.tolist() == [
-        i not in rows for i in range(5)
-    ]
+    assert states.spec_candidates_ready.tolist() == [i not in rows for i in range(5)]
     assert states.future_input_map.tolist() == [[11, 11]] * 5
 
 
@@ -130,7 +128,7 @@ def test_remote_landing_relies_on_the_receive_time_reset():
     before = probs.clone()
     states.write_remote_spec_candidate_ids(2, [5, 6, 7])
     assert states.future_input_map[2].tolist() == [5, 6, 7]
-    assert bool(states.remote_spec_candidate_ready[2])
+    assert bool(states.spec_candidates_ready[2])
     assert torch.equal(probs, before)
     for slot in range(5):
         expected = 3.0 if slot == 2 else 0.25
@@ -172,12 +170,12 @@ def test_reset_states_graph_replay_uses_current_inputs():
         indices.copy_(torch.tensor([1 + offset, 3 + offset], device="cuda"))
         lengths.fill_(512 + offset)
         states.valid_cache_lengths.zero_()
-        states.remote_spec_candidate_ready.fill_(True)
+        states.spec_candidates_ready.fill_(True)
         graph.replay()
         selected = (1 + offset, 3 + offset)
         assert states.valid_cache_lengths.tolist() == [
             512 + offset if i in selected else 0 for i in range(5)
         ]
-        assert states.remote_spec_candidate_ready.tolist() == [
+        assert states.spec_candidates_ready.tolist() == [
             i not in selected for i in range(5)
         ]

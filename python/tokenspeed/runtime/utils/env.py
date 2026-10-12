@@ -286,9 +286,11 @@ class Envs:
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
-    # Shared-expert parallelism. Keep raw strings so every rank can agree
-    # before strict validation; EnvInt would silently default malformed input.
-    TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvStr("1")
+    # Shared-expert parallelism.
+    TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvInt(1)
+    # Independent projection groups retain attention's local token ownership.
+    TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE = EnvInt(1)
+    TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE = EnvInt(1)
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
@@ -343,6 +345,13 @@ class Envs:
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
+    # "uniform" routes each token to a fixed random set of experts, so dummy
+    # weights spread MoE traffic like a trained router does.
+    TOKENSPEED_MOE_ROUTING_SIMULATION = EnvStr("")
+    # Tokens per request each speculative verify step keeps, on average, in
+    # place of what verification accepted. A raw string so malformed input
+    # fails at startup instead of silently turning the simulation off.
+    TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN = EnvStr("")
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)

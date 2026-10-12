@@ -244,7 +244,6 @@ class TestCLIConfigCompat(unittest.TestCase):
             sa.resolve_parallelism()
             sa.resolve_memory_and_scheduling()
             self.assertEqual(sa.gpu_memory_utilization, 0.95, tp)
-            self.assertTrue(sa._gpu_memory_utilization_defaulted, tp)
         sa = self._from_cli_args_no_init(
             self._parse_args(
                 [
@@ -261,7 +260,6 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_parallelism()
         sa.resolve_memory_and_scheduling()
         self.assertEqual(sa.gpu_memory_utilization, 0.8)
-        self.assertFalse(sa._gpu_memory_utilization_defaulted)
 
     def test_seed_arg(self):
         args = self._parse_args(["--model", "test/model", "--seed", "42"])
@@ -432,12 +430,18 @@ class TestCLIConfigCompat(unittest.TestCase):
                             "3",
                             "--kvstore-size",
                             "8",
+                            "--max-num-seqs",
+                            "16",
                         ]
                         if disabled:
                             argv.append("--disable-kvstore")
                         if role == "decode":
                             argv.append("--disable-prefix-caching")
                         sa = self._from_cli_args_no_init(self._parse_args(argv))
+                        # resolve_cache derives the retraction snapshot request
+                        # cap from max_num_seqs per attention-DP rank, so the
+                        # mapping must be resolved first, as in __post_init__.
+                        sa.resolve_parallelism()
                         sa.resolve_cache()
 
                         self.assertEqual(

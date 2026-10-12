@@ -55,7 +55,7 @@ class ZeroCachePagesContractTest(unittest.TestCase):
                 ),
                 virtual_block_counts={group_id: 64 for group_id in cls._GROUPS},
             ),
-            _cache_dcp_rank=0,
+            _cache_kvp_rank=0,
         )
 
     @classmethod

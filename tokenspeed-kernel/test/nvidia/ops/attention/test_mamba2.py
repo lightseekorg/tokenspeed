@@ -551,6 +551,66 @@ def test_tree_verify_scan_steps_each_node_like_its_root_path(state_dtype, staged
 
 
 @pytest.mark.parametrize(
+    "state_dtype, misaligned, tol",
+    [
+        (torch.float32, False, 1e-2),
+        (torch.float32, True, 1e-2),
+        (torch.bfloat16, False, 2e-2),
+    ],
+)
+@pytest.mark.parametrize("tree", [False, True])
+def test_verify_outputs_follow_the_recurrence_for_every_pool_layout(
+    state_dtype, misaligned, tol, tree
+):
+    """The pool's dtype and alignment pick how output rows are summed; each way matches fp64."""
+    batch, steps = 3, 4
+    parents = [-1, 0, 1, 0] if tree else [-1, 0, 1, 2]
+    A_log, D, dt_bias = _params(54)
+    x, dt, B, C = _verify_window(batch, steps, 55)
+    g = torch.Generator(device="cuda").manual_seed(56)
+    size = HEADS * HEAD_DIM * D_STATE
+    storage = 0.1 * torch.randn(1 + (1 + batch) * size, generator=g, device="cuda")
+    start = 1 if misaligned else 0
+    pool = storage[start : start + (1 + batch) * size].to(state_dtype)
+    pool = pool.view(1 + batch, HEADS, HEAD_DIM, D_STATE)
+    reads = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda")
+    out = torch.empty_like(x)
+    mamba2_verify_scan(
+        pool,
+        x,
+        dt,
+        A_log,
+        B,
+        C,
+        D,
+        dt_bias,
+        state_indices=reads,
+        dst_state_indices=None,
+        parent_indices=(
+            torch.tensor([parents] * batch, dtype=torch.int32, device="cuda")
+            if tree
+            else None
+        ),
+        null_slot=-1,
+        out=out,
+    )
+    for i in range(batch):
+        for node in range(steps):
+            path = _tree_path(parents, node)
+            ref_y, _ = _oracle(
+                x[i, path],
+                dt[i, path],
+                A_log,
+                B[i, path],
+                C[i, path],
+                D,
+                dt_bias,
+                pool[reads[i]],
+            )
+            assert _relative(out[i, node], ref_y[-1]) < tol, (i, node)
+
+
+@pytest.mark.parametrize(
     "steps, parent_dtype, match",
     [
         (3, torch.int64, "parent_indices must be contiguous int32"),

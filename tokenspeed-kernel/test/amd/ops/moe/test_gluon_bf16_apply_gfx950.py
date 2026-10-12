@@ -30,7 +30,11 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-import tokenspeed_kernel  # noqa: E402
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
+
+# noqa: E402
 
 # DeepSeek-V3 TP=8 MoE reference shape.
 E = 256
@@ -68,7 +72,7 @@ def test_gluon_bf16_moe_apply_matches_reference(num_tokens):
     topk_weights = (topk_weights / topk_weights.sum(-1, keepdim=True)).to(torch.float32)
     topk_ids = topk_ids.to(torch.int32)
 
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "bf16",
         input_dtype=torch.bfloat16,
         activation="swiglu",
@@ -88,9 +92,9 @@ def test_gluon_bf16_moe_apply_matches_reference(num_tokens):
     w.w13_weight = w13  # [E, 2*I, D], gate rows [0:I], up rows [I:2I]
     w.w2_weight = w2  # [E, D, I]
     w.top_k = TOPK
-    tokenspeed_kernel.moe_process_weights(plan, w)  # no-op for this plan
+    kernel_moe_process_weights(plan, w)  # no-op for this plan
 
-    out = tokenspeed_kernel.moe_apply(
+    out = kernel_moe_apply(
         plan, x, w, logits, topk_weights=topk_weights, topk_ids=topk_ids
     )
     torch.cuda.synchronize()

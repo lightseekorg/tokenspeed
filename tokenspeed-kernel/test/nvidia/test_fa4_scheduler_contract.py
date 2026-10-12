@@ -21,6 +21,12 @@
 import inspect
 
 import pytest
+from tokenspeed_kernel.platform import current_platform
+
+if not current_platform().is_blackwell:
+    pytest.skip(
+        "FA4 scheduler contract requires NVIDIA Blackwell", allow_module_level=True
+    )
 
 tile_scheduler = pytest.importorskip("flash_attn.cute.tile_scheduler")
 

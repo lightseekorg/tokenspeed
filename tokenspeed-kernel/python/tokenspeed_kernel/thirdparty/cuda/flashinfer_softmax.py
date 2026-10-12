@@ -57,7 +57,12 @@ def softmax(
     temperature: Optional[Union[float, torch.Tensor]] = None,
     enable_pdl: bool | None = None,
 ) -> torch.Tensor:
-    """softmax(logits / temperature). Returns fp32 probs."""
+    """softmax(logits / temperature). Returns fp32 probs.
+
+    With PDL enabled, logits and per-request temperatures may be written by a
+    preceding kernel in the same stream. Every softmax kernel waits for those
+    writes before reading either input; this also applies during graph replay.
+    """
     enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     assert logits.is_contiguous(), "softmax expects contiguous logits"
     assert logits.is_cuda, "softmax requires CUDA tensors"

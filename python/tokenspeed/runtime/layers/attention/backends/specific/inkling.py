@@ -59,6 +59,7 @@ from tokenspeed_kernel.ops.attention.rmha import (
 )
 from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
 
+from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     scrub_padding_tail,
@@ -70,8 +71,11 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     reject_bounded_replay,
     reject_query_shard,
 )
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 logger = logging.getLogger(__name__)
@@ -156,6 +160,10 @@ class InklingConvStatePool:
         layout (the tokenspeed_kernel ops/conv sconv kernels' contract)."""
         return self.conv_state[layer_id]
 
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """One slot's ring across every layer and its pending-hydration bit."""
+        return [self.conv_state[:, slot], self.remote_restore_pending[slot]]
+
     def mem_usage_bytes(self) -> int:
         return self.conv_state.nbytes + self.remote_restore_pending.nbytes
 
@@ -207,6 +215,50 @@ class InklingAttnBackend(AttentionBackend):
     arguments the dense path already receives, so the scheduler and executor
     are unaware anything beyond dense attention exists.
     """
+
+    @classmethod
+    def from_config(
+        cls,
+        inner: AttentionBackend,
+        text_config: InklingModelConfig,
+        attn_config: AttnConfig,
+        *,
+        num_layers: int,
+        is_draft: bool,
+        enable_layerwise_cache_ready: bool,
+    ) -> InklingAttnBackend:
+        """Construct the wrapper and its ring before the common pool binding.
+
+        The configs provide convolution geometry, TP and serving capacity;
+        ``num_layers`` is this view's layer count. ``is_draft`` labels the
+        allocation log. ``enable_layerwise_cache_ready`` selects layerwise
+        transfer notification and is passed through to the wrapper.
+        """
+        spec_tokens = attn_config.speculative_num_draft_tokens
+        # Keep pre-chunk taps and chunk writes disjoint modulo the ring size.
+        ring_size = text_config.sconv_kernel_size - 1 + spec_tokens
+        conv_pool = InklingConvStatePool(
+            num_layers=num_layers,
+            # Row 0 is reserved; the additional slot covers padding.
+            num_slots=attn_config.max_bs + 2,
+            conv_dim=inkling_conv_total_dim(
+                text_config, attn_config.component(SoftmaxAttnConfig).attn_tp_size
+            ),
+            ring_size=ring_size,
+            dtype=torch.bfloat16,
+            device=attn_config.device,
+        )
+        logger.info(
+            f"Inkling {('draft ' if is_draft else '')!s}conv state pool: {num_layers:d} "
+            f"layers x {attn_config.max_bs + 2:d} slots, "
+            f"{conv_pool.mem_usage_bytes() / (1 << 20):.1f} MiB",
+        )
+        return cls(
+            inner,
+            conv_pool,
+            spec_num_tokens=spec_tokens,
+            enable_layerwise_cache_ready=enable_layerwise_cache_ready,
+        )
 
     def __init__(
         self,
@@ -342,6 +394,13 @@ class InklingAttnBackend(AttentionBackend):
     def mark_remote_cache_ready(self, slot_index: int) -> None:
         """Arm endpoint hydration after the complete remote transfer succeeds."""
         self.conv_pool.remote_restore_pending[slot_index] = True
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # The engine-side ring is exact only as a byte copy: hydrating it from
+        # the paged checkpoint is right at an aligned boundary alone, and a
+        # retraction stops anywhere. The pending-hydration bit travels with it
+        # so a restore neither re-arms nor loses an armed hydration.
+        return self.conv_pool.slot_state_rows(slot)
 
     def _consume_remote_restore_mask(
         self,

@@ -15,19 +15,24 @@ jobs:
     name: Build universal wheel
     runs-on: ubuntu-latest
     steps:
-      - name: Require main
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require main or a pinned release
         env:
           SOURCE_REF: ${{ github.ref }}
         run: |
           if [ "$SOURCE_REF" != "refs/heads/main" ]; then
-            echo "Release tokenspeed-mla from main after merging its version bump." >&2
-            exit 1
+            if ! [[ "$SOURCE_REF" =~ ^refs/heads/bot/mla-release-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Release tokenspeed-mla from main or a pinned MLA release branch." >&2
+              exit 1
+            fi
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor HEAD origin/main
           fi
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5

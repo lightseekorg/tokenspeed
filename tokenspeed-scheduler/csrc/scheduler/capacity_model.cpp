@@ -100,13 +100,12 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
         const std::int64_t lookback = groups_[i].lookback_pages;
         const CacheGroupConfig& group = config_.cache_groups[i];
         const auto local_prefill_peak = [&] {
-            if (group.IsSnapshotStateGroup()) {
+            if (group.Kind() == AttnKind::kMambaState) {
                 if (token_limit == 0) return std::int64_t{0};
                 // Peak = retained input checkpoint (a later chunk's, or a prefix-cache hit)
                 // + aligned checkpoint + its materialized suffix/reserve. The
                 // forward holds both the final continuation and growth storage.
                 // P banks no decode growth; overlap keeps one more decode step live.
-                // A rebased recovery prompt may exceed max_prompt_tokens.
                 const auto output_blocks = [&](std::int64_t tail_tokens) {
                     const std::int64_t reserve_tokens =
                         config_.role == Role::kP
@@ -137,13 +136,12 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
             if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
-                // Remote landing: endpoint snapshot + banked growth block.
-                const std::int64_t snapshot_pages = token_limit == 0 ? 0 : 2;
-                // A retracted Decode request may recover by locally
-                // recomputing its suffix. Old State checkpoints are
-                // evictable, but one recovery chunk and its lookback must fit.
-                child_pages = std::max(snapshot_pages, local_prefill_peak());
-            } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
+                // Remote landing: endpoint snapshot + banked growth block. The
+                // D role never prefills locally -- a retracted request comes
+                // back by restoring its image, the same shape -- so no
+                // recovery chunk is charged.
+                child_pages = token_limit == 0 ? 0 : 2;
+            } else if (group.Kind() == AttnKind::kSlidingWindow) {
                 const std::int64_t dense_pages =
                     ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
                 const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
@@ -195,7 +193,7 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
         const std::int64_t dense_pages =
             ceilDiv(max_total_tokens, block_granularity) +
             live_requests * ceilDiv(block_granularity - 1 + protected_tokens, block_granularity);
-        if (group.IsSnapshotStateGroup()) {
+        if (group.Kind() == AttnKind::kMambaState) {
             group_pages[i] = live_requests * single_request_pages[i];
         } else if (groups_[i].prefix_closed) {
             group_pages[i] = dense_pages;

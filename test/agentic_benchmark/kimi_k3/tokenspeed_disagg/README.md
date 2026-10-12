@@ -16,10 +16,10 @@ turn, 800-token later turns, 10-15 turns) and then run
 with a unique `[rid:<hash>]` mark prepended to its first user message, so
 replicas are distinct prefixes rather than cache hits. The result,
 `agentic_dataset_x32.json` (2272 conversations, all distinct first turns), is
-the only file the client reads; the 128-wide decode rung needs 128 of them.
+the only file the client reads. The 128-wide decode rung needs 128 of them.
 Replicas are interleaved, so the first 71 entries are the originals.
 
-Synthetic random-token prompts are deliberately NOT used: speculative
+The sweeps deliberately do not use synthetic random-token prompts: speculative
 acceptance and MoE expert routing are content-sensitive.
 
 Real-workload anchors (measured): fresh prefill = ~50K tokens, 1 per
@@ -30,31 +30,32 @@ conversation (~8% of requests, ~75% of prefill compute); cached prefill =
 
 Every pd_client request carries `rid=pdsim-conv-<index>`. The gateway runs
 `--dp-aware --sticky-sessions --policy round_robin`: each DP rank is a
-routable worker, a conversation's first request is placed round-robin, and
-every later request with the same rid is pinned to that rank. The engine's own
-DP dispatch is load-based and each rank's cache is private, so without this a
-resent prompt reaches the rank that primed it only by chance.
+routable worker, the gateway places a conversation's first request
+round-robin, and pins every later request with the same rid to that rank.
+The engine's own DP dispatch is load-based and each rank's cache is private,
+so without this a resent prompt reaches the rank that primed it only by
+chance.
 
 ## P-sim: prefill-node simulation
 
 Batch contains prefill only (`max_tokens 1` kills the decode phase). One boot
-per config, fresh phase then cached phase; a warmup of one cold prefill per DP
+per config, fresh phase then cached phase. A warmup of one cold prefill per DP
 rank on spare conversations 64-79 (excluded from every metric) absorbs
 first-touch costs on every rank before the timed rungs.
 
 **P-fresh (compute-bound):** send unique first turns cold. Ladder: parallel
-1/2/4/8/16, number = 2 x parallel, offsets advance so no prompt is reused
+1/2/4/8/16, number = 2 x parallel, offsets advance so no prompt repeats
 (62 conversations). Ranking: **prefill tok/s / GPU**; secondary TTFT p50/p99.
 Validity guard: cache hit <= 5%.
 
 **P-cached (bandwidth-bound, distinct prefixes):** per conversation, prime
 turn 1 with `max_tokens 500` (excluded from measurement), then measure turn 2
 with `max_tokens 1`: a cached prefill of the ~50K prefix plus the ~800-token
-turn increment. The prime's reasoning_content and content are passed back in
-the replayed assistant turn; whatever the re-rendered turn fails to match is
-recomputed and counted. Ranking: **computed tok/s / GPU = (prompt_tokens -
-cached_tokens) / time**; secondary requests/s and TTFT p50/p99. Validity
-guard: cache hit >= 95%.
+turn increment. The client passes the prime's reasoning_content and content
+back in the replayed assistant turn. Whatever the re-rendered turn fails to
+match is recomputed and counted. Ranking: **computed tok/s / GPU =
+(prompt_tokens - cached_tokens) / time**; secondary requests/s and TTFT
+p50/p99. Validity guard: cache hit >= 95%.
 
 ## D-sim: decode-node simulation
 
@@ -67,13 +68,13 @@ Each rung is its own prime-measure loop:
 
 1. **Prime** the rung's conversations (0 .. parallel - 1) with
    `max_tokens 1` at concurrency 16, one cold prefill per DP rank.
-2. **Settle 10s**: the host writebacks of the primed contexts are issued
-   within a second of each request finishing, and launching the measure
+2. **Settle 10s**: the engine issues the host writebacks of the primed
+   contexts within a second of each request finishing, and launching the measure
    client as a job step adds about 20 s on top.
 3. **Measure**: resend the same first turns, `max_tokens 2000` + `ignore_eos`,
    as one lockstep wave of exactly parallel requests. Sticky placement fixes
    each conversation's rank, so rolling admission could not hold per-rank
-   concurrency constant anyway; one wave keeps every rank at parallel/16
+   concurrency constant anyway. One wave keeps every rank at parallel/16
    requests for the whole rung.
 4. Rungs: parallel 16/32/64/128 (one to eight requests per rank).
    Ranking: **Output Throughput (tok/s) / GPU**; secondary TPOT p50/p99.
@@ -84,7 +85,7 @@ checkpoint block per state group each), so a measured rung roughly triples the
 footprint of the contexts it replays. Under a single up-front prime, that
 growth evicts the contexts a later rung needs (observed: rung 128 missing
 exactly the half rung 64 had not touched). Priming right before each rung
-refreshes exactly what the rung will read.
+refreshes exactly what the rung reads.
 
 Validity guard, recorded per rung in the collect output: **cache hit >= 95%**
 on the measure wave — below it the rung is VOID (primed KV evicted, or a
@@ -98,7 +99,7 @@ request reached a rank other than the one holding its KV).
   agentic bench, so acceptance lengths are comparable across the two. A
   rung's output throughput is output divided by the wall time set by its
   slowest request, so D-sim differences below the measured noise band need
-  repeated runs; TPOT p50 is the steadier column.
+  repeated runs. TPOT p50 is the steadier column.
 - Config: `--max-num-seqs 128` (8 slots per rank), chunked prefill 8192 with
   `--gpu-memory-utilization 0.8` — the trtllm MoE workspace scales with the
   tokens gathered from all 16 ranks per step, and 16 x 8192 needs the headroom
@@ -118,11 +119,11 @@ request reached a rank other than the one holding its KV).
   inherits the gap.
 - Every summary and collect report carries the boundaries statement: no
   KV-transfer cost modeled; prime-as-transfer is the core approximation;
-  single deployment; TTFT is approximated by full-request latency at
+  single deployment; TTFT approximated by full-request latency at
   max_tokens 1; TPOT (d-measure only) amortizes the cache-hit KV load into
   per-token time.
 - The KV host tier (`kvstore`) holds finished contexts once they leave the
-  device; measured hits are then host-to-device load-backs. Its pool is pinned
+  device. Measured hits are then host-to-device load-backs. Its pool is pinned
   host memory sized per rank, and the config caps it at `--kvstore-size 80`
   (GB, about one device arena): the default 2x ratio would pin ~162 GB per
   rank, and four ranks share one node's Slurm memory limit (880 GiB here), so
@@ -144,7 +145,7 @@ python3 test/agentic_benchmark/kimi_k3/tokenspeed_disagg/collect_outputs.py \
     test/agentic_benchmark/kimi_k3/tokenspeed_disagg/outputs/d_<ts>
 ```
 
-The wrapper is a foreground loop; run it under nohup (or sbatch it, see the
+The wrapper is a foreground loop. Run it under nohup (or sbatch it, see the
 usage header) so a dropped session does not stop the sweep.
 
 ## Layout

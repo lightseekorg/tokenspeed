@@ -37,10 +37,12 @@ from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
     write_prefill_recurrent_checkpoints,
 )
 from tokenspeed_kernel.ops.attention.gdn import (
+    gdn_chain_verify_is_chunked,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
     gdn_replay_commit,
+    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CAUSAL_CONV1D_BLOCK_M,
@@ -491,6 +493,7 @@ class MambaAttnBackend(AttentionBackend):
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
         self._verify_seed_dst_cache: dict[tuple[int, int, int], torch.Tensor] = {}
         self._verify_grid_cache: dict[tuple[int, int], torch.Tensor] = {}
+        self._chain_ancestors_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._verify_base_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._qsl_dirty: list[bool] = []
         self._qsl_last_mode: list[tuple[ForwardMode, bool] | None] = []
@@ -765,7 +768,11 @@ class MambaAttnBackend(AttentionBackend):
                     ),
                     state_dtype=ssm.dtype,
                 )
-            if self.draft_tree and self._tree_node_state_workspace:
+            if (
+                self.draft_tree
+                and self._tree_node_state_workspace
+                and gdn_tree_verify_needs_node_states(draft_token_num)
+            ):
                 self._tree_node_states = torch.zeros(
                     (max_bs, draft_token_num, *ssm.shape[1:]),
                     dtype=ssm.dtype,
@@ -919,6 +926,26 @@ class MambaAttnBackend(AttentionBackend):
 
     def _tree_parents(self, bs: int) -> torch.Tensor | None:
         return None if self.tree_verify is None else self.tree_verify.parent[:bs]
+
+    def _verify_ancestors(
+        self, bs: int, draft_token_num: int, num_value_heads: int
+    ) -> torch.Tensor | None:
+        """Ancestor masks for the GDN verify: the draft tree's, or a ReplaySSM
+        chain's where it verifies in the chunked form (a one-path tree).
+        Memoized per (bs, T): CUDA-graph capture records the tensor's storage."""
+        if self.tree_verify is not None:
+            return self.tree_verify.mask.view(-1, self.tree_verify.num_nodes)[:bs]
+        if not self.replay_ssm or not gdn_chain_verify_is_chunked(
+            draft_token_num, bs * num_value_heads
+        ):
+            return None
+        key = (bs, draft_token_num)
+        ancestors = self._chain_ancestors_cache.get(key)
+        if ancestors is None:
+            steps = torch.arange(draft_token_num, device=self.device)
+            ancestors = ((1 << (steps + 1)) - 1).repeat(bs, 1)
+            self._chain_ancestors_cache[key] = ancestors
+        return ancestors
 
     def _verify_scratch_grid(self, bs: int, draft_token_num: int) -> torch.Tensor:
         """Scratch row grid ``[bs, draft_token_num]``: row ``req*(T+1)`` is
@@ -2541,7 +2568,7 @@ class MambaAttnBackend(AttentionBackend):
             initial_state = ssm_comp
             initial_indices = state_in_blocks[:batch_size]
             output_state_indices = None
-            if self.tree_verify is not None:
+            if self._tree_node_states is not None:
                 intermediate_states = self._tree_node_states[:batch_size]
         else:
             initial_state = ssm_scratch
@@ -2571,7 +2598,9 @@ class MambaAttnBackend(AttentionBackend):
             use_qk_l2norm=True,
             output_state_indices=mtp_output_indices,
             intermediate_states_buffer=intermediate_states,
-            parent_indices=self._tree_parents(batch_size),
+            tree_ancestors=self._verify_ancestors(
+                batch_size, draft_token_num, num_value_heads
+            ),
             disable_state_update=self.replay_ssm,
             solution=mtp_solution,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)

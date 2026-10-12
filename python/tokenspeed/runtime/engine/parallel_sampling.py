@@ -83,15 +83,19 @@ def prepare_prefix_warmup(
 def prepare_parallel_sampling_replica(
     tmp_obj: GenerateReqInput | EmbeddingReqInput,
     tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
+    replica_index: int,
 ) -> TokenizedGenerateReqInput | TokenizedEmbeddingReqInput:
     """Build one tokenized replica for parallel-sampling fan-out.
 
     Mutates ``tmp_obj`` to receive a fresh rid; returns a copy of
-    ``tokenized_obj`` sharing that rid. The rest of the tokenized
-    payload (sampling_params, input_ids, etc.) is unchanged because
-    the replicas share everything except their request identity.
+    ``tokenized_obj`` sharing that rid. Each replica gets its own
+    ``sampling_params`` with a per-replica seed; the rest of the payload
+    is shared.
     """
     tokenized_copy = copy.copy(tokenized_obj)
     _own_multimodal_inputs(tokenized_copy)
     tokenized_copy.rid = tmp_obj.regenerate_rid()
+    tokenized_copy.sampling_params = tokenized_obj.sampling_params.for_parallel_sample(
+        replica_index
+    )
     return tokenized_copy

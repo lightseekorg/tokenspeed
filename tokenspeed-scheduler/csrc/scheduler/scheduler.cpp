@@ -51,6 +51,10 @@ std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
 }
 
+std::int32_t snapshotPoolBlocks(const SchedulerConfig& config) {
+    return config.HasSnapshotPool() ? config.snapshot_allocator.NumUsableBlocks() : 0;
+}
+
 std::vector<std::int32_t> slotsPerParentByGroup(const SchedulerConfig& config) {
     std::vector<std::int32_t> slots_per_group;
     slots_per_group.reserve(config.cache_groups.size());
@@ -82,10 +86,13 @@ CacheKey eventKey(const CacheKey& key) {
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
       req_pool_allocator_{config_.max_batch_size},
+      snapshot_slots_{config_.max_retracted_requests},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
       host_pool_{hostPoolBlocks(config_), slotsPerParentByGroup(config_)},
+      snapshot_pool_{snapshotPoolBlocks(config_), slotsPerParentByGroup(config_)},
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
                                    config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
+                                   snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost())},
       tier_transfers_{coordinator_} {
     // config_.Validate() already ran; the body only derives state from it.
@@ -193,7 +200,7 @@ bool Scheduler::cacheIsClearable(bool include_host) const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
-    if (has_pd_transfers || has_tier_transfers) {
+    if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0) {
         return false;
     }
     return coordinator_.CacheIsClearable(include_host);
@@ -204,13 +211,19 @@ bool Scheduler::clearCache(bool include_host) {
     // completes its pin check before mutating anything -- so residency is not
     // this function's business. What IS its business are the writers the pins
     // do not cover: an asynchronous transfer still landing into a cached
-    // block would race a clear that succeeded on the pin check alone.
+    // block would race a clear that succeeded on the pin check alone. And the
+    // images the pins do not show: a request suspended with its KV on Host
+    // continues from those bytes once restored, so a flush (a weight update)
+    // under it would resume old-weight KV under new weights. Its L2 leg is
+    // pinned and would refuse the Host clear by itself; its snapshot-pool leg
+    // is not indexed anywhere, so the suspended set is checked directly.
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight();
-    if (has_pd_transfers || has_tier_transfers) {
-        spdlog::info("[Scheduler] flush L1 cache rejected: pd_transfers={} tier_transfers={}", has_pd_transfers,
-                     has_tier_transfers);
+    const std::size_t suspended = RetractedSize();
+    if (has_pd_transfers || has_tier_transfers || suspended > 0) {
+        spdlog::info("[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={}",
+                     include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended);
         return false;
     }
     const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
@@ -315,7 +328,13 @@ std::size_t Scheduler::BootstrappingSize() const {
 
 std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Submitted, fsm::Retracted>();
+        return request->IsAnyOf<fsm::Submitted, fsm::Prefetching, fsm::Retracted, fsm::Restoring>();
+    }));
+}
+
+std::size_t Scheduler::RetractedSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Retracted, fsm::Restoring>();
     }));
 }
 
@@ -372,72 +391,6 @@ std::vector<std::string> Scheduler::PrefixHashesForTokens(const std::vector<std:
     return ComputePrefixHashes(prefix_pages, "");
 }
 
-std::vector<std::string> Scheduler::WaitingPrefixHashes() const {
-    std::vector<Request*> candidates;
-    candidates.reserve(requests_.size());
-    for (const auto& request : requests_) {
-        candidates.push_back(request.get());
-    }
-    Request* readmission = nextReadmission(candidates);
-
-    bool hol_blocks_new_prompts = false;
-    for (const auto& request : requests_) {
-        const auto* prefilling = request->GetIf<fsm::Prefilling>();
-        if (prefilling != nullptr) {
-            hol_blocks_new_prompts = true;
-            break;
-        }
-    }
-    const std::int32_t occupied = static_cast<std::int32_t>(PrefillSize() + DecodingSize());
-    const std::int32_t free_slots = config_.max_batch_size - occupied;
-    if (free_slots <= 0 && readmission == nullptr) {
-        return {};
-    }
-
-    std::vector<std::string> hashes;
-    std::unordered_set<std::string> seen;
-    const auto append_hashes = [&](const Request& request) {
-        std::vector<std::span<const std::int32_t>> prefix_pages = request.FullPrefixPages(/*except_last=*/false);
-        const std::int32_t candidate_prefix_pages =
-            std::max((request.PrefillSize() - 1) / config_.prefix_granularity, 0);
-        prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-        for (std::string& content_hash : ComputePrefixHashes(prefix_pages, "")) {
-            if (seen.insert(content_hash).second) {
-                hashes.push_back(std::move(content_hash));
-            }
-        }
-    };
-    if (readmission != nullptr) {
-        append_hashes(*readmission);
-    }
-    if (free_slots <= 0 || hol_blocks_new_prompts || AvailableLcmBlocks() <= 0) {
-        return hashes;
-    }
-    std::int32_t remaining = free_slots;
-    if (readmission != nullptr) {
-        remaining = std::max(remaining - 1, 0);
-    }
-    for (Request* request : candidates) {
-        if (remaining <= 0) {
-            break;
-        }
-        if (request == readmission) {
-            continue;
-        }
-        if (request->Is<fsm::Submitted>()) {
-            append_hashes(*request);
-            --remaining;
-            continue;
-        }
-        const auto* retracted = request->GetIf<fsm::Retracted>();
-        if (retracted != nullptr && !retracted->HasRecoverableSnapshot()) {
-            append_hashes(*request);
-            --remaining;
-        }
-    }
-    return hashes;
-}
-
 std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
     const auto it = requests_by_id_.find(id);
     return it == requests_by_id_.end() ? -1 : it->second->TokenSize();
@@ -462,11 +415,11 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
             candidates.push_back(request.get());
         }
     }
+    ++plan_calls_;
     ExecutionPlan plan;
-    auto [forward_operations, load_back_operations] =
-        buildForwardOperations(plan, std::move(candidates), write_back_operations);
+    BuiltOperations built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
 
-    plan.With(ForwardBatch{std::move(forward_operations)});
+    plan.With(ForwardBatch{std::move(built.forward)});
 
     if (config_.StreamsDeviceCacheToHost()) {
         // Boundary publications of live requests: their owners hold the pages,
@@ -477,11 +430,24 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         }
     }
 
+    // Store legs first (the runtime fences the forward thread's stream on the
+    // stream-ordered ones before the plan's page reuse), then the L3
+    // prefetches (no stream dependency: nothing in the round reads them),
+    // then the loads.
     if (!write_back_operations.empty()) {
         plan.With(CacheOperation{WriteBackBatch{write_back_operations}});
     }
-    if (!load_back_operations.empty()) {
-        plan.With(CacheOperation{LoadBackBatch{load_back_operations}});
+    if (!built.snapshot_stores.empty()) {
+        plan.With(CacheOperation{SnapshotStoreBatch{built.snapshot_stores}});
+    }
+    if (!built.prefetches.empty()) {
+        plan.With(CacheOperation{PrefetchBatch{built.prefetches}});
+    }
+    if (!built.load_backs.empty()) {
+        plan.With(CacheOperation{LoadBackBatch{built.load_backs}});
+    }
+    if (!built.snapshot_restores.empty()) {
+        plan.With(CacheOperation{SnapshotRestoreBatch{built.snapshot_restores}});
     }
     return plan;
 }

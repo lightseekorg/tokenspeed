@@ -113,11 +113,15 @@ from tokenspeed.runtime.layers.attention.page_table import (
     mask_invalid_graph_tokens as _mask_invalid_graph_tokens,
 )
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+from tokenspeed.runtime.layers.moe import topk as topk_module
 from tokenspeed.runtime.layers.paged_attention import bind_cache_groups
 from tokenspeed.runtime.layers.quantization import (
     QUANTIZATION_METHODS,
     Fp8Config,
     Mxfp4Config,
+)
+from tokenspeed.runtime.model_loader.weight_utils import (
+    initialize_dummy_integer_weights,
 )
 from tokenspeed.runtime.models import deepseek_v4 as deepseek_v4_model
 from tokenspeed.runtime.models.deepseek_v4 import (
@@ -201,9 +205,9 @@ def _v4_backend(flat: SimpleNamespace) -> DeepseekV4AttentionBackend:
     config_fields = {k: v for k, v in fields.items() if k not in _V4_SPEC_FIELDS}
     config_fields.setdefault("speculative_num_steps", 0)
     config_fields.setdefault("speculative_num_draft_tokens", 1)
-    config_fields.setdefault("dcp_size", 1)
-    config_fields.setdefault("dcp_rank", 0)
-    config_fields.setdefault("dcp_group", (0,))
+    config_fields.setdefault("kvp_size", 1)
+    config_fields.setdefault("kvp_rank", 0)
+    config_fields.setdefault("kvp_group", (0,))
     backend = DeepseekV4AttentionBackend(
         SimpleNamespace(**config_fields), SimpleNamespace(**spec_fields)
     )
@@ -295,7 +299,7 @@ def _v4_recipe(
             max_bs=1,
             context_len=4096,
             pd_disaggregation_enabled=False,
-            dcp_size=1,
+            kvp_size=1,
         ),
         draft_model_config=None,
         draft_attn_config=None,
@@ -373,8 +377,8 @@ def _make_deepseek_v4_cache_metadata(*, page_size, page_table, block_tables):
         page_size=page_size,
         page_table=page_table,
         block_tables=block_tables,
-        dcp_size=1,
-        dcp_rank=0,
+        kvp_size=1,
+        kvp_rank=0,
         runtime_contract=_replicated_placement(block_tables),
     )
     cache.refresh_page_tables()
@@ -807,6 +811,32 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertIs(output.topk_ids, topk_ids)
         self.assertIs(output.router_logits, router_logits)
         self.assertEqual(calls[0][0][2:6], ("sqrt_softplus", "topk", True, 2.0))
+
+    def test_deepseek_v4_topk_routes_simulated_logits(self):
+        router_logits = torch.zeros((2, 4))
+        seen = []
+
+        def fake_moe_topk(logits, *args, **kwargs):
+            seen.append(logits)
+            return torch.ones((2, 2)), torch.zeros((2, 2), dtype=torch.int32)
+
+        with (
+            patch.dict(os.environ, {"TOKENSPEED_MOE_ROUTING_SIMULATION": "uniform"}),
+            patch.dict(topk_module._simulated_logits, clear=True),
+            patch.object(deepseek_v4_model, "moe_topk", fake_moe_topk),
+        ):
+            output = DeepseekV4TopK(
+                top_k=2,
+                renormalize=True,
+                correction_bias=torch.zeros(4),
+                routed_scaling_factor=1.0,
+                hash_routing=False,
+            )(torch.ones((2, 3)), router_logits)
+            expected = topk_module.simulated_router_logits(router_logits)
+
+        torch.testing.assert_close(seen[0], expected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(seen[0], router_logits))
+        self.assertIs(output.router_logits, seen[0])
 
     def test_deepseek_v4_moe_stream_fork_disabled_order(self):
         calls = []
@@ -2879,9 +2909,9 @@ class TestDeepseekV4Config(unittest.TestCase):
                 speculative_num_draft_tokens=1,
                 head_dim=4,
                 context_len=4096,
-                dcp_size=2,
-                dcp_rank=1,
-                dcp_group=(0, 1),
+                kvp_size=2,
+                kvp_rank=1,
+                kvp_group=(0, 1),
             )
         )
         backend.init_cuda_graph_state(max_bs=4, max_tokens_per_req=1)
@@ -6682,6 +6712,24 @@ class TestDeepseekV4Config(unittest.TestCase):
         self.assertEqual(logits.dtype, torch.float32)
         self.assertTrue(torch.allclose(logits, expected))
 
+    def test_deepseek_v4_dummy_hash_table_spreads_tokens_over_experts(self):
+        config = SimpleNamespace(
+            n_routed_experts=16,
+            hidden_size=8,
+            num_hash_layers=1,
+            vocab_size=64,
+            num_experts_per_tok=4,
+        )
+        gate = DeepseekV4MoEGate(config, layer_index=0)
+        gate.tid2eid.data.fill_(-1)
+
+        initialize_dummy_integer_weights(gate)
+
+        table = gate.tid2eid
+        self.assertTrue(bool(((table >= 0) & (table < 16)).all()))
+        self.assertTrue(all(row.unique().numel() == 4 for row in table))
+        self.assertEqual(table.unique().numel(), 16)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_deepseek_v4_gate_dsv3_router_gemm_shape(self):
         major, _ = torch.cuda.get_device_capability()
@@ -6859,7 +6907,7 @@ def test_v4_pd_recipe_and_readiness_follow_cache_producers():
             ),
         ),
         attn_config=SimpleNamespace(
-            dcp_size=1,
+            kvp_size=1,
             pd_disaggregation_enabled=True,
             prefix_granularity=256,
             max_bs=2,
@@ -6927,18 +6975,18 @@ def _unbound_deepseek_v4_backend():
     backend = DeepseekV4AttentionBackend.__new__(DeepseekV4AttentionBackend)
     backend._init_pool_binding()
     backend._init_cache_group_latches()
-    backend.dcp_size = 1
-    backend.dcp_rank = 0
-    backend.dcp_group = (0,)
+    backend.kvp_size = 1
+    backend.kvp_rank = 0
+    backend.kvp_group = (0,)
     return backend
 
 
 class DeepseekV4RebindTest(unittest.TestCase):
-    def test_indexer_cache_uses_dcp_topology_but_state_remains_replicated(self):
+    def test_indexer_cache_uses_kvp_topology_but_state_remains_replicated(self):
         for degree in (1, 4):
             with self.subTest(degree=degree):
                 backend = _unbound_deepseek_v4_backend()
-                backend.dcp_size = degree
+                backend.kvp_size = degree
                 pool = _cache_pool_with_page_counts(
                     {"v4.c4a.indexer_kv": 16, "v4.c4a.indexer_compressor_state": 4},
                     4,
@@ -6956,12 +7004,12 @@ class DeepseekV4RebindTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "topologies disagree"):
                         backend.set_cache_pool(pool)
 
-    def test_dcp_rebind_and_runtime_configuration_retain_virtual_page_bounds(self):
+    def test_kvp_rebind_and_runtime_configuration_retain_virtual_page_bounds(self):
         for degree in (1, 4):
             with self.subTest(degree=degree):
                 backend = _unbound_deepseek_v4_backend()
-                backend.dcp_size = degree
-                backend.dcp_group = tuple(range(degree))
+                backend.kvp_size = degree
+                backend.kvp_group = tuple(range(degree))
                 for pages in (4, 16):
                     pool = _cache_pool_with_page_counts(
                         {"v4.swa_kv": pages, "v4.c128a.compressed_kv": pages}, 4, 1

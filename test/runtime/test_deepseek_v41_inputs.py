@@ -229,7 +229,7 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         "vocab_size",
         "valid_cache_lengths",
         "future_input_map",
-        "remote_spec_candidate_ready",
+        "spec_candidates_ready",
         "draft_probs",
         "draft_probs_sentinel",
         "chain_parents",
@@ -917,7 +917,7 @@ def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
         assert x.dtype == layer.input_dtype
         return x
 
-    monkeypatch.setattr(model_executor.tokenspeed_kernel, "moe_apply", fake_apply)
+    monkeypatch.setattr(model_executor, "kernel_moe_apply", fake_apply)
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = torch.device("cpu")
     executor.drafter = SimpleNamespace(
@@ -1018,7 +1018,7 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         SimpleNamespace(
             forward_thread=SimpleNamespace(submit=submit), execute_forward_op=execute
         ),
-        l2_cache_executor=None,
+        host_cache_executor=None,
         kv_transfer=None,
     )
     planned = PlannedForward(

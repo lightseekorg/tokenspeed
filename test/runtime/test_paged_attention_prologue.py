@@ -185,8 +185,8 @@ def test_the_prefill_prologue_runs_over_every_row_before_the_break(monkeypatch):
     )
 
 
-def test_the_write_lands_on_this_ranks_shard_under_dcp(monkeypatch):
-    """Under decode context parallelism the layer hands the pool this rank's
+def test_the_write_lands_on_this_ranks_shard_under_kvp(monkeypatch):
+    """Under KV parallelism the layer hands the pool this rank's
     local slots and the ownership mask; rows another rank owns, and padding
     rows, resolve to slot 0 with a False mask."""
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
@@ -231,7 +231,7 @@ def test_a_query_shard_gathers_the_rotated_latent_before_the_masked_store(
     """Under query context parallelism the layer rotates its own rows without
     a cache, all-gathers the rotated latent to the whole span with the plan's
     row counts, and stores it through the owner-masked target: the same
-    masked write as DCP alone, fed by every rank's rows."""
+    masked write as KVP alone, fed by every rank's rows."""
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 

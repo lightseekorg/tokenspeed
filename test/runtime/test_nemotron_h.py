@@ -32,7 +32,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
-from tokenspeed_kernel.ops.gemm.fp8_utils import static_quant_fp8
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import Mamba2Config
@@ -106,6 +106,18 @@ def test_mamba2_component_maps_ssd_geometry_onto_the_linear_fields():
     assert mamba2.conv_dim == 2 * 2 * 16 + 8 * 4
     assert mamba2.conv_state_shape == (mamba2.conv_dim // 2, 3)
     assert mamba2.temporal_state_shape == (4, 4, 16)
+
+
+def test_mamba2_component_reads_a_1e30_dt_bound_as_unbounded():
+    config = _config(time_step_limit=(0.0, 1e30))
+    model_config = SimpleNamespace(hf_text_config=config)
+    server_args = SimpleNamespace(
+        mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=1))
+    )
+    assert Mamba2Config.generate(server_args, model_config).dt_limit == (
+        0.0,
+        float("inf"),
+    )
 
 
 def test_non_gated_expert_plan_loads_up_proj_as_all_of_w13():
@@ -602,7 +614,7 @@ def test_gated_norm_quantizes_for_a_static_fp8_out_proj():
     )
 
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
-    expected, _ = static_quant_fp8(out, scale)
+    expected, _ = quantize_fp8(out, scale=scale)
     assert torch.equal(out_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 
@@ -632,7 +644,7 @@ def test_add_norm_folds_both_moe_halves_into_the_residual(with_fp8: bool):
     torch.testing.assert_close(normed.float(), ref, atol=2e-2, rtol=2e-2)
     assert (normed_fp8 is not None) == with_fp8
     if with_fp8:
-        expected, _ = static_quant_fp8(normed, scale)
+        expected, _ = quantize_fp8(normed, scale=scale)
         assert torch.equal(normed_fp8.view(torch.uint8), expected.view(torch.uint8))
 
 
@@ -721,6 +733,36 @@ def test_quantized_fc2_sees_the_reduced_latent_and_counts_once(
         assert torch.equal(out, torch.full((2, 4), 3.0))
     else:
         assert out is None
+
+
+def test_moe_without_a_latent_runs_the_experts_on_the_input():
+    """Without ``moe_latent_size`` the routed experts take and return full-width rows."""
+    from tokenspeed.runtime.models import nemotron_h
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    seen = {}
+    moe = SimpleNamespace(
+        stream_fork=StreamFork(torch.cuda.Stream()),
+        gate=lambda x: x * 3,
+        shared_experts=lambda x: x * 2,
+        fc1_latent_proj=None,
+        _routed=lambda x, logits, latent, ctx: seen.setdefault("latent", latent),
+    )
+    hidden = torch.arange(8.0, device="cuda").view(2, 4)
+    routed, shared = nemotron_h.NemotronHMoE.forward(moe, hidden, None, None)
+    assert seen["latent"] is hidden and routed is hidden
+    assert torch.equal(shared, hidden * 2)
+
+    experts_out = torch.ones(2, 4)
+    moe = SimpleNamespace(
+        topk=lambda x, logits: None,
+        comm_manager=SimpleNamespace(get_num_tokens=lambda ctx: (2, 2)),
+        experts=lambda **kwargs: experts_out,
+        fc2_latent_proj=None,
+    )
+    assert (
+        nemotron_h.NemotronHMoE._routed(moe, hidden, None, hidden, None) is experts_out
+    )
 
 
 @pytest.mark.parametrize("graph_phase,capture", [(False, False), (True, True)])
@@ -1124,7 +1166,7 @@ def test_static_per_tensor_checkpoint_runs_a_merged_projection(
     assert error.item() < 1e-2
 
     # A producer that already quantized with the layer's scale gets the same GEMM.
-    x_prequantized, _ = static_quant_fp8(x, layer.input_scale)
+    x_prequantized, _ = quantize_fp8(x, scale=layer.input_scale)
     out_prequantized = method.apply(layer, x_prequantized)
     assert out_prequantized.dtype == torch.bfloat16
     assert torch.equal(out_prequantized, out)

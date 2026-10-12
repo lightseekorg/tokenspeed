@@ -227,6 +227,7 @@ def test_mixed_round_preserves_prefill_outputs():
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.sampling_backend = backend
+    executor._simulated_accept_length = None
     executor._apply_force_single_token_verify = lambda accept, off, cnt, ids: accept
 
     out_tokens, out_accept = ModelExecutor._run_sampling(
@@ -310,6 +311,7 @@ def test_mixed_round_preserves_prefill_logprobs():
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.sampling_backend = backend
+    executor._simulated_accept_length = None
     executor._apply_force_single_token_verify = lambda accept, off, cnt, ids: accept
 
     logits_output = LogitsProcessorOutput(next_token_logits=logits)

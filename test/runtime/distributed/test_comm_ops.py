@@ -284,6 +284,7 @@ def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
         gpu_id=0,
         dist_init_addr=None,
         nccl_port=1234,
+        emulate_rank_zero=False,
         distributed_timeout_seconds=10,
         mapping=mapping,
         hidden_size=0,

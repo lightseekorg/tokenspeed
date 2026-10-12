@@ -85,7 +85,10 @@ class GroupTableSpec:
         return self.block_granularity // self.kernel_page_size
 
 
-@triton.jit(do_not_specialize=["num_blocks", "src_stride_b", "actual_bs"])
+@triton.jit(
+    do_not_specialize=["num_blocks", "src_stride_b", "actual_bs"],
+    do_not_specialize_on_alignment=["src_ptr"],
+)
 def _unpack_group_kernel(
     src_ptr,  # this group's raw table [>= actual_bs, num_blocks] int32
     dst_ptr,  # this group's stack [max_bs, stack_max_num_pages] int32

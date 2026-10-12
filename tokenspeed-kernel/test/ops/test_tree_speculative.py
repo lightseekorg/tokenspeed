@@ -109,26 +109,41 @@ def test_verify_tree_matches_reference(n, max_depth, vocab):
 
 
 def _paged_tree_problem(
-    bs, n, prefix_lens, hq, hkv, d, page, gen, rows=None, seen_width=None
+    bs,
+    n,
+    prefix_lens,
+    hq,
+    hkv,
+    d,
+    page,
+    gen,
+    rows=None,
+    seen_width=None,
+    kv_dtype=torch.bfloat16,
 ):
     """A paged HND cache holding each request's prefix + ``n``-key tree window,
     plus the reference. ``rows=None`` is verify (a row per node, ancestor
-    masks); otherwise ``rows`` lane rows per request with random window masks."""
+    masks); otherwise ``rows`` lane rows per request with random window masks.
+    K/V hold values exact in ``kv_dtype``, so the reference sees what it stores."""
     r = n if rows is None else rows
+
+    def stored(x):
+        return x.to(kv_dtype).bfloat16()
+
     scale = d**-0.5
     pages_per_req = max((p + n + page - 1) // page for p in prefix_lens)
     k_cache = torch.zeros(bs * pages_per_req + 1, hkv, page, d, dtype=torch.bfloat16)
     v_cache = torch.zeros_like(k_cache)
     tables = torch.zeros(bs, pages_per_req, dtype=torch.int32)
     q = torch.randn(bs * r, hq, d, generator=gen).bfloat16()
-    kt = torch.randn(bs * n, hkv, d, generator=gen).bfloat16()
-    vt = torch.randn(bs * n, hkv, d, generator=gen).bfloat16()
+    kt = stored(torch.randn(bs * n, hkv, d, generator=gen))
+    vt = stored(torch.randn(bs * n, hkv, d, generator=gen))
     mask = torch.zeros(bs * r, dtype=torch.int64)
     refs = []
     for b, plen in enumerate(prefix_lens):
         tables[b] = torch.arange(pages_per_req) + 1 + b * pages_per_req
-        kp = torch.randn(plen, hkv, d, generator=gen).bfloat16()
-        vp = torch.randn(plen, hkv, d, generator=gen).bfloat16()
+        kp = stored(torch.randn(plen, hkv, d, generator=gen))
+        vp = stored(torch.randn(plen, hkv, d, generator=gen))
         keys = torch.cat([kp, kt[b * n : (b + 1) * n]])
         vals = torch.cat([vp, vt[b * n : (b + 1) * n]])
         for pos in range(plen + n):
@@ -218,7 +233,7 @@ def _causal_prefix_partial(q, k_rows, v_rows, tables, prefix_lens, r, page, scal
     ``i`` attends keys ``[0, P - r + 1 + i)``; bf16 output and base-2 LSE."""
     hq, hkv = q.shape[1], k_rows.shape[1]
     group = hq // hkv
-    out = torch.zeros_like(q)
+    out = q.new_zeros(*q.shape[:2], v_rows.shape[-1])
     lse = torch.full(q.shape[:2], float("-inf"))
     for b, plen in enumerate(prefix_lens):
         pos = torch.arange(plen)
@@ -238,7 +253,18 @@ def _causal_prefix_partial(q, k_rows, v_rows, tables, prefix_lens, r, page, scal
 
 
 def _check_tree_window(
-    bs, n, prefix_lens, hq, hkv, d, page, gen, strided=False, rows=None, poison=None
+    bs,
+    n,
+    prefix_lens,
+    hq,
+    hkv,
+    d,
+    page,
+    gen,
+    strided=False,
+    rows=None,
+    poison=None,
+    kv_dtype=torch.bfloat16,
 ):
     q, _, _, mask, k_cache, v_cache, tables, ref, scale = _paged_tree_problem(
         bs,
@@ -251,6 +277,7 @@ def _check_tree_window(
         gen,
         rows,
         None if poison is None else rows,
+        kv_dtype,
     )
     r = n if rows is None else rows
     if poison is not None:
@@ -270,8 +297,8 @@ def _check_tree_window(
     layout = _last_dim_strided if strided else (lambda t: t)
     out = tree_window_attention(
         layout(q.cuda()),
-        layout(k_rows.cuda()),
-        layout(v_rows.cuda()),
+        layout(k_rows.cuda().to(kv_dtype)),
+        layout(v_rows.cuda().to(kv_dtype)),
         tables.cuda(),
         torch.tensor(prefix_lens, dtype=torch.int32).cuda() + n,
         mask.cuda(),
@@ -283,6 +310,107 @@ def _check_tree_window(
         sm_scale=scale,
     )
     torch.testing.assert_close(out.float().cpu(), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("rows,n", [(None, 16), (None, 64), (4, 12), (8, 32)])
+def test_tree_window_attention_fp8_kv(rows, n, require):
+    """An unscaled FP8 E4M3 cache: the window's K/V widen to the bf16 query."""
+    require("attention", "tree_window", "triton", torch.float8_e4m3fn, "k_cache")
+    gen = torch.Generator().manual_seed(n * 10 + (rows or 0))
+    _check_tree_window(
+        3,
+        n,
+        [5, 70, 131],
+        32,
+        8,
+        128,
+        32,
+        gen,
+        rows=rows,
+        kv_dtype=torch.float8_e4m3fn,
+    )
+
+
+def _check_mla_tree_window(
+    bs, n, prefix_lens, hq, page, gen, rows=None, kv_dtype=torch.bfloat16
+):
+    """MLA: one latent KV row per token (512 latent + 64 rotary), the latent doubling
+    as the value; q is absorbed to the same 576 channels."""
+    latent, rope = 512, 64
+    r = n if rows is None else rows
+    scale = (128 + rope) ** -0.5
+    pages_per_req = max((p + n + page - 1) // page for p in prefix_lens)
+    cache = torch.zeros((bs * pages_per_req + 1) * page, 1, latent + rope)
+    tables = torch.zeros(bs, pages_per_req, dtype=torch.int32)
+    q = torch.randn(bs * r, hq, latent + rope, generator=gen).bfloat16()
+    mask = torch.zeros(bs * r, dtype=torch.int64)
+    refs = []
+    for b, plen in enumerate(prefix_lens):
+        tables[b] = torch.arange(pages_per_req) + 1 + b * pages_per_req
+        keys = torch.randn(plen + n, 1, latent + rope, generator=gen)
+        keys = keys.to(kv_dtype).float()
+        for pos in range(plen + n):
+            cache[int(tables[b, pos // page]) * page + pos % page] = keys[pos]
+        parent = [-1] + [
+            int(torch.randint(0, j, (1,), generator=gen)) for j in range(1, n)
+        ]
+        vis = torch.ones(r, plen + n, dtype=torch.bool)
+        for i in range(r):
+            if rows is None:
+                bits, cur = 0, i
+                while cur >= 0:
+                    bits |= 1 << cur
+                    cur = parent[cur]
+            else:
+                bits = int(torch.randint(0, 2**62, (1,), generator=gen)) & (
+                    (1 << n) - 1
+                )
+            mask[b * r + i] = bits - (1 << 64) if bits >> 63 else bits
+            for j in range(n):
+                vis[i, plen + j] = bool((bits >> j) & 1)
+        s = (
+            torch.einsum("nhd,xd->hnx", q[b * r : (b + 1) * r].float(), keys[:, 0])
+            * scale
+        )
+        s = s.masked_fill(~vis[None], float("-inf"))
+        refs.append(
+            torch.einsum("hnx,xd->nhd", torch.softmax(s, -1), keys[:, 0, :latent])
+        )
+    k_rows = cache.to(kv_dtype)
+    prefix_out, prefix_lse = _causal_prefix_partial(
+        q, k_rows, k_rows[..., :latent], tables, prefix_lens, r, page, scale
+    )
+    k_rows = k_rows.cuda()
+    out = tree_window_attention(
+        q.cuda(),
+        k_rows,
+        k_rows[..., :latent],
+        tables.cuda(),
+        torch.tensor(prefix_lens, dtype=torch.int32).cuda() + n,
+        mask.cuda(),
+        prefix_out.cuda(),
+        prefix_lse.cuda(),
+        rows_per_req=r,
+        window=n,
+        page_size=page,
+        sm_scale=scale,
+    )
+    assert out.shape == (bs * r, hq, latent)
+    torch.testing.assert_close(out.float().cpu(), torch.cat(refs), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "rows,n,hq",
+    [(None, 8, 16), (None, 64, 16), (None, 16, 128), (4, 12, 16), (2, 6, 64)],
+)
+def test_tree_window_attention_mla(rows, n, hq, kv_dtype, require):
+    """MLA latent rows: 576-channel keys whose leading 512 are the value, one KV head."""
+    require("attention", "tree_window", "triton", kv_dtype, "k_cache")
+    gen = torch.Generator().manual_seed(n * 7 + hq + (rows or 0))
+    # A lane row always sees the committed frontier; a verify row its own node.
+    prefix_lens = [5, 70, 0] if rows is None else [5, 70, 1]
+    _check_mla_tree_window(3, n, prefix_lens, hq, 64, gen, rows=rows, kv_dtype=kv_dtype)
 
 
 def test_logprob_topk_row_offset_beyond_int32():

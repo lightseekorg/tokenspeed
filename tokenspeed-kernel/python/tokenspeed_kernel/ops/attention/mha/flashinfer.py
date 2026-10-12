@@ -25,6 +25,7 @@ from functools import wraps
 from inspect import signature
 
 import torch
+from tokenspeed_kernel.ops.tuning import untuned
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -41,6 +42,7 @@ BatchMLAPagedAttentionWrapper = ErrorClass
 BatchPrefillWithPagedKVCacheWrapper = ErrorClass
 BatchPrefillWithRaggedKVCacheWrapper = ErrorClass
 cudnn_batch_prefill_with_kv_cache = error_fn
+get_trtllm_gen_multi_ctas_kv_counter_bytes = error_fn
 trtllm_batch_context_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache = error_fn
 trtllm_batch_decode_with_kv_cache_mla = error_fn
@@ -69,6 +71,26 @@ def _with_pdl_default(function):
     return wrapper
 
 
+def _untuned_with_lse(function):
+    """MLA decode tunes batches up to 8192, and with ``return_lse`` each one
+    reserves 256 rows of softmax stats per request and head from the workspace,
+    more than it holds: a log-sum-exp call takes the cached or heuristic tactic."""
+    return_lse_index = tuple(signature(function).parameters).index("return_lse")
+
+    @wraps(function)
+    def wrapper(*args, **kwargs):
+        if len(args) > return_lse_index:
+            return_lse = args[return_lse_index]
+        else:
+            return_lse = kwargs.get("return_lse", False)
+        if not return_lse:
+            return function(*args, **kwargs)
+        with untuned("trtllm_batch_decode_mla"):
+            return function(*args, **kwargs)
+
+    return wrapper
+
+
 if platform.is_nvidia:
     from flashinfer.decode import (
         BatchDecodeWithPagedKVCacheWrapper,
@@ -90,6 +112,7 @@ if platform.is_nvidia:
     from flashinfer.prefill import (
         trtllm_ragged_attention_deepseek as _trtllm_ragged_attention_deepseek,
     )
+    from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
     trtllm_batch_context_with_kv_cache = _with_pdl_default(
         _trtllm_batch_context_with_kv_cache
@@ -97,8 +120,8 @@ if platform.is_nvidia:
     trtllm_batch_decode_with_kv_cache = _with_pdl_default(
         _trtllm_batch_decode_with_kv_cache
     )
-    trtllm_batch_decode_with_kv_cache_mla = _with_pdl_default(
-        _trtllm_batch_decode_with_kv_cache_mla
+    trtllm_batch_decode_with_kv_cache_mla = _untuned_with_lse(
+        _with_pdl_default(_trtllm_batch_decode_with_kv_cache_mla)
     )
     trtllm_ragged_attention_deepseek = _with_pdl_default(
         _trtllm_ragged_attention_deepseek
@@ -282,6 +305,7 @@ __all__ = [
     "BatchPrefillWithPagedKVCacheWrapper",
     "BatchPrefillWithRaggedKVCacheWrapper",
     "cudnn_batch_prefill_with_kv_cache",
+    "get_trtllm_gen_multi_ctas_kv_counter_bytes",
     "trtllm_batch_context_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache",
     "trtllm_batch_decode_with_kv_cache_mla",

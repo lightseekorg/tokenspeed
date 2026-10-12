@@ -38,6 +38,7 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     _global_overrides,
+    _logged_overrides,
     _oracles,
 )
 from utils import make_sample_specs
@@ -233,10 +234,12 @@ def fresh_registry(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(KernelRegistry, "_instance", None)
     _oracles.clear()
     _global_overrides.clear()
+    _logged_overrides.clear()
     yield
     KernelRegistry.reset()
     _oracles.clear()
     _global_overrides.clear()
+    _logged_overrides.clear()
 
 
 @pytest.fixture

@@ -43,9 +43,12 @@ def project(tmp_path):
 
 
 def test_nightly_versions_and_kernel_dependency_share_date(project):
+    base_version = tomllib.loads((project / "python/pyproject.toml").read_text())[
+        "project"
+    ]["version"]
     version = PREPARE(project, "20260930", "0.1.3.post20260930")
     metadata = tomllib.loads((project / "python/pyproject.toml").read_text())["project"]
-    assert metadata["version"] == version == "0.1.0.post20260930"
+    assert metadata["version"] == version == f"{base_version}.post20260930"
     kernel = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
     assert kernel == ["tokenspeed-kernel==0.1.3.post20260930"]
     assert (

@@ -102,6 +102,8 @@ def test_amd_owned_paths_require_only_amd(path):
         f"{KERNEL}/ops/attention/gdn/_flashinfer/adapter.py",
         f"{KERNEL}/ops/moe/deep_gemm/_triton/mega_moe_stage.py",
         f"{KERNEL}/ops/moe/flashinfer/trtllm_mxfp4.py",
+        f"{KERNEL}/ops/communication/_cuda/a2a_fp8.cuh",
+        f"{KERNEL}/ops/communication/_cuda/lamport_a2a.py",
         f"{KERNEL}/ops/communication/_cuda/lamport_a2a.cu",
         f"{KERNEL}/thirdparty/cute_dsl/ll_bf16.py",
         f"{KERNEL}/thirdparty/msa/csrc/fmha_sm100_plan.cu",
@@ -255,9 +257,23 @@ def test_unrelated_paths_run_nothing():
         assert not should_run({"assets/logo.png"}, group, "pull_request", REPO_ROOT)
 
 
-@pytest.mark.parametrize("runner_group", RUNNER_GROUPS)
-def test_workflow_classifies_the_checkout_after_installing_pyyaml(runner_group):
-    workflow = load_yaml(REPO_ROOT / VENDOR_WORKFLOWS[runner_group])
+VENDOR_WORKFLOW_CASES = [
+    (group, workflow)
+    for group, workflows in VENDOR_WORKFLOWS.items()
+    for workflow in workflows
+]
+
+
+@pytest.mark.parametrize(("runner_group", "workflow_path"), VENDOR_WORKFLOW_CASES)
+def test_workflow_yaml_requires_only_its_runner_group(runner_group, workflow_path):
+    assert required_groups(workflow_path) == {runner_group}
+
+
+@pytest.mark.parametrize(("runner_group", "workflow_path"), VENDOR_WORKFLOW_CASES)
+def test_workflow_classifies_the_checkout_after_installing_pyyaml(
+    runner_group, workflow_path
+):
+    workflow = load_yaml(REPO_ROOT / workflow_path)
     steps = next(
         job["steps"]
         for job in workflow["jobs"].values()

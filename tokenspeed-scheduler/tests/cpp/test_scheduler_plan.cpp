@@ -195,6 +195,7 @@ protected:
         cfg.device_allocator.total_pages = 3;
         cfg.disable_l2_cache = true;
         cfg.enable_kv_cache_events = true;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -244,6 +245,7 @@ protected:
         CacheGroupConfig second = cfg.cache_groups.front();
         second.group_id = "full_attention_1";
         cfg.cache_groups.push_back(std::move(second));
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -269,6 +271,7 @@ protected:
         group.block_granularity = 1;
         group.total_pages = 2 * cfg.device_allocator.total_pages;
         group.cache_blocks_per_lcm_block = 2;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 };
@@ -323,6 +326,7 @@ protected:
         cfg.device_allocator.total_pages = 8;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -433,6 +437,7 @@ protected:
         coarse.block_granularity = cfg.prefix_granularity;
         coarse.total_pages = cfg.device_allocator.total_pages;
         cfg.cache_groups.insert(cfg.cache_groups.begin(), std::move(fine));
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -536,6 +541,7 @@ protected:
             state.family = CacheGroupFamily::State;
             cfg.cache_groups.push_back(std::move(state));
         }
+        SetTestSnapshotPool(cfg);
         return cfg;
     }
 
@@ -595,6 +601,7 @@ TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     // device_allocator.total_pages stays 0, so the block pool would be built
     // with a negative usable count and assert before the config diagnostic.
     try {
+        SetTestSnapshotPool(cfg);
         Scheduler scheduler{cfg};
         FAIL() << "a device cache without usable capacity was accepted";
     } catch (const std::invalid_argument& error) {

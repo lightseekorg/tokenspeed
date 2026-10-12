@@ -21,6 +21,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 import torch
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
 from tokenspeed.runtime.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
@@ -142,7 +143,9 @@ class TestLoaderSkipsFilteredShards(unittest.TestCase):
                 fall_back_to_pt_during_load=False,
                 secondary_weights=(),
             )
-            model_config = SimpleNamespace(model_path=tmpdir, revision=None)
+            model_config = SimpleNamespace(
+                model_path=tmpdir, revision=None, mapping=Mapping(rank=0)
+            )
 
             names = [name for name, _ in loader._get_all_weights(model_config, model)]
             self.assertEqual(names, ["model.mtp.fc.weight"])
@@ -160,7 +163,9 @@ class TestLoaderSkipsFilteredShards(unittest.TestCase):
                 fall_back_to_pt_during_load=False,
                 secondary_weights=(),
             )
-            model_config = SimpleNamespace(model_path=tmpdir, revision=None)
+            model_config = SimpleNamespace(
+                model_path=tmpdir, revision=None, mapping=Mapping(rank=0)
+            )
 
             names = [name for name, _ in loader._get_all_weights(model_config, model)]
             self.assertEqual(names, ["model.layers.0.w"])
@@ -171,13 +176,15 @@ class TestLoaderSkipsFilteredShards(unittest.TestCase):
         # pipeline stage's draft) bound the distributed loader's collectives.
         groups = []
 
-        def capture(source, weight_name_filter, checkpoint_load_group):
+        def capture(source, weight_name_filter, checkpoint_load_group, mapping):
             groups.append(checkpoint_load_group)
             return iter(())
 
         loader = DefaultModelLoader(LoadConfig(checkpoint_load_group=(4, 5, 6, 7)))
         loader._get_weights_iterator = capture
-        model_config = SimpleNamespace(model_path="unused", revision=None)
+        model_config = SimpleNamespace(
+            model_path="unused", revision=None, mapping=Mapping(rank=4, world_size=8)
+        )
         declaring = SimpleNamespace(
             checkpoint_load_group=(4, 5),
             fall_back_to_pt_during_load=False,

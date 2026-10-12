@@ -28,6 +28,11 @@ namespace tokenspeed {
 
 enum class CacheGroupFamily { History, State };
 
+// The scheduler's classification of a cache group. CacheGroupConfig::Kind()
+// derives it from the bridge-facing family/retention pair; scheduler logic
+// reads only this kind.
+enum class AttnKind { kFull, kSlidingWindow, kMambaState };
+
 enum class CacheTransferPolicy {
     Unspecified,
     FullSuffix,
@@ -71,13 +76,21 @@ struct CacheGroupConfig {
     // children across them by request load. 1 keeps the group replicated.
     std::int32_t shard_count{1};
 
-    // A State group keeps one recurrent-state checkpoint per block instead of
-    // a token history: the mamba-style group (GDN linear attention, conv
-    // columns) whose PD destination layout is a LatestSnapshot. A checkpoint
-    // summarizes everything before it, so nothing in such a group ever slides
-    // out: Validate() rejects State with SlidingWindow retention, and a
-    // trailing token window (SWA kv, compressor tails) is a History group.
-    bool IsSnapshotStateGroup() const { return family == CacheGroupFamily::State; }
+    // The scheduler-facing kind of this group, and the only classification
+    // scheduler logic reads. A State group keeps one recurrent-state
+    // checkpoint per block instead of a token history: the mamba-style group
+    // (GDN linear attention, conv columns), kMambaState, whose PD destination
+    // layout is a LatestSnapshot. A checkpoint summarizes everything before
+    // it, so nothing in such a group ever slides out: Validate() rejects State
+    // with SlidingWindow retention, and a trailing token window (SWA kv,
+    // compressor tails) is a sliding History group, kSlidingWindow. Every
+    // other History group is kFull. The mapping is therefore one-to-one.
+    AttnKind Kind() const {
+        if (family == CacheGroupFamily::State) {
+            return AttnKind::kMambaState;
+        }
+        return retention == Retention::SlidingWindow ? AttnKind::kSlidingWindow : AttnKind::kFull;
+    }
 
     void Validate() const;
     // Validate() without the total_pages check: every field the capacity

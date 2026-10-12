@@ -7,7 +7,7 @@ elementwise launch precedes them. `mamba2_chunk_scan` handles prefill,
 verify window and `mamba2_replay_commit` the accepted part of that window. All
 use the recurrence in the package docstring and keep states as
 `[heads, head_dim, d_state]` with `d_state` last, the layout of the runtime's
-recurrent-state pool, so no transpose is needed at the cache boundary.
+recurrent-state pool, so the cache boundary requires no transpose.
 
 ## Prefill scan
 
@@ -41,7 +41,7 @@ It is the chunked SSD algorithm in four Triton launches:
    contribution, and `D * x`.
 
 `chunk_size` must be a power of two of at least 16, and one launch holds at
-most 65535 chunks, the CUDA cap on the grid axis the chunks occupy; decode and
+most 65535 chunks, the CUDA cap on the grid axis the chunks occupy. Decode and
 verify likewise hold at most 65535 requests per launch. Final states match an
 FP64 token-by-token recurrence to about `3e-6` relative error. On GB300 at
 Nemotron-3 Super geometry the scan takes 465 us for 8192 tokens per layer.
@@ -64,8 +64,9 @@ tensor cores in the activation dtype, where FP16 would overflow.
 The update reads each request's state from `state_indices` and writes the new
 state to `dst_state_indices`. Separate source and destination slots let
 speculative verify keep the committed state intact. Rows whose index equals
-`null_slot` are padding: their state is neither read nor written. Decode is a
-one-token verify with a destination slot, so it runs the verify kernel.
+`null_slot` are padding: the kernel neither reads nor writes their state.
+Decode is a one-token verify with a destination slot, so it runs the verify
+kernel.
 
 ## Speculative verify and replay
 
@@ -81,9 +82,16 @@ round in one launch through a table of per-layer pool addresses.
 
 Decode runs the verify kernel, and replay repeats its arithmetic step for
 step. Both round the state through the pool dtype after every token, as
-decode's reload does, and the destination write is a runtime branch, so
-decode, verify and replay produce bit-identical states and verify outputs
+decode's reload does, and the destination write is a runtime branch. Decode,
+verify and replay therefore produce bit-identical states, and verify outputs
 match decode outputs bit for bit, for fp32 and bf16 state pools alike.
+
+Instruction issue bounds the verify kernel, and at `d_state` 128 half of
+each token's instructions went to the output's per-row sums across the warp.
+For a 16-byte-aligned fp32 pool, where each lane loads 4 consecutive columns
+of every row, lanes instead trade halves of their rows: 9 shuffles per 8 rows
+rather than 40, pairing lanes as the warp reduction does, so the outputs keep
+their bits. Other pools keep the warp reduction.
 
 With `parent_indices` the window is a draft tree: token `t` continues from the
 state after its parent token rather than token `t - 1`. At such a branch a
@@ -104,5 +112,6 @@ fp64 recurrence. It covers single-token and multi-chunk sequences, nonzero
 initial states, resuming a split scan, padded update rows, and decode steps
 that continue a prefill, checks verify and replay bit for bit against
 consecutive decode updates, checks tree windows against chain verifies of each
-token's root path, and guards every kernel against recompiling when
+token's root path, checks verify outputs against the recurrence for fp32,
+misaligned and bf16 pools, and guards every kernel against recompiling when
 the batch shape changes.

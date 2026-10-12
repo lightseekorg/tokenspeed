@@ -22,7 +22,6 @@
 
 """CPU-only contracts for the shared AMD scheduling library."""
 
-import hashlib
 import importlib.util
 import re
 import tomllib
@@ -50,51 +49,41 @@ def schedule():
 
 def test_scheduler_library_is_package_data(schedule):
     path = Path(schedule._SCHED_LIBRARY_PATH)
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
     assert path.name == "sched_barrier.ll"
-    assert digest == schedule._scheduler_library_hash()
     config = tomllib.loads((_AMD / "pyproject.toml").read_text())
     patterns = config["tool"]["setuptools"]["package-data"][_PACKAGE]
     assert any(path.match(pattern) for pattern in patterns)
-    text = path.read_text()
-    assert f"define i32 @{schedule._SCHED_SYMBOL}() alwaysinline" in text
     # Triton links the library only for calls whose symbol contains its name.
-    symbols = set(re.findall(r"^define \S+ @(\w+)", text, re.M))
+    symbols = set(re.findall(r"^define \S+ @(\w+)", path.read_text(), re.M))
     hints = symbols - {schedule._READFIRSTLANE_SYMBOL}
     assert hints and all(schedule._SCHED_LIBRARY_NAME in s for s in hints)
 
 
-def test_normal_compile_options_pin_library_path(schedule):
-    assert schedule.sched_barrier_compile_options() == {
-        "SCHED_LIBRARY_HASH": hashlib.sha256(
-            Path(schedule._SCHED_LIBRARY_PATH).read_bytes()
-        ).hexdigest(),
-        "extern_libs": {schedule._SCHED_LIBRARY_NAME: schedule._SCHED_LIBRARY_PATH},
-    }
-
-
-def test_changed_library_cannot_reuse_old_content_key(schedule, monkeypatch, tmp_path):
+def test_changed_library_changes_compile_key(schedule, tmp_path):
+    compiler = pytest.importorskip("tokenspeed_triton.backends.amd.compiler")
     path = tmp_path / Path(schedule._SCHED_LIBRARY_PATH).name
     path.write_bytes(Path(schedule._SCHED_LIBRARY_PATH).read_bytes())
-    monkeypatch.setattr(schedule, "_SCHED_LIBRARY_PATH", str(path))
-    before = schedule.sched_barrier_compile_options()
-    path.write_bytes(path.read_bytes() + b"; changed contents, same path\n")
-    # Simulate the fresh process required after editing JIT/library source.
-    schedule._scheduler_library_hash.cache_clear()
-    after = schedule.sched_barrier_compile_options()
-    assert before["extern_libs"] == after["extern_libs"]
-    assert before["SCHED_LIBRARY_HASH"] != after["SCHED_LIBRARY_HASH"]
-    assert after["SCHED_LIBRARY_HASH"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    options = compiler.HIPOptions(
+        arch="gfx950", extern_libs={schedule._SCHED_LIBRARY_NAME: str(path)}
+    )
+    try:
+        before = options.hash()
+        path.write_bytes(path.read_bytes() + b"; changed contents, same path\n")
+        # Triton memoizes file hashes per process; start cold as a new process.
+        compiler.file_hash.cache_clear()
+        assert options.hash() != before
+    finally:
+        compiler.file_hash.cache_clear()
 
 
 def test_compile_options_are_not_shared_mutable_state(schedule):
-    options = schedule.sched_barrier_compile_options()
+    options = schedule.sched_compile_options()
+    assert options == {
+        "extern_libs": {schedule._SCHED_LIBRARY_NAME: schedule._SCHED_LIBRARY_PATH}
+    }
     options["extern_libs"].clear()
-    options["SCHED_LIBRARY_HASH"] = None
-    again = schedule.sched_barrier_compile_options()
-    assert again["SCHED_LIBRARY_HASH"] == schedule._scheduler_library_hash()
-    assert again["extern_libs"] == {
-        schedule._SCHED_LIBRARY_NAME: schedule._SCHED_LIBRARY_PATH
+    assert schedule.sched_compile_options() == {
+        "extern_libs": {schedule._SCHED_LIBRARY_NAME: schedule._SCHED_LIBRARY_PATH}
     }
 
 

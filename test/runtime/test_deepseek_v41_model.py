@@ -40,7 +40,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
@@ -1826,8 +1825,8 @@ def _mock_loader_hardware(monkeypatch, mapping):
     monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
     monkeypatch.setattr(expert_module, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
     monkeypatch.setattr(
-        tokenspeed_kernel,
-        "moe_plan",
+        expert_module,
+        "kernel_moe_plan",
         lambda *args, **kwargs: {
             "solution": "mega_moe",
             "support_routing": False,

@@ -43,8 +43,14 @@ from tokenspeed.runtime.layers.attention.backends.paged.mha import (  # noqa: E4
 from tokenspeed.runtime.layers.attention.backends.paged.router import (  # noqa: E402
     CacheGroupRouter,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla import (  # noqa: E402
+    CuteDSLMLABackend,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (  # noqa: E402
     TRTLLMMHAAttnBackend,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla import (  # noqa: E402
+    TRTLLMMLABackend,
 )
 from tokenspeed.runtime.layers.attention.backends.state.kda import (  # noqa: E402
     KdaAttnBackend,
@@ -66,6 +72,14 @@ def _trtllm(kv_cache_dtype=torch.bfloat16):
     leaf = object.__new__(TRTLLMMHAAttnBackend)
     leaf.kv_cache_dtype = kv_cache_dtype
     leaf.dtype = torch.bfloat16
+    return leaf
+
+
+def _mla(cls, kv_cache_dtype=torch.bfloat16, kvp_size=1):
+    leaf = object.__new__(cls)
+    leaf.data_type = kv_cache_dtype
+    leaf.q_data_type = torch.bfloat16
+    leaf.kvp_group = tuple(range(kvp_size))
     return leaf
 
 
@@ -92,8 +106,19 @@ def _hybrid(full, linear):
     return hybrid
 
 
-def test_trtllm_router_supports_verify_and_lanes():
-    resolve_tree_support(_router(_trtllm()), _router(_trtllm()))
+@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_trtllm_router_supports_verify_and_lanes(kv_cache_dtype):
+    resolve_tree_support(
+        _router(_trtllm(kv_cache_dtype)), _router(_trtllm(kv_cache_dtype))
+    )
+
+
+@pytest.mark.parametrize("cls", [TRTLLMMLABackend, CuteDSLMLABackend])
+@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mla_routers_support_verify_and_lanes(cls, kv_cache_dtype):
+    resolve_tree_support(
+        _router(_mla(cls, kv_cache_dtype)), _router(_mla(cls, kv_cache_dtype))
+    )
 
 
 def test_full_history_cache_groups_verify_and_draft_trees():
@@ -127,7 +152,7 @@ def test_draft_with_linear_layers_is_refused():
     "target, blocker",
     [
         (lambda: _router(MHAAttnBackend.__new__(MHAAttnBackend)), "MHAAttnBackend"),
-        (lambda: _router(_trtllm(torch.float8_e4m3fn)), "kv_cache_dtype"),
+        (lambda: _router(_trtllm(torch.float8_e5m2)), "kv_cache_dtype"),
         (
             lambda: _router(_trtllm(), _trtllm(), retention="sliding_window"),
             "one row per token; 0, 1 slide",
@@ -137,6 +162,14 @@ def test_draft_with_linear_layers_is_refused():
             "one row per token; 0 slide or pack",
         ),
         (lambda: _hybrid(_router(_trtllm()), _mamba(KdaAttnBackend)), "KDA"),
+        (
+            lambda: _router(_mla(TRTLLMMLABackend, torch.float8_e5m2)),
+            "latent rows .* kv_cache_dtype",
+        ),
+        (
+            lambda: _router(_mla(CuteDSLMLABackend, kvp_size=2)),
+            "KV parallelism",
+        ),
     ],
 )
 def test_unsupported_target_nodes_are_named(target, blocker):
@@ -147,7 +180,7 @@ def test_unsupported_target_nodes_are_named(target, blocker):
 def test_every_blocker_is_reported_at_once():
     with pytest.raises(NotImplementedError) as err:
         resolve_tree_support(
-            _router(_trtllm(torch.float8_e4m3fn)),
+            _router(_trtllm(torch.float8_e5m2)),
             _hybrid(_router(_trtllm()), _mamba()),
         )
     assert "verify: " in str(err.value) and "draft: " in str(err.value)

@@ -18,7 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FlashInfer LL/BT public API and native-H3584 HT behind one workspace."""
+"""FlashInfer LL/BT/HT behind one workspace.
+
+The pinned FlashInfer version includes the H3584 HT kernel and tuning presets.
+LL/BT routes cap at 1024 tokens; HT covers the full serving capacity.
+"""
 
 from __future__ import annotations
 
@@ -43,11 +47,17 @@ def allreduce_fusion_support_error(group, hidden_size, top_k, max_num_tokens, dt
         import torch.distributed._symmetric_memory as symm_mem
         from flashinfer.comm import allreduce_fusion
         from flashinfer.comm.mnnvl import is_multicast_supported
+        from flashinfer.comm.mnnvl_cutedsl.kernel_ht import protocol as ht_protocol
         from flashinfer.comm.mnnvl_cutedsl.kernel_ll.protocol import LLAllReduceTuning
         from flashinfer.comm.mnnvl_cutedsl_ar import (
             MNNVLCuteDSLAllReduceFusionWorkspace,
         )
-        from tokenspeed_kernel.thirdparty.cute_dsl.mnnvl_k3_ht import K3H3584HTProtocol
+
+        if not all(
+            hasattr(ht_protocol, name)
+            for name in ("HT_FINALIZE_GB300_H3584_K16", "HT_ALL_REDUCE_GB300_H3584")
+        ):
+            return "FlashInfer H3584 HT presets are unavailable"
 
         if symm_mem.get_backend(device) is None or not is_multicast_supported(
             device.index
@@ -59,7 +69,7 @@ def allreduce_fusion_support_error(group, hidden_size, top_k, max_num_tokens, dt
                 allreduce_fusion,
                 MNNVLCuteDSLAllReduceFusionWorkspace,
                 LLAllReduceTuning,
-                K3H3584HTProtocol,
+                ht_protocol.HTProtocol,
             )
         ):
             return "FlashInfer allreduce fusion interfaces are unavailable"
@@ -72,8 +82,6 @@ class MNNVLAllReduceFusionBackend:
     """Own both input forms and all three protocol workspaces before capture."""
 
     def __init__(self, group, hidden_size, top_k, max_num_tokens, rms_eps):
-        from flashinfer.comm import allreduce_fusion
-        from flashinfer.comm.allreduce import AllReduceFusionPattern
         from flashinfer.comm.mnnvl_cutedsl.config import (
             KernelTarget,
             MNNVLCuteDSLConfig,
@@ -86,6 +94,10 @@ class MNNVLAllReduceFusionBackend:
             BTCollectiveTuning,
             BTFinalizeTuning,
         )
+        from flashinfer.comm.mnnvl_cutedsl.kernel_ht.protocol import (
+            HT_ALL_REDUCE_GB300_H3584,
+            HT_FINALIZE_GB300_H3584_K16,
+        )
         from flashinfer.comm.mnnvl_cutedsl.kernel_ll.protocol import (
             LLAllReduceTuning,
             LLCollectiveTuning,
@@ -94,14 +106,7 @@ class MNNVLAllReduceFusionBackend:
         from flashinfer.comm.mnnvl_cutedsl_ar import (
             MNNVLCuteDSLAllReduceFusionWorkspace,
         )
-        from tokenspeed_kernel.thirdparty.cute_dsl.mnnvl_k3_ht import (
-            K3_HT_ALL_REDUCE_GB300_H3584,
-            K3_HT_FINALIZE_GB300_H3584_K16,
-            K3H3584HTProtocol,
-        )
 
-        self._allreduce_fusion = allreduce_fusion
-        self._patterns = AllReduceFusionPattern
         ll_collective = LLCollectiveTuning(
             cluster_size=8, rank_lanes=1, threads=128, enable_pdl=True
         )
@@ -114,7 +119,7 @@ class MNNVLAllReduceFusionBackend:
             top_k=top_k,
             dtype=torch.bfloat16,
             finalize_routes=MRangeDispatch(
-                upper_bounds=(32, 1024),
+                upper_bounds=(32, 1024, None),
                 targets=(
                     KernelTarget(
                         ProtocolKind.LL,
@@ -136,10 +141,11 @@ class MNNVLAllReduceFusionBackend:
                             collective=bt_collective,
                         ),
                     ),
+                    KernelTarget(ProtocolKind.HT, HT_FINALIZE_GB300_H3584_K16),
                 ),
             ),
             all_reduce_routes=MRangeDispatch(
-                upper_bounds=(32, 1024),
+                upper_bounds=(32, 1024, None),
                 targets=(
                     KernelTarget(
                         ProtocolKind.LL,
@@ -158,13 +164,14 @@ class MNNVLAllReduceFusionBackend:
                             collective=bt_collective,
                         ),
                     ),
+                    KernelTarget(ProtocolKind.HT, HT_ALL_REDUCE_GB300_H3584),
                 ),
             ),
         )
         self._workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
             tp_size=group.size(),
             tp_rank=group.rank(),
-            max_token_num=min(max_num_tokens, 1024),
+            max_token_num=max_num_tokens,
             hidden_dim=hidden_size,
             dtype=torch.bfloat16,
             group=group,
@@ -177,26 +184,6 @@ class MNNVLAllReduceFusionBackend:
             write_residual_output=False,
             config=MNNVLCuteDSLConfig(profiles=(profile,)),
         )
-        self._ht = None
-        self._ht_finalize_tuning = K3_HT_FINALIZE_GB300_H3584_K16
-        self._ht_allreduce_tuning = K3_HT_ALL_REDUCE_GB300_H3584
-        if max_num_tokens > 1024:
-            self._ht = K3H3584HTProtocol(
-                hidden_size=hidden_size,
-                top_k=top_k,
-                tp_size=group.size(),
-                rank=group.rank(),
-                capacity_m=max_num_tokens,
-                rms_epsilon=rms_eps,
-                routed_scaling_factor=1.0,
-                weight_bias=0.0,
-                include_shared_expert=False,
-                add_residual=False,
-                write_residual_output=False,
-                finalize_tunings=(self._ht_finalize_tuning,),
-                all_reduce_tunings=(self._ht_allreduce_tuning,),
-                group=group,
-            )
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.output = torch.empty(
             (max_num_tokens, hidden_size), device=self.device, dtype=torch.bfloat16
@@ -207,53 +194,31 @@ class MNNVLAllReduceFusionBackend:
         self.rms_eps = rms_eps
 
     def run(self, input, gamma, num_tokens, finalize, expert_weights, expanded_idx):
+        from flashinfer.comm import allreduce_fusion
+        from flashinfer.comm.allreduce import AllReduceFusionPattern
+
         output = self.output[:num_tokens]
         if finalize and input.shape[0] == 0:
             input = self._empty_routed
-        if num_tokens <= 1024:
-            pattern = (
-                self._patterns.kMoEFinalizeARResidualRMSNorm
-                if finalize
-                else self._patterns.kARResidualRMSNorm
-            )
-            return self._allreduce_fusion(
-                input=input,
-                workspace=self._workspace,
-                pattern=pattern,
-                launch_with_pdl=True,
-                trigger_completion_at_end=True,
-                fp32_acc=False,
-                residual_out=None,
-                norm_out=output,
-                residual_in=None,
-                rms_gamma=gamma,
-                rms_eps=self.rms_eps,
-                expanded_idx_to_permuted_idx=expanded_idx,
-                expert_scale_factor=expert_weights,
-                shared_expert_output=None,
-                weight_bias=0.0,
-            )
-        if self._ht is None:
-            raise RuntimeError("HT workspace was not prepared for this token count")
-        if finalize:
-            return self._ht.finalize_kernels[self._ht_finalize_tuning](
-                input,
-                expert_weights,
-                expanded_idx,
-                None,
-                None,
-                gamma,
-                num_tokens,
-                state=self._ht.state,
-                norm_output=output,
-                residual_output=None,
-            )[0]
-        return self._ht.all_reduce_kernels[self._ht_allreduce_tuning](
-            input,
-            None,
-            gamma,
-            num_tokens,
-            state=self._ht.state,
-            norm_output=output,
-            residual_output=None,
-        )[0]
+        pattern = (
+            AllReduceFusionPattern.kMoEFinalizeARResidualRMSNorm
+            if finalize
+            else AllReduceFusionPattern.kARResidualRMSNorm
+        )
+        return allreduce_fusion(
+            input=input,
+            workspace=self._workspace,
+            pattern=pattern,
+            launch_with_pdl=True,
+            trigger_completion_at_end=True,
+            fp32_acc=False,
+            residual_out=None,
+            norm_out=output,
+            residual_in=None,
+            rms_gamma=gamma,
+            rms_eps=self.rms_eps,
+            expanded_idx_to_permuted_idx=expanded_idx,
+            expert_scale_factor=expert_weights,
+            shared_expert_output=None,
+            weight_bias=0.0,
+        )

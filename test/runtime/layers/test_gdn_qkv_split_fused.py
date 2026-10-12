@@ -138,6 +138,36 @@ def test_strided_input(nq, nv, hq, hv, T):
         assert torch.equal(got, ref)
 
 
+def test_row_stride_does_not_key_a_binary():
+    """Projection slices arrive with different row widths; that must not key a binary."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
+        _fused_qkv_split_kernel,
+    )
+
+    nq = nk = 4
+    nv, head = 8, 128
+    width = (nq + nk + nv) * head
+
+    def run(tokens, pad):
+        mixed = torch.randn(tokens, width + pad, dtype=torch.bfloat16, device="cuda")
+        mixed = mixed[:, :width]
+        q, k, v = fused_qkv_split_gdn_prefill(
+            mixed, nq, nk, nv, head, head, head, fuse_l2norm=False
+        )
+        expected = _ref_split(mixed.contiguous(), nq, nk, nv, head, head, head)
+        for got, ref in zip((q, k, v), expected, strict=True):
+            assert torch.equal(got, ref)
+
+    run(64, 0)
+    jit = _fused_qkv_split_kernel.fn
+    with patch.object(jit, "_do_compile", wraps=jit._do_compile) as compiles:
+        for tokens, pad in ((1, 0), (17, 128), (33, 2048), (100, 64)):
+            run(tokens, pad)
+    assert compiles.call_count == 0
+
+
 def test_column_slice_past_int32_offsets_is_copied_first():
     """Rows whose strided span passes int32 offsets split exactly, via a copy."""
     nq, nk, nv, hq, hk, hv = 2, 2, 4, 32, 32, 24

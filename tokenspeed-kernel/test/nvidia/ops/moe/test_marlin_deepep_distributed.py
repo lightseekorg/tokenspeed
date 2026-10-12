@@ -43,6 +43,9 @@ import torch
 import torch.distributed as dist
 from kimi3_reference import mxfp4_moe_reference
 from tokenspeed_kernel.ops.communication.deep_ep import DeepEPBuffer
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from utils import make_mxfp4_moe_weights
 
 
@@ -59,7 +62,6 @@ def _deepep_mode() -> str:
     reason="launch with torchrun world size 2, 4, or 8",
 )
 def test_marlin_deepep_matches_replicated_reference() -> None:
-    import tokenspeed_kernel
 
     world_size = _world_size()
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -132,7 +134,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
     module.activation_situ_linear_beta = linear_beta
 
     mode = _deepep_mode()
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",
@@ -155,11 +157,11 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
         combine_order="rank",
     )
     assert plan["apply_kernel_name"] == "marlin_mxfp4_deepep_moe_apply"
-    tokenspeed_kernel.moe_process_weights(plan, module)
+    kernel_moe_process_weights(plan, module)
     prepared_buffer = DeepEPBuffer._buffer
     assert prepared_buffer is not None
 
-    actual = tokenspeed_kernel.moe_apply(
+    actual = kernel_moe_apply(
         plan,
         x,
         module,

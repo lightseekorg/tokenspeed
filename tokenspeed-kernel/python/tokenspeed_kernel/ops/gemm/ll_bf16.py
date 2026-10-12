@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -73,6 +74,9 @@ def ll_bf16_router_supported(
 ) -> bool:
     """Whether the vendored driver can serve this call.
 
+    Once serving, it declines the calls the dot-product kernel would take: that
+    kernel compiles once per exact M, so the caller's other GEMM runs them.
+
     Args:
         hidden_states: ``[M, K]`` activation; weight: ``[N, K]`` weight.
         m: Token count, which selects the dot-product or split-K backend.
@@ -80,7 +84,9 @@ def ll_bf16_router_supported(
     Returns:
         True when a vendored kernel is compilable and applicable here.
     """
-    return ll_bf16_router.supports(hidden_states, weight, m)
+    return ll_bf16_router.supports(hidden_states, weight, m) and not (
+        is_serving() and ll_bf16_router.uses_dotprod(m, hidden_states.shape[1])
+    )
 
 
 __all__ = [

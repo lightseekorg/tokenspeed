@@ -275,9 +275,7 @@ class TestLongcatExpertPlacementWiring(unittest.TestCase):
         with (
             torch.device("cpu"),
             mock.patch.object(expert_module, "get_moe_backend", lambda: trtllm),
-            mock.patch.object(
-                expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan
-            ),
+            mock.patch.object(expert_module, "kernel_moe_plan", fake_moe_plan),
             mock.patch.dict(
                 global_server_args_dict,
                 {

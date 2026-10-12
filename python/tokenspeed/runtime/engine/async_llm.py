@@ -473,10 +473,10 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for replica_index in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     replica_obj = prepare_parallel_sampling_replica(
-                        tmp_obj, tokenized_objs[i]
+                        tmp_obj, tokenized_objs[i], replica_index
                     )
                     self._send_one_request(tmp_obj, replica_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj))

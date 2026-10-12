@@ -41,14 +41,15 @@ def _is_joint_fi_arch() -> bool:
 
 def test_registry_fallback_selection():
     _select.cache_clear()
-    impl = _select(1, 999, 4096, True)
+    bf16 = (torch.bfloat16, torch.bfloat16, False)
+    impl = _select(1, 999, 4096, True, *bf16)
     assert "rowcta" in getattr(impl, "__name__", "")
-    impl = _select(4, 3217, 7168, True)
+    impl = _select(4, 3217, 7168, True, *bf16)
     assert "torch" in getattr(impl, "__name__", "")
     # A width no call site produces.
-    impl = _select(3, 6289, 7168, True)
+    impl = _select(3, 6289, 7168, True, *bf16)
     assert "torch" in getattr(impl, "__name__", "")
-    impl = _select(1, 2305, 1536, True)
+    impl = _select(1, 2305, 1536, True, *bf16)
     assert "rowcta" in getattr(impl, "__name__", "")
 
 

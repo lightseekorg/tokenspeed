@@ -20,6 +20,7 @@
 
 """Sampling parameters for text generation."""
 
+import copy
 import zlib
 from typing import Any
 
@@ -229,6 +230,21 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         TP/DP ranks agree on the seed."""
         if self.seed is None:
             self.seed = zlib.crc32(rid.encode("utf-8")) & 0xFFFFFFFF
+
+    def for_parallel_sample(self, replica_index: int) -> "SamplingParams":
+        """Copy of these params for replica ``replica_index`` of an n > 1 request.
+
+        All replicas start from the same resolved seed, and some backends
+        (e.g. triton) sample from (seed, position) only, so without an offset
+        every replica returns the same tokens. Greedy requests keep their
+        pinned seed.
+        """
+        if self.seed is None:
+            raise ValueError("resolve_seed() must run before fan-out.")
+        replica = copy.copy(self)
+        if replica.top_k != 1:
+            replica.seed = self.seed + replica_index
+        return replica
 
     def normalize(self, tokenizer) -> None:
         # Process stop strings

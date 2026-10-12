@@ -28,20 +28,8 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.cute.testing as testing
+import cutlass.memory
 import torch
-
-# Compat shim: setmaxregister_{decrease,increase} added in cutlass-dsl 4.4;
-# older versions only have the deprecated warpgroup_reg_{dealloc,alloc}.
-_setmaxregister_decrease = getattr(
-    cute.arch,
-    "setmaxregister_decrease",
-    getattr(cute.arch, "warpgroup_reg_dealloc", None),
-)
-_setmaxregister_increase = getattr(
-    cute.arch,
-    "setmaxregister_increase",
-    getattr(cute.arch, "warpgroup_reg_alloc", None),
-)
 
 # Compat shim: get_max_tmem_alloc_cols added in cutlass-dsl 4.4;
 # older versions don't have it, so we provide a fallback implementation.
@@ -564,6 +552,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         p_major_mode = OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.q_dtype,
+            self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.acc_dtype,
@@ -571,6 +560,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             self.mma_qk_tiler[:2],
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
@@ -1026,16 +1016,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+        tmem = cutlass.memory.TmemAllocator(
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
             arch=self.arch,
         )
 
@@ -1116,9 +1106,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # ///////////////////////////////////////////////////////////////////////////////
 
         if warp_idx >= self.empty_warp_ids[0] and warp_idx <= self.empty_warp_ids[-1]:
-            _setmaxregister_decrease(self.other_reg_num)
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
         if warp_idx == self.load_pt_warp_id:
-            _setmaxregister_decrease(self.other_reg_num)
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
             # PDL: wait for the prior kernel to finish its writes before
             # reading the page table from GMEM.
             cute.arch.griddepcontrol_wait()
@@ -1156,7 +1146,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 work_tile = tile_sched.get_current_work()
             load_pt_pipeline.producer_tail(load_pt_producer_state)
         if warp_idx == self.load_tma_warp_id:
-            _setmaxregister_decrease(self.other_reg_num)
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
             # PDL: wait for the prior kernel to finish its writes before
             # issuing TMA loads for Q / K / V from GMEM.
             cute.arch.griddepcontrol_wait()
@@ -1244,7 +1234,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         #  MMA warp
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            _setmaxregister_decrease(self.other_reg_num)
+            cute.arch.setmaxregister_decrease(self.other_reg_num)
             # Alloc tensor memory buffer
             tmem.allocate(_get_max_tmem_alloc_cols(self.arch))
             tmem.wait_for_alloc()
@@ -1336,7 +1326,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             warp_idx >= self.compute_warp_ids[0]
             and warp_idx <= self.compute_warp_ids[-1]
         ):
-            _setmaxregister_increase(self.softmax_reg_num)
+            cute.arch.setmaxregister_increase(self.softmax_reg_num)
             mma_s_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.mma_s_stage
             )
@@ -1407,7 +1397,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             warp_idx >= self.correction_warp_ids[0]
             and warp_idx <= self.correction_warp_ids[-1]
         ):
-            _setmaxregister_increase(self.correction_reg_num)
+            cute.arch.setmaxregister_increase(self.correction_reg_num)
             p_cor_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.p_cor_stage
             )
@@ -1559,7 +1549,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         local_split_kv = cute.ceil_div(k_tile_total - k_tile_lo, max(1, k_tile_per_cta))
 
         # Alloc shared memory
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
         smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))
@@ -2902,7 +2892,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         if cutlass.const_expr(self.arch == "sm_100"):
             cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
             cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
-            for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+            for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                 if apply_mask:
                     qk_col = tTR_tS[i][1]
                     if cutlass.const_expr(
@@ -3008,7 +2998,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             # branch so CuTe DSL can assign it a stable type at the join.
             cta_m_rows = self.mma_qk_tiler[0] // self.cluster_shape_mnk[0]
             if apply_mask:
-                for i in cutlass.range_constexpr(cute.size(tTR_rAcc)):
+                for i in cutlass.range(cute.size(tTR_rAcc), unroll_full=True):
                     qk_col = tTR_tS[i][1]
                     if cutlass.const_expr(
                         self.is_causal or common_params.local_visible_lens is not None
@@ -3091,7 +3081,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # if warps in N is 2, reduce row_max across warps (0, 1) and (2, 3)
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_max_new
-            self.softmax_exchange_sync_bar.wait()
+            self.softmax_exchange_sync_bar.arrive_and_wait()
             row_max_new = cute.arch.fmax(
                 row_max_new,
                 common_params.smem_exchange[
@@ -3483,7 +3473,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # exchange row_sum between warps (0, 1) and (2, 3)
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_sum
-            self.epilogue_exchange_sync_bar.wait()
+            self.epilogue_exchange_sync_bar.arrive_and_wait()
             # (64, 2)
             row_sum = (
                 row_sum

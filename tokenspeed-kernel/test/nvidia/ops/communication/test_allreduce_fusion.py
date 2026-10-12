@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Public fused-all-reduce input contracts and backend dispatch."""
+"""Public fused-all-reduce input contracts."""
 
 import importlib
 from types import SimpleNamespace
@@ -28,9 +28,6 @@ import pytest
 import torch
 
 api = importlib.import_module("tokenspeed_kernel.ops.communication.allreduce_fusion")
-backend_module = importlib.import_module(
-    "tokenspeed_kernel.thirdparty.flashinfer.allreduce_fusion"
-)
 
 
 def inputs():
@@ -96,45 +93,3 @@ def test_route_metadata_must_match_the_input_pattern(finalize):
             expanded_idx_to_permuted_idx=indices,
         )
     workspace.kernel.impl.assert_not_called()
-
-
-@pytest.mark.parametrize("m", [1024, 1025])
-@pytest.mark.parametrize("finalize", [False, True])
-def test_flashinfer_to_vendored_ht_dispatch_boundary(m, finalize):
-    backend = object.__new__(backend_module.MNNVLAllReduceFusionBackend)
-    backend.output = torch.empty(2048, 8)
-    backend.rms_eps = 1e-5
-    backend._workspace = object()
-    backend._patterns = SimpleNamespace(
-        kARResidualRMSNorm=1, kMoEFinalizeARResidualRMSNorm=7
-    )
-    result = torch.ones(m, 8)
-    backend._allreduce_fusion = Mock(return_value=result)
-    backend._ht_finalize_tuning = "finalize"
-    backend._ht_allreduce_tuning = "allreduce"
-    final = Mock(return_value=(result, None))
-    reduced = Mock(return_value=(result, None))
-    backend._ht = SimpleNamespace(
-        state=object(),
-        finalize_kernels={"finalize": final},
-        all_reduce_kernels={"allreduce": reduced},
-    )
-    x = torch.ones(m, 8)
-    gamma = torch.ones(8)
-    weights = torch.ones(m, 2) if finalize else None
-    indices = torch.zeros(m, 2, dtype=torch.int32) if finalize else None
-    assert backend.run(x, gamma, m, finalize, weights, indices) is result
-    if m <= 1024:
-        kwargs = backend._allreduce_fusion.call_args.kwargs
-        assert kwargs["pattern"] == (7 if finalize else 1)
-        assert kwargs["shared_expert_output"] is None
-        assert kwargs["residual_in"] is None
-        assert kwargs["workspace"] is backend._workspace
-        assert kwargs["launch_with_pdl"] is True
-        final.assert_not_called()
-        reduced.assert_not_called()
-    else:
-        backend._allreduce_fusion.assert_not_called()
-        selected = final if finalize else reduced
-        selected.assert_called_once()
-        assert selected.call_args.args[0] is x

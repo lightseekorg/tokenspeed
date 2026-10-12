@@ -1,0 +1,44 @@
+name: MLA release pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional stable MLA version; otherwise increment the patch.'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: weekly-release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Bump MLA version
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: mla-version
+      previous: ''
+      version: ${{ inputs.version || '' }}
+    secrets: inherit
+
+  publish:
+    name: Publish MLA
+    needs: version
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: mla-publish
+      previous: mla-version
+    secrets: inherit
+
+  dependency:
+    name: Update kernel dependency
+    needs: publish
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: mla-dependency
+      previous: mla-publish
+    secrets: inherit

@@ -45,6 +45,14 @@ class QuantizeMethodBase(ABC):
         Expects create_weights to have been called before on the layer."""
         raise NotImplementedError
 
+    def static_fp8_input_scale(self, layer: nn.Module) -> torch.Tensor | None:
+        """The per-tensor FP8 scale ``apply`` quantizes its input with, which a producer may apply instead."""
+        return None
+
+    def nvfp4_global_scale(self, layer: nn.Module) -> torch.Tensor | None:
+        """The global scale ``apply`` hands ``fp4_quantize`` for its input, which a producer may apply instead."""
+        return None
+
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         """Process the weight after loading.
 
@@ -214,9 +222,24 @@ class LinearMethodBase(QuantizeMethodBase):
         """
         return self.apply(layer, activation(x), bias)
 
-    def prepared_linear_plan(self, layer: nn.Module) -> object | None:
-        """Return an opaque backend warmup plan, if this layer prepared one."""
-        return None
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
+        """Apply into caller-owned storage; methods may override to avoid staging.
+
+        Return the supplied tensor itself, not another view of its storage.
+        This keeps ownership explicit and avoids redundant self-copies.
+        """
+        if block_scale is None:
+            output = self.apply(layer, x, bias)
+        else:
+            output = self.apply(layer, x, bias, block_scale, output_dtype)
+        if (
+            out.shape != output.shape
+            or out.dtype != output.dtype
+            or out.device != output.device
+        ):
+            raise ValueError("Linear destination must match the computed output")
+        out.copy_(output)
+        return out
 
 
 def method_has_implemented_embedding(method_class: type[QuantizeMethodBase]) -> bool:

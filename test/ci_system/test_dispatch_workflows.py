@@ -1,5 +1,7 @@
 import os
+import shlex
 import subprocess
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -251,39 +253,115 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
     assert all((REPO_ROOT / choice).is_file() for choice in choices)
 
 
-def test_amd_pr_workflow_runs_kernel_benchmarks_alongside_model_tests():
-    workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")
+def test_kernel_ut_parts_cover_every_test_once():
+    root = REPO_ROOT / "tokenspeed-kernel/test"
+    files = {
+        path
+        for path in root.rglob("*.py")
+        if path.name.startswith("test_") or path.name.endswith("_test.py")
+    }
+    assert files
+    executions = Counter()
+    for part in ("i", "ii"):
+        task = load_yaml(
+            REPO_ROOT / f"test/ci/ut/ut-tokenspeed-kernel-part-{part}.yaml"
+        )
+        for command in task["ut"]["commands"]:
+            tokens = shlex.split(command)
+            arguments = tokens[tokens.index("pytest") + 1 :]
+            targets = [REPO_ROOT / arg for arg in arguments if not arg.startswith("-")]
+            ignores = [
+                REPO_ROOT / arg.removeprefix("--ignore=")
+                for arg in arguments
+                if arg.startswith("--ignore=")
+            ]
+            executions.update(
+                path
+                for path in files
+                if any(path.is_relative_to(target) for target in targets)
+                and not any(path.is_relative_to(ignore) for ignore in ignores)
+            )
+
+    assert executions == Counter({path: 1 for path in files})
+
+
+def test_amd_kernel_benchmarks_run_in_their_own_workflow():
+    # AMD Tests keeps unit and model tests; the benchmark lives in a separate
+    # workflow so it starts alongside unit tests and completes on its own.
+    tests = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")["jobs"]
+    assert "kernel-benchmark" not in tests
+    assert "kernel-benchmark" not in tests["finish"]["needs"]
+    assert (
+        "kernel-benchmark"
+        not in next(
+            step
+            for step in tests["scan"]["steps"]
+            if step.get("name") == "Build task matrix"
+        )["run"]
+    )
+
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-kernel-benchmark.yml")
+    assert workflow["name"] == "AMD Kernel Benchmark"
+    triggers = workflow.get("on") or workflow.get(True)
+    # The `high priority` label only affects model tests; it must not restart
+    # the benchmark.
+    assert "labeled" not in triggers["pull_request"]["types"]
+    # tokenspeed-mla is NVIDIA-only, so its changes must not start the workflow.
+    for event in ("push", "pull_request"):
+        assert "tokenspeed-mla/**" not in triggers[event]["paths"]
     jobs = workflow["jobs"]
-
-    assert jobs["kernel-benchmark"]["needs"] == ["scan", "unit-test"]
-    normal_model = jobs["model-test"]
-    assert normal_model["needs"] == ["scan", "unit-test"]
-    assert "!cancelled()" in normal_model["if"]
-    assert "needs.unit-test.result == 'success'" in normal_model["if"]
-    assert "needs.scan.outputs.unit_has_tasks != 'true'" in normal_model["if"]
-    assert "needs.kernel-benchmark" not in normal_model["if"]
-
-    eager_model = jobs["model-test-eager"]
-    assert eager_model["needs"] == "scan"
-    assert "needs.unit-test" not in eager_model["if"]
-    assert "needs.kernel-benchmark" not in eager_model["if"]
-    assert "kernel-benchmark" in jobs["finish"]["needs"]
-    benchmark_inputs = jobs["kernel-benchmark"]["with"]
     assert (
-        "github.event.pull_request.base.sha" in benchmark_inputs["comparison_base_ref"]
-    )
-    assert (
-        "github.event.pull_request.head.sha"
-        in benchmark_inputs["comparison_candidate_ref"]
-    )
-    assert (
-        "kernel_benchmark:kernel-benchmark"
+        '--workflow-stage "kernel-benchmark"'
         in next(
             step
             for step in jobs["scan"]["steps"]
             if step.get("name") == "Build task matrix"
         )["run"]
     )
+    benchmark = jobs["kernel-benchmark"]
+    assert benchmark["needs"] == "scan"
+    assert "draft == false" in benchmark["if"]
+    assert (
+        "github.event.pull_request.base.sha" in benchmark["with"]["comparison_base_ref"]
+    )
+    assert (
+        "github.event.pull_request.head.sha"
+        in benchmark["with"]["comparison_candidate_ref"]
+    )
+    assert "always()" in jobs["finish"]["if"]
+
+
+@pytest.mark.parametrize(
+    ("scan", "benchmark", "passes"),
+    [
+        ("success", "success", True),
+        ("success", "skipped", True),
+        ("success", "failure", False),
+        ("success", "cancelled", False),
+        # A failed scan skips the benchmark and must not pass the gate.
+        ("failure", "skipped", False),
+        ("cancelled", "skipped", False),
+    ],
+)
+def test_amd_kernel_benchmark_gate_blocks_on_failure(scan, benchmark, passes):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-kernel-benchmark.yml")
+    # The default-branch ruleset requires a check named `finish`; a renamed
+    # gate job would stop blocking merges.
+    finish = workflow["jobs"]["finish"]
+    assert "name" not in finish
+    assert finish["needs"] == ["scan", "kernel-benchmark"]
+    (step,) = finish["steps"]
+    completed = subprocess.run(
+        ["bash", "-c", step["run"]],
+        env={
+            **os.environ,
+            "SCAN_RESULT": scan,
+            "KERNEL_BENCHMARK_RESULT": benchmark,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert (completed.returncode == 0) == passes
 
 
 def test_kernel_benchmark_task_uses_shared_ci_contract():
@@ -559,7 +637,7 @@ def test_slurm_dispatch_maps_b200_yaml_to_gb300_runners(tmp_path):
     result = run_slurm_dispatch_script(
         tmp_path,
         CLUSTER="gb300",
-        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel.yaml",
+        YAML_SELECTION="test/ci/ut/ut-tokenspeed-kernel-part-i.yaml",
     )
 
     assert result.returncode == 0, result.stderr
@@ -627,7 +705,7 @@ def test_slurm_dispatch_rejects_mismatched_or_multiple_gb300_runners(
 
 
 def test_slurm_dispatch_accepts_multiple_native_gb300_runners(tmp_path):
-    task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel.yaml")
+    task = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-part-i.yaml")
     task["runner"]["labels"] = ["gb300-1gpu", "gb300-4gpu"]
     config = tmp_path / "ambiguous.yaml"
     config.write_text(yaml.safe_dump(task))
@@ -1101,7 +1179,7 @@ def test_slurm_dispatch_takes_a_dispatched_pr_from_its_own_tree():
     )
 
     assert step["env"]["INSTALL_TOKENSPEED_MLA_FROM_SOURCE"] == (
-        "${{ inputs.pr && '1' || '0' }}"
+        "${{ (inputs.pr || inputs.commit) && '1' || '0' }}"
     )
 
 
@@ -1146,6 +1224,21 @@ def test_mi450_sim_uses_bounded_smoke_suite():
     assert "/sys/fs/cgroup/cpu.max" in parallel_script
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
+
+
+def test_mi450_sim_pins_one_rocm_nightly():
+    env = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")["env"]
+    setup_script = (REPO_ROOT / "test/ci_system/setup_mi450_sim.sh").read_text()
+
+    # PyTorch requires the exact ROCm SDK build it was built against.
+    rocm_build = f"+rocm{env['ROCM_SDK_VERSION']}"
+    for name in ("TORCH_VERSION", "TORCHVISION_VERSION", "TORCH_DEVICE_PACKAGE"):
+        assert env[name].endswith(rocm_build), name
+    # Standalone runs of the setup script default to the lane's pins, and a
+    # cached rocJITsu build is reused only for those same pins.
+    for name in ("ROCM_SYSTEMS_REF", "ROCM_SDK_VERSION"):
+        assert f"{name}=${{{name}:-{env[name]}}}" in setup_script
+    assert 'build_key="${ROCM_SYSTEMS_REF}:${ROCM_SDK_VERSION}"' in setup_script
 
 
 def test_mi450_sim_uses_stock_triton_compatible_libhip_path():

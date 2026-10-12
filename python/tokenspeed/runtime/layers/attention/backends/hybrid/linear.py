@@ -98,6 +98,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
+    def read_prefix_history(self, *args, **kwargs):
+        return self.full_attn_backend.read_prefix_history(*args, **kwargs)
+
     # Composite: the full-attention child owns the per-request decode lengths
     # the draft reads, so every drafter length-edit hook reaches it (the
     # linear child's state follows the committed position, not seq_lens).
@@ -182,6 +185,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         self.full_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
         self.linear_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        return self.linear_attn_backend.preallocate_verify_workspace(
+            max_bs, draft_token_num
+        )
 
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,

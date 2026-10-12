@@ -94,7 +94,33 @@ _KIMI_K3_PROFILE = _Profile(
     has_bias=False,
     activation="situ",
 )
-_PROFILES = (_GPT_OSS_120B_PROFILE, _DSV4_PROFILE, _KIMI_K3_PROFILE)
+_DSV41_FLASH_PROFILE = _Profile(
+    name="dsv41_flash",
+    num_experts=384,
+    top_k=6,
+    model_dim=5120,
+    logical_intermediate=2304,
+    inter_dim=2560,
+    has_bias=False,
+    activation="silu_clamped",
+)
+_DSV41_FLASH_DSPARK_PROFILE = _Profile(
+    name="dsv41_flash_dspark",
+    num_experts=128,
+    top_k=3,
+    model_dim=5120,
+    logical_intermediate=2304,
+    inter_dim=2560,
+    has_bias=False,
+    activation="silu_clamped",
+)
+_PROFILES = (
+    _GPT_OSS_120B_PROFILE,
+    _DSV4_PROFILE,
+    _KIMI_K3_PROFILE,
+    _DSV41_FLASH_PROFILE,
+    _DSV41_FLASH_DSPARK_PROFILE,
+)
 
 
 @dataclass
@@ -235,20 +261,26 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
         return profile
 
     if w.activation not in {"silu", "swiglu"} or w.swiglu_beta is not None:
-        raise ValueError("Gluon Petit DSV4 MegaMoE requires standard SiLU")
+        raise ValueError("Gluon Petit DeepSeek MegaMoE requires standard SiLU")
     if w.w13_input_layout != "concatenated":
-        raise ValueError("Gluon Petit DSV4 MegaMoE requires concatenated W13 input")
+        raise ValueError("Gluon Petit DeepSeek MegaMoE requires concatenated W13 input")
     swiglu_arg = getattr(w, "swiglu_arg", None)
     if swiglu_arg is not None and swiglu_arg.alpha is not None:
         raise ValueError(
-            "Gluon Petit DSV4 MegaMoE does not support nonstandard SiLU alpha"
+            "Gluon Petit DeepSeek MegaMoE does not support nonstandard SiLU alpha"
         )
     if (
         getattr(w, "w13_weight_bias", None) is not None
         or getattr(w, "w2_weight_bias", None) is not None
     ):
-        raise ValueError("Gluon Petit DSV4 MegaMoE requires bias-free experts")
+        raise ValueError("Gluon Petit DeepSeek MegaMoE requires bias-free experts")
 
+    if profile.activation == "silu_clamped":
+        if swiglu_arg is None or swiglu_arg.limit != 10.0:
+            raise ValueError(
+                "Gluon Petit V4.1 requires the checkpoint SiLU clamp of 10"
+            )
+        return profile
     if swiglu_arg is not None and swiglu_arg.limit is not None:
         raise ValueError(
             "Gluon Petit DSV4 MegaMoE does not support an activation clamp; "
@@ -477,8 +509,7 @@ def gluon_petit_mxfp4_megamoe_apply(
         and max_num_tokens_per_gpu > _MAX_TOKENS_PER_RANK
     ):
         raise ValueError(
-            "Gluon Petit MegaMoE per-rank token count exceeds its "
-            "1024-token capacity"
+            "Gluon Petit MegaMoE per-rank token count exceeds its 1024-token capacity"
         )
     num_tokens = int(x.shape[0])
     if num_tokens > _MAX_TOKENS_PER_RANK:

@@ -162,7 +162,10 @@ def _gqa_store_tile(
     tl.store(dst[:, None] + i2[None, :], o2.to(dtype), mask=pair_mask)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_rows", "positions_stride"],
+    do_not_specialize_on_alignment=["positions_ptr", "slots_ptr"],
+)
 def _gqa_prologue_kernel(
     q_ptr,
     k_ptr,

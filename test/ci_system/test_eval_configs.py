@@ -32,7 +32,7 @@ GPQA_DATASET_SOURCE_PRELUDE = (
 )
 DATASETS = {
     "aime25": {
-        "count": 10,
+        "count": 9,
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
@@ -44,7 +44,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 10,
+        "count": 6,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -191,6 +191,13 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
     assert flag_value(eval_tokens, "--model") == "Qwen/Qwen3.8-Flash-Next-FP8"
     assert flag_value(eval_tokens, "--datasets") == "gsm8k"
     assert task["score_threshold"] == 0.96
+
+
+def test_deepseek_v4_flash_and_pro_are_not_in_ci_catalog():
+    for path in (REPO_ROOT / "test" / "ci").rglob("*.yaml"):
+        config = path.read_text(encoding="utf-8")
+        assert "DeepSeek-V4-Flash" not in config, path
+        assert "DeepSeek-V4-Pro" not in config, path
 
 
 def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():

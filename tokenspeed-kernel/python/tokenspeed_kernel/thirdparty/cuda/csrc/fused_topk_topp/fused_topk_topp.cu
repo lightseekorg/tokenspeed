@@ -443,10 +443,16 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
             const float sum_topk = s_cumsum[k - 1];
             const float threshold = p * sum_topk;
             int j = k - 1;
-            for (int i = 0; i < k; ++i) {
-                if (s_cumsum[i] >= threshold) {
-                    j = i;
-                    break;
+            // P >= 1 means no top-P truncation: keep the whole top-K prefix. Scanning the
+            // FP32 prefix sums against the FP32 total would stop as soon as the running sum
+            // reaches the total, dropping tail tokens whose probability is below the total's
+            // ulp although they belong to the kept set.
+            if (p < 1.0f) {
+                for (int i = 0; i < k; ++i) {
+                    if (s_cumsum[i] >= threshold) {
+                        j = i;
+                        break;
+                    }
                 }
             }
             s_cutoff_j = j;
@@ -481,8 +487,14 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
         // matters: a runtime branch leaves the unaligned code in the aligned
         // path's register footprint and costs ~2.5% occupancy even on rows that
         // never execute it.
+        // P >= 1 means no top-P truncation: every value survives (threshold 0 keeps all
+        // non-negative probabilities and leaves exact zeros at zero). The radix threshold
+        // is only meaningful for P < 1; at P = 1 its FP32 mass accounting can select a
+        // value above the smallest probabilities and drop them from the support.
         const float threshold =
-            air_top_p::twiddleOut<float>(topp_counters[b].kthValueBits, false);
+            (p >= 1.0f)
+                ? 0.0f
+                : air_top_p::twiddleOut<float>(topp_counters[b].kthValueBits, false);
 
         float const* in_row = probs + b * vocab_size;
         float* out_row = out_probs + b * vocab_size;
@@ -607,7 +619,6 @@ __launch_bounds__(BLOCK_SIZE) __global__ void applyKernel(
                 if (v >= threshold) out_row[i] = v * inv;
             }
         }
-        (void)p;  // unused in this branch
     }
 }
 
