@@ -22,8 +22,6 @@
 
 from __future__ import annotations
 
-import functools
-
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
@@ -1314,6 +1312,34 @@ def _largem_pingpong_consume(
     return a_desc, b_desc, acc
 
 
+@gluon.constexpr_function
+def _largem_pingpong_layouts(block_m, block_n, block_k, num_warps):
+    """Partitioned LDS layouts and the matching WMMA layout for one tile."""
+    padded_a = gl.PaddedSharedLayout.with_identity_for(
+        [[block_k, 8]], [block_m, block_k], [1, 0]
+    )
+    padded_b = gl.PaddedSharedLayout.with_identity_for(
+        [[block_k, 8]], [block_n, block_k], [1, 0]
+    )
+    # Splitting the A rows and B columns across the two LDS partitions lets
+    # paired waves read different partitions in the same instruction.
+    shared_a, shared_b, wmma_layout = gl.amd.cdna5.make_partitioned_dot_layouts(
+        block_m,
+        block_n,
+        padded_a,
+        padded_b,
+        num_warps,
+        [16, 16, 32],
+        a_transposed=False,
+        b_transposed=True,
+        transposed=True,
+    )
+    shared_out = gl.PaddedSharedLayout.with_identity_for(
+        [[block_n, 8]], [block_m, block_n], [1, 0]
+    )
+    return shared_a, shared_b, shared_out, wmma_layout
+
+
 # The live row count varies with the prefill chunk, so it must not split the
 # compile cache on its divisibility.
 @gluon.jit(
@@ -1335,10 +1361,6 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
     BLOCK_K: gl.constexpr,
     GROUP_M: gl.constexpr,
     NUM_XCDS: gl.constexpr,
-    SHARED_A: gl.constexpr,
-    SHARED_B: gl.constexpr,
-    SHARED_OUT: gl.constexpr,
-    WMMA_LAYOUT: gl.constexpr,
 ):
     """Eight-wave ping-pong BF16 CDNA5 GEMM for wide large-M projections.
 
@@ -1348,6 +1370,13 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
     zero-fills the loads past the edge and clips the TDM store.
     """
     gl.static_assert(gl.num_warps() == 8, "ping-pong needs two waves per SIMD")
+    # Built here rather than passed in: layout objects are not valid launch
+    # arguments for the JIT hooks (compile monitor) that serialize them.
+    layouts: gl.constexpr = _largem_pingpong_layouts(BLOCK_M, BLOCK_N, BLOCK_K, 8)
+    SHARED_A: gl.constexpr = layouts[0]
+    SHARED_B: gl.constexpr = layouts[1]
+    SHARED_OUT: gl.constexpr = layouts[2]
+    WMMA_LAYOUT: gl.constexpr = layouts[3]
     pid_m, pid_n = _largem_pingpong_xcd_tile(
         gl.program_id(0),
         gl.cdiv(M, BLOCK_M),
@@ -1434,34 +1463,6 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
     gl.amd.cdna5.tdm.async_wait(0)
 
 
-@functools.lru_cache(maxsize=None)
-def _largem_pingpong_layouts(block_m: int, block_n: int, block_k: int, num_warps: int):
-    """Partitioned LDS layouts and the matching WMMA layout for one tile."""
-    padded_a = gl.PaddedSharedLayout.with_identity_for(
-        [[block_k, 8]], [block_m, block_k], [1, 0]
-    )
-    padded_b = gl.PaddedSharedLayout.with_identity_for(
-        [[block_k, 8]], [block_n, block_k], [1, 0]
-    )
-    # Splitting the A rows and B columns across the two LDS partitions lets
-    # paired waves read different partitions in the same instruction.
-    shared_a, shared_b, wmma_layout = gl.amd.cdna5.make_partitioned_dot_layouts(
-        block_m,
-        block_n,
-        padded_a,
-        padded_b,
-        num_warps,
-        [16, 16, 32],
-        a_transposed=False,
-        b_transposed=True,
-        transposed=True,
-    )
-    shared_out = gl.PaddedSharedLayout.with_identity_for(
-        [[block_n, 8]], [block_m, block_n], [1, 0]
-    )
-    return shared_a, shared_b, shared_out, wmma_layout
-
-
 def gluon_mm_a16w16_largem_gfx1250(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1525,9 +1526,6 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
     # contiguous output; narrower outputs leave its 256-wide grid underfilled.
     if m >= _LARGEM_WIDE_M and n >= _LARGEM_PINGPONG_MIN_N and out.is_contiguous():
         block_m = block_n = 256
-        shared_a, shared_b, shared_out, wmma_layout = _largem_pingpong_layouts(
-            block_m, block_n, _LARGEM_BLOCK_K, 8
-        )
         grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
         _wmma_tdm_dense_largem_pingpong_kernel[(grid,)](
             A,
@@ -1544,10 +1542,6 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
             BLOCK_K=_LARGEM_BLOCK_K,
             GROUP_M=_LARGEM_PINGPONG_GROUP_M,
             NUM_XCDS=_LARGEM_NUM_XCDS,
-            SHARED_A=shared_a,
-            SHARED_B=shared_b,
-            SHARED_OUT=shared_out,
-            WMMA_LAYOUT=wmma_layout,
             num_warps=8,
             waves_per_eu=2,
         )

@@ -27,6 +27,7 @@ from utils import assert_no_triton_compile, is_cdna5
 if not is_cdna5():
     pytest.skip("AMD CDNA5 is required", allow_module_level=True)
 
+from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
     _wmma_tdm_dense_largem_pingpong_kernel,
     gluon_mm_a16w16_largem_gfx1250,
@@ -67,6 +68,19 @@ def test_largem_pingpong_row_counts_reuse_compilation():
     with assert_no_triton_compile(_wmma_tdm_dense_largem_pingpong_kernel):
         for rows in (4097, 6096, 8144, 8192):
             actual = _project(a[:rows], b)
-            torch.testing.assert_close(
-                actual, a[:rows] @ b.T, atol=1e-2, rtol=1e-2
-            )
+            torch.testing.assert_close(actual, a[:rows] @ b.T, atol=1e-2, rtol=1e-2)
+
+
+def test_largem_pingpong_compiles_under_compile_monitor():
+    # Serving installs the compile monitor, whose JIT hooks serialize every
+    # launch argument; the kernel must compile with them in place.
+    torch.manual_seed(7)
+    a = torch.randn(4096, 512, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(3072, 512, device="cuda", dtype=torch.bfloat16) / 512**0.5
+    _wmma_tdm_dense_largem_pingpong_kernel.device_caches.clear()
+    compile_monitor.install_compile_monitor("warn")
+    try:
+        actual = _project(a, b)
+    finally:
+        compile_monitor.uninstall_compile_monitor()
+    torch.testing.assert_close(actual, a @ b.T, atol=1e-2, rtol=1e-2)
