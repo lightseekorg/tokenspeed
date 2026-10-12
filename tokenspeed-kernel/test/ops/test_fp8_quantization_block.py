@@ -83,10 +83,13 @@ def test_fp8_block_quantization_rejects_non_2d(device: str) -> None:
         quantize_fp8(x, granularity="block", block_size=(128, 128))
 
 
-def test_fp8_block_quantization_feeds_block_scaled_gemm(device: str) -> None:
+@pytest.mark.parametrize("m, n", [(16, 256), (1, 576), (33, 1088)])
+def test_fp8_block_quantization_feeds_block_scaled_gemm(
+    device: str, m: int, n: int
+) -> None:
     """The produced weights must be consumable by the block-scaled FP8 GEMM."""
     torch.manual_seed(0)
-    m, n, k = 16, 256, 256
+    k = 256
     block_size = (128, 128)
     a = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 0.1
     weight = torch.randn(n, k, device=device, dtype=torch.bfloat16) * 0.1
