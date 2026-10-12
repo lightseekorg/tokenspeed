@@ -23,7 +23,9 @@
 The same launch writes the BF16 output, unchanged bit for bit, and its
 per-token FP8 E4M3 codes and FP32 scales, bit for bit those of
 ``fp8_quantize_per_token`` of that output; with the residual and its BF16
-rounding, with and without the x and residual scales.
+rounding, with and without the x and residual scales. Over many rows, where
+summing a row's squares in another order would change some output bits, also
+without a residual and with the FP32 residual sum.
 """
 
 import pytest
@@ -64,5 +66,35 @@ def test_rmsnorm_writes_the_per_token_fp8_of_its_output(rows, scaled):
     )
     assert torch.equal(out, fused_out) and torch.equal(residual_out, fused_residual)
     expected_codes, expected_scales = fp8_quantize_per_token(out)
+    assert torch.equal(scales, expected_scales)
+    assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
+
+
+@pytest.mark.parametrize("hidden", [2048, 4096, 7168])
+@pytest.mark.parametrize("residual", ["none", "fp32_sum", "bf16_sum", "scaled"])
+def test_token_fp8_out_keeps_every_output_bit(hidden, residual):
+    """2,048 rows: enough that a launch summing a row's squares in another
+    order than the call without token_fp8_out rounds some output elements to
+    the other BF16 neighbour."""
+    rows = 2048
+    x = _rows(rows, hidden, seed=16)
+    weight = (1 + 0.1 * torch.randn(hidden, device="cuda")).to(torch.bfloat16)
+    kwargs = dict(enable_pdl=None)
+    if residual != "none":
+        kwargs["residual"] = _rows(rows, hidden, seed=17)
+    if residual in ("bf16_sum", "scaled"):
+        kwargs["round_residual_sum_bf16"] = True
+    if residual == "scaled":
+        kwargs.update(x_scale=0.75, residual_scale=1.25)
+    plain = rmsnorm(x, weight, 1e-6, **kwargs)
+    codes = torch.empty(rows, hidden, device="cuda", dtype=FP8)
+    scales = torch.empty(rows, 1, device="cuda", dtype=torch.float32)
+    fused = rmsnorm(x, weight, 1e-6, token_fp8_out=(codes, scales), **kwargs)
+    if residual == "none":
+        plain, fused = (plain,), (fused,)
+    for want, got in zip(plain, fused):
+        differ = (want.view(torch.int16) != got.view(torch.int16)).sum().item()
+        assert differ == 0, f"{differ} elements differ from the plain call"
+    expected_codes, expected_scales = fp8_quantize_per_token(plain[0])
     assert torch.equal(scales, expected_scales)
     assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))

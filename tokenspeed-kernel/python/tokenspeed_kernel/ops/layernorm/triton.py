@@ -99,7 +99,15 @@ def _rmsnorm_kernel(
         normed = (x * weight).to(out_ptr.dtype.element_ty).to(tl.float32)
         amax = tl.max(tl.abs(normed), axis=0)
         codes = fp8_quantize_by_multiplier(normed, fp8_token_multiplier(amax))
-        tl.store(fp8_out_ptr + row_offsets, codes, mask=mask)
+        # Store the codes in vectors of at most 16 bytes of the output (8
+        # BF16 elements). A vector of 16 one-byte codes would have the
+        # compiler give every thread 16 elements of the row, loads included,
+        # and so sum the squares above in another order than the call
+        # without token_fp8_out, which changes some output bits.
+        code_offsets = tl.max_contiguous(
+            tl.arange(0, BLOCK), 128 // out_ptr.dtype.element_ty.primitive_bitwidth
+        )
+        tl.store(fp8_out_ptr + row * n_cols + code_offsets, codes, mask=mask)
         tl.store(fp8_scale_ptr + row, fp8_token_scale(amax))
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
