@@ -33,6 +33,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     capacity_model,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_TABLE_SLOTS,
     CacheGroupSpec,
     compute_max_logical_pages_for_capture,
 )
@@ -280,6 +281,31 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                                 self.assertGreaterEqual(
                                     capture_pages, conservative_pages
                                 )
+
+    def test_state_capture_width_is_the_two_slots_whatever_the_context(self):
+        state = CacheGroupSpec(
+            group_id="state",
+            retention="full_history",
+            sliding_window_tokens=None,
+            family="state",
+            replayable=False,
+        )
+        for context_len in (0, 1, 4096, 1 << 20):
+            for verify_width in (1, 8):
+                for overlap_depth in (0, 1):
+                    self.assertEqual(
+                        compute_max_logical_pages_for_capture(
+                            state,
+                            max_context_len=context_len,
+                            max_tokens_per_req=verify_width,
+                            overlap_schedule_depth=overlap_depth,
+                        ),
+                        STATE_TABLE_SLOTS,
+                    )
+        with self.assertRaises(ValueError):
+            compute_max_logical_pages_for_capture(
+                state, max_context_len=8, max_tokens_per_req=0
+            )
 
     def test_overlap_sizing_rejects_invalid_runtime_parameters(self):
         spec = CacheGroupSpec(

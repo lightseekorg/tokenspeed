@@ -1387,6 +1387,48 @@ class PrefillRoleGraphsTest(unittest.TestCase):
                 config=config,
             )
 
+    def test_placeholder_tables_give_a_state_group_its_two_slots(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            STATE_TABLE_SLOTS,
+            CacheGroupSpec,
+        )
+
+        class Backend:
+            def init_cuda_graph_state(self, *args, **kwargs):
+                pass
+
+        specs = (
+            CacheGroupSpec(
+                group_id="full",
+                retention="full_history",
+                rows_per_page=128,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+                replayable=False,
+            ),
+            CacheGroupSpec(
+                group_id="state",
+                retention="full_history",
+                sliding_window_tokens=None,
+                family="state",
+                replayable=False,
+            ),
+        )
+        runner = self.forward_step.ForwardStepRunner(
+            forward_func=lambda *args, **kwargs: None,
+            attn_backend=Backend(),
+            token_to_kv_pool=_fake_pool(specs=specs, cache_group_page_counts={}),
+            input_buffers=object(),
+            config=self._config(prefill_only=False),
+        )
+        tables = runner._placeholder_tables
+        self.assertEqual(set(tables), {"full", "state"})
+        self.assertEqual(tables["state"].shape[1], STATE_TABLE_SLOTS)
+        self.assertGreater(tables["full"].shape[1], STATE_TABLE_SLOTS)
+        self.assertTrue(
+            all(table.shape[0] == runner.max_decode_bs for table in tables.values())
+        )
+
     def test_prefill_role_skips_the_decode_graph_and_keeps_the_prefill_graph(
         self,
     ):

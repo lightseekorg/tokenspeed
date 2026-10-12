@@ -213,7 +213,8 @@ def compute_max_logical_pages_for_capture(
     """Return the decode CUDA Graph block-table width for one cache group.
 
     Decode only: a decode row describes live cache history, so a sliding group
-    is bounded by its window. Prefill capture fabricates one extend across the
+    is bounded by its window and a state group's row is its two slots
+    whatever the context. Prefill capture fabricates one extend across the
     whole extent and derives a write column per position in it, so it sizes
     its own tables -- see ``PrefillGraph._dummy_group_tables``.
 
@@ -240,6 +241,8 @@ def compute_max_logical_pages_for_capture(
         raise ValueError(
             f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
         )
+    if spec.family == "state":
+        return STATE_TABLE_SLOTS
     block_granularity = spec.block_granularity
     reservation_horizon = (overlap_schedule_depth + 1) * max_tokens_per_req
     if spec.retention == "sliding_window":
