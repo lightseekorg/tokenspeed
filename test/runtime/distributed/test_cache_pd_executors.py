@@ -117,13 +117,14 @@ def _typed_layout(
     )
 
 
-def _op(*, state_page: int = 6, spec_candidate_ids=((),)):
+def _op(*, state_page: int = 6, spec_candidate_ids=((),), state_prefix_cached=False):
     tables = {
         "history": np.asarray([[1, 2, 3]], dtype=np.int32),
-        "state": np.asarray([[4, 5, state_page]], dtype=np.int32),
+        # The D lands the prompt-end state in its live slot; slot 0 is null.
+        "state": np.asarray([[0, state_page, -1]], dtype=np.int32),
     }
     # The remote-decode op is self-contained: the scheduler stamps the
-    # bootstrap token and drafter candidates onto its rows.
+    # bootstrap token, drafter candidates and the state-hit flag onto its rows.
     return make_operation(
         tables,
         request_ids=["request-0"],
@@ -133,6 +134,7 @@ def _op(*, state_page: int = 6, spec_candidate_ids=((),)):
         num_extends=lambda: 1,
         decode_input_ids=[42],
         spec_candidate_ids=[list(ids) for ids in spec_candidate_ids],
+        state_prefix_cached=[state_prefix_cached],
     )
 
 
@@ -643,7 +645,18 @@ def test_decode_publishes_manifest_through_contract_receiver() -> None:
     args, kwargs = calls[0]
     assert args == ()
     assert kwargs["block_manifest"].groups[0].block_ids == (2, 3)
+    assert kwargs["block_manifest"].groups[1].block_ids == (6,)
+    assert kwargs["block_manifest"].state_prefix_cached is False
     assert executor._admissions == {"request-0": (7, 2)}
+
+    # A D-local state hit at the prompt end: the manifest carries the flag
+    # and no state block for the P to fill.
+    calls.clear()
+    executor.receivers = {"request-0": receiver}
+    executor._cache_prefill(_op(state_prefix_cached=True))
+    manifest = calls[0][1]["block_manifest"]
+    assert manifest.state_prefix_cached is True
+    assert manifest.groups[1].block_ids == ()
 
 
 def test_prefill_submits_manifest_through_contract_sender() -> None:

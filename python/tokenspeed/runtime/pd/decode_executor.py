@@ -70,6 +70,7 @@ class DisaggDecodeExecutor:
                 request_row=index,
                 prefix_len=prefix_len,
                 prompt_len=int(op.prefill_lengths[index]),
+                state_prefix_cached=bool(op.state_prefix_cached[index]),
             )
             pending.append(
                 (
