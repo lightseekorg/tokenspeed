@@ -3692,10 +3692,21 @@ class KimiLinearModel(nn.Module):
             capture_tap(self.config.num_hidden_layers - 1)
 
         if dspark_context is not None:
-            cache_locs = ctx.attn_backend.decode_window_locations()
-            if ctx.num_extends > 0:
+            # Target and draft views share the full-history group's page-id
+            # space; keep the target's packed order: extend rows, then verify
+            # rows. A pure prefill round (every request extending -- a PD
+            # prefill engine never publishes a decode window) reads the
+            # extend span only.
+            if ctx.num_extends == ctx.bs:
+                cache_locs = ctx.attn_backend.extend_span_locations()
+            elif ctx.num_extends == 0:
+                cache_locs = ctx.attn_backend.decode_window_locations()
+            else:
                 cache_locs = torch.cat(
-                    (ctx.attn_backend.extend_span_locations(), cache_locs)
+                    (
+                        ctx.attn_backend.extend_span_locations(),
+                        ctx.attn_backend.decode_window_locations(),
+                    )
                 )
             dspark_context.write_context(
                 projected_context,
