@@ -215,6 +215,9 @@ def _load_builtin_generators() -> None:
         prepare_sigmoid_bias_topk,
         prepare_topk,
     )
+    from tokenspeed_kernel.benchmark.generators.quantization import (
+        prepare_fp8_with_scale,
+    )
     from tokenspeed_kernel.benchmark.generators.residual import (
         prepare_attn_res_fwd,
         prepare_mhc_mixes,
@@ -290,6 +293,9 @@ def _load_builtin_generators() -> None:
         ("moe", "sigmoid_bias_topk"), prepare_sigmoid_bias_topk
     )
     _BENCHMARK_GENERATORS.setdefault(("moe", "topk"), prepare_topk)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("quantization", "fp8_with_scale"), prepare_fp8_with_scale
+    )
     _BENCHMARK_GENERATORS.setdefault(("moe", "apply"), prepare_moe_apply)
     _BENCHMARK_GENERATORS.setdefault(("moe", "latent_input"), prepare_latent_input)
     _BENCHMARK_GENERATORS.setdefault(
