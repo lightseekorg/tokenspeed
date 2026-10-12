@@ -837,7 +837,16 @@ projection and optional sigmoid gate into its split merge.
 Each workgroup of two warps owns one sequence, a block of up to 16 query
 heads, and one split of the keys, and walks one 64-key page per tile. TDM
 loads the latent and RoPE parts of each page into LDS as two loads. The
-splits write FP32 partials that a second kernel merges.
+splits write FP32 partials that a second kernel merges: one program per
+token and head streams the partials into registers a few splits at a time,
+so the merge has no split-count limit. The split count follows the
+query-block decode's rule below.
+
+The QK product spreads rows over warps and the PV product spreads latent
+columns. When a block's rows really span several warps, each tile hands the
+probabilities and rescale factors to every warp through two small LDS buffers
+behind a single barrier; that barrier also orders the tile's last LDS reads
+before the TDM load that reuses its slot.
 
 16-bit inputs load each tile into one LDS slot and wait for it before the
 math. FP8 inputs use two slots and two waves per SIMD: the next tile's page
@@ -877,12 +886,17 @@ tile the program loads serves all of its rows, and per-query lengths apply the
 causal mask within the block. Programs of 16 rows use two warps and larger
 ones four; FP8 double-buffers its TDM loads as in the flattened decode.
 
-The KV split count is the largest power of two that is at most 64, the page
-count of `max_seqlen_k`, and the CU count divided by the program count. A query
-that sees no key in a split stores a negative-infinity maximum, so the merge
-skips that split without producing NaN. The page-table stride and the request
-and token counts are runtime arguments, so batch sizes that keep the split
-count reuse one binary.
+FP8 programs fit two per CU (`waves_per_eu=2`), and a second resident program
+hides the first one's TDM and LDS waits. The KV split count first spreads the
+programs over every CU, then keeps doubling toward two programs per CU while
+each split still walks at least 12 pages of `max_seqlen_k`; shorter splits
+spend more on their prologue and FP32 partials than they save. It is a power
+of two of at most 128. A query that sees no key in a split stores a
+negative-infinity maximum, so the merge skips that split without producing
+NaN. The splits store their partials in BF16, halving the partial traffic
+that at 32 or more splits otherwise reaches a fifth of the KV bytes. The
+page-table stride and the request and token counts are runtime arguments, so
+batch sizes that keep the split count reuse one binary.
 
 ### gfx950 MLA prefill
 
