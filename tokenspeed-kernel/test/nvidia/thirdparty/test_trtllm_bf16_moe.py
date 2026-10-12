@@ -944,6 +944,13 @@ def _gpu_bf16_moe_layer(
 # an exactly representable BF16 bias spread over 2 to 8 (a control: BF16
 # loses nothing), and logits whose tanh-form sigmoid is 0.
 _BIAS_CASES = ["fp32-bias-steps", "bf16-bias-steps", "negative-logits"]
+# FlashInfer routes one expert group on routingCustom, which already adds the
+# bias in FP32 but keeps the tanh-form sigmoid; flashinfer-ai/flashinfer#5557
+# and the FP32-bias module change only the grouped routingMainKernel.
+_ONE_GROUP_ROUTER = (
+    "one expert group routes on FlashInfer's routingCustom, which keeps the "
+    "tanh-form sigmoid"
+)
 
 
 def _routing_case(case, num_tokens, device="cuda"):
@@ -985,6 +992,8 @@ def test_dsv3_sized_bias_cases_need_an_fp32_bias(n_group, topk_group):
 def test_fp32_bias_routing_matches_the_fp32_reference(
     case, num_tokens, intermediate_size, n_group, topk_group
 ):
+    if n_group == 1 and case == "negative-logits":
+        pytest.skip(_ONE_GROUP_ROUTER)
     w, x = _gpu_bf16_moe_layer(intermediate_size)
     from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as unquant
 
@@ -1039,7 +1048,9 @@ def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
 ):
     """The in-kernel FP32-bias plan and precomputed FP32 top-k give the same
     layer output, also on an expert-parallel rank whose local experts start
-    at an offset (64 or 192 of 256) and with a single expert group."""
+    at an offset (64 or 192 of 256)."""
+    if n_group == 1:
+        pytest.skip(_ONE_GROUP_ROUTER)
     w, x = _gpu_bf16_moe_layer(intermediate_size, ep_size=ep_size, ep_rank=ep_rank)
     reached = []
     fp32_moe = adapter.trtllm_bf16_fp32_routing_bias_moe
