@@ -436,13 +436,18 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         )
 
         # Each request retains its 7-token window plus the decode token at any
-        # page alignment; one chunk in flight -- capped by the total -- adds its
-        # rows behind the resumable-boundary lookback.
+        # page alignment, and with the prefix cache on hands its partial page
+        # to the cache at the prompt end while continuing on a fresh one (one
+        # more block per request, ceil((P - 1) / g), within the lookback); one
+        # chunk in flight -- capped by the total -- adds its rows behind the
+        # resumable-boundary lookback.
         resident_pages = 10 * math.ceil((7 + 1 + 3) / 4)
+        handover_pages = 10 * min(math.ceil((4 - 1) / 4), math.ceil(7 / 4))
         lookback_pages = math.ceil(7 / 4)
         scheduled_pages = math.ceil(20 / 4)
         self.assertEqual(
-            pages["sliding"], resident_pages + lookback_pages + scheduled_pages
+            pages["sliding"],
+            resident_pages + handover_pages + lookback_pages + scheduled_pages,
         )
 
     def test_page_counts_positive_finite_and_under_total_times_live(self):

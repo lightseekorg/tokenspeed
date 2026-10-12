@@ -336,7 +336,9 @@ def test_tail_is_one_page_per_published_group_plus_a_replayable_groups_worst_cas
     specs = (FULL, SLIDING)
     model = _model(specs, {"full": 1, "swa": 1})
     worst_case = model.single_request_group_pages(4096)
-    assert worst_case[0] == 4096 // PAGE  # the full group's whole context
+    # The full group's whole context, plus the page the prompt-end copy-in
+    # hands to the cache while the request continues on a fresh one.
+    assert worst_case[0] == 4096 // PAGE + 1
     # The replayable group's worst case is the scheduler's (window + chunk).
     assert tail_lcm_blocks_per_request(
         model, specs, 4096
