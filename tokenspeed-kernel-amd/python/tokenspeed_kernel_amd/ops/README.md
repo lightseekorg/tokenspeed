@@ -1173,6 +1173,46 @@ Post runs one token per CTA so its twenty coefficients are scalar loads that
 never wait behind the vector stores. The collapse runs one token per CTA so
 the optional RMSNorm reduces the whole row once.
 
+### gfx950 Qwen4 hyper-connection mix
+
+`gluon_hyperconnection_mix_gfx950` serves `gated_residual_mix` for decode
+batches (1 to 256 rows) of the HC4 / H2560 / R320 stream in two launches,
+replacing two hipBLASLt GEMMs (one with a split-K reduction kernel) and two
+Triton epilogues.
+
+#### Contract
+
+- Contiguous FP16/BF16 `normalized [rows, 4 * H]`, fused down/inject weight
+  `[R (+ 4), 4 * H]` and up weight `[4 * H, R]`; `4 * H` divisible by 10240
+  and `R` equal to 256 plus a power of two. Returns the mixed `[rows, H]` and
+  the inject logits `[rows, 4]` (or `None`) in the input dtype.
+- Numerics follow the GEMM-plus-epilogue path: both projections accumulate in
+  FP32 and are rounded to the input dtype before the scale/SiLU and the
+  sigmoid gate, so only the accumulation order differs (at most one ulp).
+  Split partials are summed in split order, so results are deterministic.
+- Row counts are runtime arguments within three tile buckets (up to 16, up
+  to 32, larger rows).
+- The split-K workspace (FP32 partials and self-resetting arrival counters)
+  is shared per device and tiling, so launches must be ordered on one stream.
+
+#### Algorithm
+
+The down projection splits `K = 4 * H` into 1024-deep slices, one per
+workgroup, with 16-wide weight tiles: about 200 workgroups each stream 32 KB
+of weight, which keeps every CU busy and the last split's reduction small.
+Operands are loaded with 16-byte coalesced loads, all issued before the
+first MFMA; the conversion to the MFMA operand layout broadcasts a shared
+operand through LDS rather than re-reading it per wave. Each split writes an
+FP32 partial through to memory and bumps a per-tile counter; the last split
+sums the partials, applies scale and SiLU, and writes the activation (and
+inject logits).
+
+The up projection gives each workgroup 16 hidden columns of all four
+branches as one MFMA tile, one branch per wave, with the 320-deep reduction
+loaded as a 256 + 64 pair so every load is in flight at once. The epilogue
+multiplies `sigmoid(gate)` with the matching normalized branch and sums the
+four branches across waves, so the gate tensor never reaches memory.
+
 ## Quantization
 
 ### gfx950 group-32 UE8M0 FP8 activations
