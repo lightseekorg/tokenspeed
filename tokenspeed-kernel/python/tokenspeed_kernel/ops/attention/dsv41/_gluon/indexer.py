@@ -331,16 +331,10 @@ def select_rows_gfx950(logits, candidates, live_widths, topk, row_out, row_lens)
 
 
 def select_rows_gfx1250(logits, candidates, live_widths, topk, row_out, row_lens):
-    # The radix select runs one program per row, so it only beats torch.topk
-    # once a score tile has enough rows to occupy most of the GPU.
-    if logits.shape[0] < 128:
-        select_rows_torch(logits, candidates, live_widths, topk, row_out, row_lens)
-        return
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
-        launch_triton_dsv41_index_topk_select_gfx1250,
+        launch_gluon_dsv41_index_topk_select_gfx1250,
     )
 
-    values_topk, columns = launch_triton_dsv41_index_topk_select_gfx1250(
-        logits, min(int(topk), logits.shape[1])
+    launch_gluon_dsv41_index_topk_select_gfx1250(
+        logits, candidates, live_widths, topk, row_out, row_lens
     )
-    _write_selected_rows(values_topk, columns, candidates, row_out, row_lens)

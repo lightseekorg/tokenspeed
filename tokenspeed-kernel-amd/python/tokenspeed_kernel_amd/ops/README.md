@@ -695,12 +695,10 @@ scorer writes one row of FP32 logits per query, one per candidate column, and
 a selector turns each row into that query's sorted list of logical KV row ids.
 gfx950 runs both steps in Gluon (`gluon_dsv41_index_topk_gfx950`, then
 `gluon_dsv41_index_topk_select_gfx950`) and selects candidate blocks with the
-portable Triton radix select (`tokenspeed_kernel` `index_block_select`);
-gfx1250 has a Gluon scorer and, for query tiles of 128 rows and up, a Triton
-radix selector
-(`triton_dsv41_index_topk_select_gfx1250`); smaller tiles use the portable
-torch selector. Both scorers take queries packed as MXFP4 values with one E8M0
-scale per 32 values.
+portable Triton radix select (`tokenspeed_kernel` `index_block_select`).
+gfx1250 runs the same two steps in Gluon (`gluon_dsv41_index_topk_gfx1250`,
+then `gluon_dsv41_index_topk_select_gfx1250`). Both scorers take queries
+packed as MXFP4 values with one E8M0 scale per 32 values.
 
 #### Contract
 
@@ -714,8 +712,9 @@ scale per 32 values.
   without a candidate, or on a missing or out-of-range page stay `-inf`.
 - Row selection writes the logical ids of the `min(topk, width)` largest
   finite logits in ascending order, then -1, plus their count (the
-  `select_rows_torch` contract). The gfx950 selector and the gfx1250 radix
-  selector keep the lowest columns among equal-score boundary ties.
+  `select_rows_torch` contract). The Gluon selectors keep the lowest columns
+  among equal-score boundary ties; the gfx1250 selector also ties `-0.0` with
+  `+0.0`.
 - Optional block selection keeps the best 8-row blocks by their maximum logit.
   A valid newest visible block remains eligible regardless of its score.
 - Selection scores the configured page-table or candidate capacity without
@@ -753,11 +752,8 @@ ascending without candidates and with ascending candidate lists; otherwise an
 all-pairs rank sorts them. LDS atomics cost about one wave instruction per 64
 lanes regardless of conflicts, so the radix passes dominate on wide rows.
 
-The gfx1250 radix selector runs one program per row. Four 8-bit histogram
-passes find the K-th largest value, and a final pass writes the selected
-values and columns in ascending column order, taking ties at the threshold in
-column order. The adapter then maps the columns to logical rows and sorts them
-in torch. Tiles below 128 rows, including decode, use the torch selector.
+The gfx1250 selector runs the same passes on sixteen 32-lane waves, so each
+workgroup keeps 512 lanes and the 2048-bin histograms.
 
 Block selection takes the maximum logit of each 8-row block, forces the
 newest visible block to `+inf`, and keeps the top blocks in ascending order.
