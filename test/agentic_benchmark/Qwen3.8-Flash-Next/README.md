@@ -4,9 +4,12 @@ Run [NVIDIA's NVFP4 checkpoint](https://huggingface.co/nvidia/Qwen3.8-Flash-Next
 with attention TP4, MoE EP4, three-step MTP and BF16 KV cache on four Blackwell
 GPUs. TokenSpeed must already be installed in the active environment or the
 repository's `.venv` / `venv`. Port 8000 must be free.
+The launcher requires `ts`, `curl`, and `setsid` in `PATH` and reports missing
+commands before preparing assets.
 
 MTP draft iterations share the sparse indexer's top-k selection through
 `--hf-overrides '{"index_share_for_mtp_iteration":true}'`.
+ReplaySSM uses the server's enabled default.
 KVStore is disabled with `--disable-kvstore`; GPU prefix caching stays enabled.
 
 The checkpoint mixes NVFP4 main-model experts with FP8 MTP experts and PLE
@@ -105,7 +108,8 @@ per-concurrency EvalScope JSON/SQLite artifacts and `summary.csv`.
 | `Approx Cache Hit` | EvalScope `KV Cache Hit Rate (%)` |
 | `Decoded Tok/Iter` | `sum(completion_tokens - 1) / sum(streaming gaps)` over successful requests; `-1` if unavailable |
 
-Failed requests, invalid TPOT or missing concurrency results fail the run.
+Missing required metrics (including `Failed Requests`), failed requests,
+invalid TPOT or missing concurrency results fail the run.
 To collect an existing sweep again:
 
 ```bash

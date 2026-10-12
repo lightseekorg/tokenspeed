@@ -73,7 +73,7 @@ def collect(sweep_dir: Path, *, expected_concurrencies: list[int]) -> list[dict]
     seen = set()
     for summary_path in sorted((sweep_dir / CONFIG).rglob("benchmark_summary.json")):
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        if summary.get("Failed Requests", 0):
+        if summary["Failed Requests"]:
             raise ValueError(f"{summary_path}: benchmark contains failed requests")
         concurrency = int(summary["Concurrency"])
         if concurrency in seen:

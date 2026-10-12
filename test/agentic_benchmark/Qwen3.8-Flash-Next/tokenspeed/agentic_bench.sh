@@ -37,7 +37,10 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
     done
 fi
 for COMMAND in ts curl setsid; do
-    command -v "$COMMAND" > /dev/null
+    if ! command -v "$COMMAND" > /dev/null; then
+        echo "Missing required command: $COMMAND" >&2
+        exit 1
+    fi
 done
 
 # Check before installing tools, and never benchmark an unrelated server.

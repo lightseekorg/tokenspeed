@@ -258,7 +258,9 @@ def test_collector_preserves_kimi_metrics_and_ci_csv(sweep, tpot_key):
     }
 
 
-@pytest.mark.parametrize("failure", ["missing_concurrency", "failed_request"])
+@pytest.mark.parametrize(
+    "failure", ["missing_concurrency", "failed_request", "missing_failure_count"]
+)
 def test_collector_rejects_unusable_sweeps(sweep, failure):
     run_dir = sweep / CONFIG / "parallel_32"
     if failure == "missing_concurrency":
@@ -266,7 +268,10 @@ def test_collector_rejects_unusable_sweeps(sweep, failure):
     else:
         summary_path = run_dir / "benchmark_summary.json"
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        summary["Failed Requests"] = 1
+        if failure == "missing_failure_count":
+            del summary["Failed Requests"]
+        else:
+            summary["Failed Requests"] = 1
         summary_path.write_text(json.dumps(summary), encoding="utf-8")
 
     result = collect(sweep)
@@ -412,6 +417,39 @@ def mock_benchmark(tmp_path):
     return scripts, env
 
 
+@pytest.mark.parametrize("missing_command", ["ts", "curl", "setsid"])
+def test_one_click_reports_missing_required_command(
+    mock_benchmark, tmp_path, missing_command
+):
+    scripts, env = mock_benchmark
+    bash = shutil.which("bash", path=env["PATH"])
+    assert bash is not None
+    commands_dir = tmp_path / "commands"
+    commands_dir.mkdir()
+    for command in ("dirname", "ts", "curl", "setsid"):
+        if command != missing_command:
+            executable = shutil.which(command, path=env["PATH"])
+            assert executable is not None
+            (commands_dir / command).symlink_to(executable)
+    env["PATH"] = str(commands_dir)
+    env["VIRTUAL_ENV"] = sys.prefix
+    env.pop("BASH_ENV", None)
+
+    result = subprocess.run(
+        [bash, str(scripts / "agentic_bench.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert f"Missing required command: {missing_command}" in result.stderr
+    assert not Path(env["SERVER_PIDS"]).exists()
+    assert not Path(env["PERF_CALLS"]).exists()
+
+
 @pytest.mark.parametrize(
     ("failure", "status", "calls"),
     [("none", 0, 2), ("warmup", 17, 1), ("perf", 17, 2), ("server", 1, 0)],
@@ -516,6 +554,7 @@ def test_ci_uses_tp4ep4_config_and_preserves_launcher_arguments(mock_benchmark):
         "--max-model-len",
         "--kvstore-size",
         "--disable-cuda-graph-padding",
+        "--disable-replay-ssm",  # Benchmark uses the server's default ReplaySSM.
         "--reasoning-parser",
         "--tool-call-parser",
     }.intersection(tokens)
