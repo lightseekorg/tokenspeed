@@ -335,15 +335,20 @@ def _moe_layer(tp_size, intermediate_size=512):
 
 @pytest.mark.parametrize("arch", [(9, 0), (10, 0), (10, 3)])
 @pytest.mark.parametrize("tp_size", [1, 2])
-def test_fp8_channel_moe_layer_plans_the_triton_kernel(nvidia_arch, arch, tp_size):
+def test_fp8_channel_moe_layer_plans_its_kernel(nvidia_arch, arch, tp_size):
     """An MoE layer of compressed-tensors FP8_DYNAMIC experts takes the
-    fp8_channel weights and plans the Triton FP8 channel MoE on SM90 to
-    SM103, with the tensors it reads."""
+    fp8_channel weights and plans FlashInfer's TRT-LLM FP8 per-channel MoE on
+    SM100 and SM103 and the Triton FP8 channel MoE on SM90, with the tensors
+    they read."""
     nvidia_arch(*arch)
     layer = _moe_layer(tp_size)
     ispp = 512 // tp_size
     assert layer._quant_kind == "fp8_channel"
-    assert layer.plan["apply_kernel_name"] == "triton_fp8_channel_precomputed_moe_apply"
+    assert layer.plan["apply_kernel_name"] == (
+        "triton_fp8_channel_precomputed_moe_apply"
+        if arch == (9, 0)
+        else "flashinfer_trtllm_fp8_channel_moe_apply"
+    )
     shapes = {
         name: (p.dtype, tuple(p.shape))
         for name, p in layer.named_parameters()

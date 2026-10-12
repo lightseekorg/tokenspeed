@@ -163,3 +163,28 @@ consecutive MoE layers through their activations, so one buffer per device
 is never in use by two calls at once; a model that overlapped two MoE calls on
 separate streams would need one buffer per stream. PDL stays off in this
 chain for the race described in the BF16 CUTLASS section of `flashinfer.py`.
+
+### FP8 per-channel experts
+
+The FP8 per-channel TRT-LLM section of `flashinfer.py` runs `fp8_channel`
+experts (compressed-tensors FP8 dynamic W8A8: one FP32 scale per weight row,
+activations quantized per token) on FlashInfer's
+`trtllm_fp8_per_channel_scale_moe`. The kernel reads the per-row scales in the
+weights' own resident row order, so the weight preprocessor moves every scale
+with its row: the `[gate | up]` to `[up | gate]` swap, the gated-activation
+interleave and the epilogue-tile shuffle. Its per-expert output scalars stay 1.
+Each rank pads its own intermediate partition to a multiple of 64 with zero rows
+and columns whose scales are 1, so a rank's channels do not move and the padding
+adds exactly zero, also to the per-route FC2-input quantization. Partitions that
+are a multiple of 64 need no padding: on GB200 the kernel output for a multiple
+of 64 is bit-identical to the same experts padded to the next multiple of 128.
+The FC2 input is quantized per routed row by TRT-LLM's `perTokenQuantization`
+(scale `max(amax / 448, 1 / (448 * 512))`, codes `x * min(448 / amax, 448 *
+512)` in FP32, rounded to BF16 and then to E4M3, `amax` over the BF16 row). The
+cubins need `usePerTokenSfA` and `usePerTokenSfB`; they are not among the BF16
+and NVFP4 MoE cubins, so an offline cache must hold them.
+
+The kernel takes precomputed routes only as BF16 weights packed with the
+expert ids. With FP32 route weights the routed kernel stops before its
+finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
+FP32 weights, accumulating in FP32 and rounding once to BF16.

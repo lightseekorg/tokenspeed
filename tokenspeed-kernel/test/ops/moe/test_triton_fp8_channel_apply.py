@@ -34,6 +34,8 @@ def _plan(**overrides) -> dict:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        # On SM100 and SM103 FlashInfer's TRT-LLM kernel ranks first.
+        solution="triton",
     )
     kwargs.update(overrides)
     return kernel_moe_plan("fp8_channel", **kwargs)
