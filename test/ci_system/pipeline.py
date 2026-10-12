@@ -36,7 +36,17 @@ SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 # after startup (a per-batch constexpr) fails the run instead of stalling it.
 SERVING_TASK_TYPES = {"server_smoke", "eval", "perf"}
 JIT_COMPILE_CHECK_ENV = "TOKENSPEED_JIT_COMPILE_CHECK"
-SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug", "slurm"}
+SUPPORTED_TRIGGERS = {
+    "per-commit",
+    "post-submit",
+    "manual",
+    "nightly",
+    "debug",
+    "slurm",
+}
+# Task triggers each scan trigger selects. `per-commit` tasks run on pull
+# requests and on pushes to main; `post-submit` tasks run only on pushes.
+SCAN_TRIGGER_TASK_TRIGGERS = {"post-submit": {"per-commit", "post-submit"}}
 WORKFLOW_STAGE_TYPES = {
     "unit-test": {"ut", "server_smoke"},
     "kernel-benchmark": {"perf"},
@@ -399,9 +409,10 @@ def build_matrix(
         raise ValueError(f"unsupported multi-node filter: {multi_node!r}")
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
+    task_triggers = SCAN_TRIGGER_TASK_TRIGGERS.get(trigger, {trigger})
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
-        if trigger and trigger not in task["triggers"]:
+        if trigger and task_triggers.isdisjoint(task["triggers"]):
             continue
         is_multi_node = task.get("slurm", {}).get("nodes", 1) > 1
         if multi_node == "only" and not is_multi_node:

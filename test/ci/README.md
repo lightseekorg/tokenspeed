@@ -5,7 +5,8 @@
 
 Current trigger values:
 
-- `per-commit`
+- `per-commit`: pull requests and pushes to `main`
+- `post-submit`: pushes to `main` only
 - `manual`
 - `nightly`
 - `debug`
