@@ -7,6 +7,11 @@ from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError
+from utils import (
+    assert_no_triton_compile,
+    int_specialization_class,
+    warm_specialization_classes,
+)
 
 APPLY = "triton_fp8_channel_precomputed_moe_apply"
 
@@ -269,3 +274,83 @@ def test_fp8_channel_moe_graph_replay_matches_eager() -> None:
     x.copy_(-x)
     graph.replay()
     assert torch.equal(captured, run())
+
+
+def test_fp8_channel_moe_token_count_does_not_recompile() -> None:
+    _skip_unless_supported()
+    from tokenspeed_kernel._triton import triton
+    from tokenspeed_kernel.ops.moe._triton import common as _common
+    from tokenspeed_kernel.ops.moe._triton import fp8_channel
+
+    hidden, ispp, num_experts, top_k, max_tokens = 256, 64, 4, 2, 1500
+    layer = _layer(num_experts, hidden, ispp, 0, 1, seed=7)
+    generator = torch.Generator(device="cuda").manual_seed(13)
+    x = torch.randn(max_tokens, hidden, device="cuda", generator=generator).to(
+        torch.bfloat16
+    )
+    topk_ids = torch.stack(
+        [
+            torch.randperm(num_experts, device="cuda", generator=generator)[:top_k]
+            for _ in range(max_tokens)
+        ]
+    ).to(torch.int32)
+    topk_weights = torch.rand(
+        max_tokens, top_k, device="cuda", dtype=torch.float32, generator=generator
+    )
+    plan = _plan(ispp=ispp, hidden=hidden)
+    num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+
+    def run(tokens):
+        return kernel_moe_apply(
+            plan,
+            x[:tokens],
+            layer,
+            None,
+            topk_weights=topk_weights[:tokens],
+            topk_ids=topk_ids[:tokens],
+        )
+
+    def key(tokens):
+        routes = tokens * top_k
+        config = fp8_channel._launch_config(tokens, hidden, ispp)
+        programs = (
+            min(
+                config[f"{stage}_ctas_per_sm"] * num_sms,
+                routes * triton.cdiv(size, config[f"{stage}_block_n"]),
+            )
+            for stage, size in (("fc1", ispp), ("fc2", hidden))
+        )
+        # The launch config is bucketed by token count; up to 128 routes take
+        # the small routing block.
+        return (
+            *map(int_specialization_class, (tokens, routes, *programs)),
+            tuple(config.values()),
+            routes <= 128,
+        )
+
+    # Each token's output depends only on its own routes, so a shorter batch
+    # is compared with the prefix of the FP64 emulation of the full one.
+    expected = _moe_reference(
+        x,
+        layer.w13_weight,
+        layer.w13_weight_scale,
+        layer.w2_weight,
+        layer.w2_weight_scale,
+        topk_weights,
+        topk_ids,
+        0,
+    )
+    sweep = (1, 3, 7, 12, 24, 100, 300, 700, 1000, 1483)
+    warm_specialization_classes(run, key, sweep, range(1, max_tokens))
+    with assert_no_triton_compile(
+        fp8_channel._fc1_kernel,
+        fp8_channel._fc2_kernel,
+        fp8_channel._quantize_rows_kernel,
+        _common._routing_kernel,
+        _common._combine_kernel,
+    ):
+        for tokens in sweep:
+            actual = run(tokens).double()
+            reference = expected[:tokens]
+            error = (actual - reference).norm() / reference.norm().clamp(min=1e-30)
+            assert error < 2e-3

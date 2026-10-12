@@ -32,8 +32,9 @@ The logical layout a per-channel FP8 MoE kernel consumes, as loaded:
 A row dequantizes to ``weight[e, n, :] * scale[e, n]``. Activations are
 quantized per token by the kernel. The scales start as NaN, so a row the
 checkpoint did not fill fails ``check_fp8_channel_scales`` after loading
-instead of running with a made-up scale. A kernel's own layout (shuffle, row
-interleave, padding) is its post-load step's.
+instead of running with a made-up scale; ``--load-format dummy`` sets them to 1
+before that check. A kernel's own layout (shuffle, row interleave, padding) is
+its post-load step's.
 """
 
 from __future__ import annotations
@@ -47,6 +48,11 @@ from tokenspeed.runtime.layers.moe.weights.unquant import create_dense_weight_pa
 from tokenspeed.runtime.utils import set_weight_attrs
 
 _SCALE_NAMES = ("w13_weight_scale", "w2_weight_scale")
+
+
+def _unit_scales(param: torch.Tensor, generator: torch.Generator) -> None:
+    """Dummy loading has no checkpoint to fill the NaN scales from."""
+    param.data.fill_(1.0)
 
 
 def create_fp8_channel_weight_pair(spec: MoELayerSpec, layer: nn.Module) -> None:
@@ -63,7 +69,11 @@ def create_fp8_channel_weight_pair(spec: MoELayerSpec, layer: nn.Module) -> None
         )
         layer.register_parameter(name, scale)
         set_weight_attrs(
-            scale, {"weight_loader": make_channel_scale_loader(spec, name)}
+            scale,
+            {
+                "weight_loader": make_channel_scale_loader(spec, name),
+                "dummy_initializer": _unit_scales,
+            },
         )
 
 

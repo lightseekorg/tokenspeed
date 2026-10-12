@@ -1311,11 +1311,14 @@ if platform.is_nvidia:
             output = x.new_empty((0, x.shape[1]), dtype=torch.bfloat16)
             if do_finalize:
                 return output
-            return (
-                output,
-                x.new_empty((0, spec.top_k), dtype=torch.bfloat16),
-                x.new_empty((0,), dtype=torch.int32),
+            # The caller's route weights keep their dtype, as on non-empty
+            # batches of the routed path.
+            expert_weights = (
+                topk_weights
+                if topk_weights is not None
+                else x.new_empty((0, spec.top_k), dtype=torch.bfloat16)
             )
+            return output, expert_weights, x.new_empty((0,), dtype=torch.int32)
         x_fp8, x_scale = quantize_fp8_with_scale(x.contiguous(), granularity="token")
         scalars = w.fp8_channel_output_scales.data
         common = dict(
@@ -1431,9 +1434,20 @@ if platform.is_nvidia:
     ):
         """FP8 per-channel experts routed in the kernel from ``router_logits``
         (the layer's routing method, correction bias and routed scale); BF16
-        route weights. Rounding points as in the section comment above."""
+        route weights. Explicitly supplied ``topk_weights`` and ``topk_ids``
+        run on those routes instead, as the routed variant does. Rounding
+        points as in the section comment above."""
+        if (topk_weights is None) != (topk_ids is None):
+            raise ValueError("pass both topk_weights and topk_ids, or neither")
         return _flashinfer_trtllm_fp8_channel_moe_apply(
-            x, w, router_logits, None, None, do_finalize, enable_pdl, routed=False
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            do_finalize,
+            enable_pdl,
+            routed=topk_ids is not None,
         )
 
     @register_kernel(

@@ -30,6 +30,7 @@ compressed-tensors package's own serialization.
 import dataclasses
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -48,6 +49,7 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError
 
+from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
@@ -58,6 +60,7 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors import (
     compressed_tensors as ct,
 )
 from tokenspeed.runtime.layers.quantization.utils import should_ignore_quant_layer
+from tokenspeed.runtime.model_loader import loader
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -537,6 +540,23 @@ def test_fp8_channel_moe_layer_refuses_unloaded_scales(nvidia_arch):
     nvidia_arch(10, 0)
     layer = _moe_layer(1)
     with pytest.raises(ValueError, match="model.layers.1.mlp: w13_weight_scale has"):
+        layer.process_weights_after_loading(layer)
+
+
+def test_fp8_channel_moe_layer_takes_a_dummy_load(nvidia_arch, monkeypatch):
+    """``--load-format dummy`` sets the NaN scales to 1 before post-processing
+    checks them; a real load that leaves a row unfilled is still refused."""
+    nvidia_arch(9, 0)
+    layer = _moe_layer(1)
+    monkeypatch.setattr(loader, "_initialize_model", lambda *args: layer)
+    loader.DummyModelLoader(LoadConfig()).load_model(
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        device_config=SimpleNamespace(device="cpu"),
+    )
+    assert layer._weights_processed
+    layer = _moe_layer(1)
+    _load_all_scales(layer, skip={("w3", 2)})
+    with pytest.raises(ValueError, match="w13_weight_scale .* local expert 2, row 512"):
         layer.process_weights_after_loading(layer)
 
 

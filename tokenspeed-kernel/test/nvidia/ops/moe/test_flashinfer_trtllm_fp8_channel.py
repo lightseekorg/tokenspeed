@@ -286,6 +286,108 @@ def test_routes_pack_ids_and_bf16_weights():
     assert torch.equal(bits.float(), weights)
 
 
+def _stub_vendor_calls(monkeypatch):
+    """Replace the input quantizer and both vendor MoE calls with stubs that
+    record the routing arguments; returns the list of recorded calls."""
+    import tokenspeed_kernel.ops.moe.flashinfer as module
+
+    calls = []
+
+    def vendor(name):
+        def call(**kwargs):
+            calls.append((name, kwargs))
+            tokens, hidden = kwargs["hidden_states"].shape
+            out = torch.zeros(tokens * kwargs["top_k"], hidden, dtype=torch.bfloat16)
+            expanded = torch.arange(tokens * kwargs["top_k"], dtype=torch.int32)
+            return out, None, expanded
+
+        return call
+
+    monkeypatch.setattr(
+        module,
+        "quantize_fp8_with_scale",
+        lambda x, granularity: (x.to(FP8), x.new_ones(x.shape[0])),
+    )
+    monkeypatch.setattr(module, "trtllm_fp8_per_channel_scale_moe", vendor("logits"))
+    monkeypatch.setattr(
+        module, "trtllm_fp8_per_channel_scale_routed_moe", vendor("routed")
+    )
+    return calls
+
+
+def _stub_experts(top_k=2):
+    w = SimpleNamespace(
+        _spec=SimpleNamespace(
+            num_experts=8, top_k=top_k, ep_rank=0, num_local_experts=8
+        ),
+        fp8_channel_output_scales=torch.nn.Parameter(torch.ones(8)),
+        intermediate_size_per_partition=64,
+    )
+    for name in ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale"):
+        setattr(w, name, torch.nn.Parameter(torch.empty(0)))
+    return w
+
+
+def test_kernel_routing_variant_runs_supplied_routes(monkeypatch):
+    """Precomputed routes passed to the kernel-routing registration run on
+    those routes, not on routes recomputed from the router logits."""
+    from tokenspeed_kernel.ops.moe.flashinfer import (
+        _pack_routes,
+        flashinfer_trtllm_fp8_channel_moe_apply,
+    )
+
+    calls = _stub_vendor_calls(monkeypatch)
+    x = torch.ones(3, 128, dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[0, 5], [7, 1], [2, 3]], dtype=torch.int32)
+    topk_weights = torch.tensor([[0.5, 0.25], [1.0, 0.375], [0.125, 0.75]])
+    _, weights, _ = flashinfer_trtllm_fp8_channel_moe_apply(
+        {},
+        x,
+        _stub_experts(),
+        torch.zeros(3, 8),
+        topk_weights,
+        topk_ids,
+        do_finalize=False,
+    )
+    assert [name for name, _ in calls] == ["routed"]
+    assert torch.equal(calls[0][1]["topk_ids"], _pack_routes(topk_ids, topk_weights))
+    assert weights is topk_weights
+    with pytest.raises(ValueError, match="both topk_weights and topk_ids"):
+        flashinfer_trtllm_fp8_channel_moe_apply(
+            {}, x, _stub_experts(), torch.zeros(3, 8), None, topk_ids
+        )
+
+
+@pytest.mark.parametrize("kernel", [KERNEL_ROUTED, ROUTED])
+def test_zero_tokens_keep_the_route_weight_dtype(kernel, monkeypatch):
+    """A rank with no tokens hands back the caller's route weights, so a
+    deferred finalize sees the same dtype as on non-empty batches."""
+    import tokenspeed_kernel.ops.moe.flashinfer as module
+
+    calls = _stub_vendor_calls(monkeypatch)
+    apply = getattr(module, kernel)
+    x = torch.empty(0, 128, dtype=torch.bfloat16)
+    topk_weights = torch.empty(0, 2, dtype=torch.float32)
+    topk_ids = torch.empty(0, 2, dtype=torch.int32)
+    output, weights, expanded = apply(
+        {},
+        x,
+        _stub_experts(),
+        torch.empty(0, 8),
+        topk_weights,
+        topk_ids,
+        do_finalize=False,
+    )
+    assert calls == []
+    assert output.shape == (0, 128) and expanded.shape == (0,)
+    assert weights is topk_weights
+    if kernel == KERNEL_ROUTED:
+        _, weights, _ = apply(
+            {}, x, _stub_experts(), torch.empty(0, 8), do_finalize=False
+        )
+        assert weights.shape == (0, 2) and weights.dtype == torch.bfloat16
+
+
 def _plan_on(platform, **overrides) -> dict:
     kwargs = dict(
         input_dtype=torch.bfloat16,
