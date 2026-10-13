@@ -512,6 +512,10 @@ class AutoBackend(CommBackend):
             and tensor.dim() == 2
             and dim in (-1, tensor.dim() - 1)
         ):
+            # Small rows ride the all-reduce workspace's barrier-free exchange.
+            gathered = self._trtllm_ar.lamport_all_gather(tensor, group)
+            if gathered is not None:
+                return gathered
             return self._rsag.all_gather(tensor, group, dim)
         return self._nccl.all_gather(tensor, group, dim)
 
