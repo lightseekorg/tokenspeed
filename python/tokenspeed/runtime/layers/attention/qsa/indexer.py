@@ -49,7 +49,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qsa_rope_position_field,
 )
 from tokenspeed.runtime.layers.attention.qsa.metadata import (
-    decode_query_lengths,
     qsa_forward_layout,
 )
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -511,11 +510,7 @@ class QSAIndexer(nn.Module):
             compressed,
             full_page_size=layout.full_kernel_page_size,
             complete_blocks=complete_blocks,
-            queries_per_request=(
-                q.shape[0]
-                if ctx.bs == 1
-                else decode_query_lengths(ctx, q.shape[0], force_uniform=False)
-            ),
+            queries_per_request=layout.queries_per_request,
         )
         if self.share_topk_for_mtp_iteration:
             ctx.attn_backend.sparse_topk.decode = selected_slots

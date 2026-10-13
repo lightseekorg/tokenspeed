@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe DSL registration for the B200/B300 QSA sparse-attention specialization."""
+"""CuTe DSL registration for NVIDIA QSA streaming and Blackwell sparse attention."""
 
 from __future__ import annotations
 
@@ -33,15 +33,222 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _PLATFORM = current_platform()
+_IS_NVIDIA = _PLATFORM.is_nvidia
 _IS_NVIDIA_BLACKWELL = _PLATFORM.is_nvidia and _PLATFORM.is_blackwell
+
+if _IS_NVIDIA:
+    from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.general import (
+        kernel as _cute_dsl_qsa_general_stream_topk,
+    )
 
 if _IS_NVIDIA_BLACKWELL:
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import (
         kernel as _cute_dsl_qsa_sparse_attention,
     )
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
+        _configuration,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
+        kernel as _cute_dsl_qsa_stream_block_topk,
+    )
 
 _HEAD_DIM = 256
 _SELECTED_WIDTH = 2051
+
+
+def can_use_cute_dsl_qwen4_exp_qsa_block_topk(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    block_topk: int,
+    queries_per_request: int | None,
+    max_partial_bytes: int,
+) -> bool:
+    """Return whether a tuned Blackwell MMA specialization should be used.
+
+    Other NVIDIA layouts still use the general CuTe DSL streaming kernel.
+
+    Args:
+        query: Candidate BF16 query tensor shaped ``[rows, 4, 128]``.
+        key_cache: Candidate contiguous BF16 key cache shaped
+            ``[slots, 1, 128]``.
+        page_table: Candidate int32 page table with contiguous columns.
+        request_indices: Candidate contiguous request id per query row.
+        complete_blocks: Candidate contiguous valid-block count per query row.
+        page_size: Number of compressed blocks per cache page.
+        block_topk: Number of logical blocks to select per row.
+        queries_per_request: Uniform consecutive query-run width, or ``None``
+            for a ragged layout.
+        max_partial_bytes: Caller budget for global selection scratch,
+            excluding the output. Grouped streaming needs no global scratch.
+
+    Returns:
+        Whether the tensors satisfy a tuned MMA specialization's contract.
+    """
+
+    if not _IS_NVIDIA_BLACKWELL:
+        return False
+    if query.ndim != 3 or key_cache.ndim != 3 or page_table.ndim != 2:
+        return False
+    rows = query.shape[0]
+    if rows == 0:
+        return False
+    if queries_per_request is not None and (
+        queries_per_request < 1 or rows % queries_per_request
+    ):
+        return False
+    if (
+        query.shape[1:] != (4, 128)
+        or key_cache.shape[0] < 64
+        or key_cache.shape[0] % 64
+        or key_cache.shape[1:] != (1, 128)
+    ):
+        return False
+    if page_size != 64 or block_topk != 512:
+        return False
+    if (
+        _configuration(
+            rows,
+            page_table.shape[1] * page_size,
+            queries_per_request,
+            max_partial_bytes,
+        )
+        is None
+    ):
+        return False
+    if query.dtype is not torch.bfloat16 or key_cache.dtype is not torch.bfloat16:
+        return False
+    if page_table.dtype is not torch.int32:
+        return False
+    if request_indices.dtype not in (torch.int32, torch.int64):
+        return False
+    if complete_blocks.dtype is not torch.int32:
+        return False
+    if request_indices.shape != (rows,) or complete_blocks.shape != (rows,):
+        return False
+    tensors = (query, key_cache, page_table, request_indices, complete_blocks)
+    if not query.is_cuda or any(tensor.device != query.device for tensor in tensors):
+        return False
+    if query.stride(2) != 1 or query.stride(0) % 8 or query.stride(1) % 8:
+        return False
+    if query.data_ptr() % 16 or not key_cache.is_contiguous():
+        return False
+    if key_cache.data_ptr() % 16:
+        return False
+    if page_table.stride(1) != 1 or page_table.stride(0) < page_table.shape[1]:
+        return False
+    if page_table.data_ptr() % 16:
+        return False
+    return all(
+        tensor.is_contiguous() and tensor.data_ptr() % 16 == 0
+        for tensor in (request_indices, complete_blocks)
+    )
+
+
+def cute_dsl_qwen4_exp_qsa_block_topk(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    block_topk: int,
+    queries_per_request: int | None,
+    max_partial_bytes: int,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Run NVIDIA QSA streaming with the best matching CuTe DSL kernel.
+
+    Blackwell specializations share K for uniform runs or split small grids.
+    Other layouts use a workspace-free, independent-row CuTe streaming kernel.
+
+    Args:
+        query: BF16, FP16 or FP32 queries shaped ``[rows, heads, head_dim]``.
+        key_cache: Compressed keys shaped ``[slots, 1, head_dim]``.
+        page_table: Int32 or int64 physical pages shaped ``[requests, max_pages]``;
+            both row and column strides are supported.
+        request_indices: Int32 or int64 request id per query row.
+        complete_blocks: Int32 or int64 valid-block count per query row.
+        page_size: Number of compressed blocks per page.
+        block_topk: Power-of-two number of selected blocks, at least 64.
+        queries_per_request: Uniform consecutive query-run width, or ``None``
+            for ragged rows; required for grouped scoring optimizations.
+        max_partial_bytes: Budget for global scratch, excluding the output.
+        enable_pdl: Whether to use programmatic dependent launch ordering.
+
+    Returns:
+        Int32 logical block ids shaped ``[rows, block_topk]``, padded with ``-1``.
+    """
+
+    if not _IS_NVIDIA:
+        raise RuntimeError("CuTe DSL QSA stream top-k requires NVIDIA GPUs")
+    if not can_use_cute_dsl_qwen4_exp_qsa_block_topk(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        queries_per_request=queries_per_request,
+        max_partial_bytes=max_partial_bytes,
+    ):
+        return _cute_dsl_qsa_general_stream_topk(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            page_size=page_size,
+            block_topk=block_topk,
+            enable_pdl=enable_pdl,
+        )
+    return _cute_dsl_qsa_stream_block_topk(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        queries_per_request=queries_per_request,
+        max_partial_bytes=max_partial_bytes,
+        enable_pdl=enable_pdl,
+    )
+
+
+if _IS_NVIDIA:
+    register_kernel(
+        "attention",
+        "qsa_block_topk",
+        name="cute_dsl_qwen4_exp_qsa_block_topk",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    query=dense_tensor_format(torch.bfloat16),
+                    key_cache=dense_tensor_format(torch.bfloat16),
+                ),
+            }
+        ),
+        traits={
+            "num_q_heads": frozenset({4}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
+            "block_topk": frozenset({512}),
+        },
+        priority=Priority.SPECIALIZED,
+    )(cute_dsl_qwen4_exp_qsa_block_topk)
 
 
 def cute_dsl_blackwell_qsa_sparse_attention(
@@ -149,6 +356,10 @@ if _IS_NVIDIA_BLACKWELL:
         },
         priority=Priority.SPECIALIZED + 2,
     )(cute_dsl_blackwell_qsa_sparse_attention)
-    __all__ = ["cute_dsl_blackwell_qsa_sparse_attention"]
+    __all__ = [
+        "can_use_cute_dsl_qwen4_exp_qsa_block_topk",
+        "cute_dsl_qwen4_exp_qsa_block_topk",
+        "cute_dsl_blackwell_qsa_sparse_attention",
+    ]
 else:
     __all__ = []

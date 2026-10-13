@@ -1966,12 +1966,15 @@ def qwen4_exp_qsa_block_topk(
         queries_per_request: Uniform number of consecutive query rows per
             request, or None for ragged/mixed layouts. A positive width must
             divide ``rows``; the caller guarantees that each width-sized run
-            has one owning request. Logits scoring shares K tiles within these
+            has one owning request. Scoring may share K tiles within these
             runs while preserving each row's complete-block frontier.
-        max_partial_bytes: Memory budget for the partial top-k buffers
-            (``stream`` solution only).
-        solution: ``"stream"`` fuses scoring and selection without
-            materializing scores; ``"logits"`` materializes the
+        max_partial_bytes: Memory budget for global selection scratch
+            (``stream`` solution only), excluding the output. Grouped CuTe
+            streaming keeps its running set inside each CTA; small query
+            grids may use split scoring within this budget.
+        solution: ``"stream"`` uses fused grouped scoring or bounded split
+            scoring and selection. NVIDIA uses CuTe DSL; other vendors use
+            portable Triton. ``"logits"`` materializes the
             ``[rows, num_blocks]`` FP32 scores and radix-selects them.
         persistent_topk_workspace: Optional caller-owned CUDA uint8 workspace
             of at least 1 MiB. The ``"logits"`` solution uses it for the
@@ -2015,6 +2018,23 @@ def qwen4_exp_qsa_block_topk(
             block_topk=block_topk,
             queries_per_request=queries_per_request,
             persistent_topk_workspace=persistent_topk_workspace,
+            enable_pdl=enable_pdl,
+        )
+    if _is_nvidia:
+        from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
+            cute_dsl_qwen4_exp_qsa_block_topk,
+        )
+
+        return cute_dsl_qwen4_exp_qsa_block_topk(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            page_size=page_size,
+            block_topk=block_topk,
+            queries_per_request=queries_per_request,
+            max_partial_bytes=max_partial_bytes,
             enable_pdl=enable_pdl,
         )
     return _qwen4_exp_qsa_block_topk_stream(

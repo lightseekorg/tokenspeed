@@ -102,7 +102,7 @@ def _check_graph_edges(graph, enabled):
     assert tested > 0
 
 
-def _check_replays(forward, sources, targets, enabled):
+def _check_replays(forward, sources, targets, enabled, *, compare_outputs):
     # Explicit kernel arguments must take precedence over the global setting.
     pdl_enabled(not enabled)
     forward(enabled)
@@ -121,8 +121,11 @@ def _check_replays(forward, sources, targets, enabled):
             target.fill_(float("nan") if target.is_floating_point() else 0)
         pdl_enabled(not enabled)
         graph.replay()
-        for result, reference in zip(actual, expected):
-            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        if compare_outputs is None:
+            for result, reference in zip(actual, expected):
+                torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        else:
+            compare_outputs(actual, expected)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -193,7 +196,101 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
         )
         return selected, slots
 
-    _check_replays(forward, sources, targets, enabled)
+    _check_replays(forward, sources, targets, enabled, compare_outputs=None)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="CuTe DSL QSA stream top-k requires NVIDIA Blackwell",
+)
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    ("rows", "width", "pages"),
+    [
+        (16, 8, 65),
+        (1, 1, 128),
+        (2, 1, 1024),
+        (8, 8, 1024),
+        (256, 256, 32),
+        (256, 256, 64),
+        (256, 256, 128),
+    ],
+)
+def test_cute_dsl_qsa_stream_waits_before_query_copy_and_frontiers(
+    enabled,
+    restore_pdl,
+    rows,
+    width,
+    pages,
+):
+    torch.manual_seed(317)
+    query = torch.randn(rows, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn((pages + 1) * 64, 1, 128, device="cuda", dtype=torch.bfloat16)
+    table = torch.arange(1, pages + 1, device="cuda", dtype=torch.int32).repeat(
+        rows // width, 1
+    )
+    requests = torch.arange(
+        rows // width, device="cuda", dtype=torch.int32
+    ).repeat_interleave(width)
+    capacity = pages * 64
+    counts = [0, 1, 511, 512, 513, capacity // 2, capacity - 1, capacity]
+    if rows < 8:
+        counts = [capacity, 513][:rows]
+    else:
+        counts *= rows // 8
+    complete = torch.tensor(
+        counts,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    sources = query, cache, table, requests, complete
+    targets = tuple(torch.empty_like(t) for t in sources)
+
+    def forward(enable_pdl):
+        _publish(sources, targets)
+        selected = qwen4_exp_qsa_block_topk(
+            *targets,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=width,
+            max_partial_bytes=32 * 1024 * 1024,
+            solution="stream",
+            persistent_topk_workspace=None,
+            enable_pdl=enable_pdl,
+        )
+        return (selected,)
+
+    def compare_selected(actual, expected):
+        query, cache, table, requests, complete = targets
+
+        def selected_scores(selected):
+            counts = complete.clamp(0, 512).long()
+            torch.testing.assert_close((selected >= 0).sum(1), counts)
+            assert bool(((selected < complete[:, None]) | (selected == -1)).all())
+            ordered = selected.sort(dim=1).values
+            assert bool(
+                ((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)).all()
+            )
+            ids = selected.clamp_min(0).long()
+            slots = table[requests.long()[:, None], ids // 64].long() * 64 + ids % 64
+            scores = torch.einsum(
+                "rhd,rnd->rhn", query.float(), cache[slots, 0].float()
+            )
+            scores = (
+                scores.clamp_min_(0).sum(1).masked_fill_(selected < 0, -float("inf"))
+            )
+            return scores.sort(dim=1).values
+
+        # Atomic candidate compaction leaves output order and boundary tie
+        # ids unspecified. Compare FP32 selected scores, counts and uniqueness.
+        torch.testing.assert_close(
+            selected_scores(actual[0]),
+            selected_scores(expected[0]),
+            rtol=1e-5,
+            atol=1e-4,
+        )
+
+    _check_replays(forward, sources, targets, enabled, compare_outputs=compare_selected)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -269,7 +366,7 @@ def test_qsa_compression_orders_ring_reuse(enabled, write_rows, restore_pdl):
         )
         return out, compressed, raw, pos_cache
 
-    _check_replays(forward, sources, targets, enabled)
+    _check_replays(forward, sources, targets, enabled, compare_outputs=None)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -308,4 +405,4 @@ def test_qsa_attention_waits_for_slots_and_kv(
         )
         return (output,)
 
-    _check_replays(forward, sources, targets, enabled)
+    _check_replays(forward, sources, targets, enabled, compare_outputs=None)

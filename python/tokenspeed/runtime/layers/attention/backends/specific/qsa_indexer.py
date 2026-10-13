@@ -67,6 +67,7 @@ class QSAIndexerMetadata:
 
     seq_lens: torch.Tensor
     extend_seq_lens: torch.Tensor | None
+    queries_per_request: int | None
     qsa_block_table: torch.Tensor
     recent_block_table: torch.Tensor
 
@@ -200,6 +201,7 @@ class QSAIndexerBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor | None,
         max_seq_len: int,
+        queries_per_request: int | None,
     ) -> QSAIndexerMetadata:
         # The host bound covers prefix + new tokens, not just this chunk.
         # Keep the persistent allocation intact; only this invocation's view
@@ -214,6 +216,7 @@ class QSAIndexerBackend(AttentionBackend):
         return QSAIndexerMetadata(
             seq_lens=seq_lens,
             extend_seq_lens=extend_seq_lens,
+            queries_per_request=queries_per_request,
             qsa_block_table=table[:, :columns],
             recent_block_table=self._tables.table(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, bs),
         )
@@ -255,6 +258,21 @@ class QSAIndexerBackend(AttentionBackend):
                 )
             )
         max_seq_len = self.max_context_len
+        queries_per_request = None
+        if bs > 0:
+            # The scheduler already supplies host query lengths. Never infer
+            # equal request runs from divisibility of the total row count.
+            if num_extends == 0:
+                queries_per_request = self.spec_num_tokens
+            else:
+                host_lengths = extend_seq_lens_cpu[:num_extends]
+                width = int(host_lengths[0])
+                if (
+                    width > 0
+                    and bool((host_lengths == width).all())
+                    and (num_extends == bs or width == self.spec_num_tokens)
+                ):
+                    queries_per_request = width
         if bs > 0 and num_extends == bs:
             # All request lengths are already known on the host. Mixed batches
             # retain the capacity bound for their device-only decode lengths.
@@ -265,7 +283,7 @@ class QSAIndexerBackend(AttentionBackend):
                 ).max()
             )
         self.forward_extend_metadata = self._metadata(
-            bs, seq_lens[:bs].clone(), lengths, max_seq_len
+            bs, seq_lens[:bs].clone(), lengths, max_seq_len, queries_per_request
         )
         self._active_metadata = None
 
@@ -292,7 +310,11 @@ class QSAIndexerBackend(AttentionBackend):
         metadata = self._decode_views.get(bs)
         if metadata is None:
             metadata = self._metadata(
-                bs, self._seq_lens[:bs], None, self.max_context_len
+                bs,
+                self._seq_lens[:bs],
+                None,
+                self.max_context_len,
+                self.spec_num_tokens,
             )
             self._decode_views[bs] = metadata
         self.forward_decode_metadata = metadata
