@@ -326,6 +326,64 @@ def qsa_block_topk_select(
     )
 
 
+def qsa_block_topk_stream(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    block_topk: int,
+    max_partial_bytes: int,
+    enable_pdl: bool,
+    override: str | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Score and select each row's top-k QSA blocks without materializing scores.
+
+    Args:
+        query: Index queries shaped ``[rows, heads, head_dim]``.
+        key_cache: Compressed keys shaped ``[slots, 1, head_dim]``.
+        page_table: Compressed-cache page ids shaped ``[requests, pages]``.
+        request_indices: Owning request per query row.
+        complete_blocks: Fully compressed block count per row.
+        page_size: Compressed rows per page.
+        block_topk: Blocks selected per row.
+        max_partial_bytes: Memory budget for partial top-k buffers.
+        enable_pdl: Use programmatic dependent launch where supported.
+        override: Optional registered kernel name.
+        solution: Optional kernel solution.
+
+    Returns:
+        Int32 block ids shaped ``[rows, block_topk]`` in no particular order;
+        invalid entries are ``-1``.
+    """
+
+    kernel = select_kernel(
+        "attention",
+        "qsa_block_topk_stream",
+        format_signature(
+            query=dense_tensor_format(query.dtype),
+            key_cache=dense_tensor_format(key_cache.dtype),
+        ),
+        traits={"num_heads": query.shape[1], "head_dim": query.shape[2]},
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        max_partial_bytes=max_partial_bytes,
+        enable_pdl=enable_pdl,
+    )
+
+
 def qwen4_exp_qsa_block_topk(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -337,7 +395,7 @@ def qwen4_exp_qsa_block_topk(
     block_topk: int,
     queries_per_request: int | None,
     max_partial_bytes: int,
-    solution: str,
+    algorithm: str,
     persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool,
 ) -> torch.Tensor:
@@ -359,13 +417,13 @@ def qwen4_exp_qsa_block_topk(
             has one owning request. Logits scoring shares K tiles within these
             runs while preserving each row's complete-block frontier.
         max_partial_bytes: Memory budget for the partial top-k buffers
-            (``stream`` solution only).
-        solution: ``"stream"`` fuses scoring and selection without
+            (``stream`` algorithm only).
+        algorithm: ``"stream"`` fuses scoring and selection without
             materializing scores; ``"logits"`` materializes the
             ``[rows, num_blocks]`` FP32 scores with ``qsa_block_scores`` and
             selects them with ``qsa_block_topk_select``.
         persistent_topk_workspace: Optional caller-owned CUDA uint8 workspace
-            of at least 1 MiB. The ``"logits"`` solution uses it for the
+            of at least 1 MiB. The ``"logits"`` algorithm uses it for the
             length-aware persistent radix top-k when that kernel is available;
             otherwise selection falls back to portable Triton.
         enable_pdl: Wait for query/cache/metadata producers and release
@@ -380,10 +438,10 @@ def qwen4_exp_qsa_block_topk(
         raise ValueError("Qwen4-Exp QSA block top-k expects rank-three tensors")
     if block_topk < 64 or (block_topk & (block_topk - 1)):
         raise ValueError("Qwen4-Exp QSA block top-k needs a power-of-two topk >= 64")
-    if solution not in ("stream", "logits"):
+    if algorithm not in ("stream", "logits"):
         raise ValueError(
-            "Qwen4-Exp QSA block top-k solution must be 'stream' or 'logits', "
-            f"got {solution!r}"
+            "Qwen4-Exp QSA block top-k algorithm must be 'stream' or 'logits', "
+            f"got {algorithm!r}"
         )
     rows = query.shape[0]
     if queries_per_request is not None and (
@@ -395,7 +453,7 @@ def qwen4_exp_qsa_block_topk(
         return torch.full(
             (rows, block_topk), -1, dtype=torch.int32, device=query.device
         )
-    if solution == "logits":
+    if algorithm == "logits":
         scores = qsa_block_scores(
             query,
             key_cache,
@@ -417,11 +475,7 @@ def qwen4_exp_qsa_block_topk(
             override=None,
             solution=None,
         )
-    from tokenspeed_kernel.ops.attention.qsa.triton import (
-        triton_qsa_block_topk_stream,
-    )
-
-    return triton_qsa_block_topk_stream(
+    return qsa_block_topk_stream(
         query,
         key_cache,
         page_table,
@@ -431,6 +485,8 @@ def qwen4_exp_qsa_block_topk(
         block_topk=block_topk,
         max_partial_bytes=max_partial_bytes,
         enable_pdl=enable_pdl,
+        override=None,
+        solution=None,
     )
 
 
@@ -447,6 +503,7 @@ import tokenspeed_kernel.ops.attention.qsa.gluon  # noqa: E402,F401
 __all__ = [
     "qsa_block_scores",
     "qsa_block_topk_select",
+    "qsa_block_topk_stream",
     "qsa_sparse_attention",
     "qwen4_exp_qsa_block_topk",
 ]

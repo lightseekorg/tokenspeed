@@ -720,29 +720,29 @@ def test_qsa_dispatch_uses_router_slots_and_records_one_pd_step(
     )
 
 
-def test_qwen4_exp_qsa_topk_solution_reads_env(monkeypatch) -> None:
+def test_qwen4_exp_qsa_topk_algorithm_reads_env(monkeypatch) -> None:
     indexer = object.__new__(QSAIndexer)
     small = torch.empty(1, 64)  # 1 x 4096 blocks x 4B fits any default budget
     large = torch.empty(1, 8192)  # 1 x 524288 blocks x 4B exceeds 1 MiB
 
     monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", raising=False)
     monkeypatch.delenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", raising=False)
-    assert indexer._topk_solution(1, small, 64) == "logits"
-    assert indexer._topk_solution(1, large, 64) == "logits"
+    assert indexer._topk_algorithm(1, small, 64) == "logits"
+    assert indexer._topk_algorithm(1, large, 64) == "logits"
 
     # A tighter budget flips only the oversized batch onto the stream path.
     monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_MAX_LOGITS_MB", "1")
-    assert indexer._topk_solution(1, small, 64) == "logits"
-    assert indexer._topk_solution(1, large, 64) == "stream"
+    assert indexer._topk_algorithm(1, small, 64) == "logits"
+    assert indexer._topk_algorithm(1, large, 64) == "stream"
 
     # Explicit backends pin the routing regardless of shape or budget.
     for pinned in ("stream", "logits"):
         monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", pinned)
-        assert indexer._topk_solution(1, large, 64) == pinned
+        assert indexer._topk_algorithm(1, large, 64) == pinned
 
     monkeypatch.setenv("TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH", "bogus")
     with pytest.raises(ValueError, match="TOPK_PATH"):
-        indexer._topk_solution(1, small, 64)
+        indexer._topk_algorithm(1, small, 64)
 
 
 def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:

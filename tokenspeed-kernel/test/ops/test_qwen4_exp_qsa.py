@@ -781,7 +781,7 @@ def test_qwen4_exp_qsa_block_topk_matches_torch(device: str) -> None:
         block_topk=block_topk,
         queries_per_request=1,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="stream",
+        algorithm="stream",
         persistent_topk_workspace=None,
         enable_pdl=False,
     )
@@ -841,7 +841,7 @@ def test_qwen4_exp_qsa_block_topk_two_stage_merge_matches_torch(device: str) -> 
         block_topk=block_topk,
         queries_per_request=1,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="stream",
+        algorithm="stream",
         persistent_topk_workspace=None,
         enable_pdl=False,
     )
@@ -994,7 +994,7 @@ def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
                 block_topk=block_topk,
                 queries_per_request=width,
                 max_partial_bytes=32 * 1024 * 1024,
-                solution="logits",
+                algorithm="logits",
                 persistent_topk_workspace=None,
                 enable_pdl=False,
             )
@@ -1049,7 +1049,7 @@ def test_qwen4_exp_qsa_grouped_scores_refresh_during_graph_replay(device: str) -
             block_topk=64,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="logits",
+            algorithm="logits",
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1119,7 +1119,7 @@ def test_qwen4_exp_qsa_long_query_groups_match_independent_rows(
                 block_topk=64,
                 queries_per_request=query_width,
                 max_partial_bytes=32 * 1024 * 1024,
-                solution="logits",
+                algorithm="logits",
                 persistent_topk_workspace=None,
                 enable_pdl=False,
             )
@@ -1160,7 +1160,7 @@ def test_qwen4_exp_qsa_rejects_invalid_query_width(
             block_topk=64,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            solution="logits",
+            algorithm="logits",
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1202,7 +1202,7 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         page_table,
         requests,
         complete_blocks,
-        solution="stream",
+        algorithm="stream",
         **kwargs,
     )
     logits = qwen4_exp_qsa_block_topk(
@@ -1211,7 +1211,7 @@ def test_qwen4_exp_qsa_block_topk_logits_matches_stream(device: str) -> None:
         page_table,
         requests,
         complete_blocks,
-        solution="logits",
+        algorithm="logits",
         **kwargs,
     )
 
@@ -1287,7 +1287,7 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
         block_topk=block_topk,
         queries_per_request=1,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="logits",
+        algorithm="logits",
         persistent_topk_workspace=workspace,
         enable_pdl=False,
     )
@@ -1327,7 +1327,7 @@ def test_qwen4_exp_qsa_compact_logits_shorter_than_persistent_topk(
         block_topk=topk,
         queries_per_request=rows,
         max_partial_bytes=32 * 1024 * 1024,
-        solution="logits",
+        algorithm="logits",
         persistent_topk_workspace=torch.empty(
             1024 * 1024, device=device, dtype=torch.uint8
         ),
@@ -1381,7 +1381,7 @@ def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
         page_table,
         requests,
         complete_blocks,
-        solution="stream",
+        algorithm="stream",
         persistent_topk_workspace=None,
         **kwargs,
     )
@@ -1391,7 +1391,7 @@ def test_qwen4_exp_qsa_block_topk_logits_persistent_radix_matches_stream(
         page_table,
         requests,
         complete_blocks,
-        solution="logits",
+        algorithm="logits",
         persistent_topk_workspace=workspace,
         **kwargs,
     )
@@ -1486,7 +1486,7 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
     requests = torch.arange(rows, device=device)
     complete_blocks = torch.tensor([num_blocks, 40, 200], device=device)
 
-    for solution in ("stream", "logits"):
+    for algorithm in ("stream", "logits"):
         strided = qwen4_exp_qsa_block_topk(
             query,
             key_cache,
@@ -1497,7 +1497,7 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
             block_topk=block_topk,
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=solution,
+            algorithm=algorithm,
             persistent_topk_workspace=None,
             enable_pdl=False,
         )
@@ -1511,7 +1511,7 @@ def test_qwen4_exp_qsa_block_topk_reads_strided_inputs(device: str) -> None:
             block_topk=block_topk,
             queries_per_request=1,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=solution,
+            algorithm=algorithm,
             persistent_topk_workspace=None,
             enable_pdl=False,
         )

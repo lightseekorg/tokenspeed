@@ -1965,6 +1965,24 @@ register_kernel(
 
 register_kernel(
     "attention",
+    "qsa_block_topk_stream",
+    name="triton_qsa_block_topk_stream",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                query=dense_tensor_format(dtype),
+                key_cache=dense_tensor_format(dtype),
+            )
+            for dtype in (torch.bfloat16, torch.float16, torch.float32)
+        }
+    ),
+    priority=Priority.PORTABLE,
+)(triton_qsa_block_topk_stream)
+
+register_kernel(
+    "attention",
     "qsa_block_topk_select",
     name="triton_qsa_block_topk_select",
     solution="triton",

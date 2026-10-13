@@ -304,7 +304,7 @@ class QSAIndexer(nn.Module):
         )
         return prepared_query
 
-    def _topk_solution(
+    def _topk_algorithm(
         self,
         rows: int,
         page_table: torch.Tensor,
@@ -367,7 +367,7 @@ class QSAIndexer(nn.Module):
             block_topk=self.block_topk,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=self._topk_solution(q.shape[0], qsa_page_table, page_size),
+            algorithm=self._topk_algorithm(q.shape[0], qsa_page_table, page_size),
             persistent_topk_workspace=self._persistent_topk_workspace,
             enable_pdl=enable_pdl,
         )

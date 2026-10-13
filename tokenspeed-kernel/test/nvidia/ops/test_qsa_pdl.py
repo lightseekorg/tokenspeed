@@ -130,7 +130,7 @@ def _check_replays(forward, sources, targets, enabled):
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("queries_per_request", [1, 3, 4])
 @pytest.mark.parametrize(
-    ("solution", "blocks", "topk"),
+    ("algorithm", "blocks", "topk"),
     [
         ("stream", 1024, 64),
         ("stream", 16384, 512),
@@ -138,7 +138,7 @@ def _check_replays(forward, sources, targets, enabled):
     ],
 )
 def test_qsa_selection_waits_for_query_cache_and_metadata(
-    enabled, queries_per_request, solution, blocks, topk, restore_pdl
+    enabled, queries_per_request, algorithm, blocks, topk, restore_pdl
 ):
     torch.manual_seed(311)
     batch, heads, dim, page_size, ratio = 3, 4, 32, 64, 4
@@ -178,7 +178,7 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
             block_topk=topk,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            solution=solution,
+            algorithm=algorithm,
             persistent_topk_workspace=None,
             enable_pdl=enable_pdl,
         )

@@ -3613,16 +3613,29 @@ def test_qsa_indexer_selects_gluon_on_gfx950(
             format_signature(logits=dense_tensor_format(torch.float32)),
             traits={"topk": 2048},
         )
-        return scores, topk
+        stream = _select_on(
+            platform,
+            "attention",
+            "qsa_block_topk_stream",
+            format_signature(
+                query=dense_tensor_format(torch.bfloat16),
+                key_cache=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={"num_heads": 4, "head_dim": 128},
+        )
+        return scores, topk, stream
 
     assert all(spec.priority == Priority.SPECIALIZED for spec in gluon_specs)
+    # Streaming top-k has only the portable implementation.
     assert select(mi350_platform) == (
         "gluon_qsa_block_scores_gfx950",
         "gluon_qsa_block_topk_select_gfx950",
+        "triton_qsa_block_topk_stream",
     )
     assert select(mi450_platform) == (
         "triton_qsa_block_scores",
         "triton_qsa_block_topk_select",
+        "triton_qsa_block_topk_stream",
     )
 
 
