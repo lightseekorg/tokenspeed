@@ -27,6 +27,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
 from tokenspeed.runtime.layers.attention import registry
 from tokenspeed.runtime.layers.attention.backends.state import kda
@@ -608,6 +610,10 @@ class TestCacheBackendIdentity(unittest.TestCase):
         self.assertIs(build.draft_attn_backend, draft)
         self.assertIs(draft.cache_pool, build.draft_token_to_kv_pool)
 
+    @unittest.skipUnless(
+        current_platform().is_nvidia,
+        "the trtllm backend registers only on NVIDIA (backends/__init__.py)",
+    )
     def test_create_attn_components_keeps_msa_dense_sub_backend(self):
         import tokenspeed.runtime.layers.attention.backends  # noqa: F401
 
@@ -621,6 +627,9 @@ class TestCacheBackendIdentity(unittest.TestCase):
             build, _, _ = self._build(args, model, draft_model=model)
         self.assertEqual(build.attention_backend_name, "msa:trtllm")
         self.assertEqual(build.draft_attention_backend_name, "msa:fa3")
+
+    def test_create_attn_components_msa_auto_names_dense_default(self):
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
 
         with tempfile.TemporaryDirectory() as directory:
             self._write_config(directory, self._MINIMAX_M3_CONFIG)
