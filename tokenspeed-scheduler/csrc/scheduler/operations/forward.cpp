@@ -123,7 +123,8 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     // A final point publishes the frontier's state even when its pages were
     // all published by an earlier step (a D request leaving at a page-aligned
     // frontier): the checkpoint is keyed by the last page's chain hash.
-    const bool state_only = point != PublicationPoint::kChunk && !tail && !cache_progress.prefix_hashes.empty() &&
+    const bool publish_state = point == PublicationPoint::kFinal || point == PublicationPoint::kOwnerContinues;
+    const bool state_only = publish_state && !tail && !cache_progress.prefix_hashes.empty() &&
                             num_computed_tokens == filled_prefix_pages * prefix_granularity;
     if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) || tail || state_only) {
         progress.completed_pages = CompletedPages{
@@ -131,7 +132,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
             .first_new_prefix_page = first_new_prefix_page,
             .tail = tail,
             .owner_continues = point == PublicationPoint::kOwnerContinues,
-            .publish_state = point != PublicationPoint::kChunk,
+            .publish_state = publish_state,
             .boundary_kind =
                 point == PublicationPoint::kChunk ? CacheBoundaryKind::kChunk : CacheBoundaryKind::kEndpoint,
             .stream_completed_to_host = stream_completed_to_host,

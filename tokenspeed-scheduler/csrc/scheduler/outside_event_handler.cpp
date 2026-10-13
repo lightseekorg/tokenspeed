@@ -105,11 +105,16 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
     fsm::CacheProgress progress = request.CacheProgress();
     // Every token but the last is computed; the last is the sampled token no
-    // forward consumed.
+    // landed forward consumed. A forward still in flight (an overlapped
+    // decode the finish overtook) is writing the live state slot, so that
+    // slot is not the frontier's state and stays unpublished; the KV rows
+    // below the frontier are final either way.
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
+    const PublicationPoint point =
+        request.ResultsInFlight() > 0 ? PublicationPoint::kFinalKvOnly : PublicationPoint::kFinal;
     RequestProgress completed =
         AdvanceRequestProgress(request, progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
+                               /*stream_completed_to_host=*/false, point);
     std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages) {
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);

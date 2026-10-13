@@ -197,17 +197,75 @@ TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDe
     EXPECT_EQ(at_chunk_end.prefix_tokens, 0);
     EXPECT_NE(at_chunk_end.state_row.at(0), decode1[0]) << "a fresh zero state, not a checkpoint";
 
-    // Finish publishes the frontier (14 computed tokens: the prompt and the
-    // four consumed generated tokens) and its state.
+    // The two probes above each planned a decode of r; both land before the
+    // finish, which publishes the frontier (15 computed tokens: the prompt
+    // and the five consumed generated tokens) and its state.
     SendForwardDone("r", {105});
+    SendForwardDone("r", {106});
     SendFinish("r");
     PlanOnce();
     EXPECT_EQ(scheduler_->TailEntries(), 2u);
-    const Resume at_finish = Probe("finish-hit", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 101, 102, 103, 104, 77});
-    EXPECT_EQ(at_finish.prefix_tokens, 14);
+    const Resume at_finish = Probe("finish-hit", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 101, 102, 103, 104, 105, 77});
+    EXPECT_EQ(at_finish.prefix_tokens, 15);
     EXPECT_EQ(at_finish.state_row.at(0), decode1[1]) << "the live slot published at finish";
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks())
         << "every block is cache-only or free";
+}
+
+// A request that finishes right after its prefill (a one-token budget) never
+// rotates: finish publishes slot 1 as the prefill wrote it -- the state after
+// the prompt -- and the partial KV block in place, and a longer prompt resumes
+// from exactly those blocks.
+TEST_F(StateCheckpointSuite, FinishRightAfterPrefillPublishesThePrefillsLiveSlotInPlace) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(7), .max_new_tokens = 1});
+    const ExecutionPlan prefill = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(prefill);
+    ASSERT_NE(batch, nullptr);
+    const std::vector<std::int32_t> state_row = StateRow(*batch, "state0", "r");
+    const std::vector<std::int32_t> full_row = batch->block_tables.at("full").at(0);
+    ASSERT_EQ(state_row.size(), 2u);
+    ASSERT_EQ(full_row.size(), 2u);  // [0,4) [4,8): seven prompt tokens and the decode slot
+    SendForwardDone("r", {101});
+    SendFinish("r");  // no decode step ran: computed tokens 7, frontier inside block 1
+    PlanOnce();
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+
+    // [1..7, 77] resumes at 7: slot 0 is the block the prefill wrote as its
+    // live slot, and the KV tail copy is made from the prefill's own block.
+    Submit(RequestWithTokens("hit", {1, 2, 3, 4, 5, 6, 7, 77}));
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* hit = FindForwardBatch(plan);
+    ASSERT_NE(hit, nullptr);
+    EXPECT_EQ(hit->extend_prefix_lens, std::vector<std::int32_t>{7});
+    EXPECT_EQ(StateRow(*hit, "state0", "hit").at(0), state_row.at(1)) << "the prefill's live slot, not its input";
+    ASSERT_EQ(plan.pages_to_copy.at("full").size(), 1u);
+    EXPECT_EQ(plan.pages_to_copy.at("full").front().first, full_row.at(1)) << "the partial block as written";
+    EXPECT_EQ(hit->block_tables.at("full").at(0).at(0), full_row.at(0));
+}
+
+// A finish that overtakes an in-flight decode (overlap scheduling: the
+// runtime decides on the landed token while the next step is already
+// dispatched) publishes the KV rows below the frontier, which are final, but
+// not the state: the live slot is being written by the forward in flight.
+TEST_F(StateCheckpointSuite, FinishWithAForwardInFlightPublishesTheTailButNotTheState) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(7), .max_new_tokens = 8});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("r", {101});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);  // first decode: publishes the state at 7, rotates
+    SendForwardDone("r", {102});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);  // second decode, in flight: writes slot 1 in place
+    SendFinish("r");                                   // frontier 8: tokens [1..7, 101], 102 never consumed
+    PlanOnce();
+
+    // [1..7, 101, 102, 77]: the KV reaches 8 (page [4, 8) completed), but no
+    // state exists at 8 -- the block the in-flight decode was writing is not
+    // the state after eight tokens -- so the hit falls back to the checkpoint
+    // at 7, with the junction at 8.
+    const Resume resume = Probe("hit", {1, 2, 3, 4, 5, 6, 7, 101, 102, 77});
+    EXPECT_EQ(resume.prefix_tokens, 7);
+    EXPECT_GT(resume.state_row.at(0), 0) << "the checkpoint at 7";
 }
 
 TEST_F(StateCheckpointSuite, AbortReleasesBothSlotsAndPublishesNothing) {

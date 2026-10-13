@@ -1041,7 +1041,10 @@ lands in the same change as the pin, never a release apart.
   while decoding — feedback ends with the sampled token the next forward
   computes. It does not subtract the verify width: a decode result lands its
   accepted tokens, not a fixed number, so any margin is an estimate that lags
-  the real endpoint and delays publication and reclaim behind it.
+  the real endpoint and delays publication and reclaim behind it. A finish
+  that overtakes a forward still in flight (an overlapped decode) publishes
+  the KV rows below the frontier, which are final, but not the State
+  groups' live slot that forward is writing (`PublicationPoint::kFinalKvOnly`).
 - A `Retracted` request holds no Device pages; its image is held by that state
   alone (Host pins and pool refs) and dropped with it. It becomes a
   readmission candidate only once every store it waits for has landed, at

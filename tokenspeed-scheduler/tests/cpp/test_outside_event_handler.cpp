@@ -1068,11 +1068,13 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndClaimsAPageAligne
     SendBootstrapped("r0");
     PlanOnce();
     SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
-    PlanOnce();
-
+    // The request leaves before any decode runs: its frontier is the landed
+    // prompt, eight tokens, and the landed state is the state at that
+    // boundary.
     ExecutionEvent succeeded;
     succeeded.With(pd::SucceededEvent{"r0"});
     scheduler_->Advance(succeeded);
+    PlanOnce();
 
     // r1 repeats r0's prompt: the history pages are reused up to the probe
     // bound (the last token is recomputed), and r0's final state -- published
