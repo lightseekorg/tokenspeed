@@ -436,7 +436,15 @@ class DeviceHandle:
             self._copy_submissions.append(
                 self._thread.submit(lambda: executor.copy_cache_pages(copies))
             )
-        pages = execution_plan.pages_to_zero
+        # The plan lists every group, empty or not; only groups with pages
+        # are work. An empty submission per idle round would flood the FIFO
+        # faster than the data plane drains it, starving the real work
+        # queued behind (a D role's remote-prefill receive).
+        pages = {
+            group_id: page_ids
+            for group_id, page_ids in execution_plan.pages_to_zero.items()
+            if len(page_ids)
+        }
         zero_future = (
             self._thread.submit(lambda: executor.zero_cache_pages(pages))
             if pages

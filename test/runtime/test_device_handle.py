@@ -167,14 +167,16 @@ def _plan(
     remote_prefill=None,
 ):
     """A round's ExecutionPlan as ``execute`` reads it — every field the real
-    plan exposes, so a fake cannot hide a renamed one. ``pages_to_copy`` is
-    the ``pages_to_copy_arrays()`` view: ``[n, 2]`` arrays per group id."""
+    plan exposes, so a fake cannot hide a renamed one. ``pages_to_zero`` is
+    the real plan's shape: every cache group listed, empty or not, with the
+    given pages under ``"kv"``. ``pages_to_copy`` is the
+    ``pages_to_copy_arrays()`` view: ``[n, 2]`` arrays per group id."""
     copies = {
         group_id: np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
         for group_id, pairs in (pages_to_copy or {}).items()
     }
     return SimpleNamespace(
-        pages_to_zero=list(pages_to_zero),
+        pages_to_zero={"kv": list(pages_to_zero), "state": []},
         pages_to_copy_arrays=lambda: copies,
         cache=list(cache),
         remote_decode=remote_decode,
@@ -382,7 +384,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(plan, None)
@@ -391,7 +393,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
         "submit",
         ("write_backs", [store, load], "execution-stream", "default-stream"),
         "submit",
-        ("zero", (3, 4)),
+        ("zero", {"kv": (3, 4)}),
         "submit",
         ("load_backs", [store, load], "default-stream"),
     ]
@@ -429,7 +431,7 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
         ("copy", {gid: arr.tolist() for gid, arr in pairs.items()})
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(plan, None)
@@ -440,7 +442,7 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
         "submit",
         ("copy", {"kv": [[3, 8], [5, 9]]}),
         "submit",
-        ("zero", (3,)),
+        ("zero", {"kv": (3,)}),
         "submit",
         ("load_backs", [store]),
     ]
@@ -448,7 +450,7 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
     # A plan with no pairs submits no copy at all.
     trace.clear()
     handle.execute(_plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
-    assert trace == ["submit", ("zero", (2,))]
+    assert trace == ["submit", ("zero", {"kv": (2,)})]
 
 
 def test_a_failed_page_copy_surfaces_at_the_next_round(wire_ops):
@@ -500,7 +502,7 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(plan, None)
@@ -571,12 +573,12 @@ def test_page_zeroing_without_l2_submits_only_zeroing():
     trace: list = []
     handle = _handle(trace)
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(_plan(pages_to_zero=[3, 4]), None)
 
-    assert trace == ["submit", ("zero", (3, 4))]
+    assert trace == ["submit", ("zero", {"kv": (3, 4)})]
 
 
 def test_a_plan_with_no_device_work_submits_nothing():
