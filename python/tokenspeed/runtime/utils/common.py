@@ -965,10 +965,12 @@ def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
     shared PROMETHEUS_MULTIPROC_DIR; this serves the aggregate from the
     engine's main process, which otherwise has no HTTP surface (the gRPC
     servicer speaks gRPC only). The daemon thread keeps the synchronous
-    launch path free of event-loop assumptions. A bind failure degrades to an
-    error log: metrics must never take down serving. Returns the
-    ``uvicorn.Server`` (poll ``started`` for readiness), or None when
-    --enable-metrics is off.
+    launch path free of event-loop assumptions. The socket is bound eagerly
+    on the calling thread, so a bind failure degrades to an error log and
+    None — metrics must never take down serving — and the
+    allocate-then-rebind race stays closed. Returns the ``uvicorn.Server``
+    (poll ``started`` for readiness), or None when --enable-metrics is off or
+    the bind failed.
     """
     if not server_args.enable_metrics:
         return None
@@ -981,13 +983,20 @@ def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
 
     app = FastAPI()
     add_prometheus_middleware(app)
-    server = uvicorn.Server(
-        uvicorn.Config(app, host=host, port=port, log_level="warning")
-    )
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    try:
+        sock = config.bind_socket()
+    except SystemExit:
+        logger.error(
+            f"metrics server failed to bind {host!s}:{port!s}; "
+            "metrics endpoint disabled"
+        )
+        return None
+    server = uvicorn.Server(config)
 
     def _serve():
         try:
-            server.run()
+            server.run(sockets=[sock])
         except Exception as e:  # noqa: BLE001
             logger.error(f"metrics server stopped: {e!s}")
 

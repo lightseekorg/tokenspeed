@@ -154,6 +154,25 @@ def _get_from_args(
     return args[index + 1]
 
 
+def _drop_from_args(args: list[str], flag: str) -> list[str]:
+    """Return a copy of the argv with every ``flag value`` pair removed.
+
+    Same canonical-form assumption as ``_get_from_args``: only space-separated
+    pairs are handled.
+    """
+    out: list[str] = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == flag:
+            skip_next = True
+            continue
+        out.append(arg)
+    return out
+
+
 def _gateway_args_with_default_port(gateway_args: list[str]) -> list[str]:
     if "--port" in gateway_args:
         return gateway_args
@@ -565,14 +584,18 @@ def _add_metrics_port(engine_args: list[str]) -> tuple[list[str], str | None]:
     (see ``ServerArgs.metrics_port``). Pin a stable port — like
     ``--rl-control-port`` — so the scrape target survives engine restarts and
     can be printed at startup. An operator-pinned ``--metrics-port`` is
-    preserved untouched. Returns the scrape URL, or None when metrics are off.
+    preserved untouched; ``--metrics-port 0`` means auto-allocate, matching
+    the engine-side treatment of an unset port. Returns the scrape URL, or
+    None when metrics are off.
     """
     if "--enable-metrics" not in engine_args:
         return engine_args, None
     host = _get_from_args(engine_args, "--metrics-host", "127.0.0.1")
     pinned = _get_from_args(engine_args, "--metrics-port")
-    if pinned is not None:
+    if pinned is not None and int(pinned) != 0:
         return engine_args, f"http://{host}:{int(pinned)}/metrics"
+    if pinned is not None:
+        engine_args = _drop_from_args(engine_args, "--metrics-port")
     port = _free_port_avoiding_ephemeral_range()
     return (
         [*engine_args, "--metrics-port", str(port)],

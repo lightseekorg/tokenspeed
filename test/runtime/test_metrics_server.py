@@ -22,7 +22,17 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
 import multiprocessing as mp
+import socket
 import time
 import urllib.request
 from types import SimpleNamespace
@@ -92,3 +102,22 @@ def test_metrics_endpoint_serves_aggregated_metrics(sample_multiproc_dir):
 def test_metrics_server_off_without_enable_metrics():
     args = SimpleNamespace(enable_metrics=False)
     assert launch_metrics_server(args) is None
+
+
+def test_metrics_server_bind_failure_degrades_to_none(sample_multiproc_dir):
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    port = blocker.getsockname()[1]
+    args = SimpleNamespace(
+        enable_metrics=True,
+        metrics_host=None,
+        metrics_port=port,
+        host="127.0.0.1",
+    )
+    try:
+        # A SystemExit escaping launch_metrics_server would fail here; the
+        # contract is an error log plus None — metrics never take down serving.
+        assert launch_metrics_server(args) is None
+    finally:
+        blocker.close()

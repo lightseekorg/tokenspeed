@@ -1272,6 +1272,15 @@ def test_add_metrics_port_keeps_a_pinned_port():
     assert url == "http://127.0.0.1:5006/metrics"
 
 
+def test_add_metrics_port_treats_zero_as_auto(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40124
+    )
+    args, url = _add_metrics_port(["--enable-metrics", "--metrics-port", "0"])
+    assert args == ["--enable-metrics", "--metrics-port", "40124"]
+    assert url == "http://127.0.0.1:40124/metrics"
+
+
 def test_add_metrics_port_url_follows_metrics_host(monkeypatch):
     monkeypatch.setattr(
         "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40124

@@ -2561,7 +2561,8 @@ class ServerArgs:
             default=ServerArgs.metrics_port,
             help="Port for the engine's Prometheus /metrics HTTP endpoint, served "
             "by the engine's main process when --enable-metrics is on. Defaults "
-            "to an automatically allocated free port (logged at startup).",
+            "to an automatically allocated free port (logged at startup); 0 "
+            "also auto-allocates.",
         )
         parser.add_argument(
             "--metrics-host",
