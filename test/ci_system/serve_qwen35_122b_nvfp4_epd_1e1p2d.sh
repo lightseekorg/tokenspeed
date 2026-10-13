@@ -251,5 +251,8 @@ logs+=("$LOG_DIR/gateway.log")
 wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" "$startup_deadline"
 echo "[epd-1e1p2d] serving on http://127.0.0.1:${LB_PORT}/v1"
 
-wait -n "${pids[@]}"
+# A worker's failure status must not end the script (set -e) before the
+# report names it; the cleanup trap then exits with that status.
+wait -n "${pids[@]}" || status=$?
 report_exited_workers "epd-1e1p2d" logs pids
+exit "${status:-0}"
