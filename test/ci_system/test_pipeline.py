@@ -965,16 +965,20 @@ def test_check_perf_reference_passes_when_actual_meets_floor(throughput_metric):
         assert "24000.00" in "\n".join(formatter(result["checks"]))
 
 
-def test_check_perf_reference_fails_when_metric_below_floor():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_check_perf_reference_fails_when_metric_below_floor(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     task = {
         "perf_threshold": 0.9,
-        "perf_reference": {16: [40.0, 26000.0]},
+        "perf_reference": {16: [33.0, 30000.0]},
     }
     result = check_perf_reference(task, _command_results_with(rows), ["perf"])
     assert result is not None
     assert result["passed"] is False
-    assert any("Latency (tps/user)" in f for f in result["failures"])
+    assert any(throughput_metric in failure for failure in result["failures"])
 
 
 def test_check_perf_reference_reports_missing_row():
