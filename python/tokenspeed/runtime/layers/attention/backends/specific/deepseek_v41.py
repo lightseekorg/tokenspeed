@@ -42,6 +42,7 @@ from the replay start, and never write the global/index rows the hit already
 holds (``V41Metadata.global_write_floor``).
 """
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -71,8 +72,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
     DeepseekV41CachePool,
 )
+from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
+
+# Initial long-prefill thresholds; tune with query count and visible history.
+_INDEXER_PARTITION_MIN_QUERIES = 4096
+_INDEXER_PARTITION_MIN_HISTORY = 8192
 
 
 class V41CompressorPlan(NamedTuple):
@@ -262,6 +268,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, object]
         ] = {}
         self._prepared_selections: dict[tuple, tuple] = {}
+        self._partitioned_index_layers: set[int] = set()
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
@@ -1177,6 +1184,39 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         table = table[:, : max(0, index_cache.shape[0] - 1)]
         candidate_capacity = min(self.spec.candidate_topk, table.shape[1] * 8)
         n = positions.numel()
+        partition = None
+        scoring_positions = positions
+        scoring_requests = request_indices
+        query_group = self.spec.indexer_query_group
+        # The encoder Full sources have replicated keys and heads. Keep the
+        # CED candidate source, Reindex, small cache-hit tails and decode local
+        # to the original path. Decisions depend only on shared host metadata.
+        if (
+            window is not None
+            and index_q.is_cuda
+            and index_process_group is None
+            and layer_id < self.spec.candidate_source
+            and not reindex
+            and len(query_group) > 1
+            and n >= max(_INDEXER_PARTITION_MIN_QUERIES, len(query_group))
+            and visible_bound >= _INDEXER_PARTITION_MIN_HISTORY
+        ):
+            partition = InterleavedQueryPlan(
+                total_rows=n, rank=self.spec.indexer_query_rank, size=len(query_group)
+            )
+            index_q = index_q[partition.local_slice].contiguous()
+            index_weights = index_weights[partition.local_slice].contiguous()
+            scoring_positions = positions[partition.local_slice].contiguous()
+            scoring_requests = request_indices[partition.local_slice].contiguous()
+            n = partition.local_rows
+            if layer_id not in self._partitioned_index_layers:
+                self._partitioned_index_layers.add(layer_id)
+                if self.spec.indexer_query_rank == 0:
+                    logging.getLogger(__name__).info(
+                        f"V4.1 indexer query partition: layer={layer_id}, "
+                        f"layout=interleave, size={partition.size}, "
+                        f"global_rows={partition.total_rows}, local_rows={n}"
+                    )
         rows = torch.full(
             (n, self.spec.index_topk), -1, dtype=torch.int32, device=self.device
         )
@@ -1204,10 +1244,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 for start in range(0, n, query_tile)
             ]
         )
+        if partition is not None:
+            windows = [
+                (*partition.local_bounds(start, stop), span)
+                for start, stop, span in windows
+            ]
         for start, stop, span in windows:
+            if start == stop:
+                continue
             if span is not None:
                 visible = (
-                    ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
+                    ((scoring_positions[start:stop] + 1) // ratio)
+                    .clamp_min(0)
+                    .to(torch.int32)
                 )
                 width = max(1, ((span.prefix + span.count) // ratio + 63) // 64)
                 row = table[span.request : span.request + 1, :width]
@@ -1217,7 +1266,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 from tokenspeed_kernel.ops.attention.dsv41 import selection_table
 
                 tile_table, visible = selection_table(
-                    positions[start:stop], request_indices[start:stop], table, ratio
+                    scoring_positions[start:stop], scoring_requests[start:stop], table, ratio
                 )
             cb = None
             if reindex:
@@ -1249,6 +1298,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 ),
                 None,
             )
+        if partition is not None:
+            rows, lens = partition.gather_selection(rows, lens, query_group)
         if produce_candidates:
             candidates = V41Candidates(positions, request_indices, blocks, block_lens)
         slots = self.global_read_slots(

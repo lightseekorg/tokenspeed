@@ -81,6 +81,8 @@ def _config(device):
         num_kv_heads=1,
         head_dim=512,
         attn_tp_size=1,
+        indexer_query_rank=0,
+        indexer_query_group=(0,),
         cache_layer_types=("sliding_attention",) * 40,
         sliding_window_tokens=128,
         compress_ratios=RATIOS,
@@ -965,6 +967,8 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         mapping=SimpleNamespace(
             attn=SimpleNamespace(
                 tp_size=1,
+                tp_rank=0,
+                tp_group=(0,),
                 dp_size=2,
                 kvp_size=1,
                 kvp_rank=0,

@@ -55,6 +55,8 @@ class DeepseekV41Config(SoftmaxAttnConfig):
     candidate_block_size: int
     max_query_tokens: int
     cache_format: str
+    indexer_query_rank: int
+    indexer_query_group: tuple[int, ...]
 
     @classmethod
     def generate(cls, server_args, model_config, is_draft: bool) -> AttnConfig:
@@ -104,6 +106,8 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             num_kv_heads=1,
             head_dim=int(hf.head_dim),
             attn_tp_size=server_args.attn_tp_size or server_args.mapping.attn.tp_size,
+            indexer_query_rank=server_args.mapping.attn.tp_rank,
+            indexer_query_group=server_args.mapping.attn.tp_group,
             cache_layer_types=("sliding_attention",) * len(ratios),
             sliding_window_tokens=int(hf.sliding_window),
             compress_ratios=ratios,
