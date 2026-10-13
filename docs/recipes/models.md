@@ -744,18 +744,8 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
-QSA selects CuTe DSL sparse attention on B200 (SM100) and B300 (SM103) for
-BF16 queries with BF16 or FP8 E4M3 KV caches, 256-dimensional heads, 6/12/24
-query heads, 1/2/4 KV heads, and a selected-slot width of 2051. This applies to
-ordinary decode and MTP verification under CUDA Graph. Prefill and mixed queries,
-including one-token prefill, and other supported NVIDIA shapes and architectures
-use the FlashInfer FA2 fallback.
 
-The decoder passes ordinary sublayer-output tensors and residual tuples between
-layers. At adjacent HC boundaries, it explicitly calls the consuming mixer's
-`combine_norm()` to fuse residual injection with that mixer's grouped RMSNorm.
-PLE, deepstack updates and row-gather boundaries combine the residual first.
-The updated, unnormalized HC state remains available for MTP.
+### NVIDIA
 
 ```bash
 ts serve \
@@ -764,6 +754,23 @@ ts serve \
     --tensor-parallel-size 4 \
     --quantization fp8 \
     --moe-backend flashinfer_trtllm \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3
+```
+
+### AMD
+
+On AMD MI350X/MI355X (gfx950), serve the
+[AMD Quark MXFP4](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4)
+checkpoint, which quantizes the routed and shared experts to MXFP4 and keeps
+the rest, including the MTP layer, in BF16:
+
+```bash
+ts serve \
+    --model amd/Qwen3.8-Flash-Next-Quark-MXFP4 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --quantization mxfp4 \
     --speculative-algorithm MTP \
     --speculative-num-steps 3
 ```

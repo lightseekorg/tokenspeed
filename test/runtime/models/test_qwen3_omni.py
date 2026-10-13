@@ -14,6 +14,7 @@ from tokenspeed.runtime.configs.model_config import (
 from tokenspeed.runtime.models.qwen3_omni import (
     Qwen3OmniMoeForConditionalGeneration,
     Qwen3OmniMoeTextModel,
+    _ensure_layer_types,
     _shared_vision_config,
 )
 from tokenspeed.runtime.multimodal.embedder import (
@@ -271,7 +272,7 @@ class TestQwen3OmniMrope(unittest.TestCase):
 
 class _FakeCommManager:
     def final_norm(self, hidden_states, residual, ctx, norm):
-        return hidden_states, None
+        return hidden_states + residual, None
 
 
 class _IdentityDecoderLayer(nn.Module):
@@ -287,10 +288,33 @@ class _IdentityDecoderLayer(nn.Module):
         residual,
         cos_sin=None,
     ):
-        return hidden_states, residual
+        # The layer contributes nothing; the residual stream carries its input.
+        stream = hidden_states if residual is None else hidden_states + residual
+        return torch.zeros_like(stream), stream
 
 
 class TestQwen3OmniModelHelpers(unittest.TestCase):
+    def test_thinker_text_config_gets_layer_types(self):
+        full = SimpleNamespace(num_hidden_layers=3, sliding_window=None)
+        _ensure_layer_types(full)
+        self.assertEqual(full.layer_types, ["full_attention"] * 3)
+
+        windowed = SimpleNamespace(
+            num_hidden_layers=3,
+            use_sliding_window=True,
+            sliding_window=128,
+            max_window_layers=1,
+        )
+        _ensure_layer_types(windowed)
+        self.assertEqual(
+            windowed.layer_types,
+            ["full_attention", "sliding_attention", "sliding_attention"],
+        )
+
+        declared = SimpleNamespace(num_hidden_layers=2, layer_types=["a", "b"])
+        _ensure_layer_types(declared)
+        self.assertEqual(declared.layer_types, ["a", "b"])
+
     def test_language_only_mode_rejects_multimodal_context(self):
         model = Qwen3OmniMoeForConditionalGeneration.__new__(
             Qwen3OmniMoeForConditionalGeneration

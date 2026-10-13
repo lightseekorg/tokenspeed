@@ -464,6 +464,7 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
             drain_ready_embeddings=Mock(), assert_embeddings_received=Mock()
         ),
         _eplb_hooks=SimpleNamespace(note_round=Mock()),
+        _gc_hooks=SimpleNamespace(note_round=Mock()),
         _cache_hooks=SimpleNamespace(
             poll_ready_events=poll_ready_events, count_plan_ops=Mock()
         ),

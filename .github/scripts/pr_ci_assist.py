@@ -239,6 +239,11 @@ def plan_source():
     if pr["state"] != "open":
         print("PR is closed or merged; skipping the CI plan.")
         return
+    # GitHub matches stacked PRs against the stack base, so mid-stack PRs pass
+    # the trigger's main filter; they are planned once retargeted to main.
+    if pr["base"]["ref"] != "main":
+        print("PR does not target main; skipping the CI plan.")
+        return
     _require_open_pr(pr)
     if name == "pull_request" and (
         event["pull_request"]["head"]["sha"] != pr["head"]["sha"]

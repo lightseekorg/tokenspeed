@@ -686,6 +686,15 @@ is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
 
+### Latency histograms
+
+| Metric | Semantics |
+| --- | --- |
+| `tokenspeed:request_time_per_output_token_seconds` | End-to-end latency divided by output tokens; includes queueing and TTFT. |
+| `tokenspeed:decode_time_per_output_token_seconds` | Decode time per output token after the first output frame; excludes queueing and TTFT. |
+| `tokenspeed:inter_token_latency_seconds` | Per-token interval between output frames, measured by frontend wall clock. |
+| `tokenspeed:scheduler_inter_token_latency_seconds` | Per-token interval between output frames, measured by scheduler timestamps. |
+
 ### Per-request stats
 
 `--enable-log-request-stats` enriches the scheduler's per-request finish line for

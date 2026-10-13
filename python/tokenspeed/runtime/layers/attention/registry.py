@@ -278,6 +278,7 @@ _HYBRID_GDN_ARCHITECTURES = {
 _HYBRID_MAMBA2_ARCHITECTURES = {
     "NemotronHForCausalLM",
     "NemotronHForCausalLMNextN",
+    "NemotronH_Nano_Omni_Reasoning_V3",
 }
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.

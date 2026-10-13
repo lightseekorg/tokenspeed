@@ -38,8 +38,8 @@ last page; a state group's live block) and a request's worst-case pages for a
 group that never publishes (a replayable sliding group) -- page counts the
 scheduler's ``CapacityModel`` answers, folded to LCM blocks by the same
 model, so no page arithmetic lives here. The slot-state arena
-(``max_retracted_requests`` x blob bytes) is a separate allocation on top of
-the pool.
+(``max_retracted_requests + 1`` x blob bytes: slots number from 1) is a
+separate allocation on top of the pool.
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ class RetractionPoolSizing:
                 "aborts its victim"
             )
         pool_gb = self.lcm_blocks * host_lcm_block_bytes / 1e9
-        arena_mb = self.max_retracted_requests * blob_bytes / 1e6
+        arena_mb = (self.max_retracted_requests + 1) * blob_bytes / 1e6
         images = (
             "hash-complete pages go to Host L2, tails to the pool"
             if l2_tier
