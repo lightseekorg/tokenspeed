@@ -86,9 +86,10 @@ groups on the scheduler second dimension (`q_seqlen_eff=2`).
 
 The public `tokenspeed_mla_decode` also accepts `enable_packed_q=True` to
 opt into continuous query/head packing on the FP8 and FP16/BF16 M128 paths, adapted from
-FlashInfer PR #4178. The default is **False**, preserving the folded-query
-implementation. M64 and token-gapped Q/output views continue to
-use that implementation even when the option is enabled.
+FlashInfer PR #4178. The standalone API defaults to **False**. TokenSpeed's
+CuTe MLA backend enables packing for FP8 verification with 96 heads and four
+query tokens. M64 and token-gapped Q/output views keep the folded-query
+implementation even when the option is enabled.
 
 The packing orders rows as `query_token * num_heads + head`. Each 2-CTA
 group owns 128 consecutive rows, including across query boundaries. Thus

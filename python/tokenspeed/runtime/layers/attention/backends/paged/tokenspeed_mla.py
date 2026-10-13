@@ -760,6 +760,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             window_left=window_left,
             local_visible_lens=local_visible_lens,
             return_lse=metadata.dcp is not None,
+            enable_packed_q=(
+                query.dtype == torch.float8_e4m3fn and query.shape[1:3] == (4, 96)
+            ),
         )
         if metadata.dcp is not None:
             partial, lse_log2 = raw_out

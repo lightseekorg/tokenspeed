@@ -649,6 +649,9 @@ def _check_packed_gpu():
         # Cross-query masks straddle a K128 boundary, with split-KV.
         (_Case(1, 129, 96, 4), "fp8", False, False, False, True),
         (_Case(4, 257, 96, 8), "fp8", True, True, False, True),
+        (_Case(8, 32768, 96, 4), "fp8", True, True, False, True),
+        (_Case(16, 32768, 96, 4), "fp8", True, True, False, True),
+        (_Case(24, 32768, 96, 4), "fp8", True, True, False, True),
         # Partial final rows, no reducer, and multiple persistent work items.
         (_Case(32, 128, 96, 3), "fp8", False, False, False, True),
         (_Case(1, 257, 48, 3), "fp8", False, True, False, True),
