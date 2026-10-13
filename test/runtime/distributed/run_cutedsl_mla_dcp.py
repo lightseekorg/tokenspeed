@@ -37,7 +37,7 @@ import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.distributed.comm_backend.registry import initialize_comm_backend
-from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME, Mapping
 from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.layers.attention.backends.paged import tokenspeed_mla
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
@@ -406,6 +406,7 @@ def run_prefill_case(*, rank, mapping, context, dtype):
             prefix,
             extend.to(device),
             extend,
+            page_table_cpu=pages.cpu(),
         )
     assert leaf.chunked_prefill_metadata.chunked_loop_num > 1
     assert (
@@ -414,7 +415,9 @@ def run_prefill_case(*, rank, mapping, context, dtype):
     )
 
     def run(backend, cache):
-        ctx = SimpleNamespace(attn_backend=backend, token_to_kv_pool=cache)
+        ctx = SimpleNamespace(
+            attn_backend=backend, token_to_kv_pool=cache, query_shard=None
+        )
         prepared = DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(
             model,
             positions,
@@ -475,6 +478,9 @@ def main():
         "nccl", mapping.world_group, dist.group.WORLD
     )
     process_group_manager.init_process_group(mapping.attn.kvp_group, backend="nccl")
+    process_group_manager.init_process_group(
+        mapping.attn.kvp_group, backend="nccl", name=KVP_HISTORY_GROUP_NAME
+    )
     global_server_args_dict.update(
         mapping=mapping,
         chunked_prefill_size=64,

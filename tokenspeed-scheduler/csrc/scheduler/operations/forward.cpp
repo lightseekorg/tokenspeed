@@ -326,8 +326,12 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             "promotion boundary must be page-aligned and inside the unmatched prompt");
 
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
-    const std::int32_t tokens_this_round = PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
-                                                              unscheduled, remaining, promotion_boundary_tokens);
+    // A remote landing completes the prompt in one transfer. Local chunk
+    // promotion must not truncate its window or drop the first decode reserve.
+    const std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
+                                               ? unscheduled
+                                               : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
+                                                                    unscheduled, remaining, promotion_boundary_tokens);
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }

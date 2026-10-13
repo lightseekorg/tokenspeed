@@ -265,7 +265,7 @@ class HostCacheExecutor:
             self.blob_bytes = self._slot_state.nbytes
         self.max_retracted_requests = self.snapshot_sizing.max_retracted_requests
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
-        arena_bytes = self.max_retracted_requests * self.blob_bytes
+        arena_bytes = (self.max_retracted_requests + 1) * self.blob_bytes
         # Both tiers count against the one headroom check.
         check_host_memory(
             l2_bytes + snapshot_bytes + arena_bytes,
@@ -317,8 +317,9 @@ class HostCacheExecutor:
                 rank=kvp_rank,
             )
             # One row per retracted request, indexed by the op's snapshot_slot.
+            # The scheduler numbers slots from 1, like request-pool indices.
             self.blob_arena = allocate_blob_arena(
-                self.max_retracted_requests, self.blob_bytes
+                self.max_retracted_requests + 1, self.blob_bytes
             )
         if l2_tier:
             logger.info(
@@ -1016,10 +1017,10 @@ class HostCacheExecutor:
                 f"{type(op).__name__} {op.op_id} needs the retraction snapshot pool, "
                 "which --retraction-snapshot-ratio 0 removed"
             )
-        if not 0 <= int(op.snapshot_slot) < self.max_retracted_requests:
+        if not 1 <= int(op.snapshot_slot) <= self.max_retracted_requests:
             raise IndexError(
                 f"snapshot slot {op.snapshot_slot} outside "
-                f"[0, {self.max_retracted_requests}) for op {op.op_id}"
+                f"[1, {self.max_retracted_requests}] for op {op.op_id}"
             )
 
     def _append_snapshot_store(

@@ -74,6 +74,9 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader as _default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM as _BaseCausalLM
+from tokenspeed.runtime.models.base.decoder_layer import (
+    capture_layer_input as _capture_layer_input,
+)
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA as _DeepseekV3AttentionMLA,
 )
@@ -780,10 +783,15 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: _ForwardContext,
         residual: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.moe_comm.get_num_tokens(ctx)
 
         if ctx.forward_mode.is_idle():
+            # No rows, but the tap and its gather stay aligned across ranks.
+            _capture_layer_input(
+                self.branch_comm[0], hidden_states, ctx, aux_hidden_states
+            )
             return self._forward_idle(
                 positions,
                 hidden_states,
@@ -797,6 +805,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             hidden_states,
             residual,
         )
+        _capture_layer_input(self.branch_comm[0], residual, ctx, aux_hidden_states)
         hidden_states = self.self_attn[0](
             positions=positions,
             hidden_states=hidden_states,
@@ -912,15 +921,13 @@ class _RuntimeLongcatModel(nn.Module):
         aux_hidden_states = [] if self.layers_to_capture else None
         layer = None
         for layer_id, layer in enumerate(self.layers):
-            if aux_hidden_states is not None and layer_id in self.layers_to_capture:
-                aux_hidden_states.append(
-                    hidden_states + residual if residual is not None else hidden_states
-                )
+            capture = layer_id in self.layers_to_capture
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 ctx,
                 residual,
+                aux_hidden_states=aux_hidden_states if capture else None,
             )
 
         if not ctx.forward_mode.is_idle() and layer is not None:

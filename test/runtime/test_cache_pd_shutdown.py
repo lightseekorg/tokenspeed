@@ -97,6 +97,9 @@ class _EventLoopHarness:
             note_round=lambda *, forwarded: self.trace.append("eplb_round"),
             close=lambda: self.trace.append("close_eplb"),
         )
+        self._gc_hooks = SimpleNamespace(
+            note_round=lambda *, forwarded: self.trace.append("gc_round")
+        )
         self.load_reporter = SimpleNamespace(
             observe=lambda _stats, _running: self.trace.append("observe_load"),
             sample_and_observe=lambda _running: self.trace.append("sample_load"),
@@ -158,8 +161,10 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "observe_load",
         "metrics",
         # Every non-paused round reports its forward (none here) to the
-        # expert-rebalance hooks after the device call.
+        # expert-rebalance hooks after the device call, then to the
+        # garbage-collection hooks.
         "eplb_round",
+        "gc_round",
         "poll_pd",
         "publish_kv",
         "pause_finish",
@@ -282,6 +287,10 @@ def test_run_event_loop_reports_exit_and_finally_closes(
     )
     monkeypatch.setattr(event_loop_module.faulthandler, "enable", lambda: None)
     monkeypatch.setattr(event_loop_module, "register_usr_signal", lambda: None)
+    # Freezing would take this test process's objects out of collection.
+    monkeypatch.setattr(
+        event_loop_module, "freeze_startup_heap", lambda: trace.append("freeze_gc")
+    )
     monkeypatch.setattr(
         event_loop_module, "configure_logger", lambda *_args, **_kwargs: None
     )
@@ -295,11 +304,17 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         with pytest.raises(SystemExit) as raised:
             event_loop_module.run_event_loop(server_args, object(), pipe_writer)
         assert raised.value.code == 0
-        assert trace == ["construct", "loop_enter", "close"]
+        assert trace == ["construct", "freeze_gc", "loop_enter", "close"]
         assert exit_logs[0][1][0] is SystemExit
     else:
         event_loop_module.run_event_loop(server_args, object(), pipe_writer)
-        assert trace == ["construct", "loop_enter", "loop_return", "close"]
+        assert trace == [
+            "construct",
+            "freeze_gc",
+            "loop_enter",
+            "loop_return",
+            "close",
+        ]
         assert exit_logs[0][1] is None
     assert len(exit_logs) == 1
     assert "rank=0 pid=" in exit_logs[0][0]

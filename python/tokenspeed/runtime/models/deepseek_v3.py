@@ -91,7 +91,6 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.attention.dcp.cache import gather_mla_history
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -124,6 +123,8 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
+from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import (
     LazyValue,
@@ -1624,23 +1625,15 @@ class DeepseekV3AttentionMLA(nn.Module):
             else torch.bfloat16
         )
 
-        placement = attn_backend.cache_placement(self.attn_mha)
-        for loop_idx in range(chunk_meta.chunked_loop_num):
-            chunk_kv_indices = chunk_meta.chunk_kv_indices_list[loop_idx]
-
-            if placement is None:
-                kv_a_normed, k_pe = ctx.token_to_kv_pool.get_mla_kv_buffer(
-                    self.attn_mha, chunk_kv_indices, read_dtype
-                )
-            else:
-                kv_a_normed, k_pe = gather_mla_history(
-                    ctx.token_to_kv_pool,
-                    self.attn_mha,
-                    chunk_kv_indices,
-                    dst_dtype=read_dtype,
-                    placement=placement,
-                )
-
+        # The backend reads every loop's rows: from this rank's cache, or from
+        # their page owners when it deals history pages over them.
+        history = attn_backend.read_prefix_history(
+            ctx.token_to_kv_pool,
+            self.attn_mha,
+            chunk_meta.chunk_kv_indices_list,
+            dst_dtype=read_dtype,
+        )
+        for loop_idx, (kv_a_normed, k_pe) in enumerate(history):
             kv_a_normed = kv_a_normed.squeeze(1)
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
@@ -1875,6 +1868,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         residual: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
 
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -1890,6 +1884,10 @@ class DeepseekV3DecoderLayer(nn.Module):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
             )
+            # No rows, but the tap and its gather stay aligned across ranks.
+            capture_layer_input(
+                self.comm_manager, hidden_states, ctx, aux_hidden_states
+            )
             hidden_states = self.forward_mlp(
                 hidden_states,
                 residual,
@@ -1902,6 +1900,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states, residual = self.comm_manager.input_reduce_norm(
             hidden_states, residual
         )
+        capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -2012,27 +2011,22 @@ class DeepseekV3Model(nn.Module):
         residual = None
         aux_hidden_states = [] if self.layers_to_capture else None
         for i in range(len(self.layers)):
-            if aux_hidden_states is not None and i in self.layers_to_capture:
-                # Under RSAG the inter-layer hidden/residual are reduce-
-                # scattered across the attn TP group; aux consumers (e.g. the
-                # EAGLE3 drafter) expect full rows, so gather before capturing.
-                aux = (
-                    hidden_states + residual if residual is not None else hidden_states
-                )
-                gathered = self.layers[i].comm_manager.gather_residual(aux, ctx)
-                capture_idx = self._dflash_capture_idx_map.get(i)
-                if ctx.target_capture_sink is not None and capture_idx is not None:
-                    ctx.target_capture_sink.on_target_capture(capture_idx, gathered)
-                aux_hidden_states.append(
-                    gathered if gathered is aux else gathered.clone()
-                )
             layer = self.layers[i]
+            capture = i in self.layers_to_capture
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 ctx,
                 residual,
+                aux_hidden_states=aux_hidden_states if capture else None,
             )
+            if capture and ctx.target_capture_sink is not None:
+                notify_target_capture(
+                    ctx.target_capture_sink,
+                    self._dflash_capture_idx_map,
+                    i,
+                    aux_hidden_states,
+                )
         if not ctx.forward_mode.is_idle():
             hidden_states, _ = layer.comm_manager.final_norm(
                 hidden_states, residual, ctx, self.norm
@@ -2089,8 +2083,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         return self._routed_experts_weights_of_layer.value
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
-        # layer_ids are 0-indexed from the external API; +1 because the capture
-        # check runs *before* the layer forward, so index i captures layer i-1's output.
+        # layer_ids are 0-indexed from the external API; +1 because a layer
+        # captures the residual entering it, so index i captures layer i-1's output.
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = {2, num_layers // 2, num_layers - 3}
@@ -2098,8 +2092,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        # DFlash checkpoints name 0-indexed target layer outputs. The capture
-        # check runs before layer i, so capture at i + 1 for layer i's output.
+        # DFlash checkpoints name 0-indexed target layer outputs. A layer
+        # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")

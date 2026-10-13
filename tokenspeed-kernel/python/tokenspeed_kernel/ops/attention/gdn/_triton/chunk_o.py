@@ -29,7 +29,7 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.gdn._triton.index import prepare_chunk_indices
 from tokenspeed_kernel.ops.attention.gdn._triton.op import exp, safe_exp
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 
 @triton.heuristics(
@@ -185,7 +185,8 @@ def chunk_fwd_o(
         V=V,
         BT=BT,
         BK=128,
-        BV=64,
+        # gfx950: one 128-wide V tile reads each chunk state once.
+        BV=128 if current_platform().is_cdna4 else 64,
         num_warps=4,
         num_stages=2,
         ENABLE_PDL=enable_pdl,
