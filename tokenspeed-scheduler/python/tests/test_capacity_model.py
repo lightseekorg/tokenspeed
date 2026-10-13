@@ -104,11 +104,12 @@ def test_reports_group_pages_in_config_order() -> None:
     # Dense history plus, per request, the unaligned tail page and the block a
     # tail handover holds; a State group holds two slots per live request,
     # whatever the history; a sliding group its window pages plus the handover
-    # block, and one in-flight chunk behind its lookback.
-    assert pages == [1024 + 16 * (2 + 1), 16 * 2, 16 * (4 + 1) + 2 + 128]
+    # block, and one in-flight chunk behind the three blocks a 128-token
+    # window can span behind an unaligned boundary.
+    assert pages == [1024 + 16 * (2 + 1), 16 * 2, 16 * (4 + 1) + 3 + 128]
     assert model.single_request_group_pages(token_limit=4096)[1] == 2
-    # ceil(1072 / 12) + ceil(32 / 1) + ceil(210 / 3)
-    assert model.lcm_blocks_needed_for(pages) == 90 + 32 + 70
+    # ceil(1072 / 12) + ceil(32 / 1) + ceil(211 / 3)
+    assert model.lcm_blocks_needed_for(pages) == 90 + 32 + 71
     # A model outlives the config it was built from.
     del cfg
     assert model.max_single_request_tokens(usable_lcm_blocks=100) > 0

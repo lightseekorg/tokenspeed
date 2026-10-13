@@ -311,9 +311,10 @@ def test_first_chunk_prepays_prompt_headroom_only_in_full_history_groups():
     # headroom prepaid. The full-history group must hold that: 8 + 32 tokens
     # -> 10 pages. The sliding-window group recycles slid-out pages, so the
     # rest of the prompt costs it nothing: it holds only the chunk, 2 pages.
-    # 12 pages fit a 16-page pool; had the headroom been broadcast to both
-    # groups (20 pages) the request would have sat in the waiting queue.
-    scheduler = _hybrid_chunked_scheduler(num_usable_pages=16)
+    # 12 pages fit an 18-page pool (the startup bound admits the 40-token
+    # limit); had the headroom been broadcast to both groups (20 pages) the
+    # request would have sat in the waiting queue.
+    scheduler = _hybrid_chunked_scheduler(num_usable_pages=18)
     request = _make_spec("long", list(range(32)))
     request.max_new_tokens = 8
     scheduler.submit_requests([request])
@@ -325,6 +326,6 @@ def test_first_chunk_prepays_prompt_headroom_only_in_full_history_groups():
     tables = dict(operation.block_tables)
     assert len(tables["history"][0]) == 10
     assert len(tables["swa"][0]) == 2
-    assert scheduler.cache_group_available_pages("history") == 4
+    assert scheduler.cache_group_available_pages("history") == 6
     assert scheduler.waiting_size() == 0
     assert scheduler.prefilling_size() == 1
