@@ -461,8 +461,11 @@ def validate_cache_manifest(
     layout: CacheTransferContract,
     peer: str,
 ) -> None:
-    if manifest.prefix_len >= manifest.prompt_len:
-        raise CacheContractError(f"{peer} manifest requires prefix_len < prompt_len")
+    if not 0 <= manifest.prefix_len < manifest.prompt_len:
+        raise CacheContractError(
+            f"{peer} manifest requires 0 <= prefix_len < prompt_len, got "
+            f"prefix_len={manifest.prefix_len} prompt_len={manifest.prompt_len}"
+        )
     expected = tuple(spec.group_id for spec in layout.group_specs)
     actual = tuple(group.group_id for group in manifest.groups)
     if actual != expected:

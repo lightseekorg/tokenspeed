@@ -265,6 +265,15 @@ def test_cached_state_prefix_omits_every_latest_snapshot_group() -> None:
             peer="destination",
         )
     assert CachePDBlockManifest.from_wire_bytes(manifest.to_wire_bytes()) == manifest
+    # A prefix outside [0, prompt_len) is refused before it indexes any slot:
+    # a negative one would wrap the slot arithmetic silently.
+    for prefix_len in (-1, 14, 15):
+        with pytest.raises(CacheContractError, match="0 <= prefix_len < prompt_len"):
+            validate_cache_manifest(
+                replace(manifest, prefix_len=prefix_len),
+                layout=_layout(),
+                peer="destination",
+            )
     selection = build_cache_layerwise_block_selection(
         _op(),
         layout=_layout(),
