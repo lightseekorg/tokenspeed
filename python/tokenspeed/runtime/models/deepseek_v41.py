@@ -896,10 +896,27 @@ class DeepseekV41Attention(nn.Module):
                         rows.query.request_indices,
                     )
                 if self.indexer is not None:
-                    index_q, index_weights = self.indexer(
-                        hidden_states, qr, positions, self.rotary_emb
+                    partition = (
+                        backend.plan_indexer_queries(
+                            self.layer_id, positions, requests, mode, index_group
+                        )
+                        if hidden_states.is_cuda
+                        and mode.is_extend()
+                        and not mode.is_mixed()
+                        else None
                     )
-                    if mode.is_decode():
+                    index_x, index_qr, index_positions = hidden_states, qr, positions
+                    if partition is not None:
+                        # Only the indexer sees local rows. Main attention and
+                        # the compressor retain their original projection batch.
+                        index_x, index_qr, index_positions = (
+                            t[partition.local_slice].contiguous()
+                            for t in (hidden_states, qr, positions)
+                        )
+                    index_q, index_weights = self.indexer(
+                        index_x, index_qr, index_positions, self.rotary_emb
+                    )
+                    if mode.is_decode() or partition is not None:
                         prepared = backend.prepare_global_selection(
                             self.layer_id,
                             index_q,
@@ -908,6 +925,7 @@ class DeepseekV41Attention(nn.Module):
                             requests,
                             mode,
                             index_group,
+                            projected_partition=partition,
                         )
                         index_q = index_weights = None
             q, _ = self.wq_b(qr, block_scale=None, output_dtype=None)
