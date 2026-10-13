@@ -402,6 +402,27 @@ TEST_F(GptOssShapeWithWholePagesSuite, APromptOneTokenShorterThanAFinishedOneRes
     const ForwardBatch* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
     EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{256});
+    SendAbortEvent("y");
+    PlanOnce();
+
+    // A prompt one token longer than X hits X's prompt end at 276, and the
+    // first query after it (position 276) attends the window [149, 276): the
+    // sliding row must hold blocks 2, 3 and 4 -- one more than the lookback
+    // behind a page-aligned boundary.
+    std::vector<std::int32_t> longer = prompt;
+    longer.push_back(77);
+    Submit(RequestSpec{.request_id = "z", .tokens = longer, .max_new_tokens = 4});
+    const ExecutionPlan z_plan = PlanOnce();
+    const ForwardBatch* z = FindForwardBatch(z_plan);
+    ASSERT_NE(z, nullptr);
+    EXPECT_EQ(z->extend_prefix_lens, std::vector<std::int32_t>{276});
+    const auto& swa = z->block_tables.at("sliding").at(0);
+    ASSERT_GE(swa.size(), 5u);
+    EXPECT_EQ(swa.at(0), 0);
+    EXPECT_EQ(swa.at(1), 0);
+    EXPECT_GT(swa.at(2), 0) << "[128, 192) holds rows 149..191 of the window";
+    EXPECT_GT(swa.at(3), 0);
+    EXPECT_GT(swa.at(4), 0) << "the copied tail block [256, 276)";
 }
 
 // A pool filled by prompts whose generation budget their admission prepaid

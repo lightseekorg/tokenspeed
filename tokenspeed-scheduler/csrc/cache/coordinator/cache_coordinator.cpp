@@ -208,6 +208,18 @@ std::int32_t CacheCoordinator::TailBlocksFor(std::int32_t i, std::int32_t tail_t
     return (tail_tokens + block_granularity - 1) / block_granularity;
 }
 
+CacheCoordinator::BlockRange CacheCoordinator::SlidingWindowBlocks(std::int32_t i, std::int32_t boundary_tokens) const {
+    const CacheGroupSpec& spec = groups_[static_cast<std::size_t>(i)].Spec();
+    _assert(spec.kind == AttnKind::kSlidingWindow, "only a sliding group has a window behind a boundary");
+    const std::int32_t block_granularity = geometry_[static_cast<std::size_t>(i)].BlockGranularity();
+    const std::int32_t past_end = (boundary_tokens + block_granularity - 1) / block_granularity;
+    const std::int32_t first_row = std::max(0, boundary_tokens - spec.sliding_window + 1);
+    if (first_row >= boundary_tokens) {
+        return BlockRange{.first = past_end, .past_end = past_end};  // W == 1: nothing behind the query
+    }
+    return BlockRange{.first = first_row / block_granularity, .past_end = past_end};
+}
+
 CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary,
                                                                               std::int32_t tail_tokens) const {
     _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
@@ -222,7 +234,9 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
         const std::int32_t pages_per_prefix_hash =
             tail_tokens > 0 ? TailBlocksFor(static_cast<std::int32_t>(group_index), tail_tokens)
                             : BlocksPerBoundary(static_cast<std::int32_t>(group_index));
-        for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
+        const std::int32_t first_offset =
+            tail_tokens > 0 ? FirstTailBlockNeeded(static_cast<std::int32_t>(group_index), tail_tokens) : 0;
+        for (std::int32_t offset = first_offset; offset < pages_per_prefix_hash; ++offset) {
             const CacheKey key{
                 .namespace_id = boundary.namespace_id,
                 .group_id = groups_[group_index].Id(),
@@ -464,18 +478,19 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
         }
         return true;
     }
-    // A sliding window resumes at T when the blocks covering its last W - 1
-    // tokens are cached.
+    // A sliding window resumes at T when the blocks holding rows
+    // [T - W + 1, T) are cached.
     const std::int32_t block_granularity = geometry_[i].BlockGranularity();
     const std::int32_t blocks_per_page = prefix_granularity_ / block_granularity;
     const std::int32_t floor_blocks = floor_tokens / block_granularity;
     const std::int32_t full_blocks = full_tokens / block_granularity;
-    const std::int32_t boundary_block = full_blocks + static_cast<std::int32_t>(tail_keys.size());
-    const std::int32_t lookback = std::min(group.Matcher().BoundaryLookbackPages(), boundary_block);
+    const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), full_tokens + tail_tokens);
+    _assert(window.past_end == full_blocks + static_cast<std::int32_t>(tail_keys.size()),
+            "the tail's keys end where the window does");
     if (page_hits != nullptr) {
         page_hits->hits.assign(static_cast<std::size_t>(std::max(full_blocks - floor_blocks, 0)), 0);
     }
-    for (std::int32_t block = boundary_block - lookback; block < boundary_block; ++block) {
+    for (std::int32_t block = window.first; block < window.past_end; ++block) {
         if (block >= full_blocks) {
             const auto j = static_cast<std::size_t>(block - full_blocks);
             if (!index.Contains(pool, tail_keys[j])) {
@@ -1438,20 +1453,21 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         return ranges;
     }
     // A sliding window resumes from the newest page boundary and, at an
-    // unaligned point, from the tail as well: both need their lookback.
-    std::vector<std::int32_t> boundary_blocks;
+    // unaligned point, from the tail as well: both publish the blocks holding
+    // the window behind them.
+    std::vector<std::int32_t> boundaries;
     if (completed.first_new_prefix_page < hashed_prefix_pages) {
-        boundary_blocks.push_back(hashed_prefix_pages * pages_per_prefix_hash);
+        boundaries.push_back(hashed_prefix_pages * prefix_granularity_);
     }
     if (tail_blocks > 0) {
-        boundary_blocks.push_back(hashed_prefix_pages * pages_per_prefix_hash + tail_blocks);
+        boundaries.push_back(hashed_prefix_pages * prefix_granularity_ + completed.tail->tail_tokens);
     }
-    for (const std::int32_t boundary_block : boundary_blocks) {
-        const std::int32_t lookback = std::min(groups_[group_index].Matcher().BoundaryLookbackPages(), boundary_block);
-        if (lookback == 0) {
+    for (const std::int32_t boundary_tokens : boundaries) {
+        const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(group_index), boundary_tokens);
+        if (window.first >= window.past_end) {
             continue;
         }
-        ranges.push_back(history_range(boundary_block - lookback, boundary_block));
+        ranges.push_back(history_range(window.first, window.past_end));
     }
     return ranges;
 }

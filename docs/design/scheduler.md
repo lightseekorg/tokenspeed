@@ -350,9 +350,9 @@ recipes size a pool from the same model before the arena is allocated
 demand at `max_batch_size` live requests), and then lets the `Scheduler`
 bound requests against the pool they sized. The per-request working set —
 `decode_width + overlap_schedule_depth * decode_width` protected tokens, the
-two slots of a State group (`kStateSlots`), a group's prefix-match lookback (the same
-`PrefixMatcher` the coordinator builds, through `MakePrefixMatcher`) — exists in
-that one file; neither side restates it. The two answers are tied by an
+two slots of a State group (`kStateSlots`), the most blocks a sliding
+window can need behind a boundary (one more than behind a page-aligned one,
+`SlidingWindowBlocks`) — exists in that one file; neither side restates it. The two answers are tied by an
 invariant the model's tests sweep: for one live request of `L` tokens,
 `ConcurrentGroupPages(L, L)` is never below `SingleRequestGroupPages(L)` in
 any group, so a pool sized for the configured concurrency admits every

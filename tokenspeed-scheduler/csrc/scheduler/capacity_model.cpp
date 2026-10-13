@@ -52,11 +52,19 @@ CapacityModel::CapacityModel(const SchedulerConfig& config) : config_{config} {
     groups_.reserve(specs.size());
     for (std::size_t i = 0; i < specs.size(); ++i) {
         const std::unique_ptr<PrefixMatcher> matcher = MakePrefixMatcher(specs[i]);
+        // The most blocks a sliding window [T - W + 1, T) can intersect: one
+        // more than behind a page-aligned T when its first row falls inside a
+        // block.
+        const std::int64_t window_blocks =
+            specs[i].kind == AttnKind::kSlidingWindow && specs[i].sliding_window > 1
+                ? (static_cast<std::int64_t>(specs[i].sliding_window) - 1 + 2 * (specs[i].block_granularity - 1)) /
+                      specs[i].block_granularity
+                : 0;
         groups_.push_back(Group{
             .block_granularity = specs[i].block_granularity,
             .cache_blocks_per_lcm_block = specs[i].cache_blocks_per_lcm_block,
             .prefix_closed = matcher->IsPrefixClosed(),
-            .lookback_pages = matcher->BoundaryLookbackPages(),
+            .lookback_pages = window_blocks,
         });
     }
 }

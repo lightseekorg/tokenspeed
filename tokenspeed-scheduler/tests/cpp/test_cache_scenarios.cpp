@@ -5716,10 +5716,10 @@ TEST_F(HostHitSuite, DuplicateLoadBackDoneIsIgnored) {
 // page must leave it ticket-protected until LoadBackDone.
 // ---------------------------------------------------------------------------
 // A Host tail whose blocks a sliding group only partly needs (W=2 over
-// two-token blocks looks back one block; a three-token tail spans two): the
-// unneeded block is a hole the admission still fills with a fresh page, which
-// the planner must count.
-class HostTailHoleSuite : public SchedulerTestSuite {
+// two-token blocks needs the one block holding the row before T; a
+// three-token tail spans two): the block below the window is a hole the
+// request never writes, so it gets no page and the plan counts none.
+class HostTailBelowWindowSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
@@ -5742,9 +5742,9 @@ protected:
     }
 };
 
-TEST_F(HostTailHoleSuite, ThePlanCountsTheFreshBlockOfAHostTailHole) {
+TEST_F(HostTailBelowWindowSuite, ATailBlockBelowTheWindowStaysAHoleAndCostsNothing) {
     // r1 = [1..7] + one decode: finish publishes page 0 and the tail at 7 --
-    // the full group's block [4, 7), the sliding group's lookback block [6, 7)
+    // the full group's block [4, 7), the sliding group's window block [6, 7)
     // -- and streams them to Host.
     Submit(RequestSpec{.request_id = "r1", .tokens = MakeTokens(7), .max_new_tokens = 2});
     AckWriteBacks(PlanOnce());
@@ -5764,10 +5764,9 @@ TEST_F(HostTailHoleSuite, ThePlanCountsTheFreshBlockOfAHostTailHole) {
 
     // r2 = [1..7, 77]: the Host tail at 7 is the hit. The full group loads
     // page 0 and the tail block (2) and grows by one (3); the sliding group
-    // loads the tail block [6, 7) its lookback reaches (1), fills the tail
-    // hole [4, 6) with a fresh page (1) and grows by one (3): six blocks, one
-    // more than the pool has free, so the admission waits for the filler
-    // instead of planning five and failing to acquire the sixth.
+    // loads the window block [6, 7) (1) and grows by one (2): five blocks,
+    // exactly what is free, with the tail block [4, 6) below the window left
+    // a hole.
     Submit(RequestSpec{.request_id = "r2",
                        .tokens =
                            [] {
@@ -5776,15 +5775,6 @@ TEST_F(HostTailHoleSuite, ThePlanCountsTheFreshBlockOfAHostTailHole) {
                                return tokens;
                            }(),
                        .max_new_tokens = 1});
-    const ExecutionPlan blocked = PlanOnce();
-    const ForwardBatch* batch = FindForwardBatch(blocked);
-    ASSERT_TRUE(batch == nullptr || std::ranges::find(batch->request_ids, "r2") == batch->request_ids.end())
-        << "r2 waits";
-    EXPECT_EQ(scheduler_->WaitingSize(), 1u);
-
-    SendForwardDone("filler", {601});
-    SendForwardDone("filler", {602});
-    SendFinish("filler");
     const ExecutionPlan admitted = PlanOnce();
     const ForwardBatch* r2 = FindForwardBatch(admitted);
     ASSERT_NE(r2, nullptr);
@@ -5793,14 +5783,14 @@ TEST_F(HostTailHoleSuite, ThePlanCountsTheFreshBlockOfAHostTailHole) {
     const auto loads = ExtractCacheOpsOfKind<LoadBackBatch>(admitted);
     ASSERT_EQ(loads.size(), 1u);
     EXPECT_EQ(std::get<LoadBackBatch>(loads.front()).src_pages.at(0).size(), 3u)
-        << "page 0 and the tail block of the full group; the tail block [6, 7) of the sliding group";
+        << "page 0 and the tail block of the full group; the window block [6, 7) of the sliding group";
     const auto& swa = r2->block_tables.at("swa").at(0);
     ASSERT_GE(swa.size(), 4u);
     EXPECT_EQ(swa.at(0), 0);
     EXPECT_EQ(swa.at(1), 0);
-    EXPECT_GT(swa.at(2), 0) << "the hole [4, 6) is a fresh page the request writes";
-    EXPECT_EQ(std::ranges::count(admitted.pages_to_zero.at("swa"), swa.at(2)), 1);
-    EXPECT_GT(swa.at(3), 0) << "the loaded tail block";
+    EXPECT_EQ(swa.at(2), 0) << "the tail block [4, 6) lies below the window: a hole, not a fresh page";
+    EXPECT_GT(swa.at(3), 0) << "the loaded window block";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 }
 
 class ChunkedHostHitSuite : public HostHitSuite {

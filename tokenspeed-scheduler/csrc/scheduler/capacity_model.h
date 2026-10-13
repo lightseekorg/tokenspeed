@@ -68,6 +68,9 @@ private:
         std::int64_t cache_blocks_per_lcm_block{};
         // Prefix-match policy, the same one the coordinator's matcher answers.
         bool prefix_closed{};
+        // The most blocks a sliding window needs behind a boundary
+        // (CacheCoordinator::SlidingWindowBlocks over every alignment); 0 for
+        // other groups.
         std::int64_t lookback_pages{};
     };
 

@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -3943,15 +3944,16 @@ TEST_F(TailPublicationTest, PublishesThePartialPageUnderHashAtT) {
     // Group 1 (g = 4): the single partial block.
     EXPECT_TRUE(Cached(1, tail.hash, 0));
     EXPECT_FALSE(Cached(1, tail.hash, 1));
-    // Group 2 (sliding, lookback 1 block): the block containing T only.
+    // Group 2 (sliding, W = 3): the window behind 11 is rows [9, 11), which
+    // the two tail blocks [8, 10) and [10, 11) hold -- one block more than a
+    // page-aligned boundary's lookback.
     EXPECT_TRUE(Cached(2, tail.hash, 1));
-    EXPECT_FALSE(Cached(2, tail.hash, 0));
+    EXPECT_TRUE(Cached(2, tail.hash, 0));
     EXPECT_TRUE(Cached(0, hashes_[1], 1)) << "the full pages are published as before";
     EXPECT_EQ(coordinator_.TailBlocksFor(0, 3), 2);
     EXPECT_EQ(coordinator_.TailBlocksFor(1, 3), 1);
     EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(tail.hash, 0), tail.tail_tokens),
-              CacheCoordinator::BoundaryResidency::kPartial)
-        << "the sliding group holds one of its two tail blocks";
+              CacheCoordinator::BoundaryResidency::kComplete);
     coordinator_.Free(tables);
 }
 
@@ -3999,9 +4001,10 @@ TEST_F(TailPublicationTest, ASlidingGroupMissingThePageLookbackStillResumesAtThe
     const std::vector<std::int32_t> tokens = MakeTokens(12);
     const TailPublication tail = PublishFinal(tables, tokens, /*num_computed_tokens=*/11);
     coordinator_.Free(tables);
-    // The sliding group (W=3 over 2-token blocks) looks back one block: behind
-    // the tail at 11 that is [10, 11), behind the page boundary 8 it is
-    // [6, 8). Evict the latter alone.
+    // The sliding group (W=3 over 2-token blocks) needs the rows [T-2, T)
+    // behind a boundary: behind the tail at 11 the blocks [8, 10) and
+    // [10, 11), behind the page boundary 8 the block [6, 8). Evict the
+    // latter alone.
     CacheBlockLocation location{};
     {
         const CacheBlockRef victim = coordinator_.GroupPrefixIndex(2).Find(pool_, Key(hashes_[1], 2, 1));
@@ -4016,7 +4019,7 @@ TEST_F(TailPublicationTest, ASlidingGroupMissingThePageLookbackStillResumesAtThe
     EXPECT_EQ(probe.device.num_common_tokens, 11);
     ASSERT_TRUE(probe.device.tail.has_value());
     EXPECT_EQ(probe.device.tail->hash, tail.hash);
-    EXPECT_EQ(probe.device.tail->per_group[2].hits, (std::vector<std::uint8_t>{0, 1}));
+    EXPECT_EQ(probe.device.tail->per_group[2].hits, (std::vector<std::uint8_t>{1, 1}));
 
     // Below the tail the page boundary 8 is not resumable for the sliding
     // group, and a sliding group publishes only its newest boundary's
@@ -4024,6 +4027,79 @@ TEST_F(TailPublicationTest, ASlidingGroupMissingThePageLookbackStillResumesAtThe
     const CacheCoordinator::PrefixProbe below = coordinator_.ProbePromptPrefix(
         CacheCoordinator::PromptPrefix{.prefix_hashes = hashes_, .tokens = tokens, .max_tokens = 10});
     EXPECT_EQ(below.device.num_common_tokens, 0);
+}
+
+// Oracle: whatever the page size P, the block size g and the window W, a
+// prompt resuming at an unaligned T must hold, in the sliding group, every
+// block that intersects the window [T - W + 1, T) the first query after T
+// attends -- the owner published them and the hitter claimed (or copied)
+// them; blocks below the window stay holes.
+TEST(SlidingWindowOracleTest, AHitterHoldsEveryBlockOfTheWindowBehindAnUnalignedBoundary) {
+    std::mt19937 rng{11};
+    for (std::int32_t trial = 0; trial < 160; ++trial) {
+        const std::int32_t g = std::array{1, 2, 4}[rng() % 3];
+        const std::int32_t P = g * static_cast<std::int32_t>(1 + rng() % 4);
+        const std::int32_t W = 2 + static_cast<std::int32_t>(rng() % (3 * P));
+        BlockPool pool(/*num_lcm_blocks=*/512, {1, 1});
+        CacheCoordinator coord = MakeCoordinator(
+            std::vector<CacheGroupSpec>{
+                CacheGroupSpec{.kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = P},
+                CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+                               .sliding_window = W,
+                               .cache_blocks_per_lcm_block = 1,
+                               .block_granularity = g},
+            },
+            P, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+            /*stream_device_cache_to_host=*/false);
+        // The owner computes L tokens and publishes its frontier T < L as a
+        // final point, T unaligned.
+        const std::int32_t T = P + 1 + static_cast<std::int32_t>(rng() % (3 * P));
+        if (T % P == 0) {
+            continue;
+        }
+        const std::int32_t L = T + 1 + static_cast<std::int32_t>(rng() % P);
+        const std::vector<std::int32_t> tokens = MakeTokens(L, 1000 * (trial + 1));
+        std::vector<BlockTable> owner(2);
+        ASSERT_TRUE(AdmitForTest(coord, owner, L));
+        std::vector<std::vector<std::int32_t>> pages;
+        for (std::int32_t page = 0; page < T / P; ++page) {
+            pages.emplace_back(tokens.begin() + page * P, tokens.begin() + (page + 1) * P);
+        }
+        const std::vector<std::string> hashes = ContentHashes(pages);
+        const std::int32_t tail_tokens = T % P;
+        const TailPublication tail{
+            .tail_tokens = tail_tokens,
+            .hash = HashPrefixPage(token_span(tokens.data() + (T / P) * P, static_cast<std::size_t>(tail_tokens)),
+                                   hashes.empty() ? std::string{} : hashes.back()),
+        };
+        const RequestProgress progress{
+            .completed_pages = CompletedPages{.prefix_hashes = hashes, .first_new_prefix_page = 0, .tail = tail},
+            .num_computed_tokens = T,
+        };
+        coord.CacheCompletedBlocks(owner, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coord));
+        coord.Free(owner);
+
+        // A prompt sharing exactly T tokens resumes there.
+        std::vector<std::int32_t> prompt(tokens.begin(), tokens.begin() + T);
+        prompt.push_back(7);
+        const CacheCoordinator::PrefixProbe probe = coord.ProbePromptPrefix(
+            CacheCoordinator::PromptPrefix{.prefix_hashes = hashes, .tokens = prompt, .max_tokens = T});
+        ASSERT_EQ(probe.device.num_common_tokens, T) << "P=" << P << " g=" << g << " W=" << W << " T=" << T;
+        std::vector<BlockTable> hitter(2);
+        ASSERT_TRUE(
+            AdmitForTest(coord, hitter, CacheCoordinator::PrefixProbe{probe}, GroupDemand{.extent = DenseGrowth{1}}))
+            << "P=" << P << " g=" << g << " W=" << W << " T=" << T;
+        const std::span<const CacheBlockRef> row = hitter[1].Blocks();
+        const std::int32_t first_window_row = std::max(0, T - W + 1);
+        for (std::int32_t block = 0; block * g < T; ++block) {
+            const std::int32_t block_end = std::min((block + 1) * g, T);
+            const bool in_window = block_end > first_window_row;
+            ASSERT_LT(static_cast<std::size_t>(block), row.size());
+            EXPECT_EQ(static_cast<bool>(row[static_cast<std::size_t>(block)]), in_window)
+                << "P=" << P << " g=" << g << " W=" << W << " T=" << T << " block " << block;
+        }
+        coord.Free(hitter);
+    }
 }
 
 TEST_F(TailPublicationTest, CapDropsTheLeastRecentlyUsedTailUnderOnePriorWithItsBlocks) {

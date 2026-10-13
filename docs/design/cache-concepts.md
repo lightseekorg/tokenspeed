@@ -657,8 +657,11 @@ Its responsibilities:
   longest first, the probe hashes the prompt's own tokens up to it, skips a
   candidate whose hash differs (the publisher diverged inside the page), and
   takes the first `hash@T` every matched group holds (a closed group all of
-  its blocks below `T`; a sliding group the blocks covering its lookback
-  behind `T`). The Host tier runs the same two phases from the Device's
+  its blocks below `T`; a sliding group the blocks holding the window
+  `[T − W + 1, T)` the first query after `T` attends --
+  `CacheCoordinator::SlidingWindowBlocks`, one block more than behind a
+  page-aligned boundary when the window's first row falls inside a block;
+  the tail's blocks below that window stay holes). The Host tier runs the same two phases from the Device's
   full-page coverage and wins when it reaches further by a page or a longer
   tail; the storage tier (L3) matches full pages only. The probe is bounded
   in tokens, not pages, so a hit may end exactly at the bound. `Admit` then

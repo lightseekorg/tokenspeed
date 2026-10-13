@@ -46,6 +46,18 @@ struct CacheCoordinatorTestAccess;
 
 enum class CacheTier { kDevice, kHost };
 
+// The first block (page offset) of a tail a group needs: 0 for a group that
+// keeps every row; for a sliding group the block holding the first row of the
+// window [T - W + 1, T) when that lies inside the tail's page, below which
+// the tail's blocks are holes.
+inline std::int32_t FirstTailBlockNeeded(const CacheGroupSpec& spec, std::int32_t block_granularity,
+                                         std::int32_t tail_tokens) {
+    if (spec.kind != AttnKind::kSlidingWindow) {
+        return 0;
+    }
+    return std::max(0, tail_tokens - spec.sliding_window + 1) / block_granularity;
+}
+
 // num_common_tokens is in tokens, a multiple of the shared prefix
 // granularity. per_group[i] is group i's PrefixMatch at exactly that length.
 struct CoordinatorMatch {
@@ -465,6 +477,24 @@ public:
     // Group blocks a tail entry holds in group i: every block of the page
     // below T, the last one partial unless T is a multiple of the block span.
     std::int32_t TailBlocksFor(std::int32_t i, std::int32_t tail_tokens) const;
+    // The blocks of sliding group i a boundary at `boundary_tokens` needs
+    // behind it, [first, past_end): those holding rows [T - W + 1, T), the
+    // window the first query after T attends. An unaligned T can need one
+    // block more than a page-aligned one, since the window's first row falls
+    // inside a block instead of on its edge.
+    struct BlockRange {
+        std::int32_t first{0};
+        std::int32_t past_end{0};
+    };
+    BlockRange SlidingWindowBlocks(std::int32_t i, std::int32_t boundary_tokens) const;
+    // The first of a tail's blocks (page offset) group i needs: 0 for a
+    // History group that keeps every row; for a sliding group the block
+    // holding the window's first row when that lies inside the tail's page,
+    // below which the tail's blocks stay holes.
+    std::int32_t FirstTailBlockNeeded(std::int32_t i, std::int32_t tail_tokens) const {
+        return tokenspeed::FirstTailBlockNeeded(groups_[static_cast<std::size_t>(i)].Spec(),
+                                                geometry_[static_cast<std::size_t>(i)].BlockGranularity(), tail_tokens);
+    }
 
 private:
     friend struct CacheCoordinatorTestAccess;
@@ -542,9 +572,9 @@ private:
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     };
     // What publishing `completed` covers in one group -- every newly hashed
-    // page plus the tail's blocks of a prefix-closed group, the lookback
-    // behind the newest boundary of a sliding group, slot 1 of a State group
-    // at a non-chunk point, nothing for a replayable one.
+    // page plus the tail's blocks of a prefix-closed group, the blocks holding
+    // the window behind the newest boundary of a sliding group, slot 1 of a
+    // State group at a non-chunk point, nothing for a replayable one.
     // The one source for cacheCompletedBlocksForGroup and for
     // PublishedDataSlotsAfter.
     std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;

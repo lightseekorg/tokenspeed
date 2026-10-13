@@ -216,7 +216,8 @@ private:
         const std::int32_t block_granularity = geometry_[i].BlockGranularity();
         std::int64_t blocks = 0;
         if (const auto& tail = prefix_.device.tail; tail && !tail->group_keys[i].empty()) {
-            blocks += static_cast<std::int64_t>(tail->group_keys[i].size());
+            blocks += static_cast<std::int64_t>(tail->group_keys[i].size()) -
+                      FirstTailBlockNeeded(groups_[i].Spec(), block_granularity, tail->tail_tokens);
             if (const auto* dense = std::get_if<DenseGrowth>(&demands_[i].extent)) {
                 const std::int32_t partial_rows = tail->tail_tokens % block_granularity;
                 const std::int32_t available = partial_rows == 0 ? 0 : block_granularity - partial_rows;
@@ -228,13 +229,6 @@ private:
                 _assert(sparse != nullptr && sparse->first_block * block_granularity >= tail->tail_tokens,
                         "a sparse suffix lands past the hit's tail blocks");
             }
-        }
-        // A Host tail's hits land on fresh destinations counted per bucket
-        // (collectHostHitBuckets); its holes -- tail blocks no lookback of
-        // this group reaches -- are still slots the request writes and get a
-        // fresh block each.
-        if (const auto& tail = prefix_.host.tail; tail && !tail->group_keys[i].empty()) {
-            blocks += std::ranges::count(tail->per_group[i].hits, std::uint8_t{0});
         }
         if (completed_ != nullptr && completed_->owner_continues && completed_->tail &&
             groups_[i].Spec().kind != AttnKind::kMambaState && !groups_[i].Spec().replayable) {
@@ -856,7 +850,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         if (!GroupIsState(i) && device_tail_tokens > 0 && table.NumBlocks() > 0) {
             const TailSlots slots = tail_slots(i, acquired_prefix.device.num_common_tokens);
             _assert(slots.past_end == table.NumBlocks(), "the Device tail's blocks end the claimed table");
-            for (std::int32_t slot = slots.first; slot < slots.past_end; ++slot) {
+            // A sliding group's tail blocks below its window stay holes.
+            const std::int32_t first =
+                slots.first + FirstTailBlockNeeded(static_cast<std::int32_t>(i), device_tail_tokens);
+            for (std::int32_t slot = first; slot < slots.past_end; ++slot) {
                 privatize_slot(i, table, slot, slots.available_tokens);
             }
         }
@@ -898,18 +895,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         if (!acquired_prefix.host.per_group.empty() && !acquired_prefix.host.per_group[i].blocks.empty()) {
             const std::int32_t available =
                 host_tail_tokens > 0 ? tail_slots(i, acquired_prefix.host.num_common_tokens).available_tokens : 0;
+            // A Host tail's blocks land on fresh destinations (one load row
+            // each); a sliding group's tail blocks below its window stay holes.
             groups_[i].Allocator().AppendHostExtension(
                 pool_, table, std::move(acquired_prefix.host.per_group[i].blocks), result.load_pairs, available);
-            // A Host tail block this group did not need (no lookback reaches
-            // it) is still a block the request writes.
-            if (host_tail_tokens > 0) {
-                const TailSlots slots = tail_slots(i, acquired_prefix.host.num_common_tokens);
-                for (std::int32_t slot = slots.first; slot < std::min(slots.past_end, table.NumBlocks()); ++slot) {
-                    if (!table.Blocks()[static_cast<std::size_t>(slot)]) {
-                        privatize_slot(i, table, slot, available);
-                    }
-                }
-            }
         }
         const std::int32_t first_new_block = demand.table->NumBlocks();
         const bool acquired =

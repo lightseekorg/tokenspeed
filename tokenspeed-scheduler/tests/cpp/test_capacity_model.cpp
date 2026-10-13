@@ -193,8 +193,9 @@ TEST(CapacityModelTest, ConcurrentDemandByRetention) {
     EXPECT_EQ(pages[1], 16 * 2);
     // Each request retains ceil((127 + 4 + 4 + 63) / 64) window pages plus
     // the one lookback block a tail handover holds; one in-flight chunk adds
-    // ceil(127 / 64) lookback pages and 8192 / 64 rows.
-    EXPECT_EQ(pages[2], 16 * (4 + 1) + 2 + 128);
+    // the three blocks a 128-token window can span behind an unaligned
+    // boundary and 8192 / 64 rows.
+    EXPECT_EQ(pages[2], 16 * (4 + 1) + 3 + 128);
 
     // The prefill role protects no in-flight decode step: the full group's
     // protected spill disappears; the State group's two slots hold on every
