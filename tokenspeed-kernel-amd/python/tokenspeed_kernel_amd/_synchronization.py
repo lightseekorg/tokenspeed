@@ -26,7 +26,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 
 
 @gluon.jit
-def wait_vmcnt_zero(args, constraints: gl.constexpr):
+def wait_vmem(args, constraints: gl.constexpr):
     """Wait for this subgroup's outstanding vector memory operations to complete.
 
     ``args`` and ``constraints`` specify the assembly's compiler dependencies.

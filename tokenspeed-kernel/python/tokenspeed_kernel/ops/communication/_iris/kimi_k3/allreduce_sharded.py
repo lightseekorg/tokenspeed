@@ -27,7 +27,7 @@ from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.communication._iris import allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerPull
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel_amd._synchronization import wait_vmcnt_zero
+from tokenspeed_kernel_amd._synchronization import wait_vmem
 
 REDUCE_PROGRAMS = 24
 GATHER_PROGRAMS = 128
@@ -44,7 +44,7 @@ def _row_partition_store_completion(
     NUM_WARPS: gl.constexpr,
 ):
     """Complete local stores, update ready flags, and wait for peer completion."""
-    wait_vmcnt_zero(args=[], constraints="=r,~{memory}")
+    wait_vmem(args=[], constraints="=r,~{memory}")
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)

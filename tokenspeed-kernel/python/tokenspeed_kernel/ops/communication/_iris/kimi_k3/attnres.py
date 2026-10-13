@@ -28,7 +28,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_sync_rank_token,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel_amd._synchronization import wait_vmcnt_zero
+from tokenspeed_kernel_amd._synchronization import wait_vmem
 
 ATTNRES_WORLD_SIZE = 8
 ATTNRES_HIDDEN_SIZE = 7168
@@ -332,7 +332,7 @@ def iris_k3attn_push_oneshot(
             mask=mask,
             cache=".wt",
         )
-    wait_vmcnt_zero(args=[], constraints="=r,~{memory}")
+    wait_vmem(args=[], constraints="=r,~{memory}")
     # Wait for every subgroup's stores before signaling readiness to peers.
     gl.barrier()
 

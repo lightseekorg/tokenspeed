@@ -27,7 +27,7 @@ floating-point inputs; ``tokenspeed-kernel`` selects among them by shape.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._synchronization import wait_vmcnt_zero
+from tokenspeed_kernel_amd._synchronization import wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _dense16_mm_launch_metadata,
@@ -1051,7 +1051,7 @@ def gluon_mm_a16w16_medium_gfx950(
         # Complete each subgroup's ".wt" stores, then synchronize the workgroup
         # before incrementing the completion counter. This avoids the L2
         # writeback/invalidation of an acq_rel atomic.
-        wait_vmcnt_zero(args=[offs_cm], constraints="=v,0")
+        wait_vmem(args=[offs_cm], constraints="=v,0")
         gl.barrier()
         old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
         if old != SPLIT_K - 1:
