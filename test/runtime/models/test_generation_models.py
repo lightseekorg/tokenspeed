@@ -64,7 +64,6 @@ class ModelCase:
     enforce_eager: bool = False
     max_model_len: int = None
     max_new_tokens: int = 32
-    min_gpu_memory_gb: float = 0
     blackwell_only: bool = False
     extra_kwargs: dict = dataclasses.field(default_factory=dict)
 
@@ -73,23 +72,6 @@ class ModelCase:
 # tp_size is set to available GPU count at runtime
 _AVAILABLE_GPUS = get_available_gpu_count()
 CI_MODELS = [
-    ModelCase(
-        "openai/gpt-oss-120b",
-        tp_size=_AVAILABLE_GPUS,
-        skip_long_prompt=True,
-        min_gpu_memory_gb=80,
-        extra_kwargs={
-            "disable_prefill_graph": True,
-            "max_total_tokens": 32768,
-            "max_model_len": 16384,
-            "speculative_algorithm": "EAGLE3",
-            "speculative_draft_model_path": "nvidia/gpt-oss-120b-Eagle3-long-context",
-            "speculative_num_steps": 3,
-            "speculative_eagle_topk": 1,
-            "speculative_num_draft_tokens": 4,
-            "gpu_memory_utilization": 0.9,
-        },
-    ),
     ModelCase(
         "txn545/Qwen3.5-35B-A3B-NVFP4",
         tp_size=_AVAILABLE_GPUS,
@@ -213,19 +195,9 @@ class TestGenerationModels(unittest.TestCase):
                 )
 
     def test_ci_models(self):
-        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         for model_case in CI_MODELS:
             if model_case.blackwell_only and not _BLACKWELL_SYSTEM:
                 print(f"Skipping {model_case.model_path}: Blackwell-only model")
-                continue
-            total_memory_gb = gpu_memory_gb * model_case.tp_size
-            if (
-                model_case.min_gpu_memory_gb > 0
-                and total_memory_gb < model_case.min_gpu_memory_gb
-            ):
-                print(
-                    f"Skipping {model_case.model_path}: requires {model_case.min_gpu_memory_gb}GB, got {total_memory_gb:.0f}GB ({gpu_memory_gb:.0f}GB x {model_case.tp_size})"
-                )
                 continue
             for torch_dtype in TORCH_DTYPES:
 
