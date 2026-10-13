@@ -575,8 +575,9 @@ def copy_page_fields(
     :func:`zero_page_fields`: the host ships only the page-id pairs, and the
     group's field table is fixed once the memory plan is. The expanded ranges
     are trusted the same way (the cache arena asserts every field reaches no
-    further than ``backing`` when it builds the table). Pairs must not share
-    a destination with another pair's source: the copies run in parallel.
+    further than ``backing`` when it builds the table). The copies run in
+    parallel, so the pairs of one call must name distinct destinations and no
+    destination may be another pair's source; the caller checks both.
 
     Args:
         backing: Contiguous uint8 cache allocation.

@@ -204,6 +204,8 @@ class CacheArenaCopyBlocksCudaTest(unittest.TestCase):
             arena.copy_blocks({"history": np.asarray([[1, 2], [2, 3]])})
         with self.assertRaisesRegex(ValueError, "chain"):
             arena.copy_blocks({"history": np.asarray([[2, 2]])})
+        with self.assertRaisesRegex(ValueError, "twice"):
+            arena.copy_blocks({"history": np.asarray([[1, 3], [2, 3]])})
         with self.assertRaises(TypeError):
             arena.copy_blocks({"history": np.asarray([1, 2])})
         torch.cuda.synchronize()

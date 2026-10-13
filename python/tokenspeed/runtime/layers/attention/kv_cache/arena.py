@@ -327,8 +327,8 @@ class CacheArena:
 
         The same O(pages) path as :meth:`zero_blocks`: one pinned upload of
         the ``(source, destination)`` pairs, one page x field expansion per
-        group in the kernel. Pairs of one group copy in parallel, so no
-        destination may be another pair's source.
+        group in the kernel. Pairs of one group copy in parallel, so their
+        destinations are distinct and none is another pair's source.
 
         Args:
             block_pairs_by_group: Local ``[n, 2]`` integer arrays per group of
@@ -338,8 +338,8 @@ class CacheArena:
         Raises:
             IndexError: A block ID is outside its group's physical range.
             TypeError: A group's pairs are not an ``[n, 2]`` integer array.
-            ValueError: A pair copies a block onto itself, or a destination is
-                another pair's source.
+            ValueError: A pair copies a block onto itself, two pairs share a
+                destination, or a destination is another pair's source.
         """
         groups: list[str] = []
         arrays: list[np.ndarray] = []
@@ -350,12 +350,18 @@ class CacheArena:
                 raise TypeError(
                     f"block pairs for group {group_id!r} must be an [n, 2] array"
                 )
-            if (pairs[:, 0] == pairs[:, 1]).any() or np.isin(
-                pairs[:, 1], pairs[:, 0]
+            destinations = pairs[:, 1]
+            if (pairs[:, 0] == destinations).any() or np.isin(
+                destinations, pairs[:, 0]
             ).any():
                 raise ValueError(
                     f"block pairs for group {group_id!r} chain a destination "
                     "into a source; the copies run in parallel"
+                )
+            if np.unique(destinations).size != destinations.size:
+                raise ValueError(
+                    f"block pairs for group {group_id!r} write one destination "
+                    "twice; the copies run in parallel"
                 )
             groups.append(group_id)
             arrays.append(pairs)
