@@ -726,7 +726,7 @@ class LogitsProcessor(nn.Module):
         head's vocab-shard group, every rank of which must hold the same rows
         for the vocab all-gather to be consistent, and query context
         parallelism shards queries over exactly that group
-        (``validate_qcp``: ``qcp_size == attn_tp_size``). A plan of another
+        (``Mapping``: ``qcp_size == attn_tp_size``). A plan of another
         width, or a replicated head (attention DP), names a layout this
         processor cannot serve.
         """

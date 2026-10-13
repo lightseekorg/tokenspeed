@@ -105,11 +105,15 @@ def cache_group_config(
             f"cache_group_config: unsupported family {spec.family!r} "
             f"for group {spec.group_id!r}"
         )
-    # The declaration shape (row geometry or state checkpoint) stops here:
-    # the scheduler only learns how many tokens one block-table slot spans.
+    # The row-geometry shape stops here: the scheduler only learns how many
+    # tokens one block-table slot of a history group spans. A state group's
+    # blocks cover no span; the scheduler reads 0 as "no span" and rejects
+    # anything else for the State family.
     kwargs = dict(
         group_id=spec.group_id,
-        block_granularity=int(spec.block_granularity),
+        block_granularity=(
+            int(spec.block_granularity) if spec.family == "history" else 0
+        ),
         total_pages=int(total_pages),
         retention=retention,
         family=family,

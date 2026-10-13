@@ -18,28 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Regression test for the D-role KV-capacity deadlock (Kimi-K3 shaped config).
+"""D-role State groups: the landing is slot 1, decode runs in place.
 
-Root cause: a D-role remote admission used to give each snapshot-state group (KDA)
-exactly one materialized block and ``reserve_tokens=0``, without accounting for
-decode growth. ``groupReserveTokens`` now secures that growth at admission.
-At its first block boundary every request previously needed one
-fresh EMPTY parent per state group (packing 1).  When the prefill side is slow the
-pool fills with whole-prompt reservations before any KV lands; once fewer than
-(#state groups) empty parents remain, no landed request can take its first
-decode step, none finishes, none frees pages, and ``maybeRetractForCapacity`` is
-inert because ``max_new_tokens <= kRetractionSafeSteps`` exempts every resident
-request -> permanent, silent deadlock (``#running-req 0``, ``#queue-req 0``,
-``#pages total-2/total``).
+A D-role remote admission hands each State group a two-slot row ``[0, slot1]``:
+the peer's prompt-end state lands in slot 1 and nothing is read from slot 0
+(the D runs no prefill). The first decode keeps the pair and reads slot 1,
+later decodes write it in place, so a request never needs a state block after
+its admission and a pool filled by remote admissions before any KV lands
+still drains.
 
-Small-scale reproduction: K3-shaped 4-group config (1 History + 3 State groups,
-P = 2 tokens per block, 32 usable pages).  Prompts of exactly one block (2
-tokens) with max_new_tokens = 4.  On the unfixed scheduler each admission
-reserves ceil((2+4)/2) = 3 History pages + 3 state blocks = 6 pages; five of
-them fill 30 of 32 pages, and landing all five afterwards leaves 2 < 3 empty
-parents, so no forward op is ever produced again.  With the growth reserve each
-admission takes 3 + 6 = 9 pages: three requests are admitted, the rest queue,
-and every landed request decodes from its own banked block.
+Shape: K3-shaped 4-group config (1 History + 3 State groups, P = 2 tokens per
+block, 32 usable pages), one-block prompts with max_new_tokens = 4.
 """
 
 from __future__ import annotations
@@ -49,7 +38,7 @@ from conftest import K3_STATE_GROUPS, _make_k3_config
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
-PROMPT_TOKENS = 2  # exactly one block at P=2 -> zero slack in the state groups
+PROMPT_TOKENS = 2  # exactly one block at P=2
 MAX_NEW_TOKENS = 4
 NUM_REQUESTS = 5
 MAX_ROUNDS = 200
@@ -110,11 +99,11 @@ def _land(scheduler, request_id: str) -> None:
     )
 
 
-def _state_blocks(batch, request_id: str) -> dict[str, list[int]]:
-    """Positive block ids per snapshot-state group for one request row of a Batch."""
+def _state_rows(batch, request_id: str) -> dict[str, list[int]]:
+    """The two-slot row per State group for one request row of a Batch."""
     row = list(batch.request_ids).index(request_id)
     tables = dict(batch.block_tables)
-    return {g: [p for p in tables[g][row] if p > 0] for g in K3_STATE_GROUPS}
+    return {g: list(tables[g][row]) for g in K3_STATE_GROUPS}
 
 
 def _dispatched(plan) -> list:
@@ -192,15 +181,10 @@ def _run_closed_loop(scheduler, rids: list[str]) -> dict:
     }
 
 
-class TestDRoleStateGroupReserve:
+class TestDRoleStateSlots:
     def test_pool_filled_by_remote_admissions_before_landing_never_wedges(self):
-        """Unfixed, five one-block prompts are admitted (30/32 pages) before any KV
-        lands; fixed, three fit (27/32) and the rest queue.
-        Unfixed: after landing, every request needs 3 empty parents for its first
-        decode step, only 2 exist, no forward op is ever produced, nothing finishes
-        (available stays 2, active 30) -- the production deadlock.  Fixed: every
-        admitted request already owns its growth block per state group and all of
-        them run to completion."""
+        """Every admitted request owns the slot its decodes write; once the KV
+        lands, all of them run to completion and release every page."""
         scheduler = ts.Scheduler(_d_role_config(decode_input_tokens=1))
         rids = [f"r{i}" for i in range(NUM_REQUESTS)]
         _submit_and_bootstrap(scheduler, rids)
@@ -217,27 +201,24 @@ class TestDRoleStateGroupReserve:
         )
         assert result["active"] == 0, "finished requests must release every page"
 
-    def test_remote_admission_reserves_growth_block_per_state_group(self):
-        """A D-role remote admission must hand the request a second block in every
-        snapshot-state group (the recipe sizes the pool for 2 state blocks per live
-        request), so the first boundary crossing reuses the request's own block
-        instead of demanding a fresh empty parent from the shared pool."""
+    def test_remote_admission_lands_the_state_in_slot_one(self):
+        """The landing row is [0, slot1]: no checkpoint to read, a fresh block
+        for the peer's prompt-end state, and no state transfer skipped."""
         scheduler = ts.Scheduler(_d_role_config(decode_input_tokens=1))
         _submit_and_bootstrap(scheduler, ["r0"])
         plan = scheduler.next_execution_plan()
         assert plan.remote_prefill is not None and list(
             plan.remote_prefill.request_ids
         ) == ["r0"]
-        blocks = _state_blocks(plan.remote_prefill, "r0")
-        short = {g: b for g, b in blocks.items() if len(b) < 2}
-        assert (
-            not short
-        ), f"state groups admitted with a single block and no growth room: {short}"
+        assert list(plan.remote_prefill.state_prefix_cached) == [False]
+        zeroed = dict(plan.pages_to_zero)
+        for group, (slot0, slot1) in _state_rows(plan.remote_prefill, "r0").items():
+            assert slot0 == 0, group
+            assert slot1 > 0 and slot1 in zeroed[group], group
 
-    def test_landed_request_decodes_first_step_from_own_reserve(self):
-        """With the pool otherwise exhausted (2 free parents), a freshly landed
-        one-block prompt must still take its first decode step from its own
-        reserved state blocks."""
+    def test_landed_request_decodes_in_place_with_an_exhausted_pool(self):
+        """With the pool otherwise exhausted, every freshly landed prompt takes
+        its first decode step and keeps writing the landed slot in place."""
         scheduler = ts.Scheduler(_d_role_config(decode_input_tokens=1))
         rids = [f"r{i}" for i in range(NUM_REQUESTS)]
         _submit_and_bootstrap(scheduler, rids)
@@ -249,3 +230,13 @@ class TestDRoleStateGroupReserve:
             f"first decode step blocked for {sorted(set(admitted) - set(dispatched))}: "
             f"available={scheduler.available_lcm_blocks()} active={scheduler.active_lcm_blocks()}"
         )
+        [batch] = _dispatched(plan)
+        landed = {rid: _state_rows(batch, rid) for rid in admitted}
+        for rid in admitted:
+            _advance(scheduler, rid, [201])
+            _reserve(scheduler, rid, 1)
+        [batch] = _dispatched(scheduler.next_execution_plan())
+        for rid in admitted:
+            assert _state_rows(batch, rid) == landed[rid], rid
+            for row in landed[rid].values():
+                assert row[0] == 0 and row[1] > 0

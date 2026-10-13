@@ -44,6 +44,7 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
 from tokenspeed_scheduler import PD
@@ -157,11 +158,26 @@ def _handle(trace, **kwargs):
     )
 
 
-def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None):
+def _plan(
+    *,
+    pages_to_zero=(),
+    pages_to_copy=None,
+    cache=(),
+    remote_decode=None,
+    remote_prefill=None,
+):
     """A round's ExecutionPlan as ``execute`` reads it — every field the real
-    plan exposes, so a fake cannot hide a renamed one."""
+    plan exposes, so a fake cannot hide a renamed one. ``pages_to_zero`` is
+    the real plan's shape: every cache group listed, empty or not, with the
+    given pages under ``"kv"``. ``pages_to_copy`` is the
+    ``pages_to_copy_arrays()`` view: ``[n, 2]`` arrays per group id."""
+    copies = {
+        group_id: np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
+        for group_id, pairs in (pages_to_copy or {}).items()
+    }
     return SimpleNamespace(
-        pages_to_zero=list(pages_to_zero),
+        pages_to_zero={"kv": list(pages_to_zero), "state": []},
+        pages_to_copy_arrays=lambda: copies,
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
@@ -368,7 +384,7 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(plan, None)
@@ -377,13 +393,80 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
         "submit",
         ("write_backs", [store, load], "execution-stream", "default-stream"),
         "submit",
-        ("zero", (3, 4)),
+        ("zero", {"kv": (3, 4)}),
         "submit",
         ("load_backs", [store, load], "default-stream"),
     ]
     # Polling never touches the FIFO — the round head must not wait on it.
     assert handle.poll_cache_results() == ["done"]
     assert trace[-1] != "submit"
+
+
+def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
+    """A prefix hit's private copy (or an owner's move off its published
+    block) rides the same FIFO: after the stores' fence, before the zeroing
+    -- its source may be re-granted and zeroed by this very plan -- and only
+    when some group has pairs. Groups without pairs never reach the
+    executor."""
+    trace: list = []
+    store = _WriteBackOp("store")
+    plan = _plan(
+        pages_to_zero=[3],
+        pages_to_copy={"kv": [(3, 8), (5, 9)], "state": []},
+        cache=[store],
+    )
+    handle = _handle(
+        trace,
+        host_cache_executor=SimpleNamespace(
+            submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+                trace.append(("write_backs", ops))
+            ),
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                ("load_backs", ops)
+            ),
+            submit_prefetches=lambda ops: None,
+        ),
+    )
+    handle._executor.copy_cache_pages = lambda pairs: trace.append(
+        ("copy", {gid: arr.tolist() for gid, arr in pairs.items()})
+    )
+    handle._executor.zero_cache_pages = lambda pages: trace.append(
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
+    )
+
+    handle.execute(plan, None)
+
+    assert trace == [
+        "submit",
+        ("write_backs", [store]),
+        "submit",
+        ("copy", {"kv": [[3, 8], [5, 9]]}),
+        "submit",
+        ("zero", {"kv": (3,)}),
+        "submit",
+        ("load_backs", [store]),
+    ]
+
+    # A plan with no pairs submits no copy at all.
+    trace.clear()
+    handle.execute(_plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
+    assert trace == ["submit", ("zero", {"kv": (2,)})]
+
+
+def test_a_failed_page_copy_surfaces_at_the_next_round(wire_ops):
+    """The copy has no completion event, so its exception would otherwise
+    vanish on the data plane; ``execute`` settles the previous round's copy
+    submissions before enqueueing anything."""
+    trace: list = []
+    handle = _handle(trace)
+
+    def failing_copy(pairs):
+        raise IndexError("local block ID 99 outside [0, 8)")
+
+    handle._executor.copy_cache_pages = failing_copy
+    handle.execute(_plan(pages_to_copy={"kv": [(1, 99)]}), None)
+    with pytest.raises(RuntimeError, match="page copy submission failed"):
+        handle.execute(_plan(), None)
 
 
 def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
@@ -419,7 +502,7 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         ),
     )
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(plan, None)
@@ -490,12 +573,12 @@ def test_page_zeroing_without_l2_submits_only_zeroing():
     trace: list = []
     handle = _handle(trace)
     handle._executor.zero_cache_pages = lambda pages: trace.append(
-        ("zero", tuple(pages))
+        ("zero", {group_id: tuple(ids) for group_id, ids in pages.items()})
     )
 
     handle.execute(_plan(pages_to_zero=[3, 4]), None)
 
-    assert trace == ["submit", ("zero", (3, 4))]
+    assert trace == ["submit", ("zero", {"kv": (3, 4)})]
 
 
 def test_a_plan_with_no_device_work_submits_nothing():
@@ -593,14 +676,40 @@ def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
             shutdown=lambda: trace.append("l2_shutdown"),
         ),
     )
-    pending = Future()
-    pending.set_result(None)
-    handle._l2_submissions.append(pending)
+    for queue in (
+        handle._l2_submissions,
+        handle._transfer_submissions,
+        handle._copy_submissions,
+    ):
+        pending = Future()
+        pending.set_result(None)
+        queue.append(pending)
 
     handle.shutdown_cache()
 
     assert list(handle._l2_submissions) == []
+    assert list(handle._transfer_submissions) == []
+    assert list(handle._copy_submissions) == []
     assert trace == ["run", "l2_shutdown"]
+
+
+def test_shutdown_cache_surfaces_a_failed_final_round_copy_without_a_host_cache():
+    """A copy or transfer queued by the last round has no next round to settle
+    it; shutdown joins it and re-raises even with no Host cache to close."""
+    from concurrent.futures import Future
+
+    handle = _handle([])
+    failed = Future()
+    failed.set_exception(IndexError("local block ID 99 outside [0, 8)"))
+    handle._copy_submissions.append(failed)
+    settled = Future()
+    settled.set_result(None)
+    handle._transfer_submissions.append(settled)
+
+    with pytest.raises(IndexError, match="99"):
+        handle.shutdown_cache()
+    assert list(handle._copy_submissions) == []
+    assert list(handle._transfer_submissions) == []
 
 
 def test_cache_polling_without_kvstore_refuses_loudly():

@@ -302,6 +302,12 @@ if current_platform().is_amd:
 
 
 if current_platform().is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.hyperconnection import (
+        MAX_ROWS as _HC_MIX_MAX_ROWS,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.hyperconnection import (
+        launch_gluon_hyperconnection_mix_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.mhc import (
         launch_gluon_mhc_apply_pre_gfx950,
         launch_gluon_mhc_mixes_gfx950,
@@ -400,4 +406,56 @@ if current_platform().is_amd:
         """Collapse four streams with ``pre`` and optional fused RMSNorm."""
         return launch_gluon_mhc_apply_pre_gfx950(
             residual, pre, norm_weight=norm_weight, norm_eps=norm_eps
+        )
+
+    @register_kernel(
+        "residual",
+        "hyperconnection_mix",
+        name="gluon_hyperconnection_mix_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=format_signatures(
+            ("normalized", "projection_weight", "up_weight"),
+            "dense",
+            {torch.bfloat16, torch.float16},
+        ),
+        traits={
+            # Larger batches keep the GEMM-plus-epilogue path, which is faster
+            # once the weights are no longer the dominant traffic.
+            "num_tokens": frozenset(range(1, _HC_MIX_MAX_ROWS + 1)),
+            "hc_count": frozenset({4}),
+            "hidden_size": frozenset({2560}),
+            "lowrank": frozenset({320}),
+            "contiguous": frozenset({True}),
+            "deterministic": frozenset({False, True}),
+            "weights_independent": frozenset({False, True}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_hyperconnection_mix_gfx950(
+        normalized: torch.Tensor,
+        projection_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        hc_count: int,
+        hidden_size: int,
+        lowrank: int,
+        projection_rows: int,
+        projection_scale: float,
+        weights_independent: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the split-K down projection and gated up projection launches.
+
+        ``weights_independent`` only matters to PDL producers, which GFX950
+        does not have; the result is deterministic either way.
+        """
+        del weights_independent
+        return launch_gluon_hyperconnection_mix_gfx950(
+            normalized,
+            projection_weight,
+            up_weight,
+            hc_count,
+            hidden_size,
+            lowrank,
+            projection_rows,
+            projection_scale,
         )

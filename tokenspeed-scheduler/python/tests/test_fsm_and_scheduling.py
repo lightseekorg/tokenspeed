@@ -174,19 +174,29 @@ class TestFSMTransitions:
         assert decode_plan.forward[0].num_extends() == 0
 
     def test_finish_event_erases_request(self):
-        """advance(finish=True) triggers FinishEvent: Decoding → Finished, erased on next plan."""
+        """FinishEvent parks the request in Finishing; once every forward has
+        landed it settles (publishes, releases) and the next plan erases it."""
         s = Scheduler(make_config(max_scheduled_tokens=512))
         submit(s, "r0", list(range(4)))
 
         s.next_execution_plan()  # → PrefillDone
+        advance_forward(s, "r0", [100])  # the prefill's result lands
         s.next_execution_plan()  # → Decoding  (reserve consumed, new Decoding state has reserve=-1)
+        advance_forward(s, "r0", [101])
         send_reserve_num_tokens(s, "r0", 0)  # reset reserve before next decode plan
         decode_plan = s.next_execution_plan()  # Decoding → Decoding
         assert s.decoding_size() == 1
         assert decode_plan.forward[0].num_extends() == 0
 
-        advance_forward(s, "r0", finish=True)
-        s.next_execution_plan()  # r0 erased (FinishEvent was already applied via advance)
+        advance_forward(
+            s, "r0", finish=True
+        )  # decided on 101; the decode above is in flight
+        s.next_execution_plan()  # nothing settles: a forward of r0 is still out
+        assert s.decoding_size() == 0
+        assert s.request_token_size("r0") == 6
+
+        advance_forward(s, "r0", [102])  # the in-flight decode lands: r0 settles
+        s.next_execution_plan()  # and is erased
 
         assert s.decoding_size() == 0
         assert s.request_token_size("r0") == -1
@@ -429,9 +439,12 @@ class TestDecodeBatch:
         """
         submit(scheduler, request_id, tokens)
         scheduler.next_execution_plan()  # → PrefillDone
+        advance_forward(scheduler, request_id, [100])  # every planned forward lands
         for peer in decoding_peers:
             send_reserve_num_tokens(scheduler, peer, 0)
         scheduler.next_execution_plan()  # → Decoding
+        for rid in (request_id, *decoding_peers):
+            advance_forward(scheduler, rid, [101])
 
     def test_multiple_decoding_requests_scheduled_together(self):
         """All decoding requests are included in the same decode batch."""
@@ -457,7 +470,8 @@ class TestDecodeBatch:
         self._get_to_decoding(s, "r1", list(range(4)), decoding_peers=["r0"])
 
         advance_forward(s, "r0", finish=True)
-        # r1 is still Decoding and needs reserve; r0 received FinishEvent so it won't be scheduled.
+        # r1 is still Decoding and needs reserve; r0 settled with its finish
+        # (nothing in flight), so this plan erases it and never schedules it.
         send_reserve_num_tokens(s, "r1", 0)
         plan = s.next_execution_plan()
 
@@ -469,7 +483,10 @@ class TestDecodeBatch:
     def test_decode_step_appends_token(self):
         """Each decode advance appends one output token."""
         s = Scheduler(make_config(max_scheduled_tokens=512))
-        self._get_to_decoding(s, "r0", list(range(4)))
+        self._get_to_decoding(
+            s, "r0", list(range(4))
+        )  # prompt, the prefill's token, one decode's
+        assert s.request_token_size("r0") == 6
 
         for step in range(3):
             send_reserve_num_tokens(
@@ -478,7 +495,7 @@ class TestDecodeBatch:
             plan = s.next_execution_plan()
             assert plan.forward[0].num_extends() == 0
             advance_forward(s, "r0", tokens=[100 + step])
-            assert s.request_token_size("r0") == 4 + step + 1
+            assert s.request_token_size("r0") == 6 + step + 1
 
 
 # ---------------------------------------------------------------------------

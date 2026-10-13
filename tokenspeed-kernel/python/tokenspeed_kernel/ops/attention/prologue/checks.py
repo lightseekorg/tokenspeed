@@ -33,7 +33,6 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     KVCacheFormat,
     LatentKVCache,
     MLAExpandedKV,
-    PerTokenHeadPlanes,
     Rotary,
 )
 

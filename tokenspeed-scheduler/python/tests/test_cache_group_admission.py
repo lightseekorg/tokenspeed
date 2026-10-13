@@ -121,7 +121,7 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
         ),
         CacheGroupConfig(
             group_id="state",
-            block_granularity=64,
+            block_granularity=0,
             total_pages=4096,
             family=CacheGroupFamily.State,
         ),
@@ -218,7 +218,9 @@ def test_sliding_release_before_admit_prevents_oom():
 
 
 def test_batch_admission_debits_simulated_free_pages():
-    cfg = _base_config(num_device_pages=12)
+    # Thirteen usable pages admit one eight-token prompt (two groups of
+    # ceil(9 / 2) blocks plus a tail handover each), never two.
+    cfg = _base_config(num_device_pages=14)
     cfg.prefix_granularity = 2
     cfg.max_batch_size = 4
     cfg.max_scheduled_tokens = 512
@@ -226,7 +228,7 @@ def test_batch_admission_debits_simulated_free_pages():
         CacheGroupConfig(
             group_id=f"swa.g{i}",
             block_granularity=2,
-            total_pages=12,
+            total_pages=14,
             retention=CacheRetention.SlidingWindow,
             sliding_window_tokens=4,
         )
@@ -309,9 +311,10 @@ def test_first_chunk_prepays_prompt_headroom_only_in_full_history_groups():
     # headroom prepaid. The full-history group must hold that: 8 + 32 tokens
     # -> 10 pages. The sliding-window group recycles slid-out pages, so the
     # rest of the prompt costs it nothing: it holds only the chunk, 2 pages.
-    # 12 pages fit a 16-page pool; had the headroom been broadcast to both
-    # groups (20 pages) the request would have sat in the waiting queue.
-    scheduler = _hybrid_chunked_scheduler(num_usable_pages=16)
+    # 12 pages fit an 18-page pool (the startup bound admits the 40-token
+    # limit); had the headroom been broadcast to both groups (20 pages) the
+    # request would have sat in the waiting queue.
+    scheduler = _hybrid_chunked_scheduler(num_usable_pages=18)
     request = _make_spec("long", list(range(32)))
     request.max_new_tokens = 8
     scheduler.submit_requests([request])
@@ -323,6 +326,6 @@ def test_first_chunk_prepays_prompt_headroom_only_in_full_history_groups():
     tables = dict(operation.block_tables)
     assert len(tables["history"][0]) == 10
     assert len(tables["swa"][0]) == 2
-    assert scheduler.cache_group_available_pages("history") == 4
+    assert scheduler.cache_group_available_pages("history") == 6
     assert scheduler.waiting_size() == 0
     assert scheduler.prefilling_size() == 1

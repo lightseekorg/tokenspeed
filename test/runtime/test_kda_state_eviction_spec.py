@@ -55,6 +55,10 @@ from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
     pool_to_cache_groups,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    STATE_INPUT_SLOT,
+    STATE_LIVE_SLOT,
+)
 
 register_cuda_ci(
     est_time=180,
@@ -198,10 +202,10 @@ class _KDA:
             outputs[layer] = output.reshape(end - begin, _H, _D).clone()
         return outputs
 
-    def states(self, tables, *, end: int):
+    def states(self, tables):
         return {
             (layer, component): self.pool.get_component(layer, component)[
-                tables[group][0][(end - 1) // _P]
+                tables[group][0][STATE_LIVE_SLOT]
             ].clone()
             for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True)
             for component in _COMPONENTS
@@ -248,7 +252,7 @@ def _assert_states(actual, expected, label: str):
 @requires_cuda
 @requires_fla
 @pytest.mark.parametrize("replay", [False, True], ids=["scratch", "replay"])
-def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpoint(
+def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints(
     replay,
 ):
     actual = _KDA(width=_WIDTH, replay=replay)
@@ -277,10 +281,10 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
             ("beta_raw", _H),
         )
     }
-    # The oracle deliberately never allocates or publishes snapshots. Every
-    # accepted token updates the same working block through q_len=1 decode.
+    # The oracle never allocates or publishes checkpoints: every accepted
+    # token updates the same live block through q_len=1 decode.
     reference_tables = {
-        spec.group_id: [[1] * 12] for spec in reference.contract.group_specs
+        spec.group_id: [[0, 1]] for spec in reference.contract.group_specs
     }
     reference_outputs = {layer: [] for layer in _LAYERS}
     reference_states = {}
@@ -298,9 +302,7 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
         )
         for layer in _LAYERS:
             reference_outputs[layer].append(outputs[layer])
-        reference_states[position + 1] = reference.states(
-            reference_tables, end=position + 1
-        )
+        reference_states[position + 1] = reference.states(reference_tables)
     reference_outputs = {
         layer: torch.cat(outputs, dim=0) for layer, outputs in reference_outputs.items()
     }
@@ -323,27 +325,34 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
     outputs = actual.forward(inputs, begin=0, end=4, prefill=True)
     for layer in _LAYERS:
         _assert_close(outputs[layer], reference_outputs[layer][:4], "initial prefill")
-    _assert_states(actual.states(tables, end=4), reference_states[4], "initial prefill")
+    _assert_states(actual.states(tables), reference_states[4], "initial prefill")
     _feedback(scheduler, request_id="source", tokens=[4], decode=False)
+    prompt_end_tables = tables
+    prompt_end = actual.states(tables)
 
     computed = 4
-    previous_tables = tables
-    released = {group: set() for group in KIMI_STATE_GROUPS}
-    reused_outputs = {group: set() for group in KIMI_STATE_GROUPS}
-    # 7 -> 10 crosses 8 without committing there; 10 -> 12 writes an aligned
-    # partial acceptance. Both remain working state only; later GPU outputs
-    # reuse retired blocks without retaining a Decode snapshot.
-    for accepted in [1, 2, 3, 2, 1, 3] + [3, 1] * 6:
+    live_blocks = None
+    # Every verify round reads the committed state and commits the accepted
+    # prefix into the live block; the first round reads the prompt-end
+    # checkpoint from slot 0, every later one evolves the live block in place.
+    for index, accepted in enumerate([1, 2, 3, 2, 1, 3] + [3, 1] * 6):
         batch, tables = _batch(scheduler, "source")
         assert batch.num_extends() == 0
         assert list(batch.input_lengths) == [_WIDTH]
-        expired_slots = max(0, (computed - _WIDTH) // _P)
         for group in KIMI_STATE_GROUPS:
             row = tables[group][0]
-            assert all(block == 0 for block in row[:expired_slots])
-            for slot, block in enumerate(previous_tables[group][0]):
-                if block > 0 and row[slot] == 0:
-                    released[group].add(block)
+            if index == 0:
+                assert (
+                    row[STATE_INPUT_SLOT]
+                    == prompt_end_tables[group][0][STATE_LIVE_SLOT]
+                )
+                assert row[STATE_LIVE_SLOT] not in prompt_end_tables[group][0]
+            else:
+                assert row[STATE_INPUT_SLOT] == 0
+                assert row[STATE_LIVE_SLOT] == live_blocks[group]
+        live_blocks = {
+            group: tables[group][0][STATE_LIVE_SLOT] for group in KIMI_STATE_GROUPS
+        }
         actual.metadata(
             tables,
             begin=computed,
@@ -367,14 +376,10 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
                 f"accepted verify outputs at {end}",
             )
         _assert_states(
-            actual.states(tables, end=end),
+            actual.states(tables),
             reference_states[end],
             f"accepted endpoint {end}",
         )
-        for group in KIMI_STATE_GROUPS:
-            output_block = tables[group][0][(end - 1) // _P]
-            if output_block in released[group]:
-                reused_outputs[group].add(output_block)
         empty_before_feedback = scheduler.empty_lcm_blocks()
         assert empty_before_feedback > 0
         _feedback(
@@ -384,26 +389,33 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
             decode=True,
         )
         assert scheduler.empty_lcm_blocks() == empty_before_feedback
-        previous_tables = tables
         computed = end
     assert computed == 40
-    assert all(released.values())
-    assert all(
-        reused_outputs.values()
-    ), "retired working blocks must become GPU outputs again"
+    _assert_states(
+        actual.states(prompt_end_tables), prompt_end, "prompt-end checkpoint"
+    )
     finish = ts.ForwardEvent.Finish()
     finish.request_id = "source"
     scheduler.advance(ts.ExecutionEvent().add_event(finish))
+    finish_tables = tables
 
-    for boundary in (8, 12, 40):
+    # The published checkpoints are the prompt end (4 tokens) and the finish
+    # (40 computed tokens). A probe sharing 8 or 12 tokens resumes from the
+    # prompt-end state; one sharing all 40 resumes from the finish state.
+    for boundary, begin in ((8, 4), (12, 4), (40, 40)):
         request = ts.RequestSpec()
         request.request_id = f"resume_{boundary}"
         request.tokens = list(range(boundary)) + [999]
         request.max_new_tokens = 4
         scheduler.submit_requests([request])
         batch, tables = _batch(scheduler, request.request_id)
-        begin = int(batch.extend_prefix_lens[0])
-        assert begin == 4
+        assert int(batch.extend_prefix_lens[0]) == begin
+        checkpoint_tables = prompt_end_tables if begin == 4 else finish_tables
+        for group in KIMI_STATE_GROUPS:
+            assert (
+                tables[group][0][STATE_INPUT_SLOT]
+                == checkpoint_tables[group][0][STATE_LIVE_SLOT]
+            )
         end = begin + int(batch.input_lengths[0])
         actual.metadata(
             tables,
@@ -421,7 +433,7 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
                 f"resume {boundary}",
             )
         _assert_states(
-            actual.states(tables, end=end), reference_states[end], f"resume {boundary}"
+            actual.states(tables), reference_states[end], f"resume {boundary}"
         )
         _feedback(
             scheduler,
@@ -434,6 +446,9 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
         abort = ts.ForwardEvent.Abort()
         abort.request_id = request.request_id
         scheduler.advance(ts.ExecutionEvent().add_event(abort))
+    _assert_states(
+        actual.states(prompt_end_tables), prompt_end, "prompt-end checkpoint"
+    )
     for layer in _LAYERS:
         for component in _COMPONENTS:
             assert (

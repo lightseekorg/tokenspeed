@@ -361,11 +361,13 @@ def _sconv_apply(
 
     ``weight`` is ``[dim, W]``; ``channel_offset``/``dim`` select the state
     channels in the layer's conv pool buffer. Fusing adjacent streams (K+V)
-    is just a wider ``dim`` with concatenated weights. The paged bridges are
-    mandatory and fused: extend chunks tap the checkpoint at their aligned
+    is just a wider ``dim`` with concatenated weights. The checkpoint bridges
+    are mandatory and fused: extend chunks tap the input checkpoint at their
     start (the prefill kernel never reads the ring), decode rounds tap the
-    ring (the decode kernel never reads the checkpoint blocks), and both publish
-    every covered boundary in-kernel.
+    ring (the decode kernel never reads the checkpoint blocks), and the
+    chunk-end window is published to the live slot in-kernel whenever the
+    chunk ends at the committed frontier -- a target verify publishes its
+    accepted window after acceptance instead.
     """
     backend = ctx.attn_backend
     # Same routing as the dense metadata: prefill-family forwards read the
@@ -405,7 +407,7 @@ def _sconv_apply(
             md,
             checkpoint_group,
         )
-    y = inkling_ring_sconv(
+    return inkling_ring_sconv(
         x,
         weight,
         state,
@@ -418,18 +420,10 @@ def _sconv_apply(
         checkpoint_buffers[0],
         checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
         num_extends=md.num_extends,
-        page_size=backend.conv_columns["block_tokens"],
+        publish_live=(
+            md.num_extends > 0 or backend.conv_spec_num_tokens == 1 or backend.is_draft
+        ),
     )
-    if md.num_extends > 0 and backend.conv_columns.get("pd_endpoint_snapshots", False):
-        # The fused kernel already publishes aligned boundaries. CachePD also
-        # needs the exact prompt endpoint, which may lie inside the last page.
-        backend.publish_shortconv_endpoint(
-            state,
-            checkpoint_buffers,
-            md,
-            checkpoint_group,
-        )
-    return y
 
 
 class InklingRelLogitsProj(nn.Module):

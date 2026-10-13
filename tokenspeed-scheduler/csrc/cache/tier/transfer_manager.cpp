@@ -377,7 +377,7 @@ SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(const std::st
     _assert(request_pool_index.valid(), "a restore imports the slot-state blob into a request-pool row");
     _assert(blob_slot != nullptr && blob_slot->valid(), "a restore imports from the image's blob slot");
     for (const BlockTransfer& pair : load_pairs) {
-        _assert(!pair.key.content_hash.empty() && coordinator_.IsHostCachedBlock(pair.source->Location()),
+        _assert(coordinator_.IsHostCachedBlock(pair.source->Location()),
                 "a restore's Host L2 row must come from a published Host entry");
     }
     SnapshotRestoreOperation op{

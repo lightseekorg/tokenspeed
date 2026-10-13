@@ -1219,6 +1219,28 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
 
 
 @pytest.mark.parametrize(
+    "m,k,routed",
+    [
+        (1, 7168, True),
+        (1, 2048, True),
+        (1, 16384, True),
+        (1, 65537, False),
+        (8, 7168, True),
+        (8, 8192, False),
+        (12, 4096, True),
+        (16, 16384, False),
+    ],
+)
+def test_fp32_rowcta_routing_bounds_k(m, k, routed):
+    api = _functions(
+        KERNEL / "ops/gemm/triton_gemv.py", None, ("_fp32_rowcta_k_fits",), {}
+    )
+    # A direct call takes any width, but the registry sends a second 64K block
+    # for one row, and more than 15 blocks of 512 for more rows, to Torch.
+    assert api._fp32_rowcta_k_fits(m, 256, k) is routed
+
+
+@pytest.mark.parametrize(
     "capturing,warmed", [(False, False), (True, False), (True, True)]
 )
 @pytest.mark.parametrize("failure", [False, True])

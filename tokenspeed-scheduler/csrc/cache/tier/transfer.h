@@ -252,9 +252,11 @@ struct SnapshotStoreOperation {
 
 // The way back, Host -> DEVICE in one op: every imaged slot that was not
 // claimed from the Device prefix index, each row naming its source tier, plus
-// the slot-state blob imported into the new request_pool_index. L2 rows carry
-// their key (content_hash / page_offset) so the ACK republishes the
-// destination into the Device prefix index; pool rows carry none. Runs after
+// the slot-state blob imported into the new request_pool_index. An L2 row
+// carries its key (content_hash / page_offset) so the ACK republishes the
+// destination into the Device prefix index, except the row of the partial
+// page the request keeps writing, whose destination stays private (empty
+// key); pool rows carry none. Runs after
 // the plan's zeroing; nothing in the round's batch reads the destinations,
 // so no layerwise tracking is involved.
 struct SnapshotRestoreOperation {

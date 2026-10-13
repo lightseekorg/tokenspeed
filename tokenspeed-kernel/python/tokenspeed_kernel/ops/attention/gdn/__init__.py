@@ -412,6 +412,7 @@ def gdn_decode_mtp(
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
     tree_ancestors: torch.Tensor | None,
+    replay_payload: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -465,6 +466,10 @@ def gdn_decode_mtp(
             needs ``disable_state_update``, and an ``intermediate_states_buffer``
             is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
             Runs the Triton solution; ``None`` is a chain.
+        replay_payload: Optional contiguous ``[B * T, num_q_heads * head_dim +
+            num_v_heads * head_v_dim + 2 * num_v_heads]`` ReplaySSM payload, in
+            the inputs' dtype, that a chunked ReplaySSM tree verify fills with
+            each token's ``[k | v | a | b]`` as read.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -561,6 +566,60 @@ def gdn_decode_mtp(
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
             tree_ancestors=tree_ancestors,
+            replay_payload=replay_payload,
+        )
+
+
+def validate_replay_commit_setup(
+    payload: torch.Tensor,
+    parameters: torch.Tensor,
+    *,
+    geometry: tuple[int, int, int, int],
+    state_dtype: torch.dtype,
+) -> None:
+    """Validate fixed GDN/Mamba2 replay storage when the workspace is created.
+
+    Call again after replacing the workspace. Metadata allocation supplies
+    contiguous uint64 address, int64 stride, and int32 index tables on the
+    payload device; execution checks their current row counts.
+
+    Args:
+        payload: Contiguous packed K/V/a/b storage shaped [layers, rows, width].
+        parameters: FP32 A_log/dt_bias table shaped [layers, 2, value_heads].
+        geometry: (key_heads, value_heads, key_dim, value_dim).
+        state_dtype: Element dtype shared by every recurrent-state pool.
+    """
+    num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
+    if num_v_heads <= 0 or num_k_heads <= 0 or num_v_heads % num_k_heads:
+        raise ValueError("num_v_heads must be divisible by num_k_heads")
+    if head_k_dim <= 0 or head_v_dim <= 0:
+        raise ValueError("replay head dimensions must be positive")
+    if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise ValueError(f"unsupported replay state dtype: {state_dtype}")
+
+    payload_width = (
+        num_k_heads * head_k_dim + num_v_heads * head_v_dim + 2 * num_v_heads
+    )
+    if (
+        payload.ndim != 3
+        or payload.shape[-1] != payload_width
+        or not payload.is_contiguous()
+    ):
+        raise ValueError(
+            f"replay payload must be contiguous [L, rows, {payload_width}]"
+        )
+    if parameters.shape != (payload.shape[0], 2, num_v_heads):
+        raise ValueError(
+            "replay parameters must have shape "
+            f"{(payload.shape[0], 2, num_v_heads)}, got {tuple(parameters.shape)}"
+        )
+    if (
+        parameters.dtype != torch.float32
+        or parameters.device != payload.device
+        or not parameters.is_contiguous()
+    ):
+        raise ValueError(
+            "replay parameters must be contiguous FP32 on the payload device"
         )
 
 
@@ -577,84 +636,39 @@ def validate_replay_commit_args(
     geometry: tuple[int, int, int, int],
     state_dtype: torch.dtype,
 ) -> bool:
-    """Validate a recurrent replay call against the shared ``[K | V | a | b]`` layout.
+    """Validate the current replay batch against a prepared workspace.
 
-    Arguments are those of ``gdn_replay_commit``, with ``geometry`` read as
-    ``(key_heads, value_heads, key_dim, value_dim)``.
+    ``validate_replay_commit_setup`` owns fixed payload/parameter geometry,
+    dtype and layout. Keep this signature shared by the GDN and Mamba2 entries;
+    metadata allocation supplies contiguous tables on the payload device.
 
     Returns:
         ``False`` when there is no layer or request to replay.
     """
-    if payload.dim() != 3 or not payload.is_contiguous():
-        raise ValueError("replay payload must be contiguous [L, rows, width]")
     num_layers = payload.shape[0]
     batch_size = accepted_length.numel()
     if num_layers == 0 or batch_size == 0:
         return False
-    num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
     if draft_token_num <= 0:
         raise ValueError("draft_token_num must be positive")
-    if num_v_heads <= 0 or num_k_heads <= 0 or num_v_heads % num_k_heads:
-        raise ValueError("num_v_heads must be divisible by num_k_heads")
-    if head_k_dim <= 0 or head_v_dim <= 0:
-        raise ValueError("replay head dimensions must be positive")
-    payload_width = (
-        num_k_heads * head_k_dim + num_v_heads * head_v_dim + 2 * num_v_heads
-    )
     if payload.shape[1] < batch_size * draft_token_num:
         raise ValueError("replay payload has insufficient token capacity")
-    if payload.shape[2] != payload_width:
-        raise ValueError(
-            f"replay payload width must be {payload_width}, got {payload.shape[2]}"
-        )
-    if parameters.shape != (num_layers, 2, num_v_heads):
-        raise ValueError(
-            "replay parameters must have shape "
-            f"{(num_layers, 2, num_v_heads)}, got {tuple(parameters.shape)}"
-        )
-    if parameters.dtype != torch.float32 or not parameters.is_contiguous():
-        raise ValueError("replay parameters must be contiguous torch.float32")
-    if state_addresses.shape != (num_layers,) or state_addresses.dtype != torch.uint64:
-        raise ValueError(
-            "state_addresses must be torch.uint64 with one entry per layer"
-        )
-    if (
-        state_row_strides.shape != (num_layers,)
-        or state_row_strides.dtype != torch.int64
+    if state_addresses.shape != (num_layers,) or state_row_strides.shape != (
+        num_layers,
     ):
         raise ValueError(
-            "state_row_strides must be torch.int64 with one entry per layer"
+            "replay address and stride tables must have one entry per layer"
         )
-    if read_indices.shape != (num_layers, batch_size):
+    expected_indices = (num_layers, batch_size)
+    if (
+        read_indices.shape != expected_indices
+        or write_indices.shape != expected_indices
+    ):
         raise ValueError(
-            "read_indices must have shape "
-            f"{(num_layers, batch_size)}, got {tuple(read_indices.shape)}"
+            f"replay read/write indices must have shape {expected_indices}"
         )
-    if write_indices.shape != (num_layers, batch_size):
-        raise ValueError(
-            "write_indices must have shape "
-            f"{(num_layers, batch_size)}, got {tuple(write_indices.shape)}"
-        )
-    if read_indices.dtype != torch.int32 or write_indices.dtype != torch.int32:
-        raise ValueError("replay page tables must have dtype torch.int32")
-    if accepted_length.shape != (batch_size,) or accepted_length.dtype != torch.int32:
-        raise ValueError("accepted_length must be a one-dimensional torch.int32 tensor")
-    if state_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ValueError(f"unsupported replay state dtype: {state_dtype}")
-    tensors = (
-        parameters,
-        state_addresses,
-        state_row_strides,
-        read_indices,
-        write_indices,
-        accepted_length,
-    )
-    if any(not tensor.is_contiguous() for tensor in tensors):
-        raise ValueError(
-            "replay address, stride, index, and parameter tables must be contiguous"
-        )
-    if any(tensor.device != payload.device for tensor in tensors):
-        raise ValueError("all replay tensors must reside on the payload device")
+    if accepted_length.ndim != 1:
+        raise ValueError("accepted_length must be one-dimensional")
     return True
 
 
@@ -804,4 +818,5 @@ __all__ = [
     "gdn_replay_commit_supported",
     "gdn_tree_verify_needs_node_states",
     "validate_replay_commit_args",
+    "validate_replay_commit_setup",
 ]

@@ -97,6 +97,23 @@ def test_gated_rmsnorm_rows_are_independent_of_their_neighbours():
         torch.testing.assert_close(full[row : row + 1], alone, rtol=0, atol=0)
 
 
+def test_one_group_weight_on_whole_rows_matches_one_row_per_group():
+    """A ``group_size`` weight shared by every group of whole rows, with z a
+    row-strided view, normalizes exactly like one row per group."""
+    torch.manual_seed(0)
+    tokens, heads, dim = 37, 12, 128
+    x = torch.randn(tokens, heads * dim, device="cuda", dtype=torch.bfloat16)
+    wide = torch.randn(tokens, (heads + 3) * dim, device="cuda", dtype=torch.bfloat16)
+    z = wide[:, 3 * dim :]
+    weight = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    kwargs = dict(eps=1e-6, group_size=dim, weights_independent=True)
+    rows = rmsnorm_fn(x, weight, z=z, **kwargs)
+    per_group = rmsnorm_fn(
+        x.view(-1, dim), weight, z=z.contiguous().view(-1, dim), **kwargs
+    )
+    torch.testing.assert_close(rows.view(-1, dim), per_group, rtol=0, atol=0)
+
+
 def test_gated_rmsnorm_fp8_output_matches_quantized_bf16():
     """The FP8 output equals quantizing the activation-dtype output with the same scale."""
     torch.manual_seed(1)
@@ -109,3 +126,7 @@ def test_gated_rmsnorm_fp8_output_matches_quantized_bf16():
     fp8 = rmsnorm_fn(x, weight, z=z, fp8_scale=scale, **kwargs)
     expected = (bf16.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
     torch.testing.assert_close(fp8.float(), expected.float(), rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

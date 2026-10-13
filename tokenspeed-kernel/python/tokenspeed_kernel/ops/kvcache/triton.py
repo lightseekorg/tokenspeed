@@ -51,9 +51,9 @@ def _use_pdl(enable_pdl: bool | None) -> bool:
 __all__ = [
     "HOST_CACHE_TRANSFER_CHUNK_BYTES",
     "compact_window_rows",
+    "copy_page_fields",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
-    "gather_page_table_with_padding",
     "get_mla_kv_buffer_triton",
     "index_k_block_split_scatter",
     "mla_latent_norm_rope_scatter",
@@ -63,6 +63,7 @@ __all__ = [
     "state_verify_commit_rows",
     "store_kv_cache",
     "store_sf_interleaved",
+    "store_state_rows",
     "transfer_cache_blocks",
     "wait_layer_ready",
     "transfer_kv_all_layer",
@@ -531,6 +532,100 @@ def zero_page_fields(
     )
 
 
+@triton.jit(do_not_specialize=["num_fields"])
+def _copy_page_fields_kernel(
+    backing_ptr,
+    pairs_ptr,
+    fields_ptr,
+    # Runtime: the field count follows the cache group and the pair count the
+    # batch; neither may specialize the binary.
+    num_fields,
+    BLOCK_SIZE: tl.constexpr,
+):
+    entry = tl.program_id(0)
+    pair = pairs_ptr + (entry // num_fields) * 2
+    source = tl.load(pair).to(tl.int64)
+    destination = tl.load(pair + 1).to(tl.int64)
+    field = fields_ptr + (entry % num_fields) * 3
+    field_offset = tl.load(field)
+    page_stride = tl.load(field + 1)
+    range_size = tl.load(field + 2)
+    source_offset = field_offset + source * page_stride
+    destination_offset = field_offset + destination * page_stride
+    for start in range(
+        tl.program_id(1) * BLOCK_SIZE, range_size, tl.num_programs(1) * BLOCK_SIZE
+    ):
+        byte_offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = byte_offsets < range_size
+        payload = tl.load(backing_ptr + source_offset + byte_offsets, mask=mask)
+        tl.store(backing_ptr + destination_offset + byte_offsets, payload, mask=mask)
+
+
+def copy_page_fields(
+    backing: torch.Tensor,
+    pairs: torch.Tensor,
+    fields: torch.Tensor,
+    *,
+    max_field_bytes: int,
+) -> None:
+    """Copy every field payload of one cache group's pages onto other pages.
+
+    The pair x field expansion happens on the device, as in
+    :func:`zero_page_fields`: the host ships only the page-id pairs, and the
+    group's field table is fixed once the memory plan is. The expanded ranges
+    are trusted the same way (the cache arena asserts every field reaches no
+    further than ``backing`` when it builds the table). The copies run in
+    parallel, so the pairs of one call must name distinct destinations and no
+    destination may be another pair's source; the caller checks both.
+
+    Args:
+        backing: Contiguous uint8 cache allocation.
+        pairs: Device int32/int64 ``[num_pairs, 2]`` rows of
+            ``(source page, destination page)`` within the group.
+        fields: Device int64 ``[num_fields, 3]`` rows of
+            ``(byte offset of page 0, page stride bytes, payload bytes)``.
+        max_field_bytes: The largest payload in ``fields``; sizes the grid.
+    """
+    if backing.dtype != torch.uint8 or not backing.is_contiguous():
+        raise ValueError("backing must be a contiguous uint8 tensor")
+    if (
+        pairs.dim() != 2
+        or pairs.shape[1] != 2
+        or pairs.dtype
+        not in (
+            torch.int32,
+            torch.int64,
+        )
+    ):
+        raise ValueError("pairs must be an int32/int64 [num_pairs, 2] tensor")
+    if fields.dim() != 2 or fields.shape[1] != 3 or fields.dtype != torch.int64:
+        raise ValueError("fields must be an int64 [num_fields, 3] tensor")
+    if not (pairs.is_contiguous() and fields.is_contiguous()):
+        raise ValueError("pairs and fields must be contiguous")
+    if pairs.data_ptr() % 16 or fields.data_ptr() % 16:
+        raise ValueError("pairs and fields must be 16-byte aligned")
+    if max_field_bytes <= 0:
+        raise ValueError("max_field_bytes must be positive")
+    num_ranges = pairs.shape[0] * fields.shape[0]
+    if num_ranges == 0:
+        return
+
+    block_size = 1024
+    tiles_per_range = max(32, triton.cdiv(1024, num_ranges))
+    grid = (
+        num_ranges,
+        min(tiles_per_range, triton.cdiv(max_field_bytes, block_size)),
+    )
+    _copy_page_fields_kernel[grid](
+        backing,
+        pairs,
+        fields,
+        fields.shape[0],
+        BLOCK_SIZE=block_size,
+        num_warps=4,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Batched state-row copies across per-layer slabs (pointer table)
 # -----------------------------------------------------------------------------
@@ -663,6 +758,103 @@ def copy_state_rows(
         BLOCK_I32=block_i32,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
+    )
+
+
+@triton.jit(do_not_specialize=["num_rows", "state_width"])
+def _store_state_rows_kernel(
+    states,
+    slab,
+    blocks,
+    num_rows,
+    state_width,
+    state_dim_2,
+    state_dim_3,
+    state_stride_0,
+    state_stride_1,
+    state_stride_2,
+    state_stride_3,
+    slab_stride_0,
+    slab_stride_1,
+    slab_stride_2,
+    slab_stride_3,
+    BLOCK: tl.constexpr,
+):
+    offsets = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
+    row = offsets // state_width
+    feature = offsets % state_width
+    live = row < num_rows
+    destination = tl.load(blocks + row, mask=live, other=-1).to(tl.int64)
+    live = live & (destination >= 0)
+    # int64 element offsets: a slab block id times its stride, or a late row of
+    # a wide state, exceeds int32 on large pools.
+    dim_1_index = feature // (state_dim_2 * state_dim_3)
+    remainder = feature % (state_dim_2 * state_dim_3)
+    dim_2_index = remainder // state_dim_3
+    dim_3_index = remainder % state_dim_3
+    state_offset = (
+        row * state_stride_0
+        + dim_1_index * state_stride_1
+        + dim_2_index * state_stride_2
+        + dim_3_index * state_stride_3
+    )
+    slab_offset = (
+        destination * slab_stride_0
+        + dim_1_index * slab_stride_1
+        + dim_2_index * slab_stride_2
+        + dim_3_index * slab_stride_3
+    )
+    value = tl.load(states + state_offset, mask=live)
+    tl.store(slab + slab_offset, value.to(slab.dtype.element_ty), mask=live)
+
+
+def store_state_rows(
+    states: torch.Tensor,
+    slab: torch.Tensor,
+    blocks: torch.Tensor,
+) -> None:
+    """Scatter one recurrent state per request into its slab block.
+
+    Args:
+        states: ``[rows, *state_shape]`` per-request states; strides are
+            honoured, so transposed scan outputs need no copy. Cast to the
+            slab's dtype on store.
+        slab: ``[blocks, *state_shape]`` recurrent-state slab, updated in
+            place; strides are honoured (page-interleaved arena views).
+        blocks: ``[rows]`` int32/int64 destination block per request. A
+            negative block skips the row: capacity-shaped prefill metadata
+            pads the request dimension with ``-1`` rows whose dummy scan
+            result must reach no block.
+    """
+    if blocks.numel() == 0:
+        return
+    if states.ndim != 4 or slab.ndim != 4:
+        raise ValueError("recurrent states must be four-dimensional")
+    if states.shape[1:] != slab.shape[1:]:
+        raise ValueError("state and slab shapes must agree past the row dimension")
+    if states.shape[0] != blocks.numel():
+        raise ValueError("one destination block per state row is required")
+    if blocks.dtype not in (torch.int32, torch.int64) or (
+        blocks.numel() > 1 and blocks.stride(0) != 1
+    ):
+        raise ValueError("blocks must be a unit-stride int32/int64 vector")
+    if not states.is_cuda:
+        live = blocks >= 0
+        slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
+        return
+    state_width = states[0].numel()
+    block = 256
+    _store_state_rows_kernel[(triton.cdiv(blocks.numel() * state_width, block),)](
+        states,
+        slab,
+        blocks,
+        blocks.numel(),
+        state_width,
+        states.shape[2],
+        states.shape[3],
+        *states.stride(),
+        *slab.stride(),
+        BLOCK=block,
     )
 
 
@@ -1941,77 +2133,6 @@ def fused_fp8_set_kv_buffer(
 # -----------------------------------------------------------------------------
 # Page Table Gather
 # -----------------------------------------------------------------------------
-
-
-@triton.jit
-def _gather_page_table_with_padding_kernel(
-    req_to_page_ptr,
-    req_pool_indices_ptr,
-    seq_lens_ptr,
-    out_ptr,
-    src_stride0,
-    out_stride0,
-    max_num_pages: tl.constexpr,
-    page_size: tl.constexpr,
-    dummy_slot: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-):
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-
-    sl = tl.load(seq_lens_ptr + pid_row).to(tl.int32)
-    n_pages = (sl + page_size - 1) // page_size
-
-    col_offsets = pid_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-    in_bounds = col_offsets < max_num_pages
-    valid = col_offsets < n_pages
-
-    req_idx = tl.load(req_pool_indices_ptr + pid_row).to(tl.int64)
-    src_addr = req_to_page_ptr + req_idx * src_stride0 + col_offsets
-    gathered = tl.load(src_addr, mask=valid & in_bounds, other=dummy_slot)
-
-    out_addr = out_ptr + pid_row * out_stride0 + col_offsets
-    tl.store(out_addr, gathered, mask=in_bounds)
-
-
-def gather_page_table_with_padding(
-    req_to_page: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    out: torch.Tensor,
-    *,
-    bs: int,
-    max_num_pages: int,
-    page_size: int,
-    dummy_slot: int = 0,
-) -> None:
-    """Gather active request page tables and clear padding columns.
-
-    Args:
-        req_to_page: Source page table with request rows.
-        req_pool_indices: Request row indices to gather, shape ``[bs]``.
-        seq_lens: Per-request KV lengths, shape ``[bs]``.
-        out: Destination page table, shape ``[max_bs, max_num_pages]``.
-        bs: Number of active rows to gather.
-        max_num_pages: Number of destination page-table columns.
-        page_size: Number of tokens per page.
-        dummy_slot: Value written into padding columns.
-    """
-    block_cols = 128
-    grid = (bs, triton.cdiv(max_num_pages, block_cols))
-    _gather_page_table_with_padding_kernel[grid](
-        req_to_page,
-        req_pool_indices,
-        seq_lens,
-        out,
-        req_to_page.stride(0),
-        out.stride(0),
-        max_num_pages,
-        page_size,
-        dummy_slot,
-        BLOCK_COLS=block_cols,
-        num_warps=4,
-    )
 
 
 # -----------------------------------------------------------------------------

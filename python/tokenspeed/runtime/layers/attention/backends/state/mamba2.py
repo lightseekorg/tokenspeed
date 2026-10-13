@@ -104,9 +104,9 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         self._chunk_size = mamba2.chunk_size
         # Every layer of a forward passes the same fresh host bounds tensor; keep its plan.
         self._chunk_plans: deque[tuple[torch.Tensor, Mamba2ChunkMetadata]] = deque(
-            maxlen=3
+            maxlen=1
         )
-        # Retained body/tail bounds are rewritten in place, so their plans are too.
+        # Retained capacity bounds are rewritten in place, so their plans are too.
         self._capacity_plans: list[tuple[torch.Tensor, Mamba2ChunkMetadata]] = []
 
     def _admits_capacity_prefill(self) -> bool:
@@ -117,37 +117,31 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         self._capacity_plans.clear()
 
     def _refresh_captured_prefill(self, metadata: CapacityPrefillMetadata) -> None:
-        """Rewrite the body and tail chunk plans of a retained shape in one upload.
+        """Rewrite the chunk plan of a retained shape in one upload.
 
-        Each plan reserves ``extent // chunk_size + num_seqs`` chunks; the
+        The plan reserves ``extent // chunk_size + num_seqs`` chunks; the
         unused tail repeats the last offset, so those chunks are empty.
         """
-        batch = metadata.prefill_checkpoint_batch
+        bounds = metadata.cu_extend_seq_lens_cpu
         device = metadata.query_start_loc.device
-        parts: list[torch.Tensor] = []
-        plans: list[Mamba2ChunkMetadata] = []
-        for bounds, extent in (
-            (batch.body_cu_seqlens_cpu, batch.body_token_indices.numel()),
-            (batch.tail_cu_seqlens_cpu, batch.tail_token_indices.numel()),
-        ):
-            plan = self._capacity_plan(bounds, extent, device)
-            live = build_mamba2_chunk_metadata(
-                bounds, self._chunk_size, torch.device("cpu")
-            )
-            pad = plan.seq_idx.numel() - live.seq_idx.numel()
-            parts += [
+        plan = self._capacity_plan(bounds, metadata.capacity.token_capacity, device)
+        live = build_mamba2_chunk_metadata(
+            bounds, self._chunk_size, torch.device("cpu")
+        )
+        pad = plan.seq_idx.numel() - live.seq_idx.numel()
+        uploaded = upload_packed(
+            (
                 torch.cat(
                     (live.cu_chunk_seqlens, live.cu_chunk_seqlens[-1:].expand(pad))
                 ),
                 torch.cat((live.seq_idx, live.seq_idx[-1:].expand(pad))),
                 live.last_chunk_indices,
-            ]
-            plans.append(plan)
-        uploaded = upload_packed(tuple(parts), device)
-        for i, plan in enumerate(plans):
-            targets = (plan.cu_chunk_seqlens, plan.seq_idx, plan.last_chunk_indices)
-            for target, source in zip(targets, uploaded[3 * i : 3 * i + 3]):
-                target.copy_(source)
+            ),
+            device,
+        )
+        targets = (plan.cu_chunk_seqlens, plan.seq_idx, plan.last_chunk_indices)
+        for target, source in zip(targets, uploaded, strict=True):
+            target.copy_(source)
 
     def _capacity_plan(
         self, bounds: torch.Tensor, extent: int, device: torch.device
@@ -189,7 +183,6 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
-        inputs_packed: bool,
         cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chunked SSD scan from the gathered states; see the base seam.
@@ -197,7 +190,7 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         Returns ``([1, T, H, P]`` output, ``[bs, H, P, N]`` final states)``.
         Rows past the live boundaries stay zero.
         """
-        del seq_len, num_real_tokens, inputs_packed
+        del seq_len, num_real_tokens
         D = _require_mamba2_inputs(
             D, b, g_raw, f_a_out, f_b_weight, beta_raw, lower_bound
         )
@@ -228,7 +221,6 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
 
         The metadata builder makes the host bounds fresh per batch and never
         writes them in place, so tensor identity names one forward's bounds.
-        A forward uses at most three (whole batch, checkpoint body and tail).
         Retained capacity bounds are refreshed in place and keep their own plans.
         """
         for bounds, plan in self._capacity_plans:
@@ -264,6 +256,7 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         draft_token_num: int,
         seq_len: int,
         lower_bound: float | None,
+        replay_payload: torch.Tensor | None,
     ) -> torch.Tensor:
         """SSD steps through each request's verify window; see the base seam.
 
@@ -271,6 +264,8 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         the accepted prefix to the replay commit. The scratch fallback starts
         from the seeded scratch row and writes one state per position.
         """
+        if replay_payload is not None:
+            raise ValueError("the Mamba2 verify scan fills no replay payload")
         D = _require_mamba2_inputs(
             D, b, g_raw, f_a_out, f_b_weight, beta_raw, lower_bound
         )

@@ -69,14 +69,6 @@ def _load_pgids(runner_id: str) -> set[int]:
     return pgids
 
 
-def _load_pgid(runner_id: str) -> Optional[int]:
-    """Backward-compatible single-pgid accessor for older callers/tests."""
-    pgids = _load_pgids(runner_id)
-    if not pgids:
-        return None
-    return next(iter(sorted(pgids)))
-
-
 def _remove_pgid(runner_id: str) -> None:
     _pgid_path(runner_id).unlink(missing_ok=True)
 

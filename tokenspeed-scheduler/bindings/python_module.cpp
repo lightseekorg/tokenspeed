@@ -23,6 +23,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/variant.h>
@@ -291,6 +292,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
         .def_ro("extend_replay_lens", &tokenspeed::ForwardBatch::extend_replay_lens)
+        // Per extend row (the D role's remote admission only): every State
+        // group's prompt-end checkpoint sits in slot 0, so the peer omits the
+        // latest-snapshot transfer.
+        .def_ro("state_prefix_cached", &tokenspeed::ForwardBatch::state_prefix_cached)
         .def_prop_ro(
             "prefill_lengths",
             [](const tokenspeed::ForwardBatch& op) -> const std::vector<std::int32_t>& { return op.prefill_lengths; },
@@ -435,17 +440,40 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                          return nb::cast(*plan.remote_prefill, nb::rv_policy::copy);
                      })
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
-        .def("pages_to_zero_arrays", [](nb::handle self) {
-            // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
-            // (empty groups included); `self` keeps the ExecutionPlan alive
-            // for the lifetime of each ndarray. The list export builds one
-            // Python int per page, which for a long prompt's admission is
-            // thousands of objects on the forward thread's critical path.
+        .def("pages_to_zero_arrays",
+             [](nb::handle self) {
+                 // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
+                 // (empty groups included); `self` keeps the ExecutionPlan alive
+                 // for the lifetime of each ndarray. The list export builds one
+                 // Python int per page, which for a long prompt's admission is
+                 // thousands of objects on the forward thread's critical path.
+                 auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
+                 nb::dict out;
+                 for (auto& [gid, pages] : plan.pages_to_zero) {
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(pages.data(), {pages.size()}, self);
+                 }
+                 return out;
+             })
+        // Device -> Device whole-block copies per cache group, (source,
+        // destination) virtual block ids. The runtime runs them on the forward
+        // thread's default stream after the execution stream's in-flight
+        // forwards and before this plan's zeroing; destinations are never in
+        // pages_to_zero. No ACK.
+        .def_ro("pages_to_copy", &tokenspeed::ExecutionPlan::pages_to_copy)
+        .def("pages_to_copy_arrays", [](nb::handle self) {
+            // Zero-copy (n, 2) int32 views of pages_to_copy, one per cache
+            // group (empty groups included): column 0 the source, column 1
+            // the destination. std::pair<int32, int32> is two contiguous
+            // int32s, which the static_assert below holds the layout to.
+            static_assert(sizeof(std::pair<std::int32_t, std::int32_t>) == 2 * sizeof(std::int32_t),
+                          "a copy pair must be two contiguous int32 values");
             auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
             nb::dict out;
-            for (auto& [gid, pages] : plan.pages_to_zero) {
+            for (auto& [gid, pairs] : plan.pages_to_copy) {
+                const auto* data = pairs.empty() ? nullptr : reinterpret_cast<const std::int32_t*>(pairs.data());
                 out[nb::str(gid.c_str())] =
-                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>>(pages.data(), {pages.size()}, self);
+                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(data, {pairs.size(), 2}, self);
             }
             return out;
         });
@@ -490,6 +518,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "suspended request's image).")
         .def("host_pool_pinned_blocks", &tokenspeed::Scheduler::HostPoolPinnedBlocks,
              "Host L2 entries pinned by a request -- a suspended request's image, or an in-flight transfer.")
+        .def("tail_entries", &tokenspeed::Scheduler::TailEntries,
+             "Published partial-page boundaries (hash@T) the prefix probe can resume at.")
+        .def("tail_cap_evictions", &tokenspeed::Scheduler::TailCapEvictions,
+             "Tails dropped because more than eight were published under one prior page.")
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)

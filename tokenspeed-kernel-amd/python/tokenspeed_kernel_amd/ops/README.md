@@ -565,6 +565,46 @@ them in a fixed order and adds the sink once; each of its workgroups owns one
 token, 16 heads and a 64-dim slice, so the merge of a small batch still spreads
 over many CUs.
 
+### gfx950 QSA sparse attention
+
+`gluon_qsa_sparse_attention_gfx950` serves `qsa_sparse_attention`: each query
+row attends to its own list of physical KV-cache slots (Qwen3.8 QSA selects
+2051 per row).
+
+#### Contract
+
+- BF16 queries `(tokens, q_heads, head_dim)`; BF16 or FP8 E4M3 caches
+  `(slots, kv_heads, head_dim)` of any size with contiguous head dims;
+  `head_dim` and `value_head_dim` in {128, 256}; any GQA group (blocks of 16
+  query heads).
+- Int32 `selected_slots (tokens, width)`, any column order: slots `<= 0` are
+  ignored (slot 0 may hold NaN), rows without a valid slot return zeros.
+  Scalar FP8 `k_scale` / `v_scale`.
+- Grid and split count depend only on tensor shapes; the token count is never
+  a compile key.
+
+#### Algorithm
+
+A one-wave workgroup owns one row, up to 16 query heads of one KV head (the
+MFMA M dimension) and a share of the row's slots. It first compacts the row's
+valid slots to the front of an LDS list (prefix sum and scatter), so invalid
+columns, such as the unselected middle of a short context, cost neither
+gathers nor MFMAs. Each 16-slot tile is gathered straight into registers, K in
+the 16x16x32 MFMA B-operand layout and V through one LDS store and
+`ds_read_b64_tr_b16` transposed reads for the 16x16x16 PV MFMA; the next tile's
+gathers are issued before the current one is consumed. Gathers use 64-bit
+pointers, since serving caches exceed the 2 GiB reach of buffer loads; lanes
+past the valid slots read slot 1, so no gather is predicated. Q is kept in LDS and
+re-read per tile: the arch-VGPR budget goes to gathers in flight, and a
+register-resident Q forced the allocator to reuse gather destinations behind
+`vmcnt(0)` waits.
+
+Gathering is L2-bandwidth bound (prefill rows of one request re-read the same
+slots). Batches with fewer than about 1024 (row, head-block) workgroups split
+the compacted tiles over up to 32 workgroups that store FP32 partials and
+base-2 LSE; `gluon_qsa_sparse_attention_merge_gfx950` merges all splits of a
+(row, head) in one pass.
+
 ### gfx1250 MLA decode
 
 `gluon_mla_decode_gfx1250` computes absorbed MLA decode over a paged cache,
@@ -1172,6 +1212,47 @@ The post and collapse kernels move eight contiguous BF16 values per lane.
 Post runs one token per CTA so its twenty coefficients are scalar loads that
 never wait behind the vector stores. The collapse runs one token per CTA so
 the optional RMSNorm reduces the whole row once.
+
+### gfx950 Qwen4 hyper-connection mix
+
+`gluon_hyperconnection_mix_gfx950` serves `gated_residual_mix` for decode
+batches (1 to 256 rows) of the HC4 / H2560 / R320 stream in two launches,
+replacing two hipBLASLt GEMMs (one with a split-K reduction kernel) and two
+Triton epilogues.
+
+#### Contract
+
+- Contiguous FP16/BF16 `normalized [rows, 4 * H]`, fused down/inject weight
+  `[R (+ 4), 4 * H]` and up weight `[4 * H, R]`; `4 * H` divisible by 10240
+  and `R` equal to 256 plus a power of two of at least 32. Returns the mixed
+  `[rows, H]` and the inject logits `[rows, 4]` (or `None`) in the input
+  dtype.
+- Numerics follow the GEMM-plus-epilogue path: both projections accumulate in
+  FP32 and are rounded to the input dtype before the scale/SiLU and the
+  sigmoid gate, so only the accumulation order differs (at most one ulp).
+  Split partials are summed in split order, so results are deterministic.
+- Row counts are runtime arguments within three tile buckets (up to 16, up
+  to 32, larger rows).
+- The split-K workspace (FP32 partials and self-resetting arrival counters)
+  is shared per device and tiling, so launches must be ordered on one stream.
+
+#### Algorithm
+
+The down projection splits `K = 4 * H` into 1024-deep slices, one per
+workgroup, with 16-wide weight tiles: about 200 workgroups each stream 32 KB
+of weight, which keeps every CU busy and the last split's reduction small.
+Operands are loaded with 16-byte coalesced loads, all issued before the
+first MFMA; the conversion to the MFMA operand layout broadcasts a shared
+operand through LDS rather than re-reading it per wave. Each split writes an
+FP32 partial through to memory and bumps a per-tile counter; the last split
+sums the partials, applies scale and SiLU, and writes the activation (and
+inject logits).
+
+The up projection gives each workgroup 16 hidden columns of all four
+branches as one MFMA tile, one branch per wave, with the 320-deep reduction
+loaded as a 256 + 64 pair so every load is in flight at once. The epilogue
+multiplies `sigmoid(gate)` with the matching normalized branch and sums the
+four branches across waves, so the gate tensor never reaches memory.
 
 ## Quantization
 

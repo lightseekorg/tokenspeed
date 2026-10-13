@@ -191,12 +191,15 @@ def test_read_requirements_skips_installer_options_and_cycles(
     ]
 
 
-def test_sdist_includes_requirements_and_python_sources(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("backend", ["cuda", "rocm"])
+def test_sdist_includes_requirements_and_python_sources(
+    tmp_path, monkeypatch, backend
+) -> None:
     source = tmp_path / "python"
     dist_dir = tmp_path / "dist"
     shutil.copytree(SETUP_PY.parent, source)
     dist_dir.mkdir()
-    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", backend)
     monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_SHA", "test")
     monkeypatch.chdir(source)
 

@@ -449,8 +449,8 @@ class TestAttentionHeadTp:
         the shard width ({0, 2} / {1, 3} for tp 4, qcp 2), while every group
         here is contiguous: the default head group would shard the heads over
         ranks holding different rows with no exchange. The mapping refuses the
-        shard, explicit head TP or not, as ``validate_qcp`` does for the
-        server."""
+        shard, explicit head TP or not; it is the one place that rule
+        lives."""
         for head_tp_size in (None, 2, 4):
             with pytest.raises(ValueError, match="whole attention TP group"):
                 AttentionLayerMapping(

@@ -112,9 +112,12 @@ def get_to_decoding(
     """
     submit(scheduler, request_id, tokens)
     scheduler.next_execution_plan()  # → PrefillDone
+    advance_forward(scheduler, request_id, [100])  # every planned forward lands
     for peer in decoding_peers:
         send_reserve(scheduler, peer, 0)
     scheduler.next_execution_plan()  # → Decoding
+    for rid in (request_id, *decoding_peers):
+        advance_forward(scheduler, rid, [101])
 
 
 def get_forward_op(plan):
@@ -178,8 +181,10 @@ class TestReqPoolIndices:
         first_plan = s.next_execution_plan()
         r0_idx = first_plan.forward[0].request_pool_indices[0]
 
-        advance_forward(s, "r0", finish=True)
-        s.next_execution_plan()  # erases r0 (FinishEvent already applied)
+        advance_forward(
+            s, "r0", [102], finish=True
+        )  # the decode lands; r0 finishes and settles
+        s.next_execution_plan()  # erases r0
 
         submit(s, "r1", list(range(4)))
         new_plan = s.next_execution_plan()  # r1: Submitted → PrefillDone

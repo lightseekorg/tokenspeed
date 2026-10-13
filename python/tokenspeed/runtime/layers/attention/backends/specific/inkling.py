@@ -36,11 +36,12 @@ rejected speculative rows are overwritten when their positions recur.
   derives the conv metadata (``InklingConvMetadata``) the model's sconv modules
   consume.
 
-The conv state is paged (kvconv + hiddenconv checkpoint groups), so prefix
-caching holds unconditionally: cache-hit restores replay the conv columns
-from the layers' own K/V slots, and a fresh prefill runs with
-``has_initial_state=False`` so a reused slot's previous contents are ignored
-and overwritten.
+The conv windows are also checkpointed in two state groups (kvconv +
+hiddenconv), each a two-slot block table per request: slot 0 holds the input
+checkpoint a chunk resumes from (a prefix hit, or the previous chunk's window
+the scheduler rotated there), slot 1 the live block that receives the window
+at the chunk end. A fresh prefill runs with ``has_initial_state=False`` so a
+reused ring slot's previous contents are ignored and overwritten.
 """
 
 from __future__ import annotations
@@ -72,6 +73,11 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_INPUT_SLOT,
+    STATE_LIVE_SLOT,
+    STATE_TABLE_SLOTS,
+)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
@@ -116,7 +122,7 @@ class InklingConvMetadata:
     # Target decode graphs keep endpoint restoration captured. This mask is
     # armed for exactly the first decode after a successful remote transfer.
     remote_restore_mask: torch.Tensor | None = None
-    # Checkpoint groups: per-group tables {group: [bs, max_conv_blocks]},
+    # Checkpoint groups: per-group two-slot tables {group: [bs, >= 2]},
     # populated by every metadata build.
     col_block_table: dict[str, torch.Tensor] | None = None
 
@@ -168,43 +174,24 @@ class InklingConvStatePool:
         return self.conv_state.nbytes + self.remote_restore_pending.nbytes
 
 
-_ConvGeometry = tuple[int, tuple[tuple[str, int], ...], tuple[str, ...]]
+_ConvGeometry = tuple[tuple[str, ...], bool]
 
 
 class InklingConvColumns(TypedDict):
-    block_tokens: int
-    group_block_tokens: dict[str, int]
+    groups: tuple[str, ...]
     pd_endpoint_snapshots: bool
 
 
 def conv_columns_for_pool(pool: CachePool) -> InklingConvColumns:
-    """The paged ShortConv geometry a backend derives from its bound pool."""
-    prefix_granularity = pool.arena.plan.prefix_granularity
-    # The checkpoint grain belongs to the conv groups' own specs; P is only
-    # the fallback when a group is absent from the plan.
-    specs_by_id = {spec.group_id: spec for spec in pool.arena.cache_group_specs}
-
-    def conv_grain(group_id: str) -> int:
-        spec = specs_by_id.get(group_id)
-        return spec.block_granularity if spec is not None else prefix_granularity
-
-    conv_columns: InklingConvColumns = {
-        "block_tokens": conv_grain("kvconv"),
-        "group_block_tokens": {
-            "kvconv": conv_grain("kvconv"),
-            "hiddenconv": conv_grain("hiddenconv"),
-        },
-        "pd_endpoint_snapshots": all(
-            spec.transfer_policy == "latest_snapshot"
-            for spec in pool.arena.cache_group_specs
-            if spec.group_id in ("kvconv", "hiddenconv")
-        )
-        and any(
-            spec.group_id in ("kvconv", "hiddenconv")
-            for spec in pool.arena.cache_group_specs
+    """The ShortConv checkpoint groups a backend derives from its bound pool."""
+    published = {spec.group_id: spec for spec in pool.arena.cache_group_specs}
+    groups = tuple(gid for gid in ("kvconv", "hiddenconv") if gid in published)
+    return InklingConvColumns(
+        groups=groups,
+        pd_endpoint_snapshots=all(
+            published[gid].transfer_policy == "latest_snapshot" for gid in groups
         ),
-    }
-    return conv_columns
+    )
 
 
 class InklingAttnBackend(AttentionBackend):
@@ -271,8 +258,8 @@ class InklingAttnBackend(AttentionBackend):
         # Deliberately skip AttentionBackend.__init__: the wrapper mirrors inner via __getattr__.
         self.inner = inner
         self.conv_pool = conv_pool
-        # Paged conv geometry (see conv_columns_for_pool). Mandatory: the
-        # sconv state always has its paged bridges; there is no rolling mode.
+        # The checkpoint groups (see conv_columns_for_pool). Mandatory: the
+        # sconv state always has its checkpoint bridges; there is no rolling mode.
         self.conv_columns: InklingConvColumns
         self._conv_geometry_latched: _ConvGeometry | None = None
         # The conv groups are state-family: the inner router builds leaves
@@ -292,8 +279,8 @@ class InklingAttnBackend(AttentionBackend):
         self._reset_graph_state()
         self._init_pool_binding()
         # Registered lazily by the model's four ShortConv sites. The buffers
-        # are fixed LCM field views; target verify publishes them only after
-        # accepted-length selection.
+        # are fixed LCM field views; a target verify publishes the accepted
+        # window into them after acceptance (commit_speculative_state_after_verify).
         self._checkpoint_streams: dict[
             tuple[int, int, int, str], tuple[torch.Tensor, ...]
         ] = {}
@@ -343,14 +330,9 @@ class InklingAttnBackend(AttentionBackend):
 
     @staticmethod
     def _conv_geometry(pool: CachePool) -> _ConvGeometry:
-        """The ShortConv geometry a rebind keeps; ``pd_endpoint_snapshots`` is policy."""
+        """The ShortConv checkpoint groups and transfer policy a rebind keeps."""
         columns = conv_columns_for_pool(pool)
-        published = {spec.group_id for spec in pool.arena.cache_group_specs}
-        return (
-            columns["block_tokens"],
-            tuple(sorted(columns["group_block_tokens"].items())),
-            tuple(gid for gid in ("hiddenconv", "kvconv") if gid in published),
-        )
+        return (columns["groups"], columns["pd_endpoint_snapshots"])
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
@@ -374,9 +356,7 @@ class InklingAttnBackend(AttentionBackend):
         self.conv_columns = conv_columns_for_pool(cache_pool)
         self._conv_geometry_latched = self._conv_geometry(cache_pool)
         logger.info(
-            "Inkling ShortConv boundary checkpoints: P="
-            f"{cache_pool.arena.plan.prefix_granularity:d}, groups="
-            f"{tuple(self.conv_columns['group_block_tokens'])!s}",
+            f"Inkling ShortConv checkpoint groups: {self.conv_columns['groups']!s}"
         )
 
     @property
@@ -396,10 +376,10 @@ class InklingAttnBackend(AttentionBackend):
         self.conv_pool.remote_restore_pending[slot_index] = True
 
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
-        # The engine-side ring is exact only as a byte copy: hydrating it from
-        # the paged checkpoint is right at an aligned boundary alone, and a
-        # retraction stops anywhere. The pending-hydration bit travels with it
-        # so a restore neither re-arms nor loses an armed hydration.
+        # The engine-side ring is exact only as a byte copy: the checkpoint
+        # holds one window, the ring the last R rows a draft lookback rewinds
+        # through. The pending-hydration bit travels with it so a restore
+        # neither re-arms nor loses an armed hydration.
         return self.conv_pool.slot_state_rows(slot)
 
     def _consume_remote_restore_mask(
@@ -419,20 +399,15 @@ class InklingAttnBackend(AttentionBackend):
         return out
 
     @staticmethod
-    def _checkpoint_blocks_at_endpoints(
-        table: torch.Tensor,
-        lengths: torch.Tensor,
-        checkpoint_granularity: int,
-    ) -> torch.Tensor:
-        """Resolve each positive endpoint to its latest-snapshot block."""
-        lengths = lengths.to(torch.int64)
-        valid = lengths > 0
-        slots = torch.div(lengths - 1, checkpoint_granularity, rounding_mode="floor")
-        slots = slots.clamp(min=0, max=table.shape[1] - 1)
-        blocks = table.gather(1, slots.unsqueeze(1)).squeeze(1).to(torch.int32)
+    def _input_state_blocks(table: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """The block a request resumes from: slot 0 when it holds a block (a
+        prefix hit), else the live slot the remote prompt-end state landed in."""
+        checkpoint = table[:, STATE_INPUT_SLOT].to(torch.int32)
+        live = table[:, STATE_LIVE_SLOT].to(torch.int32)
+        blocks = torch.where(checkpoint > 0, checkpoint, live)
         torch._assert_async(
             ((~valid) | (blocks > 0)).all(),
-            "ShortConv endpoint checkpoint is a hole or pad",
+            "ShortConv input checkpoint is a hole or pad",
         )
         return torch.where(valid, blocks, torch.zeros_like(blocks))
 
@@ -455,10 +430,8 @@ class InklingAttnBackend(AttentionBackend):
             boundary,
             torch.zeros_like(boundary),
         )
-        pages = self._checkpoint_blocks_at_endpoints(
-            metadata.col_block_table[group_id][:n],
-            masked_boundary,
-            int(self.conv_columns["block_tokens"]),
+        pages = self._input_state_blocks(
+            metadata.col_block_table[group_id][:n], restore_mask & (boundary > 0)
         )
         slots = metadata.cache_indices[:n].to(torch.int64)
         valid = restore_mask & (pages > 0) & (slots >= 0)
@@ -469,67 +442,84 @@ class InklingAttnBackend(AttentionBackend):
             dim=-1,
         )
         if restored.shape[-1] != state.shape[-1]:
-            raise ValueError(
+            raise RuntimeError(
                 f"ShortConv checkpoint width {restored.shape[-1]} does not "
-                f"match ring width {state.shape[-1]}"
+                f"match the ring channel width {state.shape[-1]}"
             )
         state_rows = restored.shape[1]
-        rows = (
-            boundary.view(n, 1)
-            - state_rows
-            + torch.arange(state_rows, device=state.device).view(1, state_rows)
-        ).remainder(state.shape[1])
-        current = state[slots.view(n, 1), rows]
-        state[slots.view(n, 1), rows] = torch.where(
-            valid.view(n, 1, 1),
-            restored,
-            current,
-        )
-
-    def publish_shortconv_endpoint(
-        self,
-        state: torch.Tensor,
-        checkpoint_buffers: tuple[torch.Tensor, ...],
-        metadata: InklingConvMetadata,
-        group_id: str,
-    ) -> None:
-        """Publish the final ``W - 1`` ring rows to the PD snapshot block."""
-        n = metadata.cache_indices.shape[0]
-        lengths = metadata.seq_lens[:n].to(torch.int64)
-        pages = self._checkpoint_blocks_at_endpoints(
-            metadata.col_block_table[group_id][:n],
-            lengths,
-            int(self.conv_columns["block_tokens"]),
-        )
-        slots = metadata.cache_indices[:n].to(torch.int64)
-        valid = (pages > 0) & (slots >= 0) & (lengths > 0)
-        pages = pages.to(torch.int64).clamp_min(0)
-        slots = slots.clamp_min(0)
-        widths = tuple(int(buffer.shape[-1]) for buffer in checkpoint_buffers)
-        state_rows = int(checkpoint_buffers[0].shape[1])
         absolute_rows = (
-            lengths.view(n, 1)
+            masked_boundary.view(n, 1)
             - state_rows
             + torch.arange(state_rows, device=state.device).view(1, state_rows)
         )
         rows = absolute_rows.remainder(state.shape[1])
-        endpoint = state[slots.view(n, 1), rows]
-        endpoint = torch.where(
-            (absolute_rows >= 0).unsqueeze(-1),
-            endpoint,
-            torch.zeros_like(endpoint),
+        current = state[slots.view(n, 1), rows]
+        state[slots.view(n, 1), rows] = torch.where(
+            (valid.view(n, 1) & (absolute_rows >= 0)).unsqueeze(-1),
+            restored,
+            current,
         )
-        for buffer, values in zip(
-            checkpoint_buffers,
-            endpoint.split(widths, dim=-1),
-            strict=True,
-        ):
-            current = buffer[pages]
-            buffer[pages] = torch.where(
-                valid.view(n, 1, 1),
-                values.to(buffer.dtype),
-                current,
+
+    def commit_speculative_state_after_verify(
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
+    ) -> None:
+        """Publish the accepted window of every ShortConv stream to its live slot.
+
+        A verify round's kernel writes all K speculative rows into the ring
+        but publishes nothing: the window ending at the committed frontier
+        (``seq_lens - K + accepted``) is known only now, and the live slot
+        must hold exactly the state at the request's computed frontier.
+        """
+        del accepted_path
+        metadata = self.conv_decode_metadata
+        if num_extends > 0 or metadata is None or metadata.col_block_table is None:
+            return
+        if self.conv_spec_num_tokens == 1:
+            return
+        bs = accepted_lengths.shape[0]
+        steps = (
+            accepted_lengths[:bs].to(torch.int64).clamp(1, self.conv_spec_num_tokens)
+        )
+        frontier = metadata.seq_lens[:bs].to(torch.int64) - self.conv_spec_num_tokens
+        frontier = frontier + steps
+        slots = metadata.cache_indices[:bs].to(torch.int64)
+        valid_slot = slots >= 0
+        for (
+            layer_id,
+            channel_offset,
+            dim,
+            group_id,
+        ), buffers in self._checkpoint_streams.items():
+            table = metadata.col_block_table[group_id][:bs]
+            pages = table[:, STATE_LIVE_SLOT].to(torch.int64)
+            valid = valid_slot & (pages > 0)
+            state = self.conv_pool.layer_state_wd(layer_id)[
+                :, :, channel_offset : channel_offset + dim
+            ]
+            state_rows = int(buffers[0].shape[1])
+            absolute_rows = (
+                frontier.view(bs, 1)
+                - state_rows
+                + torch.arange(state_rows, device=state.device).view(1, state_rows)
             )
+            rows = absolute_rows.remainder(state.shape[1])
+            window = state[slots.clamp_min(0).view(bs, 1), rows]
+            window = torch.where(
+                (absolute_rows >= 0).unsqueeze(-1), window, torch.zeros_like(window)
+            )
+            widths = tuple(int(buffer.shape[-1]) for buffer in buffers)
+            safe_pages = pages.clamp_min(0)
+            for buffer, values in zip(
+                buffers, window.split(widths, dim=-1), strict=True
+            ):
+                current = buffer[safe_pages]
+                buffer[safe_pages] = torch.where(
+                    valid.view(bs, 1, 1), values.to(buffer.dtype), current
+                )
 
     # ------------------------------------------------------------------
     # Conv metadata
@@ -559,8 +549,8 @@ class InklingAttnBackend(AttentionBackend):
         if forward_mode.is_mixed():
             raise RuntimeError(
                 "Inkling sconv does not support MIXED batches: the prefill "
-                "kernel hard-codes checkpoint taps at aligned chunk starts "
-                "and decode rows have none (run without --enable-mixed-batch)"
+                "kernel taps the checkpoint at the chunk start and the decode "
+                "kernel the ring (run without --enable-mixed-batch)"
             )
         if not forward_mode.is_extend_or_mixed():
             raise RuntimeError(
@@ -579,8 +569,7 @@ class InklingAttnBackend(AttentionBackend):
             and bs <= self._pfg_max_bs
         ):
             pfg_total = extend_total
-        groups = set(self.conv_columns["group_block_tokens"])
-        found = {g: group_tables.get(g) for g in groups}
+        found = {g: group_tables.get(g) for g in self.conv_columns["groups"]}
         missing = sorted(g for g, t in found.items() if t is None)
         if missing:
             raise RuntimeError(
@@ -720,9 +709,8 @@ class InklingAttnBackend(AttentionBackend):
         dependent, so pure tensor ops — recomputed per graph replay; the
         next round's decode refresh rebuilds ``conv_decode_metadata``."""
         self.inner.update_draft_forward_metadata(frontier)
-        # Paged bridges ride through: the in-kernel publish resolves pages
-        # by position, so boundaries rewritten by the re-anchored rows are
-        # re-published with committed content.
+        # The checkpoint tables ride through: the re-anchored chunk ends at the
+        # committed frontier, so its publish lands the committed window.
         self.conv_decode_metadata = replace(
             self.conv_decode_metadata, seq_lens=frontier
         )
@@ -981,12 +969,12 @@ class InklingAttnBackend(AttentionBackend):
         )
         self._pfg_col_tables = {
             g: torch.full(
-                (self._pfg_max_bs + 1, -(-self._inner_max_context_len // bt)),
+                (self._pfg_max_bs + 1, STATE_TABLE_SLOTS),
                 -1,
                 dtype=torch.int32,
                 device=device,
             )
-            for g, bt in geo["group_block_tokens"].items()
+            for g in geo["groups"]
         }
 
     def _pfg_refresh_col_tables(
@@ -994,9 +982,8 @@ class InklingAttnBackend(AttentionBackend):
     ) -> dict[str, torch.Tensor]:
         """Copy this step's live conv tables into the prefill-graph statics.
 
-        Only ``[0:bs, 0:live_width]`` needs refreshing: a request's prefix
-        taps and persist columns stay under ``ceil(seq_len / BT)`` <= the
-        live table width, rows in ``(bs, max_bs)`` are pointed at by no
+        Only ``[0:bs, 0:2]`` needs refreshing: the two slots are all a
+        request reads, rows in ``(bs, max_bs)`` are pointed at by no
         ``seq_idx``, and the PAD row (``max_bs``) has been all ``-1`` since
         init. The device-side copy is stream-ordered, so it doubles as the
         snapshot the eager path otherwise takes with ``clone()``.
@@ -1021,15 +1008,11 @@ class InklingAttnBackend(AttentionBackend):
         self._graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device=device)
         # Wrapper-owned persistent conv tables, refreshed from block_tables
         # each decode step.
-        groups = self.conv_columns["group_block_tokens"]
         self._graph_col_tables = {
             g: torch.full(
-                (max_bs, -(-self._inner_max_context_len // bt)),
-                1,
-                dtype=torch.int32,
-                device=device,
+                (max_bs, STATE_TABLE_SLOTS), 1, dtype=torch.int32, device=device
             )
-            for g, bt in groups.items()
+            for g in self.conv_columns["groups"]
         }
         self._graph_cache_indices = torch.full(
             (max_bs,), PAD_SLOT_ID, dtype=torch.int32, device=device

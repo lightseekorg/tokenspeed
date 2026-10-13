@@ -40,9 +40,6 @@ import sys
 import threading
 from collections.abc import AsyncIterator, Iterator
 
-import zmq
-import zmq.asyncio
-
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
 
@@ -74,8 +71,6 @@ from tokenspeed.runtime.engine.io_struct import (
     RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
-    RpcReqInput,
-    RpcReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
@@ -500,25 +495,6 @@ class Engine(EngineBase):
     def is_sleeping(self) -> bool:
         """Return whether any GPU memory is currently released (data-plane sleep)."""
         return self.llm.run(self.tokenizer_manager.is_sleeping())
-
-    """
-    Execute an RPC call on all scheduler processes.
-    """
-
-    def collective_rpc(self, method: str, **kwargs):
-        obj = RpcReqInput(method=method, parameters=kwargs)
-        self.send_to_rpc.send_pyobj(obj)
-        recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
-        if not isinstance(recv_req, RpcReqOutput):
-            raise TypeError(f"Expected RpcReqOutput, got {type(recv_req).__name__}.")
-        if not recv_req.success:
-            raise RuntimeError(recv_req.message)
-
-    def save_remote_model(self, **kwargs):
-        self.collective_rpc("save_remote_model", **kwargs)
-
-    def save_sharded_model(self, **kwargs):
-        self.collective_rpc("save_sharded_model", **kwargs)
 
 
 def _set_socket_interface(server_args: ServerArgs):

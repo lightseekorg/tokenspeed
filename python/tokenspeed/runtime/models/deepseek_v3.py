@@ -874,11 +874,11 @@ class DeepseekV3AttentionMLA(nn.Module):
             return hidden_states.new_empty(0, self.hidden_size)
         if self.has_head_tp and ctx.num_extends > 0:
             # Unreachable by configuration (see _validate_decode_tp_layouts
-            # and validate_qcp): a guard against a prefill row reaching the
-            # expanded prologue on a head-sharded layout. Head TP serves
-            # decode rows, or extend rows under query context parallelism
-            # through the absorbed sparse prefill (the shard was refused
-            # above); the expanded path never.
+            # and validate_context_parallel_roles): a guard against a prefill
+            # row reaching the expanded prologue on a head-sharded layout.
+            # Head TP serves decode rows, or extend rows under query context
+            # parallelism through the absorbed sparse prefill (the shard was
+            # refused above); the expanded path never.
             raise RuntimeError(
                 "attention head TP serves decode rows, or extend rows under query "
                 "context parallelism with an absorbed sparse prefill: the "

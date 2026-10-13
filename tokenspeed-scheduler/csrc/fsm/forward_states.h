@@ -45,30 +45,11 @@ struct CacheProgress {
     // history needed to publish a resumable boundary across chunk edges.
     std::vector<std::string> prefix_hashes;
     std::uint64_t access_epoch{0};
-    // Pending closed-prefix boundary; zero once published or when absent.
-    std::int32_t promotion_boundary_tokens{0};
-    // Aligned prefill checkpoints written but not yet hashed, in token order.
-    // Scheduled prefill windows record their materialized checkpoint;
-    // decode results keep working state only and add no reusable boundary.
-    std::vector<std::int32_t> materialized_state_boundaries;
-
-    void RecordMaterializedStateBoundary(std::int32_t boundary, std::int32_t prefix_granularity) {
-        if (boundary <= 0 || boundary % prefix_granularity != 0 ||
-            boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size())) {
-            return;
-        }
-        if (materialized_state_boundaries.empty() || materialized_state_boundaries.back() < boundary) {
-            materialized_state_boundaries.push_back(boundary);
-        }
-    }
-
-    // Only after the admission that hashed them succeeded: a failed attempt
-    // retries their publication with the same hashes.
-    void DiscardHashedStateBoundaries(std::int32_t prefix_granularity) {
-        std::erase_if(materialized_state_boundaries, [&](std::int32_t boundary) {
-            return boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size());
-        });
-    }
+    // The junction a chunk is cut at: the KV coverage the admission probe
+    // found beyond the state checkpoint it resumed from. The chunk ending
+    // there publishes its natural checkpoint where the KV is already cached,
+    // so the next prompt resumes at the junction. Zero once passed or absent.
+    std::int32_t junction_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -334,6 +315,23 @@ struct Restoring {
     std::shared_ptr<SnapshotSlotIndex> blob_slot;
     ResumeShape shape;
     std::uint32_t restore_op{0};
+};
+
+// The request is done but its pages are not: every finish passes through
+// here, whether or not a forward is still out against the pages. The
+// scheduler settles it at the next plan once no result is in flight --
+// publishes the frontier (the state the last landed forward wrote and the KV
+// below the one unconsumed token) and releases the pages. Under the overlap
+// schedule the finish lands while the next decode is dispatched; that decode's
+// result still arrives and extends the tokens, so the frontier it published
+// is the one after the token the finish was decided on. Nothing is scheduled
+// for it, and it is no retraction victim.
+struct Finishing {
+    explicit Finishing(ForwardResources resources) : resources{std::move(resources)} {}
+
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
+
+    ForwardResources resources;
 };
 
 struct Finished {};
