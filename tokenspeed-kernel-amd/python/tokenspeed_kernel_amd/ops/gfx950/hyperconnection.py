@@ -96,7 +96,6 @@ def _coalesced_layout(rows, cols, num_warps, k_dim):
 @gluon.jit(
     launch_metadata=_mix_down_launch_metadata,
     do_not_specialize=("M",),
-    do_not_specialize_on_alignment=("M",),
 )
 def gluon_hyperconnection_mix_gfx950(
     a_ptr,
@@ -242,7 +241,6 @@ def gluon_hyperconnection_mix_gfx950(
 @gluon.jit(
     launch_metadata=_mix_up_launch_metadata,
     do_not_specialize=("M",),
-    do_not_specialize_on_alignment=("M",),
 )
 def gluon_hyperconnection_mix_up_gfx950(
     act_ptr,
