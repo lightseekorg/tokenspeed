@@ -440,10 +440,11 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         # to the cache at the prompt end while continuing on a fresh one (one
         # more block per request, ceil((P - 1) / g), within the lookback); one
         # chunk in flight -- capped by the total -- adds its rows behind the
-        # resumable-boundary lookback.
+        # resumable-boundary lookback, which spans the most blocks a window can
+        # cover at any alignment: ceil((W - 1 + g - 1) / g).
         resident_pages = 10 * math.ceil((7 + 1 + 3) / 4)
-        handover_pages = 10 * min(math.ceil((4 - 1) / 4), math.ceil(7 / 4))
-        lookback_pages = math.ceil(7 / 4)
+        lookback_pages = math.ceil((7 + 3) / 4)
+        handover_pages = 10 * min(math.ceil((4 - 1) / 4), lookback_pages)
         scheduled_pages = math.ceil(20 / 4)
         self.assertEqual(
             pages["sliding"],
