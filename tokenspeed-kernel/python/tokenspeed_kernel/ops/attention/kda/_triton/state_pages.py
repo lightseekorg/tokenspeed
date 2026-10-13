@@ -21,8 +21,9 @@
 """State pages a speculative verify reads and its commit writes.
 
 A state group's block table holds two slots per request. Slot 0 is the input
-checkpoint: a claimed prefix hit, or the block the request's previous forward
-wrote before the scheduler rotated it; null (``0``) once that block has been
+checkpoint: a claimed prefix hit, the block the request's previous forward
+wrote before the scheduler rotated it, or a fresh zeroed block when the
+request starts from the zero state; null (``0``) once that block has been
 consumed. Slot 1 is the live block the request's forwards write. A forward
 reads slot 0 when it is non-null and slot 1 otherwise, and always writes
 slot 1 -- verify reads the committed state from the input slot and the commit
