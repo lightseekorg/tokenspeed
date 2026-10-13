@@ -412,6 +412,7 @@ def gdn_decode_mtp(
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
     tree_ancestors: torch.Tensor | None,
+    replay_payload: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -465,6 +466,10 @@ def gdn_decode_mtp(
             needs ``disable_state_update``, and an ``intermediate_states_buffer``
             is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
             Runs the Triton solution; ``None`` is a chain.
+        replay_payload: Optional contiguous ``[B * T, num_q_heads * head_dim +
+            num_v_heads * head_v_dim + 2 * num_v_heads]`` ReplaySSM payload, in
+            the inputs' dtype, that a chunked ReplaySSM tree verify fills with
+            each token's ``[k | v | a | b]`` as read.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -561,6 +566,7 @@ def gdn_decode_mtp(
             intermediate_states_buffer=intermediate_states_buffer,
             output_state_indices=output_state_indices,
             tree_ancestors=tree_ancestors,
+            replay_payload=replay_payload,
         )
 
 
