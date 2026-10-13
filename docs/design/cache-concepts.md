@@ -1323,12 +1323,13 @@ is the pool-less engine, where every capacity block aborts.
 
 ## Virtual block placement within a shared physical plan
 
-KV parallelism (KVP, `--kv-parallel-size`) is a storage layout: a sharded
-group's pages are dealt page-cyclically to the ranks of the KVP subgroup by
-virtual block id, so each rank stores `1/N` of them. Decode context
-parallelism (DCP) is the decode compute over those pages -- every rank attends
-the pages it owns and the partials are merged by LSE -- and belongs to the
-attention backends. This section is about the storage side.
+KV parallelism (KVP, `--kv-parallel-size`, PD roles only) is a storage
+layout: a sharded group's pages are dealt page-cyclically to the ranks of the
+KVP subgroup by virtual block id, so each rank stores `1/N` of them. Decode
+context parallelism (DCP, `--decode-context-parallel-size` on the decode
+role) is the decode compute over those pages -- every rank attends the pages
+it owns and the partials are merged by LSE -- and belongs to the attention
+backends. This section is about the storage side.
 
 A recipe declares each group as a `(CacheGroupSpec, fields)` tuple.
 `CacheGroupSpec.shard_count` defaults to 1 (replicated); a larger value assigns
@@ -1460,7 +1461,7 @@ unowned rows, and zeroing filters foreign blocks through the same path at
 every KVP size. Virtual block 0 is the null block; no path writes to it, at
 any KVP size.
 
-Query context parallelism (`--prefill-context-parallel-size`,
+Query context parallelism (`--query-context-parallel-size`,
 `docs/design/unified_path.md`) is orthogonal to placement: KVP decides who
 stores a page, QCP decides who computes a row. Allocation, prefix matching,
 zeroing, publication and the P->D route never see the query shard. The

@@ -1424,9 +1424,10 @@ memory use and performance in addition to kernel correctness.
 
 ## Query context parallelism
 
-`--prefill-context-parallel-size N` (`mapping.attn.qcp_*`, `N ==
-attn.tp_size`) shards every extend forward of a PD prefill engine over the
-attention TP group. One forward, one path: the scheduler plans the whole
+`--query-context-parallel-size N` (`mapping.attn.qcp_*`, `N ==
+attn.tp_size == attn.kvp_size`) shards every extend forward of a PD prefill
+engine over the attention TP group, over the pages `--kv-parallel-size N`
+shards. One forward, one path: the scheduler plans the whole
 chunk on every rank, the executor builds a `QueryShardPlan` from the request
 lengths (`execution/query_shard.py`: `row_counts = scatter_count(total, N)`
 — the reduce-scatter / all-gather split, so the `CommManager` row tables
@@ -1629,7 +1630,7 @@ The contract a model (in tree or a plugin) implements:
   audit when a sharding model allocates them.
 
 **Head TP over the query shards** (`--attn-head-tp-size N` with
-`--prefill-context-parallel-size N`). The query shards hold different rows,
+`--query-context-parallel-size N`). The query shards hold different rows,
 so the head group of the decode-side layout (`docs/serving/parallelism.md`,
 "Decode-side TP layouts under attention DP") applies to them unchanged:
 `mapping.attn.head_tp_group == qcp_group` (the attention TP group),
@@ -1676,16 +1677,17 @@ needed) key on
 shards; the prefill role's own rules (`validate_qcp`) and the mapping (`head
 TP == qcp`) gate this layout.
 
-Eager only: the history gather runs in the attention break, so
-`--prefill-context-parallel-size > 1` requires `--disable-prefill-graph`
-(the executor also refuses to replay a prefill graph for a sharded forward).
-A graph-capable form needs equal padding on every rank so the gathers are
-even collectives inside the captured segment. MIXED rounds, attention DP,
-non-prefill roles, a non-bf16 KV cache (the gathered write is
-`latent_store`, native rows only) and dense / MoE groups that are neither 1
-nor the attention TP width are refused at argument resolution
-(`validate_qcp`); `AttnConfig` repeats the attention-family and KV-cache
-checks where the config is built.
+Eager only: the history gather runs in the attention break, so the GPU DSA
+backend declares `CudaGraphSupport(prefill_graph=False)` under a query shard
+and the executor never captures one (it also refuses to replay a prefill
+graph for a sharded forward). A graph-capable form needs equal padding on
+every rank so the gathers are even collectives inside the captured segment.
+Each rule lives once: the prefill role and `--kv-parallel-size` equal to the
+shard in `validate_context_parallel_roles`; MIXED rounds, attention DP and
+dense / MoE groups that are neither 1 nor the attention TP width in
+`validate_qcp`; the shard width (`N == attn.tp_size`) in `Mapping`; and the
+attention family (GPU DSA), device and KV cache (bf16: the gathered write is
+`latent_store`, native rows only) in `AttnConfig`, which sees them resolved.
 
 ## Non-goals
 

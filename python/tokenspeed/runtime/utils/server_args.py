@@ -147,19 +147,66 @@ def _nonempty_str(value: str) -> str:
     return value
 
 
-def validate_kvp_disaggregation_role(
-    *, has_kvp: bool, disaggregation_mode: str
+def validate_context_parallel_roles(
+    *, kvp_size: int, dcp_size: int, qcp_size: int, disaggregation_mode: str
 ) -> None:
-    """Reject KVP on the encode role, which has no KV cache to shard.
+    """Pin the three context-parallel sizes to the PD roles that serve them.
 
-    Aggregated engines and both PD roles may shard: a transfer edge copies
-    only the pages its prefill rank and its decode rank both own, so the
-    prefill and decode caches shard independently.
+    KVP (``--kv-parallel-size``) is the storage layout: a PD prefill or decode
+    engine shards its pages (a transfer edge copies only the pages both its
+    ranks own, so the two caches shard independently); an aggregated engine
+    does not, because reading a sharded cache in steady-state decode is the
+    decode role's compute below. DCP (``--decode-context-parallel-size``)
+    names that compute -- attend the owned pages, merge the partials by LSE
+    -- and is the only way a decode engine reads a sharded cache, so on the
+    decode role the two sizes come together and equal. QCP
+    (``--query-context-parallel-size``) names the prefill role's query-row
+    sharding over the same sharded pages; a prefill engine may also shard
+    its pages without it (chunked history gather).
     """
-    if has_kvp and disaggregation_mode not in ("null", "prefill", "decode"):
+    if dcp_size < 1:
         raise ValueError(
-            "--kv-parallel-size > 1 requires --disaggregation-mode "
-            f"null, prefill or decode (got {disaggregation_mode!r})"
+            f"--decode-context-parallel-size must be a positive integer, got {dcp_size}"
+        )
+    if kvp_size > 1 and disaggregation_mode not in ("prefill", "decode"):
+        raise ValueError(
+            "--kv-parallel-size > 1 requires --disaggregation-mode prefill or "
+            f"decode (got {disaggregation_mode!r}): decode over sharded pages is "
+            "--decode-context-parallel-size, which serves the decode role only"
+        )
+    if qcp_size > 1:
+        if disaggregation_mode != "prefill":
+            raise ValueError(
+                "--query-context-parallel-size > 1 requires --disaggregation-mode "
+                f"prefill (got {disaggregation_mode!r}): the query shard is a "
+                "prefill-role layout whose decode arm runs every row on every "
+                "rank (the drafter's steps only), which no engine serving "
+                "steady-state decode should pay"
+            )
+        if qcp_size != kvp_size:
+            raise ValueError(
+                "--query-context-parallel-size must equal --kv-parallel-size "
+                f"(got qcp={qcp_size}, kvp={kvp_size}): the history gather "
+                "splits by the page owners of the whole shard group"
+            )
+    if dcp_size > 1:
+        if disaggregation_mode != "decode":
+            raise ValueError(
+                "--decode-context-parallel-size > 1 requires --disaggregation-mode "
+                f"decode (got {disaggregation_mode!r})"
+            )
+        if dcp_size != kvp_size:
+            raise ValueError(
+                "--decode-context-parallel-size must equal --kv-parallel-size "
+                f"(got dcp={dcp_size}, kvp={kvp_size}): every rank of the KVP "
+                "group owns pages of every request, so all of them merge the "
+                "partials"
+            )
+    elif kvp_size > 1 and disaggregation_mode == "decode":
+        raise ValueError(
+            "--kv-parallel-size > 1 on --disaggregation-mode decode requires "
+            f"--decode-context-parallel-size {kvp_size}: decode over sharded "
+            "pages is DCP, and the launch names it explicitly"
         )
 
 
@@ -173,11 +220,6 @@ def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
         raise ValueError(f"{flag} must be one of {list(choices)}, got {value!r}")
 
 
-# Attention backends whose sparse prefill can attend a query shard against the
-# gathered history of its requests (the query-context-parallel extend arm).
-QCP_ATTENTION_BACKENDS = frozenset({"dsa"})
-
-
 def validate_qcp(
     *,
     qcp_size: int,
@@ -185,39 +227,22 @@ def validate_qcp(
     attn_dp_size: int,
     dense_tp_size: int,
     moe_tp_ep_size: int,
-    kvp_size: int,
-    disaggregation_mode: str,
-    disable_prefill_graph: bool,
     enable_mixed_batch: bool,
-    attention_backend: str | None,
-    kv_cache_dtype: str,
-    kv_cache_quant_method: str,
 ) -> None:
     """Reject query-context-parallel layouts the first landing does not serve.
 
-    QCP shards an extend forward's rows over the attention TP group. It is a
-    prefill-role layout: the decode arm serves only the drafter's steps, the
-    eager extend break gathers the request history, and the sparse DSA
-    kernels attend the gathered buffer. ``qcp_size == 1`` is off and passes.
+    QCP shards an extend forward's rows over the attention TP group; the
+    decode arm serves only the drafter's steps, every row on every rank.
+    These are the layout gaps that rule; the role and size relations live in
+    ``validate_context_parallel_roles``, the shard width in ``Mapping``, and
+    the backend, device and KV-cache capabilities in ``AttnConfig``, which
+    sees them resolved. ``qcp_size == 1`` is off and passes.
     """
     if qcp_size == 1:
         return
-    if kv_cache_dtype not in ("auto", "bfloat16") or kv_cache_quant_method != "none":
-        raise ValueError(
-            "--prefill-context-parallel-size > 1 requires a bf16 KV cache (got "
-            f"--kv-cache-dtype {kv_cache_dtype!r}, --kv-cache-quant-method "
-            f"{kv_cache_quant_method!r}): the sharded KV write gathers the rotated "
-            "latent and stores it with latent_store, which writes native rows only"
-        )
-    if qcp_size != attn_tp_size:
-        raise ValueError(
-            "--prefill-context-parallel-size must equal the attention TP size "
-            f"(got {qcp_size} with attn_tp_size={attn_tp_size}): the query shard "
-            "spans the whole attention TP group"
-        )
     if attn_dp_size != 1:
         raise ValueError(
-            "--prefill-context-parallel-size > 1 requires attention DP 1 (got "
+            "--query-context-parallel-size > 1 requires attention DP 1 (got "
             f"attn_dp_size={attn_dp_size}): the sampled-row table of a shard is "
             "per DP group and the DP metadata gather does not carry it"
         )
@@ -226,44 +251,18 @@ def validate_qcp(
         attn_tp_size,
     ):
         raise ValueError(
-            "--prefill-context-parallel-size > 1 requires --dense-tp-size and the "
+            "--query-context-parallel-size > 1 requires --dense-tp-size and the "
             f"MoE TP x EP group to be 1 or the attention TP width {attn_tp_size} "
             f"(got dense {dense_tp_size}, MoE {moe_tp_ep_size}): attention returns "
             "complete rows (head-replicated weights, or the head-TP tail), so the "
             "drafter's replicated decode rows are never scattered and a narrower "
             "dense or MoE group has no rows to gather"
         )
-    if disaggregation_mode != "prefill":
-        raise ValueError(
-            "--prefill-context-parallel-size > 1 requires --disaggregation-mode "
-            f"prefill (got {disaggregation_mode!r}): a sharded extend and "
-            "replicated decode rows cannot share one forward"
-        )
-    if not disable_prefill_graph:
-        raise ValueError(
-            "--prefill-context-parallel-size > 1 requires --disable-prefill-graph: "
-            "the history gather runs in the eager attention break"
-        )
     if enable_mixed_batch:
         raise ValueError(
-            "--prefill-context-parallel-size > 1 does not support "
+            "--query-context-parallel-size > 1 does not support "
             "--enable-mixed-batch: a MIXED round would carry sharded extend rows "
             "and replicated decode rows in one forward"
-        )
-    if (
-        attention_backend is not None
-        and attention_backend not in QCP_ATTENTION_BACKENDS
-    ):
-        raise ValueError(
-            "--prefill-context-parallel-size > 1 requires a DSA-family attention "
-            f"backend ({sorted(QCP_ATTENTION_BACKENDS)}), got "
-            f"--attention-backend {attention_backend!r}"
-        )
-    if kvp_size not in (1, qcp_size):
-        raise ValueError(
-            "--kv-parallel-size must be 1 or equal to "
-            f"--prefill-context-parallel-size (got kvp={kvp_size}, qcp={qcp_size}): "
-            "the history gather splits by the page owners of the whole shard group"
         )
 
 
@@ -493,11 +492,18 @@ class ServerArgs:
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
     # KV parallelism: shard the full-history KV pages page-cyclically over a
-    # consecutive subgroup of attention TP (1 = off).
+    # consecutive subgroup of attention TP (1 = off; PD roles only).
     kv_parallel_size: int = 1
+    # Decode context parallelism on the PD decode role: attend the owned
+    # pages and merge the partials across the KVP group (1 = off; equals
+    # kv_parallel_size when on). Names the compute; the backends key the DCP
+    # path on the mapping's kvp_size, which the drafter's steps on a sharded
+    # prefill engine take as well.
+    decode_context_parallel_size: int = 1
     # Query context parallelism on the PD prefill role: shard every extend
-    # forward's rows over the attention TP group (1 = off).
-    prefill_context_parallel_size: int = 1
+    # forward's rows over the attention TP group (1 = off; equals
+    # kv_parallel_size when on).
+    query_context_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -980,7 +986,7 @@ class ServerArgs:
             attn_kvp_size=self.kv_parallel_size,
             attn_head_tp_size=self.attn_head_tp_size,
             lm_head_tp_size=self.lm_head_tp_size,
-            attn_qcp_size=self.prefill_context_parallel_size,
+            attn_qcp_size=self.query_context_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -997,8 +1003,10 @@ class ServerArgs:
         )
 
         # Impl constraints:
-        validate_kvp_disaggregation_role(
-            has_kvp=self.mapping.attn.has_kvp,
+        validate_context_parallel_roles(
+            kvp_size=self.mapping.attn.kvp_size,
+            dcp_size=self.decode_context_parallel_size,
+            qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
         )
         validate_qcp(
@@ -1007,13 +1015,7 @@ class ServerArgs:
             attn_dp_size=self.mapping.attn.dp_size,
             dense_tp_size=self.mapping.dense.tp_size,
             moe_tp_ep_size=self.mapping.moe.tp_ep_size,
-            kvp_size=self.mapping.attn.kvp_size,
-            disaggregation_mode=self.disaggregation_mode,
-            disable_prefill_graph=bool(self.disable_prefill_graph),
             enable_mixed_batch=self.enable_mixed_batch,
-            attention_backend=self.attention_backend,
-            kv_cache_dtype=self.kv_cache_dtype,
-            kv_cache_quant_method=self.kv_cache_quant_method,
         )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
@@ -1049,13 +1051,14 @@ class ServerArgs:
             # only: an expanded prefill would need every head's K/V for the
             # cached prefix, which the head-sharded kv_b_proj cannot produce.
             # Over the query shards (attn.has_qcp) the extend rows run the
-            # absorbed sparse prefill through the exchange, and validate_qcp
-            # pinned the prefill role and the eager prefill already.
+            # absorbed sparse prefill through the exchange;
+            # validate_context_parallel_roles pinned the prefill role and the
+            # GPU DSA backend declares its prefill eager under a shard.
             if self.disaggregation_mode != "decode":
                 raise ValueError(
                     "--attn-head-tp-size > 1 serves decode rows only and "
                     "requires --disaggregation-mode decode (or, on the prefill "
-                    "role, --prefill-context-parallel-size equal to it)"
+                    "role, --query-context-parallel-size equal to it)"
                 )
             # The prefill CUDA graph records extend forwards, and startup
             # would capture (and tune on) extend-shaped dummies this layout
@@ -1099,7 +1102,7 @@ class ServerArgs:
                 f"group wider than attention TP (got --dense-tp-size "
                 f"{self.mapping.dense.tp_size} with attention TP {attn.tp_size})"
                 + (
-                    "; under --prefill-context-parallel-size the dense group is 1 "
+                    "; under --query-context-parallel-size the dense group is 1 "
                     "or the attention TP width, so only --tp-batch-invariant attn "
                     "applies"
                     if attn.has_qcp
@@ -3443,11 +3446,24 @@ class ServerArgs:
             help="KV parallelism (KVP): shard full-history KV pages (MLA/DSA "
             "latent, DeepSeek V4 compressed KV) cyclically over a consecutive "
             "subgroup of attention TP, each rank storing one shard of every "
-            "request's pages; decode attends the owned pages and merges the "
-            "partials (DCP). Allowed on aggregated engines and the PD prefill "
-            "role, with the Host KVStore and the retraction snapshot pool; the "
-            "decode role and L3 storage (--kvstore-storage-backend) are not "
-            "supported yet.",
+            "request's pages. Must divide --attn-tp-size. PD roles only: the "
+            "decode role reads the shards with --decode-context-parallel-size "
+            "(required there, equal to this), the prefill role writes them and "
+            "may split its query rows over them with "
+            "--query-context-parallel-size. Works with the Host KVStore and the "
+            "retraction snapshot pool; not with L3 storage "
+            "(--kvstore-storage-backend).",
+        )
+        parser.add_argument(
+            "--decode-context-parallel-size",
+            type=int,
+            default=ServerArgs.decode_context_parallel_size,
+            help="Decode context parallelism (DCP) on the PD decode role: every "
+            "rank attends the KV pages it owns under --kv-parallel-size and the "
+            "partials are merged across the KVP group by their log-sum-exp. "
+            "Requires --disaggregation-mode decode and must equal "
+            "--kv-parallel-size, which requires it in turn on that role (a "
+            "sharded cache has no other decode).",
         )
         parser.add_argument(
             "--attn-head-tp-size",
@@ -3459,10 +3475,10 @@ class ServerArgs:
             "Either attention-DP ranks of a decode engine (requires attention "
             "TP 1, attention DP and --disaggregation-mode decode; every rank "
             "keeps its own KV cache), or the query shards of a prefill engine "
-            "(must equal --prefill-context-parallel-size; the extend rows run "
+            "(must equal --query-context-parallel-size; the extend rows run "
             "the absorbed sparse prefill through the exchange). Defaults to the "
             "ranks holding the same rows: the attention TP size, or 1 "
-            "(head-replicated) under --prefill-context-parallel-size.",
+            "(head-replicated) under --query-context-parallel-size.",
         )
         parser.add_argument(
             "--lm-head-tp-size",
@@ -3489,17 +3505,18 @@ class ServerArgs:
             "o_proj / down_proj weights.",
         )
         parser.add_argument(
-            "--prefill-context-parallel-size",
+            "--query-context-parallel-size",
             type=int,
-            default=ServerArgs.prefill_context_parallel_size,
-            help="Shard every extend forward's query rows over the attention TP "
-            "group on the PD prefill role (query context parallelism): rank r "
-            "computes a contiguous slice of the chunk's rows against the gathered "
-            "KV history of its requests. Must equal --attn-tp-size and requires "
-            "--disaggregation-mode prefill, --disable-prefill-graph, a DSA-family "
-            "attention backend and --kv-parallel-size 1 or equal. "
-            "The attention weights are head-replicated unless --attn-head-tp-size "
-            "equals it, which shards them over the shard group.",
+            default=ServerArgs.query_context_parallel_size,
+            help="Query context parallelism (QCP) on the PD prefill role: shard "
+            "every extend forward's query rows over the attention TP group, rank "
+            "r computing a contiguous slice of the chunk's rows against the "
+            "gathered KV history of its requests. Requires --disaggregation-mode "
+            "prefill and must equal both --attn-tp-size and --kv-parallel-size; "
+            "needs GPU DSA attention with a bf16 KV cache and keeps the prefill "
+            "eager. The attention weights are head-replicated unless "
+            "--attn-head-tp-size equals it, which shards them over the shard "
+            "group.",
         )
         parser.add_argument(
             "--dense-tp-size",

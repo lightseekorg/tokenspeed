@@ -224,6 +224,10 @@ class DSABackend(PagedAttentionBackend):
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
         if len(self.qcp_group) > 1:
+            # The sharded extend arm gathers each request's history in the
+            # eager attention break; a captured prefill would replay the
+            # dummy's gather. Overrides the KPool consumer's declaration too.
+            self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
             self._probe_history_gather_topk_leaf(spec)
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:

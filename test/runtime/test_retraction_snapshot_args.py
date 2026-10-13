@@ -165,21 +165,17 @@ def test_kvp_takes_both_host_tiers_but_not_l3():
     # class and the executor translates ownership on both ends of every row,
     # so a KV-page-sharded engine may run the Host KVStore and the snapshot
     # pool. L3 keys have no owner-stable form under sharding and stay refused.
-    args = ServerArgs(
+    sharded_decode = dict(
         model="x",
         world_size=2,
+        disaggregation_mode="decode",
         kv_parallel_size=2,
-        retraction_snapshot_host_gb=1.0,
+        decode_context_parallel_size=2,
     )
+    args = ServerArgs(**sharded_decode, retraction_snapshot_host_gb=1.0)
     assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
     with pytest.raises(ValueError, match="L3.*kv-parallel-size"):
-        ServerArgs(
-            model="x",
-            world_size=2,
-            kv_parallel_size=2,
-            kvstore_storage_backend="mooncake",
-            **PREFETCH,
-        )
+        ServerArgs(**sharded_decode, kvstore_storage_backend="mooncake", **PREFETCH)
 
 
 def test_forced_retraction_is_a_test_knob_that_needs_a_pool():
