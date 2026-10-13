@@ -674,14 +674,40 @@ def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
             shutdown=lambda: trace.append("l2_shutdown"),
         ),
     )
-    pending = Future()
-    pending.set_result(None)
-    handle._l2_submissions.append(pending)
+    for queue in (
+        handle._l2_submissions,
+        handle._transfer_submissions,
+        handle._copy_submissions,
+    ):
+        pending = Future()
+        pending.set_result(None)
+        queue.append(pending)
 
     handle.shutdown_cache()
 
     assert list(handle._l2_submissions) == []
+    assert list(handle._transfer_submissions) == []
+    assert list(handle._copy_submissions) == []
     assert trace == ["run", "l2_shutdown"]
+
+
+def test_shutdown_cache_surfaces_a_failed_final_round_copy_without_a_host_cache():
+    """A copy or transfer queued by the last round has no next round to settle
+    it; shutdown joins it and re-raises even with no Host cache to close."""
+    from concurrent.futures import Future
+
+    handle = _handle([])
+    failed = Future()
+    failed.set_exception(IndexError("local block ID 99 outside [0, 8)"))
+    handle._copy_submissions.append(failed)
+    settled = Future()
+    settled.set_result(None)
+    handle._transfer_submissions.append(settled)
+
+    with pytest.raises(IndexError, match="99"):
+        handle.shutdown_cache()
+    assert list(handle._copy_submissions) == []
+    assert list(handle._transfer_submissions) == []
 
 
 def test_cache_polling_without_kvstore_refuses_loudly():

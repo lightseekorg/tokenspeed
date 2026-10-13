@@ -648,18 +648,27 @@ class DeviceHandle:
             self._l2.set_l3_weight_version(weight_version)
 
     def shutdown_cache(self) -> None:
-        """Join queued cache submissions, then close the Host cache (L2/L3, pool)."""
+        """Join every queued data-plane submission, then close the Host cache.
 
-        if self._l2 is None:
-            return
+        A cache plan, a PD transfer or a page copy the last round queued is
+        settled by the next round's execute or poll; at shutdown there is no
+        next round, so they are joined here and the first failure re-raised
+        after the Host cache (L2/L3, pool) is closed.
+        """
         errors = []
-        while self._l2_submissions:
-            future = self._l2_submissions.popleft()
-            try:
-                future.result()
-            except BaseException as exc:  # noqa: BLE001 — surface after close
-                errors.append(exc)
-        self._thread.run(self._l2.shutdown)
+        for submissions in (
+            self._l2_submissions,
+            self._transfer_submissions,
+            self._copy_submissions,
+        ):
+            while submissions:
+                future = submissions.popleft()
+                try:
+                    future.result()
+                except BaseException as exc:  # noqa: BLE001 — surface after close
+                    errors.append(exc)
+        if self._l2 is not None:
+            self._thread.run(self._l2.shutdown)
         if errors:
             raise errors[0]
 
@@ -1227,13 +1236,10 @@ def build_device_side(
     and persistent communication buffers must be prepared after weights are
     loaded and before ``create_attn_components`` profiles memory for the KV
     budget (the EPD receive pool, which the admission allocates later, is left
-    out of that budget instead), and the chunked-prefill limit must be aligned
-    to the cache groups before ``ModelExecutorConfig`` sizes the input buffers
-    from it.
+    out of that budget instead).
 
     Args:
-        server_args: Parsed server arguments. ``chunked_prefill_size`` may
-            be lowered here to the cache-group checkpoint grain.
+        server_args: Parsed server arguments.
         model_config: The target model's config.
         draft_model_config: The draft model's config, or None.
         gpu_id: Local device index.
