@@ -45,6 +45,7 @@ from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -151,6 +152,17 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     quant_config = _get_quantization_config(model_config, load_config)
+    if isinstance(quant_config, ModelOptMxfp8Config):
+        # Deferred: the model base imports this package (weight_utils).
+        from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+
+        if not (
+            issubclass(model_class, BaseCausalLM)
+            and model_class.supports_modelopt_mxfp8
+        ):
+            raise ValueError(
+                f"{model_class.__name__} does not support ModelOpt MXFP8 checkpoints"
+            )
     if quant_config is not None:
         replacements = getattr(model_class, "quant_module_name_replacements", None)
         if replacements:

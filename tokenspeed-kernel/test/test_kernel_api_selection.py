@@ -146,6 +146,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_u
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.marlin import deepep_mxfp4 as _moe_marlin_deepep_mxfp4
 from tokenspeed_kernel.ops.moe.marlin import mxfp4 as _moe_marlin_mxfp4
+from tokenspeed_kernel.ops.moe.marlin import mxfp8 as _moe_marlin_mxfp8
 from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import (
     decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
@@ -157,6 +158,9 @@ from tokenspeed_kernel.ops.moe.triton import (
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
+from tokenspeed_kernel.ops.residual import ihc_head as kernel_ihc_head
+from tokenspeed_kernel.ops.residual import ihc_post as kernel_ihc_post
+from tokenspeed_kernel.ops.residual import ihc_pre as kernel_ihc_pre
 from tokenspeed_kernel.ops.residual import mhc_apply_pre as kernel_mhc_apply_pre
 from tokenspeed_kernel.ops.residual import mhc_mixes as kernel_mhc_mixes
 from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
@@ -256,6 +260,7 @@ _RELOAD_MODULES = [
     _moe_gluon,
     _moe_marlin_deepep_mxfp4,
     _moe_marlin_mxfp4,
+    _moe_marlin_mxfp8,
     _moe_marlin,
     _moe_native,
     _moe_triton_bf16,
@@ -353,6 +358,9 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd_available",
         "gated_residual_combine",
         "gated_residual_mix",
+        "ihc_head",
+        "ihc_post",
+        "ihc_pre",
         "mhc_apply_pre",
         "mhc_fused_hc",
         "mhc_mixes",
@@ -370,6 +378,9 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd",
         "hyperconnection_combine",
         "hyperconnection_mix",
+        "ihc_head",
+        "ihc_post",
+        "ihc_pre",
         "mhc_apply_pre",
         "mhc_mixes",
         "mhc_post",
@@ -1994,6 +2005,50 @@ def _attention_dsa_prefill() -> object:
     )
 
 
+def _attention_dsa_hy_v4(entrypoint: Callable[..., object], sink: bool) -> object:
+    # HY V4 attends over a dense BF16 latent cache with top-2048 slots.
+    q = torch.empty((2, 4, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4096, 576), dtype=torch.bfloat16)
+    topk_slots = torch.empty((2, 2048), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return entrypoint(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=4096,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        return_lse=False,
+        slot_order="selection",
+        attn_sink=torch.empty((4,), dtype=torch.float32) if sink else None,
+    )
+
+
+def _attention_dsa_dense_partial(qk_nope_head_dim: int, heads: int) -> object:
+    # Context-parallel ranks gather their group's query heads and return
+    # sinkless partials with the LSE over a dense BF16 latent cache.
+    return _attention_dsa_pkg.dsa_decode(
+        q=torch.empty((2, heads, 576), dtype=torch.bfloat16),
+        kv_cache=torch.empty((4096, 576), dtype=torch.bfloat16),
+        sparse_kv_cache=None,
+        topk_slots=torch.empty((2, 2048), dtype=torch.int32),
+        topk_lens=torch.empty((2,), dtype=torch.int32),
+        max_seqlen_k=4096,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        return_lse=True,
+        slot_order="selection",
+    )
+
+
 def _attention_dsa_prefill_glm53_flash_bf16_dense() -> object:
     q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
     kv_cache = torch.empty((2051, 512), dtype=torch.bfloat16)
@@ -2968,6 +3023,39 @@ def _mhc_apply_pre_fused_norm() -> object:
     return kernel_mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=1e-6)
 
 
+def _ihc_pre(hc_mult: int) -> object:
+    residual = torch.empty((2, hc_mult, 64), dtype=torch.float32)
+    fn = torch.empty((2 * hc_mult, hc_mult * 64), dtype=torch.float32)
+    hc_scale = torch.empty((2,), dtype=torch.float32)
+    hc_base = torch.empty((2 * hc_mult,), dtype=torch.float32)
+    return kernel_ihc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        2.0,
+        1e-6,
+        1e-6,
+        norm_weight=torch.empty((64,), dtype=torch.bfloat16),
+        norm_eps=1e-6,
+    )
+
+
+def _ihc_post() -> object:
+    block_output = torch.empty((2, 64), dtype=torch.bfloat16)
+    residual = torch.empty((2, 4, 64), dtype=torch.float32)
+    gates = torch.empty((2, 4), dtype=torch.float32)
+    return kernel_ihc_post(block_output, residual, gates)
+
+
+def _ihc_head(hc_mult: int) -> object:
+    residual = torch.empty((2, hc_mult, 64), dtype=torch.float32)
+    fn = torch.empty((hc_mult, hc_mult * 64), dtype=torch.float32)
+    hc_scale = torch.empty((1,), dtype=torch.float32)
+    hc_base = torch.empty((hc_mult,), dtype=torch.float32)
+    return kernel_ihc_head(residual, fn, hc_scale, hc_base, 1e-6, 1e-6)
+
+
 def _attention_gdn_chunk_prefill() -> object:
     q = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
@@ -3060,6 +3148,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3102,6 +3191,7 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
                 expert_id_repeats=False,
                 fast_math=True,
                 combine_order="rank",
+                requires_deterministic_finalize=False,
             )
     finally:
         Platform.override(real_platform)
@@ -3126,6 +3216,79 @@ def test_moe_plan_rejects_persistent_workspace_for_ordinary_kernel(
                 ispp=128,
                 internal_activation_dtype="input",
                 persistent_max_num_tokens_per_gpu=16,
+                solution="triton",
+                hidden=128,
+                swiglu_form=None,
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
+                combine_order="rank",
+                requires_deterministic_finalize=False,
+            )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
+
+
+def test_moe_plan_deterministic_finalize_skips_atomic_reduction(
+    b200_platform,
+) -> None:
+    """The routed trtllm kernel wins by priority but reduces with atomics."""
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer MoE kernels are registered only on NVIDIA")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(b200_platform)
+        KernelRegistry.get().clear_cache()
+        plans = {
+            required: kernel_moe_plan(
+                "unquant",
+                input_dtype=torch.bfloat16,
+                activation="swiglu",
+                routing_mode="precomputed_topk",
+                ep_size=2,
+                ispp=128,
+                internal_activation_dtype="input",
+                requires_deterministic_finalize=required,
+                hidden=None,
+                swiglu_form="standard",
+                activation_clamped=False,
+                expert_id_repeats=False,
+                fast_math=True,
+                combine_order="rank",
+            )
+            for required in (False, True)
+        }
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry.get().clear_cache()
+
+    assert plans[False]["apply_kernel_name"] == (
+        "flashinfer_trtllm_unquant_routed_moe_apply"
+    )
+    assert plans[False]["deterministic_finalize"] is False
+    assert plans[True]["apply_kernel_name"] == "flashinfer_cutlass_unquant_moe_apply"
+    assert plans[True]["deterministic_finalize"] is True
+
+
+def test_moe_plan_rejects_deterministic_finalize_for_atomic_kernel(
+    h100_platform,
+) -> None:
+    real_platform = Platform.get()
+    try:
+        Platform.override(h100_platform)
+        KernelRegistry.get().clear_cache()
+        with pytest.raises(kernel_NoKernelFoundError):
+            kernel_moe_plan(
+                "unquant",
+                input_dtype=torch.bfloat16,
+                activation="silu",
+                routing_mode="precomputed_topk",
+                ep_size=1,
+                ispp=128,
+                internal_activation_dtype="input",
+                requires_deterministic_finalize=True,
                 solution="triton",
                 hidden=128,
                 swiglu_form=None,
@@ -3188,6 +3351,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3213,6 +3377,7 @@ def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     assert plan["deepep_mode"] == "auto"
     assert plan["deepep_low_latency_max_num_tokens_per_gpu"] is None
@@ -3244,6 +3409,7 @@ def test_moe_plan_rejects_invalid_deepep_mode(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
 
 
@@ -3552,6 +3718,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3589,6 +3756,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
         assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     finally:
@@ -3652,6 +3820,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3698,6 +3867,7 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3733,6 +3903,7 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
     finally:
         Platform.override(real_platform)
@@ -3825,6 +3996,7 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
     finally:
         Platform.override(real_platform)
@@ -4043,6 +4215,7 @@ def _moe_apply_unquant_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4105,6 +4278,7 @@ def _moe_apply_unquant_cutlass() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4131,6 +4305,7 @@ def _moe_apply_fp8_cutlass() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4140,6 +4315,60 @@ def _moe_apply_fp8_cutlass() -> object:
     x = torch.empty((4, 16), dtype=torch.bfloat16)
     router_logits = torch.empty((4, 8), dtype=torch.float32)
     return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def _moe_plan_fp8_hy_v4(
+    fp8_scale_block_shape: tuple[int, int], solution: str | None
+) -> dict:
+    # HY V4 on one EP32 rank: clamped SwiGLU experts, 6144-wide hidden,
+    # 2048-wide FFN.
+    return kernel_moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        ep_size=32,
+        ispp=2048,
+        hidden=6144,
+        swiglu_form="standard",
+        activation_clamped=True,
+        expert_id_repeats=False,
+        fp8_scale_block_shape=fp8_scale_block_shape,
+        internal_activation_dtype="input",
+        fast_math=True,
+        combine_order="rank",
+        requires_deterministic_finalize=False,
+        solution=solution,
+    )
+
+
+def _moe_apply_mxfp8_marlin() -> object:
+    plan = _moe_plan_fp8_hy_v4((1, 32), solution=None)
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp8_precomputed_moe_apply",
+        preprocessor="marlin_mxfp8_moe_weights",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return kernel_moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def test_marlin_mxfp8_moe_requires_mxfp8_block_scales(
+    h100_platform: PlatformInfo,
+) -> None:
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(h100_platform)
+        registry.clear_cache()
+        plan = _moe_plan_fp8_hy_v4((1, 32), solution="marlin")
+        assert plan["apply_kernel_name"] == "marlin_mxfp8_precomputed_moe_apply"
+        with pytest.raises(kernel_NoKernelFoundError, match="traits"):
+            _moe_plan_fp8_hy_v4((128, 128), solution="marlin")
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
 
 
 def _moe_apply_mxfp4_plan(
@@ -4173,6 +4402,7 @@ def _moe_apply_mxfp4_plan(
         solution=solution,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
 
 
@@ -4370,6 +4600,7 @@ def _moe_apply_fp8_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4396,6 +4627,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4428,6 +4660,7 @@ def _moe_apply_nvfp4_cutlass() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4455,6 +4688,7 @@ def _moe_apply_nvfp4_trtllm_routed() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4494,6 +4728,7 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4522,6 +4757,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4561,6 +4797,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4591,6 +4828,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4627,6 +4865,7 @@ def _moe_apply_mxfp4_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4654,6 +4893,7 @@ def _moe_apply_mxfp4_triton() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4689,6 +4929,7 @@ def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> obj
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(plan, apply=apply, preprocessor=preprocessor)
     x = torch.empty((4, 16), dtype=torch.bfloat16)
@@ -4721,6 +4962,7 @@ def _moe_apply_unquant_triton() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4755,6 +4997,7 @@ def _moe_apply_mxfp4_gluon() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4780,6 +5023,7 @@ def _moe_apply_mxint4_trtllm() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -4805,6 +5049,7 @@ def _moe_apply_mxfp4_dynamic_tp() -> object:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     _assert_moe_plan(
         plan,
@@ -5016,6 +5261,126 @@ _CASES = [
             (128, "flashmla"),
         )
     ],
+    # A sink rules out the DSA kernels that cannot apply one (FlashInfer
+    # TRT-LLM, Gluon); dense-KV FlashMLA decode is registered for sinks and,
+    # on Hopper, for the sinkless partials that context parallelism merges by
+    # LSE.
+    _case(
+        _is_hopper,
+        "hopper",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=False,
+        ),
+        id_suffix="hy-v4",
+    ),
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "attention",
+        "dsa_decode",
+        "flashinfer_trtllm_dsa_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=False,
+        ),
+        id_suffix="hy-v4",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_split_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=True,
+        ),
+        id_suffix="hy-v4-sink",
+    ),
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "attention",
+        "dsa_decode",
+        "flashmla_dense_dsa_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=True,
+        ),
+        id_suffix="hy-v4-sink",
+    ),
+    *[
+        _case(
+            _is_hopper,
+            "hopper",
+            "attention",
+            "dsa_decode",
+            "flashmla_dense_dsa_partial_decode",
+            partial(_attention_dsa_dense_partial, qk_nope_head_dim=nope, heads=heads),
+            id_suffix=f"dcp-partial-{model}",
+        )
+        for model, nope, heads in (
+            ("hy-v4", 192, 16),
+            ("glm5", 192, 64),
+            ("dsv32", 128, 128),
+        )
+    ],
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_decode",
+        partial(_attention_dsa_dense_partial, qk_nope_head_dim=128, heads=128),
+        id_suffix="dcp-partial-dsv32",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=True,
+        ),
+        id_suffix="hy-v4-sink",
+    ),
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "attention",
+        "dsa_prefill",
+        "flashinfer_trtllm_dsa_prefill",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_prefill,
+            sink=False,
+        ),
+        id_suffix="hy-v4",
+    ),
+    _case(
+        _is_hopper_plus_with_flashmla_prefill,
+        "hopper-plus",
+        "attention",
+        "dsa_prefill",
+        "flashmla_dsa_prefill",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_prefill,
+            sink=True,
+        ),
+        id_suffix="hy-v4-sink",
+    ),
     _case(
         _is_hopper,
         "hopper",
@@ -6140,6 +6505,14 @@ _CASES = [
         _moe_apply_fp8_cutlass,
     ),
     _case(
+        _is_hopper_plus,
+        "hopper-plus",
+        "moe",
+        "apply",
+        "marlin_mxfp8_precomputed_moe_apply",
+        _moe_apply_mxfp8_marlin,
+    ),
+    _case(
         _is_hopper,
         "hopper",
         "moe",
@@ -6303,6 +6676,50 @@ _CASES = [
         "mhc_post",
         "gluon_mhc_post_gfx950",
         _mhc_post,
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_pre",
+        "triton_ihc_pre",
+        partial(_ihc_pre, hc_mult=4),
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_post",
+        "triton_ihc_post",
+        _ihc_post,
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_head",
+        "triton_ihc_head",
+        partial(_ihc_head, hc_mult=4),
+    ),
+    # Past the Triton kernels' 16 gate lanes: pre takes 2 * hc_mult gates and
+    # the head hc_mult.
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_pre",
+        "torch_ihc_pre",
+        partial(_ihc_pre, hc_mult=9),
+        id_suffix="hc9",
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_head",
+        "torch_ihc_head",
+        partial(_ihc_head, hc_mult=17),
+        id_suffix="hc17",
     ),
     _case(
         _is_cdna4,
@@ -6604,6 +7021,7 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
             expert_id_repeats=False,
             fast_math=True,
             combine_order="rank",
+            requires_deterministic_finalize=False,
         )
 
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")
@@ -7268,3 +7686,26 @@ def test_kernel_api_selection(
         registry.clear_cache()
 
     assert calls == [case.expected]
+
+
+def test_moe_plan_legacy_call_preserves_finalize_behavior():
+    kwargs = dict(
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        routing_mode="precomputed_topk",
+        ep_size=1,
+        ispp=128,
+        solution="triton",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+    )
+    legacy = kernel_moe_plan("unquant", **kwargs)
+    explicit = kernel_moe_plan(
+        "unquant", requires_deterministic_finalize=False, **kwargs
+    )
+    assert legacy["deterministic_finalize"] is False
+    assert legacy["apply_kernel_name"] == explicit["apply_kernel_name"]

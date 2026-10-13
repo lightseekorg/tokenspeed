@@ -54,6 +54,7 @@ global_server_args_dict: dict = {
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
+    "speculative_algorithm": ServerArgs.speculative_algorithm,
     "disable_pdl": ServerArgs.disable_pdl,
     "enable_prefix_caching": ServerArgs.enable_prefix_caching,
     "mla_disable_ragged": ServerArgs.mla_disable_ragged,

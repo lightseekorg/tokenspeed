@@ -414,6 +414,7 @@ class DeepseekV3MoE(nn.Module):
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
             },
+            deterministic_finalize=False,
         )
 
         self.topk = TopK(

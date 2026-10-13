@@ -50,19 +50,99 @@ __device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffff
   return v - original;
 }
 
+// Lane of a route: global expert expert_start + e (e < num_lanes - 1) maps to
+// e + 1; every other id, including the -1 of masked slots, to the invalid lane 0.
+template <typename scalar_t>
+__device__ __forceinline__ int32_t route_lane(scalar_t id, int32_t expert_start, int32_t num_lanes) {
+  const int32_t local = static_cast<int32_t>(id) - expert_start;
+  return local >= 0 && local < num_lanes - 1 ? local + 1 : 0;
+}
+
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ cumsum_buffer,
+    int32_t expert_start,
+    int32_t num_experts,
     size_t numel) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i] + 1;
+    int32_t expert_id = route_lane(topk_ids[i], expert_start, num_experts);
     int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
     sorted_token_ids[rank_post_pad] = i;
+  }
+}
+
+// Stable counterpart of count_and_sort_expert_tokens_kernel: routes land in
+// each expert's segment in increasing route order, so the layout (and every
+// downstream split-K partition) is identical run to run. One block of
+// kSortWarps warps; warp w owns a contiguous slice of the routes and keeps one
+// running offset per expert in shared memory ([kSortWarps][num_experts]).
+constexpr int kSortWarps = 32;
+
+template <typename scalar_t>
+__global__ void stable_sort_expert_tokens_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    const int32_t* __restrict__ cumsum_buffer,
+    int32_t expert_start,
+    int32_t num_experts,
+    size_t numel) {
+  extern __shared__ int32_t warp_offsets[];
+  const int warp_id = threadIdx.x / WARP_SIZE;
+  const int lane_id = threadIdx.x & (WARP_SIZE - 1);
+  const unsigned lanes_below = (1u << lane_id) - 1;
+  int32_t* my_offsets = warp_offsets + warp_id * num_experts;
+
+  const size_t per_warp = (numel + kSortWarps * WARP_SIZE - 1) / (kSortWarps * WARP_SIZE) * WARP_SIZE;
+  const size_t begin = warp_id * per_warp;
+  const size_t end = min(numel, begin + per_warp);
+
+  for (int i = threadIdx.x; i < kSortWarps * num_experts; i += blockDim.x) {
+    warp_offsets[i] = 0;
+  }
+  __syncthreads();
+
+  for (size_t base = begin; base < end; base += WARP_SIZE) {
+    const size_t i = base + lane_id;
+    const int32_t expert_id = i < end ? route_lane(topk_ids[i], expert_start, num_experts) : -1;
+    const unsigned peers = __match_any_sync(0xffffffffu, expert_id);
+    if (expert_id >= 0 && lane_id == __ffs(peers) - 1) {
+      my_offsets[expert_id] += __popc(peers);
+    }
+  }
+  __syncthreads();
+
+  // Exclusive scan over warps per expert, seeded with the expert's segment start.
+  for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+    int32_t running = cumsum_buffer[e];
+    for (int w = 0; w < kSortWarps; ++w) {
+      const int32_t count = warp_offsets[w * num_experts + e];
+      warp_offsets[w * num_experts + e] = running;
+      running += count;
+    }
+  }
+  __syncthreads();
+
+  for (size_t base = begin; base < end; base += WARP_SIZE) {
+    const size_t i = base + lane_id;
+    const int32_t expert_id = i < end ? route_lane(topk_ids[i], expert_start, num_experts) : -1;
+    const unsigned peers = __match_any_sync(0xffffffffu, expert_id);
+    int32_t slot = 0;
+    if (expert_id >= 0) {
+      slot = my_offsets[expert_id] + __popc(peers & lanes_below);
+    }
+    __syncwarp();
+    if (expert_id >= 0) {
+      sorted_token_ids[slot] = static_cast<int32_t>(i);
+      if (lane_id == __ffs(peers) - 1) {
+        my_offsets[expert_id] += __popc(peers);
+      }
+    }
+    __syncwarp();
   }
 }
 
@@ -72,6 +152,7 @@ __global__ void moe_align_block_size_kernel(
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ expert_ids,
     int32_t* __restrict__ total_tokens_post_pad,
+    int32_t expert_start,
     int32_t num_experts,
     int32_t block_size,
     size_t numel,
@@ -109,7 +190,7 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += stride) {
-    int expert_id = topk_ids[i] + 1;
+    int expert_id = route_lane(topk_ids[i], expert_start, num_experts);
     atomicAdd(&shared_counts[expert_id], 1);
   }
 
@@ -252,6 +333,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ expert_ids,
     int32_t* __restrict__ total_tokens_post_pad,
+    int32_t expert_start,
     int32_t num_experts,
     int32_t block_size,
     size_t numel,
@@ -289,7 +371,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i] + 1;
+    int32_t expert_id = route_lane(topk_ids[i], expert_start, num_experts);
     ++tokens_cnts[(tid + 1) * num_experts + expert_id];
   }
 
@@ -321,7 +403,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i] + 1;
+    int32_t expert_id = route_lane(topk_ids[i], expert_start, num_experts);
     int32_t rank_post_pad = tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
     ++tokens_cnts[tid * num_experts + expert_id];
@@ -329,8 +411,8 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 }
 
 // v2 kernel: supports >1024 experts via EXPERTS_PER_THREAD templating
-// and a two-level warp scan (no cub dependency). Uses the same +1 offset
-// convention as the original kernel (topk_ids shifted by +1 so -1 maps to 0).
+// and a two-level warp scan (no cub dependency). Uses the same route_lane
+// convention as the original kernel (local experts shifted by +1, the rest in 0).
 // Launched with <<<2, 1024>>>: block 1 fills sorted_token_ids in parallel
 // with block 0 doing the alignment compute.
 //
@@ -343,6 +425,7 @@ __global__ void moe_align_block_size_kernel_v2(
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ expert_ids,
     int32_t* __restrict__ total_tokens_post_pad,
+    int32_t expert_start,
     int32_t num_experts,
     int32_t padded_num_experts,
     int32_t block_size,
@@ -382,7 +465,7 @@ __global__ void moe_align_block_size_kernel_v2(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += blockDim.x) {
-    int expert_id = topk_ids[i] + 1;  // +1 offset convention
+    int expert_id = route_lane(topk_ids[i], expert_start, num_experts);
     if (expert_id < num_experts) {
       atomicAdd(&shared_counts[expert_id], 1);
     }
@@ -455,15 +538,67 @@ namespace {
 
 template <typename scalar_t>
 struct MoeAlignBlockSizeKernel {
+  static void sort_expert_tokens(
+      const scalar_t* topk_ids_ptr,
+      int32_t* sorted_token_ids_ptr,
+      int32_t* cumsum_buffer_ptr,
+      int32_t expert_start,
+      int64_t num_experts,
+      size_t numel,
+      bool deterministic,
+      int device,
+      cudaStream_t stream) {
+    using namespace host;
+    if (deterministic) {
+      const size_t shared_mem_size = moe::kSortWarps * num_experts * sizeof(int32_t);
+      int max_shared_mem = 0;
+      RuntimeDeviceCheck(cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+      RuntimeCheck(
+          shared_mem_size <= static_cast<size_t>(max_shared_mem),
+          "moe_align_block_size: deterministic sort supports at most ",
+          max_shared_mem / (moe::kSortWarps * sizeof(int32_t)),
+          " expert lanes, got ",
+          num_experts);
+      auto sort_kernel = moe::stable_sort_expert_tokens_kernel<scalar_t>;
+      RuntimeDeviceCheck(
+          cudaFuncSetAttribute(sort_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
+      LaunchKernel(dim3(1), dim3(moe::kSortWarps * WARP_SIZE), stream, shared_mem_size)(
+          sort_kernel,
+          topk_ids_ptr,
+          sorted_token_ids_ptr,
+          cumsum_buffer_ptr,
+          expert_start,
+          (int32_t)num_experts,
+          numel);
+      return;
+    }
+    const int block_threads = 256;
+    const int num_blocks = (numel + block_threads - 1) / block_threads;
+    const int max_blocks = 65535;
+    const int actual_blocks = std::min(num_blocks, max_blocks);
+
+    auto sort_kernel = moe::count_and_sort_expert_tokens_kernel<scalar_t>;
+    LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
+        sort_kernel,
+        topk_ids_ptr,
+        sorted_token_ids_ptr,
+        cumsum_buffer_ptr,
+        expert_start,
+        (int32_t)num_experts,
+        numel);
+  }
+
   static void
   run(tvm::ffi::TensorView topk_ids,
+      int64_t expert_start,
       int64_t num_experts,
       int64_t block_size,
       tvm::ffi::TensorView sorted_token_ids,
       tvm::ffi::TensorView expert_ids,
       tvm::ffi::TensorView num_tokens_post_pad,
       tvm::ffi::TensorView cumsum_buffer,
-      bool pad_sorted_token_ids) {
+      bool pad_sorted_token_ids,
+      bool deterministic) {
     using namespace host;
 
     auto device = topk_ids.device();
@@ -474,7 +609,8 @@ struct MoeAlignBlockSizeKernel {
 
     int64_t max_num_tokens_padded = sorted_token_ids.size(0);
 
-    // num_experts from Python is actual_num_experts + 1 (for EP offset convention).
+    // num_experts from Python is actual_num_experts + 1: lane 0 collects the routes
+    // of experts outside [expert_start, expert_start + actual_num_experts).
     // The v2 kernel (>1024 experts) uses 1024 threads with EXPERTS_PER_THREAD up
     // to 8, covering at most 8192 expert indices. This supports up to 8191 real
     // experts, sufficient for LoRA virtual experts (num_moe_experts * max_loras).
@@ -501,6 +637,7 @@ struct MoeAlignBlockSizeKernel {
           sorted_token_ids_ptr,
           expert_ids_ptr,
           num_tokens_post_pad_ptr,
+          (int32_t)expert_start,
           (int32_t)num_experts,
           (int32_t)block_size,
           numel,
@@ -517,6 +654,7 @@ struct MoeAlignBlockSizeKernel {
           sorted_token_ids_ptr,
           expert_ids_ptr,
           num_tokens_post_pad_ptr,
+          (int32_t)expert_start,
           (int32_t)num_experts,
           (int32_t)block_size,
           numel,
@@ -525,14 +663,16 @@ struct MoeAlignBlockSizeKernel {
           (int32_t)scan_size,
           (int32_t)max_num_tokens_padded);
 
-      const int block_threads = std::min(256, threads);
-      const int num_blocks = (numel + block_threads - 1) / block_threads;
-      const int max_blocks = 65535;
-      const int actual_blocks = std::min(num_blocks, max_blocks);
-
-      auto sort_kernel = moe::count_and_sort_expert_tokens_kernel<scalar_t>;
-      LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
-          sort_kernel, topk_ids_ptr, sorted_token_ids_ptr, cumsum_buffer_ptr, numel);
+      sort_expert_tokens(
+          topk_ids_ptr,
+          sorted_token_ids_ptr,
+          cumsum_buffer_ptr,
+          (int32_t)expert_start,
+          num_experts,
+          numel,
+          deterministic,
+          device.device_id,
+          stream);
     } else {
       // v2 path for >1024 experts: two-level warp scan with EXPERTS_PER_THREAD
       int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
@@ -547,6 +687,7 @@ struct MoeAlignBlockSizeKernel {
             sorted_token_ids_ptr,
             expert_ids_ptr,
             num_tokens_post_pad_ptr,
+            (int32_t)expert_start,
             (int32_t)num_experts,
             (int32_t)padded_num_experts,
             (int32_t)block_size,
@@ -564,14 +705,16 @@ struct MoeAlignBlockSizeKernel {
         launch_v2(std::integral_constant<int, 8>{});
       }
 
-      const int block_threads = std::min(256, threads);
-      const int num_blocks = (numel + block_threads - 1) / block_threads;
-      const int max_blocks = 65535;
-      const int actual_blocks = std::min(num_blocks, max_blocks);
-
-      auto sort_kernel = moe::count_and_sort_expert_tokens_kernel<scalar_t>;
-      LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
-          sort_kernel, topk_ids_ptr, sorted_token_ids_ptr, cumsum_buffer_ptr, numel);
+      sort_expert_tokens(
+          topk_ids_ptr,
+          sorted_token_ids_ptr,
+          cumsum_buffer_ptr,
+          (int32_t)expert_start,
+          num_experts,
+          numel,
+          deterministic,
+          device.device_id,
+          stream);
     }
   }
 };

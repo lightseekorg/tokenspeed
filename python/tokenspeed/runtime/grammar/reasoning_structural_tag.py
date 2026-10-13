@@ -45,6 +45,8 @@ already have an xgrammar Format instance can call the base function.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 # smg reasoning_parser name → xgrammar builtin model template. Keys
@@ -96,6 +98,62 @@ def _structural_tag_for_inkling(content_format: Any) -> str:
             elements=[
                 StarFormat(content=reasoning_block),
                 response_block,
+            ]
+        )
+    )
+    return tag.model_dump_json(by_alias=True)
+
+
+# HY V4 tokenizers may tag their think tokens with a suffix, e.g.
+# ``<think:0a1b2c3d>``, so the tokens are looked up in the vocab.
+_HY_V4_THINK_START = re.compile(r"<think(:[^\s>]+)?>")
+
+
+def hy_v4_think_tokens(vocab: Mapping[str, int]) -> tuple[int, str] | None:
+    """Return HY V4's think-start token id and think-end token string.
+
+    Returns ``None`` when ``vocab`` holds no matching ``<think…>`` /
+    ``</think…>`` pair.
+    """
+    for token, token_id in vocab.items():
+        match = _HY_V4_THINK_START.fullmatch(token)
+        if match is None:
+            continue
+        end = f"</think{match.group(1) or ''}>"
+        if end in vocab:
+            return token_id, end
+    return None
+
+
+def structural_tag_for_hy_v4_response(
+    content_format: Any,
+    prompt_ids: Sequence[int],
+    think_tokens: tuple[int, str],
+) -> str | None:
+    """Defer ``content_format`` past HY V4's reasoning block.
+
+    The chat template ends a thinking prompt with the think-start token, so
+    the reply is free reasoning, the think-end token, then the answer. With
+    ``reasoning_effort=no_think`` the prompt already closes the block and the
+    whole reply is the answer; this returns ``None`` so the caller applies the
+    constraint from the first token.
+    """
+    think_start_id, think_end = think_tokens
+    if not prompt_ids or prompt_ids[-1] != think_start_id:
+        return None
+
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        SequenceFormat,
+        StructuralTag,
+        TagFormat,
+    )
+
+    tag = StructuralTag(
+        format=SequenceFormat(
+            elements=[
+                TagFormat(begin="", content=AnyTextFormat(), end=think_end),
+                content_format,
             ]
         )
     )

@@ -815,6 +815,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
         v_head_dim=128,
         scaling=0.1,
         logit_cap=0.0,
+        attn_sink=None,
     )
 
     def gather(q, group):

@@ -129,6 +129,7 @@ def _make_plan() -> dict:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     assert plan["apply_kernel_name"] == _KERNEL_NAME
     return plan

@@ -59,6 +59,7 @@ def _plan_kwargs(monkeypatch, **layer_kwargs) -> dict:
         ),
         layer_index=0,
         prefix="model.layers.0.mlp",
+        deterministic_finalize=False,
     )
     kwargs.update(layer_kwargs)
     MoELayer(**kwargs)

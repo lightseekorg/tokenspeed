@@ -76,6 +76,7 @@ def prepared_latent_experts():
                 w13_input_layout="concatenated",
                 routing_mode="precomputed_topk",
                 internal_activation_dtype_override="input",
+                deterministic_finalize=False,
             )
             up = Kimi3LatentProjection(3584, 7168, params_dtype=torch.bfloat16)
             norm = RMSNorm(3584, eps=1e-6)

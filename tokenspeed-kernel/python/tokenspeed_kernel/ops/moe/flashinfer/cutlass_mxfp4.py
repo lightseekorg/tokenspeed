@@ -302,6 +302,7 @@ if platform.is_nvidia:
             "expert_id_repeats": frozenset({False}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
+            "deterministic_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             # Both GEMM K dims carry int32-viewed E8M0 scales (see _ALIGNMENT);

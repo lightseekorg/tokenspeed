@@ -61,6 +61,7 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
             fast_math=True,
             combine_order="rank",
             solution="gluon",
+            requires_deterministic_finalize=False,
         )
 
     assert plan["solution"] == "gluon"
@@ -90,6 +91,7 @@ def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
             fast_math=True,
             combine_order="rank",
             solution="gluon",
+            requires_deterministic_finalize=False,
         )
 
 
