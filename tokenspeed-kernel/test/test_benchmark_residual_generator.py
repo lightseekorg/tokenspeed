@@ -136,3 +136,61 @@ def test_mhc_generators_reject_unimplemented_cases(
 ) -> None:
     with pytest.raises(BenchmarkCaseError, match=message):
         prepare(_request(mode, **overrides), None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("inject", [True, False])
+def test_hyperconnection_mix_generator_selection_matches_operation_api(
+    monkeypatch: pytest.MonkeyPatch, inject: bool
+) -> None:
+    from tokenspeed_kernel.ops import residual as residual_ops
+
+    captured: list[tuple] = []
+
+    def select(family, mode, signature, **kwargs):
+        captured.append((family, mode, signature, kwargs["traits"]))
+        raise RuntimeError("selection captured")
+
+    monkeypatch.setattr(residual_ops, "select_kernel", select)
+    monkeypatch.setattr(residual_generator, "load_builtin_kernels", lambda: None)
+
+    hc_count, hidden_size, lowrank, tokens = 4, 256, 32, 16
+    wide = hc_count * hidden_size
+    normalized = torch.empty((tokens, wide), dtype=torch.bfloat16, device="cuda")
+    projection = torch.empty(
+        (lowrank + (hc_count if inject else 0), wide),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    up = torch.empty((wide, lowrank), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(RuntimeError, match="selection captured"):
+        residual_ops.gated_residual_mix(
+            normalized,
+            projection,
+            up,
+            hc_count,
+            hidden_size,
+            lowrank,
+            weights_independent=True,
+        )
+    request = BenchmarkRequest(
+        family="residual",
+        mode="hyperconnection_mix",
+        parameters={
+            "model_profile": "qwen38_flash_tp2",
+            "tokens": tokens,
+            "hc_count": hc_count,
+            "hidden_size": hidden_size,
+            "lowrank": lowrank,
+            "inject": inject,
+            "dtype": "bfloat16",
+        },
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+    with pytest.raises(RuntimeError, match="selection captured"):
+        residual_generator.prepare_hyperconnection_mix(request, None)
+
+    assert captured[0] == captured[1]
