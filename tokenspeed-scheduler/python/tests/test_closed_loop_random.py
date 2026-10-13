@@ -44,7 +44,9 @@ STATES = ("linear_attention_0", "linear_attention_1")
 ROUNDS = 300
 
 
-def _config(role, pages: int, history_block: int, sliding: bool) -> "ts.SchedulerConfig":
+def _config(
+    role, pages: int, history_block: int, sliding: bool
+) -> "ts.SchedulerConfig":
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = P
     cfg.num_device_pages = pages
@@ -106,7 +108,9 @@ def _event(kind: str, request_id: str, **fields):
 class _Loop:
     def __init__(self, seed: int, role):
         self.rng = random.Random(seed)
+        self.role = role
         self.remote = role == ts.SchedulerConfig.Role.D
+        self.prefill_only = role == ts.SchedulerConfig.Role.P
         self.scheduler = ts.Scheduler(
             _config(
                 role,
@@ -132,7 +136,9 @@ class _Loop:
     def submit(self, count: int) -> None:
         specs = []
         for _ in range(count):
-            user = [self.rng.randrange(2, 500) for _ in range(self.rng.randrange(1, 30))]
+            user = [
+                self.rng.randrange(2, 500) for _ in range(self.rng.randrange(1, 30))
+            ]
             draw = self.rng.random()
             if draw < 0.15 and self.live:
                 tokens = list(self.rng.choice(list(self.live.values()))["prompt"])
@@ -143,7 +149,9 @@ class _Loop:
             else:
                 tokens = self.rng.choice(self.systems) + user
             max_new = self.rng.randrange(1, 10)
-            tokens = tokens[: max(1, self.scheduler.max_single_request_tokens() - max_new - 1)]
+            tokens = tokens[
+                : max(1, self.scheduler.max_single_request_tokens() - max_new - 1)
+            ]
             spec = ts.RequestSpec()
             spec.request_id = request_id = f"r{self.next_id}"
             self.next_id += 1
@@ -155,7 +163,8 @@ class _Loop:
                 "max_new": max_new,
                 "generated": 0,
                 "finished": False,
-                "bootstrapped": not self.remote,
+                "bootstrapped": self.role == ts.SchedulerConfig.Role.Fused,
+                "transferring": False,
                 "out": [],
             }
         self.scheduler.submit_requests(specs)
@@ -171,7 +180,8 @@ class _Loop:
                 state = self.live.get(request_id)
                 is_decode = i >= num_extends
                 mid_chunk = not is_decode and (
-                    op.extend_prefix_lens[i] + op.input_lengths[i] < op.prefill_lengths[i]
+                    op.extend_prefix_lens[i] + op.input_lengths[i]
+                    < op.prefill_lengths[i]
                 )
                 if mid_chunk:
                     events.add_event(_event("ExtendResult", request_id, tokens=[]))
@@ -181,8 +191,8 @@ class _Loop:
                 if state is None:
                     continue
                 state["out"].append(token)
-                if state["finished"]:
-                    continue  # the delayed row of a finished request
+                if state["finished"] or self.prefill_only:
+                    continue  # a finished request's delayed row; the P never finishes itself
                 state["generated"] += 1
                 if state["generated"] >= state["max_new"] or self.rng.random() < 0.03:
                     state["finished"] = True
@@ -201,13 +211,28 @@ class _Loop:
         self.scheduler.advance(events)
 
     def peer(self, plan) -> None:
-        """D role: bootstrap waiting prompts; land the plan's remote prefills."""
+        """The transfer peer: bootstraps waiting prompts; on the D lands the
+        plan's remote prefills, on the P acknowledges (or fails) the decodes
+        it was handed."""
         events = ts.ExecutionEvent()
         count = 0
+        if plan is not None and plan.remote_decode is not None:
+            for request_id in plan.remote_decode.request_ids:
+                self.live[request_id]["transferring"] = True
         for request_id, state in self.live.items():
             if not state["bootstrapped"] and self.rng.random() < 0.7:
                 events.add_event(ts.PD.BootstrappedEvent(request_id))
                 state["bootstrapped"] = True
+                count += 1
+            if state["transferring"] and self.rng.random() < 0.5:
+                kind = (
+                    ts.PD.FailedEvent
+                    if self.rng.random() < 0.1
+                    else ts.PD.SucceededEvent
+                )
+                events.add_event(kind(request_id))
+                state["transferring"] = False
+                state["finished"] = True
                 count += 1
         if plan is not None and plan.remote_prefill is not None:
             for request_id in plan.remote_prefill.request_ids:
@@ -225,11 +250,11 @@ class _Loop:
         for _ in range(rounds):
             if self.rng.random() < 0.3:
                 self.submit(self.rng.randrange(1, 4))
-            if self.remote:
+            if self.remote or self.prefill_only:
                 self.peer(None)
             plan = self.scheduler.next_execution_plan()
             self.pending.append(plan)
-            if self.remote:
+            if self.remote or self.prefill_only:
                 self.peer(plan)
             if len(self.pending) > 1:
                 self.land(self.pending.pop(0))
@@ -249,7 +274,7 @@ class _Loop:
 
 # Seed 42 on the D role reaches the sliding-window tail hit inside a prompt's
 # last block.
-@pytest.mark.parametrize("role", ["Fused", "D"])
+@pytest.mark.parametrize("role", ["Fused", "D", "P"])
 @pytest.mark.parametrize("seed", [*range(12), 42])
 def test_random_closed_loop_never_raises(role: str, seed: int) -> None:
     _Loop(seed, getattr(ts.SchedulerConfig.Role, role)).run(ROUNDS)
