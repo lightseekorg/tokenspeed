@@ -268,6 +268,14 @@ def test_kernel_ut_tasks_cover_every_test_once_per_runner():
         for suffix in ("-part-i", "-part-ii", "")
     ]
     labels = {label for task in tasks for label in task["runner"]["labels"]}
+    # Pin the runner set so dropping a runner from every task fails here.
+    assert labels == {
+        "h100-1gpu",
+        "b200-1gpu",
+        "gb200-1gpu",
+        "b300-1gpu",
+        "amd-mi35x-1gpu-test",
+    }
     for label in labels:
         executions = Counter()
         for task in tasks:
@@ -313,6 +321,13 @@ def test_runtime_1gpu_tasks_run_every_partition_once_per_runner():
             for label in task["runner"]["labels"]:
                 partitions.setdefault(label, []).append(partition)
 
+    # Pin the runner set so dropping a runner from every task fails here.
+    assert partitions.keys() == {
+        "h100-1gpu",
+        "b200-1gpu",
+        "gb200-1gpu",
+        "amd-mi35x-1gpu-test",
+    }
     for label, parts in partitions.items():
         size = parts[0][1]
         assert sorted(parts) == [(i, size) for i in range(size)], label
