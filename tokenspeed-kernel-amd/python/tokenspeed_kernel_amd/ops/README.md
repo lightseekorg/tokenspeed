@@ -519,6 +519,8 @@ ties and maps candidate columns to logical rows. The picks are already
 ascending without candidates and with ascending candidate lists; otherwise an
 all-pairs rank sorts them. LDS atomics cost about one wave instruction per 64
 lanes regardless of conflicts, so the radix passes dominate on wide rows.
+With candidates, the selector first finds the last listed block and scans only
+up to it: unlisted blocks are never scored.
 
 Block selection takes the maximum logit of each 8-row block, forces the
 newest visible block to `+inf`, and keeps the top blocks in ascending order.
