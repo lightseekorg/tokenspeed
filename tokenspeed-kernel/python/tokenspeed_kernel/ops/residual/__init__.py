@@ -298,8 +298,8 @@ def select_gated_residual_mix_kernel(
     lowrank: int,
     *,
     weights_independent: bool,
-    override: str | None = None,
-    solution: str | None = None,
+    override: str | None,
+    solution: str | None,
 ):
     """Select the ``gated_residual_mix`` kernel for validated 2-D inputs.
 

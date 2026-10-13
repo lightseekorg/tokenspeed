@@ -514,6 +514,8 @@ def prepare_hyperconnection_mix(
             hidden_size,
             lowrank,
             weights_independent=True,
+            override=None,
+            solution=None,
         )
     except NoKernelFoundError as error:
         raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
