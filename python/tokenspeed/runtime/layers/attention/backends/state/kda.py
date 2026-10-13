@@ -159,6 +159,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self.max_bs = config.max_bs
         # The platform layout; the workspace planner probes the same one.
         self.kda_recurrent_layout = kda_recurrent_layout_default()
+        if self.kda_recurrent_layout not in ("k_major", "v_major"):
+            raise ValueError(
+                f"unsupported KDA recurrent layout {self.kda_recurrent_layout!r}"
+            )
         self._replay_active = False
         self._batched_replay_kernel = None
         self._replay_uses_raw_gate = False

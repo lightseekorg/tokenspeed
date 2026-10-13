@@ -192,6 +192,20 @@ class TrtllmAllReduceBackend(CommBackend):
 
         return self._fallback.all_reduce(tensor, group, op=op)
 
+    def lamport_all_gather(
+        self, tensor: torch.Tensor, group: Group
+    ) -> torch.Tensor | None:
+        """All-gather along the last dim through the armed mnnvl workspace;
+        None when it does not serve the call."""
+        res = self._resources.get(group)
+        if res is None:
+            return None
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            trtllm_workspace_all_gather,
+        )
+
+        return trtllm_workspace_all_gather(tensor, res["device_group"])
+
     # ---- Delegate everything else to fallback ----
 
     def all_gather(

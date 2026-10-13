@@ -606,7 +606,7 @@ def test_terminal_events_clear_transport_room_state(
 
     assert len(decode.generate_events()) == 1
     assert decode.pop_remote_cache_slot("request") == 7
-    assert decode.pop_remote_cached_tokens("request") == max(2, remote_hits)
+    assert decode.pop_remote_cached_tokens("request") == remote_hits
     assert decode.pop_remote_bootstrap_logprob("request") == -0.25
     assert decode.pop_remote_spec_candidate_ids("request") == (7, [1])
     assert decode._admissions == {}
@@ -670,7 +670,7 @@ def test_decode_publishes_manifest_through_contract_receiver() -> None:
     assert kwargs["block_manifest"].groups[0].block_ids == (2, 3)
     assert kwargs["block_manifest"].groups[1].block_ids == (6,)
     assert kwargs["block_manifest"].state_prefix_cached is False
-    assert executor._admissions == {"request-0": (7, 2)}
+    assert executor._admissions == {"request-0": 7}
 
     # A D-local state hit at the prompt end: the manifest carries the flag
     # and no state block for the P to fill.
