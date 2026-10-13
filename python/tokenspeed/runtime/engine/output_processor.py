@@ -120,6 +120,11 @@ class OutputProcessor:
                 )
                 continue
 
+            # Whether out_dict's output_ids hold every id so far instead of
+            # this frame's. Only the raw-token path streams them that way;
+            # a non-streamed output replaces the pending one anyway.
+            cumulative_ids = False
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -271,6 +276,7 @@ class OutputProcessor:
                     else:
                         state.output_ids.extend(recv_obj.output_ids[i])
                         output_token_ids = state.output_ids.copy()
+                        cumulative_ids = True
                         if recv_obj.output_multi_ids is not None:
                             output_multi_ids = recv_obj.output_multi_ids[i]
 
@@ -315,7 +321,9 @@ class OutputProcessor:
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 
             state.collector.put(
-                out_dict, stream=bool(getattr(state.obj, "stream", False))
+                out_dict,
+                stream=bool(getattr(state.obj, "stream", False)),
+                cumulative=cumulative_ids,
             )
             state.event.set()
 

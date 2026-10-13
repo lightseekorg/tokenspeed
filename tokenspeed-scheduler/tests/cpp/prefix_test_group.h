@@ -80,7 +80,8 @@ public:
     }
     void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
                              std::vector<BlockTransfer>& load_pairs) {
-        allocator_.AppendHostExtension(pool, table, std::move(host_block_refs), load_pairs);
+        allocator_.AppendHostExtension(pool, table, std::move(host_block_refs), load_pairs,
+                                       /*tail_available_tokens=*/0);
     }
 
     // --- retention (token API, policy converted through GroupGeometry) ---

@@ -57,7 +57,7 @@ def one_group(group_id: str, *fields, **spec_kwargs):
     scheduler semantics. ``group`` (the pipeline stage) is the other way in.
     """
     spec_kwargs.setdefault("retention", "full_history")
-    if "checkpoint_granularity" not in spec_kwargs:
+    if spec_kwargs.get("family", "history") == "history":
         spec_kwargs.setdefault("rows_per_page", spec_kwargs.pop("page_size", 1))
         spec_kwargs.setdefault("entry_stride_tokens", 1)
     return spec.CacheGroupSpec(

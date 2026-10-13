@@ -63,7 +63,7 @@ def test_verify_has_no_elementwise_launches(
     ssm = torch.randn(pool_size, heads, dim, dim, dtype=torch.float32, device="cuda")
     conv[0].zero_()
     ssm[0].zero_()
-    pool = _ContractPool(4, {0: ("linear_attention", conv, ssm)})
+    pool = _ContractPool({0: ("linear_attention", conv, ssm)})
     backend = MambaAttnBackend(
         *_mamba_config_pair(
             torch,

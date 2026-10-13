@@ -31,7 +31,7 @@ namespace {
 void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroupConfig& group) {
     group.ValidateCapacityInputs();
     const std::string where = "Cache group '" + group.group_id + "': ";
-    if (config.prefix_granularity % group.block_granularity != 0) {
+    if (group.family == CacheGroupFamily::History && config.prefix_granularity % group.block_granularity != 0) {
         throw std::invalid_argument(where + "block_granularity must divide the scheduler prefix_granularity");
     }
     if (config.role == Role::kFused) {
@@ -143,31 +143,18 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     std::int32_t replay_window_tokens = 0;
     for (const CacheGroupConfig& group : cache_groups) {
         validateGroupCapacityInputs(*this, group);
-        // A recurrent state advances one whole checkpoint at a time, so a chunk
-        // must be able to cover one cache block.
-        if (group.Kind() == AttnKind::kMambaState && max_scheduled_tokens < prefix_granularity) {
-            throw std::invalid_argument("Scheduler: Mamba max_scheduled_tokens must cover one cache block");
-        }
         if (group.replayable) {
             replay_window_tokens = std::max(replay_window_tokens, *group.sliding_window_tokens);
         }
     }
     if (replay_window_tokens > 0) {
-        // A prefix hit re-feeds up to one replay window and must still advance:
-        // by every new token when fewer than a window remain, or by one prefix
-        // page when a promotion boundary aligns the chunk.
+        // A prefix hit re-feeds up to one replay window and must still carry
+        // the prompt's final window whole, or at least a prefix page of new
+        // tokens when the window is smaller than a page.
         if (max_scheduled_tokens < replay_window_tokens + std::max(replay_window_tokens, prefix_granularity)) {
             throw std::invalid_argument(
                 "Scheduler: max_scheduled_tokens must cover the replayable groups' largest sliding_window_tokens "
                 "plus max(that window, prefix_granularity)");
-        }
-        // The final-chunk window rule and the state-checkpoint chunk alignment
-        // would each reshape the other's chunk; no model needs both.
-        for (const CacheGroupConfig& group : cache_groups) {
-            if (group.Kind() == AttnKind::kMambaState) {
-                throw std::invalid_argument(
-                    "Scheduler: bounded-replay cache groups cannot be combined with snapshot-state groups");
-            }
         }
     }
 }

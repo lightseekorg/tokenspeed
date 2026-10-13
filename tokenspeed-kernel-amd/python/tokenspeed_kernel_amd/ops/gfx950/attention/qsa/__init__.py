@@ -17,3 +17,13 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
+"""QSA attention kernels for AMD GFX950."""
+
+from tokenspeed_kernel_amd.ops.gfx950.attention.qsa.sparse_attention import (
+    launch_gluon_qsa_sparse_attention_gfx950,
+)
+
+__all__ = [
+    "launch_gluon_qsa_sparse_attention_gfx950",
+]

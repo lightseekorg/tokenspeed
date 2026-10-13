@@ -304,14 +304,22 @@ if platform.is_hopper_plus:
         local_tokens: int = 0,
         batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert weights.dtype in (torch.float32, torch.bfloat16)
-        # Raw weights may be a column-split view of the fused wk_weights_proj
-        # output; the fused combine only needs unit-stride rows.
-        assert weights.stride(-1) == 1
-        assert seq_lens.dtype == torch.int32
-        assert seq_lens.is_contiguous()
-        assert block_table.dtype == torch.int32
-        assert block_table.is_contiguous()
+        # Dispatch selects BF16/FP32 weights; their producer supplies unit
+        # inner stride, including packed projection views. Metadata buffers
+        # are allocated as contiguous int32 by the backend.
+
+        if seq_lens_2d is None or plan is None:
+            raise RuntimeError(
+                "DeepGEMM DSA decode top-k requires precomputed plan and "
+                "seq_lens_2d (built once per forward via dsa_plan)."
+            )
+
+        max_seq_len = block_table.shape[1] * page_size
+        if max_seq_len < int(topk):
+            raise RuntimeError(
+                "DeepGEMM DSA paged top-k requires block table capacity >= topk; "
+                f"got capacity={max_seq_len}, topk={topk}"
+            )
 
         out, lens_out = _check_out(
             out,
@@ -331,19 +339,6 @@ if platform.is_hopper_plus:
         )
         q_fp8 = q_fp8.view_as(q)
         scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
-
-        if seq_lens_2d is None or plan is None:
-            raise RuntimeError(
-                "DeepGEMM DSA decode top-k requires precomputed plan and "
-                "seq_lens_2d (built once per forward via dsa_plan)."
-            )
-
-        max_seq_len = block_table.shape[1] * page_size
-        if max_seq_len < int(topk):
-            raise RuntimeError(
-                "DeepGEMM DSA paged top-k requires block table capacity >= topk; "
-                f"got capacity={max_seq_len}, topk={topk}"
-            )
 
         kv_cache = index_k_cache.view(
             -1,

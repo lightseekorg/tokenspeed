@@ -470,7 +470,15 @@ For orientation, one iteration of `event_loop`:
    completion event fences the forward thread's default stream here, before
    anything else of the plan is enqueued; an ordinary store's sources are
    pinned by the scheduler until the ACK, so its copy rides the write stream
-   and fences nothing -- then page zeroing (the new owner's sanitization),
+   and fences nothing -- then the plan's Device-to-Device block copies
+   (`pages_to_copy`: a prefix hit's private copy of the block holding its
+   boundary, an owner's move off the block it published at its prompt end;
+   the copy waits on the execution stream and precedes the zeroing because
+   a source may be re-granted and zeroed by this very plan -- or re-granted
+   as another copy's destination, which the arena then writes only after the
+   pairs reading it; a destination is never zeroed; no op id, no ACK), then
+   page zeroing (the new
+   owner's sanitization),
    then L3 prefetches (`PrefetchOp`: Host-lane submissions with no stream
    dependency, nothing in the round reads their pages), then the
    Device-bound copies -- `LoadBackOp` and `RestoreOp`, ordered

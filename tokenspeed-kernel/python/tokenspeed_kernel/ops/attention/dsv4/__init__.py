@@ -206,25 +206,10 @@ def dsv4_swa_cache_insert(
         raise TypeError("slot_mapping must have dtype int32 or int64")
     if not positions.is_contiguous() or not slot_mapping.is_contiguous():
         raise ValueError("positions and slot_mapping must be contiguous")
-    if page_size <= 0:
-        raise ValueError(f"page_size must be positive, got {page_size}")
-    if rms_norm_eps <= 0.0:
-        raise ValueError(f"rms_norm_eps must be positive, got {rms_norm_eps}")
     if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] != 64:
         raise ValueError("cos_sin_cache must have shape [max_position, 64]")
     if cos_sin_cache.dtype != torch.float32 or not cos_sin_cache.is_contiguous():
         raise TypeError("cos_sin_cache must be contiguous float32")
-    row_bytes = 448 + 2 * 64 + 448 // 64 + 1
-    if (
-        swa_kv_cache.dtype != torch.uint8
-        or swa_kv_cache.ndim != 2
-        or swa_kv_cache.shape[1] < page_size * row_bytes
-        or swa_kv_cache.stride(1) != 1
-    ):
-        raise ValueError(
-            "swa_kv_cache must be a 2D uint8 page-planar cache with "
-            f"at least {page_size * row_bytes} bytes per page"
-        )
     tensors = (kv, swa_kv_cache, slot_mapping, positions, cos_sin_cache)
     if any(tensor.device != q.device for tensor in tensors):
         raise ValueError("all DeepSeek V4 SWA cache tensors must share a device")
@@ -445,18 +430,8 @@ def dsv4_prefill(
         raise ValueError("indices must have one row per query token")
     if lens.ndim != 1 or lens.numel() != tokens:
         raise ValueError("lens must have one entry per query token")
-    if indices.dtype not in (torch.int32, torch.int64):
-        raise TypeError("indices must have dtype int32 or int64")
-    if lens.dtype not in (torch.int32, torch.int64):
-        raise TypeError("lens must have dtype int32 or int64")
-    if attn_sink.numel() < q.shape[1]:
-        raise ValueError("attn_sink must provide one value per query head")
-    if any(tensor.device != q.device for tensor in (kv, indices, lens, attn_sink)):
-        raise ValueError("all selected-attention tensors must share a device")
-    if out is not None and (
-        out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
-    ):
-        raise ValueError("out must match q shape, dtype, and device")
+    if out is not None and (out.shape != q.shape or out.dtype != q.dtype):
+        raise ValueError("out must match q shape and dtype")
 
     signature = _attention_format_signature(q=q, kv=kv)
     traits = {
@@ -595,26 +570,11 @@ def dsv4_decode(
         raise ValueError(
             f"q must have shape [tokens, heads, 512], got {tuple(q.shape)}"
         )
-    if swa_kv_cache.dim() != 2 or swa_kv_cache.dtype != torch.uint8:
-        raise ValueError("swa_kv_cache must be a 2D uint8 page-planar cache")
-    if swa_page_size <= 0 or swa_kv_cache.shape[1] % swa_page_size:
-        raise ValueError("swa_kv_cache width must be divisible by swa_page_size")
     tokens = int(q.shape[0])
     if swa_slots.dim() < 2 or int(swa_slots.shape[0]) != tokens:
         raise ValueError("swa_slots must have one row per query token")
     if swa_lens.numel() != tokens:
         raise ValueError("swa_lens must have one entry per query token")
-    if swa_slots.dtype not in (torch.int32, torch.int64):
-        raise TypeError("swa_slots must have dtype int32 or int64")
-    if swa_lens.dtype not in (torch.int32, torch.int64):
-        raise TypeError("swa_lens must have dtype int32 or int64")
-    if attn_sink is not None and attn_sink.numel() < q.shape[1]:
-        raise ValueError("attn_sink must provide one value per query head")
-    if any(
-        tensor is not None and tensor.device != q.device
-        for tensor in (swa_kv_cache, swa_slots, swa_lens, attn_sink)
-    ):
-        raise ValueError("all paged selected-attention tensors must share a device")
 
     extra_values = (extra_kv_cache, extra_slots, extra_lens, extra_page_size)
     has_extra_segment = any(value is not None for value in extra_values)
@@ -623,33 +583,13 @@ def dsv4_decode(
             "extra_kv_cache, extra_slots, extra_lens, and extra_page_size "
             "must be provided together"
         )
-    if extra_kv_cache is not None:
-        assert extra_slots is not None
-        assert extra_lens is not None
-        assert extra_page_size is not None
-        if extra_kv_cache.dim() != 2 or extra_kv_cache.dtype != torch.uint8:
-            raise ValueError("extra_kv_cache must be a 2D uint8 page-planar cache")
-        if extra_page_size <= 0 or extra_kv_cache.shape[1] % extra_page_size:
-            raise ValueError(
-                "extra_kv_cache width must be divisible by extra_page_size"
-            )
+    if has_extra_segment:
         if extra_slots.dim() < 2 or int(extra_slots.shape[0]) != tokens:
             raise ValueError("extra_slots must have one row per query token")
         if extra_lens.numel() != tokens:
             raise ValueError("extra_lens must have one entry per query token")
-        if extra_slots.dtype not in (torch.int32, torch.int64):
-            raise TypeError("extra_slots must have dtype int32 or int64")
-        if extra_lens.dtype not in (torch.int32, torch.int64):
-            raise TypeError("extra_lens must have dtype int32 or int64")
-        if any(
-            tensor.device != q.device
-            for tensor in (extra_kv_cache, extra_slots, extra_lens)
-        ):
-            raise ValueError("all extra selected-attention tensors must share a device")
-    if out is not None and (
-        out.shape != q.shape or out.dtype != q.dtype or out.device != q.device
-    ):
-        raise ValueError("out must match q shape, dtype, and device")
+    if out is not None and (out.shape != q.shape or out.dtype != q.dtype):
+        raise ValueError("out must match q shape and dtype")
 
     swa_width = int(swa_slots.numel() // tokens)
     extra_width = int(extra_slots.numel() // tokens) if extra_slots is not None else 0
@@ -668,11 +608,7 @@ def dsv4_decode(
             {
                 swa_slots.dtype,
                 swa_lens.dtype,
-                *(
-                    (extra_slots.dtype, extra_lens.dtype)
-                    if extra_slots is not None and extra_lens is not None
-                    else ()
-                ),
+                *((extra_slots.dtype, extra_lens.dtype) if has_extra_segment else ()),
             }
         ),
         "return_lse": return_lse,
@@ -793,10 +729,6 @@ def dsv4_prefill_topk(
         are set to -1.
     """
     q_values, _ = index_q
-    if index_k_format not in ("mxfp4", "fp8_scaled"):
-        raise ValueError(
-            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
-        )
     if q_values.ndim < 3:
         raise ValueError(
             "index_q values must have at least 3 dimensions, got "
@@ -812,8 +744,6 @@ def dsv4_prefill_topk(
         "topk": int(topk),
         "index_k_format": index_k_format,
     }
-    if weights.dtype != torch.float32:
-        raise TypeError(f"weights must be float32, got {weights.dtype}")
     signature = _attention_format_signature(
         q=q_values, weights=weights, index_k_cache=index_k_cache
     )
@@ -896,13 +826,9 @@ def dsv4_index_candidates(
     index_k_format selects fp8_scaled or mxfp4; solution=None uses dispatch.
     Returns global logical offsets and FP32 scores, with (-1, -inf) padding.
     """
-    if index_k_format not in ("fp8_scaled", "mxfp4"):
-        raise ValueError(f"Unsupported Index-K format: {index_k_format}")
     q = index_q[0]
     if q.ndim != 3 or weights.shape != q.shape[:2]:
         raise ValueError("Index queries and per-head weights must match")
-    if topk <= 0 or topk & (topk - 1):
-        raise ValueError("Index candidate topk must be a positive power of two")
     if query_requests.shape != (q.shape[0],) or causal_lens.shape != (q.shape[0],):
         raise ValueError("Index candidate rows must match queries")
     if local_page_table.ndim != 2 or 0 in local_page_table.shape:
@@ -989,10 +915,6 @@ def dsv4_decode_topk(
         is provided.
     """
     q_values, _ = index_q
-    if index_k_format not in ("mxfp4", "fp8_scaled"):
-        raise ValueError(
-            "index_k_format must be 'mxfp4' or 'fp8_scaled', got " f"{index_k_format!r}"
-        )
     if q_values.ndim < 3:
         raise ValueError(
             "index_q values must have at least 3 dimensions, got "
@@ -1008,8 +930,6 @@ def dsv4_decode_topk(
         "topk": int(topk),
         "index_k_format": index_k_format,
     }
-    if weights.dtype != torch.float32:
-        raise TypeError(f"weights must be float32, got {weights.dtype}")
     signature = _attention_format_signature(
         q=q_values, weights=weights, index_k_cache=index_k_cache
     )

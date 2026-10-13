@@ -120,6 +120,7 @@ def _config(device):
 def _recipe(device):
     return DeepseekV41Recipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             pipeline_parallel_size=1,
             chunked_prefill_size=512,
             max_num_seqs=2,
@@ -1198,6 +1199,7 @@ def test_pd_contract_plan_and_manifest():
         request_row=1,
         prefix_len=prefix_len,
         prompt_len=prompt_len,
+        state_prefix_cached=False,
     )
     blocks = {group.group_id: group.block_ids for group in manifest.groups}
     specs = {spec.group_id: spec for spec in contract.group_specs}

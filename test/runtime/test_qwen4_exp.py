@@ -1870,11 +1870,12 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].entry_stride_tokens == 1
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].block_granularity == 64
     assert setup.spec.memory_plan.prefix_granularity == 256
+    # A State group's blocks are its two state slots and span no tokens.
     assert all(
         setup.spec.memory_plan.prefix_granularity % group.block_granularity == 0
         for group in groups.values()
+        if group.family != "state"
     )
-    assert groups[QWEN4_EXP_PLE_CACHE_GROUP].block_granularity == 256
     assert fields[context_field].dtype == "int64"
     selected, consumers = select_layer_fields(
         setup.spec.memory_plan.fields,

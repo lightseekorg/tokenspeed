@@ -165,21 +165,17 @@ def test_kvp_takes_both_host_tiers_but_not_l3():
     # class and the executor translates ownership on both ends of every row,
     # so a KV-page-sharded engine may run the Host KVStore and the snapshot
     # pool. L3 keys have no owner-stable form under sharding and stay refused.
-    args = ServerArgs(
+    sharded_decode = dict(
         model="x",
         world_size=2,
+        disaggregation_mode="decode",
         kv_parallel_size=2,
-        retraction_snapshot_host_gb=1.0,
+        decode_context_parallel_size=2,
     )
+    args = ServerArgs(**sharded_decode, retraction_snapshot_host_gb=1.0)
     assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
     with pytest.raises(ValueError, match="L3.*kv-parallel-size"):
-        ServerArgs(
-            model="x",
-            world_size=2,
-            kv_parallel_size=2,
-            kvstore_storage_backend="mooncake",
-            **PREFETCH,
-        )
+        ServerArgs(**sharded_decode, kvstore_storage_backend="mooncake", **PREFETCH)
 
 
 def test_forced_retraction_is_a_test_knob_that_needs_a_pool():
@@ -279,7 +275,9 @@ def test_describe_states_the_pool_or_that_capacity_blocks_abort():
     sizing = _resolve(_request(ratio=0.25), l2_tier=True)
     line = sizing.describe(host_lcm_block_bytes=BLOCK, blob_bytes=250_000, l2_tier=True)
     assert "0.01 GB (10 LCM blocks" in line
-    assert "up to 8 retracted requests (2.00 MB slot-state arena)" in line
+    # Blob slots are numbered from 1, so the arena carries one row per slot
+    # plus the unused row 0.
+    assert "up to 8 retracted requests (2.25 MB slot-state arena)" in line
     assert "tails to the pool" in line
 
 
@@ -329,7 +327,6 @@ STATE = CacheGroupSpec(
     retention="full_history",
     replayable=False,
     family="state",
-    checkpoint_granularity=PAGE,
 )
 
 
@@ -337,7 +334,9 @@ def test_tail_is_one_page_per_published_group_plus_a_replayable_groups_worst_cas
     specs = (FULL, SLIDING)
     model = _model(specs, {"full": 1, "swa": 1})
     worst_case = model.single_request_group_pages(4096)
-    assert worst_case[0] == 4096 // PAGE  # the full group's whole context
+    # The full group's whole context, plus the page the prompt-end copy-in
+    # hands to the cache while the request continues on a fresh one.
+    assert worst_case[0] == 4096 // PAGE + 1
     # The replayable group's worst case is the scheduler's (window + chunk).
     assert tail_lcm_blocks_per_request(
         model, specs, 4096
@@ -347,7 +346,7 @@ def test_tail_is_one_page_per_published_group_plus_a_replayable_groups_worst_cas
     assert tail_lcm_blocks_per_request(
         model, specs, 4096
     ) == model.lcm_blocks_needed_for([1, worst_case[1]])
-    # A state group checkpoints to L2 like the full group: one page each.
+    # A state group publishes to L2 like the full group: one page each.
     specs = (FULL, STATE)
     model = _model(specs, {"full": 1, "state": 1})
     assert tail_lcm_blocks_per_request(

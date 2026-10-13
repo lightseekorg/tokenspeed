@@ -251,7 +251,6 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                         retention="full_history",
                         sliding_window_tokens=None,
                         family="state",
-                        checkpoint_granularity=self.prefix_granularity,
                         replayable=False,
                     ),
                     ple_fields,
