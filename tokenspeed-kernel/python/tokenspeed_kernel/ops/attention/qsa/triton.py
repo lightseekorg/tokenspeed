@@ -1710,7 +1710,7 @@ def triton_qsa_block_topk_stream(
     page_size: int,
     block_topk: int,
     max_partial_bytes: int,
-    enable_pdl: bool = True,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Fused streaming path: score tiles and fold them into a running top-k.
 
