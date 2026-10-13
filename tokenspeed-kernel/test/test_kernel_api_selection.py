@@ -185,7 +185,6 @@ _ATTENTION_GLUON_MODULES = [
     _attention_gluon_kda,
     _attention_gluon_mha,
     _attention_gluon_qsa,
-    _attention_triton_qsa,
     _attention_gluon_mla,
     _attention_gluon_rmha,
 ]
@@ -210,6 +209,7 @@ _RELOAD_MODULES = [
     *_ATTENTION_GLUON_MODULES,
     _attention_triton_mha,
     _attention_triton_mla,
+    _attention_triton_qsa,
     _attention_triton_kpool,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
