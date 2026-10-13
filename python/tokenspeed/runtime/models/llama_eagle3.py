@@ -32,6 +32,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from tokenspeed.runtime.distributed.comm_ops import all_gather, all_gather_single
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
@@ -557,6 +558,9 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
         self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
+        # The target vocab shard (and its group) a replicated draft embedding is gathered from.
+        self._target_embed_shard: torch.Tensor | None = None
+        self._target_embed_group: tuple[int, ...] | None = None
 
         if self.config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
@@ -688,6 +692,17 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             and self.config.target_hidden_size != self.config.hidden_size
         ):
             return
+        sharded = self.model.embed_tokens
+        if (
+            sharded.tp_size > 1
+            and embed.shape == sharded.weight.shape
+            and sharded.num_embeddings == sharded.org_vocab_size
+            and not self.config.tie_word_embeddings
+        ):
+            # Draft from a replicated copy of the sharded target embedding: no per-step all-reduce.
+            self._target_embed_shard = embed
+            self._target_embed_group = sharded.tp_group
+            embed = all_gather(embed.contiguous(), sharded.tp_group, dim=0)
         if embed.shape != self.model.embed_tokens.weight.shape:
             # Target embedding layout differs (e.g. replicated instead of
             # vocab-parallel); rebuild the draft embedding to match it.
@@ -711,6 +726,16 @@ class LlamaForCausalLMEagle3(BaseCausalLM):
             self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def refresh_target_embed(self) -> None:
+        """Re-gather the replicated draft embedding in place from the updated target shard."""
+        if self._target_embed_shard is None:
+            return
+        all_gather_single(
+            self.model.embed_tokens.weight,
+            self._target_embed_shard,
+            self._target_embed_group,
+        )
 
 
 EntryClass = [LlamaForCausalLMEagle3]

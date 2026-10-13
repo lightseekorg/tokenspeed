@@ -1104,6 +1104,11 @@ than failing at its first forward (`BaseCausalLM.set_embed_and_head` refuses
 `embed=None` outright, since a generic draft keeps none). Off the pipeline
 both sides are shared and the draft's copies are dropped before the KV-cache
 budget is profiled, as before.
+A Llama EAGLE-3 draft under attention TP instead gathers the target's
+vocab-sharded embedding into a replicated table at bind time (one full table
+per rank), so a draft step needs no embedding all-reduce;
+`Eagle.on_target_weights_updated` re-gathers it in place after an in-place
+target weight update.
 
 Checkpoint tap labels remain zero-based completed-layer IDs. Prefix tap L is
 produced after L. AttnRes tap L is produced at L+1's entry by that layer's

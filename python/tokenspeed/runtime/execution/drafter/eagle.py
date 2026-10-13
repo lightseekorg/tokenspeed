@@ -39,6 +39,7 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeDraftInputs,
 )
+from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 DsaTopKState = tuple[Any | None, Any | None]
@@ -196,6 +197,13 @@ class Eagle(BaseDrafter):
         if self.draft_history_lengths_buf is None:
             return []
         return [self.draft_history_lengths_buf[slot]]
+
+    @override
+    def on_target_weights_updated(self) -> None:
+        model = self.draft_model_runner.model
+        # Only an EAGLE-3 draft keeps a replicated copy of the target embedding.
+        if isinstance(model, LlamaForCausalLMEagle3):
+            model.refresh_target_embed()
 
     def bind_tree(self, tree_spec: TreeSpec) -> None:
         """Draft trees: top-K lanes per step (tree.py) in the draft paged cache's lane window."""
