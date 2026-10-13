@@ -1137,17 +1137,34 @@ class DeepseekV41Attention(nn.Module):
                         rows.query.request_indices,
                     )
                 if self.indexer is not None:
+                    partition = None
                     if backend.indexer_needs_scores(
                         self.layer_id, positions, requests, mode
                     ):
-                        index_q, index_weights = self.indexer(
-                            hidden_states,
-                            index_q_input,
-                            index_q_scale,
-                            positions,
-                            self.rotary_emb,
+                        partition = (
+                            backend.plan_indexer_queries(
+                                self.layer_id, positions, requests, mode, index_group
+                            )
+                            if hidden_states.is_cuda
+                            and mode.is_extend()
+                            and not mode.is_mixed()
+                            else None
                         )
-                    if mode.is_decode():
+                        index_x, index_input, index_scale, index_positions = (
+                            hidden_states, index_q_input, index_q_scale, positions
+                        )
+                        if partition is not None:
+                            # Only indexer projections consume the local query rows.
+                            index_x, index_input, index_positions = (
+                                t[partition.local_slice].contiguous()
+                                for t in (hidden_states, index_q_input, positions)
+                            )
+                            if index_q_scale is not None:
+                                index_scale = index_q_scale[partition.local_slice].contiguous()
+                        index_q, index_weights = self.indexer(
+                            index_x, index_input, index_scale, index_positions, self.rotary_emb
+                        )
+                    if mode.is_decode() or partition is not None:
                         prepared = backend.prepare_global_selection(
                             self.layer_id,
                             index_q,
@@ -1156,6 +1173,7 @@ class DeepseekV41Attention(nn.Module):
                             requests,
                             mode,
                             index_group,
+                            projected_partition=partition,
                         )
                         index_q = index_weights = None
             q, _ = self.wq_b(

@@ -572,6 +572,10 @@ class ServerArgs:
     # forward's rows over the attention TP group (1 = off; equals
     # kv_parallel_size when on).
     query_context_parallel_size: int = 1
+    deepseek_v41_attention_query_swa_min_tokens: int = 4096
+    deepseek_v41_attention_query_min_tokens: int = 1024
+    deepseek_v41_attention_query_parallel_size: int = 1
+    deepseek_v41_indexer_query_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -1145,6 +1149,24 @@ class ServerArgs:
         )
 
         # Impl constraints:
+        if self.deepseek_v41_attention_query_swa_min_tokens < 1:
+            raise ValueError(
+                "--deepseek-v41-attention-query-swa-min-tokens must be positive"
+            )
+        if self.deepseek_v41_attention_query_min_tokens < 1:
+            raise ValueError(
+                "--deepseek-v41-attention-query-min-tokens must be positive"
+            )
+        if self.deepseek_v41_attention_query_parallel_size not in (1, attn_tp_size):
+            raise ValueError(
+                "--deepseek-v41-attention-query-parallel-size must be 1 or the "
+                f"attention TP size {attn_tp_size}"
+            )
+        if self.deepseek_v41_indexer_query_parallel_size not in (1, attn_tp_size):
+            raise ValueError(
+                "--deepseek-v41-indexer-query-parallel-size must be 1 or the "
+                f"attention TP size {attn_tp_size}"
+            )
         validate_context_parallel_roles(
             kvp_size=self.mapping.attn.kvp_size,
             dcp_size=self.decode_context_parallel_size,
@@ -3722,6 +3744,42 @@ class ServerArgs:
             "bits match a TP1 full-K GEMM. attn needs --attn-head-tp-size > 1; "
             "attn+dense also needs --dense-tp-size > 1; both need unquantized "
             "o_proj / down_proj weights.",
+        )
+        parser.add_argument(
+            "--deepseek-v41-attention-query-swa-min-tokens",
+            type=int,
+            default=ServerArgs.deepseek_v41_attention_query_swa_min_tokens,
+            help="Additional minimum query rows per request for SWA-only V4.1 "
+            "attention QCP head exchange (default: 4096). The larger of this and "
+            "--deepseek-v41-attention-query-min-tokens applies. Tune for the "
+            "deployment; this is not a hardware auto-tuner.",
+        )
+        parser.add_argument(
+            "--deepseek-v41-attention-query-min-tokens",
+            type=int,
+            default=ServerArgs.deepseek_v41_attention_query_min_tokens,
+            help="Minimum query rows per request in the current prefill window "
+            "for V4.1 attention QCP head exchange (default: 1024). Also requires "
+            "at least one query per rank. This threshold does not enable "
+            "exchange or auto-tune for the GPU/interconnect.",
+        )
+        parser.add_argument(
+            "--deepseek-v41-attention-query-parallel-size",
+            type=int,
+            default=ServerArgs.deepseek_v41_attention_query_parallel_size,
+            help="Enable DeepSeek V4.1 prefill attention QCP via query/head exchange "
+            "over attention TP. Set 1 to disable (default), or attention TP "
+            "size to enable for eligible long requests with 64 total heads. "
+            "KV storage and model projections remain unchanged.",
+        )
+        parser.add_argument(
+            "--deepseek-v41-indexer-query-parallel-size",
+            type=int,
+            default=ServerArgs.deepseek_v41_indexer_query_parallel_size,
+            help="Enable DeepSeek V4.1 long-prefill encoder indexer QCP for query "
+            "projections and scoring over attention TP. Set 1 to disable "
+            "(default), or the attention TP size to enable. KV remains "
+            "replicated; this does not enable the generic QCP execution path.",
         )
         parser.add_argument(
             "--query-context-parallel-size",
