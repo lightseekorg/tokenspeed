@@ -1,8 +1,8 @@
 """Binding-smoke tests for the cache-group scheduler (no GPU).
 
 The scheduler scenarios themselves are covered by the C++ suites
-(``tests/cpp/test_kvcache_lifecycle.cpp`` and
-``test_kvcache_scenarios.cpp``); this module keeps the marshalling
+(``tests/cpp/test_kv_cache_lifecycle.cpp`` and
+``test_cache_scenarios.cpp``); this module keeps the marshalling
 surface honest: per-group block tables (including the sliding-window null
 hole), the four-group Kimi-K3 namespace with finish/abort page restoration,
 atomic OOM deferral, and the readmit op's ``prefill_lengths`` /
