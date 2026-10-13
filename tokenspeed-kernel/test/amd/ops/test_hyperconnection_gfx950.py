@@ -132,6 +132,22 @@ def test_mix_graph_replay_reuses_workspace():
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+# The aborted capture leaves an empty graph behind.
+@pytest.mark.filterwarnings("ignore:The CUDA Graph is empty")
+def test_mix_workspace_is_not_first_created_under_capture(monkeypatch):
+    # A capture-time allocation would zero the counters only when that graph
+    # replays, while other launches of the tiling would share them.
+    monkeypatch.setattr(hyperconnection, "_workspaces", {})
+    inputs = _inputs(64, LOWRANK + HC_COUNT, torch.bfloat16, seed=10)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with pytest.raises(RuntimeError, match="run this row count eagerly"):
+        with torch.cuda.graph(graph, stream=stream):
+            _mix(inputs, "gluon_hyperconnection_mix_gfx950")
+    assert hyperconnection._workspaces == {}
+
+
 def test_mix_row_count_does_not_recompile():
     inputs = _inputs(256, LOWRANK + HC_COUNT, torch.bfloat16, seed=11)
 

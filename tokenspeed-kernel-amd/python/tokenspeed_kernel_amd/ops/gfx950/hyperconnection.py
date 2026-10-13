@@ -368,14 +368,22 @@ def _workspace(
     tiling. The last split of each tile resets its counter, so the counters
     are zero again whenever a launch completes; launches sharing a workspace
     (one per device and tiling) must therefore be ordered on one stream, as
-    the model's hyper-connection layers are. A workspace first requested
-    during graph capture is allocated from the graph's pool, and its zero
-    fill becomes part of that graph.
+    the model's hyper-connection layers are.
+
+    The first request for a tiling must run eagerly: under graph capture the
+    counter zero fill would only run when that one graph replays, while every
+    later launch of the tiling reuses the cached counters. Serving's eager
+    warmups before each capture allocate every tiling a graph uses.
     """
     index = torch.cuda.current_device() if device.index is None else device.index
     key = (index, split_k, block_m, block_n, n_tiles)
     workspace = _workspaces.get(key)
     if workspace is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "gfx950 hyper-connection mix workspace is not initialized for "
+                "graph capture; run this row count eagerly before capture"
+            )
         tiles = -(-MAX_ROWS // block_m) * n_tiles
         workspace = (
             torch.empty(
