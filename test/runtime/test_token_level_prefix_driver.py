@@ -235,7 +235,13 @@ def test_a_state_group_hits_where_its_checkpoint_was_published() -> None:
     (decode,) = _forwards(plan)
     live_block = first_decode_row[1]
     assert _state_row(decode) == [0, live_block]
+    # The second decode is in flight, writing the live block in place: a
+    # finish now publishes the KV rows below the frontier but not that block
+    # (its bytes are not the frontier's state). Land it first so the finish
+    # finds the request quiescent and publishes the state at 42 as well.
+    _land(scheduler, decode, 1002)
     _finish(scheduler, decode)
+    computed = 42
 
     plan, prefill = _hit(scheduler, "b", PROMPT + [999])
     assert list(prefill.extend_prefix_lens) == [40]
@@ -248,8 +254,8 @@ def test_a_state_group_hits_where_its_checkpoint_was_published() -> None:
     (decode,) = _forwards(plan)
     _finish(scheduler, decode)
 
-    plan, prefill = _hit(scheduler, "c", PROMPT + [1000, 5, 6])
-    assert list(prefill.extend_prefix_lens) == [41]
+    plan, prefill = _hit(scheduler, "c", PROMPT + [1000, 1001, 5, 6])
+    assert list(prefill.extend_prefix_lens) == [computed]
     row = _state_row(prefill)
     assert row[0] == live_block and row[1] > 0 and row[1] != row[0]
     _land(scheduler, prefill, 4000)
