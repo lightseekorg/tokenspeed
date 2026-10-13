@@ -274,7 +274,7 @@ def test_kernel_ut_tasks_cover_every_test_once_per_runner():
         "b200-1gpu",
         "gb200-1gpu",
         "b300-1gpu",
-        "amd-mi35x-1gpu-test",
+        "amd-mi355-1gpu",
     }
     for label in labels:
         executions = Counter()
@@ -326,7 +326,7 @@ def test_runtime_1gpu_tasks_run_every_partition_once_per_runner():
         "h100-1gpu",
         "b200-1gpu",
         "gb200-1gpu",
-        "amd-mi35x-1gpu-test",
+        "amd-mi355-1gpu",
     }
     for label, parts in partitions.items():
         size = parts[0][1]
