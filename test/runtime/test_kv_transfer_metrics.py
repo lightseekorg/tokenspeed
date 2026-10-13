@@ -28,6 +28,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
 from prometheus_client import CollectorRegistry
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -74,10 +75,9 @@ def test_latency_histogram_records_count_sum_and_buckets() -> None:
         )
         == 2.0
     )
-    assert (
-        registry.get_sample_value("tokenspeed:kv_transfer_latency_seconds_sum", LABELS)
-        == 0.503
-    )
+    assert registry.get_sample_value(
+        "tokenspeed:kv_transfer_latency_seconds_sum", LABELS
+    ) == pytest.approx(0.503)
     # The 3ms sample lands in the 5ms bucket, the 0.5s one does not.
     assert (
         registry.get_sample_value(
@@ -151,6 +151,36 @@ def test_prefill_abort_room_records_failure() -> None:
     assert manager.request_status[9] == TransferPoll.Failed
 
 
+def test_prefill_abort_room_counts_once_per_room() -> None:
+    from tokenspeed.runtime.pd.base.status import TransferPoll
+    from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
+
+    registry = CollectorRegistry()
+    manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.kv_transfer_metrics = _make(registry)
+    manager.request_status = {}
+    manager.failure_records = {}
+    manager.failure_lock = threading.Lock()
+    manager.transfer_infos = {}
+
+    # Later chunks of the same room funnel back into abort_room after the
+    # first abort popped transfer_infos; only the first may count.
+    manager.abort_room(9, "first failure")
+    manager.abort_room(9, "later chunk of the same room")
+
+    # A room already recorded (e.g. by a sender-side timeout) is not also a
+    # failure — timeout and failure accounting stay mutually exclusive.
+    manager.failure_records[10] = "sender bootstrap timed out"
+    manager.abort_room(10, "abort after timeout")
+
+    assert (
+        registry.get_sample_value("tokenspeed:kv_transfer_failures_total", LABELS)
+        == 1.0
+    )
+    assert manager.request_status[9] == TransferPoll.Failed
+    assert manager.request_status[10] == TransferPoll.Failed
+
+
 def test_decode_node_failure_records_one_failure_per_affected_room() -> None:
     from tokenspeed.runtime.pd.base.status import TransferPoll
     from tokenspeed.runtime.pd.mooncake.decode import MooncakeKVManagerDecode
@@ -161,23 +191,28 @@ def test_decode_node_failure_records_one_failure_per_affected_room() -> None:
     manager.connection_lock = threading.Lock()
     manager.connection_pool = {}
     manager.prefill_parallel_info = {}
-    manager.addr_to_rooms_tracker = {"prefill-0": {9, 10, 11}}
+    manager.addr_to_rooms_tracker = {"prefill-0": {9, 10, 11, 12, 13}}
     manager.request_status = {
         9: TransferPoll.Bootstrapped,
         10: TransferPoll.Success,
         11: TransferPoll.Transferring,
+        12: TransferPoll.Failed,
+        13: TransferPoll.WaitingForInput,
     }
-    manager.failure_records = {}
+    manager.failure_records = {13: "receiver waiting timed out"}
     manager.failure_lock = threading.Lock()
 
     manager._handle_node_failure("prefill-0")
 
-    # The successful room is not a failure; the other two are.
+    # The successful room is not a failure, nor are the already-failed room
+    # (counted on the prefill side) and the already-timed-out room (counted
+    # as a timeout); only rooms 9 and 11 count.
     assert (
         registry.get_sample_value("tokenspeed:kv_transfer_failures_total", LABELS)
         == 2.0
     )
     assert manager.request_status[9] == TransferPoll.Failed
+    assert manager.request_status[12] == TransferPoll.Failed
     assert manager.request_status[10] == TransferPoll.Success
     assert manager.request_status[11] == TransferPoll.Failed
 

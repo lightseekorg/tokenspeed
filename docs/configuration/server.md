@@ -819,7 +819,7 @@ carry the `model_name` and `app_key` labels:
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per layerwise interval; buckets span 1 ms to 60 s). |
+| `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per transferred chunk — per layerwise interval in layerwise mode; buckets span 1 ms to 60 s). |
 | `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
 
