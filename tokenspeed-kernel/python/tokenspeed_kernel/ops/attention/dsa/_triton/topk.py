@@ -26,7 +26,7 @@ from tokenspeed_kernel.platform import current_platform
 
 _is_nvidia = current_platform().is_nvidia
 
-_RADIX_TOPK_MIN_COLS = 65536
+_RADIX_TOPK_MIN_COLS = 32768
 _RADIX_TOPK_BLOCK_N = 4096
 
 
@@ -1048,10 +1048,11 @@ def _topk_with_padding(
     if rows == 0 or cols == 0:
         return torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
     logits = logits.contiguous()
-    if cols >= _RADIX_TOPK_MIN_COLS:
+    n_cols_padded = _next_power_of_2(max(cols, topk))
+    # Unrolled sort cost follows the padded width, including speculative KV padding.
+    if n_cols_padded >= _RADIX_TOPK_MIN_COLS:
         return _radix_topk(logits, topk)
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
-    n_cols_padded = _next_power_of_2(max(cols, topk))
     block_n = min(n_cols_padded, 2048)
     block_n = max(block_n, topk)
     if n_cols_padded % block_n != 0:

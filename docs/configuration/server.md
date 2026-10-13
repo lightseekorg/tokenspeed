@@ -397,7 +397,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
-| `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages; decode attends the owned pages and merges the partials by LSE (DCP, `docs/serving/parallelism.md`). Allowed on aggregated engines and with `--disaggregation-mode prefill` (every rank of the subgroup sends its owned pages to an unsharded decode). Not supported yet: the decode role; speculative decoding on any ordinary MLA/DSA model (the recipe refuses to shard a cache holding a draft group, whichever dense kernel runs it -- only the DeepSeek V4 and Kimi K3 recipes shard with a draft, and FlashMLA/GPU DSA reject speculation in their DCP decode outright); and L3 storage (`--kvstore-storage-backend`: a page-cyclic sharded group has no owner-stable L3 key). The Host KVStore and the retraction snapshot pool are supported: the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
+| `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4 compressed KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages; decode attends the owned pages and merges the partials by LSE (DCP, `docs/serving/parallelism.md`). Allowed on aggregated engines and on both PD roles, with independently sharded caches on either side (each transfer edge copies only the pages both its prefill rank and its decode rank own). GPU MLA/DSA speculative decoding is supported within each backend's device, dtype and draft-attention capabilities: the recipe shards the draft group like the target's, FlashMLA verification uses per-query local causal lengths and GPU DSA uses causal Top-K selection; non-causal DSA block drafts remain unsupported. Not supported yet: L3 storage (`--kvstore-storage-backend`: a page-cyclic sharded group has no owner-stable L3 key). The Host KVStore and the retraction snapshot pool are supported: the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
 | `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph` and tunes on a decode step; it admits any `max_new_tokens`, because a retracted request resumes by restore rather than by a recovery prefill. Over the query shards of a prefill engine (must equal `--prefill-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--prefill-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
 | `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--prefill-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
@@ -658,8 +658,10 @@ the draft's attention to the full history.
 | `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
 | `--log-requests-level` | Request logging verbosity. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
-| `--enable-metrics` | Enable metrics reporting. |
+| `--enable-metrics` | Enable metrics reporting and serve the engine's Prometheus metrics over HTTP (see "Prometheus metrics" below). |
 | `--metrics-reporters` | Metrics reporter, such as `prometheus`. |
+| `--metrics-port` | Port for the engine's `/metrics` HTTP endpoint. Defaults to an automatically allocated free port (logged at startup). |
+| `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
 
@@ -679,12 +681,58 @@ suffix also lists on its own. The Prometheus waiting gauge and the router
 load snapshot report the scheduler's narrower waiting count, without the
 bootstrapping share.
 
+`tokenspeed:request_queue_time_seconds` is the Prometheus per-request
+queue-wait histogram (`--enable-metrics`): the wall time from a request's
+submission to the scheduler's waiting queue to its first dispatch into a
+forward batch, observed once per request. The enqueue point is submission —
+tokenizer-manager and IPC wait are not included, and neither are the waits
+that precede submission: a structured-output request's grammar-compile wait
+(readiness gates submission), a pause admission hold, and an EPD embedding
+wait all stay out of the sample. A request preempted by capacity retraction
+re-enters the queue without recording a second sample. Under prefill/decode
+disaggregation each node records its own leg: the prefill node's sample spans
+its queue admission to the prefill batch, the decode node's its own admission
+to the decode batch. Bucket boundaries span 0.3 s to 7680 s.
+
 Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify
 step's committed widths and accepted draft-token counts. This reads the
 already-synchronized CPU result and does not add a GPU synchronization, but it
 is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
+
+### Prometheus metrics
+
+With `--enable-metrics`, every engine process on a node (scheduler ranks and
+the tokenizer manager) writes its metrics to a node-local
+`PROMETHEUS_MULTIPROC_DIR`, and the engine's main process aggregates and
+serves them as `GET /metrics` in Prometheus text format. Scrape it at
+`http://<metrics-host>:<metrics-port>/metrics`; the bound address is logged at
+startup. Scrape traffic shares nothing with the request path — a bind failure
+degrades to an error log and serving continues.
+
+Where the endpoint lives depends on the launch mode:
+
+- **Single node / `ts serve`**: the engine's main process serves `/metrics`
+  on `--metrics-port` (an allocated free port if unset). `ts serve` pins this
+  port itself and prints `engine metrics available at http://...` once ready.
+  The gateway's own router metrics are separate: smg serves them on its
+  `--prometheus-port`, which `ts serve` also allocates per launch.
+- **Multi-node**: the main node (`node_rank == 0`) behaves as above. Follower
+  nodes (`node_rank >= 1`) run no tokenizer manager; their dummy health-check
+  server exposes `/metrics` (plus `/health`) on the engine's `--host`/`--port`
+  instead. Scrape every node — the multiprocess directory is node-local, so no
+  single endpoint covers the whole cluster.
+
+### Latency histograms
+
+| Metric | Semantics |
+| --- | --- |
+| `tokenspeed:request_time_per_output_token_seconds` | End-to-end latency divided by output tokens; includes queueing and TTFT. |
+| `tokenspeed:request_queue_time_seconds` | Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. |
+| `tokenspeed:decode_time_per_output_token_seconds` | Decode time per output token after the first output frame; excludes queueing and TTFT. |
+| `tokenspeed:inter_token_latency_seconds` | Per-token interval between output frames, measured by frontend wall clock. |
+| `tokenspeed:scheduler_inter_token_latency_seconds` | Per-token interval between output frames, measured by scheduler timestamps. |
 
 ### Per-request stats
 

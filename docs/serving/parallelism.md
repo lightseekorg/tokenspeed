@@ -649,11 +649,15 @@ compressor state) stay replicated. The attention backend decides how it
 attends the sharded pages (DCP decode, chunked or gathered prefill history);
 the scheduler plans the same virtual blocks on every rank and the runtime
 translates ownership where it reads, writes or copies them
-(`docs/design/cache-concepts.md`). Allowed on aggregated engines and on the PD
-prefill role (every rank of the subgroup sends the pages it owns to an
-unsharded decode engine), with the Host KVStore and the retraction snapshot
-pool; not yet on the decode role or with L3 storage. The full rule set,
-including the per-backend speculation limits, is in
+(`docs/design/cache-concepts.md`). Allowed on aggregated engines and on both
+PD roles, each side sharding its cache independently (a transfer edge copies
+the pages its prefill rank and its decode rank both own), with the Host
+KVStore and the retraction snapshot pool; not yet with L3 storage.
+Speculative decoding runs on a sharded cache with the backends whose DCP
+decode takes a verify window (FlashMLA, CuTe MLA, GPU DSA); the draft group
+shards like the target's. A FlashMLA verify under KVP runs one kernel row per
+query against that query's local causal length, so a width-`w` window reads
+each request's owned pages `w` times instead of once. The full rule set is in
 `docs/configuration/server.md`.
 
 ## Query context parallelism on the prefill role
@@ -883,7 +887,7 @@ Cross-node groups arm the full two-shot capacity at startup. Single-node
 groups start at the one-shot window and serve larger shapes once
 model-level preparation widens the shared workspace. Other
 fan-ins and dtypes, and any shape the workspace rejects, fall back to NCCL
-(inside the trtllm backend for armed groups; the Triton all-reduce tier
+(inside the trtllm backend for armed groups; the Iris all-reduce tier
 serves AMD only, where no trtllm workspace exists). Single-node token
 all-gather/reduce-scatter runs on the Triton RSAG backend and uses NCCL
 across nodes. Logits all-gather and distributed argmax use the same

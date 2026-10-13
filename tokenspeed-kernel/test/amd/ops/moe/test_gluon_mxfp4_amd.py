@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from kimi3_reference import dequantize_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from utils import (
+    assert_no_triton_compile,
     is_amd,
     is_cdna4,
     is_cdna5,
@@ -383,44 +384,36 @@ def test_gfx1250_weighted_topk_reduce_matches_torch() -> None:
     torch.testing.assert_close(actual, expected, atol=0.03125, rtol=0.01)
 
 
-@pytest.mark.parametrize("tokens", [1, 16])
-def test_gfx1250_small_m_route_matches_expert_grouping(tokens: int) -> None:
+@pytest.mark.parametrize("tokens", [1, 16, 17, 64, 128])
+@pytest.mark.parametrize("skewed", [False, True])
+def test_gfx1250_small_m_route_matches_expert_grouping(
+    tokens: int, skewed: bool
+) -> None:
     if not is_cdna5():
         pytest.skip("gfx1250 is required for the CDNA5 fused route")
 
     experts, topk = 896, 16
+    generator = torch.Generator(device="cuda").manual_seed(tokens + skewed)
+    # A skewed batch shares a few experts, so slices span several blocks.
+    pool = (
+        torch.randperm(experts, generator=generator, device="cuda")[: topk + 4]
+        if skewed
+        else torch.arange(experts, device="cuda")
+    )
     ids = torch.stack(
         [
-            (torch.arange(topk, device="cuda", dtype=torch.int32) + token * 7) % experts
-            for token in range(tokens)
+            pool[
+                torch.randperm(pool.numel(), generator=generator, device="cuda")[:topk]
+            ]
+            for _ in range(tokens)
         ]
-    )
-    weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
-    metadata, gather, scatter, gate = (
-        gfx1250_fused._precomputed_topk_route_small_m_gfx1250(
-            weights,
-            ids,
-            experts,
-        )
-    )
+    ).to(torch.int32)
+    weights = torch.rand(tokens, topk, generator=generator, device="cuda")
+
+    route = gfx1250_fused._precomputed_topk_route_small_m_gfx1250(weights, ids, experts)
     torch.cuda.synchronize()
 
-    flat_ids = ids.reshape(-1)
-    expected_sizes = torch.bincount(flat_ids, minlength=experts).to(torch.int32)
-    assert torch.equal(metadata.slice_sizes, expected_sizes)
-    expected_offsets = torch.cat(
-        (
-            torch.zeros(1, device="cuda", dtype=torch.int32),
-            expected_sizes.cumsum(0),
-        )
-    )
-    assert torch.equal(metadata.slice_offs, expected_offsets)
-    assert int(metadata.slice_sizes.sum()) == tokens * topk
-    assert torch.equal(
-        flat_ids[scatter.long()],
-        ids[gather.long(), (scatter % topk).long()],
-    )
-    assert torch.equal(gate, weights.reshape(-1)[scatter.long()])
+    _assert_gfx1250_large_route(ids, weights, experts, route)
 
 
 def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
@@ -462,11 +455,64 @@ def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
     assert torch.equal(gate[:valid_count], weights.reshape(-1)[valid_scatter.long()])
 
 
+@pytest.mark.parametrize(
+    ("route_fn", "kernels", "zero_tail", "warm", "sweep"),
+    [
+        # 33 to 64 tokens fill one 1024-gate extent: the EAGLE3 verify batches.
+        pytest.param(
+            gfx1250_fused._precomputed_topk_route_small_m_gfx1250,
+            (gfx1250_fused._precomputed_topk_route_small_m_gfx1250_kernel,),
+            False,
+            33,
+            (40, 48, 57, 64),
+            id="one_launch",
+        ),
+        # 129 to 250 tokens keep 32-gate chunks and a 128-chunk scan.
+        pytest.param(
+            gfx1250_fused._precomputed_topk_route_large_m_gfx1250,
+            (
+                gfx1250_fused._precomputed_topk_route_large_stage1_gfx1250_kernel,
+                gfx1250_fused._precomputed_topk_route_large_stage2_gfx1250_kernel,
+                gfx1250_fused._precomputed_topk_route_large_stage3_gfx1250_kernel,
+                gfx1250_fused._precomputed_topk_route_large_stage4_gfx1250_kernel,
+            ),
+            True,
+            129,
+            (130, 160, 200, 250),
+            id="staged",
+        ),
+    ],
+)
+def test_gfx1250_route_reuses_binaries_across_batch_sizes(
+    route_fn: Callable,
+    kernels: tuple,
+    zero_tail: bool,
+    warm: int,
+    sweep: tuple[int, ...],
+) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 fused route")
+
+    experts, topk = 896, 16
+
+    def run(tokens: int) -> None:
+        weights, ids = make_round_robin_topk(tokens, experts, topk)
+        route = route_fn(weights, ids, experts)
+        _assert_gfx1250_large_route(ids, weights, experts, route, zero_tail=zero_tail)
+
+    run(warm)
+    with assert_no_triton_compile(*kernels):
+        for tokens in sweep:
+            run(tokens)
+
+
 def _assert_gfx1250_large_route(
     ids: torch.Tensor,
     weights: torch.Tensor,
     experts: int,
     route,
+    *,
+    zero_tail: bool = True,
 ) -> None:
     metadata, gather, scatter, gate = route
     flat_ids = ids.reshape(-1)
@@ -494,12 +540,17 @@ def _assert_gfx1250_large_route(
     )
     assert torch.equal(gather[:valid_count], valid_scatter // ids.shape[1])
     routed_ids = flat_ids[valid_scatter.long()]
-    assert torch.all((routed_ids >= 0) & (routed_ids < experts))
+    expected_routed_ids = torch.repeat_interleave(
+        torch.arange(experts, device=ids.device, dtype=flat_ids.dtype),
+        expected_sizes.long(),
+    )
+    assert torch.equal(routed_ids, expected_routed_ids)
     assert torch.equal(
         gate[:valid_count],
         flat_weights[valid_scatter.long()],
     )
-    assert torch.count_nonzero(gate[valid_count:]) == 0
+    if zero_tail:
+        assert torch.count_nonzero(gate[valid_count:]) == 0
 
     for block_size in metadata.block_sizes():
         expected_blocks = (expected_sizes + block_size - 1) // block_size
@@ -519,6 +570,49 @@ def _assert_gfx1250_large_route(
             expected_schedule
         )
         assert torch.all(metadata.block_schedule(block_size)[num_blocks:] == -1)
+
+
+@pytest.mark.parametrize(
+    ("route_fn", "zero_tail"),
+    [
+        pytest.param(
+            gfx1250_fused._precomputed_topk_route_large_m_gfx1250, True, id="staged"
+        ),
+        # The one-launch route leaves rows past the valid count unwritten.
+        pytest.param(
+            gfx1250_fused._precomputed_topk_route_small_m_gfx1250,
+            False,
+            id="one_launch",
+        ),
+    ],
+)
+def test_gfx1250_route_handles_duplicates_invalid_ids_and_block64(
+    route_fn: Callable, zero_tail: bool
+) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 fused route")
+
+    torch.manual_seed(43)
+    tokens, topk, experts = 37, 7, 11
+    ids = (
+        torch.arange(tokens * topk, device="cuda", dtype=torch.int32).reshape(
+            tokens, topk
+        )
+        % experts
+    )
+    ids[:, 1] = 3
+    ids[::3, 2] = -1
+    ids[1::4, 4] = experts
+    ids[2::5, 5] = experts + 9
+    weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
+
+    route = route_fn(weights, ids, experts)
+    torch.cuda.synchronize()
+
+    _assert_gfx1250_large_route(ids, weights, experts, route, zero_tail=zero_tail)
+    block64_offsets = route[0].block_offs(64)
+    expected64 = (route[0].slice_sizes + 63) // 64
+    assert torch.equal(block64_offsets[1:] - block64_offsets[:-1], expected64)
 
 
 @pytest.mark.parametrize(
@@ -544,17 +638,48 @@ def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64(
     ids[2::5, 5] = experts + 9
     weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
 
-    route = gfx1250_fused._precomputed_topk_route(
-        weights,
-        ids,
-        experts,
-    )
+    route = gfx1250_fused._precomputed_topk_route(weights, ids, experts)
     torch.cuda.synchronize()
 
-    _assert_gfx1250_large_route(ids, weights, experts, route)
+    one_launch = (
+        0 < tokens <= gfx1250_fused._SMALL_ROUTE_MAX_TOKENS
+        and tokens * topk <= gfx1250_fused._SMALL_ROUTE_MAX_GATES
+        and experts <= 1024
+    )
+    _assert_gfx1250_large_route(ids, weights, experts, route, zero_tail=not one_launch)
     block64_offsets = route[0].block_offs(64)
     expected64 = (route[0].slice_sizes + 63) // 64
     assert torch.equal(block64_offsets[1:] - block64_offsets[:-1], expected64)
+
+
+@pytest.mark.parametrize(
+    ("experts", "topk", "tokens", "chunk"),
+    [(896, 16, 300, 64), (896, 16, 1200, 128)],
+)
+def test_gfx1250_staged_route_handles_every_chunk_length(
+    experts: int, topk: int, tokens: int, chunk: int
+) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 fused route")
+
+    assert gfx1250_fused._large_route_chunk(experts, tokens * topk) == chunk
+    generator = torch.Generator(device="cuda").manual_seed(tokens)
+    ids = torch.randint(
+        0,
+        experts,
+        (tokens, topk),
+        generator=generator,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    ids[::7, 0] = -1
+    ids[3::11, -1] = experts
+    weights = torch.rand(tokens, topk, generator=generator, device="cuda")
+
+    route = gfx1250_fused._precomputed_topk_route_large_m_gfx1250(weights, ids, experts)
+    torch.cuda.synchronize()
+
+    _assert_gfx1250_large_route(ids, weights, experts, route)
 
 
 def test_gfx1250_weighted_topk_reduce_masks_invalid_rows() -> None:

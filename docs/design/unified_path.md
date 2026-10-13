@@ -60,9 +60,12 @@ unconditionally, so the router and every other runner-facing node call
 rewriting rows the prefix hit already shares. Likewise every node without a
 gathered-history extend arm calls `reject_query_shard`; the router forwards
 the shard to its leaves together with `page_table_cpu`, the host mirror of
-the extend rows of each leaf's kernel page table (built only for a sharded
-forward, `None` otherwise), and the one leaf that attends a shard — GPU DSA —
-counts page ownership from it on the host. No default values: the runner
+the extend rows of each leaf's kernel page table (built for a sharded
+forward, and for an extend with a prefix on a KVP page-sharded group; `None`
+otherwise). The one leaf that attends a shard — GPU DSA — counts page
+ownership from it on the host, and an MLA leaf declaring `supports_mla_dcp`
+hands it to `_prepare_prefix_history`, which splits the prefix-chunk gathers
+by page owner the same way. No default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
 idle replay passes the empty `[:0]` slices), so a node that reads a field
 can never see a silently-defaulted one. This is deliberate — a `= False`
@@ -917,7 +920,7 @@ vocabulary is fixed, with exactly one conversion point:
 | **`CacheGroupRouter`** | attention group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding and KV write-location slot math | kernel calls |
 | `QSAIndexerBackend` | its raw compressed/recent group tables, query lengths, full-KV address view and private verify workspace | MHA leaf metadata, persistent cache allocation |
 | `Qwen4ExpPLEBackend` | its PLE checkpoint table, input/output checkpoints and verify workspace | Mamba metadata and verify context, persistent cache allocation |
-| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard also `page_table_cpu`, the host mirror of its extend rows, for ownership counts | groups, block tables, contracts, draft/target table provenance |
+| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix when its group is KVP page-sharded, also `page_table_cpu`, the host mirror of its extend rows, for page-owner counts | groups, block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4) | their own family's raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
 The runner (`ForwardStepRunner`) does one thing with tables: hand the

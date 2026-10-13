@@ -70,6 +70,11 @@ def get_max_chunk_capacity():
     )
 
 
+def prefix_chunk_len(batch_size: int) -> int:
+    """Prefix rows each request contributes to one prefix-chunk loop."""
+    return get_max_chunk_capacity() // batch_size
+
+
 # Here we suppose the length of each chunk is equal
 # For example, if we have 4 sequences with seq length [256, 512, 768, 1024], chunk_len = 256
 # num_chunks = cdiv(1024, 256) = 4
@@ -126,8 +131,7 @@ def get_chunks_paged(prefix_lens, prefix_lens_cpu, page_table, page_size):
     device: torch.device = prefix_lens.device
     batch_size = len(prefix_lens_cpu)
 
-    chunk_capacity = get_max_chunk_capacity()
-    chunk_len = chunk_capacity // batch_size
+    chunk_len = prefix_chunk_len(batch_size)
     max_prefix = prefix_lens_cpu.max().item()
     num_chunks = (max_prefix + chunk_len - 1) // chunk_len
 

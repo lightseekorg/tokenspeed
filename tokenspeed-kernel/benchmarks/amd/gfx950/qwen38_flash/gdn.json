@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "qwen38_flash_tp2"
+  },
+  "cases": [
+    {
+      "id": "qwen38_flash.attention.gdn_decode_step/decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "gdn_decode_step",
+        "parameters": {
+          "batch": [
+            1,
+            16
+          ],
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5121
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.attention.gdn_decode_mtp/verify-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "gdn_decode_mtp",
+        "parameters": {
+          "batch": [
+            8,
+            16
+          ],
+          "tokens": 4,
+          "state_writes": [
+            "per_token",
+            "none"
+          ],
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5122
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.5
+      }
+    },
+    {
+      "id": "qwen38_flash.attention.gdn_chunk_prefill/prefill-2x4k-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "gdn_chunk_prefill",
+        "parameters": {
+          "sequences": 2,
+          "tokens_per_sequence": 4096,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5123
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0
+      }
+    },
+    {
+      "id": "qwen38_flash.attention.gdn_chunk_prefill/prefill-8k-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "gdn_chunk_prefill",
+        "parameters": {
+          "sequences": 1,
+          "tokens_per_sequence": 8192,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5124
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 10.0
+      }
+    }
+  ]
+}

@@ -139,17 +139,43 @@ The kernel packs query/head rows into M256 tiles and uses 4-CTA clusters
 to separate QK/softmax from PV, with a 2-CTA fallback. BF16 output keeps
 using the shared kernel.
 
+The M256 kernel and its 2-CTA fallback also support native BF16 output for
+direct launches through `_sm107_fp8_out_decode`. The compilation helper takes
+an explicit `output_dtype`, which determines the output tensor type and is
+part of the compile cache key. Epilogues, the split-KV reducer and empty-row
+stores write the selected dtype directly; no conversion kernel is needed.
+Q/KV and probabilities remain FP8, and split-KV partials remain FP32. Changing
+the output dtype does not change split selection or softmax precision.
+BF16 results are checked against an FP32 reference; bitwise equality with
+the shared M128 kernel is not guaranteed because the computation order and
+normalization parameters differ.
+
 The public wrapper uses FP32 for softmax exponentials and row sums. Packed
 FP16 softmax remains an explicit option for direct kernel construction.
+In the mixed-cluster kernel, both precisions handle each softmax group's
+final tile in the masked tail loop. This removes final-sum exchange branches
+from the full-tile loop while preserving causal masks and odd/even tile counts.
+Unsplit walks retain the normalization base for maximum increases of up to
+4 log2 units; split chunks use 8. This reduces PV rescaling and bounds the
+unnormalized probabilities by 16 and 256 respectively, within FP8 E4M3's range.
+The normalization base affects FP8 rounding, so output and LSE accuracy are
+checked against an FP32 reference.
 
-FP8 output supports up to four M256 tiles per request. By default, `H` must
-divide 256 and `q_len` must be a multiple of `256 / H`;
+Automatic split-KV planning uses the capacity of full 4-CTA clusters, reserves
+`clusters // 16` slots, and targets one wave of work. The wrapper preserves
+an explicit `min_split_kv` and normalizes the result to nonempty partitions.
+This limits workspace traffic and reduction work, but can reduce parallelism
+too far for some shapes. The H96/B16/Q4 cases regress when the split count
+drops from three to one.
+
+The M256 kernel supports up to four tiles per request for either output dtype.
+By default, `H` must divide 256 and `q_len` must be a multiple of `256 / H`;
 `enable_packed_q=True` accepts other shapes such as H96 and partial tiles.
 The kernel supports causal/non-causal attention, split-KV, LSE, PDL and CUDA
 graphs; it does not support sliding windows, DCP, or `local_visible_lens`.
 Rows with no visible keys produce zero output and `-inf` LSE.
 
-SM107 FP8-output compilation and GPU regression tests reject CuTe DSL warnings.
+SM107 FP8/BF16-output compilation and GPU regression tests reject CuTe DSL warnings.
 The mixed-cluster kernel issues CLC queries directly and owns its unswizzled
 grid and response decoding, avoiding the deprecated example scheduler classes.
 

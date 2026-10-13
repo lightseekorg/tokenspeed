@@ -727,9 +727,16 @@ def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
         ("ut", "warn", {}, "warn"),
     ],
 )
-def test_serving_tasks_arm_the_jit_compile_check(
+def test_b200v2_tasks_set_cache_and_jit_check_defaults(
     monkeypatch, tmp_path, task_type, inherited, task_env, expected
 ):
+    cache_env = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
+    monkeypatch.delenv(cache_env, raising=False)
+    monkeypatch.delenv("CI_CACHE_ROOT", raising=False)
+    monkeypatch.delenv("RUNNER_NAME", raising=False)
+    cache_root = tmp_path / "persistent cache"
+    monkeypatch.setenv("FLASHINFER_CACHE_DIR", str(cache_root / "flashinfer"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "ephemeral-home" / ".cache"))
     if inherited is None:
         monkeypatch.delenv("TOKENSPEED_JIT_COMPILE_CHECK", raising=False)
     else:
@@ -737,7 +744,7 @@ def test_serving_tasks_arm_the_jit_compile_check(
     task = {
         "name": "jit-check",
         "type": task_type,
-        "runner": {"labels": ["b200-1gpu"]},
+        "runner": {"labels": ["b200v2-1gpu"]},
         "env": task_env,
         "ut": {"commands": ["run test"]},
     }
@@ -760,7 +767,7 @@ def test_serving_tasks_arm_the_jit_compile_check(
 
     pipeline.execute_task(
         config="task.yaml",
-        runner="b200-1gpu",
+        runner="b200v2-1gpu",
         runner_override=None,
         work_dir=str(tmp_path),
         dry_run=False,
@@ -769,6 +776,9 @@ def test_serving_tasks_arm_the_jit_compile_check(
         setup_mode="ci",
     )
     assert captured["env"].get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
+    assert captured["env"][cache_env] == str(
+        cache_root / "tokenspeed" / "flashinfer-autotune"
+    )
 
 
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
@@ -1393,6 +1403,22 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     ]
     assert all(e["priority"] == "normal" for e in matrix["include"])
     assert all(e["optional"] is False for e in matrix["include"])
+
+
+def test_build_matrix_post_submit_also_selects_per_commit_tasks(tmp_path):
+    _write_task_yaml(tmp_path, "a.yaml", _default_body("pr", ["b200-1gpu"]))
+    _write_task_yaml(
+        tmp_path,
+        "b.yaml",
+        _default_body("push", ["b200-1gpu"]).replace("per-commit", "post-submit"),
+    )
+
+    def names(trigger):
+        matrix = build_matrix(tmp_path, tmp_path, trigger=trigger)
+        return [entry["name"] for entry in matrix["include"]]
+
+    assert names("per-commit") == ["pr"]
+    assert names("post-submit") == ["pr", "push"]
 
 
 def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):

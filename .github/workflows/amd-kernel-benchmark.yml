@@ -105,7 +105,7 @@ jobs:
           matrix=$(python3 test/ci_system/pipeline.py scan \
             --root test/ci \
             --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
-            --trigger "${{ github.event_name == 'workflow_dispatch' && 'manual' || 'per-commit' }}" \
+            --trigger "${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
             --runner-group "amd" \
             --workflow-stage "kernel-benchmark")
           echo "kernel_benchmark_matrix=${matrix}" >> "$GITHUB_OUTPUT"

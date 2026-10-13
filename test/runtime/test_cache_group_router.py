@@ -1534,6 +1534,7 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
         router.init_cuda_graph_state(2)
         for leaf in router.leaves.values():
             leaf._decode_views_by_bs[1] = object()
+            leaf._prefix_history = object()
 
         router.set_cache_pool(_pool(*specs))
 
@@ -1541,6 +1542,7 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
             self.assertIsNone(leaf.page_table_buf)
             self.assertIsNone(leaf.seq_lens_buf)
             self.assertEqual(leaf._decode_views_by_bs, {})
+            self.assertIsNone(leaf._prefix_history)
 
 
 class PagedLeafRebindTest(unittest.TestCase):
@@ -1667,6 +1669,10 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "kvp_block_granularity",
                 "kvp_virtual_block_count",
                 "dcp_metadata",
+                "_dcp_visible_lens_buf",
+                "_dcp_query_offsets",
+                "_dcp_page_table_rows",
+                "_dcp_kernel_seq_lens",
             ],
             workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device="cuda"),
             indices_updater_prefill=SimpleNamespace(prefill_wrapper_ragged=None),

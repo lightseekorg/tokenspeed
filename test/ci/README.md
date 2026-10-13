@@ -5,7 +5,8 @@
 
 Current trigger values:
 
-- `per-commit`
+- `per-commit`: pull requests and pushes to `main`
+- `post-submit`: pushes to `main` only
 - `manual`
 - `nightly`
 - `debug`
@@ -42,10 +43,17 @@ concurrently with unit tests. Matrix entries within
 each stage run in parallel. The workflow treats a stage with no matching tasks
 as successfully satisfied.
 
-`ut-tokenspeed-kernel-part-i` runs tests outside `tokenspeed-kernel/test/ops/`,
-keeping the numerics, TRT-LLM communication and CUDA suites in separate processes.
-`ut-tokenspeed-kernel-part-ii` runs `tokenspeed-kernel/test/ops/`. Together the
-two tasks cover the kernel suite once.
+On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
+`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication and
+CUDA suites in separate processes. `ut-tokenspeed-kernel-part-ii` runs
+`tokenspeed-kernel/test/ops/`. Together the two tasks cover the kernel suite
+once. AMD runners run the same commands in the single `ut-tokenspeed-kernel`
+task.
+
+Conversely, AMD runners split the `runtime-1gpu` suite across
+`ut-runtime-1gpu-part-i` and `ut-runtime-1gpu-part-ii`, which balance test files
+by their registered `est_time` (`run_ci_suite.py --auto-partition-*`). Other
+runners run the whole suite in `ut-runtime-1gpu`.
 
 PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
 Applying the label starts a new CI run immediately and cancels the older run
@@ -66,6 +74,10 @@ The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
 tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
+
+The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
+GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
+unquantized.
 
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
@@ -157,6 +169,11 @@ the jobs create the two directories beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
+
+B200v2 CI stores FlashInfer tactics under `tokenspeed/flashinfer-autotune`
+in the same persistent root as the package cache: an explicit `CI_CACHE_ROOT`,
+the parent of `FLASHINFER_CACHE_DIR`, or `/raid/cache`. An explicit
+`TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR` takes precedence.
 
 CI runner images are expected to provide `ninja`. Runner setup checks for the
 executable and only refreshes apt metadata and installs `ninja-build` when it is

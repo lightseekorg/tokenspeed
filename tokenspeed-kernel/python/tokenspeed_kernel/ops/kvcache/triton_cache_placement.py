@@ -143,6 +143,118 @@ def virtual_slots_to_local(
     return out, owner_mask
 
 
+@triton.jit(do_not_specialize=["COUNT", "SEND_ROWS"])
+def _split_slots_by_owner(
+    Slots,
+    GatheredIndex,
+    Fetch,
+    # The row count follows the forward's history and the send width its
+    # largest owner; runtime so every history shares one binary.
+    COUNT,
+    SEND_ROWS,
+    ROWS: tl.constexpr,
+    DEGREE: tl.constexpr,
+    OWNERS: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program walks the rows in order, carrying each owner's running row
+    # count across blocks.
+    owners = tl.arange(0, OWNERS)
+    carry = tl.zeros((OWNERS,), dtype=tl.int32)
+    for start in range(0, COUNT, BLOCK):
+        offsets = start + tl.arange(0, BLOCK)
+        active = offsets < COUNT
+        slot = tl.load(Slots + offsets, mask=active, other=ROWS).to(tl.int64)
+        previous = slot // ROWS - 1
+        owner = (previous % DEGREE).to(tl.int32)
+        hit = (owner[:, None] == owners[None, :]) & active[:, None]
+        hits = hit.to(tl.int32)
+        running = tl.cumsum(hits, axis=0) + carry[None, :]
+        within = tl.sum(tl.where(hit, running, 0), axis=1) - 1
+        tl.store(GatheredIndex + offsets, owner * SEND_ROWS + within, mask=active)
+        local = (previous // DEGREE + 1) * ROWS + slot % ROWS
+        tl.store(
+            Fetch + within,
+            local.to(Fetch.dtype.element_ty),
+            mask=active & (owner == RANK),
+        )
+        carry += tl.sum(hits, axis=0)
+
+
+def split_slots_by_owner(
+    slots: torch.Tensor,
+    *,
+    block_granularity: int,
+    degree: int,
+    rank: int,
+    send_rows: int,
+    gathered_index: torch.Tensor,
+    fetch: torch.Tensor,
+) -> None:
+    """Lay rows out for an all-gather over their cyclic page owners.
+
+    Row ``i`` belongs to owner ``(slots[i] // block_granularity - 1) % degree``,
+    the rule of ``virtual_slots_to_local``, and every owner keeps its rows in
+    order. With every owner sending ``send_rows`` rows, the rank-major
+    all-gather output holds row ``i`` at ``owner * send_rows`` plus the count
+    of that owner's rows before ``i``.
+
+    Args:
+        slots: Int32 or int64 virtual slots [rows], contiguous. Every row must
+            have an owner: ``slots >= block_granularity``.
+        block_granularity: Tokens per scheduler ownership block.
+        degree: Number of owners.
+        rank: The owner whose rows ``fetch`` receives.
+        send_rows: Rows every owner contributes; at least any owner's count.
+        gathered_index: Int32 output [rows]: each row's all-gather output row.
+        fetch: Output [>= rank's row count] in the slots' dtype: the physical
+            slots of ``rank``'s rows, in order. Entries past that count keep
+            their contents.
+
+    Returns:
+        None; both outputs are written in place.
+    """
+    if block_granularity <= 0 or degree <= 0 or not 0 <= rank < degree:
+        raise ValueError("invalid owner split geometry")
+    if (
+        slots.dim() != 1
+        or not slots.is_contiguous()
+        or gathered_index.shape != slots.shape
+        or gathered_index.dtype != torch.int32
+        or fetch.dim() != 1
+        or fetch.dtype != slots.dtype
+    ):
+        raise ValueError("owner split buffers disagree with the slots")
+    if slots.numel() == 0:
+        return
+    if slots.is_cuda:
+        _split_slots_by_owner[(1,)](
+            slots,
+            gathered_index,
+            fetch,
+            slots.numel(),
+            send_rows,
+            ROWS=block_granularity,
+            DEGREE=degree,
+            OWNERS=triton.next_power_of_2(degree),
+            RANK=rank,
+            BLOCK=1024,
+        )
+    else:
+        previous = slots.to(torch.int64) // block_granularity - 1
+        owner = previous % degree
+        seen = torch.cumsum(
+            torch.arange(degree).unsqueeze(1) == owner.unsqueeze(0), dim=1
+        )
+        within = seen.gather(0, owner.unsqueeze(0)).squeeze(0) - 1
+        gathered_index.copy_(owner * send_rows + within)
+        mine = owner == rank
+        local = (previous // degree + 1) * block_granularity
+        local += slots.to(torch.int64) % block_granularity
+        fetch[within[mine]] = local[mine].to(fetch.dtype)
+
+
 @triton.jit
 def _compact_owned_pages(
     Table,

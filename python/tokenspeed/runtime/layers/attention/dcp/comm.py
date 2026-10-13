@@ -118,27 +118,3 @@ def combine_attention_partials(
             dtype=local_output.dtype, memory_format=torch.contiguous_format
         ).contiguous()
     return dcp_apply_sink(output, lse, sink, dtype=local_output.dtype)
-
-
-def gather_owned_rows(
-    local_rows: torch.Tensor,
-    owned: torch.Tensor,
-    group: tuple[int, ...],
-) -> torch.Tensor:
-    """Reconstruct aligned rows with one owner per row through a sum reduction.
-
-    Args:
-        local_rows: Local values [rows, ...], in identical logical order on all ranks.
-        owned: Boolean vector [rows]; false rows must contribute zero, even if NaN.
-        group: KVP ranks collectively owning those rows, or a singleton group.
-
-    Returns:
-        Contiguous reconstructed rows with the original shape and dtype.
-    """
-    if owned.shape != local_rows.shape[:1] or owned.dtype != torch.bool:
-        raise ValueError("KVP owner mask must be bool [rows]")
-    mask = owned.reshape((-1,) + (1,) * (local_rows.ndim - 1))
-    rows = torch.where(mask, local_rows, 0).contiguous()
-    if len(group) == 1:
-        return rows
-    return all_reduce(rows, group).contiguous()

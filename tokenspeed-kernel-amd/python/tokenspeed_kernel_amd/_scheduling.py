@@ -31,7 +31,7 @@ from pathlib import Path
 from tokenspeed_kernel_amd._triton import tl
 
 _SCHED_LIBRARY_NAME = "tokenspeed_sched"
-_READFIRSTLANE_SYMBOL = "__tokenspeed_readfirstlane_i32"
+_READFIRSTLANE_SYMBOL = "__tokenspeed_sched_readfirstlane_i32"
 _SCHED_LIBRARY_PATH = str(Path(__file__).with_name("sched_barrier.ll"))
 
 

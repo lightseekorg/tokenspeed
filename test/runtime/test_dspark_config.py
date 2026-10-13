@@ -33,7 +33,7 @@ from tokenspeed.runtime.layers.attention.configs.mla import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
-from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
+from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.dspark import _get_markov_params
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 from tokenspeed.runtime.utils.spec_block_geometry import (
@@ -489,7 +489,10 @@ class _CaptureModel:
         self.layers_to_capture = []
         self._dflash_capture_idx_map = {}
 
-    notify = BaseTransformerModel._notify_dflash_capture
+    def notify(self, sink, layer_idx, aux_hidden_states):
+        notify_target_capture(
+            sink, self._dflash_capture_idx_map, layer_idx, aux_hidden_states
+        )
 
 
 class _RecordingSink:
