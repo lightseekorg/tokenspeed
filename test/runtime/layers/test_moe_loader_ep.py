@@ -99,6 +99,7 @@ def test_mtp_fp8_block_scales_load_into_local_ep_expert(
         prefix="mtp.layers.0.mlp",
         ep_rank=1,
         ep_size=2,
+        deterministic_finalize=False,
     )
     params = {
         f"model.layers.0.mlp.experts.{name}": param

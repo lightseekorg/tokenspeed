@@ -793,6 +793,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     backend.kvp_block_granularity = 64
     backend.kvp_virtual_block_count = 5
     backend.qcp_group = (0,)
+    backend.token_parallel_group = (0,)
     # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
     # combine form.
     backend.num_attention_heads = 8
@@ -815,6 +816,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
         v_head_dim=128,
         scaling=0.1,
         logit_cap=0.0,
+        attn_sink=None,
     )
 
     def gather(q, group):

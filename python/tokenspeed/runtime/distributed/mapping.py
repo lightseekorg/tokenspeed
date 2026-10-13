@@ -90,6 +90,36 @@ def _resolve_qcp_size(tp_size: int, qcp_size: int) -> int:
     return qcp_size
 
 
+def _resolve_token_parallel_size(
+    tp_size: int, kvp_size: int, qcp_size: int, token_parallel_size: int
+) -> int:
+    """Validate attention token parallelism within resolved attention TP.
+
+    Token parallelism regroups the query rows of consecutive attention-TP
+    ranks around the sparse attention core only; it adds no world-size
+    dimension. Every rank of the group holds the same rows (attention TP),
+    so KV parallelism, whose ranks hold different pages, and query context
+    parallelism, whose ranks hold different rows, do not combine with it.
+    """
+    if (
+        isinstance(token_parallel_size, bool)
+        or not isinstance(token_parallel_size, int)
+        or token_parallel_size < 1
+    ):
+        raise ValueError("token_parallel_size must be a positive integer")
+    if tp_size % token_parallel_size:
+        raise ValueError(
+            "attention TP size must be divisible by the token-parallel size"
+        )
+    if token_parallel_size > 1 and (kvp_size > 1 or qcp_size > 1):
+        raise ValueError(
+            "attention token parallelism does not combine with KV parallelism "
+            f"or query context parallelism (got kvp_size={kvp_size}, "
+            f"qcp_size={qcp_size})"
+        )
+    return token_parallel_size
+
+
 def _make_parallelism_rank(rank: int, size: int, stride: int = 1) -> int:
     """Return the rank of given size and stride."""
     return (rank // stride) % size
@@ -243,6 +273,7 @@ class AttentionLayerMapping(MappingBase):
         kvp_size: int = 1,
         head_tp_size: int | None = None,
         qcp_size: int = 1,
+        token_parallel_size: int = 1,
     ):
         super().__init__(rank, world_size)
         self.tp_size, self.dp_size = _resolve_parallelism_sizes(
@@ -250,6 +281,9 @@ class AttentionLayerMapping(MappingBase):
         )
         self.kvp_size = _resolve_kvp_size(self.tp_size, kvp_size)
         self.qcp_size = _resolve_qcp_size(self.tp_size, qcp_size)
+        self.token_parallel_size = _resolve_token_parallel_size(
+            self.tp_size, self.kvp_size, self.qcp_size, token_parallel_size
+        )
         # Width of the group the head projections (q_b/kv_b/o_proj) shard
         # over. Equal to the ranks holding the same rows (tp_size, or 1 under
         # query sharding) unless head TP widens it over DP ranks or over the
@@ -309,6 +343,22 @@ class AttentionLayerMapping(MappingBase):
     @cached_property
     def qcp_group(self) -> Group:
         return _make_parallelism_group(self.rank, self.qcp_size, stride=1)
+
+    @property
+    def has_token_parallel(self) -> bool:
+        return self.token_parallel_size > 1
+
+    @cached_property
+    def token_parallel_rank(self) -> int:
+        """Rank within the consecutive token-parallel subgroup of attention TP."""
+        return _make_parallelism_rank(self.rank, self.token_parallel_size, stride=1)
+
+    @cached_property
+    def token_parallel_group(self) -> Group:
+        """Consecutive attention-TP ranks that split the sparse attention's
+        query rows among themselves, each attending its rows with every head
+        of the group."""
+        return _make_parallelism_group(self.rank, self.token_parallel_size, stride=1)
 
     @cached_property
     def kvp_rank(self) -> int:
@@ -616,6 +666,7 @@ class Mapping(MappingBase):
         attn_head_tp_size: int | None = None,
         lm_head_tp_size: int | None = None,
         attn_qcp_size: int = 1,
+        attn_token_parallel_size: int = 1,
         dense_tp_size: int | None = None,
         dense_dp_size: int | None = None,
         moe_tp_size: int | None = None,
@@ -659,6 +710,7 @@ class Mapping(MappingBase):
             kvp_size=attn_kvp_size,
             head_tp_size=attn_head_tp_size,
             qcp_size=attn_qcp_size,
+            token_parallel_size=attn_token_parallel_size,
         )
         self.lm_head = LmHeadMapping(
             rank=rank,
@@ -701,6 +753,13 @@ class Mapping(MappingBase):
         self.nprocs_per_node, self.nnodes = _resolve_parallelism_sizes(
             self.world_size, nprocs_per_node, nnodes
         )
+        if self.nprocs_per_node % self.attn.token_parallel_size:
+            raise ValueError(
+                "attention token-parallel size "
+                f"{self.attn.token_parallel_size} must divide the "
+                f"{self.nprocs_per_node} ranks per node, so that every "
+                "token-parallel group stays inside one node"
+            )
         assert base_gpu_id >= 0
         assert gpu_id_step > 0
         self.base_gpu_id = base_gpu_id
@@ -782,7 +841,8 @@ class Mapping(MappingBase):
             f"  Pipeline: pp={self.pp_size}",
             f"  Attention: tp={self.attn.tp_size}  kvp={self.attn.kvp_size}  "
             f"qcp={self.attn.qcp_size}  dp={self.attn.dp_size}  "
-            f"head_tp={self.attn.head_tp_size}",
+            f"head_tp={self.attn.head_tp_size}  "
+            f"token_parallel={self.attn.token_parallel_size}",
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
             f"  LM head : tp={self.lm_head.tp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",

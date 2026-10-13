@@ -224,6 +224,7 @@ if platform.is_nvidia:
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"kernel_routing"}),
             "supports_deferred_finalize": frozenset({False}),
+            "deterministic_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             # w2 stores two INT4 per byte, so its packed K dim is ispp // 2 and

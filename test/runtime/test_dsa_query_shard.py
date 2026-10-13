@@ -102,6 +102,7 @@ def _backend(
     backend.kvp_virtual_block_count = None
     backend.qcp_group = tuple(range(WORLD)) if qcp else (0,)
     backend.qcp_rank = rank if qcp else 0
+    backend.token_parallel_group = (0,)
     backend.query_shard_metadata = None
     backend._prefill_page_table = None
     backend._history_workspace = None
@@ -246,6 +247,7 @@ def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, ra
         v_head_dim=KV_DIM - 2,
         scaling=0.5,
         logit_cap=0.0,
+        attn_sink=None,
     )
     local_rows = plan.local_rows
     q = torch.randn(local_rows, 2 * KV_DIM, dtype=torch.bfloat16)
@@ -328,6 +330,7 @@ def test_the_sharded_arm_refuses_a_query_carrying_the_tp_slice():
         v_head_dim=KV_DIM - 2,
         scaling=0.5,
         logit_cap=0.0,
+        attn_sink=None,
     )
     rows = plan.local_rows
     with pytest.raises(RuntimeError, match="every head"):
@@ -492,6 +495,7 @@ def _decode_layer(heads: int):
         v_head_dim=128,
         scaling=0.1,
         logit_cap=0.0,
+        attn_sink=None,
     )
 
 
@@ -797,3 +801,50 @@ def test_construction_probes_the_rows_leaf_the_sharded_prefill_will_need(
     finally:
         for name in (rows, plane, foreign):
             KernelRegistry.get()._unregister(name)
+
+
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_sinkless_runtime_keeps_the_legacy_kernel_call(monkeypatch, mode, with_sink):
+    backend = _decode_arm_backend(num_attention_heads=2, attn_tp_size=1)
+    backend.kvp_group = (0,)
+    layer = _decode_layer(2)
+    sink = torch.tensor([1.0, 2.0]) if with_sink else None
+    layer.attn_sink = sink
+    q = torch.zeros(1, 2, 128, dtype=torch.bfloat16)
+    slots = torch.zeros(1, 512, dtype=torch.int32)
+    lens = torch.ones(1, dtype=torch.int32)
+    pool = SimpleNamespace(
+        quant_method=None, get_key_buffer=lambda layer_id: torch.zeros(128, 128)
+    )
+    calls = []
+
+    def kernel(**kwargs):
+        calls.append(kwargs)
+        if with_sink:
+            assert kwargs["attn_sink"] is sink
+        else:
+            assert "attn_sink" not in kwargs
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(dsa, f"dsa_{mode}", kernel)
+    if mode == "prefill":
+        backend.forward_sparse_prefill(
+            q=q,
+            layer=layer,
+            token_to_kv_pool=pool,
+            kv_seq_lens=None,
+            topk_slots=slots,
+            topk_lens=lens,
+            max_seq_len=128,
+        )
+    else:
+        backend.forward_sparse_decode(
+            q=q,
+            layer=layer,
+            token_to_kv_pool=pool,
+            bs=1,
+            topk_indices=slots,
+            topk_lens=lens,
+        )
+    assert len(calls) == 1

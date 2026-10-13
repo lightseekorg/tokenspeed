@@ -1142,8 +1142,13 @@ class OpenSessionReqOutput(BaseReq, kw_only=True):
     success: bool
 
 
+# Rid prefix of the deep health probe, a one-token generate the gRPC servicer
+# sends and counts as passed on any scheduler output.
+HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK_"
+
+
 class HealthCheckOutput(BaseReq, kw_only=True):
-    pass
+    """A busy scheduler's answer to a health probe, sent instead of queueing it."""
 
 
 class RpcReqInput(BaseReq, kw_only=True):

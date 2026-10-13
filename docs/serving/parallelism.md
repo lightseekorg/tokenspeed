@@ -46,6 +46,7 @@ tokenspeed serve <model> \
 | `--kv-parallel-size` | KV parallelism: shard the full-history KV pages over a consecutive subgroup of attention TP on a PD prefill or decode engine (see "KV parallelism" below). |
 | `--decode-context-parallel-size` | Decode context parallelism: the decode role's compute over the sharded pages; required with and equal to `--kv-parallel-size` there. |
 | `--query-context-parallel-size` | Query context parallelism: the prefill role's query-row sharding over the sharded pages; equal to `--kv-parallel-size` and `--attn-tp-size` (see "Query context parallelism" below). |
+| `--attn-token-parallel-size` | DSA sparse attention only: attend query rows token-parallel across groups of this many attention TP ranks (see "Token-parallel sparse attention" below). |
 | `--mm-encoder-tp-mode` | `weights` (default), or TP1 whole-item DP within each attention TP group (`data`). |
 | `--enable-expert-parallel` | Expert parallelism across the selected world size. |
 | `--expert-parallel-size` | Explicit expert parallel size. |
@@ -776,6 +777,24 @@ A model supports the layout by slicing its rows by `ctx.query_shard` and,
 for head TP, threading the attention module's head-TP hooks around its
 sparse core (`docs/design/unified_path.md`, "Query context parallelism").
 Every other model refuses it at construction.
+
+## Token-parallel sparse attention
+
+The FlashMLA sparse kernels pad every launch to a multiple of 64 query heads
+on Hopper and 128 on Blackwell, so a wide attention TP group whose ranks each
+hold a few heads spends most of its sparse attention on padding.
+`--attn-token-parallel-size G` regroups the queries of G consecutive
+attention TP ranks with two all-to-alls around the sparse kernel: each rank
+attends 1/G of the rows with all of the group's heads, then gets its own
+heads back. Launches with too few rows to fill the GPU keep their local
+heads, so single-request decoding is unchanged; the exchange is
+graph-capturable, so batched decoding spreads inside CUDA graphs.
+
+G must divide both the attention TP size and `--nprocs-per-node`, so every
+group stays inside one node, and the option requires the GPU DSA backend.
+Every rank of a group holds the same rows, so it does not combine with KV
+parallelism or query context parallelism, whose ranks hold different pages
+or rows.
 
 ## Multi-node
 

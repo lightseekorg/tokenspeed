@@ -45,6 +45,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.cuda.marlin import gptq_marlin_repack
 from tokenspeed_kernel.thirdparty.cuda.marlin_moe import (
+    FLOAT4_E2M1F_ID,
     marlin_make_workspace,
     marlin_permute_scales,
     moe_align_block_size,
@@ -84,7 +85,7 @@ def _swiglu_limit(w: torch.nn.Module) -> float | None:
     beta = getattr(w, "swiglu_beta", None)
     if alpha not in (None, 1.0) or beta not in (None, 0.0):
         raise ValueError(
-            "Marlin MXFP4 MoE supports only standard SwiGLU with an optional "
+            "Marlin MoE supports only standard SwiGLU with an optional "
             f"clamp limit; got alpha={alpha!r}, swiglu_beta={beta!r}"
         )
     if swiglu_arg is None:
@@ -187,6 +188,7 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
         "swiglu_form": frozenset({"standard"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
+        "deterministic_finalize": frozenset({False}),
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({MXFP4_BLOCK}),
@@ -298,17 +300,22 @@ def marlin_mxfp4_local_moe_apply(
     hidden = int(getattr(w, "_marlin_hidden_size", x.shape[1]))
     ispp = int(getattr(w, "_marlin_ispp", w.w2_weight.shape[1] * 16))
     num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
-    is_ep = int(getattr(w, "ep_size", 1)) > 1
     local_topk_ids = local_topk_ids.to(torch.int32)
     topk_weights = topk_weights.to(torch.float32)
     num_tokens, top_k = local_topk_ids.shape
     block_m = _block_size_m(num_tokens, top_k, num_local_experts)
     sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        local_topk_ids, block_m, num_local_experts
+        local_topk_ids,
+        block_m,
+        num_local_experts,
+        expert_start=0,
+        deterministic=False,
     )
 
     workspace = marlin_make_workspace(x.device)
 
+    # -1 routes fill blocks of expert id -1, with or without EP; only the EP
+    # specialization skips them instead of reading expert -1's weights.
     gemm1_n = 2 * ispp
     intermediate1 = moe_wna16_marlin_gemm(
         x,
@@ -320,10 +327,11 @@ def marlin_mxfp4_local_moe_apply(
         expert_ids,
         num_tokens_post_padded,
         topk_weights,
+        b_q_type_id=FLOAT4_E2M1F_ID,
         moe_block_size=block_m,
         top_k=top_k,
         mul_topk_weights=False,
-        is_ep=is_ep,
+        is_ep=True,
         size_m=num_tokens,
         size_n=gemm1_n,
         size_k=hidden,
@@ -344,7 +352,7 @@ def marlin_mxfp4_local_moe_apply(
         intermediate2 = silu_and_mul(intermediate1, limit=_swiglu_limit(w))
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
-    # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.
+    # plain sum over top_k. Routes to expert -1 write nothing, so zero-init c.
     intermediate3 = moe_wna16_marlin_gemm(
         intermediate2,
         torch.zeros(num_tokens * top_k, hidden, dtype=x.dtype, device=x.device),
@@ -355,10 +363,11 @@ def marlin_mxfp4_local_moe_apply(
         expert_ids,
         num_tokens_post_padded,
         topk_weights,
+        b_q_type_id=FLOAT4_E2M1F_ID,
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=True,
-        is_ep=is_ep,
+        is_ep=True,
         size_m=num_tokens * top_k,
         size_n=hidden,
         size_k=ispp,
@@ -419,6 +428,7 @@ def marlin_mxfp4_masked_moe_apply(
         expert_ids,
         total,
         weights,
+        b_q_type_id=FLOAT4_E2M1F_ID,
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=False,
@@ -448,6 +458,7 @@ def marlin_mxfp4_masked_moe_apply(
         expert_ids,
         total,
         weights,
+        b_q_type_id=FLOAT4_E2M1F_ID,
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=False,

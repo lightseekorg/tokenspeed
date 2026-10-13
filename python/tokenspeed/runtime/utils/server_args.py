@@ -504,6 +504,9 @@ class ServerArgs:
     # forward's rows over the attention TP group (1 = off; equals
     # kv_parallel_size when on).
     query_context_parallel_size: int = 1
+    # Attention token parallelism: DSA sparse attention attends query rows
+    # spread over consecutive intra-node groups of attention TP ranks (1 = off).
+    attn_token_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -987,6 +990,7 @@ class ServerArgs:
             attn_head_tp_size=self.attn_head_tp_size,
             lm_head_tp_size=self.lm_head_tp_size,
             attn_qcp_size=self.query_context_parallel_size,
+            attn_token_parallel_size=self.attn_token_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -3517,6 +3521,18 @@ class ServerArgs:
             "eager. The attention weights are head-replicated unless "
             "--attn-head-tp-size equals it, which shards them over the shard "
             "group.",
+        )
+        parser.add_argument(
+            "--attn-token-parallel-size",
+            type=int,
+            default=ServerArgs.attn_token_parallel_size,
+            help="Split DSA sparse-attention query rows over consecutive groups of "
+            "this many attention TP ranks: each rank attends a slice of the rows "
+            "with the whole group's heads, which cuts the head padding of "
+            "kernels that pad few TP-local heads to a wide tile. Must divide "
+            "the attention TP size and --nprocs-per-node, so that every group "
+            "stays inside one node; does not combine with --kv-parallel-size or "
+            "--query-context-parallel-size.",
         )
         parser.add_argument(
             "--dense-tp-size",

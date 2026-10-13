@@ -445,6 +445,7 @@ def _prepare_routed_weights(
         fast_math=False,
         combine_order="rank",
         solution=None,
+        requires_deterministic_finalize=False,
     )
     if weight_dtype_name == "fp8":
         assert block_shape is not None

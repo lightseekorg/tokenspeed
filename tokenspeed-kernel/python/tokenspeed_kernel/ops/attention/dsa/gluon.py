@@ -238,6 +238,8 @@ if current_platform().is_amd:
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "topk_layout": frozenset({"global_slots"}),
+            # The Gluon DSA kernels do not consume a learnable sink.
+            "sinks": frozenset({False}),
         },
     )
     def gluon_dsa_decode_gfx950(*args, enable_pdl: bool = False, **kwargs):
@@ -272,6 +274,8 @@ if current_platform().is_amd:
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "topk_layout": frozenset({"global_slots"}),
+            # The Gluon DSA kernels do not consume a learnable sink.
+            "sinks": frozenset({False}),
         },
     )
     def gluon_dsa_prefill_gfx950(*args, enable_pdl: bool = False, **kwargs):
@@ -307,6 +311,8 @@ if current_platform().is_amd:
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "topk_layout": frozenset({"global_slots"}),
+            # The Gluon DSA kernels do not consume a learnable sink.
+            "sinks": frozenset({False}),
         },
     )
     def gluon_dsa_prefill_fp8_dense_gfx950(*args, enable_pdl: bool = False, **kwargs):
@@ -479,6 +485,8 @@ if current_platform().is_amd:
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "topk_layout": frozenset({"global_slots"}),
+            # The Gluon DSA kernels do not consume a learnable sink.
+            "sinks": frozenset({False}),
         },
     )
     def gluon_dsa_decode_gfx1250(*args, enable_pdl: bool = False, **kwargs):
@@ -513,6 +521,8 @@ if current_platform().is_amd:
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "topk_layout": frozenset({"global_slots"}),
+            # The Gluon DSA kernels do not consume a learnable sink.
+            "sinks": frozenset({False}),
         },
     )
     def gluon_dsa_prefill_gfx1250(*args, enable_pdl: bool = False, **kwargs):
@@ -548,6 +558,8 @@ if current_platform().is_amd:
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "topk_layout": frozenset({"global_slots"}),
+            # The Gluon DSA kernels do not consume a learnable sink.
+            "sinks": frozenset({False}),
         },
     )
     def gluon_dsa_prefill_fp8_dense_gfx1250(*args, enable_pdl: bool = False, **kwargs):

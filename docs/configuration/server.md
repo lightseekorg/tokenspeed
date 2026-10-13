@@ -119,6 +119,15 @@ switch an envelope folds is also available individually under `auto`.
 | `--model-update-engine-type` | SDK `EngineType` member name for this engine, resolved as `EngineType[value.upper()]`. Required with `--model-update-config`. |
 | `--model-update-draft-weights` | `retain` or `refresh`: whether a Mooncake update also streams the speculative draft model's weights. Required with `--model-update-config`. |
 
+The smg gateway health-probes the engine with a one-token generate, which
+passes on any scheduler output within `TOKENSPEED_HEALTH_CHECK_TIMEOUT` (20 s
+by default). An idle scheduler runs the generate; one that already holds
+requests answers the probe as soon as its loop reaches the next round, since a
+probe queued behind a long prefill backlog would see no output for minutes.
+`ts serve` sets the gateway's `--health-check-timeout-secs` to that timeout
+plus 5 s, so the gateway does not give up while the engine's probe is still
+waiting. Pass `--health-check-timeout-secs` to override it.
+
 ### Weight version metadata
 
 Every generation response includes the current version in
@@ -426,6 +435,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
 | `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--query-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
 | `--query-context-parallel-size` | Query context parallelism (QCP) on the PD prefill role: shard every extend forward's rows over the attention TP group, rank `r` computing a contiguous slice of the chunk against the gathered KV history of its requests (the KV write, index-K write, sampled rows and prompt-logprob rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Requires `--disaggregation-mode prefill` and must equal both `--attn-tp-size` and `--kv-parallel-size` (the shard is a layout over the sharded pages, so it inherits KVP's rules: Host KVStore and snapshot pool allowed, L3 refused); attention DP 1, no `--enable-mixed-batch`, `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width; GPU DSA attention with a bf16 KV cache (the gathered write stores native latent rows), checked where the attention config is built. The prefill stays eager -- the GPU DSA backend declares no prefill graph under a shard -- without `--disable-prefill-graph` on the launch. The attention weights are head-replicated unless `--attn-head-tp-size` equals it, which shards them over the shard group. 1 (default) is off. |
+| `--attn-token-parallel-size` | DSA sparse attention only: split query rows over consecutive groups of this many attention TP ranks, each attending its rows with the whole group's heads (default 1, off). Cuts the head padding of sparse kernels when few heads are TP-local. Requires the GPU DSA backend on CUDA, must divide `--attn-tp-size` and `--nprocs-per-node` (every group stays inside one node), and all ranks of a group must have the same SM count. Does not combine with `--kv-parallel-size` or `--query-context-parallel-size`. A non-DSA draft model keeps attending on its own rank. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |

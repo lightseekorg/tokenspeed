@@ -91,6 +91,7 @@ def test_moe_layer_rejects_invalid_situ_parameters(
             activation="situ",
             activation_situ_beta=beta,
             activation_situ_linear_beta=linear_beta,
+            deterministic_finalize=False,
         )
 
 
@@ -149,6 +150,7 @@ def test_moe_layer_builds_ep8_local_expert_partition(
         activation_situ_beta=4.0,
         activation_situ_linear_beta=25.0,
         routing_mode="precomputed_topk",
+        deterministic_finalize=False,
     )
 
     assert layer.num_local_experts == 112
@@ -183,6 +185,7 @@ def test_moe_layer_rejects_uneven_contiguous_ep_partition() -> None:
             layer_index=0,
             ep_rank=0,
             ep_size=3,
+            deterministic_finalize=False,
         )
 
 
@@ -217,6 +220,7 @@ def test_moe_layer_uses_mixed_fp8_block_scale_child_config(
         quant_config=quant_config,
         layer_index=0,
         prefix="mtp.layers.0.mlp",
+        deterministic_finalize=False,
     )
 
     assert layer.quant_config is quant_config.fp8_block_scales_config
@@ -265,11 +269,47 @@ def test_moe_layer_applies_outer_mixed_exclusion(
         quant_config=quant_config,
         layer_index=0,
         prefix="mtp.layers.0.mlp",
+        deterministic_finalize=False,
     )
 
     assert layer.quant_config is quant_config
     assert layer._quant_kind == "unquant"
     assert captured["weight_dtype"] == "unquant"
+
+
+@pytest.mark.parametrize("deterministic_finalize", [False, True])
+def test_moe_layer_forwards_deterministic_finalize(
+    monkeypatch: pytest.MonkeyPatch,
+    deterministic_finalize: bool,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_moe_plan(weight_dtype: str, **kwargs) -> dict:
+        captured.update(kwargs)
+        return {
+            "solution": "flashinfer_cutlass",
+            "support_routing": False,
+            "supports_deferred_finalize": False,
+        }
+
+    auto_backend = type("AutoBackend", (), {"value": "auto"})()
+    monkeypatch.setattr(expert_module, "get_moe_backend", lambda: auto_backend)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_moe_plan)
+    monkeypatch.setattr(
+        expert_module, "create_layer_weights", lambda *args, **kwargs: None
+    )
+
+    MoELayer(
+        top_k=2,
+        num_experts=4,
+        hidden_size=256,
+        intermediate_size=640,
+        quant_config=None,
+        layer_index=0,
+        deterministic_finalize=deterministic_finalize,
+    )
+
+    assert captured["requires_deterministic_finalize"] is deterministic_finalize
 
 
 def test_moe_layer_requests_dynamic_mxfp4_activations(
@@ -311,6 +351,7 @@ def test_moe_layer_requests_dynamic_mxfp4_activations(
         intermediate_size=128,
         quant_config=Mxfp4QuantConfig(),
         layer_index=0,
+        deterministic_finalize=False,
     )
 
     assert captured["internal_activation_dtype"] == "mxfp4"
@@ -338,3 +379,22 @@ def test_kernel_routing_rejects_missing_logits(monkeypatch) -> None:
             max_num_tokens_per_gpu=1,
         )
     apply.assert_not_called()
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_finalize_negotiation_preserves_new_kernel_requirement(required):
+    def planner(*, requires_deterministic_finalize):
+        return requires_deterministic_finalize
+
+    kwargs = expert_module._deterministic_finalize_kwargs(planner, required)
+    assert planner(**kwargs) is required
+
+
+def test_finalize_negotiation_keeps_old_kernel_legacy_calls():
+    def legacy_planner(*, hidden):
+        return hidden
+
+    kwargs = expert_module._deterministic_finalize_kwargs(legacy_planner, False)
+    assert legacy_planner(hidden=128, **kwargs) == 128
+    with pytest.raises(RuntimeError, match="does not support deterministic"):
+        expert_module._deterministic_finalize_kwargs(legacy_planner, True)

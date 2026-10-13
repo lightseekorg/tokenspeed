@@ -209,6 +209,11 @@ class AttnConfig:
     qcp_size: int = 1
     qcp_rank: int = 0
     qcp_group: tuple[int, ...] = (0,)
+    # Attention token parallelism: consecutive attention-TP ranks that split
+    # the DSA sparse attention's query rows; a group of one keeps every row on
+    # its rank.
+    token_parallel_rank: int = 0
+    token_parallel_group: tuple[int, ...] = (0,)
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
@@ -243,6 +248,22 @@ class AttnConfig:
                     f"{self.kv_cache_dtype} (mxfp8={self.kv_cache_mxfp8}, quant "
                     f"method {self.kv_cache_quant_method!r})"
                 )
+        if len(self.token_parallel_group) > 1:
+            softmax = softmax_components[0]
+            if not softmax.is_dsa:
+                # Only DSA spreads rows; a draft of another family (a DFLASH
+                # or DSPARK MHA draft) keeps every row on its rank.
+                if not self.is_draft:
+                    raise ValueError(
+                        "attention token parallelism requires DSA attention"
+                    )
+            elif softmax.backend_name not in (None, "dsa"):
+                raise ValueError(
+                    "attention token parallelism requires the GPU DSA backend; "
+                    f"got {softmax.backend_name!r}"
+                )
+            elif torch.device(self.device).type != "cuda":
+                raise ValueError("attention token parallelism requires CUDA")
         if self.kvp_size > 1:
             softmax = softmax_components[0]
             if softmax.backend_name == "flashmla":
@@ -329,6 +350,8 @@ def model_wide_kwargs(
         qcp_size=attn_mapping.qcp_size,
         qcp_rank=attn_mapping.qcp_rank,
         qcp_group=attn_mapping.qcp_group,
+        token_parallel_rank=attn_mapping.token_parallel_rank,
+        token_parallel_group=attn_mapping.token_parallel_group,
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(

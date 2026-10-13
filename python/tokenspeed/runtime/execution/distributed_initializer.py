@@ -21,6 +21,7 @@
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from tokenspeed.runtime.distributed.comm_backend import set_global_backend
 from tokenspeed.runtime.distributed.comm_backend.emulated import EmulatedRankBackend
@@ -141,6 +142,35 @@ class DistributedConfig:
         )
 
 
+def _check_token_parallel_sm_counts(group: tuple[int, ...]) -> None:
+    """Every rank of an attention token-parallel group decides from its own SM
+    count whether a sparse launch spreads over the group; ranks deciding
+    differently would leave the spreading ones waiting in the all-to-all."""
+    sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    counts = [None] * len(group)
+    dist.all_gather_object(
+        counts, sms, group=pg_manager.get_process_group("gloo", group)
+    )
+    if len(set(counts)) != 1:
+        raise ValueError(
+            "attention token-parallel ranks need the same SM count, got "
+            f"{dict(zip(group, counts))}"
+        )
+
+
+def _connect_token_parallel_group(group: tuple[int, ...], device: torch.device) -> None:
+    """NCCL connects the peers of an all-to-all at their first exchange and
+    takes the connection buffers from GPU memory then. Exchanging once here,
+    before the KV cache is sized from the free memory, keeps the first CUDA
+    graph capture from allocating them on top of a full cache pool."""
+    from tokenspeed.runtime.distributed.comm_ops import all_to_all_single
+
+    probe = torch.zeros(len(group), dtype=torch.uint8, device=device)
+    all_to_all_single(torch.empty_like(probe), probe, group)
+
+
 class DistributedInitializer:
     @staticmethod
     def initialize(config: DistributedConfig) -> float:
@@ -206,6 +236,15 @@ class DistributedInitializer:
         # The query-context-parallel group of a sharded extend; equal to the
         # attention TP group while qcp == tp, so this is idempotent there.
         pg_manager.init_process_group(config.mapping.attn.qcp_group)
+        # An emulated rank runs alone: its groups hold only itself, so there
+        # are no peers to compare SM counts with or to connect to.
+        token_parallel_peers = (
+            config.mapping.attn.has_token_parallel and not config.emulate_rank_zero
+        )
+        if config.mapping.attn.has_token_parallel:
+            pg_manager.init_process_group(config.mapping.attn.token_parallel_group)
+        if token_parallel_peers:
+            _check_token_parallel_sm_counts(config.mapping.attn.token_parallel_group)
         pg_manager.init_process_group(config.mapping.attn.dp_group)
         # No-op at the default linear_attn.tp == attn.tp (same group,
         # idempotent).
@@ -281,6 +320,11 @@ class DistributedInitializer:
                     f"bitwise -- {routes or 'no group headed for the switch'}; every "
                     "other reduction takes the ordered fold"
                 )
+        if token_parallel_peers:
+            _connect_token_parallel_group(
+                config.mapping.attn.token_parallel_group,
+                torch.device(config.device, config.gpu_id),
+            )
 
         logger.info(
             "Init comm buff end. Avail mem="
