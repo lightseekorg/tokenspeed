@@ -340,7 +340,7 @@ class EventLoop:
         cache_replica_tp_size = self.attn_tp_cpu_group.size()
         # Cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when the engine cannot emit cache
-        # ops -- armed hooks cost a gloo all-reduce per round. The Host L2
+        # ops -- armed hooks cost a gloo all-reduce per cache-op round. The Host L2
         # tier arms them, and so does the retraction snapshot pool (its
         # stores and restores are cache ops too). The hooks get the handle,
         # not the executor: polling goes through it.

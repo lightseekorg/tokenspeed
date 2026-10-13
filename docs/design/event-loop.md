@@ -508,6 +508,10 @@ For orientation, one iteration of `event_loop`:
   peers wait in ``all_gather_object``. Every rank stays in every
   replica-group gather, even when an earlier TP/CP intersection is empty;
   breaking out leaves a peer unmatched on the next ``all_gather_object``.
+  The poll runs these collectives only while a cache op is open (an L3
+  backup runs, and can fail, only while its write-back is): every rank
+  counts the same plans and commits the same intersections, so the open
+  count is the same everywhere and an idle replica polls nothing.
   Weight-update `flush_cache` and standalone `/flush_cache` first
   MAX-reduce flush intent across attention DP so every DP worker enters
   the same collectives — the frontend sends `FlushCacheReqInput`
