@@ -44,6 +44,32 @@ from tokenspeed.runtime.models.base.placement import ParallelGroup, PlacementTyp
 from tokenspeed.runtime.utils import add_prefix, make_layers
 
 
+def notify_target_capture(
+    sink: TargetCaptureSink,
+    capture_idx_map: dict[int, int],
+    layer_idx: int,
+    aux_hidden_states: list[torch.Tensor],
+) -> None:
+    """Hand the tap capture layer ``layer_idx`` just appended to the
+    forward's sink.
+
+    Skipped when the capture layer appended no tap: an idle forward skips
+    BaseDecoderLayer's attention block, so nothing was appended. Layers that
+    append an empty tap on an idle forward still hand over the zero-row tensor.
+
+    Args:
+        sink: The forward's ``ctx.target_capture_sink``.
+        capture_idx_map: Capture layer index to the draft's positional tap
+            index; layers absent from it are not handed over.
+        layer_idx: The capture layer that just ran.
+        aux_hidden_states: The taps collected so far in this forward.
+    """
+    capture_idx = capture_idx_map.get(layer_idx)
+    if capture_idx is None or len(aux_hidden_states) != capture_idx + 1:
+        return
+    sink.on_target_capture(capture_idx, aux_hidden_states[capture_idx])
+
+
 class BaseTransformerModel(nn.Module):
 
     layer_cls: type[BaseDecoderLayer] = BaseDecoderLayer
@@ -154,22 +180,6 @@ class BaseTransformerModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
 
-    def _notify_dflash_capture(
-        self,
-        sink: TargetCaptureSink,
-        layer_idx: int,
-        aux_hidden_states: list[torch.Tensor],
-    ) -> None:
-        """Hand the tap capture layer ``layer_idx`` just appended to the
-        forward's sink.
-
-        An idle forward skips the attention block, so nothing was appended.
-        """
-        capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-        if capture_idx is None or len(aux_hidden_states) != capture_idx + 1:
-            return
-        sink.on_target_capture(capture_idx, aux_hidden_states[capture_idx])
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -219,8 +229,11 @@ class BaseTransformerModel(nn.Module):
             )
 
             if capture and ctx.target_capture_sink is not None:
-                self._notify_dflash_capture(
-                    ctx.target_capture_sink, i, aux_hidden_states
+                notify_target_capture(
+                    ctx.target_capture_sink,
+                    self._dflash_capture_idx_map,
+                    i,
+                    aux_hidden_states,
                 )
 
         if not ctx.forward_mode.is_idle():

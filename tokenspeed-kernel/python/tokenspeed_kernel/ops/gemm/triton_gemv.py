@@ -216,6 +216,14 @@ def triton_rowcta_gemv(
     return out
 
 
+def _gfx1250_wmma_dense_problem(m: int, n: int, k: int) -> bool:
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
+        use_gluon_wmma_dense_gfx1250,
+    )
+
+    return use_gluon_wmma_dense_gfx1250(m, k, n)
+
+
 @register_kernel(
     "gemm",
     "decode_gemv",
@@ -228,9 +236,8 @@ def triton_rowcta_gemv(
     ),
     signatures=_BF16_SIG,
     traits={
-        "m": frozenset(range(2, 33)),
-        "n_align": frozenset({16}),
-        "k_align": frozenset({128}),
+        "m": frozenset(range(2, 65)),
+        "mnk_problem_filter": frozenset({_gfx1250_wmma_dense_problem}),
     },
     priority=Priority.SPECIALIZED,
 )

@@ -564,9 +564,12 @@ class InputBuffers:
                     batch_size,
                     "decode forward",
                 )
-            self.input_ids_buf[:total_tokens].copy_(
-                runtime_states.future_input_map[req_pool_indices_device].flatten(),
-                non_blocking=True,
+            width = runtime_states.future_input_map.shape[1]
+            torch.index_select(
+                runtime_states.future_input_map,
+                0,
+                req_pool_indices_device,
+                out=self.input_ids_buf[:total_tokens].view(-1, width),
             )
 
         # Defensive clamp of the target-model IDs into the valid vocab range.
