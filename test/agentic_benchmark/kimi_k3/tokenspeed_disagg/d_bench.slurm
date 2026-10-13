@@ -1,8 +1,8 @@
 #!/usr/bin/bash
 # Decode-node simulation as a Slurm sweep: dataset prep, the server and
-# pd_client run as job steps (DP16 uses the first 4 nodes; DP32 uses 8).
+# pd_client run as job steps (TP8 uses the first 2 nodes; DP16 uses 4; DP32 uses 8).
 #
-#   sbatch -N 4 --gres=gpu:4 --time=12:00:00 [-A <account> -p <partition>] \
+#   sbatch -N 8 --gres=gpu:4 --time=12:00:00 [-A <account> -p <partition>] \
 #       --export=ALL,CONTAINER_IMAGE=<sqsh-or-ref> \
 #       --wrap "bash test/agentic_benchmark/kimi_k3/tokenspeed_disagg/d_bench.slurm"
 #
@@ -11,6 +11,7 @@
 set -euo pipefail
 
 CONFIGS=(
+    attn_tp8_moe_tp8
     attn_dp16_moe_ep16
     attn_dp32_moe_ep32
 )
@@ -82,6 +83,7 @@ launch_server() {
     local config=$1
     local node_count
     case "$config" in
+        attn_tp8_moe_tp8) node_count=2 ;;
         attn_dp16_moe_ep16) node_count=4 ;;
         attn_dp32_moe_ep32) node_count=8 ;;
         *) echo "Unsupported config: $config" >&2; return 1 ;;
@@ -176,13 +178,10 @@ mkdir -p "$SWEEP_DIR"
 echo "D-sim sweep outputs: ${SWEEP_DIR}"
 
 for CONFIG in "${CONFIGS[@]}"; do
-    # Ladder: parallel / number = parallel, one lockstep wave, so every rank runs
-    # exactly parallel/DP_size requests for the whole rung (sticky placement cannot
-    # keep per-rank concurrency constant under rolling admission). Each rung
-    # primes its own conversations 0..number-1 right before measuring them: a
-    # finished request keeps checkpoint blocks for the tokens it generated, so a
-    # measured rung grows its contexts and would evict the ones a later rung needs.
+    # Entries are parallel / number. TP8 collects extra samples; DP uses one wave.
+    # Re-prime each rung because preceding measurements grow cached contexts.
     case "$CONFIG" in
+        attn_tp8_moe_tp8) LADDER=("1 4" "2 8" "4 8" "8 16" "16 32" "32 64") ;;
         attn_dp16_moe_ep16) LADDER=("16 16" "32 32" "64 64" "128 128" "256 256" "384 384" "512 512") ;;
         attn_dp32_moe_ep32) LADDER=("32 32" "64 64" "128 128" "256 256" "384 384" "512 512" "768 768" "1024 1024") ;;
     esac

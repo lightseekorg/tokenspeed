@@ -7,7 +7,7 @@ benchmark with KV transfer.
 | --- | --- | --- |
 | `agentic_bench.slurm` | 1P1D, both ADP16/EP16 | 8 |
 | `p_bench.slurm` | Prefill simulation, ADP16/EP16 | 4 |
-| `d_bench.slurm` | Decode simulation, ADP16/EP16 then ADP32/EP32 | 8 |
+| `d_bench.slurm` | Decode simulation, TP8/TP8 then ADP16/EP16 and ADP32/EP32 | 8 |
 
 ## Running
 
@@ -58,17 +58,21 @@ sticky conversation IDs for prefix reuse.
 - **Prefill:** warm up with 16 conversations, then replay 1,024 conversations
   at concurrency 512. Each turn generates one token; the client appends
   500 synthetic assistant tokens before the next user turn.
-- **Decode:** sweep concurrency 16/32/64/128/256/384/512. At each point,
+- **Decode:** sweep concurrency 1/2/4/8/16/32 for TP8, 16/32/64/128/256/384/512
+  for ADP16, and 32/64/128/256/384/512/768/1024 for ADP32. TP8 runs
+  4/8/8/16/32/64 conversations respectively; ADP runs one conversation per
+  concurrent slot. TP8 uses the first two nodes, ADP16 the first four, and
+  ADP32 all eight. At each point,
   concatenate all stored user turns, prime at concurrency 16 with the last
   token removed after chat templating, then wait 10 seconds and generate 2,000
-  tokens from each full prompt in one wave. The shorter prime works around
+  tokens from each full prompt. The shorter prime works around
   aligned KDA checkpoint misses. Assistant responses are not included.
 
 These simulations exclude real KV-transfer costs. Prefill latency includes
 queueing. Decode requests stream output: TTFT measures the wait for the first
 content or reasoning chunk; TPOT is the time from the first to the last output
-chunk divided by output tokens minus one. Throughput still uses the full wave's
-wall time, including startup and completion tails. Cache hits can involve the
+chunk divided by output tokens minus one. Throughput uses the entire measured
+run's wall time, including startup and completion tails. Cache hits can involve the
 host KV tier.
 
 Results are under `outputs/p_<timestamp>/` and `outputs/d_<timestamp>/`;

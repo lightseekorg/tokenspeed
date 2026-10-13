@@ -14,12 +14,16 @@ sticky sessions keeps a conversation on the same attention-DP rank.
 import argparse
 import concurrent.futures as cf
 import json
+import math
+import os
 import random
 import statistics
 import sys
 import threading
 import time
 import urllib.request
+
+from transformers import AutoTokenizer
 
 TARGET_RESPONSE_TOKENS = 500
 
@@ -171,8 +175,6 @@ class Runner:
             raise SystemExit(f"request {rid} failed: {str(e)[:200]}") from e
 
     def prepare_prime(self, items):
-        from transformers import AutoTokenizer
-
         tokenizer = AutoTokenizer.from_pretrained(
             self.args.model, trust_remote_code=True, local_files_only=True
         )
@@ -187,8 +189,6 @@ class Runner:
         return prepared
 
     def prepare_prefill(self, items):
-        from transformers import AutoTokenizer
-
         tokenizer = AutoTokenizer.from_pretrained(
             self.args.model, trust_remote_code=True, local_files_only=True
         )
@@ -290,8 +290,6 @@ BOUNDARIES = (
 
 
 def _nearest_rank(sorted_vals, p):
-    import math
-
     n = len(sorted_vals)
     if not n:
         return 0.0
@@ -359,8 +357,6 @@ def main():
         f"{args.outputs_dir}/{args.name}/"
         f"parallel_{args.parallel}_number_{args.number}"
     )
-    import os
-
     os.makedirs(outdir, exist_ok=True)
     with open(f"{outdir}/benchmark_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
