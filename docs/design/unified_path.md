@@ -343,9 +343,7 @@ page mapping. Mixed batches with device-only decode lengths, and persistent
 decode views, retain the capacity bound; decode graph shapes stay fixed.
 Uniform query runs may share a K tile, but groups must never cross requests.
 A single-request forward is uniform regardless of its forward mode. Long runs
-use larger query groups; ragged layouts retain independent rows. The gfx950
-Gluon scorer finds request runs inside each row tile itself, so it shares a K
-tile only within one run for every layout. A score tile
+use larger query groups; ragged layouts retain independent rows. A score tile
 beyond all of its queries' complete-block frontiers must write `-inf` without
 reading K or executing its dot, including padded graph requests.
 
