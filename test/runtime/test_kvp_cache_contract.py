@@ -647,13 +647,13 @@ class ConfigurationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "L3"):
             args.validate_cache_options()
 
-    def test_kvp_allows_aggregated_and_prefill_roles_only(self):
-        for mode in ("null", "prefill"):
+    def test_kvp_allows_roles_with_cache(self):
+        for mode in ("null", "prefill", "decode"):
             validate_kvp_disaggregation_role(has_kvp=True, disaggregation_mode=mode)
         for mode in ("null", "prefill", "decode", "encode"):
             validate_kvp_disaggregation_role(has_kvp=False, disaggregation_mode=mode)
-        for mode in ("decode", "encode"):
-            with self.assertRaisesRegex(ValueError, "only the prefill side"):
+        for mode in ("encode",):
+            with self.assertRaisesRegex(ValueError, "null, prefill or decode"):
                 validate_kvp_disaggregation_role(has_kvp=True, disaggregation_mode=mode)
 
 

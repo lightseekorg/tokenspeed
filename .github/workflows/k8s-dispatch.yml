@@ -61,11 +61,14 @@ on:
           - test/ci/ut/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d.yaml
           - test/ci/ut/qwen3.5-397b-a17b-nvfp4-pd-1p1d.yaml
           - test/ci/ut/ut-runtime-1gpu.yaml
+          - test/ci/ut/ut-runtime-1gpu-part-i.yaml
+          - test/ci/ut/ut-runtime-1gpu-part-ii.yaml
           - test/ci/ut/ut-runtime-2gpu.yaml
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
+          - test/ci/ut/ut-tokenspeed-kernel.yaml
       runner_pool:
         description: "Runner pool selected from the YAML labels"
         required: true

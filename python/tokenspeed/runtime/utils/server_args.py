@@ -149,19 +149,16 @@ def _nonempty_str(value: str) -> str:
 def validate_kvp_disaggregation_role(
     *, has_kvp: bool, disaggregation_mode: str
 ) -> None:
-    """Reject KVP on PD roles whose transfer path cannot shard pages yet.
+    """Reject KVP on the encode role, which has no KV cache to shard.
 
-    An aggregated engine and the prefill role may shard: the prefill sender
-    copies only the pages each rank owns and every rank of the KVP subgroup
-    serves every decode rank. The decode role receives into an unsharded
-    cache only -- no receive path lands a block on its owner alone -- and the
-    encode role has no KV cache to shard.
+    Aggregated engines and both PD roles may shard: a transfer edge copies
+    only the pages its prefill rank and its decode rank both own, so the
+    prefill and decode caches shard independently.
     """
-    if has_kvp and disaggregation_mode not in ("null", "prefill"):
+    if has_kvp and disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(
             "--kv-parallel-size > 1 requires --disaggregation-mode "
-            f"null or prefill (got {disaggregation_mode!r}): only the prefill "
-            "side of a PD transfer can be KVP-sharded"
+            f"null, prefill or decode (got {disaggregation_mode!r})"
         )
 
 
@@ -340,6 +337,12 @@ class ServerArgs:
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
+    # Port for the engine's Prometheus /metrics HTTP endpoint, served from the
+    # engine's main process when --enable-metrics is on. None auto-allocates a
+    # free port (logged at startup).
+    metrics_port: int | None = None
+    # Bind host for the /metrics endpoint. None binds the engine's --host.
+    metrics_host: str | None = None
     app_key: str | None = None
 
     # Cache events
@@ -2551,6 +2554,21 @@ class ServerArgs:
             choices=["prometheus"],
             default=["prometheus"],
             help="Select metrics reporter(can be specified multiple times)",
+        )
+        parser.add_argument(
+            "--metrics-port",
+            type=int,
+            default=ServerArgs.metrics_port,
+            help="Port for the engine's Prometheus /metrics HTTP endpoint, served "
+            "by the engine's main process when --enable-metrics is on. Defaults "
+            "to an automatically allocated free port (logged at startup); 0 "
+            "also auto-allocates.",
+        )
+        parser.add_argument(
+            "--metrics-host",
+            type=str,
+            default=ServerArgs.metrics_host,
+            help="Bind host for the /metrics endpoint. Defaults to --host.",
         )
 
         parser.add_argument(
