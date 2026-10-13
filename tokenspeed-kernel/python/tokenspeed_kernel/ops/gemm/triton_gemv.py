@@ -50,6 +50,10 @@ import functools
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.compile_monitor import is_serving
+from tokenspeed_kernel.ops.gemm._cute_dsl.h20_decode import (
+    cute_dsl_h20_decode,
+    h20_decode_supported,
+)
 from tokenspeed_kernel.ops.gemm.flashinfer import (
     BF16_GEMM_MAX_M,
     autotune_bf16_gemm,
@@ -442,6 +446,7 @@ def _select(
     x_dtype: torch.dtype,
     weight_dtype: torch.dtype,
     weight_split: bool,
+    h20_eligible: bool = False,
 ):
     signature = _SIGNATURES.get((x_dtype, weight_dtype))
     if not on_cuda or signature is None:
@@ -458,11 +463,16 @@ def _select(
         platform=current_platform(),
         format_signature=signature,
     ):
+        # H20 is a call-local candidate, never a generic SM90 registration.
+        # Existing matches at the same or a higher priority (including plugins)
+        # retain precedence. Eligibility is part of this function's cache key.
+        if h20_eligible and spec.priority < Priority.SPECIALIZED + 2:
+            return cute_dsl_h20_decode
         if spec_matches_traits(spec, traits) and spec_matches_shape_traits(
             spec, traits
         ):
             return reg.get_impl(spec.name)
-    return torch_decode_gemv
+    return cute_dsl_h20_decode if h20_eligible else torch_decode_gemv
 
 
 def use_decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -473,9 +483,11 @@ def use_decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
         weight: Projection weight shaped ``[N, K]``.
 
     Returns:
-        True for eligible small-M FI inputs or a registered CDNA4/CDNA5
+        True for an eligible H20 candidate, small-M FI inputs, or a CDNA4/CDNA5
         kernel; False when the caller should retain its ordinary GEMM path.
     """
+    if h20_decode_supported(x, weight):
+        return True
     if (
         flashinfer_joint_bf16_supported(x, weight, None)
         and x.shape[0] <= BF16_GEMM_MAX_M
@@ -496,12 +508,15 @@ def use_decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     platform = current_platform()
     n = weight.shape[0]
     if platform.is_cdna4:
-        return m >= 2 and _select(m, n, k, True, x.dtype, weight.dtype, False) is not (
-            torch_decode_gemv
-        )
+        return m >= 2 and _select(
+            m, n, k, True, x.dtype, weight.dtype, False, False
+        ) is not (torch_decode_gemv)
     if not platform.is_cdna5 or k < 256:
         return False
-    return _select(m, n, k, True, x.dtype, weight.dtype, False) is not torch_decode_gemv
+    return (
+        _select(m, n, k, True, x.dtype, weight.dtype, False, False)
+        is not torch_decode_gemv
+    )
 
 
 def decode_gemv(
@@ -511,10 +526,11 @@ def decode_gemv(
     *,
     weight_split: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``x @ weight.T`` through joint FI tuning or the ordinary registry fallback.
+    """``x @ weight.T`` through joint FI, bounded H20 or registry selection.
 
     FlashInfer owns runner/tactic selection on the supported BF16 range.
-    The registry retains other architectures, unsupported input layouts and
+    Eligible H20 calls participate at priority 14, below existing matches at
+    the same or a higher priority. The registry retains other architectures and
     FP32 weights, which also take BF16 activations and return FP32.
     Noncontiguous inputs and other dtypes take Torch.
 
@@ -560,6 +576,7 @@ def decode_gemv(
         x.dtype,
         weight.dtype,
         weight_split is not None,
+        h20_decode_supported(x, weight, out),
     )
     if impl is triton_bf16x3_gemm_fp32:
         return impl(x, weight_split, out)
