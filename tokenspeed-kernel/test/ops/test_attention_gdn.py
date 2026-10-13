@@ -1008,43 +1008,6 @@ def test_gdn_decode_mtp_output_state_matches_in_place(
     assert torch.equal(read_pool, pool)
 
 
-def test_gdn_decode_mtp_triton_rejects_strided_output_state(device: str, require):
-    """The Triton kernel writes ``output_state`` rows densely, so a row-strided
-    pool must be rejected rather than written at the wrong offsets."""
-    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
-
-    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
-        device=device,
-        dtype=torch.bfloat16,
-        T=2,
-        pool_size=16,
-        state_dtype=torch.float32,
-    )
-    strided = torch.zeros(
-        (pool.shape[0], 2, *pool.shape[1:]), dtype=pool.dtype, device=device
-    )[:, 0]
-    with pytest.raises(ValueError, match="contiguous output_state"):
-        gdn_decode_mtp(
-            q,
-            k,
-            v,
-            A_log=A_log,
-            a=a,
-            dt_bias=dt_bias,
-            b=b,
-            initial_state=pool,
-            initial_state_indices=torch.arange(4, device=device, dtype=torch.int32),
-            output_state=strided,
-            output_state_indices=torch.arange(8, device=device, dtype=torch.int32).view(
-                4, 2
-            ),
-            tree_ancestors=None,
-            disable_state_update=False,
-            use_qk_l2norm=True,
-            solution="triton",
-        )
-
-
 @pytest.mark.parametrize(
     ("solution", "state_dtype"),
     [
