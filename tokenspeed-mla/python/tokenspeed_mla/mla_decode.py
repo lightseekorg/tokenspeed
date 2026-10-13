@@ -484,8 +484,9 @@ def _get_compiled_sm107_mla_kernel(
     use_pdl: bool,
     use_fp16_softmax: bool,
     reducer_max_splits: int,
+    output_dtype: torch.dtype,
 ) -> Callable:
-    """Compile and cache the SM107 FP8-input, FP8-output MLA decode kernel.
+    """Compile and cache SM107 FP8-input decode with FP8 or BF16 output.
 
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse, workspace (None when split_kv == 1), split_kv,
@@ -499,10 +500,10 @@ def _get_compiled_sm107_mla_kernel(
         mma_pv_tiler_mn=(SM107_MLA_M_TILE, 256),
         max_active_clusters=_get_sm107_max_active_clusters(),
         page_size=page_size,
-        # Retaining maxima benefits split chunks; long unsplit walks benchmark
-        # faster with zero threshold. Both cluster shapes decide before P,
-        # including the last tile, so retained-max P stays <= 256 < 448.
-        skip_correction_threshold=0.0 if is_workspace_size_zero else 8.0,
+        # Retain the normalization base for small maximum increases to skip
+        # PV rescaling. These log2 thresholds bound P by 16 for unsplit walks
+        # and 256 for split chunks, below the FP8 E4M3 maximum of 448.
+        skip_correction_threshold=4.0 if is_workspace_size_zero else 8.0,
         # Cluster launch control schedules the work, so the static
         # persistent-grid choice does not apply.
         is_persistent=False,
@@ -556,7 +557,7 @@ def _get_compiled_sm107_mla_kernel(
         assumed_align=4,
     )
     o_fake = cute.runtime.make_fake_compact_tensor(
-        fp8,
+        torch_to_cutlass_dtype(output_dtype),
         (sym_batch, sym_seq_q, sym_heads, sym_latent),
         stride_order=(3, 2, 1, 0),
         assumed_align=16,
@@ -625,38 +626,42 @@ def _sm107_fp8_out_decode(
     enable_packed_q: bool,
     compute_capability: tuple[int, int],
 ):
-    """FP8-output decode on the SM107 kernel in ``mla_decode_fp8_sm107.py``."""
+    """Launch SM107 FP8-input decode with FP8 or BF16 output.
+
+    The public wrapper selects this entry for FP8 output. Direct callers can
+    also supply BF16 output; both dtypes use the same M256 split-KV planner.
+    """
     B, q_len, H, kv_lora_rank = q_latent.shape
     qk_rope_head_dim = q_rope.shape[-1]
     if compute_capability != (10, 7):
         raise ValueError(
-            f"FP8 output is only supported on SM107, got sm_{compute_capability[0]}"
+            f"This FP8-input kernel is only supported on SM107, got sm_{compute_capability[0]}"
             f"{compute_capability[1]}"
         )
     if q_latent.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"FP8 output requires FP8 E4M3 Q/KV, got {q_latent.dtype}")
+        raise ValueError(f"SM107 decode requires FP8 E4M3 Q/KV, got {q_latent.dtype}")
     if window_left != -1 or cp_world != 1 or cp_rank != 0 or causal_seqs is not None:
         raise ValueError(
-            "FP8 output does not support sliding windows or decode context parallel"
+            "SM107 M256 decode does not support sliding windows or decode context parallel"
         )
     if local_visible_lens is not None:
-        raise ValueError("FP8 output does not support local_visible_lens")
+        raise ValueError("SM107 M256 decode does not support local_visible_lens")
     if not Sm107MultiHeadLatentAttentionForwardFP8.can_implement(
         H,
         q_len,
         kv_lora_rank,
         qk_rope_head_dim,
         cutlass.Float8E4M3FN,
-        cutlass.Float8E4M3FN,
+        torch_to_cutlass_dtype(out.dtype),
         page_size,
         is_var_seq,
         False,
         enable_packed_q,
     ):
         raise ValueError(
-            f"FP8 output: unsupported configuration (q_len={q_len}, num_heads={H}, "
+            f"SM107 M256 decode: unsupported configuration (q_len={q_len}, num_heads={H}, "
             f"kv_lora_rank={kv_lora_rank}, qk_rope_head_dim={qk_rope_head_dim}, "
-            f"page_size={page_size}, enable_packed_q={enable_packed_q}); needs "
+            f"page_size={page_size}, out_dtype={out.dtype}, enable_packed_q={enable_packed_q}); needs "
             f"at most 4 {SM107_MLA_M_TILE}-row tiles of num_heads * q_len rows, "
             f"and without enable_packed_q num_heads * F == {SM107_MLA_M_TILE} "
             "with q_len a multiple of F"
@@ -665,7 +670,9 @@ def _sm107_fp8_out_decode(
     if q_latent.stride(1) != H * q_latent.stride(2) or out.stride(1) != H * out.stride(
         2
     ):
-        raise ValueError("FP8 output requires adjacent query tokens in query and out")
+        raise ValueError(
+            "SM107 M256 decode requires adjacent query tokens in query and out"
+        )
     if out.shape != (B, q_len, H, kv_lora_rank) or not out.is_contiguous():
         raise ValueError(
             f"out must be contiguous {(B, q_len, H, kv_lora_rank)}, got "
@@ -677,7 +684,7 @@ def _sm107_fp8_out_decode(
         ceil_div(q_len * H, SM107_MLA_M_TILE),
         SM107_MLA_M_TILE,
         kv_lora_rank,
-        _get_sm107_max_active_clusters() * 4,
+        get_max_active_clusters(4) * 4,
         max_seq_len,
         min_split_kv,
     )
@@ -699,6 +706,7 @@ def _sm107_fp8_out_decode(
         use_pdl=enable_pdl,
         use_fp16_softmax=_SM107_FP16_SOFTMAX,
         reducer_max_splits=_get_reducer_max_splits(split_kv),
+        output_dtype=out.dtype,
     )
     # The kernel always writes LSE; it is returned only when requested.
     lse = torch.empty((B, q_len, H), dtype=torch.float32, device=q_latent.device)

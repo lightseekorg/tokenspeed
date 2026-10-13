@@ -58,6 +58,7 @@ def _profile(**overrides) -> ModelProfile:
         default_attention_backend="mla",
         default_prefix_granularity=64,
         request_token_history=True,
+        is_multimodal=False,
         tokenizer_kwargs={"fix_mistral_regex": True},
         attention_instances_per_layer=1,
         numerics_envelopes=frozenset({"auto"}),
@@ -644,6 +645,7 @@ def test_attention_instances_per_layer_has_no_fallback() -> None:
         default_attention_backend=None,
         default_prefix_granularity=None,
         request_token_history=False,
+        is_multimodal=False,
         tokenizer_kwargs={},
     )
     with pytest.raises(TypeError, match="attention_instances_per_layer"):

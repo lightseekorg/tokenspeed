@@ -311,6 +311,9 @@ def test_idle_rank_hands_history_drafts_an_empty_view() -> None:
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
+    executor.device_module = torch.get_device_module(executor.device)
+    executor.default_stream = executor.device_module.current_stream()
+    executor.execution_stream = executor.device_module.Stream()
     executor.input_buffers = _input_buffers()
     executor.runtime_states = runtime
     executor.attn_backend = SimpleNamespace()

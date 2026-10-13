@@ -1405,6 +1405,22 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     assert all(e["optional"] is False for e in matrix["include"])
 
 
+def test_build_matrix_post_submit_also_selects_per_commit_tasks(tmp_path):
+    _write_task_yaml(tmp_path, "a.yaml", _default_body("pr", ["b200-1gpu"]))
+    _write_task_yaml(
+        tmp_path,
+        "b.yaml",
+        _default_body("push", ["b200-1gpu"]).replace("per-commit", "post-submit"),
+    )
+
+    def names(trigger):
+        matrix = build_matrix(tmp_path, tmp_path, trigger=trigger)
+        return [entry["name"] for entry in matrix["include"]]
+
+    assert names("per-commit") == ["pr"]
+    assert names("post-submit") == ["pr", "push"]
+
+
 def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):
     _write_task_yaml(
         tmp_path,

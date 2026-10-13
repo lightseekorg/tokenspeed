@@ -83,7 +83,7 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   └── force_deterministic_rsag    the user's "NCCL and the fold only" knob:
 │                                   no symmetric-memory path at all (multicast
 │                                   gathers, in-switch reduction, the trtllm
-│                                   and Triton all-reduce tiers, distributed
+│                                   and Iris all-reduce tiers, distributed
 │                                   argmax). Not folded by the envelope,
 │                                   honoured first by every route
 ├── sampling.deterministic          sampling_stream=per-request: sampled rows
@@ -436,10 +436,38 @@ afterwards, so chunked prefill and prefix-cache hits do not change a prompt
 logprob either -- the admission probe is capped at `logprob_start_len`
 (`scheduler.md` §1) so every scored position is actually recomputed.
 
+## Prefix hits resume at any token: KV bitwise, recurrent state within tolerance
+
+A prefix hit resumes a prompt at the token count a previous request stopped
+at -- its prompt end, its finish, or a chunk end -- not at a page boundary
+(`docs/design/cache-concepts.md`, "Token-level prefix hits"). For attention
+layers this changes nothing: a query row depends only on the K/V rows it
+attends to, and chunked prefill already starts forwards at arbitrary
+positions, so a KV-only model produces the same tokens and logprobs with a
+hit at any `T` as it does cold, bitwise, and the invariance harness asserts
+that.
+
+Recurrent layers (GDN, KDA, Mamba2) are different: their chunked kernels group
+tokens in kernel chunks counted from each forward's first token, so resuming
+from a stored state at a `T` that is not a multiple of the kernel chunk
+regroups a floating-point reduction that the cold forward computed in one
+grouping. The stored state is the exact state of the forward that wrote it,
+not a reordering of the cold one, and the two agree to the kernel's intra-chunk
+bf16 rounding (measured on GDN: state max abs difference ~2e-2 on a 0.7 scale,
+mean ~5e-4). The engine does not cut chunks or publication points to the
+kernel chunk; hits at any `T` are served. The oracle for a hybrid model is
+therefore greedy token agreement over the generation plus `allclose` of the
+resumed state against the cold scan at the hit, not `torch.equal`; a hybrid
+run that needs the bitwise claim of this document across a prefix hit must
+resume at a kernel-chunk multiple -- which the rl-bitwise flows do by
+construction, their prompts being the complete prefix of a finished
+sequence. Within one forward the recurrent kernels keep their batch
+invariance: a request's state does not depend on its co-batch.
+
 ## Retraction is a byte copy: the bitwise continuation oracle
 
 A capacity retraction suspends a request with its image -- every cache
-group's data blocks, the unaligned tail page included, and the slot-state
+group's data blocks, the partial last page included, and the slot-state
 blob: the next step's inputs and draft candidates, the verifier's recorded
 draft distributions `q`, the drafter's stash, the sampling backend's
 per-request state (`docs/design/cache-concepts.md`, "Retraction image") --

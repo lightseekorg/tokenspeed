@@ -69,9 +69,10 @@ class CacheTransfer:
             Device block for a store, a Host block for a restore.
         destination_page: Scheduler (virtual) block id of the destination:
             a snapshot-pool block for a store, a Device block for a restore.
-        content_hash: The prefix key of an L2-tier restore row, so the
-            scheduler can publish the restored Device block; empty on every
-            other row.
+        content_hash: The prefix key of an L2-tier restore row the scheduler
+            publishes the restored Device block under; empty on every other
+            row, including an L2 row that restores a private copy of a
+            published tail block.
         page_offset: The key's page offset; 0 where the key is empty.
     """
 

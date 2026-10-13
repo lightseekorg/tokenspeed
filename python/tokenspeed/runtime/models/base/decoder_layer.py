@@ -48,6 +48,31 @@ from tokenspeed.runtime.models.base.module_spec import ModuleKind, ModuleSpec
 from tokenspeed.runtime.models.base.placement import ParallelGroup, Partial, Replicate
 
 
+def capture_layer_input(
+    comm_manager: CommManager,
+    residual: torch.Tensor,
+    ctx: ForwardContext,
+    aux_hidden_states: list[torch.Tensor] | None,
+) -> None:
+    """Append a capture layer's input to ``aux_hidden_states`` as full rows.
+
+    Args:
+        comm_manager: The layer's communication policy; gathers RSAG rows.
+        residual: The residual right after the layer's opening (all-reduce +)
+            add, i.e. the reduced layer input even when the previous layer's
+            MLP all-reduce was fused into that add.
+        ctx: The forward context.
+        aux_hidden_states: The taps collected so far; ``None`` when this layer
+            is not captured.
+    """
+    if aux_hidden_states is None:
+        return
+    # Under RSAG the residual is reduce-scattered across the attn TP group;
+    # aux consumers (e.g. the EAGLE3 drafter) expect full rows. Clone because
+    # later norms update the residual in place.
+    aux_hidden_states.append(comm_manager.gather_residual(residual, ctx).clone())
+
+
 def _default_compute_output_placement(
     mapping: Mapping,
     group: ParallelGroup,
@@ -136,13 +161,7 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
             hidden_states, residual
         )
 
-        if aux_hidden_states is not None:
-            # Under RSAG the residual entering this layer is reduce-scattered
-            # across the attn TP group; aux consumers (e.g. the EAGLE3
-            # drafter) expect full rows, so gather before capturing.
-            aux_hidden_states.append(
-                self.comm_manager.gather_residual(residual, ctx).clone()
-            )
+        capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
 
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
 

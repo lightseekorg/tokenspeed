@@ -47,3 +47,18 @@ stop_worker_pids() {
   fi
   wait "${worker_pids[@]}" 2>/dev/null || true
 }
+
+# After `wait -n` returns: name every worker that has exited and show the tail
+# of its log, so a crash mid-run is diagnosable from the job log alone. The
+# two arrays are parallel: worker_logs[i] is the log of worker_pids[i].
+report_exited_workers() {
+  local label=$1
+  local -n _logs=$2
+  local -n _pids=$3
+  local i
+  for i in "${!_pids[@]}"; do
+    kill -0 "${_pids[$i]}" 2>/dev/null && continue
+    echo "[$label] worker exited early: pid=${_pids[$i]} log=${_logs[$i]}" >&2
+    tail -n 200 "${_logs[$i]}" >&2 || true
+  done
+}

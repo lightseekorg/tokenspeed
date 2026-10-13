@@ -121,6 +121,13 @@ class RequestState:
         # request stats (host-side); tracker attached only with --enable-log-request-stats
         self.created_time: float = created_time
         self.stats: RequestStatsTracker = NOOP_STATS
+        # Queue-time metric (tokenspeed:request_queue_time_seconds): wall time
+        # the request entered the scheduler's waiting queue, stamped when its
+        # spec is submitted, and the once-per-request observation flag. A
+        # retracted request re-enters the C++ queue without a new stamp, so
+        # preemption never records a second sample.
+        self.scheduler_enqueue_time: float = 0.0
+        self.queue_time_recorded: bool = False
         # Sampled-token logprobs, accumulated per generated token.
         # None when return_logprob is False.
         self.output_token_logprobs_val: list[float] | None = (
@@ -186,17 +193,24 @@ class RequestState:
         self.grammar_key: tuple[str, str] | None = None
         self.grammar_queued_ts: float = 0.0
 
-    def set_finish_with_abort(self, message: str, notify_client: bool = False) -> None:
+    def set_finish_with_abort(
+        self,
+        message: str,
+        notify_client: bool = False,
+        status_code: int | None = None,
+    ) -> None:
         """Mark this request as aborted with ``message``; finished_reason is
         materialized immediately so callers don't need a check_finished() pass.
 
         ``notify_client`` streams a terminating finish to the client (used for
         pause-initiated aborts, where the client did not tear down its state).
+        ``status_code`` is the HTTP status the frontend reports; None leaves
+        the abort an internal error.
         """
         self.to_abort = True
         self.to_abort_message = message
         self.abort_notify_client = notify_client
-        self.finished_reason = FINISH_ABORT(message=message)
+        self.finished_reason = FINISH_ABORT(message=message, status_code=status_code)
 
     @classmethod
     def from_recv_req(
@@ -803,20 +817,30 @@ class OutputProcesser:
             else:
                 pt += output_length
 
+            # Mid-chunk extend slot by the op's own prefill_lengths: C++ owes
+            # no token and the sampled one is garbage.
+            mid_chunk = (
+                not is_decode_slot
+                and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
+                < prefill_lengths[i]
+            )
+
             if rid not in self.rid_to_state:
-                # means it's delayed token, do not process
+                # The request finished (or was aborted) on an earlier result
+                # while this forward was already dispatched. Its output goes
+                # nowhere, but the forward landed: the scheduler counts it
+                # against the request's pages and, for a finished request,
+                # publishes the frontier it consumed once nothing is in
+                # flight. The tokens keep the frontier exact (TokenSize - 1).
+                request_changes.append(
+                    make_extend_result_event(rid, [] if mid_chunk else model_output_ids)
+                )
                 continue
 
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
-            # Mid-chunk extend slot by the op's own prefill_lengths: C++ owes
-            # no token and the sampled one is garbage.
-            if (
-                not is_decode_slot
-                and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
-                < prefill_lengths[i]
-            ):
+            if mid_chunk:
                 # It owes no token, but the chunk's KV has landed -- report
                 # that much, so the scheduler stops counting a forward
                 # against these pages and may retract the request (imaging
@@ -1059,6 +1083,9 @@ class OutputProcesser:
         It is appended to output_ids so the decode side starts generation from the
         correct position.
 
+        ``cached_tokens`` reports prefill cache reuse and determines uncached prompt
+        work. Decode-local cache hits only reduce KV transfer.
+
         A constrained request also advances its matcher here. Prefill and decode
         each compiled their own matcher for the request, and this token is the
         only one the decode node never samples itself: without accepting it here
@@ -1076,8 +1103,7 @@ class OutputProcesser:
         if req_id not in self.rid_to_state:
             return
         state = self.rid_to_state[req_id]
-        # P and D reuse overlapping leading prefixes; never sum their hits.
-        state.cached_tokens = max(state.cached_tokens, cached_tokens)
+        state.cached_tokens = cached_tokens
         if bootstrap_token == -1:
             logger.warning(
                 f"[on_remote_prefill_done] rid={req_id!s} received bootstrap_token=-1, "

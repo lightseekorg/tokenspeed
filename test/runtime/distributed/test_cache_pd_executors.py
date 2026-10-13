@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 from contextlib import nullcontext
@@ -25,8 +26,12 @@ from runtime.cache_pd_test_utils import operation as make_operation
 from runtime.cache_pd_test_utils import segment as make_segment
 
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
+    CacheContractError,
     CachePDBlockManifest,
     CacheTransferContract,
+    build_cache_block_manifest,
+    build_cache_layerwise_block_selection,
+    validate_cache_manifest,
 )
 from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
     KVArgsRegisterInfo,
@@ -35,10 +40,16 @@ from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
 )
 from tokenspeed.runtime.pd.mooncake.pack import (  # noqa: E402
     PageFieldCopies,
+    coalesce_transfer_blocks,
     flatten_transfer_blocks,
 )
+from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
-from tokenspeed.runtime.pd.transfer_plan import CacheTransferFragment  # noqa: E402
+from tokenspeed.runtime.pd.transfer_plan import (  # noqa: E402
+    CacheTransferFragment,
+    CacheTransferPlanner,
+    UnsupportedPDLayoutError,
+)
 
 
 def _topology(
@@ -117,13 +128,14 @@ def _typed_layout(
     )
 
 
-def _op(*, state_page: int = 6, spec_candidate_ids=((),)):
+def _op(*, state_page: int = 6, spec_candidate_ids=((),), state_prefix_cached=False):
     tables = {
         "history": np.asarray([[1, 2, 3]], dtype=np.int32),
-        "state": np.asarray([[4, 5, state_page]], dtype=np.int32),
+        # The D lands the prompt-end state in its live slot; slot 0 is null.
+        "state": np.asarray([[0, state_page, -1]], dtype=np.int32),
     }
     # The remote-decode op is self-contained: the scheduler stamps the
-    # bootstrap token and drafter candidates onto its rows.
+    # bootstrap token, drafter candidates and the state-hit flag onto its rows.
     return make_operation(
         tables,
         request_ids=["request-0"],
@@ -133,6 +145,7 @@ def _op(*, state_page: int = 6, spec_candidate_ids=((),)):
         num_extends=lambda: 1,
         decode_input_ids=[42],
         spec_candidate_ids=[list(ids) for ids in spec_candidate_ids],
+        state_prefix_cached=[state_prefix_cached],
     )
 
 
@@ -215,6 +228,7 @@ def _transfer_cache(
     return manager._transfer_data(
         session,
         manager._cache_transfer_blocks(
+            dst_tp_rank=0,
             dst_ptr=dst_ptr,
             src_block_manifest=src_block_manifest,
             dst_block_manifest=dst_block_manifest,
@@ -231,6 +245,7 @@ def _recording_transfer_manager(layout: CacheTransferContract, src_ptr: int):
 
     calls = []
     manager = object.__new__(MooncakeKVManagerPrefill)
+    manager.topology = SimpleNamespace(tp_rank=0)
     manager.kv_args = SimpleNamespace(cache_layout=layout, kv_data_ptr=src_ptr)
 
     # Whole-field descriptors arrive as int64 array columns, fragment rows as
@@ -491,6 +506,10 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
             plan=layout.plan,
             cache_group_specs=layout.group_specs,
             contract_binding=lambda: buffer,
+            field_address=lambda name: (
+                buffer.data_ptr() + layout.plan.field_page_byte_offset(name, 0)
+            ),
+            registration_regions=lambda: ((buffer.data_ptr(), buffer.nbytes),),
         ),
     )
 
@@ -517,7 +536,13 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
     assert kv_args.kv_data_ptr == buffer.data_ptr()
     assert kv_args.ib_device == "mlx5_0"
     assert kv_args.gpu_id == 0
-    assert kv_args.cache_layout == layout
+    assert kv_args.cache_layout.plan == layout.plan
+    assert kv_args.cache_layout.group_specs == layout.group_specs
+    assert kv_args.cache_layout.transfer_schema == layout.transfer_schema
+    for field in layout.plan.fields:
+        assert kv_args.cache_layout.field_address(
+            buffer.data_ptr(), field.field_id
+        ) == buffer.data_ptr() + layout.plan.field_page_byte_offset(field.field_id, 0)
     assert kv_args.cache_producer_schedule.fields_by_step == (
         ("layer.0.kv",),
         ("layer.1.state",),
@@ -581,7 +606,7 @@ def test_terminal_events_clear_transport_room_state(
 
     assert len(decode.generate_events()) == 1
     assert decode.pop_remote_cache_slot("request") == 7
-    assert decode.pop_remote_cached_tokens("request") == max(2, remote_hits)
+    assert decode.pop_remote_cached_tokens("request") == remote_hits
     assert decode.pop_remote_bootstrap_logprob("request") == -0.25
     assert decode.pop_remote_spec_candidate_ids("request") == (7, [1])
     assert decode._admissions == {}
@@ -643,7 +668,18 @@ def test_decode_publishes_manifest_through_contract_receiver() -> None:
     args, kwargs = calls[0]
     assert args == ()
     assert kwargs["block_manifest"].groups[0].block_ids == (2, 3)
-    assert executor._admissions == {"request-0": (7, 2)}
+    assert kwargs["block_manifest"].groups[1].block_ids == (6,)
+    assert kwargs["block_manifest"].state_prefix_cached is False
+    assert executor._admissions == {"request-0": 7}
+
+    # A D-local state hit at the prompt end: the manifest carries the flag
+    # and no state block for the P to fill.
+    calls.clear()
+    executor.receivers = {"request-0": receiver}
+    executor._cache_prefill(_op(state_prefix_cached=True))
+    manifest = calls[0][1]["block_manifest"]
+    assert manifest.state_prefix_cached is True
+    assert manifest.groups[1].block_ids == ()
 
 
 def test_prefill_submits_manifest_through_contract_sender() -> None:
@@ -813,7 +849,10 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     ]
 
 
-def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
+@pytest.mark.parametrize("physical_addresses", [False, True])
+def test_transfer_blocks_for_many_pages_match_the_per_page_geometry(
+    physical_addresses,
+) -> None:
     # Two fields and hundreds of pages: the generator resolves each field's
     # geometry once and expands pages in bulk, so check it against the plain
     # per-page formula in both the whole-field and the fragment path.
@@ -830,6 +869,23 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
 
     source_layout = two_field_layout(700)
     destination_layout = two_field_layout(900)
+    if physical_addresses:
+        # Mixed arenas advertise each field's landing address independently
+        # of the logical plane offsets and the endpoint's registration base.
+        source_layout = replace(
+            source_layout,
+            field_addresses={
+                field.field_id: 0x100000 * (i + 1)
+                for i, field in enumerate(source_layout.plan.fields)
+            },
+        )
+        destination_layout = replace(
+            destination_layout,
+            field_addresses={
+                field.field_id: 0x1000000 * (i + 1)
+                for i, field in enumerate(destination_layout.plan.fields)
+            },
+        )
     pages = 300
     src_pages = tuple(range(1, 2 * pages, 2))
     dst_pages = tuple(range(899, 899 - 2 * pages, -2))
@@ -839,7 +895,7 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
     def field_pages(layout, ptr, field_id, page_ids):
         segment = next(f for f in layout.plan.fields if f.field_id == field_id)
         return [
-            ptr + layout.plan.field_page_byte_offset(field_id, page)
+            layout.field_address(ptr, field_id) + page * segment.page_stride_bytes
             for page in page_ids
         ], segment.payload_bytes
 
@@ -852,6 +908,7 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
         expected.extend(zip(src, dst, [size] * pages, strict=True))
     blocks = list(
         manager._cache_transfer_blocks(
+            dst_tp_rank=0,
             dst_ptr=0x2000,
             src_block_manifest=source_manifest,
             dst_block_manifest=destination_manifest,
@@ -881,6 +938,7 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
     dst, _ = field_pages(destination_layout, 0x2000, fields[1], dst_pages)
     fragment_blocks = list(
         manager._cache_transfer_blocks(
+            dst_tp_rank=0,
             dst_ptr=0x2000,
             src_block_manifest=source_manifest,
             dst_block_manifest=destination_manifest,
@@ -917,7 +975,8 @@ def test_transfer_data_writes_page_grids_between_descriptor_batches() -> None:
     # rows after it start a new batch; order on the wire is preserved.
     blocks = [(1, 2, 3), (4, 5, 6), item, (7, 8, 9)]
     assert manager._transfer_data("session", iter(blocks)) == 0
-    assert [call[1] for call in calls] == [[1, 4], [7]]
+    assert [call[1] for call in calls] == [[1], [7]]
+    assert calls[0][3] == [9]
     ((session, src, dst, fields, max_batch_size),) = page_calls
     assert session == "session" and src is item.src_pages and fields is item.fields
     assert max_batch_size == prefill_module._TRANSFER_DESCRIPTOR_BATCH_SIZE
@@ -1323,7 +1382,10 @@ def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> 
     assert manager.transfer_infos == {}
 
 
-def test_shared_manager_lazily_bounds_application_descriptor_batches() -> None:
+@pytest.mark.parametrize("stride", [64, 128])
+def test_shared_manager_lazily_bounds_application_descriptor_batches(
+    stride: int,
+) -> None:
     from tokenspeed.runtime.pd.mooncake.prefill import (
         _TRANSFER_DESCRIPTOR_BATCH_SIZE,
         MooncakeKVManagerPrefill,
@@ -1346,15 +1408,20 @@ def test_shared_manager_lazily_bounds_application_descriptor_batches() -> None:
     def blocks():
         for index in range(block_count):
             pulled.append(index)
-            yield (0x1000 + index * 64, 0x2000 + index * 64, 64)
+            yield (0x1000 + index * stride, 0x2000 + index * stride, 64)
 
     assert manager._transfer_data("decode-session", blocks()) == 0
     assert pulled_at_first_write == [_TRANSFER_DESCRIPTOR_BATCH_SIZE]
-    assert batch_sizes == [
-        (_TRANSFER_DESCRIPTOR_BATCH_SIZE,) * 3,
-        (_TRANSFER_DESCRIPTOR_BATCH_SIZE,) * 3,
-        (17, 17, 17),
-    ]
+    expected_sizes = (
+        [1, 1, 1]
+        if stride == 64
+        else [
+            _TRANSFER_DESCRIPTOR_BATCH_SIZE,
+            _TRANSFER_DESCRIPTOR_BATCH_SIZE,
+            17,
+        ]
+    )
+    assert batch_sizes == [(size,) * 3 for size in expected_sizes]
 
 
 def test_shared_manager_uses_destination_page_zero_offsets() -> None:
@@ -1622,6 +1689,275 @@ def test_usage_alone_does_not_release_layerwise_bootstrap_waiter():
     assert manager.bootstrap_logprobs[9] == -1.5
 
 
+@pytest.mark.parametrize(
+    "blocks, expected",
+    [
+        ([], []),
+        ([(10, 100, 4), (14, 104, 8), (22, 112, 2)], [(10, 100, 14)]),
+        ([(10, 100, 4), (15, 104, 4)], [(10, 100, 4), (15, 104, 4)]),
+        ([(10, 100, 4), (14, 105, 4)], [(10, 100, 4), (14, 105, 4)]),
+        ([(14, 104, 4), (10, 100, 4)], [(14, 104, 4), (10, 100, 4)]),
+        ([(10, 100, 4), (12, 102, 4)], [(10, 100, 4), (12, 102, 4)]),
+    ],
+)
+def test_coalesce_transfer_blocks_preserves_byte_mapping(blocks, expected):
+    from tokenspeed.runtime.pd.mooncake.pack import coalesce_transfer_blocks
+
+    result = list(coalesce_transfer_blocks(iter(blocks)))
+    assert result == expected
+
+    def byte_mapping(entries):
+        return [
+            (src + i, dst + i) for src, dst, length in entries for i in range(length)
+        ]
+
+    assert byte_mapping(result) == byte_mapping(blocks)
+
+
+def test_coalesce_transfer_blocks_after_pack_expansion():
+    from tokenspeed.runtime.pd.mooncake.pack import (
+        PackedCopy,
+        coalesce_transfer_blocks,
+        flatten_transfer_blocks,
+    )
+
+    blocks = [PackedCopy(src=100, dst=200, width=4, src_pitch=8, rows=2), (112, 208, 4)]
+    assert list(coalesce_transfer_blocks(flatten_transfer_blocks(blocks))) == [
+        (100, 200, 4),
+        (108, 204, 8),
+    ]
+
+
+def _kvp_layout(degree):
+    contract = make_layout(
+        make_group("kv", make_segment("layer.0.kv", shape=(2, 8), stride=32)),
+        make_group(
+            "index",
+            make_segment("layer.0.index", shape=(2, 12), stride=32, offset=1024),
+        ),
+        make_group(
+            "swa", make_segment("layer.1.swa", shape=(2, 4), stride=32, offset=2048)
+        ),
+        page_bytes=256,
+    )
+    return replace(
+        contract,
+        group_specs=tuple(
+            replace(spec, shard_count=degree if spec.group_id != "swa" else 1)
+            for spec in contract.group_specs
+        ),
+    )
+
+
+def _kvp_planner(source, destination, source_tp, destination_tp):
+    return CacheTransferPlanner(
+        prefill_tp_size=source_tp,
+        decode_tp_size=destination_tp,
+        prefill_layout=source,
+        decode_layout=destination,
+        prefill_field_ids=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "source_tp,destination_tp,source_degree,destination_degree",
+    [
+        (p, d, ps, ds)
+        for p, d in ((4, 4), (4, 2), (2, 4), (8, 4))
+        for ps, ds in ((1, 1), (1, 2), (2, 1), (2, 2), (1, 4), (4, 1), (4, 4))
+        if p % ps == 0 and d % ds == 0
+    ],
+)
+@pytest.mark.parametrize("layerwise", [False, True])
+def test_kvp_pd_copies_logical_history_between_independently_allocated_pages(
+    source_tp, destination_tp, source_degree, destination_degree, layerwise
+):
+    source, destination = _kvp_layout(source_degree), _kvp_layout(destination_degree)
+    planner = _kvp_planner(source, destination, source_tp, destination_tp)
+    # Include IDs beyond the local physical-page bound, reversed ownership,
+    # independent Index-K allocation, a prefix hit, and a partial final page.
+    source_tables, destination_tables = {}, {}
+    for index, spec in enumerate(source.group_specs):
+        degree = spec.shard_count
+        source_tables[spec.group_id] = np.array(
+            [[1, 2, 8 * degree + 1 + index, 3, 7]], dtype=np.int32
+        )
+        destination_tables[spec.group_id] = np.array(
+            [[1, 4, 6, 8 * destination.shard_count(spec.group_id) + 2 + index, 2]],
+            dtype=np.int32,
+        )
+    source_op, destination_op = make_operation(source_tables), make_operation(
+        destination_tables
+    )
+    src_manifest = build_cache_block_manifest(
+        source_op,
+        layout=source,
+        request_row=0,
+        prefix_len=2,
+        prompt_len=9,
+        state_prefix_cached=False,
+    )
+    dst_manifest = build_cache_block_manifest(
+        destination_op,
+        layout=destination,
+        request_row=0,
+        prefix_len=2,
+        prompt_len=9,
+        state_prefix_cached=False,
+    )
+    validate_cache_manifest(src_manifest, layout=source, peer="source")
+    validate_cache_manifest(dst_manifest, layout=destination, peer="destination")
+    src_buffers = [
+        np.full(source.plan.arena_bytes, 173, np.uint8) for _ in range(source_tp)
+    ]
+    dst_buffers = [
+        np.full(destination.plan.arena_bytes, 211, np.uint8)
+        for _ in range(destination_tp)
+    ]
+    expected = [buffer.copy() for buffer in dst_buffers]
+    for contract, manifest, buffers in (
+        (source, src_manifest, src_buffers),
+        (destination, dst_manifest, expected),
+    ):
+        for group_index, blocks in enumerate(manifest.groups):
+            degree = contract.shard_count(blocks.group_id)
+            for position, virtual in enumerate(blocks.block_ids):
+                page, owner = divmod(virtual - 1, degree)
+                for rank, buffer in enumerate(buffers):
+                    if rank % degree != owner:
+                        continue
+                    for field in contract.fields_for_group(blocks.group_id):
+                        offset = contract.plan.field_page_byte_offset(
+                            field.field_id, page + 1
+                        )
+                        buffer[offset : offset + field.payload_bytes] = (
+                            np.arange(field.payload_bytes, dtype=np.uint8)
+                            + position
+                            + group_index * 32
+                        )
+    chunks = [(2, 5), (5, 9)] if layerwise else [None]
+    for destination_rank, buffer in enumerate(dst_buffers):
+        writes = np.zeros(buffer.shape, dtype=np.uint8)
+        route = planner.plan_for_decode_rank(destination_rank)
+        for source_rank, fragments in route.fragments_by_prefill_rank.items():
+            assert destination_rank in planner.decode_ranks_by_prefill_rank[source_rank]
+            manager = object.__new__(MooncakeKVManagerPrefill)
+            manager.kv_args = SimpleNamespace(
+                cache_layout=source, kv_data_ptr=src_buffers[source_rank].ctypes.data
+            )
+            manager.topology = SimpleNamespace(tp_rank=source_rank)
+            for chunk in chunks:
+                selection = (
+                    None
+                    if chunk is None
+                    else build_cache_layerwise_block_selection(
+                        source_op,
+                        layout=source,
+                        request_row=0,
+                        prefix_len=2,
+                        prompt_len=9,
+                        chunk_start=chunk[0],
+                        chunk_end=chunk[1],
+                        state_prefix_cached=False,
+                    )
+                )
+                copies = manager._cache_transfer_blocks(
+                    dst_ptr=buffer.ctypes.data,
+                    dst_tp_rank=destination_rank,
+                    src_block_manifest=src_manifest if selection is None else None,
+                    dst_block_manifest=dst_manifest,
+                    transfer_fragments=fragments,
+                    owner_filters=route.owner_filters_by_prefill_rank[source_rank],
+                    dst_cache_layout=destination,
+                    block_selection=selection,
+                )
+                copies = coalesce_transfer_blocks(
+                    block
+                    for item in copies
+                    for block in (
+                        _expand_page_fields(item.src_pages, item.dst_pages, item.fields)
+                        if isinstance(item, PageFieldCopies)
+                        else [item]
+                    )
+                )
+                for source_address, destination_address, nbytes in copies:
+                    assert (
+                        src_buffers[source_rank].ctypes.data
+                        <= source_address
+                        < src_buffers[source_rank].ctypes.data
+                        + src_buffers[source_rank].nbytes
+                    )
+                    assert (
+                        buffer.ctypes.data
+                        <= destination_address
+                        < buffer.ctypes.data + buffer.nbytes
+                    )
+                    offset = destination_address - buffer.ctypes.data
+                    writes[offset : offset + nbytes] += 1
+                    ctypes.memmove(destination_address, source_address, nbytes)
+        np.testing.assert_array_equal(buffer, expected[destination_rank])
+        np.testing.assert_array_equal(writes, expected[destination_rank] != 211)
+
+
+def test_kvp_pd_equal_tp_contacts_all_source_owners():
+    source, destination = _kvp_layout(4), _kvp_layout(4)
+    planner = _kvp_planner(source, destination, 4, 4)
+    for rank in range(4):
+        assert planner.plan_for_decode_rank(rank).target_prefill_ranks == (0, 1, 2, 3)
+    assert all(
+        ranks == frozenset(range(4))
+        for ranks in planner.decode_ranks_by_prefill_rank.values()
+    )
+
+
+def test_kvp_pd_rejects_incompatible_owner_topology():
+    with pytest.raises(UnsupportedPDLayoutError, match="divide"):
+        _kvp_planner(_kvp_layout(4), _kvp_layout(1), 2, 4)
+
+
+def test_kvp_pd_rejects_head_partitioned_sharded_fields():
+    contract = make_layout(
+        make_group("kv", make_segment("layer.0.kv", shape=(2, 2), axis=1, extent=4))
+    )
+    contract = replace(
+        contract, group_specs=(replace(contract.group_specs[0], shard_count=2),)
+    )
+    with pytest.raises(UnsupportedPDLayoutError, match="head-partitioned"):
+        _kvp_planner(contract, contract, 2, 2)
+
+
+def test_kvp_pd_manifest_preserves_virtual_ids_and_checks_virtual_bounds():
+    contract = _kvp_layout(4)
+    restored = CacheTransferContract.from_wire_bytes(contract.to_wire_bytes())
+    assert restored == contract
+    tables = {
+        spec.group_id: np.array(
+            [[restored.virtual_block_count(spec.group_id) - 1]], dtype=np.int32
+        )
+        for spec in restored.group_specs
+    }
+    manifest = build_cache_block_manifest(
+        make_operation(tables),
+        layout=restored,
+        request_row=0,
+        prefix_len=0,
+        prompt_len=1,
+        state_prefix_cached=False,
+    )
+    validate_cache_manifest(manifest, layout=restored, peer="decode")
+    assert manifest.groups[0].block_ids[0] >= restored.plan.group("kv").page_count
+    tables["kv"][0, 0] += 1
+    with pytest.raises(CacheContractError, match="invalid block ID"):
+        build_cache_block_manifest(
+            make_operation(tables),
+            layout=restored,
+            request_row=0,
+            prefix_len=0,
+            prompt_len=1,
+            state_prefix_cached=False,
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 
@@ -1658,6 +1994,7 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
     manager, _ = _recording_transfer_manager(source_layout, 0x1000)
 
     (item,) = manager._cache_transfer_blocks(
+        dst_tp_rank=0,
         dst_ptr=0x2000,
         src_block_manifest=source_manifest,
         dst_block_manifest=destination_manifest,
@@ -1682,6 +2019,7 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
         rows_per_page=1,
     )
     (item,) = manager._cache_transfer_blocks(
+        dst_tp_rank=0,
         dst_ptr=0x2000,
         src_block_manifest=source_manifest,
         dst_block_manifest=destination_manifest,
@@ -1697,6 +2035,7 @@ def test_transfer_blocks_keep_only_owned_pages_translated_to_local() -> None:
 
     # The other owner sends the complementary subsequence.
     (item,) = manager._cache_transfer_blocks(
+        dst_tp_rank=0,
         dst_ptr=0x2000,
         src_block_manifest=source_manifest,
         dst_block_manifest=destination_manifest,
@@ -1723,6 +2062,7 @@ def test_transfer_blocks_apply_owner_filter_to_layerwise_selection() -> None:
     def blocks(owner_rank):
         return list(
             manager._cache_transfer_blocks(
+                dst_tp_rank=0,
                 dst_ptr=0x2000,
                 src_block_manifest=None,
                 dst_block_manifest=destination_manifest,
@@ -1746,6 +2086,7 @@ def test_transfer_blocks_send_nothing_for_a_sharded_group_decided_none() -> None
     assert (
         list(
             manager._cache_transfer_blocks(
+                dst_tp_rank=0,
                 dst_ptr=0x2000,
                 src_block_manifest=manifest,
                 dst_block_manifest=manifest,
@@ -1758,6 +2099,7 @@ def test_transfer_blocks_send_nothing_for_a_sharded_group_decided_none() -> None
     with pytest.raises(KeyError):
         list(
             manager._cache_transfer_blocks(
+                dst_tp_rank=0,
                 dst_ptr=0x2000,
                 src_block_manifest=manifest,
                 dst_block_manifest=manifest,
@@ -1772,9 +2114,10 @@ def test_transfer_blocks_reject_an_out_of_range_virtual_block() -> None:
 
     manager, _ = _recording_transfer_manager(_sharded_history_layout(2), 0x1000)
     # A virtual ID past the group's virtual count never reaches the wire.
-    with pytest.raises(IndexError):
+    with pytest.raises(UnsupportedPDLayoutError, match="virtual address space"):
         list(
             manager._cache_transfer_blocks(
+                dst_tp_rank=0,
                 dst_ptr=0x2000,
                 src_block_manifest=_single_group_block_manifest("history", (31,)),
                 dst_block_manifest=_single_group_block_manifest("history", (1,)),
@@ -1870,3 +2213,45 @@ def test_every_sharded_prefill_rank_serves_every_decode_rank() -> None:
                 ),
             )
         )
+
+
+def test_bootstrap_layout_excludes_rank_local_field_addresses():
+    from dataclasses import replace
+
+    from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVBootstrapServer
+    from tokenspeed.runtime.pd.mooncake.entities import KVArgs
+
+    layout = _layout()
+    names = tuple(f.field_id for f in layout.plan.fields)
+    bootstrap = object.__new__(MooncakeKVBootstrapServer)
+    bootstrap.prefill_cache_layout_wire = None
+    bootstrap.prefill_cache_fields_by_stage = None
+    wires = []
+    for rank in range(2):
+        bound = replace(
+            layout,
+            field_addresses={
+                name: 0x1000 * (rank + 1) + i * 128 for i, name in enumerate(names)
+            },
+        )
+        args = KVArgs(
+            engine_rank=rank,
+            kv_data_ptr=0x1000,
+            ib_device="",
+            gpu_id=rank,
+            cache_layout=bound,
+            cache_fields_by_stage=(names,),
+        )
+        wire = args.wire_layout.to_wire_bytes().decode("ascii")
+        wires.append(wire)
+        bootstrap._ingest_put_extra(
+            {
+                "cache_layout": wire,
+                "cache_fields_by_stage": [list(names)],
+                "pp_size": 1,
+            }
+        )
+        # Endpoint registration still retains this rank's actual landing addresses.
+        assert args.cache_layout.field_addresses == bound.field_addresses
+        assert args.wire_layout.field_addresses is None
+    assert wires[0] == wires[1]

@@ -162,6 +162,9 @@ for prefill and decode. Inputs are a position-preserving page table (`-1` for
 absent pages), request IDs and global causal lengths. Outputs are global logical
 offsets and FP32 scores: invalid candidates use `-1`/`-inf`, and forced
 initial/local candidates use `+inf`. Cross-rank merging belongs to runtime DCP.
+Runtime setup validates a positive power-of-two candidate count when the KVP
+group has multiple ranks, using the cache-parallel topology (`kvp_group` /
+`kvp_size`). Single-rank selection keeps its existing top-k choices.
 
 DeepGEMM compacts owned, causally visible pages and maps results back to global
 offsets, masking padding and handling partial tails and empty shards. Query

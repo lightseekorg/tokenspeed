@@ -57,6 +57,8 @@ _FLOAT8_DTYPES = tuple(
     )
     if (dtype := getattr(torch, name, None)) is not None
 )
+# Weight dtypes the fused vocab-shard gather kernel is registered for.
+_FUSED_GATHER_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -527,7 +529,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         return (
             input_.is_cuda
             and type(self.quant_method) is UnquantizedEmbeddingMethod
-            and self.weight.dtype not in _FLOAT8_DTYPES
+            # The gather kernel's dtypes (no FP8) and its unit-column-stride reads.
+            and self.weight.dtype in _FUSED_GATHER_DTYPES
+            and self.weight.stride(-1) == 1
             and self.weight.is_cuda
         )
 
@@ -578,24 +582,16 @@ class VocabParallelEmbedding(torch.nn.Module):
             return token_reduce_scatter(
                 self._partial_lookup(ids), self.tp_group, counts
             )
-        if self.tp_size > 1:
-            output_parallel = self._partial_lookup(input_)
-            if reduce_results:
-                return all_reduce(output_parallel, self.tp_group)
-            return output_parallel
-        # Single-rank (DP / replicated) path has no shard mask, so an
-        # out-of-range id (e.g. CUDA-graph capture warmup where the drafter
-        # feeds argmax over uninitialized logits) hits F.embedding OOB.
-        # Clamp here for parity with the tp_size>1 mask path; under normal
-        # inference upstream guarantees id < num_embeddings_padded so this
-        # is a no-op.
-        masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
-        return self.quant_method.embedding(self, masked_input)
+        output_parallel = self._partial_lookup(input_)
+        if self.tp_size > 1 and reduce_results:
+            return all_reduce(output_parallel, self.tp_group)
+        return output_parallel
 
     def _partial_lookup(self, input_: torch.Tensor) -> torch.Tensor:
         """This rank's vocab shard's contribution to every row of ``input_``:
         the embedding of ids inside the shard, zero rows for the others. The
-        sum over the TP group is the full embedding."""
+        sum over the TP group is the full embedding; a single rank's shard is
+        the whole table."""
         if self._fused_shard_gather(input_):
             # One gather resolves the shard mask, the local index and the
             # zeroing of other ranks' rows.
@@ -614,6 +610,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                     self.shard_indices.added_vocab_end_index,
                 ),
             )
+        if self.tp_size == 1:
+            # No shard mask here: clamp the out-of-range ids CUDA-graph capture warmup can feed.
+            masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
+            return self.quant_method.embedding(self, masked_input)
         # Build the mask.
         masked_input, input_mask = get_masked_input_and_mask(
             input_,

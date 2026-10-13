@@ -88,8 +88,8 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         backend._prepare_prefill_scan_query_start_loc(scan_boundaries)
         is scan_boundaries
     )
-    # The body and tail have their own boundaries; neither may use the full
-    # forward's cached boundaries, even when those have the same row count.
+    # The scan takes the boundaries it is handed, never the metadata's cached
+    # ones, even when those have the same row count.
     full_boundaries = torch.tensor([0, 5, 8], dtype=torch.int32)
     full_scan_boundaries = full_boundaries.to(torch.int64)
     backend.forward_metadata = mamba.MambaForwardMetadata(
@@ -130,7 +130,6 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         num_real_tokens=num_tokens,
         lower_bound=-5.0,
         cu_seqlens_cpu=boundaries.to(torch.int64),
-        inputs_packed=False,
     )
     assert captured["initial_state"] is stored
     assert captured["cu_seqlens"] is scan_boundaries
@@ -195,7 +194,6 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
                 retention="full_history",
                 sliding_window_tokens=None,
                 family="state",
-                checkpoint_granularity=prefix_granularity,
                 replayable=False,
             )
         )
@@ -292,7 +290,6 @@ def test_set_kv_pool_binds_contract_state_groups(monkeypatch) -> None:
     backend = _backend("cpu", contract_pool=pool)
     assert backend.state_paging_active
     assert backend._state_group_ids == _STATE_GROUPS
-    assert backend._checkpoint_granularity == pool.arena.prefix_granularity
     _, state = backend._state_components(backend._state_layer_ids()[0])
     assert replay_probe == {
         "recurrent_layout": backend.kda_recurrent_layout,
@@ -341,7 +338,7 @@ def test_kda_verify_seed_omits_only_the_recurrent_state(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-group dual-index metadata
+# Per-group two-slot metadata
 # ---------------------------------------------------------------------------
 
 
@@ -359,29 +356,30 @@ def _kimi_tables(bs: int, width: int, *, base: int = 1) -> dict[str, np.ndarray]
     return tables
 
 
-def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
+def test_two_slot_resolve_runs_once_per_group_and_groups_are_independent(
     monkeypatch,
 ) -> None:
     pool = _make_kimi_pool("cpu", usable_pages=24)
     backend = _backend("cpu", contract_pool=pool)
-    page_size = pool.arena.prefix_granularity
 
-    plan_calls = 0
-    real = mamba._compute_state_block_index_plan
+    resolve_calls = 0
+    real = mamba.compute_state_block_indices
 
     def counting(*args, **kwargs):
-        nonlocal plan_calls
-        plan_calls += 1
+        nonlocal resolve_calls
+        resolve_calls += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(mamba, "_compute_state_block_index_plan", counting)
+    monkeypatch.setattr(mamba, "compute_state_block_indices", counting)
 
     bs = 2
     tables = _kimi_tables(bs, width=2)
+    # Request 0 is the first decode after prompt end (the rotated checkpoint
+    # in slot 0); request 1 evolves its live block in place.
+    for group_id in _STATE_GROUPS:
+        tables[group_id][1, 0] = 0
     delivered = _tables_for(pool.arena.runtime_contract, tables, "cpu")
-    # Decode: request 0 crosses into its second page, request 1 stays inside
-    # its first page.
-    seq_lens = torch.tensor([page_size + 1, 5], dtype=torch.int32)
+    seq_lens = torch.tensor([65, 5], dtype=torch.int32)
     backend.init_cuda_graph_state(max_bs=bs)
     backend.refresh_decode_metadata(
         bs,
@@ -392,23 +390,21 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
         block_tables=delivered,
     )
 
-    # Conversion and slot arithmetic run once for the whole batch. Each state
-    # group only gathers its independent page ids from that shared plan.
-    assert plan_calls == 1
+    # One resolve per state group over its own table, never per layer.
+    assert resolve_calls == len(_STATE_GROUPS)
 
     md = backend.forward_metadata
     assert tuple(sorted(md.state_in_blocks_by_group)) == _STATE_GROUPS
     assert tuple(sorted(md.state_out_blocks_by_group)) == _STATE_GROUPS
     for group_id in _STATE_GROUPS:
         rows = tables[group_id]
-        # req 0: before=P -> in slot 0, out slot 1; req 1: before=4 -> slot 0.
         assert md.state_in_blocks_by_group[group_id].tolist() == [
             int(rows[0, 0]),
-            int(rows[1, 0]),
+            int(rows[1, 1]),
         ]
         assert md.state_out_blocks_by_group[group_id].tolist() == [
             int(rows[0, 1]),
-            int(rows[1, 0]),
+            int(rows[1, 1]),
         ]
     # Three groups carry three disjoint page-id sets (independence).
     all_pages = [
@@ -456,9 +452,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
         # Real row 0 refreshed from this group's table; padded row 1 -> pad.
         expected_in, _ = compute_state_block_indices(
             torch.as_tensor(tables[gid][:1]),
-            pool.arena.runtime_contract.prefix_granularity,
             torch.tensor([4]),  # before = seq_len 5 - 1
-            torch.tensor([5]),
             validate=False,
             group_id=gid,
         )
@@ -467,7 +461,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
 
 
 # ---------------------------------------------------------------------------
-# GPU: KDA prefill/decode over dual state page indices vs naive + FLA
+# GPU: KDA prefill/decode over two-slot state tables vs naive + FLA
 # ---------------------------------------------------------------------------
 
 
@@ -722,48 +716,62 @@ def _assert_close(actual, expected, what, mean_tol=2e-3, atol=1e-1, rtol=1e-2):
 @requires_cuda
 @requires_fla
 def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
-    """Prefill from zero state, same-page decode, boundary-crossing decode,
-    per-group table independence — vs naive fp32 recurrence AND FLA."""
+    """Prefill from zero state, the first decode off the rotated prompt-end
+    checkpoint, in-place decodes, per-group table independence -- vs naive
+    fp32 recurrence AND FLA."""
     P, usable = 4, 8
     contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
         contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
     )
     h = _KDAHarness(pool, contract, layer_ids=[0, 1, 2])
-    # Distinct pages per group: writes to the wrong group's pages would land
-    # in rows this test asserts stay zero.
-    tables = {
-        "linear_attention_0": [[1, 4]],
-        "linear_attention_1": [[2, 5]],
-        "linear_attention_2": [[3, 6]],
+    # Distinct blocks per group: writes to the wrong group's blocks would land
+    # in rows this test asserts stay zero. Block (checkpoint, live) per group.
+    blocks = {
+        "linear_attention_0": (1, 4),
+        "linear_attention_1": (2, 5),
+        "linear_attention_2": (3, 6),
     }
     streams = {layer_id: h.token_stream(6) for layer_id in [0, 1, 2]}
 
     outputs = {layer_id: [] for layer_id in [0, 1, 2]}
-    # Prefill 3 tokens: in = null page 0 (zero state), out = slot 0.
-    h.extend_metadata(tables, seq_lens=[3], extend_prefix_lens=[0])
+    # Prefill 3 tokens from the zero state (slot 0 null) into the checkpoint block.
+    h.extend_metadata(
+        {gid: [[0, checkpoint]] for gid, (checkpoint, _) in blocks.items()},
+        seq_lens=[3],
+        extend_prefix_lens=[0],
+    )
     md = h.backend.forward_metadata
     for gid in _STATE_GROUPS:
         assert md.state_in_blocks_by_group[gid].tolist() == [0]
-        assert md.state_out_blocks_by_group[gid].tolist() == [tables[gid][0][0]]
+        assert md.state_out_blocks_by_group[gid].tolist() == [blocks[gid][0]]
     for layer_id in [0, 1, 2]:
         s = streams[layer_id]
         outputs[layer_id].append(
             h.extend(layer_id, s["mixed"][:3], s["g_raw"][:3], s["beta_raw"][:3])
         )
-
-    # Decode token 4 (same page), 5 (crossing), 6 (same new page).
-    expected_pages = {
-        gid: [
-            (rows[0][0], rows[0][0]),
-            (rows[0][0], rows[0][1]),
-            (rows[0][1], rows[0][1]),
-        ]
-        for gid, rows in tables.items()
-    }
+    # The prompt-end block is published: read-only from here on.
     snapshot = {}
+    for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
+        page = blocks[gid][0]
+        snapshot[layer_id] = (
+            pool.get_component(layer_id, "conv_state")[page].clone(),
+            pool.get_component(layer_id, "recurrent_state")[page].clone(),
+        )
+
+    # Decode token 4 reads the rotated checkpoint and writes the fresh live
+    # block; tokens 5 and 6 evolve the live block in place (slot 0 released).
+    decode_tables = [
+        {gid: [[checkpoint, live]] for gid, (checkpoint, live) in blocks.items()},
+        {gid: [[0, live]] for gid, (_, live) in blocks.items()},
+        {gid: [[0, live]] for gid, (_, live) in blocks.items()},
+    ]
+    expected_pages = {
+        gid: [(checkpoint, live), (live, live), (live, live)]
+        for gid, (checkpoint, live) in blocks.items()
+    }
     for step, pos in enumerate(range(3, 6)):
-        h.decode_metadata(tables, seq_lens=[pos + 1])
+        h.decode_metadata(decode_tables[step], seq_lens=[pos + 1])
         md = h.backend.forward_metadata
         for gid in _STATE_GROUPS:
             assert md.state_in_blocks_by_group[gid].tolist() == [
@@ -783,14 +791,6 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
                     bs=1,
                 )
             )
-        if pos == 3:
-            # Page written at the P boundary becomes a read-only snapshot.
-            for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
-                page = tables[gid][0][0]
-                snapshot[layer_id] = (
-                    pool.get_component(layer_id, "conv_state")[page].clone(),
-                    pool.get_component(layer_id, "recurrent_state")[page].clone(),
-                )
 
     for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
         s = streams[layer_id]
@@ -802,24 +802,23 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
         _assert_close(flat_out, fla_out, f"layer {layer_id} out vs FLA")
         ssm = pool.get_component(layer_id, "recurrent_state")
         conv = pool.get_component(layer_id, "conv_state")
-        final_page = tables[gid][0][1]
+        snap_page, final_page = blocks[gid]
         _assert_close(ssm[final_page], naive_state, f"layer {layer_id} state vs naive")
         _assert_close(ssm[final_page], fla_state, f"layer {layer_id} state vs FLA")
-        # Snapshot page untouched by the boundary-crossing decode.
-        snap_page = tables[gid][0][0]
+        # The published checkpoint is untouched by the decode that read it.
         assert torch.equal(conv[snap_page], snapshot[layer_id][0])
         assert torch.equal(ssm[snap_page], snapshot[layer_id][1])
         assert ssm[snap_page].abs().max().item() > 0.0
         # Null page 0 is never written.
         assert conv[0].abs().max().item() == 0.0
         assert ssm[0].abs().max().item() == 0.0
-        # Independence: pages belonging to the OTHER groups stay zero in this
-        # layer's slabs — the layer consumed only its own group's indices.
+        # Independence: blocks belonging to the OTHER groups stay zero in this
+        # layer's slabs -- the layer consumed only its own group's indices.
         other_pages = [
             page
-            for other_gid, rows in tables.items()
+            for other_gid, pages in blocks.items()
             if other_gid != gid
-            for page in rows[0]
+            for page in pages
         ]
         for page in other_pages:
             assert ssm[page].abs().max().item() == 0.0, (layer_id, page)
@@ -829,9 +828,9 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
 @requires_cuda
 @requires_fla
 def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
-    """Prefix hit at a P boundary: the shared snapshot page is read-only for
-    both branches (CoW), and batched decode keeps requests isolated."""
-    P, usable = 4, 12
+    """Prefix hit at a published prompt-end checkpoint: the shared block is
+    read-only for both branches, and batched decode keeps requests isolated."""
+    P, usable = 4, 16
     contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
         contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
@@ -845,8 +844,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
         # computes indices for every group once per batch).
         return {
             "linear_attention_0": rows0,
-            "linear_attention_1": [[p + 4 for p in row] for row in rows0],
-            "linear_attention_2": [[p + 8 for p in row] for row in rows0],
+            "linear_attention_1": [[p + 4 if p else 0 for p in row] for row in rows0],
+            "linear_attention_2": [[p + 8 if p else 0 for p in row] for row in rows0],
         }
 
     # Shared prefix: 4 tokens (exactly one page). Branch A continues with 2
@@ -865,8 +864,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     a_full = cat(prefix, a_new)
     b_full = cat(prefix, b_new)
 
-    # 1) A prefills the shared 4-token prefix -> snapshot page 1.
-    h.extend_metadata(tables_for([[1]]), seq_lens=[4], extend_prefix_lens=[0])
+    # 1) A prefills the shared 4-token prefix -> its prompt-end state, block 1.
+    h.extend_metadata(tables_for([[0, 1]]), seq_lens=[4], extend_prefix_lens=[0])
     a_outs = [h.extend(layer_id, prefix["mixed"], prefix["g_raw"], prefix["beta_raw"])]
     conv = pool.get_component(layer_id, "conv_state")
     ssm = pool.get_component(layer_id, "recurrent_state")
@@ -874,7 +873,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     snap_ssm = ssm[1].clone()
     assert snap_ssm.abs().max().item() > 0.0
 
-    # 2) A decodes token 5: crossing out of the snapshot (in=1, out=2).
+    # 2) A's first decode (token 5) reads the rotated checkpoint (slot 0 =
+    #    block 1) and writes the fresh live block 2.
     h.decode_metadata(tables_for([[1, 2]]), seq_lens=[5])
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [1]
@@ -891,8 +891,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
 
-    # 3) B resumes from the shared snapshot: extend prefix=4 -> 7 tokens
-    #    (in = shared page 1, out = fresh page 3; page 1 must stay intact).
+    # 3) B hits the published checkpoint: extend prefix=4 -> 7 tokens
+    #    (in = shared block 1, out = fresh block 3; block 1 must stay intact).
     h.extend_metadata(tables_for([[1, 3]]), seq_lens=[7], extend_prefix_lens=[4])
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [1]
@@ -905,12 +905,14 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
 
-    # 4) Batched decode: A token 6 (in-page evolution on page 2) and B token 8
-    #    (crossing to page 5) in ONE forward — isolation between requests.
-    h.decode_metadata(tables_for([[1, 2], [1, 3]]), seq_lens=[6, 8])
+    # 4) Batched decode: A token 6 (in place on block 2, slot 0 released) and
+    #    B's first decode, token 8 (its prompt-end block 3 rotated into slot 0,
+    #    fresh live block 5), in ONE forward -- isolation between requests.
+    h.decode_metadata(tables_for([[0, 2], [3, 5]]), seq_lens=[6, 8])
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [2, 3]
-    assert md.state_out_blocks_by_group[gid].tolist() == [2, 3]
+    assert md.state_out_blocks_by_group[gid].tolist() == [2, 5]
+    b_prompt_end = (conv[3].clone(), ssm[3].clone())
     mixed = torch.cat([a_new["mixed"][1:2], b_new["mixed"][3:4]], dim=0)
     g_raw = torch.cat([a_new["g_raw"][1:2], b_new["g_raw"][3:4]], dim=0)
     beta_raw = torch.cat([a_new["beta_raw"][1:2], b_new["beta_raw"][3:4]], dim=0)
@@ -918,9 +920,11 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     a_outs.append(both[: h.H])
     b_outs.append(both[h.H :])
 
-    # Shared snapshot page is still byte-identical after everything.
+    # Both published checkpoints are still byte-identical after everything.
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
+    assert torch.equal(conv[3], b_prompt_end[0])
+    assert torch.equal(ssm[3], b_prompt_end[1])
     assert ssm[0].abs().max().item() == 0.0
 
     naive_a, state_a, fla_a, fla_state_a = h.oracle(
@@ -937,8 +941,8 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     _assert_close(flat_b, fla_b[4 * h.H :], "branch B out vs FLA")
     _assert_close(ssm[2], state_a, "branch A final state vs naive")
     _assert_close(ssm[2], fla_state_a, "branch A final state vs FLA")
-    _assert_close(ssm[3], state_b, "branch B final state vs naive")
-    _assert_close(ssm[3], fla_state_b, "branch B final state vs FLA")
+    _assert_close(ssm[5], state_b, "branch B final state vs naive")
+    _assert_close(ssm[5], fla_state_b, "branch B final state vs FLA")
 
 
 @requires_cuda

@@ -40,6 +40,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "prepare_attn_res_fwd",
+    "prepare_hyperconnection_mix",
     "prepare_mhc_apply_pre",
     "prepare_mhc_mixes",
     "prepare_mhc_post",
@@ -48,6 +49,7 @@ __all__ = [
 
 _IMPLEMENTED_MODEL_PROFILES = frozenset({"kimi_k3_tp8"})
 _IMPLEMENTED_MHC_MODEL_PROFILES = frozenset({"dsv41_flash_tp4"})
+_IMPLEMENTED_HC_MIX_MODEL_PROFILES = frozenset({"qwen38_flash_tp2"})
 
 
 def _invalid(message: str) -> BenchmarkCaseError:
@@ -57,14 +59,14 @@ def _invalid(message: str) -> BenchmarkCaseError:
 def _positive(parameters: dict[str, Any], name: str) -> int:
     value = parameters[name]
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise _invalid(f"AttnRes {name} must be a positive integer")
+        raise _invalid(f"Residual {name} must be a positive integer")
     return value
 
 
 def _flag(parameters: dict[str, Any], name: str) -> bool:
     value = parameters[name]
     if not isinstance(value, bool):
-        raise _invalid(f"AttnRes {name} must be a boolean")
+        raise _invalid(f"Residual {name} must be a boolean")
     return value
 
 
@@ -452,6 +454,104 @@ def prepare_mhc_post(
             "tokens": tokens,
             "hc_mult": hc_mult,
             "hidden_size": hidden_size,
+            "dtype": "bfloat16",
+        },
+        validation=None,
+    )
+
+
+def prepare_hyperconnection_mix(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one Qwen4-style hyper-connection mix.
+
+    The call projects the normalized ``hc_count`` residual streams down to the
+    ``lowrank`` mix gate (plus ``hc_count`` inject logits when ``inject`` is
+    set, as for the per-layer mixers; the final mixer has none), applies the
+    gate and mixes the streams back to one ``hidden_size`` input, as
+    ``GatedResidualSimple.mix`` does. Projection storage is padded once during
+    preparation, matching model loading, and invocation uses its logical width.
+    """
+
+    _ = platform
+    if request.registration is not None or request.solution is not None:
+        raise _invalid("hyperconnection_mix cases use normal kernel selection")
+    parameters = request.parameters
+    if parameters.get("validation") is not None:
+        raise _invalid("hyperconnection_mix correctness validation is not implemented")
+    model_profile = parameters["model_profile"]
+    if model_profile not in _IMPLEMENTED_HC_MIX_MODEL_PROFILES:
+        raise _invalid(
+            "Implemented hyperconnection_mix model_profile values: "
+            f"{', '.join(sorted(_IMPLEMENTED_HC_MIX_MODEL_PROFILES))}"
+        )
+    if parameters["dtype"] != "bfloat16":
+        raise _invalid("hyperconnection_mix dtype must be bfloat16")
+    tokens = _positive(parameters, "tokens")
+    hc_count = _positive(parameters, "hc_count")
+    hidden_size = _positive(parameters, "hidden_size")
+    lowrank = _positive(parameters, "lowrank")
+    inject = _flag(parameters, "inject")
+    wide = hc_count * hidden_size
+    projection_rows = lowrank + (hc_count if inject else 0)
+
+    normalized, projection_weight, up_weight = _random_tensors(
+        request.seed,
+        (tokens, wide),
+        (projection_rows, wide),
+        (wide, lowrank),
+    )
+
+    from tokenspeed_kernel.ops import residual as residual_ops
+
+    projection_weight = residual_ops.pad_gated_residual_projection_weight(
+        projection_weight, projection_rows=projection_rows
+    )
+    load_builtin_kernels()
+    try:
+        kernel, _ = residual_ops.select_gated_residual_mix_kernel(
+            normalized,
+            projection_weight,
+            up_weight,
+            hc_count,
+            hidden_size,
+            lowrank,
+            weights_independent=True,
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError as error:
+        raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.REGISTRATION_MISSING,
+            f"Selected registration {kernel.name!r} is not available",
+        )
+
+    def invoke() -> object:
+        return residual_ops.gated_residual_mix(
+            normalized,
+            projection_weight,
+            up_weight,
+            hc_count,
+            hidden_size,
+            lowrank,
+            projection_rows=projection_rows,
+            weights_independent=True,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            "model_profile": model_profile,
+            "tokens": tokens,
+            "hc_count": hc_count,
+            "hidden_size": hidden_size,
+            "lowrank": lowrank,
+            "inject": inject,
             "dtype": "bfloat16",
         },
         validation=None,

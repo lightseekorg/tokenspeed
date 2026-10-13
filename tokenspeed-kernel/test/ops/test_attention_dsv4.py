@@ -111,26 +111,6 @@ def _apply_gptj_rope(
     return _apply_gptj_rope_with_nope(x, positions, cos_sin, NOPE_DIM)
 
 
-def _apply_inverse_gptj_rope_with_nope(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin: torch.Tensor,
-    nope_dim: int,
-) -> torch.Tensor:
-    out = x.float().clone()
-    rope_dim = out.shape[-1] - nope_dim
-    cos = cos_sin[positions, : rope_dim // 2]
-    sin = cos_sin[positions, rope_dim // 2 : rope_dim]
-    even = out[..., nope_dim::2].clone()
-    odd = out[..., nope_dim + 1 :: 2].clone()
-    while cos.ndim < even.ndim:
-        cos = cos.unsqueeze(1)
-        sin = sin.unsqueeze(1)
-    out[..., nope_dim::2] = even * cos + odd * sin
-    out[..., nope_dim + 1 :: 2] = odd * cos - even * sin
-    return out
-
-
 def _q_reference(
     q: torch.Tensor, positions: torch.Tensor, cos_sin: torch.Tensor, eps: float
 ) -> torch.Tensor:

@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 import logging
-import math
 from dataclasses import dataclass
 from typing import Any, List, Tuple
 
@@ -102,23 +101,13 @@ def triton_pack_channel_shards_for_a2a(
 __all__ = [
     "triton_pack_channel_shards_for_a2a",
     "create_state",
-    "get_token_dist",
+    "TritonRSAGState",
+    "symm_allreduce_residual_rmsnorm",
     "reduce_scatter",
     "all_gather",
     "all_gather_inner",
     "rsag_all_reduce",
     "multimem_probe_payload",
-    "all_reduce_can_run",
-    "all_reduce",
-    "initialize_all_reduce_state",
-    "symm_outputs_can_run",
-    "acquire_symm_outputs",
-    "all_reduce_symm_can_run",
-    "all_reduce_symmetric",
-    "allreduce_residual_attnres_max_tokens",
-    "allreduce_residual_attnres_combine_supported",
-    "allreduce_residual_attnres_combine",
-    "allreduce_residual_rmsnorm",
     "create_dp_sampling_state",
     "dp_sampling_gather",
     "dp_sampling_swap",
@@ -126,20 +115,14 @@ __all__ = [
 
 
 allreduce_residual_rmsnorm_states = {}
-_ALLREDUCE_RESIDUAL_ATTNRES_MAX_TOKENS = 16
 
 
 @dataclass
-class TritonCommState:
+class TritonRSAGState:
     group: dist.ProcessGroup
     rank_in_group: int
     world_size: int
     device: torch.device
-    attnres_max_numel: int
-    enable_lamport: bool
-    moe_tail_max_rows: int
-    max_numel: int
-    max_bytes: int
     max_token_num: int
     hidden_dim: int
     comm_buff: torch.Tensor | None
@@ -893,7 +876,7 @@ def _get_available_gpu_memory(gpu_id: int, empty_cache: bool = True) -> float:
 # ------------------------------------------------------------------------------
 
 
-def rsag_get_token_dist(state: TritonCommState, total_tokens_in_group: int) -> list:
+def rsag_get_token_dist(state: TritonRSAGState, total_tokens_in_group: int) -> list:
     token_list_in_group = []
     for rank in range(state.world_size):
         num_tokens_per_rank = total_tokens_in_group // state.world_size + (
@@ -904,7 +887,7 @@ def rsag_get_token_dist(state: TritonCommState, total_tokens_in_group: int) -> l
 
 
 def rsag_get_context(
-    state: TritonCommState, token_list_in_group: list
+    state: TritonRSAGState, token_list_in_group: list
 ) -> Tuple[int, int, int]:
     total_num_tokens = sum(token_list_in_group)
     assert (
@@ -915,7 +898,7 @@ def rsag_get_context(
     return total_num_tokens, local_num_tokens, local_token_offset
 
 
-def rsag_resize_hidden_if_needed(state: TritonCommState, hidden_size: int):
+def rsag_resize_hidden_if_needed(state: TritonRSAGState, hidden_size: int):
     hidden_size_bak, comm_buff_bak = state.hidden_dim, state.comm_buff
     if hidden_size < hidden_size_bak:
         state.hidden_dim = hidden_size
@@ -926,7 +909,7 @@ def rsag_resize_hidden_if_needed(state: TritonCommState, hidden_size: int):
 
 
 def rsag_restore_hidden(
-    state: TritonCommState, hidden_size_bak: int, comm_buff_bak: torch.Tensor
+    state: TritonRSAGState, hidden_size_bak: int, comm_buff_bak: torch.Tensor
 ) -> None:
     if state.hidden_dim != hidden_size_bak:
         state.hidden_dim = hidden_size_bak
@@ -1088,7 +1071,7 @@ def nvidia_create_rsag_state(
     max_tokens: int,
     hidden_size: int,
     device: torch.device = None,
-) -> TritonCommState:
+) -> TritonRSAGState:
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
@@ -1117,16 +1100,11 @@ def nvidia_create_rsag_state(
         f"Custom Triton RSAG symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
     symm_mem.rendezvous(comm_buff, group=group)
-    return TritonCommState(
-        enable_lamport=False,
-        moe_tail_max_rows=0,
+    return TritonRSAGState(
         group=group,
         rank_in_group=rank_in_group,
         world_size=group.size(),
         device=device,
-        attnres_max_numel=0,
-        max_numel=0,
-        max_bytes=0,
         max_token_num=max_tokens,
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
@@ -1135,7 +1113,7 @@ def nvidia_create_rsag_state(
 
 
 def nvidia_rsag_multimem_reduce_scatter(
-    state: TritonCommState,
+    state: TritonRSAGState,
     local_num_tokens: int,
     local_token_offset: int,
     num_blocks: int | None = None,
@@ -1162,7 +1140,7 @@ def nvidia_rsag_multimem_reduce_scatter(
 
 
 def nvidia_rsag_multimem_all_gather(
-    state: TritonCommState, local_num_tokens: int, local_token_offset: int
+    state: TritonRSAGState, local_num_tokens: int, local_token_offset: int
 ) -> None:
     num_elts = local_num_tokens * state.hidden_dim
     num_blocks, block_size, num_warps, numel_per_thread = nvidia_rsag_get_launch_config(
@@ -1186,7 +1164,7 @@ def nvidia_rsag_multimem_all_gather(
 
 
 def nvidia_rsag_reduce_scatter(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     tp_num_tokens: int = None,
     token_list_in_group: List[int] = None,
@@ -1218,7 +1196,7 @@ def nvidia_rsag_reduce_scatter(
 
 
 def nvidia_rsag_all_gather(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     tp_num_tokens: int = None,
     token_list_in_group: List[int] = None,
@@ -1251,7 +1229,7 @@ def nvidia_rsag_all_gather(
 
 
 def nvidia_rsag_all_reduce(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     *,
     issuer: int,
@@ -1675,7 +1653,7 @@ def amd_create_rsag_state(
     max_tokens: int,
     hidden_size: int,
     device: torch.device = None,
-) -> TritonCommState:
+) -> TritonRSAGState:
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
@@ -1696,16 +1674,11 @@ def amd_create_rsag_state(
         f"Custom Triton RSAG AMD symmetric-memory buffer allocated: {free_gpu_memory_begin - free_gpu_memory_after} GB"
     )
     assert rank_in_group == symm_mem_hdl.rank, "Mismatched rank id"
-    return TritonCommState(
-        enable_lamport=False,
-        moe_tail_max_rows=0,
+    return TritonRSAGState(
         group=group,
         rank_in_group=rank_in_group,
         world_size=world_size,
         device=device,
-        attnres_max_numel=0,
-        max_numel=0,
-        max_bytes=0,
         max_token_num=max_tokens,
         hidden_dim=hidden_size,
         comm_buff=comm_buff,
@@ -1714,7 +1687,7 @@ def amd_create_rsag_state(
 
 
 def amd_rsag_reduce_scatter(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     tp_num_tokens: int = None,
     token_list_in_group: List[int] = None,
@@ -1758,7 +1731,7 @@ def amd_rsag_reduce_scatter(
 
 
 def amd_rsag_all_gather(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     tp_num_tokens: int = None,
     token_list_in_group: List[int] = None,
@@ -1805,33 +1778,6 @@ def amd_rsag_all_gather(
 # ------------------------------------------------------------------------------
 # AMD Triton All-Reduce
 # ------------------------------------------------------------------------------
-
-
-@triton.jit
-def amd_all_reduce_kernel(
-    buffer_ptrs_dev,
-    signal_pad_ptrs_dev,
-    output_ptr,
-    NUMEL,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    block_id = tl.program_id(0)
-    symm_mem_barrier(signal_pad_ptrs_dev, block_id, RANK, WORLD_SIZE)
-
-    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < NUMEL
-    buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-
-    for peer in tl.static_range(0, WORLD_SIZE):
-        peer_base = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
-        acc += tl.load(peer_base + offsets, mask=mask, other=0.0).to(tl.float32)
-
-    tl.store(output_ptr + offsets, acc, mask=mask)
-
-    symm_mem_barrier(signal_pad_ptrs_dev, block_id, RANK, WORLD_SIZE)
 
 
 # ------------------------------------------------------------------------------
@@ -1884,7 +1830,7 @@ def create_allreduce_residual_rmsnorm_state(
     max_token_num: int,
     hidden_dim: int,
     device: torch.device = None,
-) -> TritonCommState:
+) -> TritonRSAGState:
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
@@ -1910,16 +1856,11 @@ def create_allreduce_residual_rmsnorm_state(
     else:
         assert platform.is_nvidia, f"Unsupported platform: {platform}"
 
-    return TritonCommState(
-        enable_lamport=False,
-        moe_tail_max_rows=0,
+    return TritonRSAGState(
         group=group,
         rank_in_group=rank_in_group,
         world_size=world_size,
         device=device,
-        attnres_max_numel=0,
-        max_numel=0,
-        max_bytes=0,
         max_token_num=max_token_num,
         hidden_dim=hidden_dim,
         comm_buff=comm_buff,
@@ -1933,7 +1874,7 @@ def allreduce_residual_rmsnorm_get_state(
     max_token_num: int,
     hidden_dim: int,
     device: torch.device = None,
-) -> TritonCommState:
+) -> TritonRSAGState:
     key = (id(group), max_token_num, hidden_dim)
     state = allreduce_residual_rmsnorm_states.get(key)
     if state is None:
@@ -1949,7 +1890,7 @@ def allreduce_residual_rmsnorm_get_state(
 
 
 def allreduce_residual_rmsnorm_can_run(
-    state: TritonCommState,
+    state: TritonRSAGState,
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -1975,7 +1916,7 @@ def allreduce_residual_rmsnorm_can_run(
     )
 
 
-def allreduce_residual_rmsnorm(
+def symm_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
@@ -2004,42 +1945,6 @@ def allreduce_residual_rmsnorm(
             return None, None, None, None
 
         token_num, hidden_dim = input_tensor.shape
-
-        import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-        if (
-            input_tensor.is_cuda
-            and residual.is_cuda
-            and weight.is_cuda
-            and input_tensor.is_contiguous()
-            and residual.is_contiguous()
-            and weight.is_contiguous()
-            and input_tensor.dtype == torch.bfloat16
-            and residual.dtype == torch.bfloat16
-            and input_tensor.shape == residual.shape
-            and weight.shape == (hidden_dim,)
-            and group.size() > 1
-            and token_num <= max_token_num
-        ):
-            key = (id(group), max_token_num, hidden_dim, input_tensor.dtype)
-            iris_state = _iris_mod.IRIS_AR_RMSNORM_STATES.get(key)
-            if iris_state is None:
-                iris_state = _iris_mod.create_iris_ar_rmsnorm_state(
-                    group=group,
-                    rank_in_group=rank,
-                    max_token_num=max_token_num,
-                    hidden_dim=hidden_dim,
-                    dtype=input_tensor.dtype,
-                )
-                _iris_mod.IRIS_AR_RMSNORM_STATES[key] = iris_state
-            norm_out, residual_out = _iris_mod.iris_allreduce_residual_rmsnorm(
-                iris_state,
-                input_tensor=input_tensor,
-                residual=residual,
-                weight=weight,
-                eps=eps,
-            )
-            return norm_out, residual_out, None, None
 
         state = allreduce_residual_rmsnorm_get_state(
             group=group,
@@ -2087,72 +1992,22 @@ def create_state(
     max_tokens: int,
     hidden_size: int,
     device: torch.device | None,
-    max_numel: int,
-    max_bytes: int,
-    attnres_max_numel: int,
-    attnres_max_rows: int,
-    enable_lamport: bool,
-    moe_tail_max_rows: int,
-) -> TritonCommState:
-    """Create an all-reduce or reduce-scatter/all-gather communication state.
+) -> TritonRSAGState:
+    """Allocate fixed-capacity Triton reduce-scatter/all-gather storage.
 
     Args:
         group: Process group used by the collective.
         rank_in_group: This process's rank within ``group``.
-        max_tokens: Maximum gathered token count for an RS/AG state.
-        hidden_size: Hidden width for an RS/AG state.
-        device: Device on which communication storage is allocated.
-        max_numel: Maximum staged all-reduce payload in elements.
-        max_bytes: Maximum producer-direct all-reduce payload in bytes.
-        attnres_max_numel: Maximum fused attention/AttnRes payload in elements;
-            pass zero when the state does not use AttnRes.
-        attnres_max_rows: Maximum fused attention/AttnRes payload in rows; pass
-            zero when the state does not use AttnRes.
-        enable_lamport: Allow Lamport for eligible producer-direct payloads;
-            pass false for RS/AG states.
-        moe_tail_max_rows: Maximum rows in the reusable symmetric result buffer;
-            zero skips its allocation.
+        max_tokens: Maximum gathered token count.
+        hidden_size: Hidden width of gathered rows.
+        device: Allocation device, or the current CUDA/ROCm device.
 
     Returns:
-        The initialized communication state.
+        Persistent symmetric storage shared by sequential RS/AG calls.
     """
     assert (
         type(group) == dist.ProcessGroup
     ), f"Expected dist.ProcessGroup, got {type(group)}"
-    if bool(attnres_max_numel) != bool(attnres_max_rows):
-        raise ValueError(
-            "AttnRes element and row capacities must both be zero or non-zero"
-        )
-    if moe_tail_max_rows < 0 or (moe_tail_max_rows and not max_bytes):
-        raise ValueError("MoE result capacity requires producer-direct storage")
-    if max_numel or max_bytes or attnres_max_numel:
-        device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
-        world_size = group.size()
-        comm_buff = None
-        symm_mem_hdl = None
-
-        platform = current_platform()
-        if platform.is_amd:
-            logger.info("Triton all-reduce AMD path will use Iris")
-        else:
-            assert platform.is_nvidia, f"Unsupported platform: {platform}"
-
-        return TritonCommState(
-            group=group,
-            rank_in_group=rank_in_group,
-            world_size=world_size,
-            device=device,
-            max_numel=max_numel,
-            max_bytes=max_bytes,
-            attnres_max_numel=attnres_max_numel,
-            enable_lamport=enable_lamport,
-            moe_tail_max_rows=moe_tail_max_rows,
-            max_token_num=attnres_max_rows,
-            hidden_dim=0,
-            comm_buff=comm_buff,
-            symm_mem_hdl=symm_mem_hdl,
-        )
-
     assert max_tokens > 0, "max_tokens must be specified for RS/AG state"
     assert hidden_size > 0, "hidden_size must be specified for RS/AG state"
     platform = current_platform()
@@ -2164,453 +2019,18 @@ def create_state(
             hidden_size=hidden_size,
             device=device,
         )
-    else:
-        assert platform.is_nvidia, f"Unsupported platform: {platform}"
-        return nvidia_create_rsag_state(
-            group=group,
-            rank_in_group=rank_in_group,
-            max_tokens=max_tokens,
-            hidden_size=hidden_size,
-            device=device,
-        )
-
-
-def all_reduce_can_run(state: TritonCommState, tensor: torch.Tensor, op=None) -> bool:
-    if op is None:
-        op = torch.distributed.ReduceOp.SUM
-    platform = current_platform()
-    return (
-        platform.is_amd
-        and op == torch.distributed.ReduceOp.SUM
-        and tensor.is_cuda
-        and tensor.is_contiguous()
-        and tensor.dtype == torch.bfloat16
-        and 0 < tensor.numel() <= state.max_numel
-        and state.world_size > 1
-    )
-
-
-def _iris_state_key(state: TritonCommState, dtype: torch.dtype) -> tuple:
-    producer_direct_max_numel = state.max_bytes // dtype.itemsize
-    return (
-        id(state.group),
-        state.max_numel,
-        producer_direct_max_numel,
-        state.attnres_max_numel,
-        state.max_token_num,
-        state.enable_lamport,
-        state.moe_tail_max_rows,
-        dtype,
-    )
-
-
-def _iris_state_is_compatible(iris_state, state, dtype: torch.dtype) -> bool:
-    return (
-        iris_state.group is state.group
-        and iris_state.rank_in_group == state.rank_in_group
-        and iris_state.device == state.device
-        and iris_state.dtype == dtype
-        and iris_state.staged_max_numel >= state.max_numel
-        and iris_state.producer_direct_max_numel >= state.max_bytes // dtype.itemsize
-        and iris_state.attnres_max_numel >= state.attnres_max_numel
-        and iris_state.attnres_max_rows >= state.max_token_num
-        and iris_state.moe_tail_max_rows >= state.moe_tail_max_rows
-        # AttnRes-only views can share a prepared state regardless of its
-        # producer-direct policy; they never dispatch a Lamport reduction.
-        and (state.max_bytes == 0 or iris_state.enable_lamport == state.enable_lamport)
-    )
-
-
-def _get_or_create_iris_state(state: TritonCommState, dtype: torch.dtype):
-    """Return the Iris state sized for this communication backing buffer."""
-    import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-    key = _iris_state_key(state, dtype)
-    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
-    if iris_state is None:
-        iris_state = next(
-            (
-                candidate
-                for candidate in _iris_mod.IRIS_AR_STATES.values()
-                if _iris_state_is_compatible(candidate, state, dtype)
-            ),
-            None,
-        )
-    if iris_state is None:
-        iris_state = _iris_mod.create_iris_state(
-            group=state.group,
-            rank_in_group=state.rank_in_group,
-            staged_max_numel=state.max_numel,
-            producer_direct_max_numel=state.max_bytes // dtype.itemsize,
-            attnres_max_numel=state.attnres_max_numel,
-            attnres_max_rows=state.max_token_num,
-            enable_lamport=state.enable_lamport,
-            moe_tail_max_rows=state.moe_tail_max_rows,
-            dtype=dtype,
-            heap_size=None,
-            device=state.device,
-        )
-    _iris_mod.IRIS_AR_STATES[key] = iris_state
-    return iris_state
-
-
-def initialize_all_reduce_state(
-    state: TritonCommState,
-    dtype: torch.dtype,
-) -> None:
-    """Allocate the backend storage described by an all-reduce state.
-
-    Args:
-        state: Communication state carrying the requested buffer capacities.
-        dtype: Element type used by the all-reduce buffers.
-
-    Returns:
-        None.
-    """
-    _get_or_create_iris_state(state, dtype)
-
-
-def all_reduce(state: TritonCommState, tensor: torch.Tensor, op=None) -> torch.Tensor:
-    assert all_reduce_can_run(state, tensor, op=op)
-    platform = current_platform()
-    if platform.is_amd:
-        import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-        iris_state = _get_or_create_iris_state(state, tensor.dtype)
-        return _iris_mod.iris_all_reduce(iris_state, tensor, op=op, safe=False)
-
-    raise AssertionError(f"Unsupported platform: {platform}")
-
-
-def symm_outputs_can_run(
-    state: TritonCommState,
-    shapes: tuple[tuple[int, ...], ...],
-    dtype: torch.dtype,
-    op=None,
-) -> bool:
-    """Check whether Iris can reduce producer-owned output buffers.
-
-    Args:
-        state: Communication group and symmetric-buffer capacity.
-        shapes: Ordered shapes the producer will write.
-        dtype: Element type shared by all outputs.
-        op: Reduction operation; only SUM is currently supported.
-
-    Returns:
-        Whether the request is supported by the CDNA4 producer-direct kernel.
-    """
-    if op is None:
-        op = torch.distributed.ReduceOp.SUM
-    numels = tuple(math.prod(shape) for shape in shapes)
-    total_numel = sum(numels)
-    if (
-        not current_platform().is_cdna4
-        or op != torch.distributed.ReduceOp.SUM
-        or not numels
-        or any(numel <= 0 for numel in numels)
-    ):
-        return False
-
-    import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-    return _iris_mod.producer_direct_all_reduce_can_run(
-        world_size=state.world_size,
-        total_numel=total_numel,
-        dtype=dtype,
-        max_bytes=state.max_bytes,
-    )
-
-
-def acquire_symm_outputs(
-    state: TritonCommState,
-    shapes: tuple[tuple[int, ...], ...],
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, ...]:
-    """Acquire consecutive Iris views for producer-direct reduction."""
-    if not symm_outputs_can_run(state, shapes, dtype):
-        raise RuntimeError("unsupported symmetric all-reduce output request")
-    import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-    iris_state = _get_or_create_iris_state(state, dtype)
-    return _iris_mod.iris_acquire_outputs(iris_state, shapes)
-
-
-def all_reduce_symm_can_run(
-    state: TritonCommState,
-    tensors: tuple[torch.Tensor, ...],
-    op=None,
-) -> bool:
-    """Check whether tensors are Iris-owned symmetric all-reduce outputs."""
-    if op is None:
-        op = torch.distributed.ReduceOp.SUM
-    if not current_platform().is_cdna4 or op != torch.distributed.ReduceOp.SUM:
-        return False
-    if not tensors:
-        return False
-    import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-    key = _iris_state_key(state, tensors[0].dtype)
-    iris_state = _iris_mod.IRIS_AR_STATES.get(key)
-    return iris_state is not None and iris_state.owns_outputs(tensors)
-
-
-def all_reduce_symmetric(
-    state: TritonCommState,
-    tensors: tuple[torch.Tensor, ...],
-) -> tuple[torch.Tensor, ...]:
-    """Return caller-owned reductions of consecutive Iris producer outputs."""
-    import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-    key = _iris_state_key(state, tensors[0].dtype)
-    iris_state = _iris_mod.IRIS_AR_STATES[key]
-    return _iris_mod.iris_all_reduce_symmetric(iris_state, tensors)
-
-
-def allreduce_residual_attnres_max_tokens(world_size: int) -> int:
-    """Return the Kimi-K3 AttnRes token limit for a communication group.
-
-    Args:
-        world_size: Number of ranks participating in the all-reduce.
-
-    Returns:
-        The supported token count, or zero when the group size is unsupported.
-    """
-    import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-    kernel_config = _iris_mod.IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
-    if world_size != kernel_config.world_size:
-        return 0
-    return _ALLREDUCE_RESIDUAL_ATTNRES_MAX_TOKENS
-
-
-def _all_reduce_residual_attnres_can_run(
-    state: TritonCommState,
-    partial: torch.Tensor,
-    residual: torch.Tensor,
-    score_weight: torch.Tensor,
-    output_weight: torch.Tensor,
-    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    op=None,
-) -> bool:
-    """Return whether Iris can reduce and consume a Kimi-K3 attention partial."""
-    if op is None:
-        op = torch.distributed.ReduceOp.SUM
-    m, s_, acc = scratch
-    platform = current_platform()
-    if not platform.is_cdna4:
-        return False
-
-    import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-    kernel_config = _iris_mod.IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
-    num_tokens = partial.shape[0] if partial.ndim == 2 else 0
-    return (
-        state.world_size == kernel_config.world_size
-        and op == torch.distributed.ReduceOp.SUM
-        and 0 < num_tokens <= allreduce_residual_attnres_max_tokens(state.world_size)
-        and num_tokens <= state.max_token_num
-        and partial.shape == residual.shape == (num_tokens, kernel_config.hidden_size)
-        and score_weight.shape == output_weight.shape == (kernel_config.hidden_size,)
-        and m.shape == s_.shape == (num_tokens,)
-        and acc.shape == (num_tokens, kernel_config.hidden_size)
-        and partial.dtype
-        == residual.dtype
-        == score_weight.dtype
-        == output_weight.dtype
-        == torch.bfloat16
-        and m.dtype == s_.dtype == acc.dtype == torch.float32
-        and partial.device
-        == residual.device
-        == score_weight.device
-        == output_weight.device
-        == m.device
-        == s_.device
-        == acc.device
-        == state.device
-        and all(
-            tensor.is_contiguous()
-            for tensor in (
-                partial,
-                residual,
-                score_weight,
-                output_weight,
-                m,
-                s_,
-                acc,
-            )
-        )
-        and partial.numel() <= state.attnres_max_numel
-    )
-
-
-def _all_reduce_residual_attnres(
-    state: TritonCommState,
-    partial: torch.Tensor,
-    residual: torch.Tensor,
-    score_weight: torch.Tensor,
-    output_weight: torch.Tensor,
-    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    eps: float,
-    op=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce a Kimi-K3 attention partial and finish its AttnRes epilogue.
-
-    Args:
-        state: Initialized communication state for the tensor-parallel group.
-        partial: Contiguous local BF16 attention partial shaped ``[M, 7168]``.
-        residual: Contiguous BF16 residual stream shaped ``[M, 7168]``.
-        score_weight: Contiguous BF16 AttnRes score weight shaped ``[7168]``.
-        output_weight: Contiguous BF16 output RMSNorm weight shaped ``[7168]``.
-        scratch: Contiguous FP32 ``(max_logit, exp_sum, weighted_sum)`` tensors
-            for the historical AttnRes candidates, shaped ``[M]``, ``[M]``,
-            and ``[M, 7168]``.
-        eps: Positive epsilon used for AttnRes scoring and output RMSNorm.
-        op: Reduction operation; only ``SUM`` is supported.
-
-    Returns:
-        A pair containing the normalized AttnRes mixture and the BF16 sum of
-        ``residual`` with the all-reduced attention partial, both shaped
-        ``[M, 7168]``.
-    """
-    assert _all_reduce_residual_attnres_can_run(
-        state,
-        partial,
-        residual,
-        score_weight,
-        output_weight,
-        scratch,
-        op=op,
-    )
-    import tokenspeed_kernel.ops.communication.iris as _iris_mod
-
-    iris_state = _get_or_create_iris_state(state, partial.dtype)
-    return _iris_mod.iris_all_reduce_residual_attnres(
-        iris_state,
-        partial,
-        residual,
-        score_weight,
-        output_weight,
-        scratch,
-        eps,
-        op=op,
-    )
-
-
-def _attnres_comm_state(
-    input_tensor: torch.Tensor,
-    rank: int,
-    group: dist.ProcessGroup,
-) -> TritonCommState:
-    return TritonCommState(
-        enable_lamport=False,
-        moe_tail_max_rows=0,
+    assert platform.is_nvidia, f"Unsupported platform: {platform}"
+    return nvidia_create_rsag_state(
         group=group,
-        rank_in_group=rank,
-        world_size=group.size(),
-        device=input_tensor.device,
-        attnres_max_numel=input_tensor.numel(),
-        max_numel=0,
-        max_bytes=0,
-        max_token_num=input_tensor.shape[0],
-        hidden_dim=0,
-        comm_buff=None,
-        symm_mem_hdl=None,
+        rank_in_group=rank_in_group,
+        max_tokens=max_tokens,
+        hidden_size=hidden_size,
+        device=device,
     )
-
-
-def allreduce_residual_attnres_combine_supported(
-    input_tensor: torch.Tensor,
-    residual: torch.Tensor,
-    score_weight: torch.Tensor,
-    output_weight: torch.Tensor,
-    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    *,
-    rank: int,
-    group: dist.ProcessGroup,
-    local_world_size: int,
-    op=None,
-) -> bool:
-    """Return whether the fused Kimi-K3 Iris collective supports this call.
-
-    The Iris all-reduce transport is node-local. ``local_world_size`` maps the
-    process group's global ranks to nodes so multi-node attention groups use
-    the model's ordinary collective fallback instead.
-    """
-    if local_world_size <= 0:
-        return False
-    group_ranks = dist.get_process_group_ranks(group)
-    if len({global_rank // local_world_size for global_rank in group_ranks}) != 1:
-        return False
-    return _all_reduce_residual_attnres_can_run(
-        _attnres_comm_state(input_tensor, rank, group),
-        input_tensor,
-        residual,
-        score_weight,
-        output_weight,
-        scratch,
-        op=op,
-    )
-
-
-def allreduce_residual_attnres_combine(
-    input_tensor: torch.Tensor,
-    residual: torch.Tensor,
-    score_weight: torch.Tensor,
-    output_weight: torch.Tensor,
-    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    *,
-    rank: int,
-    group: dist.ProcessGroup,
-    local_world_size: int,
-    eps: float = 1e-6,
-    op=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the fused Kimi-K3 Iris all-reduce and AttnRes epilogue.
-
-    Args:
-        input_tensor: Per-rank BF16 attention partial shaped ``[M, 7168]``.
-        residual: Running BF16 residual stream shaped ``[M, 7168]``.
-        score_weight: Precomputed AttnRes score weight shaped ``[7168]``.
-        output_weight: Output RMSNorm weight shaped ``[7168]``.
-        scratch: FP32 ``(max_logit, exp_sum, weighted_sum)`` partials.
-        rank: Rank within ``group``.
-        group: Validated node-local Kimi-K3 attention process group.
-        local_world_size: Number of processes on each node.
-        eps: Positive epsilon for AttnRes scoring and output RMSNorm.
-        op: Reduction operation. Only ``SUM`` is supported.
-
-    Returns:
-        The normalized AttnRes output and accumulated residual, in that order.
-    """
-    assert allreduce_residual_attnres_combine_supported(
-        input_tensor,
-        residual,
-        score_weight,
-        output_weight,
-        scratch,
-        rank=rank,
-        group=group,
-        local_world_size=local_world_size,
-        op=op,
-    )
-    return _all_reduce_residual_attnres(
-        _attnres_comm_state(input_tensor, rank, group),
-        input_tensor,
-        residual,
-        score_weight,
-        output_weight,
-        scratch,
-        eps,
-        op=op,
-    )
-
-
-def get_token_dist(state: TritonCommState, total_tokens_in_group: int) -> list:
-    return rsag_get_token_dist(state, total_tokens_in_group)
 
 
 def reduce_scatter(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     tp_num_tokens: int = None,
     token_list_in_group: List[int] = None,
@@ -2637,7 +2057,7 @@ def reduce_scatter(
 
 
 def all_gather(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     tp_num_tokens: int = None,
     token_list_in_group: List[int] = None,
@@ -2714,7 +2134,7 @@ def nvidia_rsag_all_gather_kernel_inner(
 
 
 def nvidia_rsag_multimem_all_gather_inner(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     total_tokens: int,
     local_hidden: int,
@@ -2746,7 +2166,7 @@ def nvidia_rsag_multimem_all_gather_inner(
 
 
 def nvidia_rsag_all_gather_inner(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     tp_hidden_dim: int = None,
     hidden_list_in_group: List[int] = None,
@@ -2826,7 +2246,7 @@ def nvidia_rsag_all_gather_inner(
 
 
 def all_gather_inner(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     tp_hidden_dim: int = None,
     hidden_list_in_group: List[int] = None,
@@ -2859,7 +2279,7 @@ def all_gather_inner(
 
 
 def rsag_all_reduce(
-    state: TritonCommState,
+    state: TritonRSAGState,
     hidden_states: torch.Tensor,
     *,
     issuer: int,

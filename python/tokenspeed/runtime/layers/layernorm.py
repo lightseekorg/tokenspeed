@@ -24,8 +24,8 @@ from typing import ClassVar
 
 import torch
 import torch.nn as nn
-from tokenspeed_kernel.ops.communication.triton import (
-    allreduce_residual_rmsnorm as triton_allreduce_residual_rmsnorm,
+from tokenspeed_kernel.ops.communication import (
+    allreduce_residual_rmsnorm as iris_allreduce_residual_rmsnorm,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
     allgather_dual_rmsnorm,
@@ -79,7 +79,7 @@ if _is_amd:
         rmsnorm_fused_parallel as triton_rmsnorm_fused_parallel,
     )
 
-    _allreduce_residual_rmsnorm = triton_allreduce_residual_rmsnorm
+    _allreduce_residual_rmsnorm = iris_allreduce_residual_rmsnorm
 elif _platform.is_nvidia:
     from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
     from tokenspeed_kernel.ops.layernorm.flashinfer import (

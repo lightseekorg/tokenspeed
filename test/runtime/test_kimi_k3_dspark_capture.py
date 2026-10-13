@@ -172,12 +172,14 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             mapping=mapping,
             project_target_tap=lambda index, rows: rows,
             finalize_target_projection=lambda rows: rows,
-            write_context_kv=lambda rows, positions, locations, pool: writes.append(
+            write_context_kv=lambda rows, positions, locations, pool, *, attn_backend: writes.append(
                 (rows.clone(), locations)
             ),
         )
         producer = DSparkContextProducer(
-            projector, object() if mapping.is_last_pp_rank else None
+            projector,
+            object() if mapping.is_last_pp_rank else None,
+            attn_backend=object() if mapping.is_last_pp_rank else None,
         )
         model = SimpleNamespace(
             config=SimpleNamespace(num_hidden_layers=4, attn_res_block_size=2),
@@ -197,6 +199,12 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             model, index, prefix, residual
         )
         locations = torch.tensor([9, 10])
+
+        def no_decode_window():
+            # A PD prefill engine never refreshes decode metadata, so the
+            # router raises here; a pure prefill round must not ask.
+            raise RuntimeError("decode window requested before any decode refresh")
+
         ctx = SimpleNamespace(
             dspark_context_producer=producer,
             target_capture_sink=None,
@@ -204,7 +212,7 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             bs=1,
             input_num_tokens=2,
             attn_backend=SimpleNamespace(
-                decode_window_locations=lambda: torch.empty(0, dtype=torch.int64),
+                decode_window_locations=no_decode_window,
                 extend_span_locations=lambda: locations,
             ),
         )

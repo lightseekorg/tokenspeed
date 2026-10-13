@@ -115,25 +115,41 @@ private:
     std::int32_t decode_input_tokens_{};
 };
 
+// The request is done. A page-holding request parks in Finishing with its
+// pages: the scheduler publishes its frontier and releases them
+// (ReleaseEvent) once every forward out against them has landed.
 struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     using InvalidTransitionHandler<FinishEvent>::operator();
 
     explicit FinishEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
 
-    Finished operator()(PrefillDone&& state);
-    Finished operator()(PrefillAwaitingResult&& state);
-    Finished operator()(Decoding&& state);
+    Finishing operator()(PrefillDone&& state);
+    Finishing operator()(PrefillAwaitingResult&& state);
+    Finishing operator()(Decoding&& state);
     // A suspended request's image dies with the state: its Host L2 pins drop
     // (the entries stay published, now evictable), its snapshot-pool blocks
     // and blob slot return.
     Finished operator()(Retracted&& state);
+    // The restore's copies are still filling the pages: nothing of the
+    // frontier is on Device to publish, so the pages go straight back.
     Finished operator()(Restoring&& state);
+    Finishing operator()(Finishing&& state) { return std::move(state); }
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
-    template <typename State>
-    Finished finish(State&& state);
+    CacheCoordinator* coordinator_{};
+};
 
+// A Finishing request with no forward in flight: its frontier was published;
+// its pages return to the pool.
+struct ReleaseEvent : InvalidTransitionHandler<ReleaseEvent> {
+    using InvalidTransitionHandler<ReleaseEvent>::operator();
+
+    explicit ReleaseEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
+
+    Finished operator()(Finishing&& state);
+
+private:
     CacheCoordinator* coordinator_{};
 };
 
@@ -154,6 +170,8 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Decoding&& state);
     Finished operator()(Retracted&& state);
     Finished operator()(Restoring&& state);
+    // Nothing of an aborted request is published, finished or not.
+    Finished operator()(Finishing&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
