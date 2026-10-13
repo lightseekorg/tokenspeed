@@ -302,6 +302,8 @@ bool is_valid_config(
       num_threads == NUM_THREADS && is_zp_float == IS_ZP_FLOAT) {                                                      \
     constexpr auto S_TYPE = W_TYPE == host::kFE2M1f                                                                    \
                                 ? (GROUP_BLOCKS == 1 ? host::kFE4M3fn : host::kFE8M0fnu)                               \
+                            : W_TYPE == host::kFE4M3fn && GROUP_BLOCKS == 2                                            \
+                                ? host::kFE8M0fnu                                                                      \
                                 : (std::is_same<scalar_t, half>::value ? host::kFloat16 : host::kBFloat16);            \
     kernel = Marlin<                                                                                                   \
         scalar_t,                                                                                                      \
@@ -325,7 +327,8 @@ bool is_valid_config(
 // FZP: cases for float-zero-point (is_zp_float = true)
 // ACT: cases for act order case (group_blocks == 0)
 // NVFP4: cases for nvfp4(e2m1) (group_blocks == 1)
-// MXFP4: cases for mxfp4(e2m1) (group_blocks == 2)
+// MXFP4: cases for mxfp4(e2m1) (group_blocks == 2); MXFP8 (e4m3) reuses them,
+//        both use E8M0 group-32 scales
 #define COMMON_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)       \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false)   \
@@ -471,6 +474,7 @@ MarlinFuncPtr get_marlin_kernel(
     if (false) {
     }
     MXFP4_GET_IF(host::kFE2M1f)
+    MXFP4_GET_IF(host::kFE4M3fn)
   }
 
   return kernel;
@@ -1028,6 +1032,19 @@ void moe_wna16_marlin_gemm(
     RuntimeCheck(
         group_size != 32 || std::is_same<scalar_t, nv_bfloat16>::value,
         "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 activations.");
+  }
+  if (b_q_type == kFE4M3fn) {
+    // group_size 32 is MXFP8 (E8M0 scales); -1 and 128 take BF16/FP16 scales.
+    RuntimeCheck(
+        group_size == -1 || group_size == 32 || group_size == 128,
+        "float8_e4m3fn only supports group_size == -1, 32 (MXFP8) or 128. Got group_size = ",
+        group_size);
+    RuntimeCheck(
+        group_size != 32 || std::is_same<scalar_t, nv_bfloat16>::value,
+        "MXFP8 Marlin with E8M0 scales is only instantiated for bfloat16 activations.");
+  }
+  if (group_size == 32 && (b_q_type == kFE2M1f || b_q_type == kFE4M3fn)) {
+    RuntimeCheck(b_scales.dtype().bits == 8, "E8M0 group-32 scales must be 8-bit");
   }
 
   // Verify b_zeros

@@ -1142,10 +1142,11 @@ def probe_arena_floor(
     ceiling, which is a default rather than zero when unset, and a configured
     capture batch size fabricates that many rows whatever the bucket. Returned
     rather than inlined so a test can assert the number instead of the source.
-    A narrowing model's decoder ladder (``decoder_rows_per_request`` is its
-    ``max_decoder_rows_per_request``, None for other models) fabricates one
-    request per that many rows of a bucket no wider than the token ladder's,
-    and never more than ``max_num_seqs``.
+    A narrowing model's decoder ladder (``decoder_rows_per_request`` is
+    :func:`narrowest_decoder_rows_per_request` of the target and the draft,
+    None when neither narrows) fabricates one request per that many rows of a
+    bucket no wider than the token ladder's, and never more than
+    ``max_num_seqs``.
     """
     from tokenspeed.runtime.execution.cudagraph_memory import probe_arena_parent_blocks
     from tokenspeed.runtime.execution.model_executor import (
@@ -1163,6 +1164,30 @@ def probe_arena_floor(
             else min(-(-tokens // decoder_rows_per_request), server_args.max_num_seqs)
         ),
     )
+
+
+def narrowest_decoder_rows_per_request(*models) -> int | None:
+    """The smallest ``max_decoder_rows_per_request`` among narrowing ``models``.
+
+    A narrowing target's prefill graph and a narrowing draft's step-0 graph
+    (Eagle) each capture a decoder ladder that fabricates one request per that
+    many rows, so the probe arena has to hold the narrower model's requests.
+    None entries (no draft) and models that do not narrow are skipped.
+
+    Returns:
+        The smallest per-request decoder row budget, or None when no model
+        narrows.
+    """
+    from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
+
+    budgets = [
+        narrowing.max_decoder_rows_per_request
+        for narrowing in (
+            narrowing_prefill_model(model) for model in models if model is not None
+        )
+        if narrowing is not None
+    ]
+    return min(budgets, default=None)
 
 
 def _retraction_pool_request(
@@ -1279,7 +1304,6 @@ def build_device_side(
         NULL_MEMORY_DELTA_OBSERVER,
         DriverMemoryDeltaObserver,
     )
-    from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
     from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
@@ -1351,7 +1375,9 @@ def build_device_side(
             f"CUDA-graph memory reserve off, startup residue unreserved: {refusal}"
         )
     probing = refusal is None
-    narrowing = narrowing_prefill_model(target.model)
+    decoder_rows_per_request = narrowest_decoder_rows_per_request(
+        target.model, None if draft is None else draft.model
+    )
     attention = build_components(
         graph_reserve_bytes=0,
         probe_batch_rows=(
@@ -1359,11 +1385,7 @@ def build_device_side(
                 server_args,
                 model_config,
                 max_forward_tokens,
-                decoder_rows_per_request=(
-                    None
-                    if narrowing is None
-                    else narrowing.max_decoder_rows_per_request
-                ),
+                decoder_rows_per_request=decoder_rows_per_request,
             )
             if probing
             else None

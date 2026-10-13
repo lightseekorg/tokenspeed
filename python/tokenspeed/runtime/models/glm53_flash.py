@@ -495,6 +495,7 @@ class Glm53FlashMoE(DeepseekV3MoE):
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
             },
+            deterministic_finalize=False,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -1176,11 +1177,11 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         page_table: torch.Tensor,
         q_len_per_req: int,
         decode_start: int,
-        num_tokens: int,
         num_decode_tokens: int,
         topk: int,
     ) -> GlmDsaDecodeTopK:
         del topk
+        num_tokens = indexer_output.query.shape[0]
         writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(
             num_tokens,
@@ -1210,6 +1211,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
             topk_lens=topk_lens,
+            row_offset=0,
         )
 
     def _compute_prefill_topk_indices(

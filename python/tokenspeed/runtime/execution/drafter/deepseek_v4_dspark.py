@@ -51,6 +51,7 @@ from tokenspeed.runtime.utils.spec_block_geometry import validate_block_widths
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -340,9 +341,14 @@ class DeepseekV4DSpark(BaseDrafter):
 
     @torch.inference_mode()
     def capture_prefill_graph(
-        self, stream: torch.cuda.Stream, observer: AbstractContextManager[None]
+        self,
+        stream: torch.cuda.Stream,
+        observer: AbstractContextManager[None],
+        *,
+        executor_config: ModelExecutorConfig,
     ) -> None:
         """Capture one request's bounded context seeding in a private graph pool."""
+        del executor_config
         window = int(self.model.window_size)
         self._prefill_hidden = torch.zeros(
             (1, window, self.hidden_width),

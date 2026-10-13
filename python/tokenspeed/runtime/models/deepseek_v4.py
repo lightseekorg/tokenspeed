@@ -1818,6 +1818,7 @@ class DeepseekV4MoE(nn.Module):
             persistent_max_num_tokens_per_gpu=(
                 _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
             ),
+            deterministic_finalize=False,
         )
         self.topk = DeepseekV4TopK(
             top_k=config.num_experts_per_tok,

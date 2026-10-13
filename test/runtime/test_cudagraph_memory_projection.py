@@ -499,10 +499,11 @@ def test_the_drafters_own_pool_is_declared_captured_and_labelled() -> None:
     seen = []
     drafter = SimpleNamespace(
         captures_prefill_graph=True,
-        capture_prefill_graph=lambda _stream, observer: seen.append(observer),
+        capture_prefill_graph=lambda _stream, observer, **_: seen.append(observer),
     )
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
+    executor.config = SimpleNamespace()
     executor.drafter = drafter
     executor.forward_step = SimpleNamespace(
         disable=True, capture_ladders=lambda entries: {}, stream="stream"

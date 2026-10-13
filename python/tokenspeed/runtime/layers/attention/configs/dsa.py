@@ -146,6 +146,10 @@ class DSAConfig(MLAConfig):
     # Storage of the index-key plane, one of INDEX_K_FORMATS.
     index_k_format: str
     index_kpool: int | None = None
+    # The model reads the live metadata (cache writes, the indexer top-k and
+    # the sparse kernel) only inside one eager break that drops the padded
+    # rows itself, so its prefill can replay a padded breakable graph.
+    padded_prefill_replay: bool = False
 
     def __post_init__(self) -> None:
         # None is a DSA configure-attention hook that named no plane.
@@ -167,6 +171,7 @@ class DSAConfig(MLAConfig):
             # plugin that scores the checkpoint's bf16 keys names "bf16".
             index_k_format=model_config.index_k_format,
             index_kpool=getattr(model_config, "index_kpool", None),
+            padded_prefill_replay=model_config.dsa_padded_prefill_replay,
         )
 
     @classmethod

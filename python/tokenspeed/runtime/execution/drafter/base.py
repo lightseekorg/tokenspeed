@@ -40,6 +40,7 @@ from tokenspeed.runtime.execution.slot_state import (
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -260,10 +261,19 @@ class BaseDrafter:
         """Drop a captured draft prefill graph. Drafters without one need no action."""
 
     def capture_prefill_graph(
-        self, stream: torch.cuda.Stream, observer: AbstractContextManager[None]
+        self,
+        stream: torch.cuda.Stream,
+        observer: AbstractContextManager[None],
+        *,
+        executor_config: ModelExecutorConfig,
     ) -> None:
         """Capture draft prefill work after target capture, when prefill graphs
         are enabled. Drafters without a separate prefill graph need no action.
+
+        Called only when ``captures_prefill_graph`` holds; the whole capture
+        runs inside ``observer``, the window the memory projection measures.
+        ``executor_config`` is the target executor's config; a draft-owned
+        :class:`PrefillGraph` shares its token ladder.
         """
 
     def bind_tree(self, tree_spec: TreeSpec) -> None:

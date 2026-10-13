@@ -332,6 +332,29 @@ def get_decoder_row_buckets(
     return sorted(buckets)
 
 
+class _CaptureDraftNarrowing:
+    """The dummy batch's ``DraftNarrowing`` for a draft-first-step capture.
+
+    Its presence makes capture trace the step-0 branches the live context
+    takes. Replay rebinds the live context only at eager breaks and the
+    narrowing stage, so a captured segment must not read the gather ids or
+    the frontier: it would bake the dummy batch's. Publishing under stream
+    capture is refused for that reason (it also plans on the host).
+    """
+
+    def __init__(self, attn_backend: AttentionBackend, frontier: torch.Tensor) -> None:
+        self.attn_backend = attn_backend
+        self.frontier = frontier
+
+    def publish_accepted_prefix(self) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "a draft step-0 graph segment published the accepted prefix; "
+                "publish from an eager break so replay sees the live frontier"
+            )
+        self.attn_backend.advance_draft_forward_metadata(self.frontier)
+
+
 class CapturedForward(NamedTuple):
     """A bucket's captured inner-forward outputs: leading rows of buffers shared by every capture."""
 
@@ -401,6 +424,10 @@ class PrefillGraph:
         config: Model-executor config (buckets, DP/world topology, device).
         drafter: If present, aux-hidden capture (EAGLE3/MTP) is baked into the
             captured graphs.
+        draft_first_step: When True this owner is the draft's step-0 graph
+            (Eagle / MTP after a prefill). Admission then *requires*
+            ``draft_narrowing`` and the baked ``capture_hidden_mode``
+            (``LAST``), the inverse of the target graph which declines both.
     """
 
     def __init__(
@@ -413,6 +440,7 @@ class PrefillGraph:
         drafter=None,
         num_warmup: int = 3,
         graph_supported: bool = True,
+        draft_first_step: bool = False,
     ) -> None:
         model = model_runner.model if model_runner is not None else None
         # Multimodal seam: models whose multimodal path is embeds-only expose
@@ -429,6 +457,7 @@ class PrefillGraph:
         self.config = config
         self.drafter = drafter
         self.num_warmup = num_warmup
+        self._draft_first_step = draft_first_step
         self.dp_size = config.data_parallel_size
         # The expert load counters' live-row mask (None without load
         # recording): a bucket replay marks the filler rows past each rank's
@@ -502,6 +531,9 @@ class PrefillGraph:
         self._engaged_logged: set[str] = set()
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
+        # Draft step 0 reads the target's hidden from this static, landed per
+        # replay like the input embeds. None on every other owner.
+        self._captured_hidden_buf: torch.Tensor | None = None
         # One owner for ordinary and attention-containing captures. None is the
         # batch-independent attention-break variant; integers require exact BS.
         self._captures: dict[
@@ -568,6 +600,10 @@ class PrefillGraph:
             max_bs=int(self.config.max_num_seqs)
             // max(int(self.config.data_parallel_size), 1),
         )
+        if self._draft_first_step:
+            # The target's last hidden is as wide as the embedding it shares
+            # with the draft; _land_captured_hidden rejects any other shape.
+            self._captured_hidden_buf = torch.zeros_like(self._input_embeds_buf)
         with maybe_inference_mode():
             self._capture_all_buckets(decode_wrapper, entries, observer)
             if self._narrowing is not None:
@@ -642,7 +678,7 @@ class PrefillGraph:
             if self._narrowing is not None:
                 sample = next(iter(self._encoders.values()), None)
                 logger.info(
-                    "prefill breakable graph: captured encoder buckets "
+                    f"{self._log_name}: captured encoder buckets "
                     f"{sorted(self._encoders)!s} (segments="
                     f"{(sample.capture.num_segments if sample is not None else 0):d}"
                     ", eager attention breaks; the narrowing stage runs eager)",
@@ -655,7 +691,7 @@ class PrefillGraph:
             }
             sample = next(iter(ordinary.values()), None)
             logger.info(
-                f"prefill breakable graph: captured buckets {sorted(ordinary)!s} "
+                f"{self._log_name}: captured buckets {sorted(ordinary)!s} "
                 f"(segments={(sample[0].num_segments if sample is not None else 0):d}, "
                 "eager attention breaks)",
             )
@@ -741,7 +777,7 @@ class PrefillGraph:
         if rank == 0:
             sample = next(iter(self._decoders.values()), None)
             logger.info(
-                "prefill breakable graph: captured decoder buckets "
+                f"{self._log_name}: captured decoder buckets "
                 f"{sorted(self._decoders)!s} (segments="
                 f"{(sample.capture.num_segments if sample is not None else 0):d}"
                 ", shared across token buckets)",
@@ -979,6 +1015,10 @@ class PrefillGraph:
         prepare_kwargs = getattr(self.text_model, "prepare_model_kwargs", None)
         if prepare_kwargs is not None:
             model_kwargs = prepare_kwargs(self._ctx, input_ids, model_kwargs)
+        if self._captured_hidden_buf is not None:
+            model_kwargs["captured_hidden_states"] = self._captured_hidden_buf[
+                :num_tokens
+            ]
         return input_ids, positions, model_kwargs
 
     def _run_encoder(self, num_tokens: int) -> NarrowedRowState:
@@ -1086,6 +1126,40 @@ class PrefillGraph:
             out[str(spec.group_id)] = first_block[:, None].expand(bs, cols).contiguous()
         return out
 
+    @property
+    def _log_name(self) -> str:
+        """Log prefix; the draft's step-0 owner reads apart from the target's."""
+        if self._draft_first_step:
+            return "prefill breakable graph (draft step 0)"
+        return "prefill breakable graph"
+
+    def _dummy_capture_hidden_mode(self):
+        """Hidden-capture mode baked into this owner's dummy batch."""
+        if self._draft_first_step:
+            return CaptureHiddenMode.LAST
+        if self.drafter is not None:
+            return CaptureHiddenMode.FULL
+        return CaptureHiddenMode.NULL
+
+    def _land_captured_hidden(
+        self, hidden: torch.Tensor | None, num_tokens: int, bucket: int
+    ) -> None:
+        """Copy draft step 0's target hidden into the static buffer, zero the tail.
+
+        The hidden must have exactly one row per input token: a shorter one
+        would leave the previous replay's rows inside the graphed bucket.
+        """
+        buf = self._captured_hidden_buf
+        if hidden is None or tuple(hidden.shape) != (num_tokens, buf.shape[1]):
+            shape = None if hidden is None else tuple(hidden.shape)
+            raise ValueError(
+                f"draft step-0 graph needs a ({num_tokens}, {buf.shape[1]}) "
+                f"captured hidden; got {shape}"
+            )
+        buf[:num_tokens].copy_(hidden)
+        if num_tokens < bucket:
+            buf[num_tokens:bucket].zero_()
+
     def make_dummy_batch(self, num_tokens: int, bs: int) -> ForwardContext:
         """Populate the static buffers + attention metadata for a dummy extend
         forward of ``num_tokens`` tokens over ``bs`` positive-length requests,
@@ -1164,14 +1238,14 @@ class PrefillGraph:
             output_layout=ForwardOutputLayout(bs, bs, 0, 1),
             input_num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.drafter is not None
-                else CaptureHiddenMode.NULL
-            ),
+            capture_hidden_mode=self._dummy_capture_hidden_mode(),
             gather_ids=torch.cumsum(seq_lens_gpu.to(torch.int64), dim=0) - 1,
             query_shard=query_shard,
         )
+        if self._draft_first_step:
+            ctx.draft_narrowing = _CaptureDraftNarrowing(
+                self.attn_backend, seq_lens_gpu
+            )
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
             ctx.global_bs = [bs] * self.config.world_size
@@ -1243,6 +1317,7 @@ class PrefillGraph:
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         multimodal_context=None,
+        captured_hidden_states: torch.Tensor | None = None,
     ):
         """Replay the captured graph for ``ctx`` (caller checked :meth:`can_run`).
 
@@ -1250,14 +1325,17 @@ class PrefillGraph:
         prefill gathers ``embed_tokens(input_ids)`` into the static buffer; a
         multimodal prefill builds the merged text+vision embeddings via the
         model's ``multimodal_input_embeds`` seam (vision encoder included)
-        instead -- both replay the same graphs. Then the inner stack replays
-        over the padded bucket and the model's eager logits tail finishes on
-        the real-token rows.
+        instead -- both replay the same graphs. A draft-first-step owner lands
+        the target's ``captured_hidden_states`` into its own static buffer the
+        same way. Then the inner stack replays over the padded bucket and the
+        model's eager logits tail finishes on the real-token rows.
         """
         bucket = self._replay_bucket(ctx)
         assert bucket is not None, "replay() called without can_run()"
-        self._log_engaged_once(bucket, ctx, multimodal_context is not None)
         num_tokens = ctx.input_num_tokens
+        if self._draft_first_step:
+            self._land_captured_hidden(captured_hidden_states, num_tokens, bucket)
+        self._log_engaged_once(bucket, ctx, multimodal_context is not None)
         input_embeds = None
         if multimodal_context is not None:
             input_embeds = self._multimodal_input_embeds(
@@ -1346,7 +1424,7 @@ class PrefillGraph:
         if route not in self._engaged_logged:
             self._engaged_logged.add(route)
             logger.info(
-                f"prefill breakable graph {route!s} ENGAGED: bucket={bucket:d} "
+                f"{self._log_name} {route!s} ENGAGED: bucket={bucket:d} "
                 f"rows={rows:d} decoder_bucket={decoder_bucket!s}"
             )
         with self._padded_to(ctx, bucket):
@@ -1411,11 +1489,16 @@ class PrefillGraph:
         draft first-step row narrowing (``draft_narrowing``) and the
         ``capture_hidden_mode`` aux-hidden capture -- so a live forward carrying
         different values falls back to eager rather than silently dropping the
-        reduce / mismatching aux. Prefix caching (cache hits and chunked-prefill
-        chunks 2+) IS eligible: the prefix changes attention metadata, not the
-        input-token count. Ordinary breaks read live metadata; inline KDA uses
-        refreshed fixed-address metadata. Under DP only the ordinary route is
-        used, and the replicated token counts determine its EP all-to-all shape.
+        reduce / mismatching aux. The target graph therefore declines any
+        context that carries narrowing; a ``draft_first_step`` owner requires
+        it, because that is the ctx Eagle step 0 actually sends. That owner
+        also declines mixed rounds: there its replay's proposals disagreed
+        with the eager draft's, so mixed rounds keep the eager step 0. Prefix
+        caching (cache hits and chunked-prefill chunks 2+) IS eligible: the
+        prefix changes attention metadata, not the input-token count.
+        Ordinary breaks read live metadata; inline KDA uses refreshed
+        fixed-address metadata. Under DP only the ordinary route is used, and
+        the replicated token counts determine its EP all-to-all shape.
         """
         if self.disable or ctx.forward_mode is None:
             return None
@@ -1423,7 +1506,10 @@ class PrefillGraph:
             return None
         if not (ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed()):
             return None
-        if ctx.draft_narrowing is not None:
+        if self._draft_first_step:
+            if ctx.draft_narrowing is None or ctx.forward_mode.is_mixed():
+                return None
+        elif ctx.draft_narrowing is not None:
             return None
         if ctx.capture_hidden_mode != self._captured_hidden_mode:
             return None
@@ -1517,7 +1603,7 @@ class PrefillGraph:
         self._engaged_logged.add(kind)
         logger.info(
             # The replay mode actually taken (mirrors _select_bucket), a DP-debug anchor.
-            f"prefill breakable graph ENGAGED ({kind!s}): bucket={bucket:d} dp="
+            f"{self._log_name} ENGAGED ({kind!s}): bucket={bucket:d} dp="
             f"{self.dp_size > 1 and ctx.global_num_tokens is not None!s} mode="
             f"{ctx.forward_mode!s} "
             "(mixed prefill+decode batches supported)",

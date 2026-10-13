@@ -20,7 +20,9 @@
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -34,17 +36,26 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.prefill_graph import (
+    PrefillGraph,
+    narrowing_prefill_model,
+)
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeDraftInputs,
 )
+from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+
+logger = get_colorful_logger(__name__)
 
 DsaTopKState = tuple[Any | None, Any | None]
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.execution.tree_spec import TreeSpec
@@ -188,6 +199,11 @@ class Eagle(BaseDrafter):
             * spec_num_tokens
             - 1
         )
+
+        # Draft-owned prefill graph for step 0 after an extend target forward.
+        # None until capture_prefill_graph sees a narrowing draft.
+        self.prefill_graph: PrefillGraph | None = None
+        self._first_step_miss_logged = False
 
     @override
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
@@ -440,12 +456,11 @@ class Eagle(BaseDrafter):
                     row_offset=rows.start,
                 )
             )
-        logits_output = self.draft_model_runner.forward(
-            ctx=ctx,
-            input_ids=input_ids,
-            positions=buffers.positions_buf[rows],
-            captured_hidden_states=draft_input.base_out_hidden_states,
-            spec_step_idx=0,
+        logits_output = self._forward_first_step(
+            ctx,
+            input_ids,
+            buffers.positions_buf[rows],
+            draft_input.base_out_hidden_states,
             **history_kwargs,
         )
         dsa_topk = self._extract_dsa_topk(dsa_topk)
@@ -643,6 +658,101 @@ class Eagle(BaseDrafter):
                 f"got logits of width {logits.shape[-1]}"
             )
         return logprob_topk(logits, self.draft_tree.topk)
+
+    def _forward_first_step(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        captured_hidden_states: torch.Tensor,
+        **model_kwargs,
+    ):
+        """Replay the draft prefill graph when it admits this step-0 context.
+
+        ``model_kwargs`` reach the eager forward only: the graph owner refuses
+        a draft that reads request-token history, the one extra input step 0
+        carries, so a captured graph never sees one.
+        """
+        graph = self.prefill_graph
+        if graph is not None and graph.can_run(ctx):
+            return graph.replay(
+                ctx, input_ids, captured_hidden_states=captured_hidden_states
+            )
+        # Decode-only first steps (num_extends == 0) ride the decode graph
+        # through draft_model_runner.forward, and the graph declines mixed
+        # rounds by design. Only a pure-extend miss is a prefill-graph fallback.
+        if (
+            graph is not None
+            and ctx.num_extends > 0
+            and not ctx.forward_mode.is_mixed()
+            and not self._first_step_miss_logged
+        ):
+            self._first_step_miss_logged = True
+            logger.info(
+                "draft first-step prefill graph declined an extend; running "
+                f"eager (tokens={ctx.input_num_tokens} extends={ctx.num_extends})"
+            )
+        return self.draft_model_runner.forward(
+            ctx=ctx,
+            input_ids=input_ids,
+            positions=positions,
+            captured_hidden_states=captured_hidden_states,
+            spec_step_idx=0,
+            **model_kwargs,
+        )
+
+    @property
+    @override
+    def captures_prefill_graph(self) -> bool:
+        # Only narrowing drafts (HY V4 NextN) own the split encoder/decoder
+        # graphs; other Eagle models keep the eager first step until they
+        # implement the same contract.
+        return narrowing_prefill_model(self.draft_model_runner.model) is not None
+
+    @override
+    def release_prefill_graph(self) -> None:
+        """Drop the step-0 graph; the next capture builds one over the bound pool."""
+        if self.prefill_graph is not None:
+            self.prefill_graph.release_graphs()
+            self.prefill_graph = None
+
+    @override
+    def capture_prefill_graph(
+        self,
+        stream: torch.cuda.Stream,
+        observer: AbstractContextManager[None],
+        *,
+        executor_config: ModelExecutorConfig,
+    ) -> None:
+        """Capture Eagle step 0 as a draft-owned :class:`PrefillGraph`.
+
+        Decode-side draft steps already ride the decode graph. The memory
+        projection sizes the draft graph as one window, so every bucket is
+        captured inside ``observer``, the probe included.
+
+        The draft reuses the target's bucket ladder. Step 0 is as long as the
+        target forward, and above the ladder both are compute-bound: a
+        one-layer graph there saves no launch time, while its scratch and
+        per-bucket outputs grow with the bucket (an 8K ladder cost HY V4
+        about 2 GB per GPU).
+        """
+        graph = PrefillGraph(
+            model_runner=self.draft_model_runner,
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            input_buffers=self.input_buffers,
+            config=executor_config,
+            drafter=None,
+            draft_first_step=True,
+        )
+        with observer:
+            graph.capture(
+                SimpleNamespace(stream=stream),
+                entries=None,
+                observer=NULL_MEMORY_DELTA_OBSERVER,
+            )
+        if not graph.disable:
+            self.prefill_graph = graph
 
     # ------------------------------------------------------------------
     # Public entry point (type-based dispatch from ModelExecutor)

@@ -35,13 +35,15 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 
-from tokenspeed.cli._argsplit import OrchestratorOpts
+from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
     DEFAULT_GRPC_MAX_MESSAGE_BYTES,
     GRPC_MAX_MESSAGE_BYTES_ENV,
+    HY_V4_REASONING_PARSER,
+    HY_V4_TOOL_CALL_PARSER,
     INKLING_ATTENTION_BACKEND,
     INKLING_REASONING_PARSER,
     INKLING_TOOL_CALL_PARSER,
@@ -51,6 +53,7 @@ from tokenspeed.cli.serve_smg import (
     _add_rl_control_port,
     _args_with_default_model_parsers,
     _free_port_avoiding_ephemeral_range,
+    _gateway_args_with_default_health_check_timeout,
     _gateway_args_with_default_log_level,
     _gateway_args_with_default_policy,
     _gateway_args_with_default_port,
@@ -60,6 +63,7 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_smg_disable_defaults,
     _get_from_args,
     _is_deepseek_v4_model,
+    _is_hy_v4_model,
     _is_inkling_model,
     _is_kimi_k3_model,
     _prewarm_hf_tokenizer,
@@ -137,7 +141,9 @@ def test_gateway_args_preserve_user_policy():
     assert gateway_args == ["--policy", "round_robin"]
 
 
-def test_gateway_args_defaults_include_port_and_reasoning_parser():
+def test_gateway_args_defaults_include_port_and_reasoning_parser(monkeypatch):
+    monkeypatch.delenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", raising=False)
+
     gateway_args = _gateway_args_with_defaults(["--model", "/tmp/x"])
 
     # No --prometheus-port here: run_smg allocates it right before
@@ -157,9 +163,41 @@ def test_gateway_args_defaults_include_port_and_reasoning_parser():
         "passthrough",
         "--tokenizer-cache-enable-l0",
         "--tokenizer-cache-enable-l1",
+        "--health-check-timeout-secs",
+        "25",
         "--log-level",
         "warn",
     ]
+
+
+def test_gateway_health_check_timeout_outlasts_engine_probe(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", "180")
+
+    gateway_args = _gateway_args_with_default_health_check_timeout(
+        ["--model", "/tmp/x"]
+    )
+
+    assert gateway_args == ["--model", "/tmp/x", "--health-check-timeout-secs", "185"]
+
+
+@pytest.mark.parametrize(
+    "user_args",
+    [["--health-check-timeout-secs", "7"], ["--health-check-timeout-secs=7"]],
+    ids=["separate-value", "equals-value"],
+)
+def test_gateway_args_preserve_user_health_check_timeout(user_args):
+    assert _gateway_args_with_default_health_check_timeout(user_args) == user_args
+
+
+def test_ts_serve_keeps_an_equals_form_health_check_timeout(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", "180")
+
+    split = split_argv(["/tmp/x", "--health-check-timeout-secs=7"])
+    gateway_args = _gateway_args_with_defaults(split.gateway)
+
+    assert gateway_args.count("--health-check-timeout-secs") == 1
+    flag = gateway_args.index("--health-check-timeout-secs")
+    assert gateway_args[flag + 1] == "7"
 
 
 def test_gateway_args_defaults_inject_passthrough_policy():
@@ -568,6 +606,100 @@ def test_kimi_k3_parser_defaults_preserve_explicit_values(tmp_path):
         engine_args,
         gateway_args,
     )
+
+
+def _write_config(path, config: dict) -> str:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "config.json").write_text(json.dumps(config))
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    ["tencent/Hy4-preview", "tencent/Hy4-preview-FP8", "org/hy-v4-instruct", "hy_v4"],
+)
+def test_hy_v4_hub_ids_are_detected(model_id):
+    assert _is_hy_v4_model(model_id)
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "/data/why4/Qwen3-8B",
+        "/ckpt/shy-4bit/llama",
+        "Qwen/Qwen3-Thy-4B",
+        "/home/hy4user/models/Llama-3-8B",
+        None,
+    ],
+)
+def test_hy_v4_detection_ignores_unrelated_names(model_id):
+    assert not _is_hy_v4_model(model_id)
+
+
+def test_hy_v4_local_config_is_authoritative(tmp_path):
+    hy_v4 = _write_config(tmp_path / "plain", {"architectures": ["HYV4ForCausalLM"]})
+    other = _write_config(tmp_path / "Hy4-distill", {"model_type": "llama"})
+
+    assert _is_hy_v4_model(hy_v4)
+    assert not _is_hy_v4_model(other)
+
+
+def test_kimi_k3_name_wins_over_hy_v4_name():
+    model = "/x/Kimi-K3-hy4-distill"
+
+    _, gateway_args = _args_with_default_model_parsers([], ["--model", model])
+
+    assert gateway_args[-1] == KIMI_K3_TOOL_CALL_PARSER
+
+
+def test_hy_v4_model_gets_default_parsers(tmp_path):
+    model = _write_config(tmp_path / "ckpt", {"model_type": "hy_v4"})
+
+    engine_args, gateway_args = _args_with_default_model_parsers(
+        ["--model", model],
+        ["--model", model],
+    )
+
+    assert engine_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        HY_V4_REASONING_PARSER,
+    ]
+    assert gateway_args == [
+        "--model",
+        model,
+        "--reasoning-parser",
+        HY_V4_REASONING_PARSER,
+        "--tool-call-parser",
+        HY_V4_TOOL_CALL_PARSER,
+    ]
+
+
+def test_hy_v4_parser_defaults_preserve_explicit_values(tmp_path):
+    model = _write_config(tmp_path / "ckpt", {"model_type": "hy_v4"})
+    engine_args = ["--model", model, "--reasoning-parser", "passthrough"]
+    gateway_args = [
+        "--model",
+        model,
+        "--reasoning-parser",
+        "passthrough",
+        "--tool-call-parser",
+        "passthrough",
+    ]
+
+    assert _args_with_default_model_parsers(engine_args, gateway_args) == (
+        engine_args,
+        gateway_args,
+    )
+
+
+@pytest.mark.parametrize("value", ["0", "-30"])
+def test_gateway_health_check_timeout_rejects_non_positive(monkeypatch, value):
+    monkeypatch.setenv("TOKENSPEED_HEALTH_CHECK_TIMEOUT", value)
+
+    with pytest.raises(ValueError, match="TOKENSPEED_HEALTH_CHECK_TIMEOUT"):
+        _gateway_args_with_default_health_check_timeout(["--model", "/tmp/x"])
 
 
 def _make_inkling_model_dir(tmp_path):

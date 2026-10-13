@@ -189,6 +189,65 @@ def test_marlin_mxfp4_ep_masks_nonlocal_experts() -> None:
     torch.testing.assert_close(acc, expected.float(), atol=5e-2, rtol=5e-2)
 
 
+def test_marlin_mxfp4_without_ep_skips_invalid_and_repeated_ids() -> None:
+    """Without EP, ``-1`` slots contribute zero and a repeated id counts once
+    per slot; the finalize sums every slot, so a GEMM that computed the -1
+    blocks would add their rows in."""
+    _requires_sm90()
+    generator = torch.Generator(device="cuda").manual_seed(31)
+    num_experts, top_k = 8, 3
+    hidden_size, intermediate_size = 256, 128
+    num_tokens = 16
+    beta, linear_beta = 4.0, 25.0
+
+    x = (
+        torch.randn(num_tokens, hidden_size, generator=generator, device="cuda") * 0.2
+    ).to(torch.bfloat16)
+    raw = make_mxfp4_moe_weights(
+        num_experts, hidden_size, intermediate_size, generator, device="cuda"
+    )
+    topk_ids = (
+        torch.arange(num_tokens * top_k, device="cuda").reshape(num_tokens, top_k)
+        % num_experts
+    ).to(torch.int32)
+    topk_ids[:, 1] = topk_ids[:, 0]
+    topk_ids[::2, 2] = -1
+    topk_ids[1] = -1
+    topk_weights = torch.rand(
+        num_tokens, top_k, generator=generator, device="cuda", dtype=torch.float32
+    )
+    topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
+
+    expected = mxfp4_moe_reference(
+        x,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        topk_ids,
+        topk_weights,
+        activation_dtype=torch.bfloat16,
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+    )
+    w = _Weights(
+        {k: v.clone() for k, v in raw.items()},
+        num_local_experts=num_experts,
+        ep_size=1,
+        ep_rank=0,
+        beta=beta,
+        linear_beta=linear_beta,
+    )
+    plan = {"activation": "situ"}
+    marlin_mxfp4_moe_weights(plan, w)
+    actual = marlin_mxfp4_precomputed_moe_apply(
+        plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), atol=5e-2, rtol=5e-2)
+    assert torch.count_nonzero(actual[1]) == 0
+
+
 def test_marlin_mxfp4_silu_without_situ_beta() -> None:
     """Non-SiTU models leave ``activation_situ_beta`` as None on the weight
     module (the expert layer's default); the apply must not ``float()`` it.

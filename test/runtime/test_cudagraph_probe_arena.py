@@ -315,6 +315,8 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
         # A narrowing decoder ladder fabricates a request per 128 rows, up to max_num_seqs.
         (None, None, 40960, 128, 80, 64),
         (None, None, 40960, 128, 16, 16),
+        # A draft keeping one row per request fabricates max_num_seqs requests.
+        (None, None, 66560, 1, 64, 64),
     ],
 )
 def test_the_boot_floor_reads_both_knobs(
@@ -335,6 +337,26 @@ def test_the_boot_floor_reads_both_knobs(
         decoder_rows_per_request=rows_per_request,
     )
     assert floor == expected
+
+
+def test_the_floor_reads_the_narrower_of_target_and_draft(monkeypatch) -> None:
+    from tokenspeed.runtime.execution import prefill_graph
+
+    class Narrowing:
+        def __init__(self, rows: int) -> None:
+            self.max_decoder_rows_per_request = rows
+
+    monkeypatch.setattr(
+        prefill_graph,
+        "narrowing_prefill_model",
+        lambda model: model if isinstance(model, Narrowing) else None,
+    )
+    plain = object()
+    assert device.narrowest_decoder_rows_per_request(plain, None) is None
+    assert device.narrowest_decoder_rows_per_request(Narrowing(128), None) == 128
+    # A plain target whose draft's step-0 graph keeps one row per request.
+    assert device.narrowest_decoder_rows_per_request(plain, Narrowing(1)) == 1
+    assert device.narrowest_decoder_rows_per_request(Narrowing(128), Narrowing(1)) == 1
 
 
 def _callee(node: ast.Call) -> str | None:
@@ -517,13 +539,17 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
     ]
     refusal, probe_build, _, _, serving, _ = calls
     assert [ast.unparse(arg) for arg in refusal.args] == ["server_args"]
-    # The target's model: the narrowing floor must not read the draft's.
-    (narrowing,) = (
+    # Both models: a narrowing draft's step-0 graph fabricates decoder rows too.
+    (narrowest,) = (
         n
         for n in ast.walk(build)
-        if isinstance(n, ast.Call) and _callee(n) == "narrowing_prefill_model"
+        if isinstance(n, ast.Call)
+        and _callee(n) == "narrowest_decoder_rows_per_request"
     )
-    assert ast.unparse(narrowing.args[0]) == "target.model"
+    assert [ast.unparse(arg) for arg in narrowest.args] == [
+        "target.model",
+        "None if draft is None else draft.model",
+    ]
     rows = next(kw.value for kw in probe_build.keywords if kw.arg == "probe_batch_rows")
     assert isinstance(rows, ast.IfExp) and ast.unparse(rows.orelse) == "None"
     assert _callee(rows.body) == "probe_arena_floor"

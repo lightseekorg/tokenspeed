@@ -58,6 +58,7 @@ def _layer(monkeypatch, quant_config, *, flag: bool, override=None):
         activation="swiglu",
         swiglu_limit=10.0,
         internal_activation_dtype_override=override,
+        deterministic_finalize=False,
     )
     assert len(plans) == 1
     return plans[0]

@@ -127,6 +127,16 @@ class BaseCausalLM(nn.Module):
     # refuses the placement flags for a model that does not, so a placement
     # is never installed only to be ignored.
     supports_expert_placement: ClassVar[bool] = False
+    # Whether the model's loader dequantizes the dense layers of a ModelOpt
+    # MXFP8 checkpoint, which those layers take unquantized. Model
+    # initialization refuses the checkpoint for a model that does not: its
+    # dense weights would load as E4M3 values without their scales.
+    supports_modelopt_mxfp8: ClassVar[bool] = False
+    # Whether the parameters can be rewritten in place while serving. A model
+    # whose loading derives state an in-place update would leave stale sets
+    # it False: every weight-update session refuses the model, and
+    # ``init_weights_update_group`` refuses it before the trainer's rendezvous.
+    supports_live_weight_updates: ClassVar[bool] = True
 
     @property
     def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:
@@ -437,8 +447,13 @@ class BaseCausalLM(nn.Module):
         """Enter a live weight-update session.
 
         Raises:
-            RuntimeError: A session is already active.
+            RuntimeError: The model does not support live weight updates, or
+                a session is already active.
         """
+        if not self.supports_live_weight_updates:
+            raise RuntimeError(
+                f"{type(self).__name__} does not support live weight updates"
+            )
         if self._weight_update_active:
             raise RuntimeError(
                 f"{type(self).__name__}: a weight-update session is already active"

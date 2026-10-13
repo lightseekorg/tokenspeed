@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import time
 from typing import TYPE_CHECKING
@@ -36,6 +37,8 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
+    hy_v4_think_tokens,
+    structural_tag_for_hy_v4_response,
     structural_tag_for_reasoning_json_schema,
 )
 from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
@@ -57,7 +60,15 @@ class InputProcessor:
     def __init__(self, engine: AsyncLLM):
         self.engine = engine
 
-    def _maybe_wrap_json_schema_for_reasoning(self, sampling: dict) -> None:
+    @functools.cached_property
+    def _hy_v4_think_tokens(self) -> tuple[int, str] | None:
+        if self.engine.tokenizer is None:
+            return None
+        return hy_v4_think_tokens(self.engine.tokenizer.get_vocab())
+
+    def _maybe_wrap_json_schema_for_reasoning(
+        self, sampling: dict, input_ids: list[int] | None
+    ) -> None:
         # Without this, xgrammar locks onto ``{`` at token 0 and the
         # model can't emit ``<think>…</think>`` before the JSON.
         if "json_schema" not in sampling:
@@ -69,7 +80,12 @@ class InputProcessor:
             schema = sampling["json_schema"]
             if isinstance(schema, str):
                 schema = json.loads(schema)
-            wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
+            if reasoning_parser == "hy_v4":
+                wrapped = self._wrap_hy_v4_json_schema(schema, input_ids)
+            else:
+                wrapped = structural_tag_for_reasoning_json_schema(
+                    reasoning_parser, schema
+                )
         except Exception as exc:
             self.engine.logger.warning(
                 f"reasoning-parser={reasoning_parser!s}: failed to wrap json_schema ("
@@ -81,6 +97,18 @@ class InputProcessor:
             return
         sampling.pop("json_schema", None)
         sampling["structural_tag"] = wrapped
+
+    def _wrap_hy_v4_json_schema(
+        self, schema: dict, input_ids: list[int] | None
+    ) -> str | None:
+        think_tokens = self._hy_v4_think_tokens
+        if think_tokens is None:
+            raise ValueError("the tokenizer has no HY V4 think tokens")
+        from xgrammar.structural_tag import JSONSchemaFormat
+
+        return structural_tag_for_hy_v4_response(
+            JSONSchemaFormat(json_schema=schema), input_ids or [], think_tokens
+        )
 
     def validate_request(self, obj: GenerateReqInput | EmbeddingReqInput) -> None:
         """Reject cross-type requests before any other processing.
@@ -340,7 +368,7 @@ class InputProcessor:
             )
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
 
-        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params)
+        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params, input_ids)
 
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.resolve_seed(obj.rid)

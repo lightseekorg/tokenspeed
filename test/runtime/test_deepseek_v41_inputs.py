@@ -851,6 +851,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     pg.token_to_kv_pool = SimpleNamespace(arena=SimpleNamespace(cache_group_specs=()))
     pg.dp_size = 1
     pg.drafter = None
+    pg._draft_first_step = False
     executor.prefill_graph = pg
     monkeypatch.setattr(model_executor, "autotune", tuner)
     monkeypatch.setattr(
