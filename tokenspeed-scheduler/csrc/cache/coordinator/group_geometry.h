@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <variant>
@@ -129,15 +130,17 @@ private:
                                     std::int32_t reserve_tokens) const {
         // The extent is absolute, so spare rows in the table's last block (a
         // hit's partial tail block the suffix continues right after) do not
-        // carry over; a suffix landing beyond the table leaves holes.
+        // carry over; a suffix landing beyond the table leaves holes. A
+        // suffix that starts past the extent's last block lands nothing: the
+        // hit's tail copy already holds the prompt's last block (a tail hit
+        // inside it) and the reserve did not reach the next one.
         _assert(table.NumBlocks() <= sparse.first_block, "sparse suffix overlaps the existing block table");
         _assert(sparse.extent_tokens > 0 && reserve_tokens >= 0,
                 "sparse suffix materialization requires a positive extent");
         const std::int64_t extent = static_cast<std::int64_t>(sparse.extent_tokens) + reserve_tokens;
         _assert(extent <= std::numeric_limits<std::int32_t>::max(), "sparse suffix extent exceeds int32 range");
         const std::int32_t last_block = static_cast<std::int32_t>((extent - 1) / block_granularity_);
-        _assert(sparse.first_block <= last_block, "materialized suffix starts beyond the requested extent");
-        return last_block - sparse.first_block + 1;
+        return std::max(0, last_block - sparse.first_block + 1);
     }
 
     AcquirePlan planSparseSuffix(const BlockTable& table, const SparseSuffix& sparse,
@@ -146,6 +149,9 @@ private:
         const std::int64_t extent = static_cast<std::int64_t>(sparse.extent_tokens) + reserve_tokens;
         const std::int32_t logical_blocks =
             static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
+        // Nothing lands: the table already reaches the extent.
+        _assert(num_blocks > 0 || table.NumBlocks() == logical_blocks,
+                "an empty sparse suffix leaves the table at the extent");
         return AcquirePlan{
             .num_blocks = num_blocks,
             .suffix_start = sparse.first_block,

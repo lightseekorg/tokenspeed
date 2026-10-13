@@ -1152,6 +1152,48 @@ TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMate
     EXPECT_EQ(plan.pages_to_zero.at("sliding"), (std::vector<std::int32_t>{row[6], row[7], row[8]}));
 }
 
+// A sliding group whose blocks are whole pages: the hit's tail copy can hold
+// the prompt's last block entirely.
+class PdSlidingPageBlockDecodeAdmissionTestSuite : public PdSlidingSparseDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = PdSlidingSparseDecodeAdmissionTestSuite::MakeConfig();
+        cfg.cache_groups.front().block_granularity = cfg.prefix_granularity;
+        return cfg;
+    }
+};
+
+// The seed leaves at frontier 5: tail [4, 5) in block 1. A 6-token prompt
+// sharing it hits 5; on the D role the partial block is a fresh page the
+// peer fills whole, and that page is already the prompt's last block, with
+// the one-token decode reserve fitting in its spare row. The remote
+// landing's sparse suffix beyond it is therefore empty, not an error.
+TEST_F(PdSlidingPageBlockDecodeAdmissionTestSuite, ATailHitInsideThePromptsLastBlockLandsNoSuffix) {
+    Submit({RequestSpec{.request_id = "seed", .tokens = {1, 2, 3, 4}}});
+    SendBootstrapped("seed");
+    ASSERT_NE(FindRemoteAdmission(PlanOnce()), nullptr);
+    SendRemotePrefillDone("seed", /*bootstrap_token=*/42);
+    ASSERT_NE(FindForwardBatch(PlanOnce().Operations()), nullptr);
+    SendForwardDone("seed", {43});
+    SendFinish("seed");  // quiescent: frontier 5, tail [4, 5) published
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+
+    Submit({RequestSpec{.request_id = "hit", .tokens = {1, 2, 3, 4, 42, 99}}});
+    SendBootstrapped("hit");
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* destination = FindRemoteAdmission(plan);
+    ASSERT_NE(destination, nullptr);
+    EXPECT_EQ(destination->extend_prefix_lens, (std::vector<std::int32_t>{5}));
+    EXPECT_EQ(destination->input_lengths, (std::vector<std::int32_t>{1}));
+    const auto& row = destination->block_tables.at("sliding").at(0);
+    ASSERT_EQ(row.size(), 2u) << "blocks [0, 4) and [4, 8): nothing lands beyond the tail's block";
+    EXPECT_GT(row[0], 0) << "the window [3, 6) keeps block 0";
+    EXPECT_GT(row[1], 0);
+    EXPECT_EQ(plan.pages_to_zero.at("sliding"), (std::vector<std::int32_t>{row[1]}))
+        << "the tail's block is the fresh page the peer fills whole";
+    EXPECT_TRUE(plan.pages_to_copy.at("sliding").empty());
+}
+
 TEST_F(PdSparseDecodeNoPrefixCacheTestSuite, DecodeStepsWriteTheLandedStateInPlace) {
     Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r0");
