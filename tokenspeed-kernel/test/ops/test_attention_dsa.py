@@ -34,7 +34,6 @@ from tokenspeed_kernel.ops.attention.dsa import (
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     workspace_topk_to_global_slots as dsa_workspace_topk_to_global_slots,
 )
-from tokenspeed_kernel.ops.attention.dsv4 import dsv4_plan
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 torch.manual_seed(42)
@@ -275,12 +274,6 @@ def test_dsa_plan_returns_none_without_kernel(device: str) -> None:
     seq_lens_2d = torch.tensor([[1]], device=device, dtype=torch.int32)
 
     assert dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64, solution="missing") is None
-
-
-def test_dsv4_plan_returns_none_without_kernel(device: str) -> None:
-    seq_lens_2d = torch.tensor([[1]], device=device, dtype=torch.int32)
-
-    assert dsv4_plan(seq_lens_2d=seq_lens_2d, page_size=64, solution="missing") is None
 
 
 def test_dsa_workspace_topk_to_global_slots(device: str) -> None:

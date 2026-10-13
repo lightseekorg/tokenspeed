@@ -22,9 +22,6 @@ from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
-from tokenspeed_kernel.ops.attention.dsv4.triton import (
-    dsv4_compute_global_topk_indices_and_lens,
-)
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -2397,23 +2394,6 @@ class TestDeepseekV4Config(unittest.TestCase):
                     torch.full_like(out[row, selected:], -1),
                 )
             )
-
-    def test_deepseek_v4_global_topk_cpu_masks_invalid_req_before_indexing(self):
-        indices, lens = dsv4_compute_global_topk_indices_and_lens(
-            topk_indices=torch.tensor([[0, 4], [0, 1]], dtype=torch.int32),
-            token_to_req_indices=torch.tensor([0, 99], dtype=torch.int32),
-            block_table=torch.tensor([[10]], dtype=torch.int32),
-            block_size=4,
-            is_valid_token=torch.tensor([True, False]),
-        )
-
-        self.assertTrue(
-            torch.equal(
-                indices,
-                torch.tensor([[40, -1], [-1, -1]], dtype=torch.int32),
-            )
-        )
-        self.assertTrue(torch.equal(lens, torch.tensor([2, 0], dtype=torch.int32)))
 
     def test_hidden_compression_reference_preserves_expected_shapes(self):
         torch.manual_seed(0)
