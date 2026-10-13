@@ -24,13 +24,10 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
-from utils import assert_no_triton_compile
+from utils import assert_no_triton_compile, is_cdna4
 
-pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
-
-if not (torch.cuda.is_available() and current_platform().is_cdna4):
-    pytest.skip("requires a GFX950 GPU", allow_module_level=True)
+if not is_cdna4():
+    pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 import tokenspeed_kernel.ops.attention.qsa  # noqa: E402,F401
 from tokenspeed_kernel.selection import select_kernel  # noqa: E402
