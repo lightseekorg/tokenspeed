@@ -69,7 +69,7 @@ class _TestCacheGroup:
     sliding_window_tokens: int | None
     fields: tuple[_TestCacheField, ...]
     cache_blocks_per_lcm_block: int
-    # DCP owners the group's virtual blocks are dealt to; 1 is replicated.
+    # KVP owners the group's virtual blocks are dealt to; 1 is replicated.
     shard_count: int
 
     @property

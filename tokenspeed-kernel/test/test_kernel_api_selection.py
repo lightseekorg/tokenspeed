@@ -31,6 +31,7 @@ import-guarded on missing optional backend packages are skipped.
 
 from __future__ import annotations
 
+import builtins
 import importlib
 import inspect
 import sys
@@ -88,6 +89,7 @@ import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
+import tokenspeed_kernel.ops.moe.gluon.softmax_topk as _moe_gluon_softmax_topk
 import tokenspeed_kernel.ops.moe.gluon.sqrt_softplus_topk as _moe_gluon_sqrt_softplus
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.marlin as _moe_marlin
@@ -111,6 +113,9 @@ import tokenspeed_kernel.ops.residual.triton as _residual_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
+import tokenspeed_kernel.ops.transform as _transform_pkg
+import tokenspeed_kernel.ops.transform.gluon as _transform_gluon
+import tokenspeed_kernel.ops.transform.triton as _transform_triton
 import torch
 from tokenspeed_kernel.ops.attention.dsa import triton as _attention_triton_dsa
 from tokenspeed_kernel.ops.attention.dsv4 import triton as _attention_triton_dsv4
@@ -152,9 +157,14 @@ from tokenspeed_kernel.ops.moe.triton import (
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
+from tokenspeed_kernel.ops.residual import mhc_apply_pre as kernel_mhc_apply_pre
+from tokenspeed_kernel.ops.residual import mhc_mixes as kernel_mhc_mixes
 from tokenspeed_kernel.ops.residual import mhc_post as kernel_mhc_post
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
 from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
+from tokenspeed_kernel.ops.transform import (
+    hadamard_transform as kernel_hadamard_transform,
+)
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
@@ -242,6 +252,7 @@ _RELOAD_MODULES = [
     _moe_sigmoid_topk,
     _moe_softmax_topk,
     _moe_gluon_sigmoid_topk,
+    _moe_gluon_softmax_topk,
     _moe_gluon,
     _moe_marlin_deepep_mxfp4,
     _moe_marlin_mxfp4,
@@ -265,6 +276,10 @@ _RELOAD_MODULES = [
     _sampling_cute_dsl,
     _sampling_gluon,
     _sampling_pkg,
+    # Transform registration modules.
+    _transform_gluon,
+    _transform_triton,
+    _transform_pkg,
 ]
 
 
@@ -281,17 +296,69 @@ def test_attention_api_ownership_and_result_type_identity_are_stable():
     assert _attention_kda_pkg.KdaPrefillResult is KdaPrefillResult
 
 
+@pytest.mark.parametrize("platform_fixture", ["h100_platform", "mi350_platform"])
+def test_hadamard_gluon_registration_uses_amd_backend_only(
+    platform_fixture: str,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _transform_gluon.__file__.endswith("/transform/gluon.py")
+    assert _transform_triton.__file__.endswith("/transform/triton.py")
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    host_registry = KernelRegistry.get()
+    imports = []
+    calls = []
+    real_import = builtins.__import__
+
+    def launch(x, *, scale):
+        calls.append((x, scale))
+        return x
+
+    def import_backend(name, *args, **kwargs):
+        if name == "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard":
+            imports.append(name)
+            assert platform.is_amd
+            return SimpleNamespace(launch_gluon_hadamard_transform_128_gfx950=launch)
+        return real_import(name, *args, **kwargs)
+
+    try:
+        Platform.override(platform)
+        KernelRegistry.reset()
+        with monkeypatch.context() as patch:
+            patch.setattr(builtins, "__import__", import_backend)
+            importlib.reload(_transform_gluon)
+            implementation = KernelRegistry.get().get_impl(
+                "gluon_hadamard_transform_128_gfx950"
+            )
+            if platform.is_amd:
+                x = torch.empty((1, 128), dtype=torch.bfloat16, device="meta")
+                assert implementation(x, scale=0.25) is x
+                assert calls == [(x, 0.25)]
+                assert imports == [
+                    "tokenspeed_kernel_amd.ops.gfx950.transform.hadamard"
+                ]
+            else:
+                assert implementation is None
+                assert not imports
+    finally:
+        Platform.override(host_platform)
+        KernelRegistry._instance = host_registry
+        importlib.reload(_transform_gluon)
+
+
 def test_residual_family_exports_and_modes():
     expected_exports = {
         "attn_res_fwd",
         "attn_res_fwd_available",
         "gated_residual_combine",
         "gated_residual_mix",
-        "pad_gated_residual_projection_weight",
+        "mhc_apply_pre",
         "mhc_fused_hc",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "pad_gated_residual_projection_weight",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -303,6 +370,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd",
         "hyperconnection_combine",
         "hyperconnection_mix",
+        "mhc_apply_pre",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
@@ -489,6 +557,18 @@ def _mm_dense() -> torch.Tensor:
     return kernel_mm(a, b)
 
 
+def _hadamard_transform(
+    *,
+    contiguous: bool,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if contiguous:
+        x = torch.empty((8_192, 32, 128), dtype=dtype, device="meta")
+    else:
+        x = torch.empty((8_192, 32, 256), dtype=dtype, device="meta")[..., ::2]
+    return kernel_hadamard_transform(x, scale=128**-0.5)
+
+
 def _mm_dense_cdna4_aligned() -> torch.Tensor:
     a = torch.empty((16, 64), dtype=torch.bfloat16)
     b = torch.empty((128, 64), dtype=torch.bfloat16)
@@ -519,6 +599,23 @@ def _mm_mxfp8(m: int) -> torch.Tensor:
         B_scales=b_scales,
         out_dtype=torch.bfloat16,
         block_size=[128, 128],
+        quant="mxfp8",
+    )
+
+
+def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
+    """True MXFP8: E4M3 operands with one UE8M0 scale byte per 32 K values."""
+    a = torch.empty((m, k), dtype=_fp8_dtype())
+    b = torch.empty((n, k), dtype=_fp8_dtype())
+    a_scales = torch.empty((m, k // 32), dtype=torch.uint8)
+    b_scales = torch.empty((n, k // 32), dtype=torch.uint8)
+    return kernel_mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.bfloat16,
+        block_size=[1, 32],
         quant="mxfp8",
     )
 
@@ -2751,6 +2848,53 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
     assert selected["solution"] == "legacy_solution"
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (64, "gluon_mhc_pre_gfx950"),
+        (65, "triton_mhc_pre"),
+        (256, "triton_mhc_pre"),
+        (257, "gluon_mhc_prefill_gfx950"),
+        (1025, "gluon_mhc_prefill_gfx950"),
+        (8193, "gluon_mhc_prefill_gfx950"),
+        (131072, "triton_mhc_pre"),
+    ],
+)
+def test_mhc_prefill_selects_gfx950_projection(
+    mi350_platform: PlatformInfo, num_tokens: int, expected: str
+) -> None:
+    registry = KernelRegistry.get()
+    if registry.get_by_name("gluon_mhc_prefill_gfx950") is None:
+        pytest.skip("optional AMD kernel package is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        selected = select_kernel(
+            "residual",
+            "mhc_pre",
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                fn=dense_tensor_format(torch.float32),
+                hc_scale=dense_tensor_format(torch.float32),
+                hc_base=dense_tensor_format(torch.float32),
+            ),
+            traits={
+                "num_tokens": num_tokens,
+                "buffer_offsets_fit_int32": num_tokens * 4 * 4096 < 2**31,
+                "hc_mult": 4,
+                "hidden_size": 4096,
+                "sinkhorn_iters": 20,
+            },
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert selected.name == expected
+
+
 def test_mhc_normalization_contract_is_explicit() -> None:
     parameters = inspect.signature(kernel_mhc_pre).parameters
 
@@ -2804,6 +2948,28 @@ def _mhc_post() -> object:
     post = torch.empty((1, 4, 1), dtype=torch.float32)
     comb = torch.empty((1, 4, 4), dtype=torch.float32)
     return kernel_mhc_post(hidden_states, residual, post, comb)
+
+
+def _mhc_mixes() -> object:
+    # The gfx950 projection is specialized to model hidden sizes.
+    residual = torch.empty((1, 4, 4096), dtype=torch.bfloat16)
+    weight = torch.empty((24, 4 * 4096), dtype=torch.float32)
+    scale = torch.empty((3,), dtype=torch.float32)
+    base = torch.empty((24,), dtype=torch.float32)
+    return kernel_mhc_mixes(residual, weight, scale, base, 1e-6, 1e-6, 2)
+
+
+def _mhc_apply_pre() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=None, norm_eps=None)
+
+
+def _mhc_apply_pre_fused_norm() -> object:
+    residual = torch.empty((1, 4, 16), dtype=torch.bfloat16)
+    pre = torch.empty((1, 4), dtype=torch.float32)
+    norm_weight = torch.empty((16,), dtype=torch.bfloat16)
+    return kernel_mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=1e-6)
 
 
 def _attention_gdn_chunk_prefill() -> object:
@@ -3280,7 +3446,6 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
 
 
 def test_amd_softmax_topk_selects_triton_on_gfx1250(
-    mi350_platform: PlatformInfo,
     mi450_platform: PlatformInfo,
 ) -> None:
     registry = KernelRegistry.get()
@@ -3297,15 +3462,6 @@ def test_amd_softmax_topk_selects_triton_on_gfx1250(
     )
     real_platform = Platform.get()
     try:
-        Platform.override(mi350_platform)
-        registry.clear_cache()
-        gfx950 = select_kernel(
-            "moe",
-            "softmax_topk",
-            bf16_signature,
-            traits={"tokens": 1, "experts": 128, "topk": 4},
-        )
-
         Platform.override(mi450_platform)
         registry.clear_cache()
         standard_shape = select_kernel(
@@ -3324,9 +3480,46 @@ def test_amd_softmax_topk_selects_triton_on_gfx1250(
         Platform.override(real_platform)
         registry.clear_cache()
 
-    assert gfx950.name == "torch_softmax_topk"
     assert standard_shape.name == "triton_softmax_topk_gfx1250"
     assert general_shape.name == "triton_softmax_topk_gfx1250"
+
+
+def test_gfx950_softmax_topk_selects_gluon(
+    mi350_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    gluon_spec = registry.get_by_name("gluon_softmax_topk_gfx950")
+    if gluon_spec is None:
+        pytest.skip("gfx950 Gluon softmax top-k is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        selected = {
+            (dtype, tokens): select_kernel(
+                "moe",
+                "softmax_topk",
+                format_signature(router_logits=dense_tensor_format(dtype)),
+                traits={"tokens": tokens, "experts": 512, "topk": 10},
+            ).name
+            # Qwen3.8 MTP draft, verify and prefill token counts.
+            for dtype in (torch.bfloat16, torch.float16, torch.float32)
+            for tokens in (16, 64, 8192)
+        }
+        too_many_experts = select_kernel(
+            "moe",
+            "softmax_topk",
+            format_signature(router_logits=dense_tensor_format(torch.bfloat16)),
+            traits={"tokens": 64, "experts": 2048, "topk": 10},
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert gluon_spec.priority == Priority.SPECIALIZED
+    assert set(selected.values()) == {"gluon_softmax_topk_gfx950"}
+    assert too_many_experts.name == "torch_softmax_topk"
 
 
 def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
@@ -4657,6 +4850,46 @@ def _case(
 
 
 _CASES = [
+    # Only contiguous BF16 on GFX950 uses Gluon; other AMD inputs retain Triton.
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "gluon_hadamard_transform_128_gfx950",
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
+        id_suffix="bf16-contiguous",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=False, dtype=torch.bfloat16),
+        id_suffix="bf16-strided-fallback",
+    ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "transform",
+            "hadamard_transform",
+            "triton_hadamard_transform_128",
+            partial(_hadamard_transform, contiguous=True, dtype=dtype),
+            id_suffix=f"{dtype}-fallback",
+        )
+        for dtype in (torch.float16, torch.float32)
+    ],
+    _case(
+        _is_cdna5,
+        "cdna5",
+        "transform",
+        "hadamard_transform",
+        "triton_hadamard_transform_128",
+        partial(_hadamard_transform, contiguous=True, dtype=torch.bfloat16),
+        id_suffix="bf16-architecture-fallback",
+    ),
     *[
         _case(
             _is_blackwell_sm100,
@@ -5747,6 +5980,31 @@ _CASES = [
         "triton_mm_fp8_blockscale",
         lambda: _mm_mxfp8(4),
     ),
+    # DeepSeek V4.1 MXFP8 projections on gfx950: the weight-streaming decode
+    # kernel through 256 rows (ahead of the skinny kernel's 64-row range),
+    # the large-tile kernel beyond, and from 64 rows on for 2**26-element
+    # weights.
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "gemm",
+            "mm",
+            expected,
+            partial(_mm_mxfp8_ue8m0, m, n, k),
+            id_suffix=f"mxfp8-ue8m0-m{m}-n{n}-k{k}",
+        )
+        for m, n, k, expected in (
+            (1, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
+            (64, 1792, 5120, "gluon_mm_mxfp8_decode_gfx950"),
+            (65, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (192, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (256, 5120, 2048, "gluon_mm_mxfp8_decode_gfx950"),
+            (257, 5120, 2048, "gluon_mm_mxfp8_gfx950"),
+            (65, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+            (256, 25600, 6144, "gluon_mm_mxfp8_gfx950"),
+        )
+    ],
     _case(
         _is_hopper_plus,
         "hopper-plus",
@@ -6047,8 +6305,33 @@ _CASES = [
         "cdna4",
         "residual",
         "mhc_post",
-        "triton_mhc_post",
+        "gluon_mhc_post_gfx950",
         _mhc_post,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_mixes",
+        "gluon_mhc_mixes_gfx950",
+        _mhc_mixes,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre,
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "residual",
+        "mhc_apply_pre",
+        "gluon_mhc_apply_pre_gfx950",
+        _mhc_apply_pre_fused_norm,
+        id_suffix="fused_norm",
     ),
     _case(
         _is_cdna4,
@@ -6204,6 +6487,9 @@ def selected_kernel_spy(monkeypatch):
             return torch.empty(
                 (logits.shape[0],), dtype=torch.int64, device=logits.device
             )
+
+        if case.family == "transform":
+            return torch.empty_like(args[0])
 
         if case.family == "moe":
             if case.mode == "topk":

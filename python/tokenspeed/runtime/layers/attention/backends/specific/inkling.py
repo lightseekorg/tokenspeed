@@ -160,6 +160,10 @@ class InklingConvStatePool:
         layout (the tokenspeed_kernel ops/conv sconv kernels' contract)."""
         return self.conv_state[layer_id]
 
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """One slot's ring across every layer and its pending-hydration bit."""
+        return [self.conv_state[:, slot], self.remote_restore_pending[slot]]
+
     def mem_usage_bytes(self) -> int:
         return self.conv_state.nbytes + self.remote_restore_pending.nbytes
 
@@ -390,6 +394,13 @@ class InklingAttnBackend(AttentionBackend):
     def mark_remote_cache_ready(self, slot_index: int) -> None:
         """Arm endpoint hydration after the complete remote transfer succeeds."""
         self.conv_pool.remote_restore_pending[slot_index] = True
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # The engine-side ring is exact only as a byte copy: hydrating it from
+        # the paged checkpoint is right at an aligned boundary alone, and a
+        # retraction stops anywhere. The pending-hydration bit travels with it
+        # so a restore neither re-arms nor loses an armed hydration.
+        return self.conv_pool.slot_state_rows(slot)
 
     def _consume_remote_restore_mask(
         self,

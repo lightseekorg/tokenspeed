@@ -88,6 +88,46 @@ LSE_LN = math.log2(math.e)
 # ===-----------------------------------------------------------------------===#
 
 
+def select_qsa_sparse_attention_kernel(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    *,
+    max_seqlen_q: int | None,
+    override: str | None,
+    solution: str | None,
+):
+    """Select the ``qsa_sparse_attention`` kernel for validated inputs.
+
+    Arguments follow ``qsa_sparse_attention``; ``q`` must have at least one row.
+
+    Returns:
+        The selected kernel.
+    """
+
+    query_width = 1 if max_seqlen_q is None else max_seqlen_q
+    traits = {
+        "batch_size": q.shape[0] // query_width,
+        "q_len": query_width,
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[1],
+        "head_dim": q.shape[-1],
+        "value_head_dim": v_cache.shape[-1],
+        "selected_width": selected_slots.shape[1],
+        "is_decode": max_seqlen_q is not None,
+    }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
+    return select_kernel(
+        "attention",
+        "qsa_sparse_attention",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+
+
 def qsa_sparse_attention(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -107,9 +147,11 @@ def qsa_sparse_attention(
     Args:
         q: Query tensor shaped ``[tokens, query_heads, head_dim]``.
         k_cache: Flattened key cache shaped
-            ``[cache_slots, kv_heads, head_dim]``.
+            ``[cache_slots, kv_heads, head_dim]``. Slot 1 must contain finite
+            values for masked reads; slot 0 may contain NaN/Inf.
         v_cache: Flattened value cache shaped
-            ``[cache_slots, kv_heads, value_head_dim]``.
+            ``[cache_slots, kv_heads, value_head_dim]`` with the same slot 1
+            requirement. Both caches must have at least two slots.
         selected_slots: Physical cache slots shaped ``[tokens, budget]``;
             non-positive values are ignored.
         scale: Softmax scale applied to query-key scores.
@@ -133,8 +175,9 @@ def qsa_sparse_attention(
     The SM100/SM103 CuTe DSL implementation is preferred when its specialization
     matches a uniform decode. Prefill and mixed/ragged queries use FlashInfer
     FA2 on supported NVIDIA architectures; other decode geometries retain
-    the registered fallback. Kernel selection preserves this distinction
-    before adapting ragged inputs to independent one-token query rows.
+    the registered fallback. AMD GPUs use the portable Triton kernel. Kernel
+    selection preserves this distinction before adapting ragged inputs to
+    independent one-token query rows.
     """
 
     if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
@@ -148,24 +191,16 @@ def qsa_sparse_attention(
         raise ValueError("QSA query rows must be divisible by max_seqlen_q")
     if q.shape[0] == 0:
         return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
-    traits = {
-        "batch_size": q.shape[0] // query_width,
-        "q_len": query_width,
-        "num_q_heads": q.shape[1],
-        "num_kv_heads": k_cache.shape[1],
-        "head_dim": q.shape[-1],
-        "value_head_dim": v_cache.shape[-1],
-        "selected_width": selected_slots.shape[1],
-        "is_decode": max_seqlen_q is not None,
-    }
-    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
-    kernel = select_kernel(
-        "attention",
-        "qsa_sparse_attention",
-        signature,
-        traits=traits,
-        solution=solution,
+    if k_cache.shape[0] < 2 or v_cache.shape[0] < 2:
+        raise ValueError("QSA caches must include slot 1 for masked reads")
+    kernel = select_qsa_sparse_attention_kernel(
+        q,
+        k_cache,
+        v_cache,
+        selected_slots,
+        max_seqlen_q=max_seqlen_q,
         override=override,
+        solution=solution,
     )
     return kernel(
         q,

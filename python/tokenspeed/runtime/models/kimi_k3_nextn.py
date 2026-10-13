@@ -145,6 +145,8 @@ class KimiK3DraftDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             reduce_attn_results=True,
             alt_stream=alt_stream,
+            qkv_parallel=None,
+            output_parallel=None,
         )
         self.block_sparse_moe = create_kimi_linear_moe(
             config=config,

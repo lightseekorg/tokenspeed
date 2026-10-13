@@ -383,11 +383,11 @@ def _score_key_tile(
     BLOCK_N: gl.constexpr,
     Q_IS_FP8: gl.constexpr,
 ):
-    if Q_IS_FP8:
-        key = raw_key
-    else:
-        key = raw_key.to(gl.bfloat16)
-    key = gl.convert_layout(key, dot_b_layout)
+    # Change layout while the key is still FP8: it moves half the bytes through
+    # LDS and keeps fewer registers live than converting BF16.
+    key = gl.convert_layout(raw_key, dot_b_layout)
+    if not Q_IS_FP8:
+        key = key.to(gl.bfloat16)
     scores = _score_head_tile(
         query_0,
         key,
@@ -423,11 +423,11 @@ def _score_key_tile_ordered_head_fold(
     BLOCK_N: gl.constexpr,
     Q_IS_FP8: gl.constexpr,
 ):
-    if Q_IS_FP8:
-        key = raw_key
-    else:
-        key = raw_key.to(gl.bfloat16)
-    key = gl.convert_layout(key, dot_b_layout)
+    # Change layout while the key is still FP8: it moves half the bytes through
+    # LDS and keeps fewer registers live than converting BF16.
+    key = gl.convert_layout(raw_key, dot_b_layout)
+    if not Q_IS_FP8:
+        key = key.to(gl.bfloat16)
     scores = _score_head_tile_ordered_head_fold(
         query_0,
         key,

@@ -446,11 +446,16 @@ class CheckpointPrefetcher:
     consumer advances.
 
     The window is min(40 GiB, 25% of available host memory). It bounds ahead
-    bytes, not total page-cache occupancy. Local ranks share cached file pages.
+    bytes, not total page-cache occupancy. Local ranks share cached file pages
+    and divide background reads by shard index. Every shard still occupies
+    the window, including shards another local rank reads. Consumers do not
+    synchronize: a peer's unfinished read falls back to demand paging.
 
     Args:
         files: Shard paths in the exact order the consumer will load them.
         num_threads: Maximum concurrent range readers per rank.
+        local_rank: Reader index among local ranks loading the same files.
+        local_world_size: Number of those local readers, never global TP size.
     """
 
     _BLOCK_SIZE = 4 * 1024**2
@@ -477,8 +482,16 @@ class CheckpointPrefetcher:
         self,
         files: list[str],
         num_threads: int = 8,
+        *,
+        local_rank: int,
+        local_world_size: int,
     ) -> None:
+        if not 0 <= local_rank < local_world_size:
+            raise ValueError("local_rank must be in [0, local_world_size)")
         self._files = list(files)
+        self._local_rank = local_rank
+        self._local_world_size = local_world_size
+        self._owned_files = len(self._files[local_rank::local_world_size])
         self._sizes = [os.path.getsize(path) for path in self._files]
         self._num_threads = max(1, num_threads)
         self._range_sizes = []
@@ -512,7 +525,8 @@ class CheckpointPrefetcher:
 
     def start(self) -> None:
         logger.info(
-            f"Prefetching {len(self._files)} checkpoint shards into the OS page "
+            f"Prefetching {self._owned_files}/{len(self._files)} checkpoint shards "
+            f"as local reader {self._local_rank}/{self._local_world_size} into the OS page "
             f"cache (window {self._window_bytes / 1024**3:.1f} GiB, "
             f"up to {self._num_threads} range-reader threads)."
         )
@@ -539,6 +553,12 @@ class CheckpointPrefetcher:
                             self._cond.wait()
                             continue
                         self._inflight_bytes += size
+                        if idx % self._local_world_size != self._local_rank:
+                            # Keep the full consumer-order window even when a
+                            # peer owns the read; shortening it multiplies read-ahead.
+                            self._next_to_read += 1
+                            self._ready[idx].set()
+                            continue
                     start = self._next_offset
                     end = min(size, start + self._range_sizes[idx])
                     self._next_offset = end
@@ -561,7 +581,7 @@ class CheckpointPrefetcher:
                 # Failed ranges also release the consumer to use demand paging.
                 self._ready[idx].set()
                 self._files_read += 1
-                all_read = self._files_read == len(self._files)
+                all_read = self._files_read == self._owned_files
             if all_read:
                 logger.info(
                     "Checkpoint prefetch finished after "
@@ -577,7 +597,7 @@ class CheckpointPrefetcher:
             thread.join()
 
     def wait_file(self, idx: int) -> None:
-        """Block until shard ``idx`` has been prefetched."""
+        """Wait for window admission and this rank's read, if it owns the shard."""
         self._ready[idx].wait()
 
     def advance(self, idx: int) -> None:
@@ -624,6 +644,9 @@ def safetensors_weights_iterator(
     decryption_key: str | None = None,
     prefetch: bool = False,
     prefetch_num_threads: int = 8,
+    *,
+    local_rank: int,
+    local_world_size: int,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -650,6 +673,8 @@ def safetensors_weights_iterator(
         prefetcher = CheckpointPrefetcher(
             hf_weights_files,
             num_threads=prefetch_num_threads,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
         )
         prefetcher.start()
 
@@ -680,6 +705,9 @@ def safetensors_filtered_weights_iterator(
     accept: Callable[[str], bool],
     prefetch: bool = False,
     prefetch_num_threads: int = 8,
+    *,
+    local_rank: int,
+    local_world_size: int,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield accepted tensors one at a time via ``get_tensor``, never load_file.
 
@@ -694,6 +722,8 @@ def safetensors_filtered_weights_iterator(
         prefetcher = CheckpointPrefetcher(
             hf_weights_files,
             num_threads=prefetch_num_threads,
+            local_rank=local_rank,
+            local_world_size=local_world_size,
         )
         prefetcher.start()
     try:

@@ -60,9 +60,12 @@ unconditionally, so the router and every other runner-facing node call
 rewriting rows the prefix hit already shares. Likewise every node without a
 gathered-history extend arm calls `reject_query_shard`; the router forwards
 the shard to its leaves together with `page_table_cpu`, the host mirror of
-the extend rows of each leaf's kernel page table (built only for a sharded
-forward, `None` otherwise), and the one leaf that attends a shard — GPU DSA —
-counts page ownership from it on the host. No default values: the runner
+the extend rows of each leaf's kernel page table (built for a sharded
+forward, and for an extend with a prefix on a KVP page-sharded group; `None`
+otherwise). The one leaf that attends a shard — GPU DSA — counts page
+ownership from it on the host, and an MLA leaf declaring `supports_mla_dcp`
+hands it to `_prepare_prefix_history`, which splits the prefix-chunk gathers
+by page owner the same way. No default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
 idle replay passes the empty `[:0]` slices), so a node that reads a field
 can never see a silently-defaulted one. This is deliberate — a `= False`
@@ -387,7 +390,7 @@ A new backend implements `refresh_decode_metadata` and inherits both
 `block_decode_expansion`; extend it for extra persistent state) and
 capture; a new override must name its kernel-imposed asymmetry here. Leaf
 capture/refresh signatures are pinned by
-`test_unified_decode_path.py::CaptureSignatureConformanceTest`.
+`test_unified_decode_path.py::LeafSignatureConformanceTest`.
 
 ### Graded CUDA-graph support
 
@@ -397,9 +400,12 @@ scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
 over the target and draft `child_backends()` trees once
 (`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
-`DSABackend` and Qwen4-Exp's PLE/indexer consumers disable the prefill graph
-(rationale comments live on those classes). Qwen4-Exp's root composes its
-actual children, so these restrictions also apply when there is no GDN leaf.
+`DSABackend` disables the prefill graph (rationale on the class). Qwen4-Exp's
+PLE and QSA indexer support the breakable graph: their model methods are eager
+break points, where live request metadata controls cache writes and padded
+token rows are sliced before state updates. The root composes its actual
+children, so a restriction from any other child still applies when there is
+no GDN leaf.
 
 Rules: declarations are static "never works" facts — a runtime prefill
 capture failure is FATAL (no silent eager degrade: a family that cannot
@@ -409,6 +415,13 @@ class-attribute-driven, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
+Prefill graph warmup runs on the same side stream as capture. Some kernels
+cache occupancy by stream and reject a cold CUDA graph capture; warming on the
+default stream does not prepare their capture-stream state. The capture stream
+waits for the dummy inputs and metadata before warmup, and warmup completes
+before capture begins. This applies to ordinary, encoder and decoder captures.
+Graph-memory observation wraps only capture; eager warmups, decoder rearming
+and smoke-test replay stay outside the measured region.
 ### One output layout per forward
 
 Every ForwardContext and grammar completion carries a required, immutable
@@ -455,13 +468,13 @@ zeroed). The decoder graphs depend only on their row count, so one ladder
 serves every token bucket; it is the token ladder clipped to
 `max_decoder_rows_per_request × max_num_seqs` (a request contributes at most
 its window). A replay is encoder graph → eager narrowing → decoder graph,
-all under the bucket-pinned ambient context; the narrowing and decoder
+all under the bucket-pinned ambient context. The narrowing and decoder
 stages size their own collectives from their row counts
-(`report_collective_sizing`), the decoder graph replays with the narrowed
-row count as its valid rows so its breaks scrub the static tail, and a
-forward whose narrowed rows exceed the largest decoder bucket runs its
-decoder stage eager. Layers read their row plan from the live context, never
-from a loose argument a captured break would freeze. Capture runs the
+(`report_collective_sizing`). The decoder graph replays with the narrowed
+row count as its valid rows, so its breaks scrub the static tail. A forward
+whose narrowed rows exceed the largest decoder bucket runs its decoder
+stage eager. Layers read their row plan from the live context, never from a
+loose argument a captured break would freeze. Capture runs the
 narrowing before every decoder run, as serving does: the decoder consumes
 per-forward backend state its predecessor produces (V4.1's reuse layers read
 the index source's selection, which later sources overwrite). Under
@@ -559,7 +572,7 @@ NOWHERE else — the same two steps in every round:
 Backends' `init_forward_metadata` must NOT double-fill draft decode metadata
 as a side effect (the deleted `is_extend() and self.is_draft` arms); the
 mixed/idle decode arms that remain serve the target's decode requests only.
-Drafters republish their in-loop seq_lens edits explicitly each step via
+Drafters republish their in-loop seq_lens edits explicitly each step through
 `advance_draft_forward_metadata` (Eagle) / `update_draft_forward_metadata`
 (vanilla MTP frontier re-anchor) — metadata never aliases a buffer the
 drafter mutates behind the backend's back. Those two hooks are deliberately
@@ -641,7 +654,7 @@ and never write a slot.
 ### PD decode nodes
 
 A PD decode-only node never runs an extend forward, so latches set on the
-extend path (`_cache_groups_bound`) stay False there. Refresh must therefore
+extend path (the pre-unification `_cache_groups_bound`) stay False there. Refresh must therefore
 bind the group tables whenever they are delivered — never gate on an
 extend-latched flag — otherwise the kernels read the null page instead of
 the transferred KV. This rule predates unification and now protects eager
@@ -852,6 +865,11 @@ Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
 single-token prefill. Adapting ragged rows to one-token queries must retain
 this distinction. Both use the same cache writer and sparse-attention call.
 
+QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
+candidates from the zero-initialized slot 1 of the reserved null page.
+Writers must leave that read slot untouched. The indexer retains its `-1`
+sentinel, and consumers derive their masks from the original selection.
+
 `QSAIndexerBackend` privately owns `QSAVerifyState` only for a speculative
 target. Registry construction binds the cache plan and preallocates its
 workspace before model forward or graph capture. Draft and non-speculative
@@ -910,7 +928,7 @@ vocabulary is fixed, with exactly one conversion point:
 | **`CacheGroupRouter`** | attention group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding and KV write-location slot math | kernel calls |
 | `QSAIndexerBackend` | its raw compressed/recent group tables, query lengths, full-KV address view and private verify workspace | MHA leaf metadata, persistent cache allocation |
 | `Qwen4ExpPLEBackend` | its PLE checkpoint table, input/output checkpoints and verify workspace | Mamba metadata and verify context, persistent cache allocation |
-| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard also `page_table_cpu`, the host mirror of its extend rows, for ownership counts | groups, block tables, contracts, draft/target table provenance |
+| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix when its group is KVP page-sharded, also `page_table_cpu`, the host mirror of its extend rows, for page-owner counts | groups, block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4) | their own family's raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
 The runner (`ForwardStepRunner`) does one thing with tables: hand the
@@ -1246,13 +1264,13 @@ extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
 
-## Recurrent prefill subgraphs (KDA, Mamba2)
+## Recurrent prefill subgraphs (KDA, Mamba2, GDN)
 
 ### Capturing recurrent layers in the outer graph
 
 `CapacityPrefillBackend` (`state/prefill_capacity.py`) owns this contract for
-KDA and Mamba2; each subclass only states which forwards it admits and whether
-uncaptured shapes also run the capacity layout. GDN does not capture its layers.
+KDA, Mamba2 and GDN; each subclass only states which forwards it admits and whether
+uncaptured shapes also run the capacity layout.
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture and replay. This consumer-stream seam builds or
 refreshes `CapacityPrefillMetadata` with the selected token and request capacities.
@@ -1274,6 +1292,13 @@ the preparation seam rewrites both in place, in one pinned upload, before each
 use. Mamba2 chunks align to the packed token axis, so when one-token dummy tails
 shift a later request's tail, a multi-request capture matches eager within
 rounding rather than bit for bit; a one-request capture matches exactly.
+
+GDN admits capacity prefills only when the selected chunk-prefill kernel sizes
+its launch from the sequence count and reads the bounds on device
+(`gdn_chunk_prefill_capturable`); otherwise its layers keep their breaks. Like
+Mamba2, uncaptured shapes keep the scheduler metadata. The scan chunks each
+sequence from its own start, so captures of any request count match eager bit
+for bit.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels and post-attention compute together.
@@ -1365,11 +1390,11 @@ capacity and request capacity; `None` in the request-count position selects
 the ordinary attention-break capture. The backend retains startup metadata for
 the exact shapes that need stable addresses, not graphs or request state. Serving
 forwards never grow this retained table. The outer owner's serial shared-pool
-discipline applies to all variants; there is no separate KDA graph pool. Before
-recapture, it releases the old captures and resets retained prefill metadata via
-`init_prefill_graph_state`. Publishing a cache pool also drops retained prefill
-metadata. Graph release and cache-pool rebind remain coordinated by the
-orchestrator.
+discipline applies to all variants; there is no separate KDA graph pool.
+Before recapture, it releases the old captures and resets retained prefill
+metadata through `init_prefill_graph_state`. Publishing a cache pool also
+drops retained prefill metadata. Graph release and cache-pool rebind remain
+coordinated by the orchestrator.
 
 ### Fixed-capacity execution metadata
 
@@ -1659,8 +1684,9 @@ alternative to this fork — sharding the drafter's decode rows by a plan too,
 so every forward exchanges — needs a sharded DSA decode arm (history gathers
 for decode rows) that does not exist; the fork is the contained form until
 it does. The decode-only gates of the attention-DP
-layout (`disaggregation_mode == "decode"`, the decode-shaped autotune, the
-retraction-window generation budget) key on
+layout (`disaggregation_mode == "decode"`, the decode-shaped autotune; a
+retracted request restores rather than recomputes, so no admission rule is
+needed) key on
 `mapping.attn.head_tp_serves_decode_only`, which is False over the query
 shards; the prefill role's own rules (`validate_qcp`) and the mapping (`head
 TP == qcp`) gate this layout.
@@ -1757,6 +1783,8 @@ mapping remains a separate consumer of the shared mapping helpers
   binds the runner call shape against every runner-facing node and every
   leaf). Metadata dataclasses may still hold `None` for fields a decode
   batch does not carry; the contract is about the call, not the record.
+  The one permitted match is the private `QSAIndexerBackend._metadata`
+  helper, which is not an `init_forward_metadata`.
 * `grep -rn "select_out_cache_loc\|DraftPageStaging\|tables_self_padding\|
   cache_active_pages_must_be_real\|engine_owned_group_ids" python/` must
   stay empty — write locations have one accessor (`write_locations`), and

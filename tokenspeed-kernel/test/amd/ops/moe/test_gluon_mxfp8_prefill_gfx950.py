@@ -38,9 +38,6 @@ from tokenspeed_kernel.ops.moe import (  # noqa: E402
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
-from tokenspeed_kernel_amd._scheduling import (  # noqa: E402
-    sched_barrier_compile_options,
-)
 from tokenspeed_kernel_amd._triton import (  # noqa: E402
     cdna4_async_copy,
     gl,
@@ -673,7 +670,6 @@ def _check_stage2_basis(k, m, *, pitch, buffer_safe, block_m):
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,
-        **sched_barrier_compile_options(),
     )
     scale_w = torch.exp2(raw["w2_scale"][0, n, group].float() - 127)
     expected = (
@@ -762,7 +758,6 @@ def _check_stage1_basis(d, varying_scales, block_m):
         num_warps=4,
         num_stages=1,
         enable_fp_fusion=False,
-        **sched_barrier_compile_options(),
     )
     code = torch.tensor([1.0, 1.5, 2.0, 3.0], device="cuda")[n % 4]
     scale_w = torch.exp2(raw["w13_scale"][0, n, group].float() - 127)

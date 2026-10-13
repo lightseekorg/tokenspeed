@@ -2512,7 +2512,7 @@ class DeepseekV4Indexer(nn.Module):
                     head_scale=self.n_head**-0.5,
                 )
 
-        if metadata.cache.dcp_size > 1:
+        if metadata.cache.kvp_size > 1:
             return self._forward_sharded_indexer(
                 packed_index_q,
                 packed_weights,
@@ -2520,7 +2520,7 @@ class DeepseekV4Indexer(nn.Module):
                 indexer_block_size,
                 positions,
                 metadata,
-                tuple(ctx.attn_backend.dcp_group),
+                tuple(ctx.attn_backend.kvp_group),
             )
 
         empty_cpu = torch.empty(0, dtype=torch.int32, device="cpu")
@@ -2721,7 +2721,7 @@ class DeepseekV4Indexer(nn.Module):
                 is_valid_token=valid_token,
                 indexer=True,
             )
-        if cache_metadata.dcp_size > 1:
+        if cache_metadata.kvp_size > 1:
             compressed_slots = cache_metadata.local_indexer_write_slots(
                 compressed_slots, indexer_block_size
             )

@@ -24,7 +24,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
-    compact_dcp_pages,
+    compact_kvp_pages,
     virtual_slots_to_local,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
@@ -68,7 +68,7 @@ def test_noncontiguous_pages_and_partial_tail(degree, device):
     for rank in range(degree):
         out = torch.empty_like(table)
         local = torch.empty_like(lengths)
-        compact_dcp_pages(
+        compact_kvp_pages(
             table,
             lengths,
             page_size=64,
@@ -115,9 +115,9 @@ def test_flashmla_dcp_rejects_unsupported_execution(override, message):
             *config.components[1:],
         ),
         pd_disaggregation_enabled=False,
-        dcp_size=4,
-        dcp_rank=0,
-        dcp_group=(0, 1, 2, 3),
+        kvp_size=4,
+        kvp_rank=0,
+        kvp_group=(0, 1, 2, 3),
     )
     with pytest.raises(ValueError, match=message):
         replace(config, **override)
@@ -131,7 +131,7 @@ def test_flashmla_absorbed_extend_refuses_sharded_cache():
         "tokenspeed.runtime.layers.attention.backends.paged.flashmla"
     )
     leaf = flashmla.FlashMLABackend.__new__(flashmla.FlashMLABackend)
-    leaf.dcp_group = (0, 1)
+    leaf.kvp_group = (0, 1)
     with pytest.raises(RuntimeError, match="absorbed extend"):
         leaf._forward_absorbed_extend(torch.empty(0), layer=None, token_to_kv_pool=None)
 
@@ -156,9 +156,9 @@ def test_kimi_capacity_shards_only_mla():
                 *components[1:],
             ),
             pd_disaggregation_enabled=False,
-            dcp_size=degree,
-            dcp_rank=0,
-            dcp_group=tuple(range(degree)),
+            kvp_size=degree,
+            kvp_rank=0,
+            kvp_group=tuple(range(degree)),
         )
         recipes.append(recipe)
     base, sharded = [r.setup().spec for r in recipes]
@@ -228,7 +228,7 @@ def test_flashmla_shards_merge_to_full_attention(degree):
         )
         assert not local_cache[:128].any()
         out, local = torch.empty_like(table), torch.empty_like(lengths)
-        compact_dcp_pages(
+        compact_kvp_pages(
             table,
             lengths,
             page_size=64,
@@ -256,7 +256,7 @@ def test_compaction_graph_replay_refreshes_lengths_and_owners():
     out, local = torch.empty_like(table), torch.empty_like(lengths)
 
     def refresh():
-        compact_dcp_pages(
+        compact_kvp_pages(
             table,
             lengths,
             page_size=64,
@@ -339,14 +339,19 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
 
     from cache_pool_test_utils import make_arena, make_mla_memory_plan, plan_group_specs
 
+    from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
     from tokenspeed.runtime.layers.attention.backends.paged import flashmla
-    from tokenspeed.runtime.layers.attention.dcp.cache import gather_mla_history
+    from tokenspeed.runtime.layers.attention.dcp import cache as dcp_cache
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        plan_prefix_history_gather,
+    )
     from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
     from tokenspeed.runtime.layers.attention.kv_cache import mla
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
         HybridKDATokenToKVPool,
     )
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
+    from tokenspeed.runtime.utils.env import global_server_args_dict
 
     plan = make_mla_memory_plan(
         size=8,
@@ -376,10 +381,10 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     )
     backend = object.__new__(flashmla.FlashMLABackend)
     backend.cache_pool = pool
-    backend.dcp_group = (0, 1)
-    backend.dcp_rank = 0
-    backend.dcp_block_granularity = 4
-    backend.dcp_virtual_block_count = arena.runtime_contract.virtual_block_counts[
+    backend.kvp_group = (0, 1)
+    backend.kvp_rank = 0
+    backend.kvp_block_granularity = 4
+    backend.kvp_virtual_block_count = arena.runtime_contract.virtual_block_counts[
         "full_attention"
     ]
     backend.kv_lora_rank = 512
@@ -437,27 +442,66 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     torch.testing.assert_close(
         torch.cat((local_nope, local_rope), dim=-1), values[[0, 2]].float()
     )
-    assert "dcp_group" not in vars(pool)
-    assert "dcp_rank" not in vars(pool)
+    assert "kvp_group" not in vars(pool)
+    assert "kvp_rank" not in vars(pool)
 
-    def gather_owner_rows(local, group):
-        assert group == (0, 1)
-        torch.testing.assert_close(local[0], values[0].float())
-        assert not local[1].any()
-        torch.testing.assert_close(local[2], values[2].float())
-        return values.float()
-
-    from tokenspeed.runtime.layers.attention.dcp import comm
-
-    monkeypatch.setattr(comm, "all_reduce", gather_owner_rows)
-    nope, rope = gather_mla_history(
-        pool,
-        layer,
-        loc,
-        dst_dtype=torch.float32,
+    # One request whose three rows sit on pages of virtual blocks 1, 2, 3:
+    # rank 0 owns rows 0 and 2, rank 1 owns row 1.
+    (window,) = plan_prefix_history_gather(
+        [loc],
+        page_table_cpu=torch.tensor([[4, 8, 12]], dtype=torch.int32),
+        prefix_lens_cpu=torch.tensor([3]),
+        chunk_len=3,
+        page_size=1,
         placement=backend.cache_placement(layer),
     )
-    torch.testing.assert_close(torch.cat((nope, rope), dim=-1), values.float())
+    assert window.owned_rows_per_rank == (2, 1)
+    assert window.send_rows == 2
+    assert window.gathered_index.tolist() == [0, 2, 1]
+    assert window.fetch_slots.tolist() == [4, 8]
+    assert window.loop_bounds == (0, 3)
+
+    class OwnerRows:
+        """Rank 0's view of the all-gather: rank 1 owns row 1."""
+
+        def all_gather_single_async(self, gathered, send, group):
+            assert group == (0, 1)
+            row_bytes = values.view(torch.uint8).view(3, 1, -1)
+            torch.testing.assert_close(send, row_bytes[[0, 2]], rtol=0, atol=0)
+            gathered[:2] = send
+            gathered[2] = row_bytes[1]
+            # Rank 1's padding row is never read.
+            gathered[3] = 0xFF
+            return SimpleNamespace(wait=lambda: None)
+
+    # The leaf's prefill metadata prepares the prefix it reads back; the
+    # gathers run on the named KVP history groups.
+    monkeypatch.setattr(
+        dcp_cache,
+        "get_global_backend",
+        lambda: SimpleNamespace(
+            for_named_groups={KVP_HISTORY_GROUP_NAME: OwnerRows()}.__getitem__
+        ),
+    )
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 3)
+    backend.kernel_page_size = 1
+    backend._prefix_history = None
+    loops = [loc]
+    backend._prepare_prefix_history(
+        loops,
+        page_table_cpu=torch.tensor([[4, 8, 12]], dtype=torch.int32),
+        prefix_lens_cpu=torch.tensor([3]),
+    )
+    ((nope, rope),) = backend.read_prefix_history(
+        pool, layer, loops, dst_dtype=torch.float32
+    )
+    torch.testing.assert_close(
+        torch.cat((nope, rope), dim=-1), values.float(), rtol=0, atol=0
+    )
+    # A sharded leaf never falls back to reading its own rows alone.
+    backend._prefix_history = None
+    with pytest.raises(NotImplementedError, match="prepared no prefix read"):
+        backend.read_prefix_history(pool, layer, loops, dst_dtype=torch.float32)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -523,7 +567,7 @@ def test_unsharded_backends_preserve_physical_slots(kind):
     }[kind]
     backend = object.__new__(cls)
     if kind in ("flashmla", "dsa"):
-        backend.dcp_group = (0,)
+        backend.kvp_group = (0,)
     loc = torch.tensor([0, 3, 8])
     slots, mask = resolve_cache_slots(
         loc, backend.cache_placement(SimpleNamespace(layer_id=0))
@@ -564,9 +608,9 @@ def test_kimi_capacity_fits_physical_parents_with_state_reservations(degree):
         device="cuda",
         components=(replace(components[0], backend_name="flashmla"), *components[1:]),
         pd_disaggregation_enabled=False,
-        dcp_size=degree,
-        dcp_rank=0,
-        dcp_group=tuple(range(degree)),
+        kvp_size=degree,
+        kvp_rank=0,
+        kvp_group=tuple(range(degree)),
     )
     groups = recipe.groups()
     layout = pack(
@@ -588,36 +632,9 @@ def test_kimi_capacity_fits_physical_parents_with_state_reservations(degree):
     )
 
 
-@pytest.mark.parametrize("shape", [(3, 4), (3, 1, 8)])
-@pytest.mark.parametrize("group", [(0,), (0, 1)])
-def test_gather_owned_rows_masks_nan_and_preserves_order(monkeypatch, shape, group):
-    from tokenspeed.runtime.layers.attention.dcp import comm
-
-    values = torch.arange(
-        torch.tensor(shape).prod().item(), dtype=torch.float32
-    ).reshape(shape)
-    values[1] = float("nan")
-    owned = torch.tensor([True, False, True])
-    expected = values.clone()
-    expected[1] = 0
-
-    def reduce(rows, actual_group):
-        assert actual_group == group
-        torch.testing.assert_close(rows, expected)
-        rows[1] = 42
-        return rows
-
-    monkeypatch.setattr(comm, "all_reduce", reduce)
-    result = comm.gather_owned_rows(values, owned, group)
-    if len(group) > 1:
-        expected[1] = 42
-    torch.testing.assert_close(result, expected)
-    assert result.is_contiguous()
-
-
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 @pytest.mark.parametrize("token_limit", [None, 64, 128, 576])
-def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
+def test_ordinary_mla_kvp_capacity_and_token_limit(degree, token_limit):
     from test.runtime.test_cache_setup import _mla_config
     from types import SimpleNamespace
 
@@ -630,9 +647,9 @@ def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
         config,
         device="cuda",
         components=(replace(config.components[0], backend_name="flashmla"),),
-        dcp_size=degree,
-        dcp_rank=0,
-        dcp_group=tuple(range(degree)),
+        kvp_size=degree,
+        kvp_rank=0,
+        kvp_group=tuple(range(degree)),
     )
     setup = prepare_cache_setup(
         family="mla",
@@ -656,7 +673,7 @@ def test_ordinary_mla_dcp_capacity_and_token_limit(degree, token_limit):
 
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
-def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
+def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
     from dataclasses import asdict
     from test.runtime.test_cache_setup import _mla_config
     from types import SimpleNamespace
@@ -680,9 +697,9 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
         base,
         device="cuda",
         components=(spec,),
-        dcp_size=degree,
-        dcp_group=tuple(range(degree)),
-        dcp_rank=0,
+        kvp_size=degree,
+        kvp_group=tuple(range(degree)),
+        kvp_rank=0,
     )
     setup = prepare_cache_setup(
         family="dsa",
@@ -720,10 +737,10 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     backend.qk_rope_head_dim = 0
     backend.index_topk = 512
     backend.max_context_len = 512
-    backend.dcp_group = (0, 1, 2, 3)
-    backend.dcp_rank = rank
-    backend.dcp_block_granularity = 64
-    backend.dcp_virtual_block_count = 5
+    backend.kvp_group = (0, 1, 2, 3)
+    backend.kvp_rank = rank
+    backend.kvp_block_granularity = 64
+    backend.kvp_virtual_block_count = 5
     backend.qcp_group = (0,)
     # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
     # combine form.
@@ -750,7 +767,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     )
 
     def gather(q, group):
-        assert group == backend.dcp_group
+        assert group == backend.kvp_group
         return q.repeat(1, 4, 1)
 
     def decode(**kwargs):
@@ -762,7 +779,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
         return torch.full((1, 8, 128), 7.0), torch.zeros(1, 8)
 
     def combine(out, lse, *, group, rank, sink, keep_all_heads):
-        assert sink is None and group == backend.dcp_group
+        assert sink is None and group == backend.kvp_group
         assert keep_all_heads is False
         assert lse.shape == out.shape[:-1]
         return out[:, rank * 2 : (rank + 1) * 2]

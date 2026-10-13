@@ -43,17 +43,16 @@ class _SchedulerHarness:
 
     def next_execution_plan(self):
         self._trace.append("next_plan")
-        return SimpleNamespace(pages_to_zero=(), cache=())
+        return SimpleNamespace(pages_to_zero=(), cache=(), aborts=())
 
 
 class _DeviceHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
-    def execute(self, execution_plan, planned, *, submit_remote_prefill: bool):
+    def execute(self, execution_plan, planned):
         # The harness plans no device work and no batch; trace anything that
         # does appear rather than fail on a missing attr.
-        del submit_remote_prefill
         if execution_plan.pages_to_zero or execution_plan.cache or planned:
             self._trace.append("execute")
         return None
@@ -78,7 +77,9 @@ class _EventLoopHarness:
             pp_size=1,
             pp_cpu_group=None,
         )
-        self.output_processor = SimpleNamespace(rid_to_state={})
+        self.output_processor = SimpleNamespace(
+            rid_to_state={}, finish_scheduler_aborted_requests=lambda aborts: None
+        )
         self.has_dp = False
         self.kv_transfer = None
         self.in_flight_depth = 0
@@ -95,6 +96,9 @@ class _EventLoopHarness:
         self._eplb_hooks = SimpleNamespace(
             note_round=lambda *, forwarded: self.trace.append("eplb_round"),
             close=lambda: self.trace.append("close_eplb"),
+        )
+        self._gc_hooks = SimpleNamespace(
+            note_round=lambda *, forwarded: self.trace.append("gc_round")
         )
         self.load_reporter = SimpleNamespace(
             observe=lambda _stats, _running: self.trace.append("observe_load"),
@@ -157,8 +161,10 @@ def test_event_loop_finishes_current_iteration_then_observes_shutdown() -> None:
         "observe_load",
         "metrics",
         # Every non-paused round reports its forward (none here) to the
-        # expert-rebalance hooks after the device call.
+        # expert-rebalance hooks after the device call, then to the
+        # garbage-collection hooks.
         "eplb_round",
+        "gc_round",
         "poll_pd",
         "publish_kv",
         "pause_finish",
@@ -281,6 +287,10 @@ def test_run_event_loop_reports_exit_and_finally_closes(
     )
     monkeypatch.setattr(event_loop_module.faulthandler, "enable", lambda: None)
     monkeypatch.setattr(event_loop_module, "register_usr_signal", lambda: None)
+    # Freezing would take this test process's objects out of collection.
+    monkeypatch.setattr(
+        event_loop_module, "freeze_startup_heap", lambda: trace.append("freeze_gc")
+    )
     monkeypatch.setattr(
         event_loop_module, "configure_logger", lambda *_args, **_kwargs: None
     )
@@ -294,11 +304,17 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         with pytest.raises(SystemExit) as raised:
             event_loop_module.run_event_loop(server_args, object(), pipe_writer)
         assert raised.value.code == 0
-        assert trace == ["construct", "loop_enter", "close"]
+        assert trace == ["construct", "freeze_gc", "loop_enter", "close"]
         assert exit_logs[0][1][0] is SystemExit
     else:
         event_loop_module.run_event_loop(server_args, object(), pipe_writer)
-        assert trace == ["construct", "loop_enter", "loop_return", "close"]
+        assert trace == [
+            "construct",
+            "freeze_gc",
+            "loop_enter",
+            "loop_return",
+            "close",
+        ]
         assert exit_logs[0][1] is None
     assert len(exit_logs) == 1
     assert "rank=0 pid=" in exit_logs[0][0]

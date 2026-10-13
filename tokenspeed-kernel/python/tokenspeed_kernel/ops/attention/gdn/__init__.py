@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
@@ -118,6 +119,69 @@ class GdnChunkPrefillResult:
     h_layout: GdnCheckpointLayout = GdnCheckpointLayout.NONE
 
 
+# Chunk-prefill kernels whose launch geometry depends only on the sequence count
+# and which read the sequence bounds on device.
+_DEVICE_BOUNDS_CHUNK_PREFILL = frozenset({"flashinfer_gdn_chunk_prefill"})
+
+
+def _chunk_prefill_traits(
+    head_dim: int,
+    value_head_dim: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    output_h: bool,
+    qk_l2norm: bool,
+) -> dict[str, int | bool]:
+    return {
+        "head_dim": head_dim,
+        "value_head_dim": value_head_dim,
+        "num_v_gte_num_q": num_v_heads >= num_q_heads,
+        "output_h": output_h,
+        "qk_l2norm": qk_l2norm,
+    }
+
+
+def gdn_chunk_prefill_capturable(
+    dtype: torch.dtype,
+    *,
+    head_dim: int,
+    value_head_dim: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    qk_l2norm: bool,
+) -> bool:
+    """Whether a CUDA graph can capture ``gdn_chunk_prefill`` at a fixed sequence count.
+
+    The kernel selected for this geometry must size its launch from the number
+    of sequences alone and read ``cu_seqlens`` on device, so a graph replayed
+    with rewritten bounds of the same sequence count stays valid.
+
+    Args:
+        dtype: Q/K/V dtype.
+        head_dim: Query/key head dimension.
+        value_head_dim: Value head dimension.
+        num_q_heads: Query (and key) head count.
+        num_v_heads: Value head count.
+        qk_l2norm: Whether the scan L2-normalizes Q/K.
+
+    Returns:
+        ``True`` when the selected kernel can be captured that way.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    try:
+        kernel = select_kernel(
+            "attention",
+            "gdn_chunk_prefill",
+            _attention_format_signature(q=probe, k=probe, v=probe),
+            traits=_chunk_prefill_traits(
+                head_dim, value_head_dim, num_q_heads, num_v_heads, False, qk_l2norm
+            ),
+        )
+    except NoKernelFoundError:
+        return False
+    return kernel.name in _DEVICE_BOUNDS_CHUNK_PREFILL
+
+
 def gdn_chunk_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -164,13 +228,9 @@ def gdn_chunk_prefill(
     value_head_dim = v.shape[-1]
     num_q_heads = q.shape[-2]
     num_v_heads = v.shape[-2]
-    traits = {
-        "head_dim": head_dim,
-        "value_head_dim": value_head_dim,
-        "num_v_gte_num_q": num_v_heads >= num_q_heads,
-        "output_h": output_h,
-        "qk_l2norm": qk_l2norm,
-    }
+    traits = _chunk_prefill_traits(
+        head_dim, value_head_dim, num_q_heads, num_v_heads, output_h, qk_l2norm
+    )
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
         "attention",
@@ -314,6 +374,24 @@ def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
         GDN_TREE_VERIFY_CHUNKED_MIN_NODES
         <= num_nodes
         <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+    )
+
+
+# A ReplaySSM chain verifies faster in the chunked form from these sizes on, measured on Blackwell.
+GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS = 13
+GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES = 24
+
+
+def gdn_chain_verify_is_chunked(num_tokens: int, num_states: int) -> bool:
+    """Whether a ReplaySSM chain ``gdn_decode_mtp`` of ``num_tokens`` tokens over
+    ``num_states`` (request, value head) states verifies in the chunked form, as
+    a one-path tree, rather than step by step: only where that is faster."""
+    return (
+        current_platform().is_blackwell
+        and GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS
+        <= num_tokens
+        <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+        and num_states >= GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES
     )
 
 
@@ -717,7 +795,9 @@ __all__ = [
     "GDN_TREE_VERIFY_CHUNKED_MAX_NODES",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
+    "gdn_chain_verify_is_chunked",
     "gdn_chunk_prefill",
+    "gdn_chunk_prefill_capturable",
     "gdn_decode_step",
     "gdn_decode_mtp",
     "gdn_replay_commit",

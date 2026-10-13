@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_step,
     gdn_tree_verify_needs_node_states,
 )
+from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
 
@@ -74,6 +75,28 @@ def _torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return (
         x_float * torch.rsqrt(x_float.square().sum(dim=-1, keepdim=True).clamp_min(eps))
     ).to(x.dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GDN L2 norm requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_gdn_l2norm_fwd_varying_prefill_rows(dtype: torch.dtype) -> None:
+    from tokenspeed_kernel.ops.attention.gdn._triton.l2norm import (
+        l2norm_fwd,
+        l2norm_fwd_kernel,
+    )
+
+    l2norm_fwd(torch.randn((1476, 4, 128), device="cuda", dtype=dtype))
+    with assert_no_triton_compile(l2norm_fwd_kernel):
+        for rows in (1499, 1620, 2051, 2064):
+            x = torch.randn((rows, 4, 128), device="cuda", dtype=dtype)
+            actual = l2norm_fwd(x)
+            reference = x.float() * torch.rsqrt(
+                x.float().square().sum(dim=-1, keepdim=True) + 1e-6
+            )
+            tolerance = 5e-3 if dtype is torch.bfloat16 else 1e-5
+            torch.testing.assert_close(
+                actual.float(), reference, atol=tolerance, rtol=tolerance
+            )
 
 
 def _torch_gdn_chunk_prefill_reference(
@@ -1715,13 +1738,62 @@ def test_gdn_decode_mtp_chunked_tree_matches_float64_within_one_ulp(
     assert ((out.double() - want).abs() <= ulp + 1e-6).all()
 
 
+def test_gdn_tree_verify_wide_tiles_match_narrow_bit_for_bit(device: str, require):
+    """The chunked verify's wide V tiles, taken once (request, head) programs
+    outnumber the SMs, give each request the same bits as the narrow tiles of a
+    small batch."""
+    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+    T, num_v_heads = 14, 8
+    wide_batch = current_platform().sm_count // num_v_heads + 1
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        batch=wide_batch,
+        pool_size=wide_batch,
+        num_v_heads=num_v_heads,
+        state_dtype=torch.float32,
+    )
+    gen = torch.Generator().manual_seed(7)
+    parents = [_random_tree(T, gen) for _ in range(wide_batch)]
+    indices = torch.arange(wide_batch, device=device, dtype=torch.int32)
+    common = dict(A_log=A_log, dt_bias=dt_bias, use_qk_l2norm=True)
+    wide, _ = _tree_verify(
+        q,
+        k,
+        v,
+        pool,
+        parents,
+        rows=False,
+        a=a,
+        b=b,
+        initial_state_indices=indices,
+        **common,
+    )
+    narrow, _ = _tree_verify(
+        q[:2],
+        k[:2],
+        v[:2],
+        pool,
+        parents[:2],
+        rows=False,
+        a=a[:2],
+        b=b[:2],
+        initial_state_indices=indices[:2],
+        **common,
+    )
+    assert torch.equal(wide[:2], narrow)
+
+
 def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
-    """Both tree kernels compile once per tree size, never per batch."""
+    """Both tree kernels compile once per tree size and V tile width, never per batch."""
     require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         _fused_gdn_decode_update_kernel,
         _gdn_tree_verify_chunked_kernel,
     )
+
+    num_v_heads = 8
 
     def run(batch: int, T: int, rows: bool) -> None:
         q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
@@ -1730,6 +1802,7 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
             T=T,
             batch=batch,
             pool_size=batch + batch * T,
+            num_v_heads=num_v_heads,
             state_dtype=torch.float32,
         )
         gen = torch.Generator().manual_seed(batch)
@@ -1749,9 +1822,11 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
             use_qk_l2norm=True,
         )
 
+    # Past the SM count of (request, head) programs the chunked verify takes wider V tiles.
+    wide_batch = current_platform().sm_count // num_v_heads + 1
     for T, rows in ((14, False), (24, False), (14, True)):
         run(4, T, rows)
-        run(16, T, rows)
+        run(wide_batch, T, rows)
         with assert_no_triton_compile(
             _gdn_tree_verify_chunked_kernel, _fused_gdn_decode_update_kernel
         ):

@@ -30,6 +30,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / ".github/scripts"))
 import pr_ci_assist as assist
+import pr_ci_common
 import pr_ci_repair as repair
 from ci_result_source import write_source
 from pr_ci_state import BOT, BOT_ID, NATIVE_CHECKS, REPO, marker, record
@@ -86,6 +87,217 @@ def test_only_actual_writer_can_issue_command(monkeypatch):
         assist.pull(123)
 
 
+def test_targeted_fix_command_keeps_authorization_and_pr_binding(monkeypatch):
+    url = f"https://github.com/{REPO}/actions/runs/101/job/201?pr=123"
+    comment = dict(body=f"@lightseek-bot fix {url}", user={"login": "example"})
+    monkeypatch.setattr(assist, "api", lambda path: {"permission": "read"})
+    assert assist.permitted(comment) is None
+    monkeypatch.setattr(assist, "api", lambda path: {"permission": "write"})
+    assert assist.permitted(comment) == "fix"
+    assert assist.command_target(comment, 123) == {"run": 101, "job": 201}
+    with pytest.raises(ValueError, match="another PR"):
+        assist.command_target(comment, 124)
+    comment["body"] = f"@lightseek-bot watch {url}"
+    assert assist.permitted(comment) is None
+    comment["body"] = (
+        f"@lightseek-bot fix {url.replace(REPO, 'pre-commit/pre-commit-hooks')}"
+    )
+    assert assist.permitted(comment) is None
+
+
+@pytest.fixture
+def targeted(selected):
+    task, state = selected
+    state.update(action="fix", target={"run": 101, "job": 201})
+    amd = dict(config=task["config"], runner="amd-mi35x-1gpu-test", cluster="")
+    b200 = {**amd, "runner": "b200v2-1gpu"}
+    data = {k: state[k] for k in ("version", "repository", "pr", "head", "base")}
+    data.update(
+        paths=["model.py", "test/test_model.py"],
+        test_files=[],
+        catalog=[
+            dict(
+                config=task["config"],
+                name=task["name"],
+                type=task["type"],
+                runners=[amd["runner"], b200["runner"]],
+                slurm_runners={},
+                triggers=task["triggers"],
+            )
+        ],
+    )
+    plan = {k: state[k] for k in ("version", "repository", "pr", "head", "base")}
+    plan.update(run=55, tests=[], tasks=[amd])
+    job = dict(
+        id=201,
+        run_id=101,
+        run_attempt=1,
+        status="completed",
+        conclusion="failure",
+        head_sha=state["head"],
+        name=f"unit-test / {task['name']} ({b200['runner']})",
+    )
+    run = dict(
+        id=101,
+        run_attempt=1,
+        status="in_progress",
+        conclusion=None,
+        event="pull_request",
+        head_sha=state["head"],
+        head_repository={"full_name": REPO},
+        path=".github/workflows/nvidia-b200-tests.yml",
+        pull_requests=[dict(number=state["pr"], head={"sha": state["head"]})],
+    )
+    return state, data, plan, job, run, b200
+
+
+def test_failed_job_in_running_workflow_adds_exact_backend(monkeypatch, targeted):
+    state, data, plan, job, run, b200 = targeted
+    with pytest.raises(ValueError, match="supported assistance route"):
+        assist.validate_plan({**plan, "tasks": [b200]}, data)
+    monkeypatch.setattr(assist, "api", lambda path: job if "/jobs/" in path else run)
+    updated = assist.targeted_plan(plan, data, state)
+    assert updated["tasks"] == [*plan["tasks"], b200]
+    assert assist.targeted_plan(updated, data, state) == updated
+    assert (
+        record(
+            {"user": {"login": BOT, "id": BOT_ID}, "body": marker("assist", state)},
+            "assist",
+        )
+        == state
+    )
+    sent = []
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "command", lambda *args: sent.append(args))
+    assist.dispatch(assist.validate_plan(updated, data)[-1], "c" * 40, "")
+    assert "runner_pool=b200v2" in sent[0] and "runner=b200v2-1gpu" in sent[0]
+    job["head_sha"] = "d" * 40
+    with pytest.raises(ValueError, match="current PR commit"):
+        assist.targeted_plan(plan, data, state)
+    job["head_sha"] = state["head"]
+    job["run_id"] = 102
+    with pytest.raises(ValueError, match="current PR commit"):
+        assist.targeted_plan(plan, data, state)
+    job["run_id"] = 101
+    run["run_attempt"] = 2
+    with pytest.raises(ValueError, match="current PR commit"):
+        assist.targeted_plan(plan, data, state)
+
+
+def test_targeted_fix_enters_repair_and_waits_for_target_validation(
+    monkeypatch, tmp_path, targeted
+):
+    state, data, plan, job, run, b200 = targeted
+    author = dict(
+        id=43,
+        body=f"@lightseek-bot fix https://github.com/{REPO}/actions/runs/101/job/201",
+    )
+    pr = dict(
+        number=state["pr"],
+        head={"sha": state["head"]},
+        base={"sha": state["base"]},
+        mergeable=True,
+    )
+    comments = [{"user": {"login": BOT, "id": BOT_ID}, "body": marker("plan", plan)}]
+    live = [None]
+
+    def api(path):
+        if path == "actions/jobs/201":
+            return job
+        if path == "actions/runs/101":
+            return run
+        if path == "git/ref/heads/main":
+            return {"object": {"sha": state["base"]}}
+        return dict(
+            path=".github/workflows/pr-ci-plan.yml",
+            conclusion="success",
+            status="completed",
+            display_title=f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+            run_started_at="2030-01-01T00:00:00Z",
+        )
+
+    monkeypatch.setattr(assist, "api", api)
+    monkeypatch.setattr(assist, "WORK", tmp_path)
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pull", lambda n: pr)
+    monkeypatch.setattr(assist, "pages", lambda *args: comments)
+    monkeypatch.setattr(assist, "load_state", lambda *args: copy.deepcopy(live[0]))
+    monkeypatch.setattr(assist, "latest_command", lambda *args: author)
+    monkeypatch.setattr(assist, "permitted", lambda c: "fix")
+    monkeypatch.setattr(assist, "checkout", lambda *args: tmp_path)
+    monkeypatch.setattr(assist, "context", lambda *args: copy.deepcopy(data))
+    monkeypatch.setattr(assist, "runs_for", lambda *args: [])
+    monkeypatch.setattr(
+        assist, "publish", lambda s, m: live.__setitem__(0, copy.deepcopy(s))
+    )
+    monkeypatch.setattr(
+        assist,
+        "task_status",
+        lambda *args, **kw: pytest.fail("Original jobs need not finish before repair"),
+    )
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "issue_comment")
+    monkeypatch.setenv("GITHUB_RUN_ID", "200")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "output"))
+    assist.control(state["pr"])
+    request = json.loads((tmp_path / "request.json").read_text())
+    assert live[0]["phase"] == "repairing"
+    assert request["state"]["target"] == state["target"]
+    assert request["plan"]["tasks"][-1] == b200
+    assert repair.allowed_paths(request) == {"model.py", "test/test_model.py"}
+    monkeypatch.setattr(assist, "repair_plan", lambda _: request["plan"])
+    candidate = dict(
+        patch="c" * 40,
+        validation="d" * 40,
+        tree="e" * 40,
+        branch=f"bot/pr-ci-assist-{state['pr']}-43-200",
+    )
+    live[0].update(phase="validating", candidate=candidate)
+    monkeypatch.setattr(assist, "main_merge_clean", lambda *args, **kwargs: True)
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    monkeypatch.setattr(
+        assist,
+        "task_status",
+        lambda t, *args, **kw: "waiting" if t["runner"] == b200["runner"] else "passed",
+    )
+    promoted = []
+    monkeypatch.setattr(repair, "promote", lambda s, *, deadline: promoted.append(s))
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "validating" and not promoted
+    monkeypatch.setattr(assist, "task_status", lambda *args, **kw: "passed")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "promoted" and len(promoted) == 1
+
+
+def test_targeted_diagnostics_use_completed_job_log_endpoint(
+    monkeypatch, tmp_path, targeted
+):
+    state, data, plan, job, run, _ = targeted
+    request = dict(state=state, data=data, plan=plan)
+    (tmp_path / "request.json").write_text(json.dumps(request))
+    monkeypatch.setattr(repair, "WORK", tmp_path)
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "provider"))
+    monkeypatch.setattr(repair, "api", lambda path: job)
+    monkeypatch.setattr(
+        repair,
+        "org_variables",
+        lambda *args: {"KIMI_API_URL": "provider", "KIMI_MODEL": "planner"},
+    )
+    calls = []
+
+    def command(*args):
+        calls.append(args)
+        assert "--allow-escape-sequences" in args
+        return "\x1b[31mtarget job failure evidence\x1b[0m"
+
+    monkeypatch.setattr(repair, "command", command)
+    repair.configure()
+    assert calls == [
+        ("gh", "api", "--allow-escape-sequences", f"repos/{REPO}/actions/jobs/201/logs")
+    ]
+    text = (tmp_path / "model/diagnostics.txt").read_text()
+    assert job["name"] in text and "target job failure evidence" in text
+
+
 def test_plan_source_only_activates_for_current_open_pr(monkeypatch, tmp_path):
     pr = dict(
         number=123,
@@ -112,7 +324,11 @@ def test_plan_source_only_activates_for_current_open_pr(monkeypatch, tmp_path):
     assist.plan_source()
     assert result.read_text() == "active=false\n"
     result.write_text("")
-    pr.update(state="open", head={**pr["head"], "sha": "c" * 40})
+    pr.update(state="open", base={**pr["base"], "ref": "feature"})
+    assist.plan_source()
+    assert result.read_text() == "active=false\n"
+    result.write_text("")
+    pr.update(base={**pr["base"], "ref": "main"}, head={**pr["head"], "sha": "c" * 40})
     assist.plan_source()
     assert result.read_text() == "active=false\n"
     result.write_text("")
@@ -128,6 +344,33 @@ def test_plan_source_only_activates_for_current_open_pr(monkeypatch, tmp_path):
     )
     triggers = workflow.get("on", workflow.get(True))
     assert set(triggers) == {"pull_request", "workflow_dispatch"}
+    assert triggers["pull_request"]["branches"] == ["main"]
+    assert "concurrency" not in workflow
+    assert workflow["jobs"]["plan"]["concurrency"]["cancel-in-progress"] is True
+    condition = (
+        workflow["jobs"]["plan"]["if"]
+        .replace("\n", " ")
+        .replace("&&", "and")
+        .replace("||", "or")
+    )
+    github = SimpleNamespace(
+        repository=REPO,
+        event_name="pull_request",
+        actor="author",
+        event=SimpleNamespace(
+            action="edited",
+            changes=SimpleNamespace(base=None),
+            pull_request=SimpleNamespace(
+                head=SimpleNamespace(repo=SimpleNamespace(full_name=REPO))
+            ),
+        ),
+    )
+    assert not eval(condition, {"__builtins__": {}}, {"github": github})
+    github.event.changes.base = {"ref": {"from": "feature"}}
+    assert eval(condition, {"__builtins__": {}}, {"github": github})
+    github.event.action = "synchronize"
+    github.event.changes.base = None
+    assert eval(condition, {"__builtins__": {}}, {"github": github})
     steps = workflow["jobs"]["plan"]["steps"]
     source = next(i for i, step in enumerate(steps) if step.get("id") == "source")
     assert all(
@@ -167,7 +410,6 @@ def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
     workflow = yaml.safe_load(
         (assist.ROOT / ".github/workflows/pr-ci-assist.yml").read_text()
     )
-    assert "NVIDIA Kernel Library Tests" in workflow[True]["workflow_run"]["workflows"]
     assert workflow[True]["workflow_run"]["branches-ignore"] == ["main"]
     assert "workflow_call" in workflow[True]
     dispatcher = yaml.safe_load(
@@ -193,7 +435,12 @@ def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
         repository=REPO,
         event_name="workflow_run",
         event=SimpleNamespace(
-            workflow_run=SimpleNamespace(event="push"),
+            workflow_run=SimpleNamespace(
+                event="push",
+                name="AMD Tests",
+                path=".github/workflows/amd-tests.yml",
+                conclusion="skipped",
+            ),
             issue=SimpleNamespace(pull_request=True),
             comment=SimpleNamespace(body="Ordinary PR comment"),
         ),
@@ -204,6 +451,11 @@ def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
     }
     assert not eval(condition, {"__builtins__": {}}, context)
     github.event.workflow_run.event = "pull_request"
+    assert eval(condition, {"__builtins__": {}}, context)
+    github.event.workflow_run.name = "CI plan #123 | head | base"
+    github.event.workflow_run.path = ".github/workflows/pr-ci-plan.yml"
+    assert not eval(condition, {"__builtins__": {}}, context)
+    github.event.workflow_run.conclusion = "success"
     assert eval(condition, {"__builtins__": {}}, context)
     github.event.workflow_run.event = "workflow_dispatch"
     assert eval(condition, {"__builtins__": {}}, context)
@@ -242,7 +494,7 @@ def published_comments(monkeypatch, tmp_path):
         comment = dict(
             id=len(comments) + 1,
             user={"login": BOT, "id": BOT_ID},
-            body=Path(args[-1]).read_text(),
+            body=args[-1],
         )
         comments.append(comment)
         return f"https://github.com/{REPO}/pull/123#issuecomment-{comment['id']}"
@@ -262,7 +514,7 @@ def published_comments(monkeypatch, tmp_path):
     monkeypatch.setattr(assist, "pages", lambda *args: comments)
     monkeypatch.setattr(assist, "api", get_comment)
     monkeypatch.setattr(assist, "command", command)
-    monkeypatch.setattr(assist, "urlopen", patch)
+    monkeypatch.setattr(pr_ci_common, "urlopen", patch)
     return comments
 
 
@@ -296,17 +548,25 @@ def test_publish_saves_progress_without_new_comments(selected, published_comment
 def test_publish_keeps_latest_record_readable(selected, published_comments):
     _, state = selected
     assist.publish(state, "Started.")
-    first = published_comments[0]["body"]
-    newer = {**state, "command": 43}
-    assist.publish(newer, "Started.")
-    assert len(published_comments) == 2
-    second = published_comments[1]["body"]
+    first_id = published_comments[0]["id"]
+    # A newer command updates the same record instead of adding a comment.
+    assist.publish({**state, "command": 43}, "Started.")
+    assert len(published_comments) == 1
+    # A new push also updates the same record without notifying subscribers.
+    assist.publish({**state, "head": "b" * 40}, "Started.")
+    assert len(published_comments) == 1
     state["statuses"] = ["waiting"]
     assist.publish(state, "1 waiting.")
-    assert len(published_comments) == 3
-    assert [c["body"] for c in published_comments[:2]] == [first, second]
+    assert len(published_comments) == 1
     latest = assist.latest_state_comment(published_comments, state["pr"])
-    assert record(latest, "assist") == state
+    assert latest["id"] == first_id and record(latest, "assist") == state
+    # Terminal outcomes notify once and their records are never edited.
+    state.update(phase="done", statuses=["passed"])
+    assist.publish(state, "1 passed.")
+    assert len(published_comments) == 2
+    assist.publish({**state, "command": 43, "phase": "watching"}, "Started.")
+    assert len(published_comments) == 3
+    assert "1 passed." in published_comments[-2]["body"]
 
 
 def test_publish_verifies_edited_state(monkeypatch, selected, published_comments):
@@ -774,6 +1034,18 @@ def test_conflicted_test_resolution_preserves_both_sides_assertions(tmp_path, se
     candidate = "def test_result():\n    assert value == 1\n    torch.testing.assert_close(actual, expected, atol=0)\n"
     file.write_text(candidate)
     repair.guard_test_assertions(tmp_path, head, base, path)
+    request["state"].update(head=head, target=dict(run=101, job=201))
+    repair.guard_targeted_tests(tmp_path, request)
+    file.write_text(
+        "import pytest\npytest.skip('disabled', allow_module_level=True)\n" + candidate
+    )
+    with pytest.raises(repair.RepairRejected, match="test assertions"):
+        repair.guard_targeted_tests(tmp_path, request)
+    file.write_text(
+        candidate.replace("def test_result():\n", "def test_result():\n    return\n")
+    )
+    with pytest.raises(repair.RepairRejected, match="test assertions"):
+        repair.guard_targeted_tests(tmp_path, request)
     file.write_text(candidate.replace("atol=0", "atol=1"))
     with pytest.raises(ValueError, match="test assertions"):
         repair.guard_test_assertions(tmp_path, head, base, path)
@@ -799,70 +1071,19 @@ def test_source_screen_retains_public_parents_and_rejects_new_private_text(tmp_p
     repair.identity(tmp_path)
     file = tmp_path / "model.py"
     file.write_text("# head https://example.com/v1\nvalue = 1\n")
-    root_api = tmp_path / repair.ROOT_API
-    root_api.parent.mkdir(parents=True)
-    old_exports = 'from package.ops import mm\n__all__ = ["mm"]\n'
-    bootstrap = "from package import bootstrap as _bootstrap\n_bootstrap()\n"
-    root_api.write_text(old_exports)
-    fp8_api = tmp_path / repair.FP8_API
-    fp8_api.parent.mkdir(parents=True)
-    fp8_api.write_text("value = 1\n")
-    fp8_reference = tmp_path / repair.FP8_REFERENCE
-    fp8_reference.write_text(
-        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return native_quantizer(x)\n"
-    )
     git("add", ".")
     git("commit", "-s", "-m", "initial")
     head = git("rev-parse", "HEAD")
     file.write_text("# main https://example.com/v1\nvalue = 2\n")
-    root_api.write_text(bootstrap)
     git("add", ".")
     git("commit", "-s", "-m", "base")
     base = git("rev-parse", "HEAD")
     file.write_text("# main https://example.com/v1\nvalue = 3\n")
-    assert repair.guard(
-        tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
-    )
-    root_api.write_text(old_exports)
-    with pytest.raises(repair.RepairRejected, match="removed root operator exports"):
-        repair.guard(
-            tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
-        )
-    root_api.write_text(bootstrap)
+    assert repair.guard(tmp_path, head, {"model.py"}, validation_base=base)
     assert repair.new_source_text(tmp_path, head, base, {"model.py"}) == "value = 3"
-    fp8_api.write_text(
-        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return x / x.abs().amax()\n"
-    )
-    with pytest.raises(repair.RepairRejected, match="Reuse main's prepacked quantizer"):
-        repair.guard(
-            tmp_path,
-            head,
-            {"model.py", repair.ROOT_API, repair.FP8_API},
-            validation_base=base,
-        )
-    fp8_api.write_text(
-        "from tokenspeed_kernel.ops.gemm.fp8_utils import flashinfer_fp8_blockscale_quantize_prepacked\n"
-    )
-    assert repair.guard(
-        tmp_path,
-        head,
-        {"model.py", repair.ROOT_API, repair.FP8_API},
-        validation_base=base,
-    )
-    fp8_reference.unlink()
-    with pytest.raises(repair.RepairRejected, match="merged source has no"):
-        repair.guard_prepacked_reference(tmp_path, head, base)
-    fp8_api.write_text(
-        "def flashinfer_fp8_blockscale_quantize_prepacked(x):\n    return registered_quantizer(x)\n"
-    )
-    repair.guard_prepacked_reference(tmp_path, head, base)
-    fp8_reference.write_text(git("show", f"{base}:{repair.FP8_REFERENCE}") + "\n")
-    fp8_api.write_text("value = 1\n")
     file.write_text("# new https://example.com/v1\nvalue = 3\n")
     with pytest.raises(repair.RepairRejected, match="public-output"):
-        repair.guard(
-            tmp_path, head, {"model.py", repair.ROOT_API}, validation_base=base
-        )
+        repair.guard(tmp_path, head, {"model.py"}, validation_base=base)
 
 
 def test_native_dispatch_rejects_changed_workflow_controls(
@@ -930,11 +1151,6 @@ def test_native_failure_diagnostics_include_slurm_artifact(monkeypatch, tmp_path
     monkeypatch.setattr(repair, "api", lambda path: dict(run_attempt=1))
 
     def pages(path, field):
-        if "organization-variables" in path:
-            return [
-                dict(name="KIMI_API_URL", value="provider"),
-                dict(name="KIMI_MODEL", value="planner"),
-            ]
         if "/jobs" in path:
             return [dict(name=check["job"], conclusion="failure", id=201)]
         return [dict(name=check["artifact"], expired=False)]
@@ -955,49 +1171,30 @@ def test_native_failure_diagnostics_include_slurm_artifact(monkeypatch, tmp_path
 
     monkeypatch.setattr(repair, "pages", pages)
     monkeypatch.setattr(repair, "command", command)
+    monkeypatch.setattr(
+        repair,
+        "org_variables",
+        lambda *args: {"KIMI_API_URL": "provider", "KIMI_MODEL": "planner"},
+    )
     repair.configure()
     diagnostics = tmp_path.joinpath("model/diagnostics.txt").read_text()
     assert "native job failure evidence" in diagnostics
     assert "native Slurm failure evidence" in diagnostics
-    request["diagnostics"] = {
-        "run_ids": {},
-        "native_checks": [
-            dict(workflow="nvidia-kernel-library-tests.yml", status="failed", run=102)
-        ],
-    }
+    request["state"]["target"] = dict(run=101, job=201)
     tmp_path.joinpath("request.json").write_text(json.dumps(request))
-    requested = []
     monkeypatch.setattr(
-        repair, "api", lambda path: requested.append(path) or dict(run_attempt=1)
+        repair,
+        "api",
+        lambda path: (
+            dict(id=201, run_id=101, name=check["job"], head_sha="a" * 40)
+            if "/jobs/" in path
+            else dict(run_attempt=1)
+        ),
     )
     repair.configure()
-    assert requested == ["actions/runs/102"]
-    prior = {
-        **request,
-        "state": {
-            "repair_run": 201,
-            "repository": REPO,
-            "pr": 123,
-            "head": "a" * 40,
-            "base": "b" * 40,
-            "command": 43,
-        },
-    }
-    prior["state"]["validation_base"] = "b" * 40
-    previous = tmp_path / "previous-repair"
-    previous.mkdir()
-    previous.joinpath("request.json").write_text(json.dumps(prior))
-    previous.joinpath("patch.diff").write_text("accepted source edits")
-    request.update(resume_run=201, state={**prior["state"], "repair_run": 202})
-    request.pop("diagnostics")
-    tmp_path.joinpath("request.json").write_text(json.dumps(request))
-    requested.clear()
-    repair.configure()
-    assert requested == ["actions/runs/102"]
-    assert (
-        json.loads(tmp_path.joinpath("request.json").read_text())["diagnostics"]
-        == prior["diagnostics"]
-    )
+    diagnostics = tmp_path.joinpath("model/diagnostics.txt").read_text()
+    assert "native job failure evidence" in diagnostics
+    assert "native Slurm failure evidence" in diagnostics
 
 
 def test_failed_task_retries_once_and_falls_back_only_before_submission(
@@ -1083,6 +1280,9 @@ def test_active_native_work_and_queued_slurm_or_amd_are_reused(monkeypatch, sele
     task.update(cluster="", runner="amd-1gpu", native_runners=["amd-1gpu"])
     run["name"] = "AMD Tests"
     queued["name"] = "unit-test / runtime (amd-1gpu)"
+    assert assist.task_status(task, state, [run], submit=True) == "waiting"
+    run["name"] = "AMD Kernel Benchmark"
+    queued["name"] = "kernel-benchmark / runtime (amd-1gpu)"
     assert assist.task_status(task, state, [run], submit=True) == "waiting"
 
 
@@ -1246,7 +1446,7 @@ def test_promotion_needs_nonempty_matching_task_result(selected):
     )
 
 
-def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path, monkeypatch):
+def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path):
     def git(*args):
         return assist.command(
             "git", "-c", "core.hooksPath=/dev/null", *args, cwd=tmp_path
@@ -1303,47 +1503,6 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path, monkey
     with pytest.raises(repair.RepairRejected, match="file type or mode"):
         repair.guard(tmp_path, head, allowed, validation_base=base)
     retained.chmod(0o644)
-    seed_work = tmp_path.parent / (tmp_path.name + "-seed")
-    previous = seed_work / "previous-repair"
-    previous.mkdir(parents=True)
-    previous.joinpath("patch.diff").write_text(diff + "\n")
-    state = dict(
-        repository=REPO,
-        pr=123,
-        head=head,
-        base=common,
-        command=43,
-        validation_base=base,
-        repair_run=201,
-    )
-    previous.joinpath("request.json").write_text(json.dumps({"state": state}))
-    request = dict(state={**state, "repair_run": 202}, resume_run=201)
-    monkeypatch.setattr(repair, "ROOT", tmp_path)
-    monkeypatch.setattr(repair, "WORK", seed_work)
-    git("remote", "add", "origin", str(tmp_path))
-    git("reset", "--hard", head)
-    assert not retained.exists()
-    git("apply", "--index", str(previous / "patch.diff"))
-    assert repair.guard(tmp_path, head, allowed, validation_base=base) == diff
-    git("reset", "--hard", head)
-    repair.merge(tmp_path, base, commit=False)
-    previous.joinpath("request.json").write_text(
-        json.dumps({"state": {**state, "command": 42}})
-    )
-    with pytest.raises(ValueError, match="authorized PR"):
-        repair.seed_repair(tmp_path, request, allowed, conflicts)
-    previous.joinpath("request.json").write_text(json.dumps({"state": state}))
-    assert repair.seed_repair(tmp_path, request, allowed, conflicts)
-    request.update(check_only=True, deadline=1893459600)
-    seed_work.joinpath("request.json").write_text(json.dumps(request))
-    repair.reuse()
-    replay = json.loads(seed_work.joinpath("request.json").read_text())
-    assert replay["deadline"] == request["deadline"]
-    assert replay["state"] == request["state"]
-    assert (
-        seed_work.joinpath("patch.diff").read_bytes()
-        == previous.joinpath("patch.diff").read_bytes()
-    )
     repair.restore_patch(tmp_path, head, allowed)
     assert file.read_text() == "value = 4\n"
     assert retained.read_text().endswith("assert value == 2\n")
@@ -1376,40 +1535,6 @@ def test_conflict_patch_preserves_main_and_can_be_cherry_picked(tmp_path, monkey
     with pytest.raises(ValueError, match="selected commit"):
         write_source(tmp_path, "f" * 40, "test/ci/example.yaml", "amd-1gpu")
 
-    # A main update outside the model's patch can refresh checks while keeping
-    # the resolved source; an overlapping change needs a fresh model repair.
-    git("checkout", "--detach", base)
-    other.write_text("base_only = False\n")
-    git("add", "--", "base.py")
-    git("commit", "-s", "-m", "updated base")
-    updated = git("rev-parse", "HEAD")
-    git("checkout", "--detach", head)
-    file.write_text("value = 4\n")
-    request = {
-        "state": {"head": head, "base": common, "validation_base": base},
-        "conflicted_tests": sorted([test_path, renamed_path]),
-        "conflicted_paths": sorted(conflicts),
-    }
-    retained.write_text(git("show", f"{base}:{renamed_path}") + "\n")
-    git("add", "--", renamed_path)
-    repair.refresh_validation_base(tmp_path, request, updated)
-    assert file.read_text() == "value = 4\n" and not other.exists()
-    assert request["state"]["validation_base"] == updated
-    assert request["repair_base"] == base
-    assert repair.guard(tmp_path, head, allowed, validation_base=updated)
-    git("reset", "--hard", head)
-    git("checkout", "--detach", updated)
-    file.write_text("value = 5\n")
-    git("add", "--", "model.py")
-    git("commit", "-s", "-m", "overlapping base")
-    overlapping = git("rev-parse", "HEAD")
-    git("checkout", "--detach", head)
-    file.write_text("value = 4\n")
-    request["state"]["validation_base"] = base
-    with pytest.raises(ValueError, match="Main changed repaired files"):
-        repair.refresh_validation_base(tmp_path, request, overlapping)
-    assert file.read_text() == "value = 4\n"
-
 
 def test_source_change_stops_before_dispatch(monkeypatch, tmp_path, selected):
     _, state = selected
@@ -1433,6 +1558,142 @@ def test_source_change_stops_before_dispatch(monkeypatch, tmp_path, selected):
     )
     assist.control(state["pr"])
     assert state["phase"] == "stale" and len(published) == 1
+
+
+@pytest.fixture
+def main_advance_repo(tmp_path, selected):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(*args):
+        return assist.command(
+            "git", "-c", "core.hooksPath=/dev/null", *args, cwd=source
+        )
+
+    def commit(path, text):
+        target = source / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+        git("add", "--all")
+        git("commit", "-s", "-m", "test input")
+        return git("rev-parse", "HEAD")
+
+    git("init", "-b", "main")
+    repair.identity(source)
+    path = "tokenspeed-kernel-amd/python/transform.py"
+    commit(path, "value = 1\n")
+    shared = "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/cuda.py"
+    base = commit(shared, "is_amd = True\n")
+    git("checkout", "-b", "pr")
+    head = commit(path, "value = 2\n")
+    patch = commit(path, "value = 3\n")
+    _, state = selected
+    state.update(
+        head=head,
+        base=base,
+        validation_base=base,
+        repair_run=200,
+        action="fix",
+        phase="validating",
+        native_checks=[],
+        candidate=dict(
+            patch=patch,
+            validation=patch,
+            tree=git("rev-parse", "HEAD^{tree}"),
+            branch="bot/pr-ci-assist-123-42-200",
+        ),
+    )
+    state["tasks"][0].update(runner="amd-mi35x-1gpu-test", cluster="")
+    git("checkout", "main")
+    return source, git, commit, state, path, shared
+
+
+def test_pr_source_matches_allows_main_advance_within_validation_base(
+    main_advance_repo, monkeypatch
+):
+    source, _, commit, state, _, _ = main_advance_repo
+    docs = commit("docs/guide.md", "Documentation\n")
+    other_vendor = commit("tokenspeed-mla/python/kernel.py", "value = 1\n")
+    pr = dict(head=dict(sha=state["head"]), base=dict(sha=docs))
+    monkeypatch.setattr(assist, "api", lambda _: {"object": {"sha": other_vendor}})
+    assert assist.pr_source_matches(state, pr, source=source)
+    pr["head"]["sha"] = docs
+    assert not assist.pr_source_matches(state, pr, source=source)
+
+
+def test_promotion_reuses_original_tree_but_rechecks_latest_main(
+    main_advance_repo, monkeypatch, tmp_path
+):
+    source, git, commit, state, path, _ = main_advance_repo
+    main = commit("docs/guide.md", "Documentation\n")
+    changed = commit(path, "value = 4\n")
+    git("remote", "add", "origin", str(source))
+    git("checkout", "--detach", state["head"])
+    pr = dict(head=dict(sha=state["head"], ref="pr"), base=dict(sha=state["base"]))
+    monkeypatch.setattr(repair, "ROOT", source)
+    monkeypatch.setattr(repair, "WORK", tmp_path)
+    monkeypatch.setattr(repair, "public_gate", lambda: None)
+    monkeypatch.setattr(repair, "pull", lambda _: pr)
+    monkeypatch.setattr(repair, "pages", lambda *args: [])
+    monkeypatch.setattr(repair, "latest_command", lambda _: {"id": state["command"]})
+    monkeypatch.setattr(repair.time, "time", lambda: 50)
+    mains = [main, main]
+
+    def api(endpoint):
+        return {
+            "object": {
+                "sha": (
+                    mains.pop(0)
+                    if endpoint == "git/ref/heads/main"
+                    else state["candidate"]["validation"]
+                )
+            }
+        }
+
+    monkeypatch.setattr(repair, "api", api)
+    pushed = []
+    monkeypatch.setattr(
+        repair, "push", lambda *args, **kwargs: pushed.append(git("rev-parse", "HEAD"))
+    )
+    repair.promote(state, deadline=100)
+    assert len(pushed) == 1
+    assert git("rev-parse", "HEAD^") == state["head"]
+    assert git("rev-parse", "HEAD^{tree}") == state["candidate"]["tree"]
+    assert not source.joinpath("docs/guide.md").exists()
+    # A conflicting change arriving during promotion must stop the push, even
+    # if the earlier documentation edit merged cleanly with the candidate.
+    git("checkout", "--detach", state["head"])
+    mains[:] = [main, changed]
+    with pytest.raises(ValueError, match="conflicts with current main"):
+        repair.promote(state, deadline=100)
+    assert len(pushed) == 1
+
+
+def test_repair_plan_requires_the_original_authorized_source(monkeypatch, selected):
+    _, state = selected
+    state.update(action="fix", repair_run=201)
+    request = dict(state=copy.deepcopy(state), plan={"run": 55})
+    run = dict(id=201, path=".github/workflows/pr-ci-assist.yml", event="issue_comment")
+    monkeypatch.setattr(assist, "api", lambda _: run)
+
+    def download(owner, name, target):
+        assert owner == run and name == "repair-request"
+        target.joinpath("request.json").write_text(json.dumps(request))
+
+    monkeypatch.setattr(assist, "download", download)
+    assert assist.repair_plan(state) == request["plan"]
+    run.update(path=".github/workflows/pr-ci-assist-dispatch.yml", event="workflow_run")
+    assert assist.repair_plan(state) == request["plan"]
+    run["event"] = "issue_comment"
+    with pytest.raises(ValueError, match="Unexpected repair workflow"):
+        assist.repair_plan(state)
+    run["event"] = "workflow_run"
+    request["state"]["command"] += 1
+    with pytest.raises(ValueError, match="another authorized source"):
+        assist.repair_plan(state)
+    run["path"] = ".github/workflows/pr-ci-plan.yml"
+    with pytest.raises(ValueError, match="Unexpected repair workflow"):
+        assist.repair_plan(state)
 
 
 def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
@@ -1479,6 +1740,14 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     monkeypatch.setattr(assist, "load_state", lambda *args: copy.deepcopy(live[0]))
     monkeypatch.setattr(assist, "latest_command", lambda *args: author)
 
+    def download(owner, name, target):
+        request = json.loads(tmp_path.joinpath("request.json").read_text())
+        assert owner["id"] == request["state"]["repair_run"]
+        assert name == "repair-request"
+        target.joinpath("request.json").write_text(json.dumps(request))
+
+    monkeypatch.setattr(assist, "download", download)
+
     def publish(s, message):
         live[0] = copy.deepcopy(s)
 
@@ -1491,7 +1760,13 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
         lambda path: (
             {
                 "name": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
-                "path": ".github/workflows/pr-ci-plan.yml",
+                "id": int(path.rsplit("/", 1)[-1]),
+                "event": "workflow_dispatch",
+                "path": (
+                    ".github/workflows/pr-ci-plan.yml"
+                    if path == "actions/runs/55"
+                    else ".github/workflows/pr-ci-assist.yml"
+                ),
                 "conclusion": "success",
                 "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
                 "status": "completed",
@@ -1585,26 +1860,29 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     assist.control(state["pr"])
     assert not emitted and live[0]["phase"] == "manual"
     pr["head"]["sha"] = state["head"]
-    # An explicit retry may refresh main while retaining the authorized PR head.
+    # An explicit retry starts a fresh repair from the retained authorized fix.
     live[0].update(phase="stale", validation_base="f" * 40)
-    monkeypatch.setenv("REPAIR_CHECK_ONLY", "true")
-    with pytest.raises(ValueError, match="authorized previous repair"):
-        assist.control(state["pr"])
-    monkeypatch.setenv("REPAIR_RUN", "199")
-    with pytest.raises(ValueError, match="authorized retry"):
-        assist.control(state["pr"])
-    monkeypatch.setenv("REPAIR_RUN", "200")
     assist.control(state["pr"])
     assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
     assert live[0]["command"] == 43 and live[0]["repair_run"] == 201
-    assert (
-        json.loads(tmp_path.joinpath("request.json").read_text())["resume_run"] == 200
+    assert live[0]["validation_base"] == state["base"]
+    request = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert set(request) == {
+        "state",
+        "plan",
+        "data",
+        "conflicts",
+        "deadline",
+        "lint_run",
+    }
+    # A newer plan for the same PR source must not change an existing candidate's
+    # checks, even when a manual retry recovers state written by an old monitor.
+    comments.append(
+        {
+            "user": {"login": BOT, "id": BOT_ID},
+            "body": marker("plan", {**plan, "run": 56, "tasks": []}),
+        }
     )
-    monkeypatch.delenv("REPAIR_RUN")
-    assert (
-        json.loads(tmp_path.joinpath("request.json").read_text())["check_only"] is True
-    )
-    monkeypatch.delenv("REPAIR_CHECK_ONLY")
     # The validation branch has a different immutable source; an old head pass
     # must not authorize promotion of that candidate.
     live[0].update(
@@ -1616,9 +1894,16 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
             "branch": "bot/pr-ci-assist-123-43",
         },
     )
+    monkeypatch.setattr(assist, "main_merge_clean", lambda *args, **kwargs: True)
     monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
     promoted = []
-    monkeypatch.setattr(repair, "promote", lambda s: promoted.append(copy.deepcopy(s)))
+    promotion_deadlines = []
+
+    def promote(s, *, deadline):
+        promoted.append(copy.deepcopy(s))
+        promotion_deadlines.append(deadline)
+
+    monkeypatch.setattr(repair, "promote", promote)
     monkeypatch.setattr(assist, "report", lambda *args: "passed")
     assist.control(state["pr"])
     assert not promoted and len(dispatched) == 2
@@ -1654,73 +1939,44 @@ def test_watch_failure_then_authorized_fix_waits_for_candidate_validation(
     monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "promoted"
-    # Recover a controller failure using the same checked candidate and hour.
+    # A manual rerun with a retained candidate harvests its existing results on
+    # a 15-minute budget anchored at the new run, dispatching nothing; a later
+    # rerun promotes the same candidate once every check has passed.
     live[0]["phase"] = "manual"
     assist.control(state["pr"])
     assert len(promoted) == 1 and live[0]["phase"] == "manual"
     monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+    original_api = assist.api
+    monkeypatch.setattr(
+        assist,
+        "api",
+        lambda path: (
+            {**original_api(path), "run_started_at": "2030-01-01T01:00:00Z"}
+            if path == "actions/runs/999"
+            else original_api(path)
+        ),
+    )
     monkeypatch.setattr(assist.time, "time", lambda: 1893459600)
-    assist.control(state["pr"])
-    assert len(promoted) == 1 and live[0]["phase"] == "manual"
-    monkeypatch.setattr(assist.time, "time", lambda: 1893459599)
-    assist.control(state["pr"])
-    assert len(promoted) == 2 and live[0]["phase"] == "promoted"
-    assert promoted[-1]["candidate"] == promoted[0]["candidate"]
-    assert promoted[-1]["repair_run"] == promoted[0]["repair_run"]
-    # Explicitly continue a failed candidate from its owning repair artifact.
-    # Old candidate diagnostics survive, but none of its passes authorize the
-    # fresh candidate or skip the model turn.
-    failed = dict(workflow=workflow, status="failed", run=103)
-    live[0].update(phase="manual", native_checks=[failed])
-    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
-    monkeypatch.setenv("GITHUB_RUN_ID", "202")
-    monkeypatch.setenv("REPAIR_RUN", "201")
-    monkeypatch.setenv("REPAIR_CHECK_ONLY", "true")
-    with pytest.raises(ValueError, match="authorized retry"):
-        assist.control(state["pr"])
-    monkeypatch.delenv("REPAIR_CHECK_ONLY")
+    native_status = ["waiting"]
+    monkeypatch.setattr(
+        assist,
+        "native_check",
+        lambda *args: dict(workflow=workflow, status=native_status[0], run=103),
+    )
     emitted.clear()
     assist.control(state["pr"])
-    retry = json.loads(tmp_path.joinpath("request.json").read_text())
-    assert live[0]["phase"] == "repairing" and emitted == [("repair", "true")]
-    assert retry["resume_run"] == 201 and retry["state"]["repair_run"] == 202
-    assert retry["diagnostics"]["native_checks"] == [failed]
-    assert "candidate" not in retry["state"] and not retry["check_only"]
-    live[0].update(
-        phase="manual",
-        statuses=["waiting"],
-        native_checks=[dict(workflow=workflow, status="waiting", run=104)],
-        candidate=dict(
-            patch="c" * 40,
-            validation="d" * 40,
-            tree="e" * 40,
-            branch="bot/pr-ci-assist-123-43-202",
-        ),
-    )
-    monkeypatch.setenv("GITHUB_RUN_ID", "203")
-    monkeypatch.setenv("REPAIR_RUN", "202")
+    assert live[0]["phase"] == "manual" and live[0]["repair_run"] == 201
+    assert len(promoted) == 1 and len(dispatched) == 2 and not emitted
+    native_status[0] = "passed"
     assist.control(state["pr"])
-    retry = json.loads(tmp_path.joinpath("request.json").read_text())
-    assert "diagnostics" not in retry
-    # A native failure arriving after the old deadline replaces stale inputs.
-    live[0].update(
-        phase="manual",
-        native_checks=[dict(workflow=workflow, status="waiting", run=105)],
-        candidate=dict(
-            patch="c" * 40,
-            validation="d" * 40,
-            tree="e" * 40,
-            branch="bot/pr-ci-assist-123-43-203",
-        ),
-    )
-    late = dict(workflow=workflow, status="failed", run=105)
-    monkeypatch.setattr(assist, "native_check", lambda *args: late)
-    monkeypatch.setenv("REPAIR_RUN", "203")
-    monkeypatch.setenv("GITHUB_RUN_ID", "204")
-    assist.control(state["pr"])
-    retry = json.loads(tmp_path.joinpath("request.json").read_text())
-    assert retry["diagnostics"]["native_checks"] == [late]
-    assert retry["resume_run"] == 203 and not retry["check_only"]
+    assert len(promoted) == 2 and live[0]["phase"] == "promoted"
+    assert promotion_deadlines[-1] == 1893460500
+    assert promoted[-1]["candidate"] == promoted[0]["candidate"]
+    assert promoted[-1]["tasks"] == [plain]
+    assert promoted[-1]["repair_run"] == 201
+    assert promoted[-1]["validation_base"] == promoted[0]["validation_base"]
+    assert len(dispatched) == 2 and not emitted
 
 
 def test_owned_request_recovers_only_an_unowned_monitor_update(monkeypatch, selected):
@@ -1751,7 +2007,7 @@ def test_owned_request_recovers_only_an_unowned_monitor_update(monkeypatch, sele
     assert published == [state]
 
 
-def test_cancelled_repair_is_recovered_on_next_reconciliation(
+def test_cancelled_repair_run_requests_help_on_the_next_event(
     monkeypatch, tmp_path, selected
 ):
     task, state = selected
@@ -1799,51 +2055,136 @@ def test_cancelled_repair_is_recovered_on_next_reconciliation(
     assert state["phase"] == "manual" and len(messages) == 1
 
 
-def test_queued_validation_expires_without_a_completion_event(monkeypatch, selected):
+def test_queued_validation_expires_without_a_completion_event(
+    monkeypatch, tmp_path, selected
+):
+    """An expired budget turns manual on the next event; nothing polls for it."""
     _, state = selected
-    state.update(action="fix", phase="validating")
-    request = {"state": state, "deadline": 100}
-    now = [40]
-    monkeypatch.setattr(repair.time, "time", lambda: now[0])
+    state.update(action="fix", phase="validating", repair_run=201)
+    pr = {
+        "number": state["pr"],
+        "head": {"sha": state["head"]},
+        "base": {"sha": state["base"]},
+    }
+    event = tmp_path / "event.json"
+    event.write_text("{}")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pull", lambda n: pr)
+    monkeypatch.setattr(assist, "pages", lambda *args: [])
+    monkeypatch.setattr(assist, "load_state", lambda *args: state)
+    monkeypatch.setattr(assist, "latest_command", lambda *args: None)
     monkeypatch.setattr(
-        repair.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds)
-    )
-    reconciled = []
-    monkeypatch.setattr(
-        repair.subprocess,
-        "run",
-        lambda args, **kwargs: reconciled.append((args, kwargs)),
-    )
-    monkeypatch.setattr(repair, "pull", lambda number: {})
-    monkeypatch.setattr(repair, "pages", lambda *args: [])
-    monkeypatch.setattr(repair, "load_state", lambda *args: state)
-    monkeypatch.setattr(
-        repair, "latest_command", lambda *args: {"id": state["command"]}
+        assist,
+        "api",
+        lambda path: {
+            "status": "completed",
+            "run_started_at": "2020-01-01T00:00:00Z",
+        },
     )
     messages = []
-    monkeypatch.setattr(repair, "publish", lambda *args: messages.append(args[1]))
-    repair.wait_for_validation(request)
-    assert len(reconciled) == 1 and reconciled[0][1]["timeout"] == 60
-    assert reconciled[0][0][1] == str(repair.ROOT / ".github/scripts/pr_ci_assist.py")
-    assert reconciled[0][0][-2:] == ["--command", str(state["command"])]
+    monkeypatch.setattr(assist, "publish", lambda *args: messages.append(args[1]))
+    monkeypatch.setattr(
+        assist, "dispatch", lambda *args: pytest.fail("expired budget dispatched")
+    )
+    assist.control(state["pr"])
     assert state["phase"] == "manual" and "one-hour" in messages[0]
 
 
-def test_validation_poll_does_not_consume_a_new_repair_command(monkeypatch, selected):
-    _, state = selected
-    state.update(action="fix", phase="validating")
+def test_manual_dispatch_retry_revalidates_candidate_or_repairs_afresh(
+    monkeypatch, tmp_path, selected
+):
+    task, state = selected
+    state.update(action="fix", phase="manual", repair_run=201)
+    plan = {k: state[k] for k in ("version", "repository", "pr", "head", "base")}
+    plan.update(run=55, tests=[], tasks=state["tasks"])
+    comments = [{"user": {"login": BOT, "id": BOT_ID}, "body": marker("plan", plan)}]
+    pr = {
+        "number": state["pr"],
+        "head": {"sha": state["head"]},
+        "base": {"sha": state["base"]},
+        "mergeable": True,
+    }
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("GITHUB_RUN_ID", "202")
+    monkeypatch.setattr(assist, "WORK", tmp_path)
     monkeypatch.setattr(assist, "public_gate", lambda: None)
-    monkeypatch.setattr(assist, "pull", lambda number: {})
-    monkeypatch.setattr(assist, "pages", lambda *args: [])
+    monkeypatch.setattr(assist, "pull", lambda n: pr)
+    monkeypatch.setattr(assist, "pages", lambda *args: comments)
     monkeypatch.setattr(assist, "load_state", lambda *args: state)
     monkeypatch.setattr(
-        assist, "latest_command", lambda *args: {"id": state["command"] + 1}
+        assist,
+        "latest_command",
+        lambda *args: {"id": state["command"], "body": "@lightseek-bot fix"},
     )
+    monkeypatch.setattr(assist, "permitted", lambda *args: "fix")
+    monkeypatch.setattr(assist, "checkout", lambda *args: tmp_path)
+    monkeypatch.setattr(assist, "context", lambda *args: {})
+    monkeypatch.setattr(assist, "validate_plan", lambda *args: [task])
+    monkeypatch.setattr(assist, "runs_for", lambda *args: [])
+    monkeypatch.setattr(assist, "main_merge_clean", lambda *args, **kwargs: True)
     monkeypatch.setattr(
-        assist, "permitted", lambda *args: pytest.fail("Poll consumed a new command")
+        assist,
+        "api",
+        lambda path: (
+            {"status": "completed", "run_started_at": "2030-01-01T00:00:00Z"}
+            if path == "actions/runs/201"
+            else (
+                {
+                    "name": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+                    "path": ".github/workflows/pr-ci-plan.yml",
+                    "conclusion": "success",
+                    "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+                    "run_started_at": "2030-01-01T00:00:00Z",
+                }
+                if "actions/runs" in path
+                else {"object": {"sha": state["base"]}}
+            )
+        ),
     )
-    assist.control(state["pr"], expected_command=state["command"])
-    assert state["phase"] == "validating"
+    published = []
+    monkeypatch.setattr(assist, "publish", lambda s, m: published.append(s["phase"]))
+    emitted = []
+    monkeypatch.setattr(assist, "output", lambda *args: emitted.append(args))
+    # Without a candidate the retry starts a fresh repair, even when the
+    # original failure evidence no longer fails right now.
+    monkeypatch.setattr(assist, "task_status", lambda *args, **kwargs: "passed")
+    assist.control(state["pr"])
+    assert published == ["repairing"] and emitted == [("repair", "true")]
+    request = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert request["state"]["repair_run"] == 202
+    assert set(request) == {
+        "state",
+        "plan",
+        "data",
+        "conflicts",
+        "deadline",
+        "lint_run",
+    }
+    # With a retained candidate the retry harvests existing results within a
+    # 15-minute window: no new repair, no new dispatch, original repair run.
+    state.update(
+        phase="manual",
+        repair_run=201,
+        candidate=dict(
+            patch="c" * 40,
+            validation="d" * 40,
+            tree="e" * 40,
+            branch="bot/pr-ci-assist-123-42-201",
+        ),
+    )
+    published.clear()
+    emitted.clear()
+    monkeypatch.setenv("GITHUB_RUN_ID", "203")
+    monkeypatch.setattr(assist, "repair_plan", lambda _: plan)
+    monkeypatch.setattr(assist, "task_status", lambda *args, **kwargs: "waiting")
+    monkeypatch.setattr(
+        assist, "dispatch", lambda *args: pytest.fail("retry duplicated validation")
+    )
+    assist.control(state["pr"])
+    assert state["phase"] == "manual" and state["repair_run"] == 201
+    assert published == ["manual"] and not emitted
 
 
 def test_rejected_patch_receives_feedback_within_the_original_budget(
@@ -1865,7 +2206,7 @@ def test_rejected_patch_receives_feedback_within_the_original_budget(
         now[0] += 10
 
     def proposal():
-        if len(turns) < 4:
+        if len(turns) < 3:
             raise repair.RepairRejected(
                 "test-assertions",
                 path="test/example.py",
@@ -1877,7 +2218,7 @@ def test_rejected_patch_receives_feedback_within_the_original_budget(
         repair.repair_with_feedback(request, run_model, proposal, feedback)
         == "accepted patch"
     )
-    assert turns == [60, 50, 40, 30] and request["deadline"] == 100
+    assert turns == [60, 50, 40] and request["deadline"] == 100
     output = capsys.readouterr().out
     assert "test/example.py" in output and "private diagnostic" not in output
     turns.clear()
@@ -1889,7 +2230,7 @@ def test_rejected_patch_receives_feedback_within_the_original_budget(
         repair.repair_with_feedback(
             request, lambda attempt: turns.append(attempt), rejected, feedback
         )
-    assert turns == list(range(8))
+    assert turns == list(range(3))
     now[0] = request["deadline"]
     with pytest.raises(ValueError, match="budget expired"):
         repair.repair_with_feedback(
@@ -2014,7 +2355,7 @@ def test_promotion_accepts_only_owned_validation_branch(
     )
     monkeypatch.setattr(repair, "WORK", tmp_path)
     monkeypatch.setattr(repair, "public_gate", lambda: None)
-    monkeypatch.setattr(repair, "repair_deadline", lambda s: 1893459600)
+    monkeypatch.setattr(repair, "main_merge_clean", lambda *args, **kwargs: True)
     monkeypatch.setattr(repair.time, "time", lambda: 1893459599)
     monkeypatch.setattr(
         repair,
@@ -2034,7 +2375,237 @@ def test_promotion_accepts_only_owned_validation_branch(
 
     monkeypatch.setattr(repair, "command", command)
     with pytest.raises(FetchReached):
-        repair.promote(state)
+        repair.promote(state, deadline=1893459600)
     state["candidate"]["branch"] = "bot/pr-ci-assist-123-42-199"
     with pytest.raises(ValueError, match="Invalid candidate record"):
-        repair.promote(state)
+        repair.promote(state, deadline=1893459600)
+
+
+def test_rerun_command_requires_a_job_url(monkeypatch, selected):
+    _, state = selected
+    monkeypatch.setattr(assist, "api", lambda path: {"permission": "write"})
+    url = f"https://github.com/{REPO}/actions/runs/101/job/201"
+    author = {"user": {"login": "someone"}}
+    assert (
+        assist.permitted({**author, "body": f"@lightseek-bot rerun {url}"}) == "rerun"
+    )
+    assert assist.permitted({**author, "body": "@lightseek-bot rerun"}) is None
+    assert assist.permitted({**author, "body": f"@lightseek-bot watch {url}"}) is None
+    # The rerun action and its target round-trip through the state record.
+    state.update(action="rerun", target={"run": 101, "job": 201})
+    comment = {"user": {"login": BOT, "id": BOT_ID}, "body": marker("assist", state)}
+    assert record(comment, "assist") == state
+
+
+def test_rerun_redispatches_and_failure_escalates_to_repair(
+    monkeypatch, tmp_path, selected
+):
+    task, state = selected
+    plan = {k: state[k] for k in ("version", "repository", "pr", "head", "base")}
+    plan.update(run=55, tests=[], tasks=state["tasks"])
+    comments = [{"user": {"login": BOT, "id": BOT_ID}, "body": marker("plan", plan)}]
+    command_comment = {
+        "id": 43,
+        "body": (
+            f"@lightseek-bot rerun "
+            f"https://github.com/{REPO}/actions/runs/101/job/201"
+        ),
+    }
+    pr = {
+        "number": state["pr"],
+        "head": {"sha": state["head"]},
+        "base": {"sha": state["base"]},
+        "mergeable": True,
+    }
+    live = [None]
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "issue_comment")
+    monkeypatch.setenv("GITHUB_RUN_ID", "200")
+    monkeypatch.setattr(assist, "WORK", tmp_path)
+    monkeypatch.setattr(assist, "public_gate", lambda: None)
+    monkeypatch.setattr(assist, "pull", lambda n: pr)
+    monkeypatch.setattr(assist, "pages", lambda *args: comments)
+    monkeypatch.setattr(assist, "load_state", lambda *args: copy.deepcopy(live[0]))
+    monkeypatch.setattr(assist, "latest_command", lambda *args: command_comment)
+    monkeypatch.setattr(assist, "permitted", lambda *args: "rerun")
+    monkeypatch.setattr(assist, "checkout", lambda *args: tmp_path)
+    monkeypatch.setattr(assist, "context", lambda *args: {})
+    monkeypatch.setattr(assist, "targeted_plan", lambda plan, *args: plan)
+    monkeypatch.setattr(assist, "validate_plan", lambda *args: [task])
+    monkeypatch.setattr(assist, "main_merge_clean", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        assist,
+        "api",
+        lambda path: (
+            {
+                "path": ".github/workflows/pr-ci-plan.yml",
+                "conclusion": "success",
+                "display_title": f"CI plan #{state['pr']} | {state['head']} | {state['base']}",
+                "run_started_at": "2030-01-01T00:00:00Z",
+            }
+            if path == "actions/runs/55"
+            else (
+                {"run_started_at": "2030-01-01T00:00:00Z"}
+                if "actions/runs" in path
+                else {"object": {"sha": "c" * 40}}
+            )
+        ),
+    )
+    published = []
+
+    def publish(s, message):
+        live[0] = copy.deepcopy(s)
+        published.append(s["phase"])
+
+    monkeypatch.setattr(assist, "publish", publish)
+    emitted = []
+    monkeypatch.setattr(assist, "output", lambda *args: emitted.append(args))
+    dispatched = []
+    monkeypatch.setattr(assist, "dispatch", lambda *args: dispatched.append(args))
+    title = assist.run_title(task, state["head"], "gb200")
+    bot_run = {
+        "id": 999,
+        "event": "workflow_dispatch",
+        "head_branch": "main",
+        "actor": {"login": BOT},
+        "display_title": title,
+    }
+    runs = [[]]
+    monkeypatch.setattr(assist, "runs_for", lambda *args: runs[0])
+    report = ["waiting"]
+    monkeypatch.setattr(assist, "report", lambda *args: report[0])
+
+    # The rerun command re-dispatches the target's validation task; the
+    # inherited submission from an earlier watch must not suppress it.
+    live[0] = {**state, "submitted": [title]}
+    assist.control(state["pr"])
+    assert dispatched == [(task, state["head"], "gb200")]
+    assert live[0]["phase"] == "watching"
+    assert live[0]["action"] == "rerun" and live[0]["since"] == 43
+    assert live[0]["target"] == {"run": 101, "job": 201}
+    assert published == ["watching", "watching"] and not emitted
+
+    # A passed rerun closes the request without touching the repair flow.
+    runs[0] = [bot_run]
+    report[0] = "passed"
+    published.clear()
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_run")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "done"
+    assert published == ["done"] and not emitted
+
+    # A failed rerun escalates into the repair flow with the target diagnostics.
+    report[0] = "failed"
+    published.clear()
+    live[0].update(phase="watching")
+    monkeypatch.setenv("GITHUB_RUN_ID", "202")
+    assist.control(state["pr"])
+    assert live[0]["phase"] == "repairing" and live[0]["repair_run"] == 202
+    assert emitted == [("repair", "true")]
+    request = json.loads(tmp_path.joinpath("request.json").read_text())
+    assert request["state"]["action"] == "rerun"
+    assert request["state"]["target"] == {"run": 101, "job": 201}
+    assert set(request) == {
+        "state",
+        "plan",
+        "data",
+        "conflicts",
+        "deadline",
+        "lint_run",
+    }
+
+
+def test_sweep_picks_the_oldest_active_authorized_pr(monkeypatch, tmp_path):
+    prs = [
+        {
+            "number": 1,
+            "state": "open",
+            "head": {"repo": {"full_name": REPO}, "sha": "a" * 40},
+            "base": {"ref": "main"},
+        },
+        {
+            "number": 2,
+            "state": "open",
+            "head": {"repo": {"full_name": REPO}, "sha": "b" * 40},
+            "base": {"ref": "main"},
+        },
+        {
+            "number": 3,
+            "state": "open",
+            "head": {"repo": None},
+            "base": {"ref": "main"},
+        },
+        {
+            "number": 4,
+            "state": "open",
+            "head": {"repo": {"full_name": REPO}, "sha": "c" * 40},
+            "base": {"ref": "dev"},
+        },
+    ]
+    comments = {
+        1: [{"id": 11, "updated_at": "2026-10-10T00:00:01Z"}],
+        2: [{"id": 22, "updated_at": "2026-10-10T00:00:02Z"}],
+        5: [{"id": 55, "updated_at": "2026-10-10T00:00:03Z"}],
+    }
+    states = {
+        1: {"phase": "done"},
+        2: {"phase": "watching"},
+        5: ValueError("revoked"),
+    }
+
+    def pages(path, field):
+        if path == "pulls?state=open":
+            return prs
+        number = int(path.split("/")[1])
+        return comments.get(number, [])
+
+    monkeypatch.setattr(assist, "pages", pages)
+    monkeypatch.setattr(
+        assist,
+        "latest_state_comment",
+        lambda cs, number: (cs or [None])[-1],
+    )
+
+    def load_state(cs, pr):
+        state = states[pr["number"]]
+        if isinstance(state, Exception):
+            raise state
+        return state
+
+    monkeypatch.setattr(assist, "load_state", load_state)
+    assert assist.sweep() == 2
+    states[2] = {"phase": "manual"}
+    assert assist.sweep() is None
+
+
+def test_resolve_schedule_outputs_the_swept_pr(monkeypatch, tmp_path):
+    output = tmp_path / "output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(tmp_path / "event.json"))
+    tmp_path.joinpath("event.json").write_text("{}")
+    pr = {
+        "number": 2,
+        "state": "open",
+        "head": {"repo": {"full_name": REPO}, "sha": "b" * 40},
+        "base": {"ref": "main"},
+    }
+    monkeypatch.setattr(assist, "sweep", lambda: 2)
+    monkeypatch.setattr(assist, "api", lambda path: pr)
+    assist.resolve()
+    assert output.read_text().strip() == "pr=2"
+    monkeypatch.setattr(assist, "sweep", lambda: None)
+    output.unlink()
+    assist.resolve()
+    assert not output.exists()
+
+
+def test_assist_workflow_wakes_only_for_owned_dispatches_and_sweeps():
+    workflow = yaml.safe_load(
+        (
+            Path(__file__).resolve().parents[2] / ".github/workflows/pr-ci-assist.yml"
+        ).read_text()
+    )
+    triggers = workflow.get("on", workflow.get(True))
+    workflows = set(triggers["workflow_run"]["workflows"])
+    assert workflows == {"PR CI Plan", "Slurm Dispatch", "K8s Dispatch"}
+    assert triggers["schedule"] == [{"cron": "13,33,53 * * * *"}]

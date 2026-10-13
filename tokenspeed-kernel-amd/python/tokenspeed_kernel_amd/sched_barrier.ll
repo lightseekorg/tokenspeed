@@ -20,26 +20,12 @@
 ; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 ; SOFTWARE.
 
-; Triton's HIP backend does not hash library contents. _scheduling.py supplies this
-; file's SHA256 as the SCHED_LIBRARY_HASH constexpr to invalidate compiled
-; kernels automatically after edits. Keep that dependency; the filename and
-; symbol need no version bumps. Restart the process after editing this file,
-; since its digest is cached for the process lifetime.
-
-declare void @llvm.amdgcn.sched.barrier(i32 immarg)
-
-define i32 @__tokenspeed_sched_barrier0() alwaysinline {
-entry:
-  call void @llvm.amdgcn.sched.barrier(i32 0)
-  ret i32 0
-}
-
 ; Through the intrinsic (not inline asm) the backend inserts the wait states a
 ; preceding VALU write of the source VGPR needs, and folds the move away when
 ; the value is already in an SGPR.
 declare i32 @llvm.amdgcn.readfirstlane.i32(i32)
 
-define i32 @__tokenspeed_readfirstlane_i32(i32 %x) alwaysinline {
+define i32 @__tokenspeed_sched_readfirstlane_i32(i32 %x) alwaysinline {
 entry:
   %r = call i32 @llvm.amdgcn.readfirstlane.i32(i32 %x)
   ret i32 %r
@@ -57,6 +43,13 @@ entry:
   ret i32 0
 }
 
+; Four VALU instructions.
+define i32 @__tokenspeed_sched_group_barrier_2_4() alwaysinline {
+entry:
+  call void @llvm.amdgcn.sched.group.barrier(i32 2, i32 4, i32 0)
+  ret i32 0
+}
+
 ; Three VMEM instructions.
 define i32 @__tokenspeed_sched_group_barrier_16_3() alwaysinline {
 entry:
@@ -68,5 +61,12 @@ entry:
 define i32 @__tokenspeed_sched_group_barrier_1024_2() alwaysinline {
 entry:
   call void @llvm.amdgcn.sched.group.barrier(i32 1024, i32 2, i32 0)
+  ret i32 0
+}
+
+; One LDS read.
+define i32 @__tokenspeed_sched_group_barrier_256_1() alwaysinline {
+entry:
+  call void @llvm.amdgcn.sched.group.barrier(i32 256, i32 1, i32 0)
   ret i32 0
 }

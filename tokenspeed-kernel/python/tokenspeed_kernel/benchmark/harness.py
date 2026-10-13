@@ -182,9 +182,20 @@ def _load_builtin_generators() -> None:
         prepare_kpool_prefill_topk,
         prepare_kpool_prefill_write,
     )
+    from tokenspeed_kernel.benchmark.generators.dsv41 import (
+        prepare_dsv4_prefill,
+        prepare_dsv41_index_topk,
+        prepare_dsv41_selected_attention,
+    )
+    from tokenspeed_kernel.benchmark.generators.gdn import (
+        prepare_gdn_chunk_prefill,
+        prepare_gdn_decode_mtp,
+        prepare_gdn_decode_step,
+    )
     from tokenspeed_kernel.benchmark.generators.gemm import (
         prepare_decode_gemv,
         prepare_dense_bmm,
+        prepare_grouped_bf16_projection,
         prepare_linear_attnres_partials,
         prepare_mm,
     )
@@ -207,8 +218,22 @@ def _load_builtin_generators() -> None:
         prepare_latent_input,
         prepare_moe_apply,
         prepare_sigmoid_bias_topk,
+        prepare_softmax_topk,
+        prepare_topk,
     )
-    from tokenspeed_kernel.benchmark.generators.residual import prepare_attn_res_fwd
+    from tokenspeed_kernel.benchmark.generators.qsa import (
+        prepare_qsa_sparse_attention,
+    )
+    from tokenspeed_kernel.benchmark.generators.quantization import (
+        prepare_fp8_with_scale,
+    )
+    from tokenspeed_kernel.benchmark.generators.residual import (
+        prepare_attn_res_fwd,
+        prepare_hyperconnection_mix,
+        prepare_mhc_apply_pre,
+        prepare_mhc_mixes,
+        prepare_mhc_post,
+    )
 
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kda_paged_decode"), prepare_kda_paged_decode
@@ -233,12 +258,33 @@ def _load_builtin_generators() -> None:
     )
     _BENCHMARK_GENERATORS.setdefault(("attention", "dsa_prefill"), prepare_dsa_prefill)
     _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "qsa_sparse_attention"), prepare_qsa_sparse_attention
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "gdn_decode_step"), prepare_gdn_decode_step
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "gdn_decode_mtp"), prepare_gdn_decode_mtp
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "gdn_chunk_prefill"), prepare_gdn_chunk_prefill
+    )
+    _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kpool_decode_append"), prepare_kpool_decode_append
     )
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "kpool_decode_topk"), prepare_kpool_decode_topk
     )
     _BENCHMARK_GENERATORS.setdefault(("attention", "dsa_decode"), prepare_dsa_decode)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "dsv41_selected_attention"), prepare_dsv41_selected_attention
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "dsv41_index_topk"), prepare_dsv41_index_topk
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "dsv4_prefill"), prepare_dsv4_prefill
+    )
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "mla_normalize_project_query"),
         prepare_mla_normalize_project_query,
@@ -255,14 +301,30 @@ def _load_builtin_generators() -> None:
         ("attention", "mla_extend_with_kvcache"), prepare_mla_extend
     )
     _BENCHMARK_GENERATORS.setdefault(("residual", "attn_res_fwd"), prepare_attn_res_fwd)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("residual", "hyperconnection_mix"), prepare_hyperconnection_mix
+    )
+    _BENCHMARK_GENERATORS.setdefault(("residual", "mhc_mixes"), prepare_mhc_mixes)
+    _BENCHMARK_GENERATORS.setdefault(("residual", "mhc_post"), prepare_mhc_post)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("residual", "mhc_apply_pre"), prepare_mhc_apply_pre
+    )
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "decode_gemv"), prepare_decode_gemv)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("gemm", "grouped_bf16_projection"), prepare_grouped_bf16_projection
+    )
     _BENCHMARK_GENERATORS.setdefault(
         ("gemm", "linear_attnres_partials"), prepare_linear_attnres_partials
     )
     _BENCHMARK_GENERATORS.setdefault(
         ("moe", "sigmoid_bias_topk"), prepare_sigmoid_bias_topk
+    )
+    _BENCHMARK_GENERATORS.setdefault(("moe", "topk"), prepare_topk)
+    _BENCHMARK_GENERATORS.setdefault(("moe", "softmax_topk"), prepare_softmax_topk)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("quantization", "fp8_with_scale"), prepare_fp8_with_scale
     )
     _BENCHMARK_GENERATORS.setdefault(("moe", "apply"), prepare_moe_apply)
     _BENCHMARK_GENERATORS.setdefault(("moe", "latent_input"), prepare_latent_input)

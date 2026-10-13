@@ -134,7 +134,9 @@ def test_trtllm_cutedsl_merged_preparation_and_dispatch(monkeypatch) -> None:
     attention = SimpleNamespace(
         local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
     )
-    parts = KimiLinearKDA._project_qkvfab(attention, x, attnres_partial_args=None)
+    parts = KimiLinearKDA._project_qkvfab(
+        attention, x, ctx=None, attnres_partial_args=None
+    )
     torch.testing.assert_close(
         torch.cat(parts, dim=-1), output[:, : module.used_rows], rtol=0, atol=0
     )
@@ -219,13 +221,6 @@ def test_fp8_merged_incomplete_load_raises() -> None:
             module.weight_scale_inv.weight_loader(module.weight_scale_inv, scales, name)
     with pytest.raises(RuntimeError, match="scale shards \\['b'\\]"):
         module.verify_fp8_load_complete()
-
-
-def test_fp8_merged_forward_fails_fast() -> None:
-    """The legacy bf16 GEMV forward must not consume FP8 codes silently."""
-    module = _build_fp8_merged(rank=0)
-    with pytest.raises(RuntimeError, match="kimi3_qkvfab_projection"):
-        module(torch.zeros(1, HIDDEN, dtype=torch.bfloat16, device="cuda"))
 
 
 def test_bf16_mode_unchanged() -> None:
@@ -332,7 +327,9 @@ def test_per_channel_merged_projection_matches_dequantized_reference(rank) -> No
     attention = SimpleNamespace(
         local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
     )
-    parts = KimiLinearKDA._project_qkvfab(attention, x, attnres_partial_args=None)
+    parts = KimiLinearKDA._project_qkvfab(
+        attention, x, ctx=None, attnres_partial_args=None
+    )
     reference = x.float() @ (codes.float() * scales[:, None]).T
     output = torch.cat(parts, dim=-1).float()
     # Per-token FP8 activation rounding bounds the error.

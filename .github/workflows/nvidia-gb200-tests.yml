@@ -105,7 +105,7 @@ jobs:
         id: matrix
         env:
           TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS: ""
-          TRIGGER: ${{ github.event_name == 'workflow_dispatch' && 'manual' || 'per-commit' }}
+          TRIGGER: ${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name == 'push' && 'post-submit' || 'per-commit' }}
         run: |
           set -euo pipefail
           matrix=$(python3 test/ci_system/pipeline.py scan \

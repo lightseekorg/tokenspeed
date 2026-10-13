@@ -14,7 +14,9 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.model_loader import weight_utils
+from tokenspeed.runtime.model_loader.loader import DefaultModelLoader
 from tokenspeed.runtime.model_loader.weight_utils import CheckpointPrefetcher
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -79,10 +81,14 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             files = self._make_files(tmpdir, count=1, size=100)
             with _fake_available_memory(100 * 1024**3):
-                prefetcher = CheckpointPrefetcher(files)
+                prefetcher = CheckpointPrefetcher(
+                    files, local_rank=0, local_world_size=1
+                )
             self.assertEqual(prefetcher._window_bytes, 25 * 1024**3)
             with _fake_available_memory(1000 * 1024**3):
-                prefetcher = CheckpointPrefetcher(files)
+                prefetcher = CheckpointPrefetcher(
+                    files, local_rank=0, local_world_size=1
+                )
             self.assertEqual(
                 prefetcher._window_bytes, CheckpointPrefetcher._WINDOW_MAX_BYTES
             )
@@ -104,7 +110,9 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                     CheckpointPrefetcher, "_read_range", side_effect=record_read
                 ),
             ):
-                prefetcher = CheckpointPrefetcher(files, num_threads=1)
+                prefetcher = CheckpointPrefetcher(
+                    files, num_threads=1, local_rank=0, local_world_size=1
+                )
                 prefetcher.start()
 
                 self.assertTrue(_wait_until(lambda: len(read_order) == 2))
@@ -137,7 +145,9 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                     side_effect=lambda p, start, end: read_order.append(p) or 100,
                 ),
             ):
-                prefetcher = CheckpointPrefetcher(files, num_threads=1)
+                prefetcher = CheckpointPrefetcher(
+                    files, num_threads=1, local_rank=0, local_world_size=1
+                )
                 prefetcher.start()
                 prefetcher.wait_file(0)
                 prefetcher.advance(0)
@@ -168,7 +178,9 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                     CheckpointPrefetcher, "_read_range", side_effect=read_range
                 ),
             ):
-                prefetcher = CheckpointPrefetcher([path], num_threads=4)
+                prefetcher = CheckpointPrefetcher(
+                    [path], num_threads=4, local_rank=0, local_world_size=1
+                )
                 prefetcher.start()
                 try:
                     self.assertTrue(last_finished.wait(_POLL_TIMEOUT_S))
@@ -183,6 +195,107 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
             for previous, following in zip(ranges, ranges[1:]):
                 self.assertEqual(previous[1], following[0])
 
+    def test_local_readers_share_reads_without_expanding_the_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = self._make_files(tmpdir, count=6, size=100)
+            reads = []
+            with (
+                _fake_available_memory(1000),
+                mock.patch.object(
+                    CheckpointPrefetcher,
+                    "_read_range",
+                    side_effect=lambda path, start, end: reads.append(path) or 100,
+                ),
+            ):
+                readers = [
+                    CheckpointPrefetcher(
+                        files, num_threads=1, local_rank=rank, local_world_size=2
+                    )
+                    for rank in range(2)
+                ]
+                try:
+                    for reader in readers:
+                        reader.start()
+                    for reader in readers:
+                        reader.wait_file(0)
+                        reader.wait_file(1)
+                    self.assertCountEqual(reads, files[:2])
+                    self.assertTrue(
+                        all(reader._inflight_bytes == 200 for reader in readers)
+                    )
+                    for idx in range(len(files)):
+                        for reader in readers:
+                            reader.wait_file(idx)
+                            reader.advance(idx)
+                    self.assertCountEqual(reads, files)
+                finally:
+                    for reader in readers:
+                        reader.close()
+
+    def test_loader_uses_node_local_participants_and_keeps_filtered_reads(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            files = self._make_files(tmpdir, count=2, size=100)
+            loader = DefaultModelLoader(LoadConfig())
+            source = DefaultModelLoader.Source(tmpdir, revision=None)
+            with (
+                mock.patch.object(
+                    loader, "_prepare_weights", return_value=(tmpdir, files[::-1], True)
+                ),
+                mock.patch.object(
+                    weight_utils.safetensors.torch,
+                    "load_file",
+                    return_value={"weight": weight_utils.torch.ones(1)},
+                ),
+                mock.patch.object(
+                    CheckpointPrefetcher, "_read_range", return_value=100
+                ) as read,
+            ):
+                # Global ranks 4 and 5 are the only participants on node 1.
+                for rank in (4, 5):
+                    list(
+                        loader._get_weights_iterator(
+                            source,
+                            None,
+                            (4, 5),
+                            Mapping(rank=rank, world_size=8, nprocs_per_node=4),
+                        )
+                    )
+                self.assertCountEqual(
+                    [call.args[0] for call in read.call_args_list], files
+                )
+
+            # Different per-rank filters must not leave shards assigned to
+            # a peer that never opens them. Each filtered iterator prefetches
+            # its complete selected list independently.
+            with (
+                mock.patch.object(
+                    loader, "_prepare_weights", return_value=(tmpdir, files, True)
+                ),
+                mock.patch(
+                    "tokenspeed.runtime.model_loader.loader.filter_safetensors_files_by_weight_names",
+                    side_effect=lambda paths, folder, index, accept: [
+                        path for path in paths if accept(path)
+                    ],
+                ),
+                mock.patch.object(weight_utils, "safe_open") as open_shard,
+                mock.patch.object(
+                    CheckpointPrefetcher, "_read_range", return_value=100
+                ) as read,
+            ):
+                open_shard.return_value.__enter__.return_value.keys.return_value = []
+                for rank, path in enumerate(files):
+                    list(
+                        loader._get_weights_iterator(
+                            source,
+                            lambda name, selected=path: name == selected,
+                            None,
+                            Mapping(rank=rank, world_size=2),
+                        )
+                    )
+                self.assertCountEqual(
+                    [call.args[0] for call in read.call_args_list], files
+                )
+
     def test_iterator_close_stops_workers_waiting_for_window(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             files = [
@@ -193,22 +306,29 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                     {"weight": weight_utils.torch.ones(1)}, path
                 )
             for filtered in [False, True]:
-                with self.subTest(filtered=filtered), _fake_available_memory(
-                    os.path.getsize(files[0]) * 4
+                with (
+                    self.subTest(filtered=filtered),
+                    _fake_available_memory(os.path.getsize(files[0]) * 4),
                 ):
-                    prefetcher = CheckpointPrefetcher(files, num_threads=2)
+                    prefetcher = CheckpointPrefetcher(
+                        files, num_threads=2, local_rank=0, local_world_size=1
+                    )
                     with mock.patch.object(
                         weight_utils, "CheckpointPrefetcher", return_value=prefetcher
                     ):
                         if filtered:
                             iterator = (
                                 weight_utils.safetensors_filtered_weights_iterator(
-                                    files, lambda name: True, prefetch=True
+                                    files,
+                                    lambda name: True,
+                                    prefetch=True,
+                                    local_rank=0,
+                                    local_world_size=1,
                                 )
                             )
                         else:
                             iterator = weight_utils.safetensors_weights_iterator(
-                                files, prefetch=True
+                                files, prefetch=True, local_rank=0, local_world_size=1
                             )
                         try:
                             next(iterator)
@@ -229,7 +349,9 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
             with mock.patch.object(
                 CheckpointPrefetcher, "_read_range", side_effect=broken_read
             ):
-                prefetcher = CheckpointPrefetcher(files, num_threads=1)
+                prefetcher = CheckpointPrefetcher(
+                    files, num_threads=1, local_rank=0, local_world_size=1
+                )
                 prefetcher.start()
                 # Must not hang; the consumer falls back to demand paging.
                 prefetcher.wait_file(0)

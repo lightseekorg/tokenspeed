@@ -89,6 +89,52 @@ def test_fresh_spec_is_the_chain(nodes):
     assert torch.equal(spec.mask_buf, fresh[1])
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_router_compacts_mla_latent_rows_once(dtype):
+    """An MLA pool hands out its latent key rows and, as the value, a narrower
+    view at the same address: compaction moves each full latent row once."""
+    nodes, bs, slots = 4, 2, 32
+    router = CacheGroupRouter(
+        None,
+        is_draft=False,
+        spec_num_tokens=nodes,
+        device="cuda",
+        consumed_group_ids=None,
+    )
+    router.bind_tree_verify(
+        TreeVerifyInputs(
+            torch.zeros(bs * nodes, dtype=torch.int64, device="cuda"),
+            nodes,
+            torch.zeros(bs, nodes, dtype=torch.int32, device="cuda"),
+        )
+    )
+    window = torch.tensor([3, 4, 5, 6, 20, 21, 22, 23], dtype=torch.int32).cuda()
+    router.leaves = {"full": None}
+    router.decode_write_locations = RouterDecodeWriteLocations(
+        tokens_per_req=nodes, by_group={"full": window}
+    )
+    latent = [torch.randn(slots, 1, 576, device="cuda").to(dtype) for _ in range(2)]
+    router.cache_pool = SimpleNamespace(
+        history_group_by_layer=lambda: {0: "full", 1: "full"},
+        get_kv_buffer=lambda layer: (latent[layer], latent[layer][..., :512]),
+    )
+    router._bind_tree_window_rows()
+    path = torch.tensor([[0, 2, 3, -1], [0, 1, 3, -1]], dtype=torch.int32).cuda()
+    want = []
+    for rows in latent:
+        expected = rows.view(torch.uint8).clone()
+        for b in range(bs):
+            for depth, row in enumerate(path[b].tolist()):
+                if row >= 0:
+                    expected[window[b * nodes + depth]] = rows.view(torch.uint8)[
+                        window[b * nodes + row]
+                    ]
+        want.append(expected)
+    router.compact_verify_window(path)
+    for rows, expected in zip(latent, want):
+        assert torch.equal(rows.view(torch.uint8), expected)
+
+
 def test_router_compacts_each_group_at_its_window_and_follows_the_pool():
     """Each cache group moves rows at its own window, also in a region another
     group shares (disjoint pages); layers aliasing one K region within a group

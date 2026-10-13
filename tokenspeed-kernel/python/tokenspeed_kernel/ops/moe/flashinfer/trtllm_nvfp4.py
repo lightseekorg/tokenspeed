@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -34,6 +35,13 @@ platform = current_platform()
 TRTLLM_NVFP4_ISPP_ALIGNMENT = 64
 # Non-gated GEMM1 tiles its rows by 128.
 TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT = 128
+# The fused kernels miscompute a hidden size off this multiple, so it is zero-padded to one.
+TRTLLM_NVFP4_HIDDEN_ALIGNMENT = 256
+
+
+def _zero_pad(t: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
+    """Zero-pad byte-sized FP4 codes or FP8 block scales as raw bytes."""
+    return F.pad(t.view(torch.uint8), pad).view(t.dtype)
 
 
 if platform.is_nvidia:
@@ -72,6 +80,8 @@ if platform.is_nvidia:
         # intermediate_size_per_partition: gated w13 stacks gate + up.
         intermediate_size = w13_rows // 2 if gated else w13_rows
         hidden_size = w.w13_weight.shape[2] * 2
+        hidden_pad = -hidden_size % TRTLLM_NVFP4_HIDDEN_ALIGNMENT
+        padded_hidden = hidden_size + hidden_pad
 
         if gated:
             # Fix 1: Swap [W1(Gate), W3(Up)] -> [W3(Up), W1(Gate)].
@@ -110,6 +120,12 @@ if platform.is_nvidia:
         w2_scales = w.w2_weight_scale.data.view(torch.float8_e4m3fn).reshape(
             num_experts, hidden_size, intermediate_size // _group_size
         )
+        if hidden_pad:
+            # Zero FP4 codes and zero block scales: the padded columns and rows contribute nothing.
+            w13_fp4 = _zero_pad(w13_fp4, (0, hidden_pad // 2))
+            w13_scales = _zero_pad(w13_scales, (0, hidden_pad // _group_size))
+            w2_fp4 = _zero_pad(w2_fp4, (0, 0, 0, hidden_pad))
+            w2_scales = _zero_pad(w2_scales, (0, 0, 0, hidden_pad))
 
         w13_weights_shuffled = []
         w13_scales_shuffled = []
@@ -171,7 +187,7 @@ if platform.is_nvidia:
         w.gemm1_scales_fp4_shuffled = torch.nn.Parameter(
             torch.stack(w13_scales_shuffled)
             .view(torch.float8_e4m3fn)
-            .reshape(num_experts, w13_rows, hidden_size // _group_size),
+            .reshape(num_experts, w13_rows, padded_hidden // _group_size),
             requires_grad=False,
         )
         w.gemm2_weights_fp4_shuffled = torch.nn.Parameter(
@@ -180,7 +196,7 @@ if platform.is_nvidia:
         w.gemm2_scales_fp4_shuffled = torch.nn.Parameter(
             torch.stack(w2_scales_shuffled)
             .view(torch.float8_e4m3fn)
-            .reshape(num_experts, hidden_size, intermediate_size // _group_size),
+            .reshape(num_experts, padded_hidden, intermediate_size // _group_size),
             requires_grad=False,
         )
 
@@ -354,11 +370,18 @@ if platform.is_nvidia:
                 data.new_empty((0,), dtype=torch.int32),
             )
 
+        hidden = data.shape[1] * 2 if prequantized else data.shape[1]
+        hidden_pad = w.gemm2_weights_fp4_shuffled.shape[1] - hidden
+        if hidden_pad and (prequantized or output is not None or not do_finalize):
+            raise NotImplementedError(
+                f"NVFP4 MoE at hidden size {hidden} (padded for the fused kernels) "
+                "takes bf16 input and returns a finalized output of its own"
+            )
         if prequantized:
             hs_fp4, hs_scale = x
         else:
             hs_fp4, hs_scale = fp4_quantize(
-                x,
+                F.pad(x, (0, hidden_pad)) if hidden_pad else x,
                 w.w13_input_scale_quant,
                 is_sf_swizzled_layout=False,
                 enable_pdl=enable_pdl,
@@ -428,7 +451,7 @@ if platform.is_nvidia:
                 **common_kwargs,
             )
         if do_finalize:
-            return result[0]
+            return result[0][:, :hidden].contiguous() if hidden_pad else result[0]
         # Deferred: [gemm2_out, expert_weights, expanded_idx_to_permuted_idx]
         gemm2_out, expert_weights, expanded_idx = result
         if routed:

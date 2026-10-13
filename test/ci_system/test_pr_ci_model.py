@@ -147,3 +147,98 @@ def test_invalid_proposal_gets_one_bounded_correction(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="Invalid CI proposal"):
         module.plan(tmp_path)
     assert len(corrections) == 2 and not tmp_path.joinpath("comment.md").exists()
+
+
+def test_plan_publish_updates_the_existing_plan_comment(tmp_path, monkeypatch):
+    scripts = REPO_ROOT / ".github/scripts"
+    monkeypatch.syspath_prepend(str(scripts))
+    spec = importlib.util.spec_from_file_location(
+        "pr_ci_model", scripts / "pr-ci-model.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    import io
+
+    import pr_ci_common
+    from pr_ci_state import BOT, BOT_ID, marker
+
+    repo = "lightseekorg/tokenspeed"
+    head = "a" * 40
+    base = "b" * 40
+    metadata = dict(
+        version=1,
+        repository=repo,
+        pr=123,
+        head=head,
+        base=base,
+        run=55,
+        tests=[],
+        tasks=[],
+    )
+    monkeypatch.setenv("GITHUB_REPOSITORY", repo)
+    monkeypatch.setenv("PR_NUMBER", "123")
+    monkeypatch.setenv("PR_HEAD_SHA", head)
+    tmp_path.joinpath("context.json").write_text(json.dumps({"base": base}))
+    body = "CI plan body\n" + marker("plan", metadata)
+    tmp_path.joinpath("comment.md").write_text(body)
+    comments = []
+    created = []
+    patched = []
+
+    def command(*args):
+        if args == ("gh", "auth", "status"):
+            return ""
+        if args == ("gh", "api", "user"):
+            return json.dumps({"login": BOT})
+        if args[:3] == ("gh", "repo", "view"):
+            return "PUBLIC"
+        if args[:3] == ("gh", "pr", "view"):
+            return head
+        if args == ("gh", "api", f"repos/{repo}/pulls/123"):
+            return json.dumps({"base": {"sha": base}})
+        if args == (
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{repo}/issues/123/comments?per_page=100",
+        ):
+            return json.dumps([comments])
+        if args[:3] == ("gh", "pr", "comment"):
+            created.append(args)
+            comment = dict(
+                id=len(comments) + 1,
+                user={"login": BOT, "id": BOT_ID},
+                body=args[-1],
+            )
+            comments.append(comment)
+            return f"https://github.com/{repo}/pull/123#issuecomment-{comment['id']}"
+        if args == ("gh", "auth", "token", "--hostname", "github.com"):
+            return "test-token\n"
+        if args[:2] == ("gh", "api") and "/issues/comments/" in args[-1]:
+            comment_id = int(args[-1].rsplit("/", 1)[-1])
+            return json.dumps(next(c for c in comments if c["id"] == comment_id))
+        raise AssertionError(f"unexpected command: {args}")
+
+    def patch(request, *, timeout):
+        assert request.method == "PATCH" and timeout == 30
+        assert request.get_header("Authorization") == "Bearer test-token"
+        patched.append(request.full_url)
+        comment_id = int(request.full_url.rsplit("/", 1)[-1])
+        next(c for c in comments if c["id"] == comment_id)["body"] = json.loads(
+            request.data
+        )["body"]
+        return io.BytesIO()
+
+    monkeypatch.setattr(module, "_command", command)
+    monkeypatch.setattr(pr_ci_common, "urlopen", patch)
+    module.publish(tmp_path)
+    assert len(created) == 1 and not patched
+    assert tmp_path.joinpath("published.md").read_text() == body
+    # A later plan for the same PR updates the same comment without notifying.
+    body_v2 = "CI plan body v2\n" + marker("plan", {**metadata, "run": 56})
+    tmp_path.joinpath("comment.md").write_text(body_v2)
+    module.publish(tmp_path)
+    assert len(created) == 1 and len(patched) == 1
+    assert patched[0].endswith("/issues/comments/1")
+    assert tmp_path.joinpath("published.md").read_text() == body_v2

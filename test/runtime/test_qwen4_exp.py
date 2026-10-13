@@ -96,6 +96,7 @@ from tokenspeed.runtime.layers.hyperconnection import (
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.ple_lookup import PLELookup
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
     QWEN4_EXP_PLE_CACHE_GROUP,
@@ -160,6 +161,27 @@ def test_qwen4_exp_nextn_preserves_quantized_mtp_config() -> None:
         exclude_modules=["mtp.layers.0"],
     )
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
+
+
+def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
+    mtp_linear_modules = [
+        f"mtp.layers.0.{module}"
+        for module in (
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.shared_expert.gate_proj",
+            "mlp.shared_expert.up_proj",
+            "mlp.shared_expert.down_proj",
+        )
+    ]
+    # Quark lists linear modules only; the fused MTP experts are never named.
+    excluded = Mxfp4Config(ignored_layers=["lm_head", *mtp_linear_modules])
+    assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
+
+    quantized = Mxfp4Config(ignored_layers=["lm_head"])
+    assert qwen4_exp_nextn._resolve_mtp_quant_config(quantized) is quantized
 
 
 def test_qwen4_exp_gdn_norm_uses_sigmoid_output_gate() -> None:
@@ -2265,7 +2287,9 @@ def test_ngram_ids_anchor_rewrite_matches_legacy(ngram_size) -> None:
 )
 @pytest.mark.parametrize("ngram_size", [2, 3, 4])
 @pytest.mark.parametrize("heads_per_ngram", [1, 3, 8])
-@pytest.mark.parametrize("lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0]])
+@pytest.mark.parametrize(
+    "lengths", [[1, 1, 1, 1], [3, 1, 5], [0, 4, 2], [0, 0], [1476], [1620]]
+)
 def test_ngram_ids_flat_kernel_matches_legacy(
     ngram_size, heads_per_ngram, lengths
 ) -> None:

@@ -138,7 +138,6 @@ def _simt_gemm_kernel(
     a0, a2 = gl.split(even)
     a1, a3 = gl.split(odd)
     partials.store(gl.sum(((a0 + a1) + a2) + a3, axis=3))
-    gl.barrier()
 
     total = gl.zeros([1, BM, BN], gl.float32, out_l)
     for s in gl.static_range(CHUNKS):

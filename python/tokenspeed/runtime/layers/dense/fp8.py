@@ -337,3 +337,7 @@ class Fp8LinearMethod(LinearMethodBase):
             if bias is not None:
                 output = output + bias
             return output.view(*output_shape)
+
+    def static_fp8_input_scale(self, layer: torch.nn.Module) -> torch.Tensor | None:
+        # Block and dynamic activation scales are found per call, so no producer can apply them.
+        return None if self.block_quant else layer.input_scale

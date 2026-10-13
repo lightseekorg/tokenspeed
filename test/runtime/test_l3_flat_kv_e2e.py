@@ -47,6 +47,7 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             import torch
 
             import tokenspeed.runtime.cache.l2.executor as executor_module
+            from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
             from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
             from tokenspeed.runtime.cache.transfer.layout import (
                 CacheField,
@@ -59,6 +60,12 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             self.skipTest("needs a CUDA device")
         self.torch = torch
         self.executor_module = executor_module
+        self.no_pool = RetractionPoolRequest(
+            host_gb=0.0,
+            ratio=0.0,
+            max_retracted_requests=0,
+            tail_lcm_blocks_per_request=0,
+        )
         self.MemoryKvStore = MemoryKvStore
         self.CacheField = CacheField
         self.CacheGroupLayout = CacheGroupLayout
@@ -97,18 +104,32 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 self.load_tracker = tracker
 
         pool = SyntheticPool()
+        specs = tuple(
+            SimpleNamespace(group_id=group.group_id, shard_count=1)
+            for group in layout.groups
+        )
         pool.arena = SimpleNamespace(
-            cache_group_specs=tuple(
-                SimpleNamespace(group_id=group.group_id) for group in layout.groups
+            cache_group_specs=specs,
+            runtime_contract=SimpleNamespace(
+                group_specs=specs,
+                virtual_block_counts={
+                    group.group_id: 1
+                    + layout.num_lcm_blocks * group.cache_blocks_per_lcm_block
+                    for group in layout.groups
+                },
             ),
         )
         with patch.object(self.executor_module, "_HOST_MEM_HEADROOM_BYTES", 0):
-            executor = self.executor_module.L2CacheExecutor(
+            executor = self.executor_module.HostCacheExecutor(
                 pool,
+                l2_tier=True,
                 host_ratio=1.0,
                 host_size_gb=0,
+                snapshot_pool=self.no_pool,
+                slot_state_exporters=None,
                 io_backend="direct",
                 attn_tp_rank=0,
+                kvp_rank=0,
             )
         store = self.MemoryKvStore()
         executor.attach_l3_storage(
@@ -116,6 +137,9 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
             key_prefix="e2e",
             rank=0,
             prefix_for_weight_version=lambda version: f"e2e-{version}",
+            prefetch_timeout_base_s=10.0,
+            prefetch_timeout_per_page_s=0.0,
+            prefetch_batch_pages=128,
         )
         self.addCleanup(executor.shutdown)
 
@@ -176,15 +200,12 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertFalse(bool(executor.host_storage.host_buffer.any().item()))
 
-        executor._prefetch_from_storage(
-            backup_pages
-        )  # pylint: disable=protected-access
+        self.assertEqual(executor.l3_store.prefetch(backup_pages), [True, True, True])
         self.assertTrue(bool(executor.host_storage.host_buffer.any().item()))
 
         load_index = executor._start_loading(  # pylint: disable=protected-access
             [9],
             [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
-            success=True,
             prerequisite_stream=torch.cuda.current_stream(),
         )
         self.assertIsNotNone(load_index)

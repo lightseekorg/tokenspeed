@@ -51,7 +51,7 @@ def owned_local_pages(
         virtual_blocks: Scheduler block IDs, including reserved null ID 0; a
             sequence or an integer array (the scheduler's zero-copy export).
         shard_count: Cyclic owner count from the group's spec; 1 is replicated.
-        rank: This process's rank in the DCP subgroup.
+        rank: This process's rank in the KVP subgroup.
         virtual_block_count: Exclusive bound from the arena's runtime contract.
 
     Returns:
@@ -69,7 +69,7 @@ def owned_local_pages(
     """
     require_positive_int("shard_count", shard_count)
     if rank < 0 or (shard_count > 1 and rank >= shard_count):
-        raise ValueError("DCP rank is out of range")
+        raise ValueError("KVP rank is out of range")
     blocks = np.asarray(virtual_blocks, dtype=np.int64).reshape(-1)
     if blocks.size == 0:
         return np.zeros(0, dtype=bool), blocks
@@ -122,7 +122,7 @@ def local_pages_by_group(
         virtual_blocks_by_group: Scheduler block IDs keyed by cache group id.
         contract: The bound arena's runtime contract; supplies each group's
             shard count and virtual block bound.
-        rank: This process's rank in the DCP subgroup.
+        rank: This process's rank in the KVP subgroup.
 
     Returns:
         Owned local page ID arrays keyed by the same group ids.

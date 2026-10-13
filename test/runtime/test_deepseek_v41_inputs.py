@@ -229,7 +229,7 @@ def test_chunked_prefill_and_pending_overlap_samples(buffers, overlap):
         "vocab_size",
         "valid_cache_lengths",
         "future_input_map",
-        "remote_spec_candidate_ready",
+        "spec_candidates_ready",
         "draft_probs",
         "draft_probs_sentinel",
         "chain_parents",
@@ -458,6 +458,19 @@ def test_verify_raw_barriers_survive_clamp_and_acceptance(
         _expected(prefix + next_branch, range(len(prefix), len(prefix) + 4)),
         [True] * 4,
     )
+
+
+def test_decode_gathers_each_request_row_from_its_slot(buffers):
+    ib, _ = buffers
+    runtime = _spec_runtime(ib, 4)
+    states = {rid: _state([10, 11, 12], []) for rid in "abc"}
+    rows = {3: [40, 41, 42, 43], 1: [20, 21, 22, 23], 2: [30, 31, 32, 33]}
+    for slot, row in rows.items():
+        runtime.valid_cache_lengths[slot] = 3
+        runtime.future_input_map[slot] = torch.tensor(row, device=ib.device)
+    op = _op(states, ["a", "b", "c"], list(rows), [4] * 3, [], [], [-1] * 3)
+    _fill(ib, runtime, op, ngram_inputs_for_forward(op, states, 3))
+    assert ib.input_ids_buf[:12].tolist() == rows[3] + rows[1] + rows[2]
 
 
 def test_mixed_verify_empty_prefix_recovery_and_override(buffers):
@@ -1018,7 +1031,7 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         SimpleNamespace(
             forward_thread=SimpleNamespace(submit=submit), execute_forward_op=execute
         ),
-        l2_cache_executor=None,
+        host_cache_executor=None,
         kv_transfer=None,
     )
     planned = PlannedForward(
