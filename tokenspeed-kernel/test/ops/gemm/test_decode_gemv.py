@@ -521,6 +521,41 @@ def test_fp32_rowcta_empty_odd_and_wide_rows(m, n, k):
     torch.testing.assert_close(out, torch.full_like(out, float(k)), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize(
+    "m,k,launch",
+    [
+        (1, 7168, dict(BM=1, BK=8192, UNROLL=True, num_warps=8)),
+        (1, 2048, dict(BM=1, BK=2048, UNROLL=True, num_warps=4)),
+        (1, 16384, dict(BM=1, BK=16384, UNROLL=True, num_warps=8)),
+        (1, 65537, dict(BM=1, BK=65536, UNROLL=True, num_warps=8)),
+        (8, 7168, dict(BM=8, BK=512, UNROLL=True, num_warps=4)),
+        (8, 8192, dict(BM=8, BK=512, UNROLL=True, num_warps=4)),
+        (12, 4096, dict(BM=16, BK=512, UNROLL=False, num_warps=8)),
+        (16, 16384, dict(BM=16, BK=512, UNROLL=False, num_warps=8)),
+    ],
+)
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
+def test_fp32_rowcta_launch_configuration(monkeypatch, m, k, launch, x_dtype):
+    from tokenspeed_kernel.ops.gemm import triton_gemv
+
+    launches = []
+
+    class Kernel:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((grid, kwargs))
+
+    # Record the launch instead of compiling it. A direct call launches any
+    # width, including the ones the registry keeps on Torch.
+    monkeypatch.setattr(triton_gemv, "_rowcta_multirow_kernel", Kernel())
+    x = torch.empty(m, k, dtype=x_dtype, device="meta")
+    weight = torch.empty(256, k, device="meta")
+    result = triton_gemv.triton_rowcta_gemm_fp32(x, weight)
+    assert result.shape == (m, 256) and result.dtype == torch.float32
+    assert launches == [
+        ((256,), dict(M=m, N=256, K=k, enable_fp_fusion=False, **launch))
+    ]
+
+
 @_requires_nvidia
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("m", [1, 8, 16])

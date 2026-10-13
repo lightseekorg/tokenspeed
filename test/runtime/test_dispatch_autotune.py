@@ -1216,43 +1216,22 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
 
 
 @pytest.mark.parametrize(
-    "m,k,launch,routed",
+    "m,k,routed",
     [
-        (1, 7168, dict(BM=1, BK=8192, UNROLL=True, num_warps=8), True),
-        (1, 2048, dict(BM=1, BK=2048, UNROLL=True, num_warps=4), True),
-        (1, 16384, dict(BM=1, BK=16384, UNROLL=True, num_warps=8), True),
-        (1, 65537, dict(BM=1, BK=65536, UNROLL=True, num_warps=8), False),
-        (8, 7168, dict(BM=8, BK=512, UNROLL=True, num_warps=4), True),
-        (8, 8192, dict(BM=8, BK=512, UNROLL=True, num_warps=4), False),
-        (12, 4096, dict(BM=16, BK=512, UNROLL=False, num_warps=8), True),
-        (16, 16384, dict(BM=16, BK=512, UNROLL=False, num_warps=8), False),
+        (1, 7168, True),
+        (1, 2048, True),
+        (1, 16384, True),
+        (1, 65537, False),
+        (8, 7168, True),
+        (8, 8192, False),
+        (12, 4096, True),
+        (16, 16384, False),
     ],
 )
-@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
-def test_fp32_rowcta_launch_configuration(m, k, launch, routed, x_dtype):
-    launches = []
-
-    class Kernel:
-        def __getitem__(self, grid):
-            return lambda *args, **kwargs: launches.append((grid, kwargs))
-
+def test_fp32_rowcta_routing_bounds_k(m, k, routed):
     api = _functions(
-        KERNEL / "ops/gemm/triton_gemv.py",
-        None,
-        ("_fp32_rowcta_k_fits", "triton_rowcta_gemm_fp32"),
-        dict(
-            torch=torch,
-            triton=SimpleNamespace(next_power_of_2=lambda v: 1 << (v - 1).bit_length()),
-            _rowcta_multirow_kernel=Kernel(),
-        ),
+        KERNEL / "ops/gemm/triton_gemv.py", None, ("_fp32_rowcta_k_fits",), {}
     )
-    x = torch.empty(m, k, dtype=x_dtype, device="meta")
-    weight = torch.empty(256, k, device="meta")
-    result = api.triton_rowcta_gemm_fp32(x, weight)
-    assert result.shape == (m, 256) and result.dtype == torch.float32
-    assert launches == [
-        ((256,), dict(M=m, N=256, K=k, enable_fp_fusion=False, **launch))
-    ]
     # A direct call takes any width, but the registry sends a second 64K block
     # for one row, and more than 15 blocks of 512 for more rows, to Torch.
     assert api._fp32_rowcta_k_fits(m, 256, k) is routed
