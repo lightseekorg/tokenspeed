@@ -52,12 +52,23 @@ class _State:
         self.finish_calls.append(message)
 
 
-def _handshaked_item():
-    return SimpleNamespace(encode_handshake=object(), encoded=None)
+def _handshaked_item(offsets=((0, 3),)):
+    return SimpleNamespace(
+        encode_handshake=object(), encoded=None, offsets=list(offsets)
+    )
 
 
 def _plain_item():
-    return SimpleNamespace(encode_handshake=None, encoded=None)
+    return SimpleNamespace(encode_handshake=None, encoded=None, offsets=[(0, 3)])
+
+
+def _context(*mm_items, prefix: int = 0, seq: int = 8):
+    return SimpleNamespace(
+        has_extend_inputs=lambda: True,
+        mm_inputs=[SimpleNamespace(mm_items=list(mm_items))],
+        extend_prefix_lens=[prefix],
+        extend_seq_lens=[seq],
+    )
 
 
 class _Admission:
@@ -212,28 +223,36 @@ def test_drain_withholds_admission_while_paused() -> None:
 
 def test_assert_embeddings_received_raises_on_unreceived_handshaked_item() -> None:
     hooks = EpdPrefillHooks(_FakeLoop(), _Admission())
-    context = SimpleNamespace(
-        has_extend_inputs=lambda: True,
-        mm_inputs=[SimpleNamespace(mm_items=[_handshaked_item()])],
-    )
 
     with pytest.raises(RuntimeError, match="un-received"):
-        hooks.assert_embeddings_received(context)
+        hooks.assert_embeddings_received(_context(_handshaked_item()))
 
 
 def test_assert_embeddings_received_accepts_filled_items_and_non_epd() -> None:
-    filled = SimpleNamespace(encode_handshake=object(), encoded=object())
-    context = SimpleNamespace(
-        has_extend_inputs=lambda: True,
-        mm_inputs=[SimpleNamespace(mm_items=[filled, _plain_item()])],
+    filled = SimpleNamespace(
+        encode_handshake=object(), encoded=object(), offsets=[(0, 3)]
     )
-    EpdPrefillHooks(_FakeLoop(), _Admission()).assert_embeddings_received(context)
+    EpdPrefillHooks(_FakeLoop(), _Admission()).assert_embeddings_received(
+        _context(filled, _plain_item())
+    )
     # Non-EPD node: no-op even with an un-received item.
-    bad = SimpleNamespace(
-        has_extend_inputs=lambda: True,
-        mm_inputs=[SimpleNamespace(mm_items=[_handshaked_item()])],
+    EpdPrefillHooks(_FakeLoop(), None).assert_embeddings_received(
+        _context(_handshaked_item())
     )
-    EpdPrefillHooks(_FakeLoop(), None).assert_embeddings_received(bad)
+
+
+def test_assert_embeddings_received_ignores_items_an_earlier_chunk_prefilled() -> None:
+    """A chunked prompt: the image's tokens [0, 3] were all prefilled by the first
+    chunk, which dropped the encoding; the second chunk [8, 16) scatters nothing
+    of it. An item still overlapping the chunk must hold its embedding."""
+    hooks = EpdPrefillHooks(_FakeLoop(), _Admission())
+    hooks.assert_embeddings_received(
+        _context(_handshaked_item(offsets=[(0, 3)]), prefix=8, seq=8)
+    )
+    with pytest.raises(RuntimeError, match="un-received"):
+        hooks.assert_embeddings_received(
+            _context(_handshaked_item(offsets=[(0, 3), (10, 12)]), prefix=8, seq=8)
+        )
 
 
 if __name__ == "__main__":
