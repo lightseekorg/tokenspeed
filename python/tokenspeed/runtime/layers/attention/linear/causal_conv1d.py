@@ -108,12 +108,13 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     if idx_seq == pad_slot_id:
         return
 
-    sequence_start_index = tl.load(query_start_loc_ptr + idx_seq)
+    # Token offsets times a projection-wide row stride outgrow int32.
+    sequence_start_index = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
     sequence_end_index = tl.load(query_start_loc_ptr + idx_seq + 1)
     # find the actual sequence length
     seqlen = sequence_end_index - sequence_start_index
 
-    token_offset = BLOCK_M * chunk_offset
+    token_offset = BLOCK_M * chunk_offset.to(tl.int64)
     segment_len = min(BLOCK_M, seqlen - token_offset)
 
     # base of the sequence

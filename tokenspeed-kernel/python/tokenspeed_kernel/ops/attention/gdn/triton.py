@@ -65,6 +65,7 @@ from tokenspeed_kernel.ops.attention.gdn._triton.prefill_state_inputs import (
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
     fused_qkv_split_gdn_prefill,
+    pack_gdn_projection,
 )
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
@@ -73,6 +74,9 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+# The payload stores take ptxas to 172 registers, a CTA per SM fewer; 168 keeps three CTAs.
+_TREE_VERIFY_REPLAY_MAX_REGISTERS = 168
 
 
 @register_kernel(
@@ -581,6 +585,7 @@ def _gdn_tree_verify_chunked_kernel(
     h0_source,
     h0_indices,
     tree_ancestors,
+    replay,
     scale,
     T,
     H: tl.constexpr,
@@ -590,6 +595,7 @@ def _gdn_tree_verify_chunked_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     T_BLOCK: tl.constexpr,
+    HAS_REPLAY: tl.constexpr,
     LOG2_T_BLOCK: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
@@ -610,7 +616,8 @@ def _gdn_tree_verify_chunked_kernel(
     solving ``(I + beta * D_strict * k k^T) U = beta * (v - exp(G) * k h0)``,
     node t's output is ``exp(G_t) q_t h0 + sum_s D[t, s] (q_t . k_s) U_s``:
     the recurrence along that path, without its serial steps. The pool is left
-    untouched.
+    untouched. With ``HAS_REPLAY`` it also copies each node's k, v, a and b, as
+    loaded, into its ``replay`` row ``[k | v | a | b]`` (the ReplaySSM payload).
     """
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
@@ -641,17 +648,32 @@ def _gdn_tree_verify_chunked_kernel(
         + o_v[None, :] * V_STRIDES[3],
         mask=valid[:, None] & mask_v[None, :],
         other=0,
-    ).to(tl.float32)
+    )
     b_a = tl.load(
         a + i_n * A_STRIDES[0] + nodes * A_STRIDES[1] + i_hv * A_STRIDES[2],
         mask=valid,
         other=0,
-    ).to(tl.float32)
+    )
     b_b = tl.load(
         b + i_n * B_STRIDES[0] + nodes * B_STRIDES[1] + i_hv * B_STRIDES[2],
         mask=valid,
         other=0,
-    ).to(tl.float32)
+    )
+    REPLAY_WIDTH: tl.constexpr = H * K + HV * V + 2 * HV
+    p_replay = replay + (i_n * T + nodes).to(tl.int64) * REPLAY_WIDTH
+    # Gates come from each value head's first V tile, k from each key head's first value head.
+    writes_k = HAS_REPLAY & (i_v == 0) & (i_hv % (HV // H) == 0)
+    if HAS_REPLAY:
+        tl.store(
+            p_replay[:, None] + H * K + i_hv * V + o_v[None, :],
+            b_v,
+            mask=valid[:, None] & mask_v[None, :],
+        )
+        tl.store(p_replay + H * K + HV * V + i_hv, b_a, mask=valid & (i_v == 0))
+        tl.store(p_replay + H * K + HV * V + HV + i_hv, b_b, mask=valid & (i_v == 0))
+    b_v = b_v.to(tl.float32)
+    b_a = b_a.to(tl.float32)
+    b_b = b_b.to(tl.float32)
     bits = tl.load(tree_ancestors + i_n * T + nodes, mask=valid, other=0)
 
     r_q = tl.full([T_BLOCK], 1.0, tl.float32) * scale
@@ -681,6 +703,10 @@ def _gdn_tree_verify_chunked_kernel(
         c_q = tl.load(p_q + o_k[None, :] * Q_STRIDES[3], mask=mask_qk, other=0)
         c_q = c_q.to(tl.float32) * r_q[:, None]
         c_k = tl.load(p_k + o_k[None, :] * K_STRIDES[3], mask=mask_qk, other=0)
+        if HAS_REPLAY:
+            tl.store(
+                p_replay[:, None] + i_h * K + o_k[None, :], c_k, mask=mask_qk & writes_k
+            )
         c_k = c_k.to(tl.float32) * r_k[:, None]
         # The K-last pool row loads as [BV, BK] with K contiguous.
         c_h = tl.load(
@@ -753,16 +779,29 @@ def _launch_gdn_tree_verify_chunked(
     scale: float | None,
     use_qk_l2norm: bool,
     tree_ancestors: torch.Tensor,
+    replay_payload: torch.Tensor | None,
 ) -> torch.Tensor:
     enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
     HV, V = v.shape[2], v.shape[3]
     if scale is None:
         scale = K**-0.5
+    if replay_payload is not None and (
+        replay_payload.shape != (B * T, H * K + HV * V + 2 * HV)
+        or not replay_payload.is_contiguous()
+        or {replay_payload.dtype, k.dtype, v.dtype, a.dtype, b.dtype} != {q.dtype}
+    ):
+        raise ValueError(
+            "replay_payload must be a contiguous [B * T, H * K + HV * V + 2 * HV] "
+            "tensor of the dtype of q, k, v, a and b"
+        )
     o = q.new_empty(B, T, HV, V)
     # Once the (request, head) programs outnumber the SMs, fewer and wider V tiles are faster.
     wide = B * HV > current_platform().sm_count
     BV = min(triton.next_power_of_2(V), 128 if wide else 64)
+    # Half-width V tiles (>= 16 for tl.dot) fill the SMs at a few requests, up to two programs per SM.
+    if BV >= 32 and triton.cdiv(V, BV // 2) * B * HV <= 2 * current_platform().sm_count:
+        BV //= 2
     T_BLOCK = triton.next_power_of_2(GDN_TREE_VERIFY_CHUNKED_MAX_NODES)
     _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](
         A_log=A_log,
@@ -778,6 +817,7 @@ def _launch_gdn_tree_verify_chunked(
         h0_source=initial_state,
         h0_indices=initial_state_indices,
         tree_ancestors=tree_ancestors,
+        replay=o if replay_payload is None else replay_payload,
         scale=scale,
         T=T,
         H=H,
@@ -787,6 +827,7 @@ def _launch_gdn_tree_verify_chunked(
         BK=min(triton.next_power_of_2(K), 32),
         BV=BV,
         T_BLOCK=T_BLOCK,
+        HAS_REPLAY=replay_payload is not None,
         LOG2_T_BLOCK=T_BLOCK.bit_length() - 1,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm,
         # Three TF32 products per FP32 one keep FP32 accuracy on tensor cores.
@@ -799,6 +840,11 @@ def _launch_gdn_tree_verify_chunked(
         ENABLE_PDL=enable_pdl,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),
+        **(
+            {"maxnreg": _TREE_VERIFY_REPLAY_MAX_REGISTERS}
+            if replay_payload is not None and current_platform().is_nvidia
+            else {}
+        ),
     )
     return o
 
@@ -831,12 +877,14 @@ def triton_gdn_decode_mtp(
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
     tree_ancestors: torch.Tensor | None,
+    replay_payload: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Portable Triton fallback for ``gdn_decode_mtp`` (see
     ``flashinfer/gated_delta_rule.py`` for the shared contract). Supports both
     batch-scoped intermediate-state caching and direct per-token pool scatter
     through ``output_state_indices``, and draft trees: ReplaySSM trees given no
-    ``intermediate_states_buffer`` in the chunked form, the others step by step.
+    ``intermediate_states_buffer`` in the chunked form, which also fills
+    ``replay_payload``, the others step by step.
     """
     if (
         tree_ancestors is not None
@@ -856,7 +904,10 @@ def triton_gdn_decode_mtp(
             scale=scale,
             use_qk_l2norm=use_qk_l2norm,
             tree_ancestors=tree_ancestors,
+            replay_payload=replay_payload,
         )
+    if replay_payload is not None:
+        raise ValueError("only a chunked ReplaySSM tree verify fills replay_payload")
     return _launch_fused_gdn_decode_update(
         q,
         k,

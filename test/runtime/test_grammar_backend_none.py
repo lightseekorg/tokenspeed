@@ -129,6 +129,7 @@ class TestFrontendSeesClientError(unittest.IsolatedAsyncioTestCase):
         state.collector.put(
             {"text": "", "output_ids": [], "meta_info": {"finish_reason": reason}},
             stream=stream,
+            cumulative=False,
         )
         state.event.set()
         return [out async for out in llm._wait_one_response(obj)]

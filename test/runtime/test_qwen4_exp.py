@@ -219,6 +219,18 @@ def test_qwen4_exp_gdn_norm_fused_matches_eager(dtype: torch.dtype) -> None:
     )
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=_requires_cuda)])
+def test_qwen4_exp_gdn_norm_normalizes_each_head_of_a_row(device: str) -> None:
+    torch.manual_seed(5)
+    heads, head_v_dim = 3, 128
+    norm = _Qwen4ExpRMSNormGated(head_v_dim, 1e-6).to(device)
+    x = torch.randn(9, heads * head_v_dim, device=device)
+    z = torch.randn_like(x)
+    per_head = norm(x.view(-1, head_v_dim), z.view(-1, head_v_dim)).view_as(x)
+
+    torch.testing.assert_close(norm(x, z), per_head, rtol=0, atol=0)
+
+
 def test_qwen4_exp_selects_checkpoint_output_gate_type() -> None:
     assert _qwen4_exp_uses_sigmoid_output_gate(
         SimpleNamespace(output_gate_type="sigmoid")
