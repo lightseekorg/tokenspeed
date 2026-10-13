@@ -47,6 +47,29 @@ files with the checkpoint. Pass a custom filename pattern through
 `{"pattern": "model-rank-{rank}-part-{part}.safetensors"}`. The serving CLI does
 not expose this loader or its extra configuration.
 
+## Sparse KV Offloading
+
+`--kv-offload-config` accepts a JSON object with four required fields:
+`layers` (unique target attention layer IDs), `hot_tokens` (a positive power of
+two), `host_gb` (a finite positive budget in GiB), and `overlap` (an explicit
+boolean enabling cross-layer prefetch). Omitting the argument disables offload.
+The model cache recipe validates supported fields, selection capacity and
+execution constraints; unsupported recipes reject the configuration.
+
+Model-specific behavior stays in `--hf-overrides`. For a plugin supporting a
+window ring, set its `kv_offload_window_ring` option explicitly. Do not put
+`window_ring` in the runtime object or use the legacy `hf_overrides.kv_offload`
+entry; both are rejected. This option does not enable MTP, CUDA Graph, scheduler
+overlap, or change numerical settings implicitly.
+
+Offloading uses capacity aborts instead of snapshot recovery. Its snapshot
+pool is disabled automatically; positive snapshot sizes, snapshot request
+caps and `--debug-force-retraction-interval` are rejected. Under decode
+memory pressure the scheduler releases the victim's history blocks and
+request slot and reports `CapacityAbort` to the client. A client that wants
+to continue must submit a new request. The fixed hot allocation persists;
+its request partition is invalidated before another PD owner uses it.
+
 ## Precision and quantization
 
 | Parameter | Purpose |
@@ -681,6 +704,19 @@ suffix also lists on its own. The Prometheus waiting gauge and the router
 load snapshot report the scheduler's narrower waiting count, without the
 bootstrapping share.
 
+`tokenspeed:request_queue_time_seconds` is the Prometheus per-request
+queue-wait histogram (`--enable-metrics`): the wall time from a request's
+submission to the scheduler's waiting queue to its first dispatch into a
+forward batch, observed once per request. The enqueue point is submission —
+tokenizer-manager and IPC wait are not included, and neither are the waits
+that precede submission: a structured-output request's grammar-compile wait
+(readiness gates submission), a pause admission hold, and an EPD embedding
+wait all stay out of the sample. A request preempted by capacity retraction
+re-enters the queue without recording a second sample. Under prefill/decode
+disaggregation each node records its own leg: the prefill node's sample spans
+its queue admission to the prefill batch, the decode node's its own admission
+to the decode batch. Bucket boundaries span 0.3 s to 7680 s.
+
 Set `TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS=1` to log each speculative verify
 step's committed widths and accepted draft-token counts. This reads the
 already-synchronized CPU result and does not add a GPU synchronization, but it
@@ -716,6 +752,7 @@ Where the endpoint lives depends on the launch mode:
 | Metric | Semantics |
 | --- | --- |
 | `tokenspeed:request_time_per_output_token_seconds` | End-to-end latency divided by output tokens; includes queueing and TTFT. |
+| `tokenspeed:request_queue_time_seconds` | Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. |
 | `tokenspeed:decode_time_per_output_token_seconds` | Decode time per output token after the first output frame; excludes queueing and TTFT. |
 | `tokenspeed:inter_token_latency_seconds` | Per-token interval between output frames, measured by frontend wall clock. |
 | `tokenspeed:scheduler_inter_token_latency_seconds` | Per-token interval between output frames, measured by scheduler timestamps. |

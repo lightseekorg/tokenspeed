@@ -492,6 +492,7 @@ def test_prefetch_convergence_precedes_the_rounds_cache_poll(
         _request_history_rows=None,
         _dispatch_depends_on_pending_commit=Mock(return_value=False),
         _mark_stats_scheduled=Mock(),
+        _record_request_queue_time=Mock(),
         _batch_logger=SimpleNamespace(log_dispatch=Mock()),
         model_config=SimpleNamespace(is_multimodal_active=False),
         _pd_hooks=SimpleNamespace(poll_transfer_events=Mock(return_value=[])),

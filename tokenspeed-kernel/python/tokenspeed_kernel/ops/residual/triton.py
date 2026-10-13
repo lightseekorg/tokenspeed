@@ -257,11 +257,14 @@ def triton_hyperconnection_mix(
     hc_count: int,
     hidden_size: int,
     lowrank: int,
+    projection_rows: int,
     projection_scale: float,
     weights_independent: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """GEMM plus Triton-epilogue path for general decode and prefill shapes."""
-    projected = F.linear(normalized, projection_weight)
+    # Model loading aligns BF16/FP16 GEMM output widths; discard only the
+    # extra output columns, preserving the GEMM's aligned row stride.
+    projected = F.linear(normalized, projection_weight)[:, :projection_rows]
     activated, inject = _launch_projection_epilogue(
         projected, lowrank, hc_count, projection_scale
     )

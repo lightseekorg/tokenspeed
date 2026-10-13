@@ -220,6 +220,7 @@ class CachePool(ABC):
         self.arena = arena
         self.dtype = dtype
         self.rank = rank
+        self.layer_fields: dict[tuple[int, str], str] = {}
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn):
             #  Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
@@ -301,6 +302,7 @@ class CachePool(ABC):
         this view's layer window, and file each under the attribute its
         kernels read.
         """
+        self.layer_fields.clear()
         lists = {
             attribute: [None] * self.layer_num
             for attribute in self.layer_plane_bindings.values()
@@ -312,10 +314,11 @@ class CachePool(ABC):
             if located is None:
                 continue
             layer_id, plane = located
+            self.layer_fields[(layer_id, plane)] = field.field_id
             attribute = self.layer_plane_bindings.get(plane)
             if attribute is None:
                 continue
-            lists[attribute][layer_id] = self.arena.field(field.field_id)
+            lists[attribute][layer_id] = self.arena.compute_field(field.field_id)
         for attribute, values in lists.items():
             setattr(self, attribute, values)
 
@@ -342,6 +345,9 @@ class CachePool(ABC):
 
     def _build_cache_transfer_layout(self, field_ids, consumers):
         from tokenspeed.runtime.cache.transfer.layout import layout_from_lcm_plan
+
+        if isinstance(self.arena, CacheArena) and self.arena.offload is not None:
+            raise ValueError("KV offloading does not support L2 or snapshot transfers")
 
         local_group_ids = {
             field.group_id
