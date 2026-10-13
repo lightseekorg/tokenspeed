@@ -21,14 +21,15 @@
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.attention.qsa as qsa_api
 import tokenspeed_kernel.ops.attention.qsa.triton as qsa_ops
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.attention.dsa.cuda import has_ragged_decode_topk
+from tokenspeed_kernel.ops.attention.qsa import qwen4_exp_qsa_block_topk
 from tokenspeed_kernel.ops.attention.qsa.triton import (
     _qwen4_exp_qsa_merge_block_topk_kernel,
     _qwen4_exp_qsa_stream_block_topk_kernel,
-    qwen4_exp_qsa_block_topk,
     qwen4_exp_qsa_commit_verify_layers,
     qwen4_exp_qsa_compress_and_store,
     qwen4_exp_qsa_prepare_metadata,
@@ -973,13 +974,13 @@ def test_qwen4_exp_qsa_grouped_scores_match_independent_queries(
     table[1].zero_()
     complete[-widths[-1] :].zero_()
     scores = []
-    select = qsa_ops._topk_from_logits
+    select = qsa_api.qsa_block_topk_select
 
-    def record_scores(logits, topk, *, enable_pdl):
+    def record_scores(logits, topk, **kwargs):
         scores.append(logits)
-        return select(logits, topk, enable_pdl=enable_pdl)
+        return select(logits, topk, **kwargs)
 
-    monkeypatch.setattr(qsa_ops, "_topk_from_logits", record_scores)
+    monkeypatch.setattr(qsa_api, "qsa_block_topk_select", record_scores)
     selected = []
     for width in (queries_per_request, None):
         selected.append(
@@ -1098,13 +1099,13 @@ def test_qwen4_exp_qsa_long_query_groups_match_independent_rows(
     complete = torch.arange(rows, device=device, dtype=torch.int32) % 577
     complete[width : width + 64] = 0
     scores = []
-    selector = qsa_ops._topk_from_logits
+    selector = qsa_api.qsa_block_topk_select
 
-    def record(logits, topk, *, enable_pdl):
+    def record(logits, topk, **kwargs):
         scores.append(logits)
-        return selector(logits, topk, enable_pdl=enable_pdl)
+        return selector(logits, topk, **kwargs)
 
-    monkeypatch.setattr(qsa_ops, "_topk_from_logits", record)
+    monkeypatch.setattr(qsa_api, "qsa_block_topk_select", record)
     selected = []
     for query_width in (width, None):
         selected.append(
@@ -1261,7 +1262,13 @@ def test_qwen4_exp_qsa_block_topk_logits_dispatches_persistent_radix(
         out.fill_(7)
 
     monkeypatch.setattr(qsa_ops, "_is_nvidia", True)
-    monkeypatch.setattr(qsa_ops, "_use_gluon_block_topk", False)
+    # Exercise the portable selection, which owns the persistent radix path.
+    select = qsa_api.qsa_block_topk_select
+    monkeypatch.setattr(
+        qsa_api,
+        "qsa_block_topk_select",
+        lambda *args, **kwargs: select(*args, **{**kwargs, "solution": "triton"}),
+    )
     monkeypatch.setattr(qsa_ops, "has_ragged_decode_topk", lambda: True)
     monkeypatch.setattr(qsa_ops, "ragged_decode_topk", fake_radix_topk)
     monkeypatch.setattr(

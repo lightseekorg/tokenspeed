@@ -25,9 +25,11 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
-from tokenspeed_kernel.ops.attention.qsa.triton import (
+from tokenspeed_kernel.ops.attention.qsa import (
+    qsa_sparse_attention,
     qwen4_exp_qsa_block_topk,
+)
+from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_compress_and_store,
     qwen4_exp_qsa_prepare_metadata,
     qwen4_exp_qsa_recent_write,

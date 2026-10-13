@@ -607,8 +607,10 @@ base-2 LSE; `gluon_qsa_sparse_attention_merge_gfx950` merges all splits of a
 
 ### gfx950 QSA indexer
 
-`qwen4_exp_qsa_block_topk` (`logits` solution) runs two Gluon kernels on
-gfx950, with the same results as the portable path.
+The `qsa_block_scores` and `qsa_block_topk_select` ops, which the `logits`
+solution of `qwen4_exp_qsa_block_topk` composes, select these Gluon kernels on
+gfx950. They return the same blocks as the portable Triton registrations; the
+selected ids come out in increasing order rather than by score.
 
 - `gluon_qsa_block_scores_gfx950` writes `sum_h relu(q_h . k)` for every
   compressed block below each row's `complete_blocks` (`-inf` elsewhere).
