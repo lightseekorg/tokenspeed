@@ -42,6 +42,7 @@ from the replay start, and never write the global/index rows the hit already
 holds (``V41Metadata.global_write_floor``).
 """
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -71,8 +72,17 @@ from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
     DeepseekV41CachePool,
 )
+from tokenspeed.runtime.layers.attention.prefill_head_exchange import (
+    selected_prefill_with_head_exchange,
+    should_exchange_prefill_heads,
+)
+from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
+
+# Initial long-prefill thresholds; tune with query count and visible history.
+_INDEXER_PARTITION_MIN_QUERIES = 4096
+_INDEXER_PARTITION_MIN_HISTORY = 8192
 
 
 class V41CompressorPlan(NamedTuple):
@@ -218,6 +228,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:
         super().__init__(config, spec)
+        self._attention_exchange_layers: set[int] = set()
         if config.is_draft:
             raise NotImplementedError("V4.1 FlatKV implements target attention only")
         if config.kernel_page_size not in (None, 64):
@@ -262,6 +273,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, object]
         ] = {}
         self._prepared_selections: dict[tuple, tuple] = {}
+        self._partitioned_index_layers: set[int] = set()
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
@@ -1072,6 +1084,40 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             record.positions, record.request_indices, positions, requests
         )
 
+    def plan_indexer_queries(
+        self, layer_id, positions, requests, forward_mode, index_process_group
+    ) -> InterleavedQueryPlan | None:
+        """Plan encoder indexer rows before projection, using shared host metadata."""
+        owner = self.spec.kv_owners[layer_id]
+        source = self.spec.index_sources[layer_id]
+        group = self.spec.indexer_query_group
+        total = positions.numel()
+        if (
+            forward_mode.is_mixed()
+            or not forward_mode.is_extend()
+            or not positions.is_cuda
+            or index_process_group is not None
+            or owner < 0
+            or source != owner
+            or layer_id != source
+            or layer_id >= self.spec.candidate_source
+            or len(group) <= 1
+            or total < max(_INDEXER_PARTITION_MIN_QUERIES, len(group))
+        ):
+            return None
+        window = self._window(positions, requests, forward_mode)
+        if window is None:
+            return None
+        ratio = self.spec.compress_ratios[owner]
+        visible = max(
+            ((span.prefix + span.count) // ratio for span in window[1]), default=0
+        )
+        if visible < _INDEXER_PARTITION_MIN_HISTORY:
+            return None
+        return InterleavedQueryPlan(
+            total_rows=total, rank=self.spec.indexer_query_rank, size=len(group)
+        )
+
     def select_global(
         self,
         layer_id,
@@ -1081,6 +1127,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         request_indices,
         forward_mode,
         index_process_group,
+        *,
+        projected_partition: InterleavedQueryPlan | None,
     ):
         """Select/reuse request-local global rows; return (physical slots, lengths).
 
@@ -1177,6 +1225,37 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         table = table[:, : max(0, index_cache.shape[0] - 1)]
         candidate_capacity = min(self.spec.candidate_topk, table.shape[1] * 8)
         n = positions.numel()
+        partition = self.plan_indexer_queries(
+            layer_id, positions, request_indices, forward_mode, index_process_group
+        )
+        scoring_positions = positions
+        scoring_requests = request_indices
+        query_group = self.spec.indexer_query_group
+        if projected_partition is not None and projected_partition != partition:
+            raise ValueError("Projected indexer rows disagree with the query plan")
+        expected_rows = (
+            projected_partition.local_rows if projected_partition is not None else n
+        )
+        if index_q.shape[0] != expected_rows or index_weights.shape[0] != expected_rows:
+            raise ValueError(
+                "Indexer projection row count disagrees with its query plan"
+            )
+        if partition is not None:
+            if projected_partition is None:
+                index_q = index_q[partition.local_slice].contiguous()
+                index_weights = index_weights[partition.local_slice].contiguous()
+            scoring_positions = positions[partition.local_slice].contiguous()
+            scoring_requests = request_indices[partition.local_slice].contiguous()
+            n = partition.local_rows
+            if layer_id not in self._partitioned_index_layers:
+                self._partitioned_index_layers.add(layer_id)
+                if self.spec.indexer_query_rank == 0:
+                    logging.getLogger(__name__).info(
+                        f"V4.1 indexer query partition: layer={layer_id}, "
+                        f"layout=interleave, size={partition.size}, "
+                        f"global_rows={partition.total_rows}, local_rows={n}, "
+                        f"local_projection={projected_partition is not None}"
+                    )
         rows = torch.full(
             (n, self.spec.index_topk), -1, dtype=torch.int32, device=self.device
         )
@@ -1204,10 +1283,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 for start in range(0, n, query_tile)
             ]
         )
+        if partition is not None:
+            windows = [
+                (*partition.local_bounds(start, stop), span)
+                for start, stop, span in windows
+            ]
         for start, stop, span in windows:
+            if start == stop:
+                continue
             if span is not None:
                 visible = (
-                    ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
+                    ((scoring_positions[start:stop] + 1) // ratio)
+                    .clamp_min(0)
+                    .to(torch.int32)
                 )
                 width = max(1, ((span.prefix + span.count) // ratio + 63) // 64)
                 row = table[span.request : span.request + 1, :width]
@@ -1217,7 +1305,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 from tokenspeed_kernel.ops.attention.dsv41 import selection_table
 
                 tile_table, visible = selection_table(
-                    positions[start:stop], request_indices[start:stop], table, ratio
+                    scoring_positions[start:stop],
+                    scoring_requests[start:stop],
+                    table,
+                    ratio,
                 )
             cb = None
             if reindex:
@@ -1249,6 +1340,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 ),
                 None,
             )
+        if partition is not None:
+            rows, lens = partition.gather_selection(rows, lens, query_group)
         if produce_candidates:
             candidates = V41Candidates(positions, request_indices, blocks, block_lens)
         slots = self.global_read_slots(
@@ -1279,6 +1372,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         requests,
         forward_mode,
         index_process_group,
+        *,
+        projected_partition: InterleavedQueryPlan | None,
     ):
         """Prepare source selection on the caller's stream for this one forward."""
         result = self.select_global(
@@ -1289,6 +1384,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             requests,
             forward_mode,
             index_process_group,
+            projected_partition=projected_partition,
         )
         key = (layer_id, forward_mode, id(positions), id(requests))
         self._prepared_selections[key] = (positions, requests, result)
@@ -1531,6 +1627,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 request_indices,
                 forward_mode,
                 index_process_group,
+                projected_partition=None,
             )
         else:
             global_slots, global_lens = prepared[2]
@@ -1653,22 +1750,57 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # Advanced request subsets do not provide a writable output view;
             # copy their compact result back explicitly after native execution.
             output = out[rows] if isinstance(rows, slice) else None
-            result = dsv41.selected_attention(
-                q[rows].contiguous(),
-                cache,
-                None,
-                None,
-                global_cache,
-                None,
-                None,
-                attn_sink,
-                softmax_scale,
-                output,
-                V41_PREFILL_QUERY_TILE,
-                None,
-                workspace[:, None, :],
-                indices.contiguous(),
-            )
+            request_q = q[rows].contiguous()
+            group = self.spec.attention_query_group
+            if (
+                canonical
+                and q.is_cuda
+                and index_process_group is None
+                and should_exchange_prefill_heads(
+                    num_queries=request_q.shape[0],
+                    local_heads=request_q.shape[1],
+                    group_size=len(group),
+                    min_queries=self.spec.attention_query_min_tokens,
+                    swa_min_queries=self.spec.attention_query_swa_min_tokens,
+                    has_global=owner >= 0,
+                )
+            ):
+                if layer_id not in self._attention_exchange_layers:
+                    logging.getLogger(__name__).info(
+                        f"V4.1 attention query exchange: layer={layer_id}, "
+                        f"size={len(group)}, rows={request_q.shape[0]}, "
+                        f"local_heads={request_q.shape[1]}"
+                    )
+                    self._attention_exchange_layers.add(layer_id)
+                result = selected_prefill_with_head_exchange(
+                    request_q,
+                    workspace[:, None, :],
+                    indices,
+                    attn_sink,
+                    softmax_scale=softmax_scale,
+                    query_chunk_size=V41_PREFILL_QUERY_TILE,
+                    group=group,
+                    rank=self.spec.attention_query_rank,
+                )
+                if output is not None:
+                    output.copy_(result)
+            else:
+                result = dsv41.selected_attention(
+                    request_q,
+                    cache,
+                    None,
+                    None,
+                    global_cache,
+                    None,
+                    None,
+                    attn_sink,
+                    softmax_scale,
+                    output,
+                    V41_PREFILL_QUERY_TILE,
+                    None,
+                    workspace[:, None, :],
+                    indices.contiguous(),
+                )
             if output is None:
                 out[rows] = result
             del workspace, current_rows, indices
