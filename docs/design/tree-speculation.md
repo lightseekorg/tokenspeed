@@ -99,7 +99,9 @@ per node). Under ReplaySSM the verify
 never writes the state pool. The verify runs a GDN tree of 8 to 16 nodes
 (`GDN_TREE_VERIFY_CHUNKED_MIN_NODES`, `GDN_TREE_VERIFY_CHUNKED_MAX_NODES`) in
 the chunked form of the delta rule, every node at once with the ancestor mask
-in place of the causal one, and keeps no node states. In other
+in place of the causal one, and keeps no node states; it also writes each
+node's replay payload row (`[k | v | a | b]`) as it reads them, so that verify
+skips the q/k/v split. In other
 trees the state of every branch point (a node with a child other than the next
 node) goes to one workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),
