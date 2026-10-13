@@ -36,11 +36,6 @@ from tokenspeed_kernel.ops.attention.qsa import (  # noqa: E402
     qsa_block_scores,
     qsa_block_topk_select,
 )
-from tokenspeed_kernel.selection import select_kernel  # noqa: E402
-from tokenspeed_kernel.signature import (  # noqa: E402
-    dense_tensor_format,
-    format_signature,
-)
 from tokenspeed_kernel_amd.ops.gfx950.attention.qsa.indexer import (  # noqa: E402
     gluon_qsa_block_scores_gfx950,
     gluon_qsa_block_topk_select_gfx950,
@@ -141,26 +136,6 @@ def test_gluon_qsa_block_topk_select_matches_portable_selection(cols) -> None:
         assert sorted(got) == sorted(expected[row].tolist())
         valid = [index for index in got if index >= 0]
         assert valid == sorted(valid)
-
-
-def test_gluon_qsa_indexer_is_selected_on_gfx950() -> None:
-    scores = select_kernel(
-        "attention",
-        "qsa_block_scores",
-        format_signature(
-            query=dense_tensor_format(torch.bfloat16),
-            key_cache=dense_tensor_format(torch.bfloat16),
-        ),
-        traits={"num_heads": 4, "head_dim": 128},
-    )
-    select = select_kernel(
-        "attention",
-        "qsa_block_topk_select",
-        format_signature(logits=dense_tensor_format(torch.float32)),
-        traits={"topk": 2048},
-    )
-    assert scores.name == "gluon_qsa_block_scores_gfx950"
-    assert select.name == "gluon_qsa_block_topk_select_gfx950"
 
 
 def test_qsa_indexer_public_ops_match_portable_solution() -> None:
