@@ -209,6 +209,7 @@ def _planned_unquant_ispp(monkeypatch, activation: str, ispp: int) -> int:
         tp_size=tp_size,
         activation=activation,
         activation_situ_beta=1.0 if activation == "situ" else None,
+        deterministic_finalize=False,
     )
     (plan,) = plans
     return plan["ispp"]

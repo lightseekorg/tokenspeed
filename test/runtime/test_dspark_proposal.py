@@ -108,6 +108,7 @@ def test_draft_prefill_capture_uses_the_resolved_prefill_gate(
     executor.prefill_graph = Mock(disable=prefill_disabled)
     # Explicit: a bare Mock answers truthily, so the gate below would hold anyway.
     executor.drafter = Mock(captures_prefill_graph=declares)
+    executor.config = object()
     model_executor.ModelExecutor.capture_graphs(
         executor, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER
     )
@@ -116,8 +117,9 @@ def test_draft_prefill_capture_uses_the_resolved_prefill_gate(
     else:
         # The drafter's own graph is a measured ladder of its own.
         executor.drafter.capture_prefill_graph.assert_called_once()
-        (stream, _observer), _ = executor.drafter.capture_prefill_graph.call_args
+        (stream, _observer), kwargs = executor.drafter.capture_prefill_graph.call_args
         assert stream is executor.forward_step.stream
+        assert kwargs == {"executor_config": executor.config}
 
 
 def test_v4_prefill_window_seeding_uses_the_cpu_length_mirror() -> None:

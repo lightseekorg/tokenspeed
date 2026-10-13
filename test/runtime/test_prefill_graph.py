@@ -695,6 +695,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         )
         pg.dp_size = 1
         pg.drafter = None
+        pg._draft_first_step = False
         pg.input_buffers = InputBuffers(
             max_bs=16,
             max_num_tokens=4096,
@@ -986,6 +987,7 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
     def _bare(self, raises=None):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.disable = False
+        pg._draft_first_step = False
         pg.capture_buckets = [4]
         pg._captures = {}
         pg._encoders = {}
@@ -1182,6 +1184,7 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
     def _bare(self, model, State, decoder_buckets, calls):
         pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
         pg._narrowing = model
+        pg._draft_first_step = False
         pg.decoder_buckets = decoder_buckets
         pg.dp_size = 1
         pg._engaged_logged = set()
@@ -1272,6 +1275,61 @@ class NarrowingPrefillGraphTest(unittest.TestCase):
             ],
         )
         self.assertEqual(hidden.shape, (300, 2))
+
+    def test_draft_first_step_replay_lands_the_captured_hidden_before_the_encoder(
+        self,
+    ):
+        from unittest import mock
+
+        from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
+
+        torch = self.torch
+        calls = []
+        model, State = self._model(1, calls)
+        pg = self._bare(model, State, [64, 192], calls)
+        pg.disable = False
+        pg._draft_first_step = True
+        pg._captured_hidden_mode = CaptureHiddenMode.LAST
+        pg.capture_buckets = [256]
+        pg.config = SimpleNamespace(world_size=1, model_is_mrope=False)
+        pg.input_buffers = SimpleNamespace(
+            input_ids_buf=torch.zeros(256, dtype=torch.int64),
+            positions_buf=torch.zeros(256, dtype=torch.int64),
+        )
+        pg._embed_tokens = lambda ids: torch.ones(ids.shape[0], 2)
+        pg._input_embeds_buf = torch.zeros(256, 2)
+        pg._captured_hidden_buf = torch.full((256, 2), 7.0)
+        seen = {}
+        pg._encoders[256] = self.mod.CapturedEncoder(
+            SimpleNamespace(
+                replay=lambda valid_rows: seen.setdefault(
+                    "hidden", pg._captured_hidden_buf.clone()
+                )
+            ),
+            State(256),
+        )
+        pg.text_model = SimpleNamespace(
+            lm_head=None,
+            logits_processor=lambda ids, hidden, head, meta, aux: (
+                hidden.shape[0],
+                meta,
+            ),
+        )
+        ctx = self._ctx(3)
+        ctx.draft_narrowing = object()
+        ctx.capture_hidden_mode = CaptureHiddenMode.LAST
+        live = torch.full((3, 2), 2.0)
+        with mock.patch.object(
+            self.mod.LogitsMetadata, "from_forward_context", return_value="meta"
+        ):
+            out = pg.replay(ctx, torch.tensor([5, 6, 7]), captured_hidden_states=live)
+        # One narrowed row per request reaches the logits; the encoder read
+        # the live hidden over a zeroed bucket tail.
+        self.assertEqual(out, (1, "meta"))
+        torch.testing.assert_close(seen["hidden"][:3], live)
+        self.assertTrue(torch.all(seen["hidden"][3:] == 0))
+        with self.assertRaisesRegex(ValueError, "captured hidden"):
+            pg.replay(ctx, torch.tensor([5, 6, 7]), captured_hidden_states=live[:1])
 
     def test_narrowing_disagreeing_with_the_metadata_is_fatal(self):
         calls = []

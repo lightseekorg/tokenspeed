@@ -514,6 +514,32 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         self.assertEqual(gather_ids.tolist(), [1, 3, 9])
         self.assertEqual(input_ids[2:].tolist(), output_tokens[1:].tolist())
 
+    def test_eagle_extend_first_step_keeps_the_full_prefill_chunk(self):
+        """Step 0 after an extend is the whole chunk, not the last token.
+
+        An 8K serving chunk therefore needs an 8K draft ladder; reusing the
+        target's 2048 cap would miss every full-size extend.
+        """
+        drafter = _make_eagle(spec_num_tokens=4)
+        chunk = torch.arange(8, dtype=torch.int32)
+        drafter.input_buffers = SimpleNamespace(
+            shifted_prefill_ids_buf=chunk,
+            input_lengths_buf=torch.tensor([8], dtype=torch.int32),
+        )
+        draft_input = EagleDraftInput(
+            input_num_tokens=8,
+            num_extends=1,
+            forward_mode=ForwardMode.EXTEND,
+            base_model_output=torch.tensor([99], dtype=torch.int32),
+            accept_lengths=torch.tensor([1], dtype=torch.int32),
+            base_out_hidden_states=torch.empty(0),
+        )
+        input_ids, gather_ids = drafter._get_first_step_input(
+            draft_input, bs=1, input_num_tokens=8
+        )
+        self.assertEqual(input_ids.tolist(), chunk.tolist())
+        self.assertEqual(gather_ids.tolist(), [7])
+
     def test_extend_depth_shifted_ids_shifts_within_each_request(self):
         # Request A: 5 prefill rows, shift-1 ids [t1..t4, S_A] (S_A = the
         # round's sampled token on the final chunk). Request B: 3 rows,
@@ -1124,6 +1150,199 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
         step=1,
     )
     assert seen == dict(step=1, rows=3)
+
+
+class _NarrowingInner:
+    max_decoder_rows_per_request = 1
+
+    def encoder_forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def narrowing_forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def decoder_forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def finish_forward(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def decoder_rows(self, ctx):
+        return ctx.bs
+
+    def allocate_decoder_state(self, rows):
+        raise NotImplementedError
+
+
+class _Window:
+    """The projection's measured window; counts the captures that fill it."""
+
+    def __init__(self):
+        self.entered = 0
+
+    def __enter__(self):
+        self.entered += 1
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _eagle_capture_shell(monkeypatch, *, disable):
+    created = {}
+
+    class FakeGraph:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+            self.disable = disable
+
+        def capture(self, wrapper, *, entries, observer):
+            created.update(stream=wrapper.stream, entries=entries, observer=observer)
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.execution.drafter.eagle.PrefillGraph", FakeGraph
+    )
+    drafter = Eagle.__new__(Eagle)
+    drafter.draft_model_runner = SimpleNamespace(
+        model=SimpleNamespace(model=_NarrowingInner())
+    )
+    drafter.attn_backend = object()
+    drafter.token_to_kv_pool = object()
+    drafter.input_buffers = object()
+    drafter.prefill_graph = None
+    return drafter, created
+
+
+def test_eagle_declares_a_draft_prefill_graph_only_for_a_narrowing_model():
+    drafter = Eagle.__new__(Eagle)
+    drafter.draft_model_runner = SimpleNamespace(model=SimpleNamespace(model=object()))
+    assert drafter.captures_prefill_graph is False
+    drafter.draft_model_runner = SimpleNamespace(
+        model=SimpleNamespace(model=_NarrowingInner())
+    )
+    assert drafter.captures_prefill_graph is True
+
+
+def test_eagle_capture_builds_a_draft_first_step_owner_on_the_target_config(
+    monkeypatch,
+):
+    from tokenspeed.runtime.execution.memory_delta import (
+        NULL_MEMORY_DELTA_OBSERVER,
+    )
+
+    drafter, created = _eagle_capture_shell(monkeypatch, disable=False)
+    config, stream, window = object(), object(), _Window()
+    drafter.capture_prefill_graph(stream, window, executor_config=config)
+    assert created["draft_first_step"] is True
+    assert created["config"] is config
+    assert created["drafter"] is None
+    assert created["stream"] is stream
+    # The projection sizes the draft graph as one window: every bucket is
+    # captured inside it, none measured on its own.
+    assert created["entries"] is None
+    assert created["observer"] is NULL_MEMORY_DELTA_OBSERVER
+    assert window.entered == 1
+    assert drafter.prefill_graph is not None
+
+
+def test_eagle_capture_fills_the_window_and_drops_a_disabled_draft_graph(
+    monkeypatch,
+):
+    drafter, _ = _eagle_capture_shell(monkeypatch, disable=True)
+    window = _Window()
+    drafter.capture_prefill_graph(object(), window, executor_config=object())
+    # A declared window is filled even when the graph records nothing.
+    assert window.entered == 1
+    assert drafter.prefill_graph is None
+
+
+def test_eagle_release_drops_the_draft_graph():
+    released = []
+    drafter = Eagle.__new__(Eagle)
+    drafter.prefill_graph = SimpleNamespace(
+        release_graphs=lambda: released.append(True)
+    )
+    drafter.release_prefill_graph()
+    assert released == [True]
+    assert drafter.prefill_graph is None
+    drafter.release_prefill_graph()
+    assert released == [True]
+
+
+def test_eagle_first_step_replays_with_the_live_captured_hidden():
+    replayed = {}
+
+    class Graph:
+        def can_run(self, ctx):
+            return True
+
+        def replay(self, ctx, input_ids, captured_hidden_states=None):
+            replayed["ctx"] = ctx
+            replayed["input_ids"] = input_ids
+            replayed["hidden"] = captured_hidden_states
+            return "logits"
+
+    def eager(**kwargs):
+        raise AssertionError("an admitted step 0 must not run eager")
+
+    drafter = Eagle.__new__(Eagle)
+    drafter.prefill_graph = Graph()
+    drafter.draft_model_runner = SimpleNamespace(forward=eager)
+    ctx = SimpleNamespace()
+    ids = torch.tensor([1, 2, 3])
+    hidden = torch.ones(3, 2)
+    assert drafter._forward_first_step(ctx, ids, torch.zeros(3), hidden) == "logits"
+    assert replayed["ctx"] is ctx
+    assert replayed["input_ids"] is ids
+    assert replayed["hidden"] is hidden
+
+
+def test_eagle_first_step_stays_eager_when_the_draft_graph_declines():
+    drafter = Eagle.__new__(Eagle)
+    drafter.prefill_graph = SimpleNamespace(can_run=lambda ctx: False)
+    drafter._first_step_miss_logged = False
+    drafter.draft_model_runner = SimpleNamespace(
+        forward=lambda **kwargs: ("eager", kwargs["spec_step_idx"])
+    )
+    decode = SimpleNamespace(num_extends=0, input_num_tokens=1)
+    out = drafter._forward_first_step(
+        decode, torch.tensor([1]), torch.zeros(1), torch.ones(1, 2)
+    )
+    assert out == ("eager", 0)
+    # Decode-only first steps are not a prefill-graph miss.
+    assert drafter._first_step_miss_logged is False
+    mixed = SimpleNamespace(
+        num_extends=1, input_num_tokens=8, forward_mode=ForwardMode.MIXED
+    )
+    assert drafter._forward_first_step(
+        mixed, torch.tensor([1]), torch.zeros(1), torch.ones(1, 2)
+    ) == ("eager", 0)
+    # Nor are mixed rounds, which the graph declines by design.
+    assert drafter._first_step_miss_logged is False
+    extend_miss = SimpleNamespace(
+        num_extends=2, input_num_tokens=8, forward_mode=ForwardMode.EXTEND
+    )
+    assert drafter._forward_first_step(
+        extend_miss, torch.tensor([1]), torch.zeros(1), torch.ones(1, 2)
+    ) == ("eager", 0)
+    assert drafter._first_step_miss_logged is True
+
+
+def test_eagle_first_step_passes_model_inputs_to_the_eager_forward():
+    seen = {}
+    drafter = Eagle.__new__(Eagle)
+    drafter.prefill_graph = None
+    drafter.draft_model_runner = SimpleNamespace(forward=lambda **kw: seen.update(kw))
+    positions = torch.zeros(2)
+    drafter._forward_first_step(
+        SimpleNamespace(num_extends=1, input_num_tokens=2),
+        torch.tensor([1, 2]),
+        positions,
+        torch.ones(2, 2),
+        request_token_history="history",
+    )
+    assert seen["request_token_history"] == "history"
+    assert seen["positions"] is positions
+    assert seen["spec_step_idx"] == 0
 
 
 if __name__ == "__main__":

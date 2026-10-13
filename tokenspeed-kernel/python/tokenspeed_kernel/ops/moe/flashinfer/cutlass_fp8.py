@@ -103,6 +103,7 @@ if platform.is_nvidia:
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
+            "deterministic_finalize": frozenset({False, True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({1}),
@@ -160,4 +161,6 @@ if platform.is_nvidia:
             swiglu_limit=swiglu_limit,
             use_deepseek_fp8_block_scale=True,
             enable_pdl=enable_pdl,
+            # The fused GEMM2 epilogue reduces the top-k outputs with atomics.
+            use_fused_finalize=not plan["deterministic_finalize"],
         )[0]

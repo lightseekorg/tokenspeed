@@ -935,7 +935,9 @@ class ModelExecutor:
             # Only a drafter that declared the ladder gets a window to fill.
             if self.captures_drafter_prefill_graph:
                 self.drafter.capture_prefill_graph(
-                    self.forward_step.stream, observer.measure("prefill:drafter")
+                    self.forward_step.stream,
+                    observer.measure("prefill:drafter"),
+                    executor_config=self.config,
                 )
 
     @property

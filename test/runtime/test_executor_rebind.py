@@ -206,10 +206,11 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
             ("prefill", entries, observer, wrapper)
         ),
     )
+    executor.config = SimpleNamespace()
     executor.drafter = SimpleNamespace(
         captures_prefill_graph=True,
-        capture_prefill_graph=lambda stream, window: seen.append(
-            ("drafter", stream, window)
+        capture_prefill_graph=lambda stream, window, *, executor_config: seen.append(
+            ("drafter", stream, window, executor_config)
         ),
     )
     monkeypatch.setattr(
@@ -222,7 +223,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
     assert seen == [
         ("decode", 3, observer),
         ("prefill", 3, observer, executor.forward_step),
-        ("drafter", "stream", "window:prefill:drafter"),
+        ("drafter", "stream", "window:prefill:drafter", executor.config),
     ]
 
 

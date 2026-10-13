@@ -444,6 +444,7 @@ def _make_moe_plan(api, routing_mode):
         deepep_mode=None,
         deepep_low_latency_max_num_tokens_per_gpu=None,
         solution=None,
+        requires_deterministic_finalize=False,
     )
 
 
@@ -738,12 +739,14 @@ def test_capture_lifecycle_preserves_main_order(
         assert runner is step
         events.append("prefill")
 
-    def capture_draft(stream, observer):
+    def capture_draft(stream, observer, *, executor_config):
         assert stream is step.stream
+        assert executor_config is executor.config
         events.append("draft")
 
     executor = SimpleNamespace(
         captures_drafter_prefill_graph=not prefill_disabled and has_drafter,
+        config=SimpleNamespace(),
         device="cpu",
         forward_step=step,
         prefill_graph=SimpleNamespace(

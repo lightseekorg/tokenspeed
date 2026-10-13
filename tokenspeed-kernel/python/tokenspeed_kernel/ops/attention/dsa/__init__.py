@@ -395,6 +395,7 @@ def dsa_decode(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    attn_sink: torch.Tensor | None = None,
 ) -> AttentionResult:
     """Sparse DSA decode over selected global KV slots.
 
@@ -431,6 +432,9 @@ def dsa_decode(
             declaring the ``slot_order`` trait, which receive it as a keyword
             and promise to reduce in the emitted order rather than by slot).
             Required keyword.
+        attn_sink: Optional FP32 per-head sink logits, applied as in
+            ``dsa_prefill``. Only kernels declaring ``sinks`` are selected
+            when it is set.
 
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
@@ -447,6 +451,7 @@ def dsa_decode(
 
     traits = {
         "q_len": int(q_len_per_req),
+        "num_heads": int(num_heads),
         "qk_nope_head_dim": int(qk_nope_head_dim),
         "kv_lora_rank": int(kv_lora_rank),
         "qk_rope_head_dim": int(qk_rope_head_dim),
@@ -456,6 +461,7 @@ def dsa_decode(
         "has_sparse_kv_cache": sparse_kv_cache is not None,
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": attn_sink is not None,
         "topk_layout": "global_slots",
         "slot_order": slot_order,
     }
@@ -505,7 +511,13 @@ def dsa_decode(
             out=out,
             enable_pdl=pdl_enabled(),
             **slot_order_kwargs,
+            **_sink_kwargs(attn_sink),
         )
+
+
+def _sink_kwargs(attn_sink: torch.Tensor | None) -> dict[str, torch.Tensor]:
+    # Kernels without ``sinks`` support never accept the keyword.
+    return {} if attn_sink is None else {"attn_sink": attn_sink}
 
 
 def dsa_prefill(
@@ -529,6 +541,7 @@ def dsa_prefill(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    attn_sink: torch.Tensor | None = None,
 ) -> AttentionResult:
     """Sparse DSA prefill over selected global KV slots.
 
@@ -558,6 +571,9 @@ def dsa_prefill(
         solution: Optional kernel solution to force through normal selection.
         slot_order: The order the selected slots are reduced in, as for
             :func:`dsa_decode`. Required keyword.
+        attn_sink: Optional FP32 per-head sink logits. The sink is one extra
+            softmax candidate with no value vector, so it scales every output
+            by ``exp(lse) / (exp(lse) + exp(sink))``. Reported LSE includes it.
 
     Returns:
         Latent DSA attention output, or ``(out, lse)`` when ``return_lse=True``.
@@ -581,6 +597,7 @@ def dsa_prefill(
         "has_sparse_kv_cache": sparse_kv_cache is not None,
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sinks": attn_sink is not None,
         "topk_layout": "global_slots",
         "slot_order": slot_order,
     }
@@ -630,6 +647,7 @@ def dsa_prefill(
             out=out,
             enable_pdl=pdl_enabled(),
             **slot_order_kwargs,
+            **_sink_kwargs(attn_sink),
         )
 
 

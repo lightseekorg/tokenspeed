@@ -539,6 +539,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
     owner._expert_load_rows = None
+    owner._draft_first_step = False
     owner._captures = {
         (8, None): (capture("ordinary"), CapturedForward(torch.ones(8, 4), None)),
         (8, capture_bs): (
@@ -604,6 +605,7 @@ def test_request_bucket_selection_reserves_dummy_scan_tokens(bs, tokens, expecte
     owner = object.__new__(PrefillGraph)
     # KDA has no CED narrowing; the split encoder/decoder capture stays off.
     owner._narrowing = None
+    owner._draft_first_step = False
     owner.disable = False
     owner.dp_size = 1
     owner.attn_backend = SimpleNamespace(step_counter=None)
@@ -622,6 +624,128 @@ def test_request_bucket_selection_reserves_dummy_scan_tokens(bs, tokens, expecte
     )
     bucket = owner._replay_bucket(ctx)
     assert (bucket, owner._merged_capture_bs(bucket, ctx)) == expected
+
+
+def test_replay_bucket_declines_draft_narrowing_and_hidden_mode_mismatch():
+    from tokenspeed.runtime.execution.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+    owner = object.__new__(PrefillGraph)
+    owner._narrowing = None
+    owner._draft_first_step = False
+    owner.disable = False
+    owner.dp_size = 1
+    owner.attn_backend = SimpleNamespace(step_counter=None)
+    owner._captures = {(8, None): None, (8, 1): None}
+    owner._captured_hidden_mode = CaptureHiddenMode.FULL
+    owner._select_bucket = lambda ctx: 8
+
+    def ctx(**overrides):
+        values = dict(
+            bs=1,
+            input_num_tokens=8,
+            num_extends=1,
+            forward_mode=ForwardMode.EXTEND,
+            draft_narrowing=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    assert owner._replay_bucket(ctx()) == 8
+    assert owner._replay_bucket(ctx(forward_mode=ForwardMode.MIXED)) == 8
+    assert owner._replay_bucket(ctx(draft_narrowing=object())) is None
+    assert owner._replay_bucket(ctx(capture_hidden_mode=CaptureHiddenMode.LAST)) is None
+    assert owner._replay_bucket(ctx(capture_hidden_mode=CaptureHiddenMode.NULL)) is None
+
+
+def test_draft_first_step_replay_requires_narrowing_last_hidden_and_pure_extend():
+    from tokenspeed.runtime.execution.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+    owner = object.__new__(PrefillGraph)
+    owner._narrowing = None
+    owner._draft_first_step = True
+    owner.disable = False
+    owner.dp_size = 1
+    owner.attn_backend = SimpleNamespace(step_counter=None)
+    owner._captures = {(8, None): None, (8, 1): None}
+    owner._captured_hidden_mode = CaptureHiddenMode.LAST
+    owner._select_bucket = lambda ctx: 8
+
+    def ctx(**overrides):
+        values = dict(
+            bs=1,
+            input_num_tokens=8,
+            num_extends=1,
+            forward_mode=ForwardMode.EXTEND,
+            draft_narrowing=object(),
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    assert owner._replay_bucket(ctx()) == 8
+    assert owner._replay_bucket(ctx(draft_narrowing=None)) is None
+    assert owner._replay_bucket(ctx(capture_hidden_mode=CaptureHiddenMode.FULL)) is None
+    assert owner._replay_bucket(ctx(forward_mode=ForwardMode.MIXED)) is None
+
+
+def test_dummy_capture_hidden_mode_is_last_only_for_draft_first_step():
+    from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+    owner = object.__new__(PrefillGraph)
+    owner.drafter = None
+    owner._draft_first_step = False
+    assert owner._dummy_capture_hidden_mode() is CaptureHiddenMode.NULL
+    owner.drafter = object()
+    assert owner._dummy_capture_hidden_mode() is CaptureHiddenMode.FULL
+    owner._draft_first_step = True
+    assert owner._dummy_capture_hidden_mode() is CaptureHiddenMode.LAST
+
+
+def test_land_captured_hidden_zeroes_the_bucket_tail_and_rejects_a_short_hidden():
+    import torch
+
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+    owner = object.__new__(PrefillGraph)
+    owner._captured_hidden_buf = torch.ones(8, 2)
+    owner._land_captured_hidden(torch.full((3, 2), 5.0), 3, 5)
+    buf = owner._captured_hidden_buf
+    assert torch.all(buf[:3] == 5)
+    assert torch.all(buf[3:5] == 0)
+    assert torch.all(buf[5:] == 1)
+    with pytest.raises(ValueError, match=r"\(3, 2\) captured hidden; got \(1, 2\)"):
+        owner._land_captured_hidden(torch.ones(1, 2), 3, 5)
+    with pytest.raises(ValueError, match="got None"):
+        owner._land_captured_hidden(None, 3, 5)
+
+
+def test_capture_draft_narrowing_refuses_to_publish_inside_a_graph_segment(
+    monkeypatch,
+):
+    import torch
+
+    from tokenspeed.runtime.execution.prefill_graph import _CaptureDraftNarrowing
+
+    published = []
+    backend = SimpleNamespace(advance_draft_forward_metadata=published.append)
+    frontier = torch.tensor([4, 6])
+    narrowing = _CaptureDraftNarrowing(backend, frontier)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    narrowing.publish_accepted_prefix()
+    assert len(published) == 1 and published[0] is frontier
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="eager break"):
+        narrowing.publish_accepted_prefix()
 
 
 @pytest.mark.parametrize(

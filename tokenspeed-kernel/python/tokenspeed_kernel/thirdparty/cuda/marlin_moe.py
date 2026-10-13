@@ -18,11 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Marlin WNA16 MoE GEMM (weight-only 4-bit, grouped experts).
+"""Marlin WNA16 MoE GEMM (weight-only, grouped experts).
 
 Wraps the pre-compiled vendored Marlin MoE kernel (see csrc/marlin_moe/). Only
-the bf16-activation specializations are exported: MXFP4 with E8M0 group-32
-scales is numerically valid only on the bf16 path.
+the bf16-activation specializations are exported: MXFP4 and MXFP8 with E8M0
+group-32 scales are numerically valid only on the bf16 path.
 """
 
 from __future__ import annotations
@@ -37,6 +37,9 @@ import torch
 # finite_values_only=1:1b | nan_repr=NONE(0):8b). Keep in sync with
 # csrc/marlin_moe/include/scalar_type.hpp (kFE2M1f).
 FLOAT4_E2M1F_ID = (2) | (1 << 8) | (1 << 16) | (0 << 17) | (1 << 49) | (0 << 50)
+# float8_e4m3fn: exponent=4, mantissa=3, signed, bias=0, finite_values_only,
+# nan_repr=EXTD_RANGE_MAX_MIN(2). Keep in sync with kFE4M3fn.
+FLOAT8_E4M3FN_ID = (4) | (3 << 8) | (1 << 16) | (0 << 17) | (1 << 49) | (2 << 50)
 
 # Max thread_n across kernel configs; sizes the fp32-reduce scratch. Matches
 # device::marlin_moe in csrc/marlin_moe/moe_wna16_marlin.cuh.
@@ -119,10 +122,11 @@ def marlin_permute_scales(
 
 
 def mxfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
-    """Reorder + retype permuted MXFP4 scales for the bf16 Marlin path.
+    """Reorder + retype permuted E8M0 scales for the bf16 Marlin path.
 
-    The bf16 kernel consumes E8M0 scales in a 4-lane [0,2,1,3] order. Input is
-    the ``marlin_permute_scales`` output as uint8 (raw E8M0 bytes).
+    The bf16 kernel consumes E8M0 scales in a 4-lane [0,2,1,3] order, for
+    MXFP4 and MXFP8 weights alike. Input is the ``marlin_permute_scales``
+    output as uint8 (raw E8M0 bytes).
     """
     marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
         marlin_scales.size(0), -1
@@ -134,15 +138,26 @@ def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
     num_experts: int,
+    *,
+    expert_start: int,
+    deterministic: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sort routes by expert and pad each expert's routes to ``block_size``.
 
     Args:
-        topk_ids: int32 ``[tokens, top_k]`` global expert ids. Out-of-range
-            ids (EP-masked experts) still get slots; the Marlin kernel skips
-            blocks whose expert id falls outside the local range.
+        topk_ids: int32 ``[tokens, top_k]`` expert ids. Ids outside
+            ``[expert_start, expert_start + num_experts)`` (other EP ranks'
+            experts, masked ``-1`` slots) share one invalid lane whose blocks
+            carry expert id -1, which the EP Marlin kernel skips.
         block_size: Token block granularity of the downstream grouped GEMM.
-        num_experts: Global expert count.
+        num_experts: Number of experts this call aligns for.
+        expert_start: Id of the first of them; block expert ids are relative
+            to it.
+        deterministic: Lay each expert's routes out in route order. The
+            default scatter places them with global atomics, so which block a
+            route lands in, and with it the split-K partition Marlin sums it
+            under, changes from run to run; true keeps the GEMM output
+            bitwise reproducible at the cost of a single-block sort.
 
     Returns:
         ``(sorted_token_ids, expert_ids, num_tokens_post_padded)`` — flat
@@ -164,6 +179,7 @@ def moe_align_block_size(
 
     _load_marlin_moe_module().moe_align_block_size(
         topk_ids,
+        expert_start,
         num_experts + 1,
         block_size,
         sorted_ids,
@@ -171,6 +187,7 @@ def moe_align_block_size(
         num_tokens_post_pad,
         cumsum_buffer,
         True,  # pad_sorted_token_ids
+        deterministic,
     )
     return sorted_ids, expert_ids, num_tokens_post_pad
 
@@ -186,6 +203,7 @@ def moe_wna16_marlin_gemm(
     num_tokens_post_padded: torch.Tensor,
     topk_weights: torch.Tensor,
     *,
+    b_q_type_id: int,
     moe_block_size: int,
     top_k: int,
     mul_topk_weights: bool,
@@ -195,20 +213,25 @@ def moe_wna16_marlin_gemm(
     size_k: int,
     use_fp32_reduce: bool = True,
 ) -> torch.Tensor:
-    """Run one grouped Marlin W4A16 GEMM over routed expert tokens.
+    """Run one grouped weight-only Marlin GEMM over routed expert tokens.
 
     Computes ``c[route] = a[token(route)] @ dequant(b_q_weight[expert(route)])``
     for every route produced by ``moe_align_block_size``-style scheduling.
-    MXFP4 weights only (E2M1 packed, E8M0 group-32 scales); activation stays
-    bf16 (W4A16 -- no FP4 tensor cores needed, runs on SM90).
+    Weights are MXFP4 (E2M1 packed) or MXFP8 (E4M3), both with E8M0 group-32
+    scales; activation stays bf16, so no FP4/FP8 tensor cores are needed and
+    the kernel runs on SM90.
 
     Args:
         a: bf16 activations ``[size_m, size_k]``.
         c: Optional output ``[size_m * top_k, size_n]``; allocated when None.
-            Must be zero-filled by the caller if experts can be masked (EP).
-        b_q_weight: Marlin-repacked weights ``[E, size_k/16, size_n*2]`` int32.
+            Rows of routes to expert ``-1`` stay unwritten, with or without
+            EP, so a caller that reads them must zero-fill ``c``.
+        b_q_weight: Marlin-repacked weights ``[E, size_k/16, size_n*bits/2]``
+            int32.
         b_scales: Marlin-permuted scales ``[E, size_k/32, size_n]``
             float8_e8m0fnu.
+        b_q_type_id: Weight ScalarType id, :data:`FLOAT4_E2M1F_ID` (MXFP4) or
+            :data:`FLOAT8_E4M3FN_ID` (MXFP8).
         workspace: int32 lock array from :func:`marlin_make_workspace`.
         sorted_token_ids: Routes padded per expert to ``moe_block_size``.
         expert_ids: Expert id per scheduled block.
@@ -217,13 +240,18 @@ def moe_wna16_marlin_gemm(
         moe_block_size: Token block size used by the alignment step (8-64).
         top_k: Routes per token.
         mul_topk_weights: Scale outputs by ``topk_weights`` (GEMM2 finalize).
-        is_ep: Expert-parallel mode; out-of-range expert ids are skipped.
+        is_ep: Skip blocks of expert id -1, the alignment's lane for ids
+            outside its expert range (``-1`` slots included). Must be true
+            whenever such routes can occur, EP or not: false reads expert
+            -1's weights.
         size_m/size_n/size_k: GEMM problem shape.
         use_fp32_reduce: Reduce partial tiles in fp32 scratch (recommended).
 
     Returns:
         ``c`` with dtype of ``a``.
     """
+    if b_q_type_id not in (FLOAT4_E2M1F_ID, FLOAT8_E4M3FN_ID):
+        raise ValueError(f"unsupported Marlin MoE weight type id {b_q_type_id}")
     device = a.device
     if c is None:
         c = torch.zeros((size_m * top_k, size_n), dtype=a.dtype, device=device)
@@ -233,8 +261,9 @@ def moe_wna16_marlin_gemm(
     num_groups = b_scales.size(1)
     group_size = size_k // num_groups if num_groups > 1 else -1
 
-    # fp32 partial-tile reduction scratch (no atomic-add on the mxfp4 path:
-    # E8M0 bf16 atomics accumulate in bf16 and lose precision).
+    # fp32 partial-tile reduction scratch (no atomic-add on the E8M0 paths:
+    # bf16 atomics accumulate in bf16 and lose precision, and their order
+    # varies run to run).
     if use_fp32_reduce:
         sms = torch.cuda.get_device_properties(device).multi_processor_count
         max_c_tmp_size = min(
@@ -277,7 +306,7 @@ def moe_wna16_marlin_gemm(
         top_k,
         mul_topk_weights,
         is_ep,
-        FLOAT4_E2M1F_ID,
+        b_q_type_id,
         size_m,
         size_n,
         size_k,

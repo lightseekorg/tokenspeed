@@ -407,7 +407,10 @@ scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
 over the target and draft `child_backends()` trees once
 (`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
-`DSABackend` disables the prefill graph (rationale on the class). Qwen4-Exp's
+`DSABackend` disables the prefill graph (rationale on the class) unless its
+model reads the backend metadata only inside the eager attention break and
+drops the padded rows there: GLM-5.3-Flash (KPool) and models whose
+`DSAConfig.padded_prefill_replay` is set (HY V4 and its MTP draft). Qwen4-Exp's
 PLE and QSA indexer support the breakable graph: their model methods are eager
 break points, where live request metadata controls cache writes and padded
 token rows are sliced before state updates. The root composes its actual
@@ -633,6 +636,52 @@ buffers), so it carries no single-layer restriction. `ForwardContext`
 carries no drafter tensors: `accept_lengths` and `draft_seq_lens_buf` are
 gone, the handle's presence is the step-0 discriminator, and no model
 computes or edits seq_lens.
+
+**Draft step 0 after a prefill is a draft-owned graph.** Two independent
+reasons the *target* graph never serves it, both intentional: the target
+`PrefillGraph._replay_bucket` declines a live context that carries
+`draft_narrowing` or a `capture_hidden_mode` other than the one baked at
+capture (Eagle step 0 sets both — narrowing present and
+`CaptureHiddenMode.LAST`, while the target dummy capture with a drafter
+attached bakes `FULL`); and Eagle / MTP draft forwards call
+`draft_model_runner.forward` directly, so they never enter
+`ModelExecutor._run_target_forward` and would not replay the target's
+graph even if the context matched. A draft-owned `PrefillGraph` constructed
+with `draft_first_step=True` inverts that admission (requires narrowing
+and the baked `LAST`) so the same owner can capture Eagle step 0 without
+relaxing the target graph. Decode-side draft steps already ride the
+decode graph.
+
+Eagle captures that owner after the target graph when the draft model is a
+`NarrowingPrefillModel`, and replays step 0 when the draft graph admits the
+context. It admits pure extends only: on a mixed round the replay's proposals
+disagreed with the eager draft's, so mixed rounds keep the eager step 0. The
+graph keeps the target hidden in a static buffer beside the
+input embeds and lands it per replay, refusing a hidden whose row count
+differs from the input ids (the target captures `FULL` when a drafter is
+attached): a short `LAST` tensor would leave the previous replay's rows in
+the graphed bucket. A captured segment must not publish the accepted
+prefix, since replay rebinds the live frontier only at eager breaks; the
+capture's dummy narrowing refuses to. Decode-only first steps
+(`num_extends == 0`) stay on the decode graph via
+`draft_model_runner.forward`; they are not a prefill-graph miss. The draft
+captures on the target's config, so its ladder, and every reason the target
+graph is off, carry over unchanged; a draft that reads request-token history
+stays eager as such a target does. A longer draft ladder would not pay: step
+0 is as long as the target forward, and both are compute-bound above the
+target ladder. The memory projection sizes the draft graph as one window
+(`prefill:drafter`, which `captures_prefill_graph` declares), so every
+capture, the probe's included, records the whole draft ladder inside it.
+Other Eagle drafts stay eager until they implement the same contract. Under
+attention DP the split graph stays off (rank-local narrowed rows), same as
+V4.1.
+
+HY V4 NextN is such a draft: the encoder is token-shaped (embed + `eh_proj`
++ attention through the output gate), `narrowing_forward` gathers the live
+rows from the live `gather_ids` (eager, so the gather is never baked), and
+the decoder is `o_proj` + MoE + final norm on one row per request
+(`max_decoder_rows_per_request = 1`). An 8K draft ladder cost it about 2 GB
+per GPU of pool scratch and per-bucket outputs.
 
 Both steps run unconditionally — there is no per-drafter opt-out. What makes
 that safe is the slot discipline: init writes prefill-slot metadata, refresh
@@ -1791,6 +1840,19 @@ mapping remains a separate consumer of the shared mapping helpers
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
   capture is inherited from the base default (idle refresh). Only a
   kernel-imposed capture asymmetry justifies an override.
+
+
+### Draft prefill graph validation
+
+Graph correctness evidence counts actual replays separately from eager
+fallbacks. Compare identical input tokens, positions, hidden states, gather
+rows and accepted frontiers; matching batch sizes alone do not align two
+runs. Check every replay proposal and full logits and written latent/index KV,
+not only an aggregate match rate or a median over matching proposals. Missing,
+truncated or non-finite traces fail. A free-running run that diverges is not
+comparable and must not be reported as a pass. The oracle's negative tests
+live in `test/runtime/test_draft_graph_validation.py` alongside the graph.
+Mixed first steps remain eager until an equivalent replay is demonstrated.
 
 ### Sparse KV offloading
 

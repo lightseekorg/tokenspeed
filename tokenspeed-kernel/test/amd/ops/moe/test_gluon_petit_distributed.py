@@ -217,6 +217,7 @@ def _make_plan(profile: _BenchmarkProfile) -> dict:
         deepep_mode=None,
         deepep_low_latency_max_num_tokens_per_gpu=None,
         solution="gluon",
+        requires_deterministic_finalize=False,
     )
 
 
