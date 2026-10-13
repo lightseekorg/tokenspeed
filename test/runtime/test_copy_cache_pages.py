@@ -159,6 +159,36 @@ class CopyCachePagesContractTest(unittest.TestCase):
         self.assertEqual(trace, [])
 
 
+class CopyWavesTest(unittest.TestCase):
+    """A block is read by every pair naming it as source before the pair
+    that overwrites it runs; independent pairs share the first wave."""
+
+    def _waves(self, pairs):
+        from tokenspeed.runtime.layers.attention.kv_cache.arena import _copy_waves
+
+        return [wave.tolist() for wave in _copy_waves(np.asarray(pairs))]
+
+    def test_independent_pairs_form_one_wave(self):
+        self.assertEqual(
+            self._waves([[1, 3], [2, 4], [1, 5]]), [[[1, 3], [2, 4], [1, 5]]]
+        )
+
+    def test_a_chain_reads_before_it_overwrites(self):
+        # (2, 1) overwrites block 1, which (1, 3) still reads; (0, 2)
+        # overwrites block 2, which (2, 1) reads.
+        self.assertEqual(
+            self._waves([[2, 1], [1, 3], [0, 2]]),
+            [[[1, 3]], [[2, 1]], [[0, 2]]],
+        )
+
+    def test_a_cycle_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            self._waves([[1, 2], [2, 1]])
+
+    def test_no_pairs_no_waves(self):
+        self.assertEqual(self._waves(np.zeros((0, 2), dtype=np.int32)), [])
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class FinishTailHitCopyCudaTest(unittest.TestCase):
     """The hitter's private copy of a published partial page, end to end.
@@ -328,6 +358,38 @@ class CacheArenaCopyBlocksCudaTest(unittest.TestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
 
+    def test_a_block_the_plan_reads_and_overwrites_is_read_first(self):
+        """A published tail some hitter copies may be evicted and re-granted
+        as another request's copy-in destination in the same plan: ``(1, 3)``
+        reads block 1, ``(2, 1)`` overwrites it. Block 3 must receive block
+        1's content as it was, not block 2's; a longer chain orders the same
+        way, and two chains of one wave stay parallel."""
+        arena = _arena("cuda")
+        generator = torch.Generator(device="cpu").manual_seed(1)
+        initial = torch.randint(
+            0, 256, (arena.buffer.numel(),), dtype=torch.uint8, generator=generator
+        )
+        arena.buffer.copy_(initial)
+        pairs = {
+            "history": np.asarray([[2, 1], [1, 3], [0, 2]], dtype=np.int32),
+            "state": np.asarray([[1, 2], [0, 1]], dtype=np.int64),
+        }
+        expected = initial.clone()
+        for group_id, group_pairs in pairs.items():
+            for source, destination in group_pairs.tolist():
+                src_segments = arena.block_byte_segments(group_id, [source])
+                dst_segments = arena.block_byte_segments(group_id, [destination])
+                for (src_off, size), (dst_off, _) in zip(
+                    src_segments, dst_segments, strict=True
+                ):
+                    expected[dst_off : dst_off + size] = initial[
+                        src_off : src_off + size
+                    ]
+
+        arena.copy_blocks(pairs)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
+
     def test_validates_every_group_before_touching_a_byte(self):
         arena = _arena("cuda")
         arena.buffer.fill_(7)
@@ -339,9 +401,9 @@ class CacheArenaCopyBlocksCudaTest(unittest.TestCase):
                     "state": np.asarray([[1, state_pages]]),
                 }
             )
-        with self.assertRaisesRegex(ValueError, "chain"):
-            arena.copy_blocks({"history": np.asarray([[1, 2], [2, 3]])})
-        with self.assertRaisesRegex(ValueError, "chain"):
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            arena.copy_blocks({"history": np.asarray([[1, 2], [2, 1]])})
+        with self.assertRaisesRegex(ValueError, "onto itself"):
             arena.copy_blocks({"history": np.asarray([[2, 2]])})
         with self.assertRaisesRegex(ValueError, "twice"):
             arena.copy_blocks({"history": np.asarray([[1, 3], [2, 3]])})

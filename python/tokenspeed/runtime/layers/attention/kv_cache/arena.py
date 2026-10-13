@@ -41,6 +41,29 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 logger = get_colorful_logger(__name__)
 
 
+def _copy_waves(pairs: np.ndarray) -> list[np.ndarray]:
+    """Order ``(source, destination)`` pairs so a block is read before it is
+    overwritten: a pair runs in the wave after every pair that still reads
+    its destination. A destination is a block granted fresh this plan and a
+    source one published before it, so the pairs never form a cycle.
+
+    Raises:
+        ValueError: The pairs copy blocks in a cycle.
+    """
+    waves: list[np.ndarray] = []
+    remaining = pairs
+    while remaining.shape[0]:
+        ready = ~np.isin(remaining[:, 1], remaining[:, 0])
+        if not ready.any():
+            raise ValueError(
+                f"block pairs copy in a cycle: {remaining.tolist()}; no order "
+                "reads every block before it is overwritten"
+            )
+        waves.append(remaining[ready])
+        remaining = remaining[~ready]
+    return waves
+
+
 class CacheArena:
     """Own the cache allocation, its typed field views, and its contract.
 
@@ -327,8 +350,11 @@ class CacheArena:
 
         The same O(pages) path as :meth:`zero_blocks`: one pinned upload of
         the ``(source, destination)`` pairs, one page x field expansion per
-        group in the kernel. Pairs of one group copy in parallel, so their
-        destinations are distinct and none is another pair's source.
+        group and wave in the kernel. Every source is read as it was before
+        any of the plan's copies: a block the plan both reads and overwrites
+        (a published tail some hitter copies, evicted and re-granted as a
+        copy-in's destination in the same plan) is read in an earlier wave
+        than it is written. Pairs of one wave copy in parallel.
 
         Args:
             block_pairs_by_group: Local ``[n, 2]`` integer arrays per group of
@@ -338,8 +364,8 @@ class CacheArena:
         Raises:
             IndexError: A block ID is outside its group's physical range.
             TypeError: A group's pairs are not an ``[n, 2]`` integer array.
-            ValueError: A pair copies a block onto itself, two pairs share a
-                destination, or a destination is another pair's source.
+            ValueError: A pair copies a block onto itself or two pairs share
+                a destination.
         """
         groups: list[str] = []
         arrays: list[np.ndarray] = []
@@ -351,20 +377,18 @@ class CacheArena:
                     f"block pairs for group {group_id!r} must be an [n, 2] array"
                 )
             destinations = pairs[:, 1]
-            if (pairs[:, 0] == destinations).any() or np.isin(
-                destinations, pairs[:, 0]
-            ).any():
+            if (pairs[:, 0] == destinations).any():
                 raise ValueError(
-                    f"block pairs for group {group_id!r} chain a destination "
-                    "into a source; the copies run in parallel"
+                    f"block pairs for group {group_id!r} copy a block onto itself"
                 )
             if np.unique(destinations).size != destinations.size:
                 raise ValueError(
                     f"block pairs for group {group_id!r} write one destination "
-                    "twice; the copies run in parallel"
+                    "twice; the copies of a wave run in parallel"
                 )
-            groups.append(group_id)
-            arrays.append(pairs)
+            for wave in _copy_waves(pairs):
+                groups.append(group_id)
+                arrays.append(wave)
         if not arrays:
             return
         pairs, spans = self._upload_block_ids(arrays, columns=2)

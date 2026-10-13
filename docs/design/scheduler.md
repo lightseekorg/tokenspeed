@@ -1006,8 +1006,11 @@ lands in the same change as the pin, never a release apart.
   page copies (`ExecutionPlan::pages_to_copy`) → zero → load → forward order
   on the forward thread's stream is what makes the immediate release safe --
   a tail hit's copy source may be evicted and re-granted by a later admission
-  of the same round -- and changing `DeviceHandle.execute`'s ordering breaks
-  it. A copy destination is never zeroed.
+  of the same round, as a fresh page or as another copy's destination -- and
+  changing `DeviceHandle.execute`'s ordering breaks it. Within the copies,
+  the arena reads a block before any pair overwrites it (`CacheArena.
+  copy_blocks` runs such pairs in a later wave), so every source is read as
+  it was when the plan was built. A copy destination is never zeroed.
 - A published block is never written again: a tail's blocks are copied into
   the hitter's table (or loaded from Host into private pages), an owner that
   keeps writing past a publication point moves to fresh copies of the blocks
