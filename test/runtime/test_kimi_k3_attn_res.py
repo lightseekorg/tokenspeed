@@ -78,12 +78,14 @@ def _reference_apply_attn_res(prefix_sum, block_residual, proj, norm):
 
 class AttnResTests(unittest.TestCase):
     def test_batched_iris_reduce_consumes_attnres_combine(self):
-        import tokenspeed_kernel.ops.communication.triton as triton_comm
 
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
 
         group = object()
         comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+        comm.iris_state = SimpleNamespace(
+            attnres_supported=mock.Mock(), attnres_combine=mock.Mock()
+        )
         comm.attn_ar_fusion_ok = False
         comm.cute_ar = None
         comm.mapping = SimpleNamespace(
@@ -102,13 +104,13 @@ class AttnResTests(unittest.TestCase):
         with (
             mock.patch.object(kimi_k3_comm, "_get_process_group", return_value=group),
             mock.patch.object(
-                triton_comm,
-                "allreduce_residual_attnres_combine_supported",
+                comm.iris_state,
+                "attnres_supported",
                 return_value=True,
             ) as supported,
             mock.patch.object(
-                triton_comm,
-                "allreduce_residual_attnres_combine",
+                comm.iris_state,
+                "attnres_combine",
                 return_value=(expected_h, expected_residual),
             ) as fused,
         ):
@@ -129,12 +131,14 @@ class AttnResTests(unittest.TestCase):
         fused.assert_called_once()
 
     def test_fused_attention_window_defers_attnres_combine(self):
-        import tokenspeed_kernel.ops.communication.triton as triton_comm
 
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
 
         group = object()
         comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+        comm.iris_state = SimpleNamespace(
+            attnres_supported=mock.Mock(), attnres_combine=mock.Mock()
+        )
         comm.attn_ar_fusion_ok = False
         comm.cute_ar = None
         comm.mapping = SimpleNamespace(
@@ -155,8 +159,8 @@ class AttnResTests(unittest.TestCase):
         with (
             mock.patch.object(kimi_k3_comm, "_get_process_group", return_value=group),
             mock.patch.object(
-                triton_comm,
-                "allreduce_residual_attnres_combine_supported",
+                comm.iris_state,
+                "attnres_supported",
                 side_effect=lambda partial, *_args, **_kwargs: partial.shape[0] <= 16,
             ) as supported,
             mock.patch.object(
@@ -179,7 +183,6 @@ class AttnResTests(unittest.TestCase):
         fallback_reduce.assert_called_once_with(partial, comm.mapping.attn.tp_group)
 
     def test_fused_attention_reduce_window(self):
-        import tokenspeed_kernel.ops.communication.triton as triton_comm
 
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
 
@@ -191,13 +194,14 @@ class AttnResTests(unittest.TestCase):
             _EPS,
         )
 
+        state = SimpleNamespace(attnres_supported=mock.Mock())
         with (
             mock.patch.object(
                 kimi_k3_comm, "_get_process_group", return_value=object()
             ),
             mock.patch.object(
-                triton_comm,
-                "allreduce_residual_attnres_combine_supported",
+                state,
+                "attnres_supported",
                 side_effect=lambda partial, *_args, **_kwargs: partial.shape[0] <= 16,
             ) as supported,
         ):
@@ -212,6 +216,7 @@ class AttnResTests(unittest.TestCase):
                         dtype=torch.bfloat16,
                     )
                     comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+                    comm.iris_state = state
                     comm.mapping = SimpleNamespace(
                         nprocs_per_node=8,
                         attn=SimpleNamespace(
@@ -422,6 +427,7 @@ class AttnResTests(unittest.TestCase):
                     _prepare_next_fallback_attnres_partial=mock.Mock(),
                 )
                 layer.k3_comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+                layer.k3_comm.iris_state = None
                 layer.k3_comm.mapping = layer.mapping
 
                 with (

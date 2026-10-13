@@ -267,6 +267,7 @@ class TestModelVerificationGate(unittest.TestCase):
             default_attention_backend=None,
             default_prefix_granularity=None,
             request_token_history=False,
+            is_multimodal=False,
             tokenizer_kwargs={},
             attention_instances_per_layer=1,
             numerics_envelopes=frozenset(envelopes),

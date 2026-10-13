@@ -83,7 +83,7 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   └── force_deterministic_rsag    the user's "NCCL and the fold only" knob:
 │                                   no symmetric-memory path at all (multicast
 │                                   gathers, in-switch reduction, the trtllm
-│                                   and Triton all-reduce tiers, distributed
+│                                   and Iris all-reduce tiers, distributed
 │                                   argmax). Not folded by the envelope,
 │                                   honoured first by every route
 ├── sampling.deterministic          sampling_stream=per-request: sampled rows

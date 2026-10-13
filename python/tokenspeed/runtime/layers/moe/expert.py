@@ -199,6 +199,16 @@ class MoELayer(torch.nn.Module):
         self._normalize_topk_weights = routing_config.get(
             "normalize_topk_weights", True
         )
+        # Route with the DeepSeekV3 correction bias added in FP32, in the
+        # kernel when it can, otherwise with TokenSpeed's top-k.
+        self._fp32_correction_bias = bool(
+            routing_config.get("fp32_correction_bias", False)
+        )
+        if (
+            self._fp32_correction_bias
+            and self._routing_method_type != RoutingMethodType.DeepSeekV3
+        ):
+            raise ValueError("fp32_correction_bias requires DeepSeekV3 routing")
 
         # Quantization config. ignored_layers (compressed-tensors) keys the MoE
         # block; exclude_modules (ModelOpt) keys the fused experts.
@@ -399,6 +409,7 @@ class MoELayer(torch.nn.Module):
             # trade exactly that away.
             fast_math=global_server_args_dict["numerics"] not in BITWISE_ENVELOPES,
             combine_order=combine_order,
+            fp32_correction_bias=self._fp32_correction_bias,
         )
 
         create_layer_weights(

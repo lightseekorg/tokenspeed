@@ -435,15 +435,6 @@ def _apply_backend_overrides(
     ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
-    if (
-        draft is not None
-        and "K3DSparkModel" in draft.architectures
-        and server_args.kv_parallel_size > 1
-    ):
-        raise ValueError(
-            "K3 DSpark does not support KVP (--kv-parallel-size > 1): context "
-            "KV injection does not translate virtual slots or mask nonowner writes"
-        )
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
     elif target.is_deepseek_v4:

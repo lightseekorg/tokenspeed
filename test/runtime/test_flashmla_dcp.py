@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+import sys
 from dataclasses import replace
 
 import pytest
@@ -28,6 +30,16 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     virtual_slots_to_local,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=60,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="The FlashMLA and GPU DSA leaves need an NVIDIA GPU.",
+)
 
 
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
@@ -98,9 +110,6 @@ def test_noncontiguous_pages_and_partial_tail(degree, device):
     "override, message",
     [
         ({"device": "cpu"}, "requires CUDA"),
-        ({"speculative_num_steps": 1}, "does not yet support speculation"),
-        ({"speculative_num_draft_tokens": 2}, "does not yet support speculation"),
-        ({"is_draft": True}, "does not yet support speculation"),
     ],
 )
 def test_flashmla_dcp_rejects_unsupported_execution(override, message):
@@ -119,6 +128,14 @@ def test_flashmla_dcp_rejects_unsupported_execution(override, message):
         kvp_rank=0,
         kvp_group=(0, 1, 2, 3),
     )
+    for draft in (False, True):
+        replace(
+            config,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            is_draft=draft,
+            pd_disaggregation_enabled=True,
+        )
     with pytest.raises(ValueError, match=message):
         replace(config, **override)
 
@@ -172,7 +189,8 @@ def test_kimi_capacity_shards_only_mla():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("degree", [2, 4, 8])
-def test_flashmla_shards_merge_to_full_attention(degree):
+@pytest.mark.parametrize("query_width,causal", [(1, True), (6, True), (6, False)])
+def test_flashmla_shards_merge_to_full_attention(degree, query_width, causal):
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("FlashMLA dense decode requires SM90")
     from tokenspeed_kernel.ops.attention.mla.cuda import (
@@ -182,29 +200,29 @@ def test_flashmla_shards_merge_to_full_attention(degree):
 
     torch.manual_seed(17)
     device = "cuda"
-    width, heads, length = 576, 32, 273
+    width, heads, length = 576, 32, 258
     source = torch.randn(12 * 128, 1, width, device=device, dtype=torch.bfloat16) * 0.1
     table = torch.tensor([[10, 11, 4, 5, 16, 17]], dtype=torch.int32, device=device)
     lengths = torch.tensor([length], dtype=torch.int32, device=device)
-    q = torch.randn(1, 1, heads, width, device=device, dtype=torch.bfloat16)
+    q = torch.randn(1, query_width, heads, width, device=device, dtype=torch.bfloat16)
     q += 0.25
     source[5 * 128 : 6 * 128] += 0.4
     source[2 * 128 : 3 * 128] -= 0.3
     source[8 * 128 : 9 * 128] += 0.1
 
-    def attention(cache, pages, lens):
+    def attention(query, cache, pages, lens):
         return flash_mla_with_kvcache(
-            q,
+            query,
             cache.view(-1, 64, 1, width),
             pages,
             lens,
             512,
             get_mla_metadata()[0],
             softmax_scale=width**-0.5,
-            causal=True,
+            causal=causal,
         )
 
-    ref, _ = attention(source, table, lengths)
+    ref, _ = attention(q, source, table, lengths)
     outputs, lses = [], []
     loc = torch.arange(source.shape[0], device=device)
     for rank in range(degree):
@@ -227,26 +245,42 @@ def test_flashmla_shards_merge_to_full_attention(degree):
             write_mask=owned,
         )
         assert not local_cache[:128].any()
-        out, local = torch.empty_like(table), torch.empty_like(lengths)
-        compact_kvp_pages(
-            table,
-            lengths,
-            page_size=64,
-            block_granularity=128,
-            virtual_block_count=1024,
+        from tokenspeed.runtime.layers.attention.dcp.metadata import (
+            CompactDCPLayout,
+            refresh_dcp_page_table_metadata,
+        )
+
+        # The backend's layout: one global endpoint per verify query (causal)
+        # or the block end for every query (non-causal block draft).
+        offsets = (
+            torch.arange(1 - query_width, 1, dtype=torch.int32, device=device)
+            if causal
+            else torch.zeros(query_width, dtype=torch.int32, device=device)
+        )
+        metadata = refresh_dcp_page_table_metadata(
+            page_table=table,
+            virtual_block_count=12,
             degree=degree,
             rank=rank,
-            out=out,
-            local_lengths=local,
+            layout=CompactDCPLayout(lengths, 64, 128, lengths[:, None] + offsets),
+            previous=None,
         )
-        partial, lse = attention(local_cache, out, local.clamp_min(1))
+        local = metadata.local_visible_lens.reshape(-1)
+        partial, lse = attention(
+            q.reshape(query_width, 1, heads, width),
+            local_cache,
+            metadata.local_page_table.repeat_interleave(query_width, dim=0),
+            local.clamp_min(1),
+        )
         outputs.append(
             torch.where((local > 0)[:, None, None, None], partial.float(), 0)
         )
         lses.append(torch.where((local > 0)[:, None, None], lse, -torch.inf))
     lses = torch.stack(lses).transpose(-1, -2).unsqueeze(-1)
     merged = (torch.stack(outputs) * torch.softmax(lses, dim=0)).sum(0)
-    torch.testing.assert_close(merged, ref.float(), atol=0.002, rtol=0.03)
+    torch.testing.assert_close(
+        merged.reshape_as(ref), ref.float(), atol=0.002, rtol=0.03
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -335,9 +369,12 @@ def test_hybrid_forwards_runtime_geometry_to_both_children():
 def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     monkeypatch, hybrid, model_write
 ):
+    from test.runtime.cache_pool_test_utils import (
+        make_arena,
+        make_mla_memory_plan,
+        plan_group_specs,
+    )
     from types import SimpleNamespace
-
-    from cache_pool_test_utils import make_arena, make_mla_memory_plan, plan_group_specs
 
     from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
     from tokenspeed.runtime.layers.attention.backends.paged import flashmla
@@ -701,6 +738,17 @@ def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
         kvp_group=tuple(range(degree)),
         kvp_rank=0,
     )
+    for draft in (False, True):
+        replace(
+            config,
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            is_draft=draft,
+            pd_disaggregation_enabled=True,
+        )
+    if degree > 1:
+        with pytest.raises(ValueError, match="non-causal block drafts"):
+            replace(config, is_draft=True, draft_block_decode=True)
     setup = prepare_cache_setup(
         family="dsa",
         server_args=SimpleNamespace(max_total_tokens=None),
@@ -722,7 +770,10 @@ def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
 
 
 @pytest.mark.parametrize("rank", range(4))
-def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch, rank):
+@pytest.mark.parametrize("query_width", [1, 6])
+def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
+    monkeypatch, rank, query_width
+):
     from types import SimpleNamespace
 
     from tokenspeed.runtime.layers.attention.backends.paged import dsa
@@ -751,9 +802,9 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
             num_extends=0, seq_lens_k=torch.tensor([128]), max_seq_len_k=128
         )
     )
-    query = torch.zeros(1, 2, 128, dtype=torch.bfloat16)
-    slots = torch.full((1, 512), -1, dtype=torch.int32)
-    slots[0, :4] = torch.tensor([64, 128, 192, 256])
+    query = torch.zeros(query_width, 2, 128, dtype=torch.bfloat16)
+    slots = torch.full((query_width, 512), -1, dtype=torch.int32)
+    slots[:, :4] = torch.tensor([64, 128, 192, 256])
     pool = SimpleNamespace(
         quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
     )
@@ -772,11 +823,15 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
 
     def decode(**kwargs):
         assert kwargs["return_lse"] is True
+        torch.testing.assert_close(
+            kwargs["kv_seq_lens"],
+            torch.arange(129 - query_width, 129, dtype=torch.int32),
+        )
         expected = torch.full_like(slots, -1)
-        expected[0, rank] = 64
+        expected[:, rank] = 64
         torch.testing.assert_close(kwargs["topk_slots"], expected)
-        assert kwargs["q"].shape == (1, 8, 128)
-        return torch.full((1, 8, 128), 7.0), torch.zeros(1, 8)
+        assert kwargs["q"].shape == (query_width, 8, 128)
+        return torch.full((query_width, 8, 128), 7.0), torch.zeros(query_width, 8)
 
     def combine(out, lse, *, group, rank, sink, keep_all_heads):
         assert sink is None and group == backend.kvp_group
@@ -795,7 +850,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
         topk_indices=slots,
         topk_lens=None,
     )
-    assert out.shape == (1, 256)
+    assert out.shape == (query_width, 256)
     assert (out == 7).all()
 
 
@@ -892,3 +947,169 @@ def test_dsa_indexer_16_heads_with_padded_quantization_scales():
     assert (indices[0] == -1).all()
     assert set(indices[1, :17].tolist()) == set(range(17))
     assert set(indices[2, :127].tolist()) == set(range(127))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_flashmla_draft_refreshes_dcp_after_advance_and_rollback(monkeypatch):
+    """The per-query DCP rows are refreshed in place: a captured seq_lens edit
+    (drafter hook) and a captured full refresh both replay against the same
+    buffers, so the kernel inputs follow advances and rollbacks."""
+    from tokenspeed.runtime.layers.attention.backends.paged.flashmla import (
+        FlashMLABackend,
+    )
+
+    backend = object.__new__(FlashMLABackend)
+    backend.kvp_group = (0, 1, 2, 3)
+    backend.kvp_rank = 0
+    backend.kvp_block_granularity = 128
+    backend.kvp_virtual_block_count = 10
+    backend.kernel_page_size = 64
+    backend.is_draft = False
+    backend.draft_block_decode = False
+    backend.spec_num_tokens = 3
+    backend._decode_views_by_bs = {}
+    # Blocks 2, 5 (pages 4-5, 10-11); rank 0 owns block 5 only, which is its
+    # local block 2 (pages 4-5).
+    backend.page_table_buf = torch.tensor(
+        [[4, 5, 10, 11]], device="cuda", dtype=torch.int32
+    )
+    backend.seq_lens_buf = torch.tensor([127], device="cuda", dtype=torch.int32)
+    backend._init_dcp_state()
+    monkeypatch.setattr(
+        FlashMLABackend, "_renew_decode_tile_metadata", lambda self, *, for_graph: None
+    )
+    lens = backend.seq_lens_buf.clone()
+    table = backend.page_table_buf.clone()
+    # A drafter hook edits a published refresh; eager refresh lays the rows out.
+    backend.refresh_decode_metadata(1, 1, lens, table)
+    advance = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(advance):
+        backend.advance_draft_forward_metadata(lens)
+    refresh = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(refresh):
+        backend.refresh_decode_metadata(1, 1, lens, table, for_graph_replay=True)
+    metadata = backend.dcp_metadata
+    cases = ((129, [0, 0, 1]), (132, [2, 3, 4]), (128, [0, 0, 0]))
+    for graph in (advance, refresh):
+        for length, expected in cases:
+            lens.fill_(length)
+            graph.replay()
+            assert metadata.local_visible_lens.tolist() == [expected]
+            assert metadata.local_seq_lens.item() == expected[-1]
+            assert backend._dcp_kernel_seq_lens.tolist() == [
+                max(value, 1) for value in expected
+            ]
+            assert backend._dcp_page_table_rows.tolist() == [[4, 5, 0, 0]] * 3
+    # A narrower table on refresh clears the stale columns (null page 0) so a
+    # later advance cannot resolve into them.
+    lens.fill_(132)
+    backend.refresh_decode_metadata(1, 1, lens, table[:, :2])
+    assert backend.page_table_buf.tolist() == [[4, 5, 0, 0]]
+    assert metadata.local_visible_lens.tolist() == [[0, 0, 0]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("degree", [2, 4])
+def test_flashmla_backend_kvp_verify_rows_merge_to_dense_verify(monkeypatch, degree):
+    """``_run_flash_mla_decode`` under KVP: the per-step rows a refresh laid
+    out (one kernel row per verify query, local causal lengths, repeated
+    page table) merge across the owners to the dense verify, with the
+    decode request behind a mixed round's extend row."""
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("FlashMLA dense decode requires SM90")
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.ops.attention.mla.cuda import (
+        flash_mla_with_kvcache,
+        get_mla_metadata,
+    )
+
+    from tokenspeed.runtime.layers.attention.backends.paged import flashmla
+
+    torch.manual_seed(5)
+    device = "cuda"
+    width, heads, length, queries = 576, 16, 258, 6
+    source = torch.randn(12 * 128, 1, width, device=device, dtype=torch.bfloat16) * 0.1
+    source[5 * 128 : 6 * 128] += 0.4
+    source[2 * 128 : 3 * 128] -= 0.3
+    # Row 0 is the round's extend request (never read here), row 1 decodes.
+    table = torch.tensor(
+        [[2, 3, 0, 0, 0, 0], [10, 11, 4, 5, 16, 17]], dtype=torch.int32, device=device
+    )
+    lengths = torch.tensor([64, length], dtype=torch.int32, device=device)
+    q = torch.randn(queries, heads, width, device=device, dtype=torch.bfloat16) + 0.25
+    ref, _ = flash_mla_with_kvcache(
+        q[None],
+        source.view(-1, 64, 1, width),
+        table[1:],
+        lengths[1:],
+        512,
+        get_mla_metadata()[0],
+        softmax_scale=width**-0.5,
+        causal=True,
+    )
+    layer = SimpleNamespace(
+        layer_id=0, tp_q_head_num=heads, head_dim=width, scaling=width**-0.5
+    )
+    loc = torch.arange(source.shape[0], device=device)
+    partials = []
+    for rank in range(degree):
+        backend = object.__new__(flashmla.FlashMLABackend)
+        backend.kvp_group = tuple(range(degree))
+        backend.kvp_rank = rank
+        backend.kvp_block_granularity = 128
+        backend.kvp_virtual_block_count = 12
+        backend.kernel_page_size = 64
+        backend.is_draft = False
+        backend.draft_block_decode = False
+        backend.spec_num_tokens = queries
+        backend.num_q_heads = heads
+        backend.kv_lora_rank = 512
+        backend.kv_cache_dim = width
+        backend._decode_views_by_bs = {}
+        backend._decode_tile_metadata = None
+        backend._decode_tile_metadata_keepalive = []
+        backend.page_table_buf = torch.zeros((4, 6), dtype=torch.int32, device=device)
+        backend.seq_lens_buf = torch.zeros(4, dtype=torch.int32, device=device)
+        backend._init_dcp_state()
+        local_cache = torch.zeros(
+            ((12 - 1 + degree - 1) // degree + 1) * 128,
+            1,
+            width,
+            device=device,
+            dtype=source.dtype,
+        )
+        slots, owned = virtual_slots_to_local(
+            loc, rows_per_page=128, virtual_block_count=12, degree=degree, rank=rank
+        )
+        set_mla_kv_buffer_triton(
+            local_cache,
+            slots,
+            source[..., :512],
+            source[..., 512:],
+            sanitize=True,
+            write_mask=owned,
+        )
+        pool = SimpleNamespace(get_key_buffer=lambda layer_id, c=local_cache: c)
+        recorded = []
+
+        def combine(out, lse, *, group, rank, sink, keep_all_heads, rec=recorded):
+            assert group == backend.kvp_group and sink is None and not keep_all_heads
+            rec.append((out.float().clone(), lse.clone()))
+            return out[:, :heads]
+
+        monkeypatch.setattr(
+            flashmla, "gather_query_heads", lambda q, g: q.repeat(1, len(g), 1)
+        )
+        monkeypatch.setattr(flashmla, "combine_attention_partials", combine)
+        backend.refresh_decode_metadata(2, 2, lengths, table, num_extends=1)
+        out, lse = backend._run_flash_mla_decode(
+            q.reshape(-1, heads * width), layer, pool, 1
+        )
+        assert lse is None and out.shape == (queries, 1, heads, 512)
+        (partial,) = recorded
+        partials.append(partial)
+    outputs = torch.stack([p[0] for p in partials])
+    lses = torch.stack([p[1] for p in partials]).unsqueeze(-1)
+    merged = (outputs * torch.softmax(lses, dim=0)).sum(0)
+    torch.testing.assert_close(merged[:, :heads], ref[0].float(), atol=0.002, rtol=0.03)

@@ -24,7 +24,12 @@
     "gfx950/kimi_k3/mla.json",
     "gfx950/kimi_k3/gemm.json",
     "gfx950/kimi_k3/kda.json",
-    "gfx950/kimi_k3/residual.json"
+    "gfx950/kimi_k3/residual.json",
+    "gfx950/qwen38_flash/moe.json",
+    "gfx950/qwen38_flash/residual.json",
+    "gfx950/qwen38_flash/gemm.json",
+    "gfx950/qwen38_flash/qsa.json",
+    "gfx950/qwen38_flash/gdn.json"
   ],
   "cases": []
 }
