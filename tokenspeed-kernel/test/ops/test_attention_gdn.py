@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
+    GDN_TREE_VERIFY_CHUNKED_MIN_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
     gdn_chunk_prefill,
@@ -31,6 +32,49 @@ from tokenspeed_kernel.ops.attention.gdn import (
 )
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
+
+
+def test_pack_gdn_projection_copies_the_row_strided_views(device: str):
+    """Dense copies of a projection's [qkv | z | b | a] views, bit for bit,
+    compiled once across row counts."""
+    from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
+        _pack_gdn_projection_kernel,
+    )
+    from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
+
+    qkv_dim, z_dim, heads = 2 * 512 + 1536, 1536, 12
+
+    def views(rows):
+        projection = torch.randn(
+            rows, qkv_dim + z_dim + 2 * heads, device=device, dtype=torch.bfloat16
+        )
+        b, a = projection[:, qkv_dim + z_dim :].split(heads, dim=-1)
+        return projection[:, :qkv_dim], a, b
+
+    for rows in (1, 16):
+        sources = views(rows)
+        for packed, source in zip(pack_gdn_projection(*sources), sources):
+            assert packed.is_contiguous() and packed.data_ptr() % 16 == 0
+            assert packed.data_ptr() != source.data_ptr()
+            assert torch.equal(packed, source)
+    with assert_no_triton_compile(_pack_gdn_projection_kernel):
+        for rows in (3, 64):
+            pack_gdn_projection(*views(rows))
+
+
+def test_pack_gdn_projection_reads_rows_past_int32_offsets(device: str):
+    """Row offsets times the projection's row stride pass int32."""
+    from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
+
+    qkv_dim, heads, row_stride = 64, 4, 1 << 20
+    rows = (1 << 31) // row_stride + 2
+    projection = torch.empty(rows, row_stride, device=device, dtype=torch.uint8)
+    used = projection[:, : qkv_dim + 2 * heads]
+    used.copy_(torch.randint(0, 256, used.shape, device=device, dtype=torch.uint8))
+    b, a = used[:, qkv_dim:].split(heads, dim=-1)
+    sources = (used[:, :qkv_dim], a, b)
+    for packed, source in zip(pack_gdn_projection(*sources), sources):
+        assert torch.equal(packed, source)
 
 
 def _fla_chunk_gated_delta_rule():
@@ -1622,6 +1666,75 @@ def test_gdn_decode_mtp_random_trees_match_float64_reference(
 
 
 @pytest.mark.parametrize(
+    "T,num_v_heads,head_dim",
+    [
+        (GDN_TREE_VERIFY_CHUNKED_MIN_NODES, 4, 128),
+        (11, 8, 128),
+        (GDN_TREE_VERIFY_CHUNKED_MAX_NODES, 8, 128),
+        # Too narrow to halve: the V tile stays a full tl.dot operand.
+        (GDN_TREE_VERIFY_CHUNKED_MIN_NODES, 4, 16),
+    ],
+)
+def test_gdn_decode_mtp_chunked_tree_fills_the_replay_payload(
+    device: str, require, T: int, num_v_heads: int, head_dim: int
+):
+    """A chunked ReplaySSM tree reading packed q/k/v and strided gate views
+    writes each token's ``[k | v | a | b]`` as read into the payload, idle rows
+    included, and the same output as from contiguous inputs without one."""
+    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=T,
+        num_v_heads=num_v_heads,
+        head_dim=head_dim,
+        pool_size=4,
+        state_dtype=torch.float32,
+    )
+    a, b = a.bfloat16(), b.bfloat16()
+    batch, _, H, K = k.shape
+    HV, V = v.shape[2:]
+    rows = batch * T
+    parents = [
+        [t - 1 for t in range(T)],
+        [-1] + [0] * (T - 1),
+        [-1, 0, 1, 1, 0, 4] + [t - 1 for t in range(6, T)],
+        [-1, -1, 1, -1, 3, 3] + [t - 1 for t in range(6, T)],
+    ]
+    common = dict(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        initial_state=pool,
+        initial_state_indices=torch.tensor(
+            [0, 1, -1, 3], device=device, dtype=torch.int32
+        ),
+        scale=K**-0.5,
+        use_qk_l2norm=True,
+        disable_state_update=True,
+        tree_ancestors=_tree_ancestors(parents, device),
+    )
+    want = gdn_decode_mtp(q, k, v, a=a, b=b, **common)
+
+    mixed = torch.cat([t.reshape(rows, -1) for t in (q, k, v)], dim=1)
+    q_view, k_view, v_view = (
+        part.view(batch, T, -1, last)
+        for part, last in zip(mixed.split([H * K, H * K, HV * V], dim=1), (K, K, V))
+    )
+    gates = torch.cat([b.reshape(rows, -1), a.reshape(rows, -1)], dim=1)
+    b_view, a_view = (gate.view(batch, T, HV) for gate in gates.split(HV, dim=1))
+    payload = torch.full(
+        (rows, H * K + HV * V + 2 * HV), float("nan"), device=device, dtype=q.dtype
+    )
+    got = gdn_decode_mtp(
+        q_view, k_view, v_view, a=a_view, b=b_view, replay_payload=payload, **common
+    )
+
+    assert torch.equal(got, want)
+    expected = torch.cat([t.reshape(rows, -1) for t in (k, v, a, b)], dim=1)
+    assert torch.equal(payload, expected)
+
+
+@pytest.mark.parametrize(
     ("A_log_value", "state_value"), [(88.0, None), (89.0, None), (10.0, 3e38)]
 )
 def test_gdn_decode_mtp_chunked_tree_keeps_extreme_gates_finite(
@@ -1795,7 +1908,7 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
 
     num_v_heads = 8
 
-    def run(batch: int, T: int, rows: bool) -> None:
+    def run(batch: int, T: int, rows: bool, payload: bool) -> None:
         q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
             device=device,
             dtype=torch.bfloat16,
@@ -1807,6 +1920,11 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
         )
         gen = torch.Generator().manual_seed(batch)
         parents = [_random_tree(T, gen) for _ in range(batch)]
+        replay = {}
+        if payload:
+            a, b = a.bfloat16(), b.bfloat16()
+            width = k[0, 0].numel() + v[0, 0].numel() + 2 * v.shape[2]
+            replay["replay_payload"] = q.new_empty(batch * T, width)
         _tree_verify(
             q,
             k,
@@ -1820,15 +1938,21 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
             b=b,
             initial_state_indices=torch.arange(batch, device=device, dtype=torch.int32),
             use_qk_l2norm=True,
+            **replay,
         )
 
-    # Past the SM count of (request, head) programs the chunked verify takes wider V tiles.
-    wide_batch = current_platform().sm_count // num_v_heads + 1
-    for T, rows in ((14, False), (24, False), (14, True)):
-        run(4, T, rows)
-        run(wide_batch, T, rows)
+    # V tile tiers: half width at a few requests, full up to one program per SM, wider past it.
+    full_batch = current_platform().sm_count // num_v_heads
+    for T, rows, payload in (
+        (14, False, False),
+        (14, False, True),
+        (24, False, False),
+        (14, True, False),
+    ):
+        for batch in (4, full_batch, full_batch + 1):
+            run(batch, T, rows, payload)
         with assert_no_triton_compile(
             _gdn_tree_verify_chunked_kernel, _fused_gdn_decode_update_kernel
         ):
             for batch in (1, 2, 3, 5, 8, 17, 33):
-                run(batch, T, rows)
+                run(batch, T, rows, payload)

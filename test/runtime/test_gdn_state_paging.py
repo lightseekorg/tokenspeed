@@ -1003,6 +1003,21 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self.assertTrue(torch.equal(conv_scratch[5], conv_slab[5]))
         self.assertIsNone(ssm_scratch)
 
+    def test_gating_reads_a_row_strided_decay_view(self):
+        """The prefill scan gates over a row-strided view of the projection."""
+        torch = self.torch
+        from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
+
+        heads = 12
+        projection = torch.randn(37, 4 * heads, device="cuda", dtype=torch.bfloat16)
+        a = projection[:, 3 * heads :]
+        A_log = torch.randn(heads, device="cuda")
+        dt_bias = torch.randn(heads, device="cuda")
+        expected = fused_gdn_gating(A_log, a.contiguous(), dt_bias)
+        torch.testing.assert_close(
+            fused_gdn_gating(A_log, a, dt_bias), expected, rtol=0, atol=0
+        )
+
     def test_paged_states_match_fla_oracle(self):
         if not self.gdn.is_available():
             self.skipTest("sm100 GDN kernel unavailable")

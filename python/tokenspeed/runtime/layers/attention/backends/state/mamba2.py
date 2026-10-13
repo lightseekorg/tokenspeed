@@ -256,6 +256,7 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         draft_token_num: int,
         seq_len: int,
         lower_bound: float | None,
+        replay_payload: torch.Tensor | None,
     ) -> torch.Tensor:
         """SSD steps through each request's verify window; see the base seam.
 
@@ -263,6 +264,8 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         the accepted prefix to the replay commit. The scratch fallback starts
         from the seeded scratch row and writes one state per position.
         """
+        if replay_payload is not None:
+            raise ValueError("the Mamba2 verify scan fills no replay payload")
         D = _require_mamba2_inputs(
             D, b, g_raw, f_a_out, f_b_weight, beta_raw, lower_bound
         )

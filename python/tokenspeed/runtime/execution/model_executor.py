@@ -2126,9 +2126,7 @@ class ModelExecutor:
                     bs,
                     self.input_buffers.req_pool_indices_buf[:bs],
                     self.runtime_states.future_parent_map,
-                )
-                self.tree_spec.depth_positions(
-                    bs, self.input_buffers.positions_buf[:total_tokens]
+                    self.input_buffers.positions_buf[:total_tokens],
                 )
             if request_history_seeds is not None:
                 self.runtime_states.seed_request_token_history(request_history_seeds)

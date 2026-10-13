@@ -380,3 +380,93 @@ def fused_qkv_split_gdn_prefill(
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return q, k, v
+
+
+@triton.jit
+def _pack_gdn_projection_kernel(
+    qkv_out,
+    a_out,
+    b_out,
+    qkv,
+    a,
+    b,
+    stride_qkv,
+    stride_a,
+    stride_b,
+    QKV_DIM: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCK_GATES: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Release successor setup; its wait still guards all dependent reads.
+        tl.extra.cuda.gdc_launch_dependents()
+    # Row offsets in int64: the views' row stride spans the whole projection.
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
+    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < QKV_DIM
+    tl.store(
+        qkv_out + row * QKV_DIM + offsets,
+        tl.load(qkv + row * stride_qkv + offsets, mask=mask),
+        mask=mask,
+    )
+    # One tile owns each row's gates.
+    if tile == 0:
+        heads = tl.arange(0, BLOCK_GATES)
+        gates = heads < NUM_V_HEADS
+        tl.store(
+            b_out + row * NUM_V_HEADS + heads,
+            tl.load(b + row * stride_b + heads, mask=gates),
+            mask=gates,
+        )
+        tl.store(
+            a_out + row * NUM_V_HEADS + heads,
+            tl.load(a + row * stride_a + heads, mask=gates),
+            mask=gates,
+        )
+
+
+def pack_gdn_projection(
+    mixed_qkv: torch.Tensor, a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dense copies of a GDN input projection's row-strided views, in one launch.
+
+    Args:
+        mixed_qkv: ``[T, qkv_dim]`` conv input, unit inner stride.
+        a: ``[T, num_v_heads]`` decay input, unit inner stride.
+        b: ``[T, num_v_heads]`` beta gate input, unit inner stride.
+
+    Returns:
+        Contiguous ``(mixed_qkv, a, b)`` with the inputs' shapes and dtypes.
+    """
+    if any(t.stride(-1) != 1 for t in (mixed_qkv, a, b)):
+        raise ValueError("pack_gdn_projection needs unit inner strides")
+    rows, qkv_dim = mixed_qkv.shape
+    num_v_heads = a.shape[1]
+    if a.shape != (rows, num_v_heads) or b.shape != (rows, num_v_heads):
+        raise ValueError("pack_gdn_projection needs [T, num_v_heads] gates")
+    outputs = tuple(
+        torch.empty(t.shape, dtype=t.dtype, device=t.device) for t in (mixed_qkv, a, b)
+    )
+    if rows == 0:
+        return outputs
+    enable_pdl = pdl_enabled()
+    block = 2048
+    _pack_gdn_projection_kernel[(rows, triton.cdiv(qkv_dim, block))](
+        *outputs,
+        mixed_qkv,
+        a,
+        b,
+        mixed_qkv.stride(0),
+        a.stride(0),
+        b.stride(0),
+        QKV_DIM=qkv_dim,
+        NUM_V_HEADS=num_v_heads,
+        BLOCK=block,
+        BLOCK_GATES=triton.next_power_of_2(num_v_heads),
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return outputs
