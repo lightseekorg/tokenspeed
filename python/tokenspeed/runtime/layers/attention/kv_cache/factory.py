@@ -28,6 +28,7 @@ def create_cache_arena(
         cache_group_specs=spec.cache_group_specs,
         token_capacity=spec.token_capacity,
         enable_memory_saver=enable_memory_saver,
+        storage_plan=spec.storage_plan,
     )
 
 

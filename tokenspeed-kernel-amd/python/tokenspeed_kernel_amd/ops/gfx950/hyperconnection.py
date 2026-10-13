@@ -441,6 +441,7 @@ def launch_gluon_hyperconnection_mix_gfx950(
     hc_count: int,
     hidden_size: int,
     lowrank: int,
+    projection_rows: int,
     projection_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Mix normalized hyper-connection branches in two launches.
@@ -448,12 +449,16 @@ def launch_gluon_hyperconnection_mix_gfx950(
     Args:
         normalized: Contiguous ``[rows, hc_count * hidden_size]`` FP16/BF16
             branches, ``1 <= rows <= MAX_ROWS``.
-        projection_weight: Contiguous ``[lowrank (+ hc_count), wide]`` fused
-            mix-down / inject weight.
+        projection_weight: Contiguous ``[stored_rows, wide]`` fused mix-down /
+            inject weight; ``stored_rows`` is ``projection_rows`` or that
+            rounded up to eight rows by model-loading padding, which is never
+            read.
         up_weight: Contiguous ``[wide, lowrank]`` mix-up weight.
         hc_count: Number of branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
+        projection_rows: Logical weight rows: ``lowrank``, or ``lowrank +
+            hc_count`` with inject logits.
         projection_scale: Scale applied to the down and inject projections.
 
     Returns:
@@ -461,7 +466,7 @@ def launch_gluon_hyperconnection_mix_gfx950(
         inject logits (``None`` without inject rows), in the input dtype.
     """
     rows, wide = normalized.shape
-    projection_rows = projection_weight.shape[0]
+    padded_rows = -(-projection_rows // 8) * 8
     if (
         normalized.dtype not in _SUPPORTED_DTYPES
         or projection_weight.dtype != normalized.dtype
@@ -472,6 +477,7 @@ def launch_gluon_hyperconnection_mix_gfx950(
         or wide != hc_count * hidden_size
         or up_weight.shape != (wide, lowrank)
         or projection_rows not in (lowrank, lowrank + hc_count)
+        or projection_weight.shape not in ((projection_rows, wide), (padded_rows, wide))
         or not supports_gluon_hyperconnection_mix_gfx950(
             rows, hc_count, hidden_size, lowrank
         )

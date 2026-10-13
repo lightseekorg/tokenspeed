@@ -491,6 +491,7 @@ def _super_cache_recipe(
             speculative_num_draft_tokens=draft_tokens,
             speculative_eagle_topk=topk,
             enable_replay_ssm=with_draft,
+            kv_offload_config=None,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=SimpleNamespace()),

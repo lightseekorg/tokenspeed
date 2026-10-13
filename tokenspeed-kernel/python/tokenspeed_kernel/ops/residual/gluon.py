@@ -439,6 +439,7 @@ if current_platform().is_amd:
         hc_count: int,
         hidden_size: int,
         lowrank: int,
+        projection_rows: int,
         projection_scale: float,
         weights_independent: bool,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -455,5 +456,6 @@ if current_platform().is_amd:
             hc_count,
             hidden_size,
             lowrank,
+            projection_rows,
             projection_scale,
         )

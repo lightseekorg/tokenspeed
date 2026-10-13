@@ -120,6 +120,7 @@ def _config(device):
 def _recipe(device):
     return DeepseekV41Recipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             pipeline_parallel_size=1,
             chunked_prefill_size=512,
             max_num_seqs=2,

@@ -23,6 +23,7 @@
 import argparse
 import dataclasses
 import json
+import math
 import os
 import random
 import socket
@@ -149,19 +150,16 @@ def _nonempty_str(value: str) -> str:
 def validate_kvp_disaggregation_role(
     *, has_kvp: bool, disaggregation_mode: str
 ) -> None:
-    """Reject KVP on PD roles whose transfer path cannot shard pages yet.
+    """Reject KVP on the encode role, which has no KV cache to shard.
 
-    An aggregated engine and the prefill role may shard: the prefill sender
-    copies only the pages each rank owns and every rank of the KVP subgroup
-    serves every decode rank. The decode role receives into an unsharded
-    cache only -- no receive path lands a block on its owner alone -- and the
-    encode role has no KV cache to shard.
+    Aggregated engines and both PD roles may shard: a transfer edge copies
+    only the pages its prefill rank and its decode rank both own, so the
+    prefill and decode caches shard independently.
     """
-    if has_kvp and disaggregation_mode not in ("null", "prefill"):
+    if has_kvp and disaggregation_mode not in ("null", "prefill", "decode"):
         raise ValueError(
             "--kv-parallel-size > 1 requires --disaggregation-mode "
-            f"null or prefill (got {disaggregation_mode!r}): only the prefill "
-            "side of a PD transfer can be KVP-sharded"
+            f"null, prefill or decode (got {disaggregation_mode!r})"
         )
 
 
@@ -315,6 +313,8 @@ class ServerArgs:
     enable_mixed_batch: bool = False
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
+    # JSON on the CLI, normalized once to generic runtime options.
+    kv_offload_config: str | dict | None = None
     # special kv cache
     mamba_ssm_dtype: str = "float32"
 
@@ -340,6 +340,12 @@ class ServerArgs:
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
+    # Port for the engine's Prometheus /metrics HTTP endpoint, served from the
+    # engine's main process when --enable-metrics is on. None auto-allocates a
+    # free port (logged at startup).
+    metrics_port: int | None = None
+    # Bind host for the /metrics endpoint. None binds the engine's --host.
+    metrics_host: str | None = None
     app_key: str | None = None
 
     # Cache events
@@ -1142,6 +1148,7 @@ class ServerArgs:
             )
 
     def resolve_cache(self):
+        self.resolve_kv_offload()
         # Handle KVStore settings.
         self._handle_kvstore()
         self.validate_l3_prefetch_options()
@@ -1188,6 +1195,26 @@ class ServerArgs:
                 "--retraction-snapshot-host-gb, --retraction-snapshot-ratio and "
                 "--retraction-snapshot-max-requests must be non-negative"
             )
+        if self.kv_offload_config is not None:
+            if host_gb > 0 or ratio not in (None, 0) or max_requests > 0:
+                raise ValueError(
+                    "KV offloading aborts requests under decode memory pressure; "
+                    "retraction snapshot pools are unsupported. Remove the "
+                    "--retraction-snapshot-host-gb, --retraction-snapshot-ratio "
+                    "and --retraction-snapshot-max-requests overrides "
+                    "(a ratio of 0 is allowed)."
+                )
+            if self.debug_force_retraction_interval != 0:
+                raise ValueError(
+                    "KV offloading has no recovery images; "
+                    "--debug-force-retraction-interval is unsupported."
+                )
+            # Reuse the scheduler's no-pool capacity abort path. Host history
+            # and fixed hot partitions follow the ordinary request ownership.
+            self.retraction_snapshot_host_gb = 0.0
+            self.retraction_snapshot_ratio = 0.0
+            self.retraction_snapshot_max_requests = 0
+            return
         if not self.retracting_role:
             forced = self.debug_force_retraction_interval != 0
             if host_gb > 0 or ratio is not None or max_requests > 0 or forced:
@@ -1234,6 +1261,44 @@ class ServerArgs:
                     "least the attention-DP size or pass "
                     "--retraction-snapshot-max-requests"
                 )
+
+    def resolve_kv_offload(self):
+        """Validate deployment options without model-specific cache geometry."""
+        options = self.kv_offload_config
+        if options is None:
+            return
+        if isinstance(options, str):
+            try:
+                options = json.loads(options)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--kv-offload-config must be valid JSON") from exc
+        required = {"layers", "hot_tokens", "host_gb", "overlap"}
+        if not isinstance(options, dict) or set(options) != required:
+            raise ValueError(
+                f"--kv-offload-config requires a JSON object with exactly {sorted(required)}"
+            )
+        layers = options["layers"]
+        if (
+            not isinstance(layers, list)
+            or not layers
+            or any(type(layer) is not int or layer < 0 for layer in layers)
+            or len(set(layers)) != len(layers)
+        ):
+            raise ValueError("offload layers must be unique nonnegative integer IDs")
+        hot = options["hot_tokens"]
+        if type(hot) is not int or hot <= 0 or hot & (hot - 1):
+            raise ValueError("offload hot_tokens must be a positive power of two")
+        host = options["host_gb"]
+        if (
+            type(host) not in (int, float)
+            or not math.isfinite(host)
+            or host <= 0
+            or int(host * (1 << 30)) <= 0
+        ):
+            raise ValueError("offload host_gb must be a finite positive GiB budget")
+        if type(options["overlap"]) is not bool:
+            raise ValueError("offload overlap must be an explicit bool")
+        self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
         # Keep drafter backend consistent with the main model unless explicitly set.
@@ -2311,6 +2376,14 @@ class ServerArgs:
 
         # KVStore
         parser.add_argument(
+            "--kv-offload-config",
+            type=str,
+            default=ServerArgs.kv_offload_config,
+            help='Sparse KV offload JSON object with explicit "layers", "hot_tokens", '
+            '"host_gb" (GiB), and "overlap". Model-specific options remain in '
+            "--hf-overrides; unsupported cache recipes reject this configuration.",
+        )
+        parser.add_argument(
             "--disable-kvstore",
             action="store_true",
             help="Disable KVStore",
@@ -2551,6 +2624,21 @@ class ServerArgs:
             choices=["prometheus"],
             default=["prometheus"],
             help="Select metrics reporter(can be specified multiple times)",
+        )
+        parser.add_argument(
+            "--metrics-port",
+            type=int,
+            default=ServerArgs.metrics_port,
+            help="Port for the engine's Prometheus /metrics HTTP endpoint, served "
+            "by the engine's main process when --enable-metrics is on. Defaults "
+            "to an automatically allocated free port (logged at startup); 0 "
+            "also auto-allocates.",
+        )
+        parser.add_argument(
+            "--metrics-host",
+            type=str,
+            default=ServerArgs.metrics_host,
+            help="Bind host for the /metrics endpoint. Defaults to --host.",
         )
 
         parser.add_argument(

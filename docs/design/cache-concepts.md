@@ -1211,6 +1211,12 @@ window the first decode consumes. Under PD the retained tail of the SWA group
 ships to the decode node like any sliding window, draft rows included, and
 the decode node re-feeds nothing.
 
+K3 DSpark context injection uses the draft backend's cache placement to
+resolve virtual slots and mask nonowner writes before storing MLA KV. It
+therefore follows the same KVP ownership contract as attention writes; the
+architecture alone must not reject KVP. Backend capability and shared-group
+storage checks still apply.
+
 Capacity has three shapes, all on the base class. The default is the flat
 product (`parents × tightest packing × P`). A probe arena is the third and
 narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe
@@ -1311,18 +1317,22 @@ collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. GPU DSA sparse
 prefill instead combines local sparse-attention partials.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
-KVP does not make unsupported kernels portable. KVP excludes speculative
-decoding for every model on the ordinary MLA/DSA recipe, whichever dense
-kernel runs it: `OrdinaryRecipe.groups()` refuses to shard a cache that holds
-a draft group, so a CuTe MLA engine that would accept the draft kernels still
-cannot combine KVP with a draft; FlashMLA and GPU DSA `AttnConfig` additionally
-reject any speculative width, draft or target, in their DCP decode. Only the recipes
-that declare their own groups shard with a draft present: DeepSeek V4 (its
-draft layers join the compressed-KV chains) and Kimi K3 (its draft layers join
-the sharded MLA history group), each subject to its backend's `AttnConfig`
-gate. The draft's decode steps would run the same sparse/dense DCP branches as
-the target's, but that path has not been validated for the ordinary recipe, so
-its exclusion is a gate rather than a geometry limit.
+KVP does not make unsupported kernels portable. Speculative decoding runs
+on sharded caches: `OrdinaryRecipe.groups()` shards a draft group like the
+target's, and the DeepSeek V4 and Kimi K3 recipes shard with their draft
+layers in the compressed-KV chains and the MLA history group respectively,
+each subject to its backend's `AttnConfig` gate. A verify window's queries
+end at different global positions, and the kernel's multi-query causal mask
+would subtract a query's global offset from a *local* length, so FlashMLA
+and CuTe MLA feed every query's global endpoint through the compact layout
+(`CompactDCPLayout.visible_lens` -> `local_visible_lens`, one owned-page
+prefix lookup per query, refreshed in place with the table and by the
+drafter's seq_lens hooks) and FlashMLA runs one kernel row per query against
+its local length. Known cost: a width-`w` FlashMLA verify under KVP issues
+`bs * w` single-query rows and reads each request's owned pages `w` times
+instead of once. GPU DSA selects causal Top-K before mapping cache slots.
+Non-causal DSA block drafts remain unsupported (`AttnConfig` rejects
+`draft_block_decode` under GPU DSA KVP).
 
 **Tier transfers under sharding pair blocks of equal residue.** The Host L2
 pool and the snapshot pool are registered with the same `shard_count` as the
@@ -1344,8 +1354,7 @@ balanced allocator keeps ordinary admissions within one block per bucket, so
 the imbalance a restore sees is bounded by what its own victim table
 contributed.
 
-PD transfer supports a sharded **prefill** role against an unsharded decode
-role. Manifests carry scheduler (virtual) IDs on both sides and are bounded
+PD transfer supports independently sharded prefill and decode roles. Manifests carry scheduler (virtual) IDs on both sides and are bounded
 by each side's virtual count, `1 + (page_count - 1) * shard_count`, never by
 the physical page count. The route planner (`pd/transfer_plan.py`) reads
 `shard_count` from the wire `group_specs`: for a sharded group it fans a
@@ -1353,12 +1362,12 @@ decode rank's replica out to the whole KVP subgroup (consecutive attention-TP
 ranks), tagging every member with an owner filter `(owner_rank, owner_count)`;
 the sender keeps the manifest blocks with `(v - 1) % owner_count ==
 owner_rank`, translates them to local pages through the same
-`owned_local_pages` placement zeroing uses, and copies them to the destination
-blocks at the same manifest positions. Every rank of the subgroup therefore
+`owned_local_pages` placement zeroing uses, and matches them to destination blocks at the same manifest positions.
+Only pairs owned by the destination rank are copied, after translating both
+virtual IDs to local pages. Every rank of the subgroup therefore
 serves every decode rank and none is a control-only dummy; the decode receiver
 already counts completions from a rank set. Replicated groups keep the
-single-source route. A sharded decode cache, and a field that is both
-head-partitioned and page-sharded, are rejected by the planner.
+single-source route. A field that is both head-partitioned and page-sharded is rejected by the planner.
 
 The plan records one decision per (source rank, sharded group), never by
 omission: the owner filter when the rank's fragments name the group, an
@@ -1690,9 +1699,12 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   leaves see kernel vocabulary only. The bridge's per-group table views
   (`CacheBatchMetadata`) are the router's input — block vocabulary in,
   kernel pages out, one expand launch per group. Models and the runner never
-  compute locations — `write_locations(layer, mode)` is the single accessor,
-  and `forward_write_locations` composes it for the attention prologue's writes
-  (`unified_path.md`, "Write locations have one owner").
+  compute locations — `write_locations(layer, mode)` addresses authoritative
+  history, and `forward_write_locations` supplies the attention prologue's
+  writes (`unified_path.md`, "Write locations have one owner"). Sparse
+  offloading prepares separate compute writes with `prepare_sparse_kv_access`;
+  the router uses those slots for both prologue and leaf dispatch (see
+  "Sparse KV offloading and physical storage").
   QSA's indexer reuses `GroupTableStacks` with `kernel_page_size` equal to
   each group's `block_granularity`. This ratio-one fill copies stable raw
   table views and clears holes/padding; it does not add another subdivision
@@ -1727,7 +1739,13 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   view. The contract carries no parallel `field_dtypes` tuple. ✓
 * The arena owns the allocation and materializes every planned field view in
   its constructor, so `field(field_id)` is a lookup with no dtype argument and
-  no lazy-bind state. `CachePool.store_dtype` means one thing: how a pool
+  no lazy-bind state. Ordinary history fields fold their page axis only when
+  their leading extent matches the prefix grain; compressor state keeps its
+  page axis even though its leading extent matches the group's row count.
+  Offloaded history fields fold by their own physical row grain, preserving
+  flat row addressing when that grain differs from the prefix grain.
+  These are views of the allocation, never reshaped copies.
+  `CachePool.store_dtype` means one thing: how a pool
   reinterprets *input* tensors before a write. A pool allocates nothing —
   `_bind_layer_planes` walks `plan.fields` once and arranges this view's layer
   window into the per-layer buffers its kernels read, with each subclass
@@ -1792,3 +1810,122 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 Verified end to end for this round: DeepSeek V3.2, R1 and V4-Flash, each
 × {CUDA graph, eager} × {spec, no spec}, against pre-refactor baselines
 (accuracy equal or better; speculative accept length within noise).
+
+### Sparse KV offloading and physical storage
+
+**Configuration and placement.** `ServerArgs.resolve_kv_offload()` normalizes
+`--kv-offload-config`: target attention layer IDs, per-request hot capacity,
+Host GiB budget and prefetch overlap. The plugin recipe interprets model
+options, including the explicit `kv_offload_window_ring` HF override, and
+declares a `KVOffloadPolicy` with field IDs, verify width, reserved/ring rows
+and selection dependencies. The common `CacheRecipe.setup()` binds request
+slots and the extend chunk bound. Recipes without offloading support reject
+an enabled configuration.
+
+`CacheStoragePlan` binds the logical `CacheMemoryPlan` to physical regions,
+field offsets and offload workspaces. Selected fields have authoritative
+history in pinned Host regions; other fields retain their device placement.
+`CacheArena` owns these regions and its `SparseKVOffload` engine, which owns
+each selected field's hot buffer, GPU tags, LRU metadata and transfer streams.
+Allocation bytes are checked against the storage plan.
+
+`arena.field(field_id)` returns authoritative history;
+`arena.compute_field(field_id)` returns the hot buffer for an offloaded field
+and the history view for other fields. PD registers the regions and publishes
+each field's actual landing address. Transfer contracts validate plan/group
+IDs and transfer policies; bootstrap schema identity excludes rank-local
+addresses. Block clearing splits logical byte ranges through the physical
+bindings. CuTeDSL clears mapped pinned Host ranges on the execution stream,
+respecting outstanding GPU work. This Host history belongs to the arena;
+the coordinator's L2 prefix cache has a separate ownership contract.
+
+**Fixed hot capacity and admission.** For each offloaded field, let `S` be
+the configured request-slot capacity (including null and graph padding), `H`
+the ordinary hot rows per request and `R` the reserved/ring rows per request.
+`compute_offload_capacity()` fixes the device row count to `S * (H + R)`,
+rounded to the storage-page alignment.
+Reserved capacity is measured in token rows; page rounding applies to the
+complete allocation.
+
+The device cache budget reserves this payload, persistent metadata and a
+conservative temporary-workspace peak before sizing device history. Remaining
+device bytes and the Host budget bound the logical LCM capacity, including the
+null parent. Probe and serving arenas cover every configured hot partition;
+insufficient memory is a startup error. Each C++ request slot owns its fixed
+hot partition throughout PD landing and execution, so request-slot allocation
+and history-page admission provide the admission checks. Null and padding
+requests are masked before installing tags or writing KV.
+
+**Router access.** `KVOffloadAdapter` in `paged/offload_adapter.py` binds
+router layers to offloaded fields and groups. It selects the group's kernel
+page table and uses `seed_locations` to produce physical history/hot row
+pairs. It retains the step's compute read/write mappings; the arena-owned
+engine manages payloads and replacement state.
+
+`write_locations(layer, mode)` returns authoritative history destinations,
+including those used by Index-K. The model passes its canonical Top-K and
+positions to `prepare_sparse_kv_access`, which returns projection destinations:
+hot rows for decode, or ordinary history rows
+for a field on device. The router substitutes the prepared hot read indices
+and write locations at leaf dispatch. An offloaded compute access requires a
+prepare for the same step and forward family. Index-K and shared-selection
+consumers keep canonical history IDs; models use the returned destinations
+without accessing the engine's tags or constructing physical field IDs.
+
+**Lookup and replacement.** Each field has a request-private LRU permutation
+over ordinary hot slots. A resolve processes the multi-query selection union
+once: protect selected resident rows and ordinary current rows, allocate
+unique misses from the oldest unprotected slots, then publish remaining old
+slots, newly loaded slots and protected slots in that order. Hits retain their
+relative order. Reserved/ring slots have their own write placement and are
+excluded from LRU replacement.
+
+CuTeDSL hash lookup coalesces duplicate history IDs for physical loads. Unique
+misses receive destinations in first-occurrence input order, while the mapped
+attention inputs preserve order, duplicates and masks. Hash tables use shared
+memory where the kernel geometry permits it; larger tables and destination
+scratch use the planned persistent GPU workspace. Slot reuse resets
+LRU; accepted-prefix writeback leaves the selection-access replacement state
+intact.
+
+**Prefetch and writeback.** The recipe declares selection producer/consumer
+pairs. `prefetch_sparse_kv` seeds a selected consumer and installs current-token
+write slots on the execution stream, then schedules lookup and Host-to-hot
+copies on the prefetch stream. The field's `ready` event covers payload,
+mapped indices, tags and LRU. The consumer still calls
+`prepare_sparse_kv_access`, which joins that event before consuming the hot
+buffer. Fields without a scheduled prefetch resolve on the execution stream.
+LongCat2 shares selection from each even attention layer with the following
+odd layer; prefetch applies when that consumer is offloaded and overlap is
+enabled. The available overlap depends on intervening compute and stream
+dependencies.
+
+The executor calls `prepare_cache_batch` before the target forward and
+`writeback_accepted_kv` after verification. Decode writes only accepted target
+input rows to authoritative Host history. The write stream waits for forward
+work, and the execution stream joins `write_done` before completion or request
+slot reuse. Batch lifecycle hooks broadcast to child backends.
+`invalidate_cache_residency` fences transfer streams and resets hot tags,
+seed flags and LRU for reused slots, preserving authoritative history and
+scheduler-owned blocks. PD transfer completion gates the first seed.
+
+**Capacity abort.** Offloading disables the retraction snapshot pool. It
+uses the scheduler's existing no-pool path: a quiescent capacity victim is
+aborted, its cache blocks and request slot return to their allocators, and
+the blocked grant can proceed in the same plan. The runtime reports a
+`CapacityAbort` finish to the client. It never suspends or resumes that request.
+Explicit snapshot capacity and forced-retraction options are rejected.
+
+Authoritative Host history follows the logical blocks' lifetime. The hot
+payload is a fixed allocation; releasing a request slot makes that slot's
+partition available rather than freeing the serving arena. Before a new PD
+owner uses it, `invalidate_cache_residency` fences transfer streams and
+clears tags, seed flags and LRU. Accepted writeback is joined to execution
+before completion, so page and slot reuse cannot race its writes. Offloaded
+arenas support neither L2/snapshot copies nor local recovery prefill.
+
+The LongCat2 plugin supports PD decode with PP=1, unsplit KV rows and
+KVStore disabled, using the target router directly. Local offloaded prefill
+and mixed-arena sleep/wake are unsupported. Eager and CUDA-graph decode
+use the same batch, access and accepted-writeback hooks; execution details are
+in `unified_path.md`, "Sparse KV offloading".

@@ -1243,6 +1243,7 @@ def build_device_side(
         DriverMemoryDeltaObserver,
     )
     from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
+    from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1364,7 +1365,7 @@ def build_device_side(
             config=ModelExecutorConfig.from_server_args(
                 server_args=server_args,
                 model_config=model_config,
-                max_req_pool_size=max_batch_size + 1,
+                max_req_pool_size=RequestSlotLayout(max_batch_size).padding,
                 gpu_id=gpu_id,
                 global_rank=global_rank,
                 prefix_granularity=views.cache_geometry.prefix_granularity,

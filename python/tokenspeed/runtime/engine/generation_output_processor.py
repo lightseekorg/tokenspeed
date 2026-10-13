@@ -121,6 +121,13 @@ class RequestState:
         # request stats (host-side); tracker attached only with --enable-log-request-stats
         self.created_time: float = created_time
         self.stats: RequestStatsTracker = NOOP_STATS
+        # Queue-time metric (tokenspeed:request_queue_time_seconds): wall time
+        # the request entered the scheduler's waiting queue, stamped when its
+        # spec is submitted, and the once-per-request observation flag. A
+        # retracted request re-enters the C++ queue without a new stamp, so
+        # preemption never records a second sample.
+        self.scheduler_enqueue_time: float = 0.0
+        self.queue_time_recorded: bool = False
         # Sampled-token logprobs, accumulated per generated token.
         # None when return_logprob is False.
         self.output_token_logprobs_val: list[float] | None = (

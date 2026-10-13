@@ -668,6 +668,16 @@ class EventLoop:
         )
 
     def _submit_scheduler_requests(self, specs) -> None:
+        if self.metrics.enabled:
+            # Queue-time histogram anchor: the specs enter the scheduler's
+            # waiting queue here. EPD-staged and pause-withheld requests reach
+            # this same funnel only when finally submitted, so their stamp
+            # excludes the staged/withheld wait.
+            enqueue_time = time.time()
+            for spec in specs:
+                state = self.output_processor.rid_to_state.get(spec.request_id)
+                if state is not None:
+                    state.scheduler_enqueue_time = enqueue_time
         self._l3_hooks.submit_requests(specs)
 
     # ------------------------------------------------------------------
@@ -1238,6 +1248,7 @@ class EventLoop:
                             request_changes.extend(self._drain_in_flight(in_flight))
 
                         self._mark_stats_scheduled(forward_op)
+                        self._record_request_queue_time(forward_op)
                         planned = PlannedForward(
                             forward_op=forward_op,
                             sampling_params_list=sampling_params_list,
@@ -1323,6 +1334,27 @@ class EventLoop:
             st = rid_to_state.get(rid)
             if st is not None:
                 st.stats.mark_scheduled(now)
+
+    def _record_request_queue_time(self, forward_op) -> None:
+        # Observe each request's waiting-queue wall time once, when its first
+        # forward dispatches. The enqueue stamp rides the RequestState from
+        # _submit_scheduler_requests; a retracted request re-enters the C++
+        # waiting queue without a new stamp, and the recorded flag keeps its
+        # re-dispatch from producing a second observation. --enable-metrics.
+        if not self.metrics.enabled:
+            return
+        now = time.time()
+        rid_to_state = self.output_processor.rid_to_state
+        for rid in forward_op.request_ids:
+            state = rid_to_state.get(rid)
+            if (
+                state is None
+                or state.queue_time_recorded
+                or state.scheduler_enqueue_time <= 0.0
+            ):
+                continue
+            state.queue_time_recorded = True
+            self.metrics.observe_request_queue_time(now - state.scheduler_enqueue_time)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The

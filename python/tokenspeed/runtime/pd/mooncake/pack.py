@@ -139,6 +139,26 @@ def flatten_transfer_blocks(blocks: Iterable[object]) -> Iterator[Sge]:
         yield (int(src), int(dst), int(length))
 
 
+def coalesce_transfer_blocks(blocks: Iterable[Sge]) -> Iterator[Sge]:
+    """Merge adjacent byte ranges contiguous at both source and destination.
+
+    Input and output entries are (source address, destination address, length).
+    Preserve order and gaps; consume only one lookahead entry. Call within a
+    single peer's ready transfer batch, after packed copies are materialized.
+    """
+    pending: Sge | None = None
+    for src, dst, length in blocks:
+        if pending is not None:
+            prev_src, prev_dst, prev_length = pending
+            if src == prev_src + prev_length and dst == prev_dst + prev_length:
+                pending = (prev_src, prev_dst, prev_length + length)
+                continue
+            yield pending
+        pending = (src, dst, length)
+    if pending is not None:
+        yield pending
+
+
 def _aligned(nbytes: int) -> int:
     return (nbytes + _PACK_ALIGN - 1) & ~(_PACK_ALIGN - 1)
 

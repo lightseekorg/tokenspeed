@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_step,
     gdn_replay_commit,
     gdn_tree_verify_needs_node_states,
+    validate_replay_commit_setup,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CAUSAL_CONV1D_BLOCK_M,
@@ -430,6 +431,14 @@ class _GDNReplayWorkspace:
     initialized_layers: set[int]
     geometry: tuple[int, int, int, int]
     state_dtype: torch.dtype
+
+    def __post_init__(self) -> None:
+        validate_replay_commit_setup(
+            self.payload,
+            self.parameters,
+            geometry=self.geometry,
+            state_dtype=self.state_dtype,
+        )
 
 
 _StateLayerGeometry = tuple[

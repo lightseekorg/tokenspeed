@@ -97,9 +97,38 @@ class CacheTransferContract:
     plan: CacheMemoryPlan
     group_specs: tuple[CacheGroupSpec, ...]
     transfer_schema: CacheTransferSchema = CacheTransferSchema()
+    # Endpoint bindings; absent in the rank-independent bootstrap layout.
+    field_addresses: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
+        plan_group_ids = {group.group_id for group in self.plan.groups}
+        spec_group_ids = {spec.group_id for spec in self.group_specs}
+        if plan_group_ids != spec_group_ids:
+            raise CacheContractError(
+                "cache plan and scheduler group IDs disagree: "
+                f"missing={sorted(plan_group_ids - spec_group_ids)}, "
+                f"extra={sorted(spec_group_ids - plan_group_ids)}"
+            )
         self.transfer_schema.validate(self.plan)
+        if self.field_addresses is not None:
+            if not isinstance(self.field_addresses, dict):
+                raise CacheContractError("field addresses must be a mapping")
+            if set(self.field_addresses) != {f.field_id for f in self.plan.fields}:
+                raise CacheContractError("field addresses must cover the complete plan")
+            if any(
+                type(p) is not int or not 0 < p < 2**64
+                for p in self.field_addresses.values()
+            ):
+                raise CacheContractError("field addresses must be nonzero uint64")
+
+    def field_address(self, base: int, field_id: str) -> int:
+        if self.field_addresses is not None:
+            return self.field_addresses[field_id]
+        return base + self.plan.field_page_byte_offset(field_id, 0)
+
+    def shard_count(self, group_id: str) -> int:
+        """Return the cache group's cyclic owner count; one means replicated."""
+        return self.group_spec(group_id).shard_count
 
     def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:
         return tuple(
@@ -173,6 +202,7 @@ class CacheTransferContract:
             schema_payload = payload["transfer_schema"]
             return cls(
                 plan=plan,
+                field_addresses=payload.get("field_addresses"),
                 group_specs=tuple(
                     CacheGroupSpec(**spec) for spec in payload["group_specs"]
                 ),
@@ -203,14 +233,6 @@ def build_cache_transfer_contract(
 ) -> tuple[CacheTransferContract, int]:
     """Bind one cache memory plan to its semantics and raw slab."""
     specs = tuple(group_specs)
-    plan_group_ids = tuple(group.group_id for group in plan.groups)
-    spec_group_ids = tuple(spec.group_id for spec in specs)
-    if set(plan_group_ids) != set(spec_group_ids):
-        raise CacheContractError(
-            "cache plan and scheduler group IDs disagree: "
-            f"missing={sorted(set(plan_group_ids) - set(spec_group_ids))}, "
-            f"extra={sorted(set(spec_group_ids) - set(plan_group_ids))}"
-        )
     contract = CacheTransferContract(
         plan=plan,
         group_specs=specs,
@@ -235,11 +257,18 @@ def build_arena_cache_transfer_contract(
     transfer_schema: CacheTransferSchema = CacheTransferSchema(),
 ) -> tuple[CacheTransferContract, int]:
     """Build the PD wire envelope from the cache arena it transfers."""
-    return build_cache_transfer_contract(
-        plan=arena.plan,
-        buffer=arena.contract_binding(),
-        group_specs=arena.cache_group_specs,
-        transfer_schema=transfer_schema,
+    if not arena.supports_disaggregation:
+        raise RuntimeError("cache arena has no transfer policy in its runtime contract")
+    return (
+        CacheTransferContract(
+            plan=arena.plan,
+            group_specs=tuple(arena.cache_group_specs),
+            transfer_schema=transfer_schema,
+            field_addresses={
+                f.field_id: arena.field_address(f.field_id) for f in arena.plan.fields
+            },
+        ),
+        arena.registration_regions()[0][0],
     )
 
 
@@ -394,9 +423,10 @@ def validate_cache_peer_layout(
     for local_spec, peer_spec in zip(
         layout.group_specs, peer_layout.group_specs, strict=True
     ):
-        # shard_count is deliberately not compared: a KVP-sharded Prefill
-        # transfers into an unsharded Decode. Which rank sets exchange which
-        # pages is the transfer planner's decision, not a contract mismatch.
+        # shard_count is deliberately not compared: Prefill and Decode shard
+        # a group independently (either, both or neither). Which rank sets
+        # exchange which pages is the transfer planner's decision, not a
+        # contract mismatch.
         if (
             local_spec.family != peer_spec.family
             or local_spec.rows_per_page != peer_spec.rows_per_page
