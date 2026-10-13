@@ -470,6 +470,12 @@ def _launch_fused_gdn_decode_update(
     V = v.shape[3]
     if scale is None:
         scale = K**-0.5
+    # The kernel addresses output rows densely (row * HV * V * K).
+    if output_state is not None and not output_state.is_contiguous():
+        raise ValueError(
+            "Triton GDN decode requires a contiguous output_state, got strides "
+            f"{output_state.stride()}"
+        )
 
     o = q.new_empty(B, T, HV, V)
 
