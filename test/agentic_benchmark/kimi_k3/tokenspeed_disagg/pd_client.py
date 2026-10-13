@@ -21,7 +21,6 @@ conversation on the DP rank that primed it across phases.
 import argparse
 import concurrent.futures as cf
 import json
-import statistics
 import sys
 import threading
 import time

@@ -22,9 +22,7 @@ register_cuda_ci(est_time=300, suite="runtime-2gpu")
 import dataclasses
 import multiprocessing as mp
 import os
-import subprocess
 import sys
-import time
 import unittest
 from typing import List
 
