@@ -104,7 +104,11 @@ the natural checkpoint it leaves coincides with KV already cached and the next
 prompt sharing that prefix resumes at `T` in every group. A chunk that ends at
 the junction publishes like a prompt end (`PublicationPoint::kOwnerContinues`:
 KV tail and state) and moves off the published blocks; every other chunk end
-publishes only its completed full pages.
+publishes only its completed full pages. The move-off needs fresh blocks the
+completing chunk did not reserve, so it is best effort: when the pool cannot
+fund the copies the admission replans without the tail and the owner keeps
+its partial block private, publishing nothing at that point beyond its full
+pages (`cache-concepts.md`, copy-in).
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, whether the round completes
@@ -371,9 +375,11 @@ block — the partial one included — into fresh copies while the published
 blocks are still in its table. A tail is at most `P − 1` tokens, so that is
 `ceil((P − 1) / g)` blocks on a role that prefills locally and
 `floor((P − 1) / g)` on the D role (its partial block is a fresh page, not a
-copy); a sliding group caps it at its lookback. Without the charge a pool
-sized exactly for a request wedges at its first decode: the copy-in needs a
-block and nothing in the pool is evictable.
+copy); a sliding group caps it at its lookback. The charge is what lets a
+pool sized for a request fund its copy-in; when a pool cannot (several
+retraction-exempt requests reaching their first decode together, each
+needing a copy), the owner publishes nothing at that point instead of
+waiting (§1).
 
 Speculative decode admission grows from the committed token frontier plus the verify
 spans still in flight and the span being scheduled. Already reserved slots
@@ -1002,8 +1008,15 @@ lands in the same change as the pin, never a release apart.
 - A published block is never written again: a tail's blocks are copied into
   the hitter's table (or loaded from Host into private pages), an owner that
   keeps writing past a publication point moves to fresh copies of the blocks
-  it published, and a restore copies the imaged tail blocks instead of
-  claiming them (1, cache-concepts.md).
+  it published -- or, when the pool cannot fund the copies, publishes no
+  tail at that point and keeps writing its private block -- and a restore
+  copies the imaged tail blocks instead of claiming them (1,
+  cache-concepts.md).
+- A request whose admission prepaid its generation never needs a block it did
+  not reserve: the decode slot is reserved on the completing chunk, a State
+  group's rotation swaps a released block for a fresh one, and the owner's
+  copy-in is best effort (1). Without this a pool full of retraction-exempt
+  requests wedges at their first decodes.
 - A store either pins its Device sources until the ack or is stream-ordered;
   never neither (2). Only the two legs of a retraction image are
   stream-ordered — their sources are granted away in the same round — and

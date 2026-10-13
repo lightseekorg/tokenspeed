@@ -25,6 +25,9 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
+#include <set>
+
 #include <algorithm>
 #include <cstdint>
 #include <random>
@@ -276,6 +279,210 @@ TEST_F(TokenLevelHitWithSlidingGroupSuite, ASlidingGroupFollowsTheSameBoundaries
             PlanOnce();
         }
     }
+}
+
+// The gpt-oss shape: full attention and a 128-token sliding window over
+// 64-token pages, no State group. A cold prompt decodes and finishes; a
+// prompt one token shorter resumes at the longest boundary both groups hold.
+class GptOssShapeSuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kP = 64;
+    virtual std::int32_t BlockGranularity() const { return 16; }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = kP;
+        cfg.device_allocator.total_pages = 257;
+        cfg.host_allocator.total_pages = 0;
+        cfg.disable_l2_cache = true;
+        cfg.max_scheduled_tokens = 1024;
+        cfg.max_batch_size = 16;
+        cfg.overlap_schedule_depth = 1;
+        cfg.enable_mixed_prefill_decode = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full",
+            .block_granularity = BlockGranularity(),
+            .total_pages = 1 + 256 * (kP / BlockGranularity()),
+            .cache_blocks_per_lcm_block = kP / BlockGranularity(),
+            .retention = CacheGroupConfig::Retention::FullHistory,
+            .family = CacheGroupFamily::History,
+        });
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "sliding",
+            .block_granularity = BlockGranularity(),
+            .total_pages = 1 + 256 * (kP / BlockGranularity()),
+            .cache_blocks_per_lcm_block = kP / BlockGranularity(),
+            .retention = CacheGroupConfig::Retention::SlidingWindow,
+            .sliding_window_tokens = 128,
+            .family = CacheGroupFamily::History,
+        });
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(GptOssShapeSuite, APromptOneTokenShorterThanAFinishedOneResumesAtItsLastPage) {
+    const std::vector<std::int32_t> prompt = MakeTokens(276);
+    Submit(RequestSpec{.request_id = "x", .tokens = prompt, .max_new_tokens = 32});
+    const ExecutionPlan prefill = PlanOnce();
+    ASSERT_NE(FindForwardBatch(prefill), nullptr);
+    std::int32_t next_token = 5000;
+    SendForwardDone("x", {next_token++});
+    for (std::int32_t step = 0; step < 24; ++step) {
+        ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr) << "decode step " << step;
+        SendForwardDone("x", {next_token++});
+    }
+    SendFinish("x");
+    PlanOnce();
+
+    // X + Y hits the prompt end exactly, decodes four steps and finishes.
+    std::vector<std::int32_t> extended = prompt;
+    for (std::int32_t i = 0; i < 10; ++i) {
+        extended.push_back(9000 + i);
+    }
+    Submit(RequestSpec{.request_id = "xy", .tokens = extended, .max_new_tokens = 8});
+    const ExecutionPlan xy_plan = PlanOnce();
+    const ForwardBatch* xy = FindForwardBatch(xy_plan);
+    ASSERT_NE(xy, nullptr);
+    EXPECT_EQ(xy->extend_prefix_lens, std::vector<std::int32_t>{276});
+    SendForwardDone("xy", {next_token++});
+    for (std::int32_t step = 0; step < 4; ++step) {
+        ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr) << "xy decode step " << step;
+        SendForwardDone("xy", {next_token++});
+    }
+    SendFinish("xy");
+    PlanOnce();
+
+    // X[:-1]: 275 tokens, probed up to 274. Pages 0..3 of the full group are
+    // cached and the sliding group holds the lookback behind 256, so the hit
+    // is the page boundary 256 (the tails at 276 and 299 lie beyond the bound).
+    std::vector<std::int32_t> shorter(prompt.begin(), prompt.end() - 1);
+    Submit(RequestSpec{.request_id = "y", .tokens = shorter, .max_new_tokens = 4});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"y"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{256});
+    SendAbortEvent("y");
+    PlanOnce();
+
+    // X[:-37]: 239 tokens, probed up to 238. The full group holds pages 0..2,
+    // but the sliding group publishes only the lookback behind its newest
+    // boundary (256) and its tails; the blocks behind 192 slid out of X's
+    // table unpublished, so no boundary below 256 is resumable.
+    std::vector<std::int32_t> cut(prompt.begin(), prompt.end() - 37);
+    Submit(RequestSpec{.request_id = "z", .tokens = cut, .max_new_tokens = 4});
+    const ExecutionPlan cut_plan = PlanOnce();
+    const ForwardBatch* cut_batch = FindForwardBatch(cut_plan);
+    ASSERT_NE(cut_batch, nullptr);
+    ASSERT_EQ(cut_batch->request_ids, std::vector<std::string>{"z"});
+    EXPECT_EQ(cut_batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+}
+
+class GptOssShapeWithWholePagesSuite : public GptOssShapeSuite {
+protected:
+    std::int32_t BlockGranularity() const override { return kP; }
+};
+
+TEST_F(GptOssShapeWithWholePagesSuite, APromptOneTokenShorterThanAFinishedOneResumesAtItsLastPage) {
+    const std::vector<std::int32_t> prompt = MakeTokens(276);
+    Submit(RequestSpec{.request_id = "x", .tokens = prompt, .max_new_tokens = 32});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    std::int32_t next_token = 5000;
+    SendForwardDone("x", {next_token++});
+    for (std::int32_t step = 0; step < 24; ++step) {
+        ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr) << "decode step " << step;
+        SendForwardDone("x", {next_token++});
+    }
+    SendFinish("x");
+    PlanOnce();
+    std::vector<std::int32_t> shorter(prompt.begin(), prompt.end() - 1);
+    Submit(RequestSpec{.request_id = "y", .tokens = shorter, .max_new_tokens = 4});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{256});
+}
+
+// A pool filled by prompts whose generation budget their admission prepaid
+// (retraction-exempt), each ending inside a page: their first decodes would
+// each copy the published partial block into a fresh block, and the pool has
+// none. The owner then keeps its partial block private and publishes nothing
+// at the prompt end, so every request still decodes and finishes.
+class ExemptOwnersFillThePoolSuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kP = 16;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = kP;
+        cfg.device_allocator.total_pages = 1 + 24;
+        cfg.host_allocator.total_pages = 0;
+        cfg.disable_l2_cache = true;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_mixed_prefill_decode = false;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full",
+            .block_granularity = kP,
+            .total_pages = cfg.device_allocator.total_pages,
+            .retention = CacheGroupConfig::Retention::FullHistory,
+            .family = CacheGroupFamily::History,
+        });
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "sliding",
+            .block_granularity = kP,
+            .total_pages = cfg.device_allocator.total_pages,
+            .retention = CacheGroupConfig::Retention::SlidingWindow,
+            .sliding_window_tokens = 2 * kP,
+            .family = CacheGroupFamily::History,
+        });
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(ExemptOwnersFillThePoolSuite, FirstDecodesProceedWithoutTheirCopyIn) {
+    // Four 23-token prompts with a two-token budget: 2 full blocks (23 + 1
+    // decode slot + 1 headroom) + 2 sliding blocks each -> 16 blocks; three
+    // more such prompts queue behind them on the remaining 8 and 0 blocks.
+    std::vector<std::string> ids;
+    for (std::int32_t i = 0; i < 7; ++i) {
+        ids.push_back("r" + std::to_string(i));
+        Submit(RequestSpec{.request_id = ids.back(), .tokens = MakeTokens(23, 1000 * (i + 1)), .max_new_tokens = 2});
+    }
+    std::map<std::string, std::int32_t> produced;
+    std::map<std::string, std::int32_t> computed;
+    std::set<std::string> finished;
+    std::int32_t idle = 0;
+    std::int32_t next_token = 50000;
+    for (std::int32_t round = 0; round < 200 && finished.size() < ids.size() && idle < 10; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        if (batch == nullptr || batch->request_ids.empty()) {
+            ++idle;
+            continue;
+        }
+        idle = 0;
+        for (std::size_t row = 0; row < batch->request_ids.size(); ++row) {
+            const std::string& id = batch->request_ids[row];
+            if (row < batch->extend_prefix_lens.size()) {
+                computed[id] = batch->extend_prefix_lens[row] + batch->input_lengths[row];
+                if (computed[id] < 23) {
+                    SendForwardDone(id);  // an intermediate chunk produces no token
+                    continue;
+                }
+            }
+            SendForwardDone(id, {next_token++});
+            if (++produced[id] >= 2) {
+                SendFinish(id);
+                finished.insert(id);
+            }
+        }
+    }
+    EXPECT_EQ(finished.size(), ids.size()) << "idle rounds: " << idle << ", waiting " << scheduler_->WaitingSize();
+    PlanOnce();
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
 }  // namespace

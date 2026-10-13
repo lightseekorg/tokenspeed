@@ -676,7 +676,16 @@ Its responsibilities:
   keeps writing past (`CompletedPages::owner_continues`, the fused role's
   prompt end) registers the owner's tail blocks under `hash@T` and swaps a
   fresh copy of each into the table, so the published bytes are exactly
-  what the prefill forward wrote and nothing writes them again. Copies are
+  what the prefill forward wrote and nothing writes them again. The copies
+  are the one thing such an admission may need beyond what the completing
+  chunk reserved, so they are best effort: when the plan does not fit with
+  them, `Admit` replans without the tail -- the owner keeps its partial
+  block private and publishes neither the tail nor the state checkpoint
+  keyed by it at that point (its full pages still publish; its finish
+  publishes the frontier later). A request whose reserve covers its
+  generation therefore never waits on a block it did not reserve, which is
+  what keeps a pool full of such requests from wedging at their first
+  decodes. Copies are
   fire-and-forget: the runtime orders them on the forward thread's default
   stream after the execution stream's in-flight forwards and before the
   plan's zeroing, so a source another admission of the same round evicts

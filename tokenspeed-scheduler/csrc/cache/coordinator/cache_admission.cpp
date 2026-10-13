@@ -585,6 +585,21 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
     return AdmissionPlan{.prefix = std::move(prefix), .victims = std::move(victims)};
 }
 
+// The same progress without the tail it would publish: the full pages still
+// publish; the tail, the owner's move off it and the state checkpoint keyed
+// by it are dropped. Nothing left to publish leaves no CompletedPages.
+RequestProgress withoutTailPublication(const RequestProgress& progress) {
+    RequestProgress out = progress;
+    CompletedPages& completed = *out.completed_pages;
+    completed.tail.reset();
+    completed.owner_continues = false;
+    completed.publish_state = false;
+    if (completed.first_new_prefix_page >= static_cast<std::int32_t>(completed.prefix_hashes.size())) {
+        out.completed_pages.reset();
+    }
+    return out;
+}
+
 }  // namespace
 
 bool CacheCoordinator::writableImageSlot(std::size_t group_index, const ImageTable& shape,
@@ -649,9 +664,25 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         demands = replayed;
     }
 
+    // The publication this admission carries. An owner that keeps writing
+    // past a tail it publishes needs a fresh copy of every published block;
+    // when the pool cannot fund those copies the owner keeps its partial
+    // block private instead and publishes nothing at this point -- neither
+    // the tail nor the state checkpoint keyed by it -- so a request whose
+    // reserve covers its generation never waits on a block it did not
+    // reserve. Its finish publishes the frontier later.
+    RequestProgress effective = progress;
+    const bool copies_in =
+        progress.completed_pages && progress.completed_pages->owner_continues && progress.completed_pages->tail;
     std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix), demands, progress,
+        planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_,
+                      copies_in ? PrefixProbe{prefix} : PrefixProbe{std::move(prefix)}, demands, effective,
                       /*shapes=*/{}, /*claimed=*/{});
+    if (!candidate && copies_in) {
+        effective = withoutTailPublication(progress);
+        candidate = planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix),
+                                  demands, effective, /*shapes=*/{}, /*claimed=*/{});
+    }
     if (!candidate) {
         return std::nullopt;
     }
@@ -762,8 +793,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         BlockTable& table = *demands[i].table;
-        if (progress.completed_pages) {
-            cacheDeviceCompletedBlocksForGroup(i, table, *progress.completed_pages, access_epoch);
+        if (effective.completed_pages) {
+            cacheDeviceCompletedBlocksForGroup(i, table, *effective.completed_pages, access_epoch);
         }
         if (GroupIsState(i)) {
             // The step's release: slot 0 leaves the table (the index keeps it
@@ -789,13 +820,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             }
             continue;
         }
-        if (progress.num_computed_tokens) {
+        if (effective.num_computed_tokens) {
             groups_[i].Allocator().ReclaimExpired(
-                pool_, table, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *progress.num_computed_tokens));
+                pool_, table, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *effective.num_computed_tokens));
         }
     }
-    if (progress.completed_pages) {
-        recordPublishedTail(*progress.completed_pages);
+    if (effective.completed_pages) {
+        recordPublishedTail(*effective.completed_pages);
     }
     for (const auto& [group_id, location] : prospective_victims) {
         if (!evictCachedBlock(group_id, location)) {
@@ -806,14 +837,14 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const GroupDemand& demand = demands[i];
         BlockTable& table = *demand.table;
-        const CompletedPages* completed = progress.completed_pages ? &*progress.completed_pages : nullptr;
+        const CompletedPages* completed = effective.completed_pages ? &*effective.completed_pages : nullptr;
         // An owner that keeps writing past the publication point moves off
         // every block it just published: a published block is never written
         // again and never carries a second key. (A State group's published
         // slot 1 moves to slot 0 by rotation instead.)
         if (!GroupIsState(i) && completed != nullptr && completed->owner_continues && completed->tail &&
-            progress.num_computed_tokens) {
-            const TailSlots slots = tail_slots(i, *progress.num_computed_tokens);
+            effective.num_computed_tokens) {
+            const TailSlots slots = tail_slots(i, *effective.num_computed_tokens);
             for (std::int32_t slot = slots.first; slot < std::min(slots.past_end, table.NumBlocks()); ++slot) {
                 if (groups_[i].Index().Contains(table.Blocks()[static_cast<std::size_t>(slot)])) {
                     privatize_slot(i, table, slot, table.AvailableTokens());
