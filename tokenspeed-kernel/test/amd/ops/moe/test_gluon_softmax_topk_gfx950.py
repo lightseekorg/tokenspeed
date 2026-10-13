@@ -43,13 +43,7 @@ def _reference(logits, topk, renormalize, scale):
     return weights * scale, ids
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize(
-    ("tokens", "experts", "topk"),
-    [(1, 512, 10), (16, 512, 10), (64, 512, 10), (1000, 512, 10), (33, 100, 7)],
-)
-@pytest.mark.parametrize("renormalize", [True, False])
-def test_softmax_topk_matches_reference(dtype, tokens, experts, topk, renormalize):
+def _check_against_reference(dtype, tokens, experts, topk, renormalize, ids_dtype):
     generator = torch.Generator(device="cuda").manual_seed(tokens * experts + topk)
     logits = torch.randn(
         tokens, experts, device="cuda", generator=generator, dtype=torch.float32
@@ -62,13 +56,40 @@ def test_softmax_topk_matches_reference(dtype, tokens, experts, topk, renormaliz
     weights, ids = softmax_topk.launch_gluon_softmax_topk_gfx950(
         router_logits=logits,
         topk=topk,
-        topk_indices_dtype=torch.int32,
+        topk_indices_dtype=ids_dtype,
         renormalize=renormalize,
         routed_scaling_factor=1.5,
     )
     expected_weights, expected_ids = _reference(logits, topk, renormalize, 1.5)
+    assert ids.dtype == ids_dtype
     assert torch.equal(ids.long(), expected_ids)
     torch.testing.assert_close(weights, expected_weights, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    ("tokens", "experts", "topk"),
+    [
+        (1, 512, 10),
+        (16, 512, 10),
+        (64, 512, 10),
+        (1000, 512, 10),
+        (33, 100, 7),
+        # Registration limits, each its own specialization: the widest
+        # per-lane vector and the largest selection, then a one-slot selection
+        # over a single vector element per lane.
+        (4, 1024, 32),
+        (5, 64, 1),
+    ],
+)
+@pytest.mark.parametrize("renormalize", [True, False])
+def test_softmax_topk_matches_reference(dtype, tokens, experts, topk, renormalize):
+    _check_against_reference(dtype, tokens, experts, topk, renormalize, torch.int32)
+
+
+@pytest.mark.parametrize(("experts", "topk"), [(512, 10), (1024, 32)])
+def test_softmax_topk_writes_int64_ids(experts, topk):
+    _check_against_reference(torch.bfloat16, 16, experts, topk, True, torch.int64)
 
 
 def test_moe_topk_softmax_matches_reference():
