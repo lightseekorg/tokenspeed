@@ -20,15 +20,14 @@
 
 """QSA sparse attention over per-row selected KV-cache slots for GFX950.
 
-A one-wave workgroup owns one query row, up to 16 query heads of one KV
-head's GQA group (the MFMA M dimension) and a share of the row's selected
-slots. The
+A one-wave workgroup owns one query row, up to 16 query heads of one KV head's
+GQA group (the MFMA M dimension) and a share of the row's selected slots. The
 row's valid slots are first compacted in LDS, so invalid columns cost no
 gathers whatever their order. Each 16-slot tile is gathered straight into
 registers (K in the MFMA operand layout, V transposed through LDS) one tile
-ahead of the compute. Small batches split the compacted slots over
-workgroups and merge the partial softmax states in a companion kernel. See
-the "gfx950 QSA sparse attention" section of ``ops/README.md``.
+ahead of the compute. Small batches split the compacted slots over workgroups
+and merge the partial softmax states in a companion kernel. See the "gfx950 QSA
+sparse attention" section of ``ops/README.md``.
 """
 
 from __future__ import annotations
@@ -281,9 +280,8 @@ def gluon_qsa_sparse_attention_gfx950(
     last = gl.minimum(first + per_split, num_tiles)
 
     # A block of the GQA group's query heads, padded to the MFMA M size with
-    # zeros. Q
-    # lives in LDS and is re-read per tile, leaving the arch VGPRs to the
-    # gathers in flight.
+    # zeros. Q lives in LDS and is re-read per tile, leaving the arch VGPRs to
+    # the gathers in flight.
     q_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, q_layout))
     q_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_layout))
     q_offsets = (
