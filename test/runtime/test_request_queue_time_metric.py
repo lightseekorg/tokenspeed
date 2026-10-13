@@ -74,7 +74,7 @@ def test_submit_stamps_enqueue_time_on_the_registered_state():
     specs = [SimpleNamespace(request_id="r"), SimpleNamespace(request_id="ghost")]
     EventLoop._submit_scheduler_requests(loop, specs)
 
-    # One stamp per batch, after the batch arrived at the scheduler process;
+    # One stamp per batch, after the batch was submitted to the waiting queue;
     # an unregistered rid is skipped rather than an error.
     assert before <= state.scheduler_enqueue_time <= time.time()
     assert submitted == specs
