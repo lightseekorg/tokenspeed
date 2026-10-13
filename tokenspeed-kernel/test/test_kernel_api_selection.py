@@ -84,21 +84,12 @@ import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
-import tokenspeed_kernel.ops.moe.deep_gemm as _moe_deep_gemm
+import tokenspeed_kernel.ops.moe.deep_ep as _moe_deep_ep
 import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
-import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
-import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
-import tokenspeed_kernel.ops.moe.gluon.softmax_topk as _moe_gluon_softmax_topk
-import tokenspeed_kernel.ops.moe.gluon.sqrt_softplus_topk as _moe_gluon_sqrt_softplus
-import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.marlin as _moe_marlin
 import tokenspeed_kernel.ops.moe.native as _moe_native
-import tokenspeed_kernel.ops.moe.sigmoid_topk as _moe_sigmoid_topk
-import tokenspeed_kernel.ops.moe.softmax_topk as _moe_softmax_topk
 import tokenspeed_kernel.ops.moe.triton as _moe_triton
-import tokenspeed_kernel.ops.moe.triton.softmax_topk as _moe_triton_softmax_topk
-import tokenspeed_kernel.ops.moe.triton.sqrt_softplus_topk as _moe_triton_sqrt_softplus
 import tokenspeed_kernel.ops.quantization as _quantization_pkg
 import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
@@ -130,31 +121,6 @@ from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.ops.moe import moe_topk as kernel_moe_topk
-from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8 as _moe_deep_gemm_deepep_fp8
-from tokenspeed_kernel.ops.moe.flashinfer import (
-    cutedsl_deepep_nvfp4 as _moe_cutedsl_deepep_nvfp4,
-)
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_fp8 as _moe_cutlass_fp8
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_mxfp4 as _moe_cutlass_mxfp4
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_nvfp4 as _moe_cutlass_nvfp4
-from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant as _moe_cutlass_unquant
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_fp8 as _moe_trtllm_fp8
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxfp4 as _moe_trtllm_mxfp4
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_mxint4 as _moe_trtllm_mxint4
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_nvfp4 as _moe_trtllm_nvfp4
-from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_unquant
-from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
-from tokenspeed_kernel.ops.moe.marlin import deepep_mxfp4 as _moe_marlin_deepep_mxfp4
-from tokenspeed_kernel.ops.moe.marlin import mxfp4 as _moe_marlin_mxfp4
-from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
-from tokenspeed_kernel.ops.moe.triton import (
-    decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
-)
-from tokenspeed_kernel.ops.moe.triton import fp8 as _moe_triton_fp8
-from tokenspeed_kernel.ops.moe.triton import (
-    kimi3_sigmoid_topk as _moe_triton_kimi3_sigmoid_topk,
-)
-from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
 from tokenspeed_kernel.ops.residual import mhc_apply_pre as kernel_mhc_apply_pre
@@ -233,38 +199,11 @@ _RELOAD_MODULES = [
     _residual_pkg,
     # MoE registration modules.
     _moe_cuda,
-    _moe_deep_gemm_deepep_fp8,
-    _moe_deep_gemm,
-    _moe_cutedsl_deepep_nvfp4,
-    _moe_cutlass_fp8,
-    _moe_cutlass_mxfp4,
-    _moe_cutlass_nvfp4,
-    _moe_cutlass_unquant,
-    _moe_trtllm_fp8,
-    _moe_trtllm_mxfp4,
-    _moe_trtllm_mxint4,
-    _moe_trtllm_nvfp4,
-    _moe_trtllm_unquant,
+    _moe_deep_ep,
     _moe_flashinfer,
-    _moe_gluon_sqrt_softplus,
-    _moe_gluon_fp8,
-    _moe_gluon_mxfp4,
-    _moe_sigmoid_topk,
-    _moe_softmax_topk,
-    _moe_gluon_sigmoid_topk,
-    _moe_gluon_softmax_topk,
     _moe_gluon,
-    _moe_marlin_deepep_mxfp4,
-    _moe_marlin_mxfp4,
     _moe_marlin,
     _moe_native,
-    _moe_triton_bf16,
-    _moe_triton_decode_sigmoid_topk,
-    _moe_triton_fp8,
-    _moe_triton_kimi3_sigmoid_topk,
-    _moe_triton_sqrt_softplus,
-    _moe_triton_mxfp4,
-    _moe_triton_softmax_topk,
     _moe_triton,
     _moe_pkg,
     # Quantization registration modules.
@@ -399,6 +338,7 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
         "gluon_mxfp4_dynamic_moe_apply": Priority.SPECIALIZED + 1,
         # Prefer the coupled MXFP8 bank over the overlapping A16 EP8 plan.
         "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply": Priority.SPECIALIZED + 1,
+        "gluon_petit_mxfp4_megamoe_apply": Priority.SPECIALIZED + 3,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
         # Prefer packed routing while keeping overlapping Gluon selectable.
         "triton_kimi3_packed_sigmoid_bias_topk_gfx1250": Priority.SPECIALIZED + 1,
@@ -3248,18 +3188,18 @@ def test_moe_plan_rejects_invalid_deepep_mode(
 
 
 def test_gluon_mxfp4_swiglu_args_default_missing_values_to_standard_swiglu() -> None:
-    if not hasattr(_moe_gluon_mxfp4, "_swiglu_args"):
+    if not hasattr(_moe_gluon, "_swiglu_args"):
         pytest.skip("Gluon MXFP4 SwiGLU args are AMD-only")
 
     w = torch.nn.Module()
     w.swiglu_arg = type("SwigluArg", (), {"alpha": None, "limit": None})()
 
-    assert _moe_gluon_mxfp4._swiglu_args(w) == (1.0, 0.0, 0.0)
+    assert _moe_gluon._swiglu_args(w) == (1.0, 0.0, 0.0)
 
     w.swiglu_arg = type("SwigluArg", (), {"alpha": 1.702, "limit": 7.0})()
     w.swiglu_beta = 1.0
 
-    assert _moe_gluon_mxfp4._swiglu_args(w) == (1.702, 7.0, 1.0)
+    assert _moe_gluon._swiglu_args(w) == (1.702, 7.0, 1.0)
 
 
 def test_gluon_dsa_prefill_topk_rejects_unsupported_page_size() -> None:
@@ -3768,31 +3708,31 @@ def test_kimi3_a8_plan_preserves_unclipped_a16_decode(
     )
     plan = {"apply_kernel_name": "gluon_mxfp4_a8w4_situ_ep_precomputed_moe_apply"}
     monkeypatch.setattr(
-        _moe_latent_decode,
+        _moe_pkg,
         "select_kernel",
         lambda *_args, **_kwargs: object(),
     )
 
-    assert _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert _moe_pkg.latent_moe_decode_pipeline_available(
         *tensors,
         plan,
         topk=16,
         linear_clamp=None,
     )
-    assert _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert _moe_pkg.latent_moe_decode_pipeline_available(
         *tensors,
         plan,
         topk=16,
         linear_clamp=25.0,
     )
-    assert not _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert not _moe_pkg.latent_moe_decode_pipeline_available(
         *tensors,
         plan,
         topk=16,
     )
 
     a16_plan = {"apply_kernel_name": "gluon_mxfp4_a16w4_situ_ep_precomputed_moe_apply"}
-    assert _moe_latent_decode.latent_moe_decode_pipeline_available(
+    assert _moe_pkg.latent_moe_decode_pipeline_available(
         *tensors,
         a16_plan,
         topk=16,
@@ -3880,7 +3820,7 @@ def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
     interval (_DIRECT_DECODE_MAX_M, _PRECOMPUTED_MFMA_MIN_M) silently dropped
     the precomputed top-k and recomputed routing from ``router_logits``.
     """
-    if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_dynamic_moe_apply"):
+    if not hasattr(_moe_gluon, "gluon_mxfp4_dynamic_moe_apply"):
         pytest.skip("gluon mxfp4 dynamic apply is AMD-only")
 
     captured: dict[str, object] = {}
@@ -3891,7 +3831,7 @@ def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
         return "sentinel"
 
     monkeypatch.setattr(
-        _moe_gluon_mxfp4, "gluon_mxfp_dynamic_mxfp4_fused_moe", fake_fused_moe
+        _moe_gluon, "gluon_mxfp_dynamic_mxfp4_fused_moe", fake_fused_moe
     )
 
     w = _make_fake_gluon_mxfp4_layer(top_k=1)
@@ -3900,7 +3840,7 @@ def test_gluon_mxfp4_dynamic_apply_forwards_precomputed_topk_by_batch_size(
     topk_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
     topk_ids = torch.zeros((num_tokens, 1), dtype=torch.int32)
 
-    out = _moe_gluon_mxfp4.gluon_mxfp4_dynamic_moe_apply(
+    out = _moe_gluon.gluon_mxfp4_dynamic_moe_apply(
         {},
         x,
         w,
@@ -3932,7 +3872,7 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
     expected_decode: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if not hasattr(_moe_gluon_mxfp4, "gluon_mxfp4_gfx1250_precomputed_moe_apply"):
+    if not hasattr(_moe_gluon, "gluon_mxfp4_gfx1250_precomputed_moe_apply"):
         pytest.skip("gfx1250 Gluon MXFP4 apply is AMD-only")
 
     captured: dict[str, object] = {}
@@ -3942,7 +3882,7 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
         return "sentinel"
 
     monkeypatch.setattr(
-        _moe_gluon_mxfp4.fused_mxfp_gfx1250,
+        _moe_gluon.fused_mxfp_gfx1250,
         "gluon_mxfp_precomputed_mxfp4_fused_moe",
         fake_fused_moe,
     )
@@ -3961,7 +3901,7 @@ def test_gluon_mxfp4_gfx1250_apply_selects_kernel_by_average_bpe(
     topk_weights = torch.ones((num_tokens, top_k), dtype=torch.float32)
     topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32)
 
-    out = _moe_gluon_mxfp4.gluon_mxfp4_gfx1250_precomputed_moe_apply(
+    out = _moe_gluon.gluon_mxfp4_gfx1250_precomputed_moe_apply(
         {},
         x,
         w,
@@ -3978,7 +3918,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     apply_name = "gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply"
-    if not hasattr(_moe_gluon_mxfp4, apply_name):
+    if not hasattr(_moe_gluon, apply_name):
         pytest.skip("gfx1250 Gluon MXFP4 SiTU apply is AMD-only")
 
     captured: dict[str, object] = {}
@@ -3988,7 +3928,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
         return "sentinel"
 
     monkeypatch.setattr(
-        _moe_gluon_mxfp4.fused_mxfp_gfx1250,
+        _moe_gluon.fused_mxfp_gfx1250,
         "gluon_mxfp_precomputed_mxfp4_fused_moe",
         fake_fused_moe,
     )
@@ -4010,7 +3950,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
     topk_weights = torch.ones((1, num_experts), dtype=torch.float32)
     topk_ids = torch.arange(num_experts, dtype=torch.int32).view(1, -1)
 
-    apply = getattr(_moe_gluon_mxfp4, apply_name)
+    apply = getattr(_moe_gluon, apply_name)
     out = apply(
         {},
         x,
@@ -6587,7 +6527,7 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
     try:
         Platform.override(b200_platform)
         KernelRegistry.reset()
-        importlib.reload(_moe_trtllm_fp8)
+        importlib.reload(_moe_flashinfer)
 
         plan = kernel_moe_plan(
             "fp8",
@@ -6617,7 +6557,7 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
 def test_cutlass_fp8_weights_attach_swiglu_tensors() -> None:
     if not Platform.get().is_nvidia:
         pytest.skip("FlashInfer cutlass MoE is registered only on NVIDIA")
-    from tokenspeed_kernel.ops.moe.flashinfer.cutlass_fp8 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_cutlass_fp8_moe_weights,
     )
 
@@ -6718,7 +6658,7 @@ def test_cutlass_mxfp4_weights_interleave_and_attach(monkeypatch) -> None:
     """
     if not Platform.get().is_nvidia:
         pytest.skip("FlashInfer cutlass MoE is registered only on NVIDIA")
-    module = _moe_cutlass_mxfp4
+    module = _moe_flashinfer
     calls: list[tuple] = []
 
     def fake_weights(w: torch.Tensor, dtype: str) -> torch.Tensor:

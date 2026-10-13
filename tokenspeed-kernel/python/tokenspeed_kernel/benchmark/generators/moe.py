@@ -985,7 +985,7 @@ def prepare_latent_input(
     )
 
     load_builtin_kernels()
-    from tokenspeed_kernel.ops.moe.latent_input import (
+    from tokenspeed_kernel.ops.moe import (
         REGION_ALIGNMENT,
         latent_moe_input_projections,
         packed_projection_weight_view,
@@ -1180,7 +1180,7 @@ def prepare_latent_expert_shared(
     }
     spec = _selected_spec(request, platform, signature, traits)
 
-    from tokenspeed_kernel.ops.moe.latent_decode import latent_moe_expert_shared
+    from tokenspeed_kernel.ops.moe import latent_moe_expert_shared
 
     def reset() -> None:
         routed_out.zero_()

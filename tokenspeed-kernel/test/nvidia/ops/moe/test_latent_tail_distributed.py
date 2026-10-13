@@ -49,7 +49,9 @@ def _setup():
 def _require_attn_collective():
     """Rank-agreed multicast probe; a one-sided skip hangs the rendezvous."""
     from tokenspeed_kernel.ops.communication.fabric import gather_fabric_map
-    from tokenspeed_kernel.ops.moe.latent_tail import multicast_backend_available
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
+        multicast_backend_available,
+    )
 
     # The probe will not gather the fabric map; a server does it at init.
     gather_fabric_map()

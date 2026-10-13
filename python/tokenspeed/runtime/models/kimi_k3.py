@@ -89,7 +89,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
 )
-from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.platform import current_platform, pdl_enabled

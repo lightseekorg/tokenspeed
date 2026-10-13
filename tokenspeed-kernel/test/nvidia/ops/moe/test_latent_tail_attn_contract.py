@@ -26,7 +26,7 @@ cuda.bindings, which ROCm images do not have.
 """
 
 import pytest
-from tokenspeed_kernel.ops.moe.latent_tail import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
     attn_reduce_shape_supported,
     build_attn_reduce_collective,
 )
