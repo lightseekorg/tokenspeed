@@ -836,6 +836,7 @@ def triton_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
         "activation": frozenset({"silu", "situ", "swiglu"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
+        "deterministic_finalize": frozenset({False}),
         "supports_ep": frozenset({False}),
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({32, 128}),

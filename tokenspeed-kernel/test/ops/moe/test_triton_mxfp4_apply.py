@@ -76,6 +76,7 @@ def test_triton_mxfp4_moe_matches_torch(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     kernel_moe_process_weights(plan, weights)
     actual = kernel_moe_apply(

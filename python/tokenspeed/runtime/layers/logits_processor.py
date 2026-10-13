@@ -354,6 +354,12 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+        # Checkpoints trained with an FP32 LM head (``head_dtype="float32"``,
+        # e.g. HY V4's ``enable_lm_head_fp32``) accumulate the head GEMM into
+        # FP32 while the weight stays in the model dtype. BF16 products are
+        # exact in FP32, so this matches an FP32 head up to summation order
+        # without materializing an FP32 copy of the weight.
+        self._fp32_lm_head = getattr(self.config, "head_dtype", None) == "float32"
 
     def require_full_vocab_logits(self) -> None:
         """Turn the fused draft argmax off so every forward returns full-vocab logits.
@@ -544,6 +550,10 @@ class LogitsProcessor(nn.Module):
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
         if _dist_argmax_vetoed():
+            return None
+        if self._fp32_lm_head:
+            # The sharded-argmax buffers are sized for the weight dtype; FP32
+            # logits take the regular gather path instead.
             return None
         if not 2 <= self.tp_size <= 32:
             return None  # the kernel's cross-rank reduce is a single warp shuffle
@@ -961,8 +971,19 @@ class LogitsProcessor(nn.Module):
                 logits = kernel_mm(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
+                    out_dtype=torch.float32 if self._fp32_lm_head else None,
                     override="aok",
                 )
+            elif self._fp32_lm_head:
+                weight = lm_head.weight
+                activations = hidden_states.to(weight.dtype)
+                if activations.is_cuda and weight.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ):
+                    logits = torch.mm(activations, weight.T, out_dtype=torch.float32)
+                else:
+                    logits = activations.float() @ weight.float().T
             else:
                 cast_hidden = hidden_states.to(lm_head.weight.dtype)
                 if current_platform().is_amd and use_decode_gemv(

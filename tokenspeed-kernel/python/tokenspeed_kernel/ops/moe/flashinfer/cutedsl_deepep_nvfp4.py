@@ -125,6 +125,7 @@ if platform.is_nvidia:
             "activation": frozenset({"silu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
+            "deterministic_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({True}),
             "deepep_modes": frozenset({"low_latency"}),

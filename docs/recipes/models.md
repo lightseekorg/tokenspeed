@@ -448,6 +448,118 @@ ts serve zai-org/GLM-5.3 \
   --speculative-num-steps 3
 ```
 
+## HY V4 (Hy4-preview)
+
+HY V4 requires pipeline-parallel size 1 and checks its kernel capabilities
+before allocating layers. Model discovery imports the residual module rather
+than new iHC symbols, so an older kernel package does not prevent unrelated
+models from being discovered. Use a matching runtime/kernel source build or
+a release containing the required iHC and DSA sink APIs.
+The fused-boundary model also requires `ihc_fused_hc`; it rejects older
+iHC-only kernels before model allocation rather than on its first forward.
+
+`tencent/Hy4-preview` (`HYV4ForCausalLM`, 770B total / 49B active) runs on the
+GLM-DSA serving path with four additions: a gated MLA output, a per-head
+learnable attention sink, independent Hyper-Connections (iHC, four residual
+channels) and a clamped SwiGLU on the routed experts. The base checkpoint ships
+one MTP layer (`model.mtp_layers.0`), so MTP needs no separate draft checkpoint.
+
+Constraints that follow from the architecture:
+
+* The learnable sink is applied inside the sparse DSA kernels (FlashMLA on
+  NVIDIA, the portable Triton kernel elsewhere). Kernels that cannot apply a
+  sink are excluded from selection, so a sink-bearing model never silently
+  drops it.
+* iHC reduces and re-scatters every channel of a token at once, so attention
+  must see full token rows: use attention data parallelism (`--attn-tp-size 1`)
+  or a layout where attention all-reduces. The reduce-scatter attention layout
+  is rejected at startup.
+* `enable_lm_head_fp32` is honored by accumulating the LM head GEMM in FP32
+  with the BF16 weight, so no FP32 copy of the head is kept.
+* The iHC residual channels are carried in FP32 from the embedding to the
+  head; each sub-block still runs in BF16 on its reduced input. Rounding the
+  channels to BF16 at every sub-block boundary compounds across the layers
+  into a logit drift large enough to flip greedy answers.
+* The routed experts require a MoE kernel that sums each token's expert
+  outputs in a fixed order (`requires_deterministic_finalize`), so outputs are
+  reproducible run to run. The FlashInfer cutlass kernels (BF16 and block-FP8)
+  provide it by finalizing outside the GEMM2 epilogue, whose atomic adds would
+  reorder the sum; kernels that cannot guarantee it are not selected.
+* MXFP8 checkpoints (ModelOpt `quant_algo: MXFP8`: E4M3 weights with one E8M0
+  scale per 32 input channels) are detected from the checkpoint's
+  `quantization_config`; no `--quantization` flag is needed. On Hopper the
+  routed experts stay MXFP8 and run on the Marlin W8A16 MoE kernel, half the
+  BF16 expert memory. Its route alignment switches to a stable sort under the
+  deterministic-finalize requirement, so outputs stay reproducible. Batches
+  with at least 192 routes per expert (prefill) instead dequantize the local
+  experts into one BF16 scratch per GPU and use the CUTLASS grouped GEMM,
+  since Marlin's mma.sync tiles leave Hopper tensor cores idle once the GEMM
+  is compute bound; the dequantization is exact. Decode batches of at most
+  16 routes with expert parallelism take a Triton GEMV over the same Marlin
+  layout instead: Marlin's split-K lock chain is bandwidth-starved at one
+  or two local routes, and counting those routes on the device would break
+  decode CUDA graphs. Dense projections are
+  dequantized to BF16 while loading; an E4M3 value times a power of two is
+  exact in BF16, so this matches a weight-only MXFP8 GEMM up to accumulation
+  order.
+* Startup rejects what HY V4 cannot load or route: quantization other than
+  ModelOpt MXFP8 (such as `--quantization fp8`, block-scaled or W8A8 FP8
+  checkpoints), speculative algorithms other than MTP (speculative decoding
+  uses the checkpoint's MTP layer), and expert placements other than the
+  checkpoint's own order (EPLB, redundant experts, an
+  `--init-expert-location` file).
+* Live weight updates are refused: `init_weights_update_group` before the
+  trainer's update group forms, and every weight-update session
+  (`update_weights_from_distributed`, `update_weights_from_mooncake`).
+  Loading derives the absorbed MLA weights and the MoE kernels' weight
+  layouts from the checkpoint, and an in-place update would leave them stale;
+  restart the server to serve new weights.
+* Prefill and mixed batches up to `--prefill-graph-max-tokens` (default:
+  the smaller of 2048 and the chunked-prefill size) replay breakable CUDA
+  graphs. Only the sparse attention core (cache writes, the indexer top-k and
+  FlashMLA) runs eagerly between the graph segments, and it drops the padded
+  rows itself. MTP keeps the target's prefill graphs; the draft's first step
+  after a prefill runs eagerly.
+* Validated so far: the BF16 and MXFP8 checkpoints on four 8x H20 (96 GB)
+  nodes with attention TP32 and EP32, there also the MXFP8 checkpoint with MTP
+  (one and three draft steps), and the MXFP8 checkpoint on two such nodes with
+  TP16 and EP16. Keep the KV cache in BF16 unless you have validated FP8 KV
+  accuracy on your workload.
+
+Four nodes of 8x H20, attention TP32 with EP32:
+
+```bash
+# node 0 (serves the HTTP API)
+ts serve tencent/Hy4-preview \
+  --served-model-name hy4 \
+  --nnodes 4 --node-rank 0 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 32 --dense-tp-size 32 \
+  --enable-expert-parallel \
+  --max-model-len 65536 \
+  --max-num-seqs 64
+
+# nodes 1-3: the same command with --node-rank 1, 2, 3
+```
+
+MTP drafts from the checkpoint's own MTP layer; add to every node's command:
+
+```bash
+  --speculative-algorithm MTP --speculative-num-steps 3
+```
+
+With three draft steps a verification accepts about 3.2 tokens on math and code
+prompts, which roughly halves the per-token latency of a lightly loaded server.
+Near the batch limit the verified draft tokens cost about as much as they save:
+at 64 concurrent requests, throughput stays within 3% (one step) to 6% (three
+steps) of decoding without MTP.
+
+`ts serve` defaults the reasoning and tool-call parsers to `hy_v4`; the pinned
+gateway (smg 1.11) provides both. The chat template accepts `reasoning_effort`
+values `high` (the default), `low` and `no_think`. With
+`--grammar-backend xgrammar`, a `json_schema` response format is enforced after
+the reasoning block closes, or from the first token under `no_think`.
+
 ## GLM 5.3 Flash
 
 GLM-5.3-Flash automatically configures its KDA/DSA backends and supports MTP from

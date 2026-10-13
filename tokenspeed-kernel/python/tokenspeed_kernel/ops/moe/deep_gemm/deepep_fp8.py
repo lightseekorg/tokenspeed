@@ -503,6 +503,7 @@ if platform.is_hopper_plus:
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
+            "deterministic_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({True}),
             "deepep_modes": frozenset({"normal", "low_latency"}),

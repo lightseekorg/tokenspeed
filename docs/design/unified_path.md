@@ -407,7 +407,10 @@ scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
 over the target and draft `child_backends()` trees once
 (`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
-`DSABackend` disables the prefill graph (rationale on the class). Qwen4-Exp's
+`DSABackend` disables the prefill graph (rationale on the class) unless its
+model reads the backend metadata only inside the eager attention break and
+drops the padded rows there: GLM-5.3-Flash (KPool) and models whose
+`DSAConfig.padded_prefill_replay` is set (HY V4 and its MTP draft). Qwen4-Exp's
 PLE and QSA indexer support the breakable graph: their model methods are eager
 break points, where live request metadata controls cache writes and padded
 token rows are sliced before state updates. The root composes its actual

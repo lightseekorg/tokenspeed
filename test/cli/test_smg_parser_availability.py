@@ -39,3 +39,15 @@ def test_smg_exposes_deepseek_v4_parsers():
 
     assert "deepseek_v31" in proc.stdout
     assert "deepseek_v4" in proc.stdout
+
+
+def test_smg_exposes_hy_v4_parsers():
+    proc = subprocess.run(
+        [sys.executable, "-m", "smg", "launch", "--help"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    assert "hy_v4" in proc.stdout
