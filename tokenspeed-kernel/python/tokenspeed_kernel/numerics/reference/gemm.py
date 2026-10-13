@@ -542,16 +542,9 @@ def torch_bmm(
 def grouped_bf16_projection_torch(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None
 ) -> torch.Tensor:
-    """Preserve the original batched projection and its BF16 rounding.
-
-    The batched GEMM writes each group's ``[tokens, output_dim]`` block
-    straight into the contiguous ``[tokens, groups, output_dim]`` result.
-    """
+    """Preserve the original batched projection and its BF16 rounding."""
+    result = torch.einsum("tgd,grd->tgr", x, weight)
     if out is None:
-        out = torch.empty(
-            (x.shape[0], weight.shape[0], weight.shape[1]),
-            dtype=x.dtype,
-            device=x.device,
-        )
-    torch.bmm(x.transpose(0, 1), weight.transpose(1, 2), out=out.transpose(0, 1))
+        return result
+    out.copy_(result)
     return out
