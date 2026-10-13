@@ -911,7 +911,13 @@ def test_extract_perf_summary_rows_returns_none_when_missing():
     assert extract_perf_summary_rows("nothing relevant here") is None
 
 
-def test_qwen_output_throughput_is_reported_per_minute_per_gpu(tmp_path):
+@pytest.mark.parametrize(
+    "invalid_values",
+    [{}, {"Output Throughput (tok/s)": "nan"}, {"Failed Requests": 1}],
+)
+def test_qwen_output_throughput_is_reported_per_minute_per_gpu(
+    tmp_path, invalid_values
+):
     run_dir = tmp_path / "attn_tp4_moe_ep4" / "parallel_1"
     run_dir.mkdir(parents=True)
     (run_dir / "benchmark_summary.json").write_text(
@@ -923,6 +929,7 @@ def test_qwen_output_throughput_is_reported_per_minute_per_gpu(tmp_path):
                 "Output Throughput (tok/s)": 120.0,
                 "KV Cache Hit Rate (%)": 0.0,
                 "Failed Requests": 0,
+                **invalid_values,
             }
         ),
         encoding="utf-8",
@@ -933,6 +940,11 @@ def test_qwen_output_throughput_is_reported_per_minute_per_gpu(tmp_path):
             / "agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed/collect_outputs.py"
         )
     )
+
+    if invalid_values:
+        with pytest.raises(ValueError):
+            collector["collect"](tmp_path, expected_concurrencies=[1])
+        return
 
     rows = collector["collect"](tmp_path, expected_concurrencies=[1])
 
