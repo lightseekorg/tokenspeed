@@ -319,6 +319,8 @@ class TestTokenLevelPrefixHits(unittest.TestCase):
                     case,
                     enable_prefix_caching=True,
                     chunked_prefill_size=len(prefix) - 1,
+                    # The reference asks for prompt logprobs (its cache bypass).
+                    enable_output_logprobs=True,
                 )
                 try:
                     # X[:-1] first: one cold forward over [0, |X|-1), the
