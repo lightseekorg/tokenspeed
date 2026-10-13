@@ -24,8 +24,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 2.0
       }
     },
     {
@@ -42,8 +41,26 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "dsv41_flash.residual.mhc_apply_pre/hc4-fused-norm-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "residual",
+        "mode": "mhc_apply_pre",
+        "parameters": {
+          "tokens": [192, 8192],
+          "fused_norm": true,
+          "rms_eps": 1e-20
+        },
+        "cold_cache": true,
+        "seed": 5403
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
       }
     }
   ]

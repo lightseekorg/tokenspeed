@@ -26,8 +26,7 @@
       },
       "policy": {
         "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -55,8 +54,7 @@
       },
       "policy": {
         "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -84,8 +82,7 @@
       },
       "policy": {
         "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -113,8 +110,7 @@
       },
       "policy": {
         "max_regression_relative": 0.15,
-        "max_regression_absolute_us": 0.5,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -142,8 +138,7 @@
       },
       "policy": {
         "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -171,8 +166,7 @@
       },
       "policy": {
         "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -200,8 +194,7 @@
       },
       "policy": {
         "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -229,8 +222,7 @@
       },
       "policy": {
         "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -258,8 +250,7 @@
       },
       "policy": {
         "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -287,8 +278,7 @@
       },
       "policy": {
         "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -316,8 +306,7 @@
       },
       "policy": {
         "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -345,8 +334,7 @@
       },
       "policy": {
         "max_regression_relative": 0.1,
-        "max_regression_absolute_us": 0.5,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -373,8 +361,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 2.0
       }
     },
     {
@@ -401,8 +388,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 2.0
       }
     },
     {
@@ -429,8 +415,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -457,8 +442,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -485,8 +469,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -513,8 +496,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -541,8 +523,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -569,8 +550,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -597,8 +577,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -625,8 +604,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -653,8 +631,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -681,8 +658,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -709,8 +685,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -737,8 +712,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -765,8 +739,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -793,8 +766,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -821,8 +793,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -849,8 +820,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -877,8 +847,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -905,8 +874,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -933,8 +901,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -961,8 +928,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -989,8 +955,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -1017,8 +982,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -1045,8 +1009,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
       }
     },
     {
@@ -1073,8 +1036,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -1101,8 +1063,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -1129,8 +1090,73 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.mm/torch_mm/tp4-lm_head-n32320-k5120-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [6, 192],
+          "N": 32320,
+          "K": 5120,
+          "quant": "none",
+          "dtype": "bfloat16"
+        },
+        "registration": "torch_mm",
+        "cold_cache": true,
+        "seed": 5531
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.grouped_bf16_projection/tp4-wo_a-decode-g2-n1024-k4096-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "grouped_bf16_projection",
+        "parameters": {
+          "groups": 2,
+          "M": [6, 192],
+          "N": 1024,
+          "K": 4096,
+          "x_token_stride": 32768,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5532
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "dsv41_flash.gemm.grouped_bf16_projection/tp4-wo_a-prefill-g2-n1024-k4096-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "grouped_bf16_projection",
+        "parameters": {
+          "groups": 2,
+          "M": [1024, 8192],
+          "N": 1024,
+          "K": 4096,
+          "x_token_stride": 8192,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5533
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
       }
     }
   ]

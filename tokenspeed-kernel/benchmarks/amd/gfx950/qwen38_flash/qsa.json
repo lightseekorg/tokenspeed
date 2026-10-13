@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "qwen38_flash_tp2"
+  },
+  "cases": [
+    {
+      "id": "qwen38_flash.attention.qsa_sparse_attention/verify-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "qsa_sparse_attention",
+        "parameters": {
+          "phase": "decode",
+          "batch": 16,
+          "dtype": "bfloat16",
+          "q_len": 4,
+          "context_tokens": [
+            1024,
+            8192
+          ],
+          "kv_dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5116
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "qwen38_flash.attention.qsa_sparse_attention/draft-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "qsa_sparse_attention",
+        "parameters": {
+          "phase": "decode",
+          "batch": 16,
+          "dtype": "bfloat16",
+          "q_len": 1,
+          "context_tokens": [
+            1024,
+            8192
+          ],
+          "kv_dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5117
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "qwen38_flash.attention.qsa_sparse_attention/verify-fp8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "qsa_sparse_attention",
+        "parameters": {
+          "phase": "decode",
+          "batch": 16,
+          "dtype": "bfloat16",
+          "q_len": 4,
+          "context_tokens": 1024,
+          "kv_dtype": "float8_e4m3fn"
+        },
+        "cold_cache": true,
+        "seed": 5118
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "qwen38_flash.attention.qsa_sparse_attention/prefill-2x4k-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "qsa_sparse_attention",
+        "parameters": {
+          "phase": "prefill",
+          "batch": 2,
+          "context_tokens": 4096,
+          "dtype": "bfloat16",
+          "kv_dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5119
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0
+      }
+    },
+    {
+      "id": "qwen38_flash.attention.qsa_sparse_attention/prefill-8k-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "qsa_sparse_attention",
+        "parameters": {
+          "phase": "prefill",
+          "batch": 1,
+          "context_tokens": 8192,
+          "dtype": "bfloat16",
+          "kv_dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5120
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0
+      }
+    }
+  ]
+}

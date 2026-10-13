@@ -299,3 +299,105 @@ if current_platform().is_amd:
             norm_weight=norm_weight,
             norm_eps=norm_eps,
         )
+
+
+if current_platform().is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.mhc import (
+        launch_gluon_mhc_apply_pre_gfx950,
+        launch_gluon_mhc_mixes_gfx950,
+        launch_gluon_mhc_post_gfx950,
+    )
+
+    _GFX950 = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+        vendors=frozenset({"amd"}),
+    )
+
+    @register_kernel(
+        "residual",
+        "mhc_mixes",
+        name="gluon_mhc_mixes_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=frozenset(
+            {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+        ),
+        traits={
+            "buffer_offsets_fit_int32": frozenset({True}),
+            # The projection tiles K = 4 * hidden_size by 64.
+            "hidden_size": frozenset({4096, 5120, 6144, 7168, 8192}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mhc_mixes_gfx950(
+        residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters
+    ):
+        """Run the single-pass GFX950 hc=4 mixes projection and reduction."""
+        return launch_gluon_mhc_mixes_gfx950(
+            residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters
+        )
+
+    @register_kernel(
+        "residual",
+        "mhc_post",
+        name="gluon_mhc_post_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    residual=dense_tensor_format(torch.bfloat16),
+                    post=dense_tensor_format(torch.float32),
+                    comb=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        traits={
+            "buffer_offsets_fit_int32": frozenset({True}),
+            "hc_mult": frozenset({4}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mhc_post_gfx950(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the vectorized GFX950 hc=4 post-mapping."""
+        return launch_gluon_mhc_post_gfx950(hidden_states, residual, post, comb)
+
+    @register_kernel(
+        "residual",
+        "mhc_apply_pre",
+        name="gluon_mhc_apply_pre_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=frozenset(
+            {
+                format_signature(
+                    residual=dense_tensor_format(torch.bfloat16),
+                    pre=dense_tensor_format(torch.float32),
+                )
+            }
+        ),
+        traits={
+            "buffer_offsets_fit_int32": frozenset({True}),
+            "fused_norm": frozenset({False, True}),
+            "hc_mult": frozenset({4}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mhc_apply_pre_gfx950(
+        residual: torch.Tensor,
+        pre: torch.Tensor,
+        *,
+        norm_weight: torch.Tensor | None,
+        norm_eps: float | None,
+    ) -> torch.Tensor:
+        """Collapse four streams with ``pre`` and optional fused RMSNorm."""
+        return launch_gluon_mhc_apply_pre_gfx950(
+            residual, pre, norm_weight=norm_weight, norm_eps=norm_eps
+        )

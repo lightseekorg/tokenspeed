@@ -25,6 +25,13 @@ and reclaims inside the same `Admit` (`advanceRequestProgress` in
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
 
+Decode-role remote admission covers the complete unmatched prompt in one
+landing window. Local prefill chunk limits and prefix-promotion boundaries do
+not shorten it: the peer transfers the full prompt's cache and endpoint state.
+The window must reach `PrefillSize()` so the first decode consumes its reserved
+input width. A truncated remote window would leave that reserve at zero and
+delay later cache growth even though the device has committed the full prompt.
+
 **L3 is fetched before admission, never by it.** An admission loads only
 Host entries that exist (`PrefixProbe::host`), so nothing it loads can miss and
 the Host-to-Device leg keeps its layer-wise overlap with the first chunk. The
@@ -643,6 +650,9 @@ phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
    arrives. Head-of-line (1.1) does not apply — there is no mid-way. A restore
    that failed for capacity in phase 1 **seals** this phase: a newcomer taking
    the pages it waits for would starve it.
+   Remote admission therefore bypasses local prefill chunking and prefix
+   promotion boundaries; the destination tables must cover the entire
+   unmatched suffix advertised by the transfer manifest.
 4. `maybeRetractForCapacity` (§2), whose grant also rides beside the batch
    (a remote admission) or joins it (a blocked decode).
 

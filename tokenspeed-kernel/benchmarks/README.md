@@ -89,7 +89,7 @@ can be compared. Measurement-block counts may differ.
 
 The result contains the raw device-time samples, resolved registration, timing
 mode, and structured failure information. Suite-level comparison uses the
-sample median and relative median absolute deviation.
+sample median.
 
 ## Correctness
 
@@ -117,8 +117,13 @@ A suite declares:
 - the required hardware vendor and architecture;
 - shared eager and graph-replay warmup counts, plus a default measurement-block
   count;
-- stable case IDs, comparison epochs, and definitions; and
-- per-case relative regression, absolute regression, and noise limits.
+- stable case IDs, comparison epochs, and definitions;
+- per-case relative and absolute regression limits; and
+- `min_regression_absolute_us`, the smallest absolute limit any case may use.
+
+The minimum absolute limit reflects timing resolution rather than performance
+intent: separate processes can measure the same small kernel a fraction of a
+microsecond apart, so a tighter limit would flag process-to-process noise.
 
 A case may set `measurement_blocks` when its noise profile requires more samples
 than the suite default. The suite runner records the effective value with that
@@ -158,13 +163,24 @@ settings, cache mode, and recorded hardware. Their measurement-block counts may
 differ. The comparison reports the resolved registration, which may change
 because dispatch is part of the behavior under test. Added and changed cases
 appear in the report without comparison. A baseline case missing from the
-candidate also appears in the report. If any
-otherwise-compatible run is too noisy, its result is inconclusive rather than a
-regression.
+candidate also appears in the report.
 
 Regression policy comes from the merge-base suite, so a candidate cannot weaken
 its own gate by changing a threshold. A benchmark is a regression only when its
 median slowdown exceeds both the configured relative and absolute limits.
+
+The variation between benchmark processes is several times larger than the
+sample spread within one process, and it occasionally shifts a single
+process by more than a budget. A single base/candidate pair therefore cannot
+settle a verdict. The comparison runs every case once per revision, then
+re-measures only the cases outside their budgets in further rounds. Each
+round starts fresh baseline and candidate processes, and the revision that runs
+first alternates between rounds. The round with the median relative change
+supplies the reported times and the verdict. If one round finds a regression
+and another an improvement, the measurement cannot tell the direction, and the
+result is inconclusive. A wide spread alone does not void the verdict: noise
+grows with the size of the change, so a large regression that every round
+reproduces still fails.
 
 ## Running a suite
 
@@ -195,8 +211,13 @@ Run a complete base/candidate comparison from the repository root:
 python3 test/ci_system/kernel_benchmark_ci.py \
   --base-ref <target-commit> \
   --candidate-ref <candidate-commit> \
-  --output-dir /tmp/tokenspeed-kernel-benchmark
+  --output-dir /tmp/tokenspeed-kernel-benchmark \
+  --measurement-rounds 3
 ```
+
+`--measurement-rounds` is the total number of rounds for cases that the first
+round finds outside their budgets. It must be odd so that a median round
+exists; `1` reports first-round verdicts without re-measuring.
 
 The default comparison creates separate worktrees and virtual environments for
 the two revisions and installs each revision's ROCm kernel requirements. To

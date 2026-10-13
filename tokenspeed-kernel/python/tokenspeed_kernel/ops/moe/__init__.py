@@ -17,6 +17,8 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+import functools
+import logging
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -84,6 +86,8 @@ from tokenspeed_kernel.ops.moe.sigmoid_topk import (  # noqa: E402
     _moe_sigmoid_bias_topk,
 )
 from tokenspeed_kernel.ops.moe.softmax_topk import _moe_softmax_topk  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def _assert_indices_in_range(
@@ -488,6 +492,30 @@ def _build_traits(
     return traits
 
 
+def _select_moe_apply(
+    input_dtype: torch.dtype, traits: dict[str, Any], solution: str | None
+):
+    kernel = select_kernel(
+        "moe",
+        "apply",
+        format_signature(x=dense_tensor_format(input_dtype)),
+        traits=traits,
+        solution=solution,
+    )
+    apply_spec = KernelRegistry.get().get_by_name(kernel.name)
+    if apply_spec is None:
+        raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
+    return kernel, apply_spec
+
+
+@functools.cache
+def _log_fp32_correction_bias_fallback(kernel_name: str) -> None:
+    logger.info(
+        f"MoE kernel {kernel_name} cannot add the correction bias in FP32 while "
+        "routing; layers that need it plan precomputed top-k"
+    )
+
+
 def moe_plan(
     weight_dtype: str,
     input_dtype: torch.dtype = torch.bfloat16,
@@ -512,6 +540,7 @@ def moe_plan(
     fast_math: bool,
     combine_order: str,
     solution: str | None = None,
+    fp32_correction_bias: bool = False,
 ) -> dict:
     """Create a MoE execution plan.
 
@@ -580,6 +609,12 @@ def moe_plan(
             the EP process group. Required keyword.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
+        fp32_correction_bias: Whether routing must add the DeepSeekV3
+            correction bias in FP32. A kernel that routes from logits is kept
+            only if its ``_tokenspeed_fp32_correction_bias`` hook prepares
+            such a router and returns True; otherwise the plan uses
+            precomputed top-k, whose routers add the bias in FP32, and a
+            "kernel_routing" requirement raises ValueError.
 
     The selected apply kernel owns plan metadata. A plan with support_routing
     false requires precomputed top-k ids and weights when calling moe_apply.
@@ -627,17 +662,24 @@ def moe_plan(
     )
     traits["persistent_workspace"] = persistent_max_num_tokens_per_gpu is not None
 
-    kernel = select_kernel(
-        "moe",
-        "apply",
-        format_signature(x=dense_tensor_format(input_dtype)),
-        traits=traits,
-        solution=solution,
-    )
-    registry = KernelRegistry.get()
-    apply_spec = registry.get_by_name(kernel.name)
-    if apply_spec is None:
-        raise RuntimeError(f"Kernel spec not found for selected kernel {kernel.name}")
+    kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution)
+    # A kernel that routes from logits keeps an FP32 correction bias only if
+    # its hook says so; TokenSpeed's top-k routers always add it in FP32.
+    fp32_bias_hook = getattr(kernel.impl, "_tokenspeed_fp32_correction_bias", None)
+    if (
+        fp32_correction_bias
+        and routing_mode != "precomputed_topk"
+        and "kernel_routing" in apply_spec.traits.get("routing_mode", frozenset())
+        and not (fp32_bias_hook is not None and fp32_bias_hook())
+    ):
+        if routing_mode == "kernel_routing":
+            raise ValueError(
+                f"MoE kernel {apply_spec.name!r} cannot add the correction bias "
+                "in FP32 while routing"
+            )
+        _log_fp32_correction_bias_fallback(apply_spec.name)
+        routing_mode = traits["routing_mode"] = "precomputed_topk"
+        kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution)
     _validate_selected_deepep_mode(
         a2a_backend,
         deepep_mode,
@@ -653,7 +695,11 @@ def moe_plan(
         )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
-    support_routing = "kernel_routing" in routing_modes
+    # With an FP32 correction bias, precomputed top-k also means routing
+    # outside a kernel that could route itself.
+    support_routing = "kernel_routing" in routing_modes and not (
+        fp32_correction_bias and routing_mode == "precomputed_topk"
+    )
     supports_precomputed_topk = "precomputed_topk" in routing_modes
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
@@ -682,6 +728,7 @@ def moe_plan(
         "supports_all_to_all_ep": traits["supports_all_to_all_ep"],
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
+        "fp32_correction_bias": fp32_correction_bias,
     }
 
 

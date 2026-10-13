@@ -467,17 +467,11 @@ class LogitsProcessor(nn.Module):
         key = (self.tp_group, vocab_padded)
         if key not in self._LOGITS_AG_STATES:
             self._LOGITS_AG_STATES[key] = create_state(
-                enable_lamport=False,
-                moe_tail_max_rows=0,
                 group=pg_manager.get_process_group("nccl", self.tp_group),
                 rank_in_group=self.tp_rank,
-                attnres_max_numel=0,
-                attnres_max_rows=0,
                 max_tokens=self._LOGITS_AG_MAX_TOKENS,
                 hidden_size=vocab_padded,
                 device=None,
-                max_numel=0,
-                max_bytes=0,
             )
         return self._LOGITS_AG_STATES[key]
 

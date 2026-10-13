@@ -26,18 +26,24 @@ env:
   # reduced-size MXFP4 MoE cases run here.
   MI450_SIM_TEST_ROOT: tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tile_shapes
   MI450_SIM_TESTS: |
-    # MHA prefill beyond the root's tile shapes: selected packed GQA on full,
-    # ragged and 512-window rows, forced packed FP16, the TDM warp hint and
-    # reversed Q blocks at two heads, and host selectors no other lane runs.
+    # MHA prefill beyond the root's tile shapes: packed GQA, compact and
+    # non-compact ragged batches, both wide-transport variants, QK interleave,
+    # and load-bearing host selectors no other lane runs.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[full-tiles]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[guarded-rows]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[compact-ragged]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[five-ragged]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[window512]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_wide_transport[sim]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_wide_transport_fused_tdm[sim]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_qk_interleave[sim]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_packed_gqa[2-dtype1]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tdm_warp_hint_remainder[sim]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_reverse_q_blocks_ragged[sim]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_llvm_fn_attrs
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_deep_pipeline
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_packed_gqa
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_wide_transport_rechecks_launch_preconditions
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_tdm_warp_hint
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_reverse_q_blocks
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_m_tile_gates
@@ -64,14 +70,16 @@ env:
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[1-1]
     tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_gluon_batched_replay_uneven_groups_match_per_layer_launches
     # DeepSeek V4.1 index top-k: CSA2 scoring, reindexing, missing and
-    # out-of-table latest pages, arena page strides.
+    # out-of-table latest pages, arena page strides, and raw gfx1250 logits.
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.dsv41_index_topk/gluon_dsv41_index_topk_gfx1250@mi450]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_full_and_reindex_gluon[65-17-32]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_missing_latest_page[-1-gluon]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_missing_latest_page[3-gluon]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_latest_block_outside_table[320-31-gluon]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-1]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-2]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-arena]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-byte-strided]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_index_topk_preserves_arena_page_stride[True-unaligned-pages]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_index_topk.py::test_gfx1250_index_logits_match_reference[40-False]
     # DeepSeek V4.1 fused selected attention, with and without the global cache.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_gluon_is_selected_on_supported_amd
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsv41_selected.py::test_fused_selected_attention_matches_gather_softmax[True-16]
@@ -114,7 +122,7 @@ env:
     # Kimi K3 BF16 GEMMs: M=16 add3 in Gluon and Triton, strided shared-down,
     # dense-M16 TDM through the M=17 decode GEMV, large-M o_proj. QKV-gate and
     # 512-token latent projections reuse these kernels and stay on hardware.
-    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_m16_add3_auto_matches_composed_and_captures
+    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_add3_auto_fuses_matches_composed_and_captures[16]
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_output_contract
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_inputs_use_torch
     tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches

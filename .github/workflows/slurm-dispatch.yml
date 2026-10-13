@@ -71,6 +71,7 @@ on:
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml
+          - test/ci/perf/qwen3.8-flash-next-nvfp4-tp4ep4-evalscope-agentic.yaml
           - test/ci/ut/deepseek-v4.1-flash-pd-1p1d.yaml
           - test/ci/ut/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d.yaml
           - test/ci/ut/qwen3.5-397b-a17b-nvfp4-pd-1p1d.yaml

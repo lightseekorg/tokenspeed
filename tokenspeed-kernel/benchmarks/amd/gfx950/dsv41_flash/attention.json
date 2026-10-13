@@ -28,8 +28,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 2.0
       }
     },
     {
@@ -50,8 +49,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -72,8 +70,29 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 1.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_selected_attention/verify-padded-h64-b32-t6-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_selected_attention",
+        "parameters": {
+          "local_heads": 64,
+          "batch": 32,
+          "q_len_per_req": 6,
+          "context_length": 8192,
+          "compress_ratio": [0, 1, 2]
+        },
+        "registration": "gluon_dsv41_selected_attention_gfx950",
+        "cold_cache": true,
+        "seed": 5004
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0
       }
     },
     {
@@ -94,8 +113,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 20.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 20.0
       }
     },
     {
@@ -116,8 +134,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 50.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 50.0
       }
     },
     {
@@ -138,8 +155,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 50.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 50.0
       }
     },
     {
@@ -164,8 +180,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 20.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 20.0
       }
     },
     {
@@ -190,8 +205,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 20.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 20.0
       }
     },
     {
@@ -215,8 +229,107 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 5.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 5.0
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/verify-full-csa2-b32-t6-c32768-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 20,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 32,
+          "q_len_per_req": 6,
+          "context_length": 32768,
+          "compress_ratio": 2,
+          "selection": "full",
+          "table_pages": 8192,
+          "query_chunk_size": 256
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5207
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/verify-full-csa2-b1-t6-c1048576-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 20,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 6,
+          "context_length": 1048576,
+          "compress_ratio": 2,
+          "selection": "full",
+          "table_pages": 8192,
+          "query_chunk_size": 256
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5208
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/verify-full-candidates-csa1-b32-t6-c32768-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 20,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 32,
+          "q_len_per_req": 6,
+          "context_length": 32768,
+          "compress_ratio": 1,
+          "selection": "full_candidates",
+          "table_pages": 16384,
+          "query_chunk_size": 256
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5209
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/verify-full-candidates-csa1-b1-t6-c1048576-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 20,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 6,
+          "context_length": 1048576,
+          "compress_ratio": 1,
+          "selection": "full_candidates",
+          "table_pages": 16384,
+          "query_chunk_size": 256
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5210
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0
       }
     },
     {
@@ -241,8 +354,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 10.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 10.0
       }
     },
     {
@@ -267,8 +379,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 20.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 20.0
       }
     },
     {
@@ -293,8 +404,82 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 20.0,
-        "max_relative_mad": 0.05
+        "max_regression_absolute_us": 20.0
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/extend-full-csa2-p57344-t8192-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 10,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 8192,
+          "context_length": 65536,
+          "compress_ratio": 2,
+          "selection": "full",
+          "table_pages": 512,
+          "query_chunk_size": 1024
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5211
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 50.0
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/extend-full-candidates-csa1-c65536-t128-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 20,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 128,
+          "context_length": 65536,
+          "compress_ratio": 1,
+          "selection": "full_candidates",
+          "table_pages": 1024,
+          "query_chunk_size": 1024
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5212
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0
+      }
+    },
+    {
+      "id": "dsv41_flash.attention.dsv41_index_topk/extend-full-candidates-csa1-c65536-t1-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 20,
+      "definition": {
+        "family": "attention",
+        "mode": "dsv41_index_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 1,
+          "context_length": 65536,
+          "compress_ratio": 1,
+          "selection": "full_candidates",
+          "table_pages": 1024,
+          "query_chunk_size": 1024
+        },
+        "registration": "gluon_dsv41_index_topk_gfx950",
+        "cold_cache": true,
+        "seed": 5213
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 20.0
       }
     }
   ]

@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from functools import cache
+
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.indexing import (
@@ -61,12 +63,36 @@ _STANDARD_DECODE_BLOCK_N = 64
 _STANDARD_DECODE_CHUNK_N = 64
 _STANDARD_DECODE_NUM_WARPS = 4
 _STANDARD_DECODE_WAVES_PER_EU = 2
-_STANDARD_PREFILL_BLOCK_N = 128
+_STANDARD_PREFILL_BLOCK_N = 256
 _STANDARD_PREFILL_NUM_WARPS = 8
 _STANDARD_PREFILL_WAVES_PER_EU = 1
 _KPOOL_SCORE_BLOCK_N = 128
 _KPOOL_SCORE_NUM_WARPS = 4
 _KPOOL_SCORE_WAVES_PER_EU = 4
+# Prefill and KPool scorers split each row's columns over enough programs to
+# give every compute unit this many, so short batches still fill the GPU.
+_SCORE_SPLIT_PROGRAMS_PER_CU = 4
+
+
+@cache
+def _device_compute_units(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _score_split_cols(
+    rows: int,
+    columns: int,
+    block_n: int,
+    device: torch.device,
+) -> int:
+    """Return the per-program column span for ``rows`` scorer rows.
+
+    The span is a multiple of ``block_n`` and is passed as a runtime argument,
+    so changing batch sizes do not recompile the scorer.
+    """
+    programs = _SCORE_SPLIT_PROGRAMS_PER_CU * _device_compute_units(device.index)
+    splits = min(triton.cdiv(programs, rows), triton.cdiv(columns, block_n))
+    return triton.cdiv(triton.cdiv(columns, max(splits, 1)), block_n) * block_n
 
 
 @gluon.constexpr_function
@@ -757,7 +783,9 @@ def gluon_dsa_kpool_prefill_logits_gfx1250(
         pool_offset: First global pool represented by output column zero.
         window_cols: Output columns in the local scoring window.
         softmax_scale: Scale applied after weighted per-head ReLU reduction.
-        ordered_head_fold: Whether to fold heads in logical order.
+        ordered_head_fold: Whether the caller requires heads folded in
+            logical order. GFX1250 always folds heads in logical order, its
+            fastest reduction, so both values return identical scores.
         out: Optional contiguous FP32 scoring workspace.
         row_ends_out: Optional contiguous int32 local exclusive bounds.
 
@@ -824,7 +852,10 @@ def gluon_dsa_kpool_prefill_logits_gfx1250(
         return out, row_ends_out
 
     num_warps = _KPOOL_SCORE_NUM_WARPS
-    gluon_kpool_prefill_topk_fp8_gfx1250[(tokens, 1)](
+    split_cols = _score_split_cols(tokens, window_cols, _KPOOL_SCORE_BLOCK_N, q.device)
+    gluon_kpool_prefill_topk_fp8_gfx1250[
+        (tokens, triton.cdiv(window_cols, split_cols))
+    ](
         q,
         weights,
         pooled_k_cache.view(torch.float8_e4m3fn),
@@ -847,6 +878,7 @@ def gluon_dsa_kpool_prefill_logits_gfx1250(
         float(softmax_scale),
         max_candidates,
         pool_offset,
+        split_cols,
         PAGE_SIZE=page_size,
         PAGE_STRIDE_BYTES=cache_page_stride_bytes,
         POOL_SIZE=pool_size,
@@ -855,7 +887,6 @@ def gluon_dsa_kpool_prefill_logits_gfx1250(
         BLOCK_N=_KPOOL_SCORE_BLOCK_N,
         WINDOW_COLS=window_cols,
         NUM_WARPS=num_warps,
-        ORDERED_HEAD_FOLD=ordered_head_fold,
         USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
         USE_BUFFER_STORE=out.nbytes < 2**31,
         num_warps=num_warps,
@@ -895,7 +926,9 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         pool_offset: First request-local pool represented by output column zero.
         window_cols: Output columns in the local scoring window.
         softmax_scale: Scale applied after weighted per-head ReLU reduction.
-        ordered_head_fold: Whether to fold heads in logical order.
+        ordered_head_fold: Whether the caller requires heads folded in
+            logical order. GFX1250 always folds heads in logical order, its
+            fastest reduction, so both values return identical scores.
         out: Optional contiguous FP32 scoring workspace.
         row_ends_out: Optional contiguous int32 local exclusive bounds.
 
@@ -953,7 +986,10 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         raise ValueError("a nonempty prefill plan requires pooled cache pages")
 
     num_warps = _KPOOL_SCORE_NUM_WARPS
-    gluon_kpool_prefill_topk_fp8_plan_gfx1250[(tokens, 1)](
+    split_cols = _score_split_cols(tokens, window_cols, _KPOOL_SCORE_BLOCK_N, q.device)
+    gluon_kpool_prefill_topk_fp8_plan_gfx1250[
+        (tokens, triton.cdiv(window_cols, split_cols))
+    ](
         q,
         weights,
         pooled_k_cache.view(torch.float8_e4m3fn),
@@ -975,6 +1011,7 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         float(softmax_scale),
         int(pool_workspace_slots.numel()),
         pool_offset,
+        split_cols,
         PAGE_SIZE=page_size,
         PAGE_STRIDE_BYTES=cache_page_stride_bytes,
         POOL_SIZE=pool_size,
@@ -983,7 +1020,6 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         BLOCK_N=_KPOOL_SCORE_BLOCK_N,
         WINDOW_COLS=window_cols,
         NUM_WARPS=num_warps,
-        ORDERED_HEAD_FOLD=ordered_head_fold,
         USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
         USE_BUFFER_STORE=out.nbytes < 2**31,
         num_warps=num_warps,
@@ -1449,7 +1485,10 @@ def launch_gluon_dsa_prefill_topk_standard_gfx1250(
             dtype=torch.float32,
             device=q.device,
         )
-        gluon_dsa_prefill_topk_standard_gfx1250[(end - start, 1)](
+        split_cols = _score_split_cols(end - start, workspace_rows, block_n, q.device)
+        gluon_dsa_prefill_topk_standard_gfx1250[
+            (end - start, triton.cdiv(workspace_rows, split_cols))
+        ](
             q[start:end],
             q_scale_arg[start:end],
             index_k_cache.view(torch.float8_e4m3fn),
@@ -1470,6 +1509,7 @@ def launch_gluon_dsa_prefill_topk_standard_gfx1250(
             logits.stride(0),
             float(softmax_scale),
             workspace_rows,
+            split_cols,
             PAGE_SIZE=int(page_size),
             PAGE_STRIDE_BYTES=page_stride_bytes,
             NUM_HEADS=q.shape[1],

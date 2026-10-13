@@ -137,6 +137,15 @@ def should_ignore_quant_layer(
                     and prefix_v_proj in ignored_layers
                 ):
                     should_ignore_layer = True
+            elif prefix.endswith(".ple.kv_proj"):
+                # Qwen4-Exp PLE fuses key_proj and value_proj into kv_proj.
+                if all(
+                    check_equal_or_regex_match(
+                        prefix.replace("kv_proj", shard), ignored_layers
+                    )
+                    for shard in ("key_proj", "value_proj")
+                ):
+                    should_ignore_layer = True
             elif "in_proj_qkvzba" in prefix:
                 shard_groups = (
                     ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),

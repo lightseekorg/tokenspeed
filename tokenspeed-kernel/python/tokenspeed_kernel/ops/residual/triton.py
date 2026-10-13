@@ -257,11 +257,14 @@ def triton_hyperconnection_mix(
     hc_count: int,
     hidden_size: int,
     lowrank: int,
+    projection_rows: int,
     projection_scale: float,
     weights_independent: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """GEMM plus Triton-epilogue path for general decode and prefill shapes."""
-    projected = F.linear(normalized, projection_weight)
+    # Model loading aligns BF16/FP16 GEMM output widths; discard only the
+    # extra output columns, preserving the GEMM's aligned row stride.
+    projected = F.linear(normalized, projection_weight)[:, :projection_rows]
     activated, inject = _launch_projection_epilogue(
         projected, lowrank, hc_count, projection_scale
     )
@@ -1926,6 +1929,37 @@ def mhc_apply_pre(residual: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
             num_warps=4,
             enable_fp_fusion=False,
         )
+    return out
+
+
+@register_kernel(
+    "residual",
+    "mhc_apply_pre",
+    name="triton_mhc_apply_pre",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                pre=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_mhc_apply_pre(
+    residual: torch.Tensor,
+    pre: torch.Tensor,
+    *,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> torch.Tensor:
+    """Collapse residual streams with ``pre``, optionally fusing RMSNorm (hc=4)."""
+    if norm_weight is None:
+        return mhc_apply_pre(residual, pre)
+    out = residual.new_empty((*residual.shape[:-2], residual.shape[-1]))
+    mhc_pre_layer_norm_hc4(pre, residual, norm_weight, out, eps=norm_eps)
     return out
 
 

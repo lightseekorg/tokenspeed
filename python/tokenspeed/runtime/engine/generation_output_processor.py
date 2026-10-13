@@ -121,6 +121,13 @@ class RequestState:
         # request stats (host-side); tracker attached only with --enable-log-request-stats
         self.created_time: float = created_time
         self.stats: RequestStatsTracker = NOOP_STATS
+        # Queue-time metric (tokenspeed:request_queue_time_seconds): wall time
+        # the request entered the scheduler's waiting queue, stamped when its
+        # spec is submitted, and the once-per-request observation flag. A
+        # retracted request re-enters the C++ queue without a new stamp, so
+        # preemption never records a second sample.
+        self.scheduler_enqueue_time: float = 0.0
+        self.queue_time_recorded: bool = False
         # Sampled-token logprobs, accumulated per generated token.
         # None when return_logprob is False.
         self.output_token_logprobs_val: list[float] | None = (
@@ -186,17 +193,24 @@ class RequestState:
         self.grammar_key: tuple[str, str] | None = None
         self.grammar_queued_ts: float = 0.0
 
-    def set_finish_with_abort(self, message: str, notify_client: bool = False) -> None:
+    def set_finish_with_abort(
+        self,
+        message: str,
+        notify_client: bool = False,
+        status_code: int | None = None,
+    ) -> None:
         """Mark this request as aborted with ``message``; finished_reason is
         materialized immediately so callers don't need a check_finished() pass.
 
         ``notify_client`` streams a terminating finish to the client (used for
         pause-initiated aborts, where the client did not tear down its state).
+        ``status_code`` is the HTTP status the frontend reports; None leaves
+        the abort an internal error.
         """
         self.to_abort = True
         self.to_abort_message = message
         self.abort_notify_client = notify_client
-        self.finished_reason = FINISH_ABORT(message=message)
+        self.finished_reason = FINISH_ABORT(message=message, status_code=status_code)
 
     @classmethod
     def from_recv_req(

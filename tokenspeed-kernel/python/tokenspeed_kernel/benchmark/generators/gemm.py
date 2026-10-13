@@ -62,6 +62,7 @@ __all__ = [
     "prepare_decode_gemv",
     "prepare_dense_bmm",
     "prepare_dense_mm",
+    "prepare_grouped_bf16_projection",
     "prepare_linear_attnres_partials",
     "prepare_mm",
     "prepare_mxfp8_mm",
@@ -801,6 +802,77 @@ def prepare_decode_gemv(
             "x_layout": "MK",
             "weight_layout": "NK",
             "out_layout": "MN",
+        },
+    )
+
+
+def prepare_grouped_bf16_projection(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare a grouped projection computing ``einsum('tgd,grd->tgr')``.
+
+    ``x[M, groups, K]`` is a view whose rows are ``x_token_stride`` elements
+    apart: ``groups * K`` for a contiguous activation, or more for a slice of
+    padded attention heads. ``weight[groups, N, K]`` is contiguous. As in the
+    models, no ``out`` buffer is passed, so the registration allocates its
+    ``[M, groups, N]`` result.
+    """
+
+    _reject_unknown_parameters(
+        request, {"groups", "M", "N", "K", "x_token_stride", "dtype"}
+    )
+    groups = _positive_int(request.parameters.get("groups"), "groups")
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    x_token_stride = _positive_int(
+        request.parameters.get("x_token_stride"), "x_token_stride"
+    )
+    if x_token_stride < groups * K:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.grouped_bf16_projection x_token_stride must be at least "
+            "groups * K",
+        )
+    dtype = _parse_dtype(request.parameters.get("dtype"))
+    shape = {"groups": groups, "M": M, "N": N, "K": K}
+
+    rows, weight = _random_tensors(
+        request.seed, dtype, (M, x_token_stride), (groups, N, K)
+    )
+    x = rows[:, : groups * K].unflatten(1, (groups, K))
+    signature = format_signature(
+        x=dense_tensor_format(dtype),
+        weight=dense_tensor_format(dtype),
+    )
+    # Mirror the operation's selection traits for these inputs.
+    traits = {
+        "batch": groups,
+        "m": M,
+        "n": N,
+        "k": K,
+        "a_inner_stride_one": x.stride(-1) == 1,
+        "b_inner_stride_one": weight.stride(-1) == 1,
+        "is_cuda": x.is_cuda,
+    }
+
+    load_builtin_kernels()
+    spec, selected = _select_registration(request, platform, signature, traits, shape)
+
+    def invoke() -> torch.Tensor:
+        return selected(x, weight, None)
+
+    return _prepared_timing(
+        spec,
+        invoke,
+        {
+            **shape,
+            "x_token_stride": x_token_stride,
+            "dtype": "bfloat16",
+            "x_layout": "MGK",
+            "weight_layout": "GNK",
+            "out_layout": "MGN",
         },
     )
 

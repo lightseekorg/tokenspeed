@@ -23,8 +23,6 @@ import math
 import socket
 import time
 import traceback
-from dataclasses import replace
-from types import SimpleNamespace
 from typing import List, Tuple
 
 import pytest
@@ -42,7 +40,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(autouse=True)
 def _require_iris():
     pytest.importorskip(
-        "tokenspeed_kernel.ops.communication.iris", exc_type=ImportError
+        "tokenspeed_kernel.ops.communication._iris", exc_type=ImportError
     )
 
 
@@ -83,207 +81,6 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-@pytest.mark.parametrize("enable_lamport", [False, True])
-def test_iris_state_uses_path_capacities(monkeypatch, enable_lamport):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
-    from tokenspeed_kernel.ops.communication import triton as triton_ops
-
-    created = []
-
-    def create_iris_state(**kwargs):
-        created.append(kwargs)
-        return SimpleNamespace(**kwargs)
-
-    monkeypatch.setattr(iris_ops, "IRIS_AR_STATES", {})
-    monkeypatch.setattr(iris_ops, "create_iris_state", create_iris_state)
-    state = SimpleNamespace(
-        group=object(),
-        rank_in_group=0,
-        max_numel=16,
-        max_bytes=8192 * 10752 * 2,
-        attnres_max_numel=55,
-        max_token_num=5,
-        enable_lamport=enable_lamport,
-        moe_tail_max_rows=0,
-        device=torch.device("cpu"),
-    )
-
-    iris_state = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
-
-    assert iris_state.staged_max_numel == 16
-    assert iris_state.producer_direct_max_numel == 8192 * 10752
-    assert iris_state.attnres_max_numel == 55
-    assert iris_state.attnres_max_rows == 5
-    assert iris_state.enable_lamport is enable_lamport
-    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is iris_state
-    assert len(created) == 1
-
-    state.enable_lamport = not enable_lamport
-    other = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
-    assert other is not iris_state
-    assert other.enable_lamport is not enable_lamport
-    assert len(created) == 2
-
-    # A tail request cannot reuse a state without an output buffer.
-    state.moe_tail_max_rows = 512
-    with_result = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
-    assert with_result is not other
-    assert with_result.moe_tail_max_rows == 512
-    assert len(created) == 3
-    state.moe_tail_max_rows = 256
-    assert triton_ops._get_or_create_iris_state(state, torch.bfloat16) is with_result
-    assert len(created) == 3
-
-
-@pytest.mark.parametrize("prepared_lamport", [False, True])
-@pytest.mark.parametrize("requested_lamport", [False, True])
-@pytest.mark.parametrize("max_bytes", [0, 64])
-def test_iris_state_reuses_prepared_capacity(
-    monkeypatch, prepared_lamport, requested_lamport, max_bytes
-):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
-    from tokenspeed_kernel.ops.communication import triton as triton_ops
-
-    group = object()
-    device = torch.device("cpu")
-    prepared = SimpleNamespace(
-        group=group,
-        rank_in_group=0,
-        device=device,
-        dtype=torch.bfloat16,
-        staged_max_numel=64,
-        producer_direct_max_numel=128,
-        attnres_max_numel=32,
-        attnres_max_rows=4,
-        enable_lamport=prepared_lamport,
-        moe_tail_max_rows=0,
-    )
-    monkeypatch.setattr(iris_ops, "IRIS_AR_STATES", {"prepared": prepared})
-    monkeypatch.setattr(
-        iris_ops, "create_iris_state", lambda **kwargs: SimpleNamespace(**kwargs)
-    )
-    state = SimpleNamespace(
-        group=group,
-        rank_in_group=0,
-        max_numel=16,
-        max_bytes=max_bytes,
-        attnres_max_numel=8,
-        max_token_num=1,
-        enable_lamport=requested_lamport,
-        moe_tail_max_rows=0,
-        device=device,
-    )
-
-    actual = triton_ops._get_or_create_iris_state(state, torch.bfloat16)
-    can_reuse = max_bytes == 0 or prepared_lamport == requested_lamport
-    assert (actual is prepared) is can_reuse
-    if not can_reuse:
-        assert actual.enable_lamport is requested_lamport
-
-
-def test_iris_context_rejects_late_heap_growth(monkeypatch):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
-
-    context = SimpleNamespace(heap_size=256)
-    monkeypatch.setattr(iris_ops, "_iris_ctx_singleton", context)
-
-    assert iris_ops._get_or_create_iris_context(128) is context
-    with pytest.raises(RuntimeError, match="prepare the largest state first"):
-        iris_ops._get_or_create_iris_context(512)
-
-
-@pytest.mark.parametrize("world_size", [2, 4, 8])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_producer_direct_admission_supported_world_sizes(
-    monkeypatch,
-    world_size,
-    dtype,
-):
-    from tokenspeed_kernel.ops.communication import triton as triton_ops
-
-    monkeypatch.setattr(
-        triton_ops,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=True),
-    )
-    state = SimpleNamespace(world_size=world_size, max_bytes=64)
-
-    assert triton_ops.symm_outputs_can_run(
-        state,
-        ((3, 5), (1, 1)),
-        dtype,
-    )
-
-
-@pytest.mark.parametrize(
-    ("dtype", "shapes"),
-    [
-        (torch.bfloat16, ((32,),)),
-        (torch.float16, ((32,),)),
-        (torch.float32, ((16,),)),
-    ],
-)
-def test_producer_direct_admission_uses_byte_capacity(monkeypatch, dtype, shapes):
-    from tokenspeed_kernel.ops.communication import triton as triton_ops
-
-    monkeypatch.setattr(
-        triton_ops,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=True),
-    )
-    state = SimpleNamespace(world_size=8, max_bytes=64)
-
-    assert triton_ops.symm_outputs_can_run(state, shapes, dtype)
-
-
-@pytest.mark.parametrize(
-    ("world_size", "shapes", "dtype", "op"),
-    [
-        (1, ((4,),), torch.bfloat16, dist.ReduceOp.SUM),
-        (8, ((3,),), torch.bfloat16, dist.ReduceOp.SUM),
-        (8, ((3,),), torch.float32, dist.ReduceOp.SUM),
-        (8, ((36,),), torch.bfloat16, dist.ReduceOp.SUM),
-        (8, ((18,),), torch.float32, dist.ReduceOp.SUM),
-        (8, ((4,),), torch.float64, dist.ReduceOp.SUM),
-        (8, ((4,),), torch.bfloat16, dist.ReduceOp.PRODUCT),
-    ],
-)
-def test_producer_direct_admission_rejects_unsupported_requests(
-    monkeypatch,
-    world_size,
-    shapes,
-    dtype,
-    op,
-):
-    from tokenspeed_kernel.ops.communication import triton as triton_ops
-
-    monkeypatch.setattr(
-        triton_ops,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=True),
-    )
-    state = SimpleNamespace(world_size=world_size, max_bytes=64)
-
-    assert not triton_ops.symm_outputs_can_run(state, shapes, dtype, op)
-
-
-def test_producer_direct_admission_is_cdna4_only(monkeypatch):
-    from tokenspeed_kernel.ops.communication import triton as triton_ops
-
-    monkeypatch.setattr(
-        triton_ops,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=False),
-    )
-    state = SimpleNamespace(world_size=8, max_bytes=64)
-
-    assert not triton_ops.symm_outputs_can_run(
-        state,
-        ((4,),),
-        torch.bfloat16,
-    )
-
-
 @pytest.mark.parametrize(
     ("world_size", "dtype", "min_bytes"),
     [
@@ -296,47 +93,17 @@ def test_producer_direct_admission_is_cdna4_only(monkeypatch):
 def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):
     try:
         from tokenspeed_kernel.ops.communication.iris import (
-            IRIS_ALL_REDUCE_KERNEL_CONFIG,
             _use_two_stage_producer_direct,
         )
     except ImportError:
         pytest.skip("iris is not installed")
 
-    config = IRIS_ALL_REDUCE_KERNEL_CONFIG
-    alignment = world_size * (config.packed_word_bytes // dtype.itemsize)
+    alignment = world_size * (8 // dtype.itemsize)
     min_numel = min_bytes // dtype.itemsize
     assert _use_two_stage_producer_direct(world_size, min_numel, dtype)
     assert not _use_two_stage_producer_direct(world_size, min_numel - alignment, dtype)
     assert not _use_two_stage_producer_direct(world_size, min_numel + 1, dtype)
     assert not _use_two_stage_producer_direct(2, min_numel, dtype)
-
-
-@pytest.mark.parametrize(
-    ("numel", "expected_path", "expected_schedule"),
-    [
-        (16 * 4096, "one_shot", (512, 1)),
-        (64 * 4096, "two_stage", None),
-    ],
-)
-def test_tp4_decode_staged_path_only_keeps_small_one_shot_shape(
-    monkeypatch,
-    numel,
-    expected_path,
-    expected_schedule,
-):
-    from tokenspeed_kernel.ops.communication import iris as iris_ops
-
-    monkeypatch.setattr(iris_ops, "_platform", SimpleNamespace(is_cdna4=True))
-
-    tuning, use_two_stage = iris_ops._select_staged_all_reduce_path(
-        numel,
-        4,
-        torch.bfloat16,
-        two_stage_supported=True,
-    )
-    assert ("two_stage" if use_two_stage else "one_shot") == expected_path
-    schedule = None if tuning is None else (tuning.block_size, tuning.num_subgroups)
-    assert schedule == expected_schedule
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -368,68 +135,9 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
     except ImportError:
         pytest.skip("iris is not installed")
 
-    config = iris_ops.IRIS_ALL_REDUCE_KERNEL_CONFIG
-    monkeypatch.setattr(
-        iris_ops,
-        "IRIS_ALL_REDUCE_KERNEL_CONFIG",
-        replace(
-            config,
-            producer_direct=replace(
-                config.producer_direct,
-                two_stage_min_bytes=(),
-            ),
-        ),
-    )
+    monkeypatch.setattr(iris_ops, "_PRODUCER_TWO_SHOT_MIN_BYTES", {})
     assert iris_ops._use_two_stage_plain(8, 8 * 7168, torch.bfloat16)
     assert not iris_ops._use_two_stage_producer_direct(8, 8 * 7168, torch.bfloat16)
-
-
-@pytest.mark.parametrize("dtype", [torch.float64, torch.complex128, torch.int8])
-def test_plain_two_stage_rejects_unsupported_dtypes(dtype):
-    """Dtypes the packing kernel cannot express must stay on one-shot.
-
-    The kernel maps the element type through _PRODUCER_DIRECT_GL_DTYPES, so
-    admitting anything outside it would raise instead of reducing. Types wider
-    than a 64-bit word are the sharper case: they make elements-per-word zero,
-    which would divide by zero in the alignment check itself.
-    """
-    try:
-        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
-    except ImportError:
-        pytest.skip("iris is not installed")
-
-    for numel in (8, 64, 7168, 32 * 7168):
-        assert not _use_two_stage_plain(8, numel, dtype)
-
-
-@pytest.mark.parametrize(
-    ("world_size", "dtype", "supported"),
-    [
-        (8, torch.bfloat16, True),
-        (4, torch.float32, True),
-        (2, torch.bfloat16, False),
-        (8, torch.float64, False),
-    ],
-)
-def test_two_stage_state_gate_matches_dispatch(world_size, dtype, supported):
-    """The state-level gate must agree with the per-call predicate.
-
-    A state that reserves the staging buffer and the larger heap for a
-    combination the predicate then refuses is not merely wasteful: a caller
-    supplying an explicit heap sized for the one-shot allocations fails to
-    construct. Everything the predicate tests apart from payload size is fixed
-    for the life of the state, so the two have to be decided from the same
-    conditions.
-    """
-    try:
-        from tokenspeed_kernel.ops.communication.iris import _use_two_stage_plain
-    except ImportError:
-        pytest.skip("iris is not installed")
-
-    # a payload that satisfies the size condition, so only the state-level
-    # conditions can decide the outcome
-    numel = 8 * 7168
-    assert _use_two_stage_plain(world_size, numel, dtype) is supported
 
 
 # ---------------------------------------------------------------------------
@@ -469,14 +177,16 @@ def _ar_output_shape_cases() -> List[Tuple[Tuple[int, ...], ...]]:
     ]
 
 
-def _ar_worker_fn(rank, world_size, port, error_dict):
+def _ar_worker_fn(rank, world_size, port, allocator_type, error_dict):
     try:
-        _ar_worker_main(rank, world_size, port)
+        _ar_worker_main(rank, world_size, port, allocator_type)
     except Exception:
         error_dict[rank] = traceback.format_exc()
 
 
-def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
+def _ar_worker_main(
+    rank: int, world_size: int, port: int, allocator_type: str | None
+) -> None:
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
     # Iris's example uses gloo because heap-base exchange is host-side; nccl
@@ -493,13 +203,11 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
         # Importing inside the worker avoids pulling iris into the parent
         # process (which has no distributed context).
         from tokenspeed_kernel.ops.communication.iris import (
-            IRIS_ALL_REDUCE_KERNEL_CONFIG,
-            _select_staged_all_reduce_path,
+            configure_iris,
             create_iris_state,
         )
 
-        kernel_config = IRIS_ALL_REDUCE_KERNEL_CONFIG
-        attnres_config = kernel_config.kimi_k3_attnres
+        configure_iris(heap_size=None, allocator_type=allocator_type)
         output_shape_cases = _ar_output_shape_cases()
         staged_max_numel = max(
             max(int(torch.tensor(shape).prod()) for shape in _ar_shape_cases()),
@@ -509,109 +217,46 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             sum(int(torch.tensor(shape).prod()) for shape in shapes)
             for shapes in output_shape_cases
         )
-        attnres_max_rows = 16 if world_size == attnres_config.world_size else 0
-        attnres_max_numel = attnres_max_rows * attnres_config.hidden_size
+        attnres_max_rows = 16 if world_size == 8 else 0
+        attnres_max_numel = attnres_max_rows * 7168
         staged_max_numel = max(staged_max_numel, attnres_max_numel)
         state = create_iris_state(
-            enable_lamport=False,
-            moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=staged_max_numel,
             producer_direct_max_numel=producer_direct_max_numel,
-            attnres_max_numel=attnres_max_numel,
-            attnres_max_rows=attnres_max_rows,
             dtype=torch.bfloat16,
             heap_size=None,
             device=device,
         )
-        assert state._input_buf.numel() == producer_direct_max_numel
-        producer_direct_two_stage = kernel_config.producer_direct.two_stage_threshold(
-            world_size
-        ) is not None and kernel_config.two_stage.supports_world_size(world_size)
-        scratch_numel = (
-            kernel_config.two_stage.scratch_numel(
-                max_numel=producer_direct_max_numel,
-                world_size=world_size,
-            )
-            if producer_direct_two_stage
-            else 0
-        )
-        if scratch_numel:
-            assert state._producer_direct_scratch_buf.numel() == scratch_numel
-        else:
-            assert state._producer_direct_scratch_buf is None
-        assert state._producer_direct_ready_flags.shape == (
-            max(
-                kernel_config.producer_direct.one_stage_max_programs,
-                (
-                    kernel_config.two_stage.max_programs
-                    if producer_direct_two_stage
-                    else 0
-                ),
-            ),
-            world_size,
-        )
-        assert state._staged_input_buf.shape == (
-            kernel_config.staged.input_slots,
-            staged_max_numel,
-        )
-        assert state._ready_flags.shape == (
-            kernel_config.staged.max_programs(staged_max_numel),
-            world_size,
-        )
         if world_size == 4 and current_platform().is_cdna4:
-            tuning = kernel_config.staged.tuning(
-                numel=16 * 4096,
-                world_size=world_size,
-                dtype=torch.bfloat16,
-                is_cdna4=True,
-            )
-            assert tuning is not None
-            tuned_input, tuned_ready = state._staged_tuning_workspaces[tuning]
-            assert tuned_input.shape == (
-                kernel_config.staged.input_slots,
-                tuning.numel,
-            )
-            assert tuned_ready.shape == (tuning.num_programs(), world_size)
-            assert tuned_input.data_ptr() != state._staged_input_buf.data_ptr()
-            assert tuned_ready.data_ptr() != state._ready_flags.data_ptr()
-        if state._staged_two_stage_supported:
-            assert state._staged_two_stage_input_buf.numel() == staged_max_numel
+            assert state.tuned_staged.slots.data_ptr() != state.staged.slots.data_ptr()
             assert (
-                state._staged_two_stage_scratch_buf.numel()
-                == (staged_max_numel + world_size - 1) // world_size
+                state.tuned_staged.ready_flags.data_ptr()
+                != state.staged.ready_flags.data_ptr()
             )
-            assert state._staged_two_stage_ready_flags.shape == (
-                kernel_config.two_stage.max_programs,
-                world_size,
-            )
-        else:
-            assert state._staged_two_stage_input_buf is None
-            assert state._staged_two_stage_scratch_buf is None
-            assert state._staged_two_stage_ready_flags is None
+        k3 = None
         if attnres_max_numel:
-            assert state._attnres_push_inbox.shape == (
-                2,
-                world_size,
-                attnres_max_numel,
+            from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+                prepare_k3_communication,
             )
-            assert state._attnres_push_epochs.shape == (attnres_max_rows,)
-            assert state._attnres_push_ready_flags.shape == (
-                2,
-                attnres_max_rows,
-                world_size,
+
+            k3 = prepare_k3_communication(
+                group=dist.group.WORLD,
+                rank_in_group=rank,
+                staged_max_numel=staged_max_numel,
+                producer_direct_max_numel=producer_direct_max_numel,
+                attnres_max_numel=attnres_max_numel,
+                attnres_max_rows=attnres_max_rows,
+                enable_lamport=False,
+                sharded_max_rows=0,
+                dtype=torch.bfloat16,
+                device=device,
+                all_reduce=state,
             )
         for shape in _ar_shape_cases():
             _check_all_reduce(state, rank, world_size, shape, device)
-        if state._staged_two_stage_supported:
-            _, use_two_stage = _select_staged_all_reduce_path(
-                numel=1024,
-                world_size=world_size,
-                dtype=torch.bfloat16,
-                two_stage_supported=True,
-            )
-            assert use_two_stage
+        if state.staged_two_shot is not None:
             for safe in (False, True):
                 _check_all_reduce_graph_replay(
                     state,
@@ -624,6 +269,14 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                 )
         if world_size == 4:
             for shape in _ar_graph_shape_cases():
+                verify_tuning = current_platform().is_cdna4
+                if verify_tuning:
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    tuned_before = state.tuned_staged.ready_flags.clone()
+                    twoshot_before = state.staged_two_shot.ready_flags.clone()
+                    torch.cuda.synchronize()
+                    dist.barrier()
                 _check_all_reduce_graph_replay(
                     state,
                     rank,
@@ -633,6 +286,18 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                     storage_offset=0,
                     safe=False,
                 )
+                if verify_tuning:
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    tuned_changed = not torch.equal(
+                        state.tuned_staged.ready_flags, tuned_before
+                    )
+                    twoshot_changed = not torch.equal(
+                        state.staged_two_shot.ready_flags, twoshot_before
+                    )
+                    assert tuned_changed == (math.prod(shape) == 65536)
+                    assert twoshot_changed == (math.prod(shape) != 65536)
+                    dist.barrier()
             if current_platform().is_cdna4:
                 _check_mixed_geometry_graph_replay(
                     state,
@@ -650,17 +315,13 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
 
         # These dtype checks only use the small shape. Their states share the
-        # fixed heap, so do not reserve another full BF16 prefill capacity.
+        # fixed heap, so do not allocate another full BF16 prefill capacity.
         other_dtype_max_numel = 16 * (7168 + 3584)
         fp16_state = create_iris_state(
-            enable_lamport=False,
-            moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
             producer_direct_max_numel=other_dtype_max_numel,
-            attnres_max_numel=0,
-            attnres_max_rows=0,
             dtype=torch.float16,
             heap_size=None,
             device=device,
@@ -682,14 +343,10 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
             )
 
         fp32_state = create_iris_state(
-            enable_lamport=False,
-            moe_tail_max_rows=0,
             group=dist.group.WORLD,
             rank_in_group=rank,
             staged_max_numel=0,
             producer_direct_max_numel=other_dtype_max_numel,
-            attnres_max_numel=0,
-            attnres_max_rows=0,
             dtype=torch.float32,
             heap_size=None,
             device=device,
@@ -709,8 +366,8 @@ def _ar_worker_main(rank: int, world_size: int, port: int) -> None:
                 ((16, 7168), (16, 3584)),
                 device,
             )
-        if world_size == attnres_config.world_size:
-            _check_all_reduce_residual_attnres(state, rank, device)
+        if world_size == 8:
+            _check_all_reduce_residual_attnres(k3, rank, device)
     finally:
         dist.destroy_process_group()
 
@@ -918,24 +575,19 @@ def _check_all_reduce_symmetric_outputs(
             )
 
 
-def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
+def _check_all_reduce_residual_attnres(k3_state, rank: int, device) -> None:
     from tokenspeed_kernel.ops.activation.triton import (
         attnres_combine,
         attnres_partial,
     )
     from tokenspeed_kernel.ops.communication.iris import (
-        IRIS_ALL_REDUCE_KERNEL_CONFIG,
         iris_all_reduce,
     )
-    from tokenspeed_kernel.ops.communication.triton import (
-        allreduce_residual_attnres_combine,
-        allreduce_residual_attnres_combine_supported,
-    )
 
-    config = IRIS_ALL_REDUCE_KERNEL_CONFIG.kimi_k3_attnres
+    state = k3_state.all_reduce
     for num_tokens in (1, 2, 4, 8, 16):
         torch.manual_seed(101 + num_tokens)
-        hidden = config.hidden_size
+        hidden = 7168
         blocks = (torch.randn(4, num_tokens, hidden, device=device) * 0.1).to(
             torch.bfloat16
         )
@@ -966,26 +618,20 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             scratch,
             torch.empty_like(residual),
         )
-        assert allreduce_residual_attnres_combine_supported(
+        assert k3_state.attnres_supported(
             local,
             residual,
             score_weight,
             output_weight,
             scratch,
-            rank=rank,
-            group=state.group,
-            local_world_size=8,
         )
         for _ in range(4):
-            actual_hidden, actual_residual = allreduce_residual_attnres_combine(
+            actual_hidden, actual_residual = k3_state.attnres_combine(
                 local,
                 residual,
                 score_weight,
                 output_weight,
                 scratch,
-                rank=rank,
-                group=state.group,
-                local_world_size=8,
                 eps=1e-6,
             )
             torch.testing.assert_close(
@@ -998,15 +644,12 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
         graph = torch.cuda.CUDAGraph()
         dist.barrier()
         with torch.cuda.graph(graph):
-            graph_hidden, graph_residual = allreduce_residual_attnres_combine(
+            graph_hidden, graph_residual = k3_state.attnres_combine(
                 local,
                 residual,
                 score_weight,
                 output_weight,
                 scratch,
-                rank=rank,
-                group=state.group,
-                local_world_size=8,
                 eps=1e-6,
             )
         dist.barrier()
@@ -1047,22 +690,23 @@ def _check_all_reduce_residual_attnres(state, rank: int, device) -> None:
             )
 
 
-def _run_ar_test(world_size: int) -> None:
+def _run_ar_test(world_size: int, allocator_type: str | None) -> None:
     _skip_if_unsupported(world_size, "Iris all-reduce tests")
     port = _get_open_port()
-    _spawn_and_collect(_ar_worker_fn, (world_size, port), world_size)
+    _spawn_and_collect(_ar_worker_fn, (world_size, port, allocator_type), world_size)
 
 
-def test_iris_all_reduce_correctness_world2():
-    _run_ar_test(world_size=2)
+@pytest.mark.parametrize("allocator_type", ["torch", "vmem"])
+def test_iris_all_reduce_correctness_world2(allocator_type):
+    _run_ar_test(world_size=2, allocator_type=allocator_type)
 
 
 def test_iris_all_reduce_correctness_world4():
-    _run_ar_test(world_size=4)
+    _run_ar_test(world_size=4, allocator_type=None)
 
 
 def test_iris_all_reduce_correctness_world8():
-    _run_ar_test(world_size=8)
+    _run_ar_test(world_size=8, allocator_type=None)
 
 
 def _ar_epoch_worker_fn(rank, world_size, port, producer_direct, rows, error_dict):
@@ -1094,20 +738,16 @@ def _ar_epoch_worker_main(rank, world_size, port, producer_direct, rows):
             rank_in_group=rank,
             staged_max_numel=16 * 7168,
             producer_direct_max_numel=16 * 7168,
-            attnres_max_numel=0,
-            attnres_max_rows=0,
-            enable_lamport=False,
-            moe_tail_max_rows=0,
             dtype=torch.bfloat16,
             heap_size=None,
             device=device,
         )
         if producer_direct:
             local = iris_acquire_outputs(state, ((rows, 7168),))[0]
-            flags = state._producer_direct_ready_flags
+            flags = state.producer_pull.ready_flags
         else:
             local = torch.empty((rows, 7168), dtype=torch.bfloat16, device=device)
-            flags = state._staged_two_stage_ready_flags
+            flags = state.staged_two_shot.ready_flags
 
         def reduce():
             if producer_direct:
@@ -1191,14 +831,10 @@ def _ar_subgroup_worker_fn(rank, world_size, port, error_dict):
         from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
         state = create_iris_state(
-            enable_lamport=False,
-            moe_tail_max_rows=0,
             group=group,
             rank_in_group=group_rank,
             staged_max_numel=4 * 7,
             producer_direct_max_numel=8 * (7168 + 3584),
-            attnres_max_numel=0,
-            attnres_max_rows=0,
             dtype=torch.bfloat16,
             heap_size=None,
             device=device,
@@ -1239,134 +875,7 @@ def test_iris_all_reduce_noncontiguous_subgroups():
 
 
 # ---------------------------------------------------------------------------
-# Suite 2: IrisRSAG (reduce-scatter / all-gather)
-# ---------------------------------------------------------------------------
-
-
-def _rsag_uniform_token_cases(world_size: int) -> List[List[int]]:
-    return [
-        [8] * world_size,
-        [16] * world_size,
-        [64] * world_size,
-    ]
-
-
-def _rsag_worker_fn(rank, world_size, port, hidden_size, error_dict):
-    try:
-        _rsag_worker_main(rank, world_size, port, hidden_size)
-    except Exception:
-        error_dict[rank] = traceback.format_exc()
-
-
-def _rsag_worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None:
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    # Match the upstream iris example - gloo for the host-side rendezvous.
-    dist.init_process_group(
-        backend="gloo",
-        init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=world_size,
-    )
-
-    try:
-        from tokenspeed_kernel.ops.communication.iris import create_iris_rsag_state
-
-        cases = _rsag_uniform_token_cases(world_size)
-        max_tokens = max(sum(tokens) for tokens in cases)
-        rsag = create_iris_rsag_state(
-            group=dist.group.WORLD,
-            rank_in_group=rank,
-            max_tokens=max_tokens,
-            hidden_size=hidden_size,
-        )
-
-        # The generic ``all_gather`` / ``reduce_scatter`` dispatchers in
-        # ``communication.triton`` route AMD calls to ``amd_rsag_*`` (which
-        # require ``state.symm_mem_hdl``); we deliberately bypass that
-        # dispatcher and call the iris RSAG state directly. ``rsag`` IS the
-        # IrisRSAG instance now (no TritonCommState wrapper).
-        ag_fn = lambda state, t, **kw: rsag.all_gather(t, **kw)  # noqa: E731
-        rs_fn = lambda state, t, **kw: rsag.reduce_scatter(t, **kw)  # noqa: E731
-
-        for tokens in cases:
-            _check_all_gather(
-                rsag, rank, world_size, tokens, hidden_size, device, ag_fn
-            )
-            _check_reduce_scatter(
-                rsag, rank, world_size, tokens, hidden_size, device, rs_fn
-            )
-    finally:
-        dist.destroy_process_group()
-
-
-def _check_all_gather(rsag, rank, world_size, tokens, hidden_size, device, all_gather):
-    local_tokens = tokens[rank]
-    local = torch.full(
-        (local_tokens, hidden_size),
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    result = all_gather(rsag, local, token_list_in_group=tokens)
-
-    expected = torch.empty(
-        (sum(tokens), hidden_size), dtype=torch.bfloat16, device=device
-    )
-    offset = 0
-    for peer, peer_tokens in enumerate(tokens):
-        expected[offset : offset + peer_tokens].fill_(peer + 1)
-        offset += peer_tokens
-
-    assert result.shape == expected.shape, f"{result.shape} vs {expected.shape}"
-    torch.testing.assert_close(result, expected, atol=0, rtol=0)
-
-
-def _check_reduce_scatter(
-    rsag, rank, world_size, tokens, hidden_size, device, reduce_scatter
-):
-    full = torch.full(
-        (sum(tokens), hidden_size),
-        rank + 1,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    result = reduce_scatter(rsag, full, token_list_in_group=tokens)
-
-    expected_value = world_size * (world_size + 1) // 2
-    expected = torch.full(
-        (tokens[rank], hidden_size),
-        expected_value,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-
-    assert result.shape == expected.shape, f"{result.shape} vs {expected.shape}"
-    torch.testing.assert_close(result, expected, atol=0, rtol=0)
-
-
-def _run_rsag_test(world_size: int, hidden_size: int) -> None:
-    _skip_if_unsupported(world_size, "IrisRSAG tests")
-    port = _get_open_port()
-    _spawn_and_collect(_rsag_worker_fn, (world_size, port, hidden_size), world_size)
-
-
-def test_iris_rsag_correctness_world2():
-    _run_rsag_test(world_size=2, hidden_size=2880)
-
-
-def test_iris_rsag_correctness_world4():
-    _run_rsag_test(world_size=4, hidden_size=2880)
-
-
-def test_iris_rsag_correctness_world8():
-    _run_rsag_test(world_size=8, hidden_size=2880)
-
-
-# ---------------------------------------------------------------------------
-# Suite 3: fused allreduce + residual + RMSNorm
+# Suite 2: fused allreduce + residual + RMSNorm
 # ---------------------------------------------------------------------------
 
 

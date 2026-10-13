@@ -31,12 +31,15 @@ if not is_cdna5():
     )
 
 
-def test_kimi3_m16_add3_auto_matches_composed_and_captures() -> None:
-    torch.manual_seed(1250)
-    hidden_states = torch.randn(16, 3584, device="cuda", dtype=torch.bfloat16)
+@pytest.mark.parametrize("rows", [2, 4, 8, 16, 32, 64])
+def test_kimi3_add3_auto_fuses_matches_composed_and_captures(rows: int) -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16 import mm as dense_module
+
+    torch.manual_seed(1250 + rows)
+    hidden_states = torch.randn(rows, 3584, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(7168, 3584, device="cuda", dtype=torch.bfloat16)
-    prefix = torch.randn(16, 7168, device="cuda", dtype=torch.bfloat16)
-    lane = torch.randn(16, 10752, device="cuda", dtype=torch.bfloat16)
+    prefix = torch.randn(rows, 7168, device="cuda", dtype=torch.bfloat16)
+    lane = torch.randn(rows, 10752, device="cuda", dtype=torch.bfloat16)
     shared_output = lane[:, 3584:]
 
     composed = kernel_kimi3_latent_projection_add3(
@@ -46,30 +49,40 @@ def test_kimi3_m16_add3_auto_matches_composed_and_captures() -> None:
         shared_output,
         solution="composed",
     )
-    forced = kernel_kimi3_latent_projection_add3(
-        hidden_states,
-        weight,
-        prefix,
-        shared_output,
-        solution="gluon_wmma_add3",
-    )
-    triton_control = kernel_kimi3_latent_projection_add3(
-        hidden_states,
-        weight,
-        prefix,
-        shared_output,
-        solution="triton_wmma_add3",
-    )
-    automatic = kernel_kimi3_latent_projection_add3(
-        hidden_states,
-        weight,
-        prefix,
-        shared_output,
-    )
-    torch.cuda.synchronize()
+    # The Triton add3 control only takes 16 rows.
+    forced_solutions = ["gluon_wmma_add3"]
+    if rows == 16:
+        forced_solutions.append("triton_wmma_add3")
+    for solution in forced_solutions:
+        forced = kernel_kimi3_latent_projection_add3(
+            hidden_states,
+            weight,
+            prefix,
+            shared_output,
+            solution=solution,
+        )
+        torch.testing.assert_close(forced, composed, rtol=2e-2, atol=2e-2)
 
-    torch.testing.assert_close(forced, composed, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(triton_control, composed, rtol=2e-2, atol=2e-2)
+    with (
+        mock.patch.object(
+            dense_module,
+            "gluon_wmma_tdm_add3_gfx1250",
+            wraps=dense_module.gluon_wmma_tdm_add3_gfx1250,
+        ) as fused,
+        mock.patch.object(
+            dense_module,
+            "gluon_wmma_tdm_add3_m16_gfx1250",
+            wraps=dense_module.gluon_wmma_tdm_add3_m16_gfx1250,
+        ) as fused_m16,
+    ):
+        automatic = kernel_kimi3_latent_projection_add3(
+            hidden_states,
+            weight,
+            prefix,
+            shared_output,
+        )
+    assert fused.call_count + fused_m16.call_count == 1
+    torch.cuda.synchronize()
     torch.testing.assert_close(automatic, composed, rtol=2e-2, atol=2e-2)
 
     graph = torch.cuda.CUDAGraph()
@@ -114,7 +127,7 @@ def test_kimi3_m16_add3_rejects_non_target_projection() -> None:
         )
 
 
-@pytest.mark.parametrize("num_tokens", [2, 4, 8, 16, 32])
+@pytest.mark.parametrize("num_tokens", [2, 4, 8, 16, 32, 64])
 def test_kimi3_mla_qkv_gate_tdm_auto_matches_and_captures(
     num_tokens: int,
 ) -> None:
@@ -361,7 +374,7 @@ def test_kimi3_gfx1250_large_m_mla_query_matches() -> None:
     torch.testing.assert_close(kv, expected_kv, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [2, 4, 8, 16, 32])
+@pytest.mark.parametrize("num_tokens", [2, 4, 8, 16, 32, 64])
 def test_kimi3_kda_qkvfab_tdm_auto_matches_and_captures(
     num_tokens: int,
 ) -> None:

@@ -208,6 +208,21 @@ count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
 compiles instead of compiling on the forward thread.
 
+A full garbage collection is a stall of the same kind, for every thread of the
+process at once. Startup leaves millions of long-lived Python objects behind
+(modules, parameters, captured graphs, kernel caches), and CPython's full
+(generation 2) collection walks all of them in hundreds of milliseconds, at a
+moment each rank's own allocations decide. Since every round waits on the
+whole group, each rank's collection stalls every rank. So `run_event_loop`
+calls `freeze_startup_heap` (`engine/gc_hooks.py`) after the JIT mark: it
+collects once, freezes the survivors (`gc.freeze`: no later collection walks
+them) and raises the generation-2 threshold far enough that CPython does not
+start full collections by itself while the loop runs its own. `GcHooks` runs
+one every `FULL_COLLECTION_INTERVAL` forwarded rounds, a count that is the
+same on every rank, so the ranks collect in the same round and each
+collection walks only what serving keeps alive. The young generations still
+collect automatically.
+
 ### The capture contract
 
 Information crosses to the data plane **only** inside the submitted closure,
@@ -317,6 +332,16 @@ The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
 
+Per-request metrics anchor to request lifecycle points instead of the round
+snapshot. `tokenspeed:request_queue_time_seconds` stamps each request's
+waiting-queue entry at `_submit_scheduler_requests` — the single funnel
+normal admission, the EPD drain and the pause resume all submit through —
+and observes it once, when the request first appears in a dispatched forward
+(`_record_request_queue_time`, beside `_mark_stats_scheduled`). A retracted
+request re-enters the C++ waiting queue without passing the funnel again, so
+preemption yields no second observation. The stamp and the recorded flag
+ride `RequestState` and die with it; no cleanup pass exists.
+
 Page gauges count LCM parents, excluding the reserved null parent. The
 per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`.
 Cached-only parents are `num_usable_pages - empty - active`. Active and cached
@@ -350,6 +375,7 @@ Current inventory:
 | `_cache_hooks` | `CacheOpHooks` — `engine/cache_hooks.py`      | glue-ish (handed the `DeviceHandle`: submission rides `execute`; polling stays control-side event queries; counts the Host L2 write-backs/load-backs and the retraction image's snapshot stores/restores alike) | `count_plan_ops`, `poll_ready_events` |
 | `_l3_hooks` | `L3CacheHooks` — `engine/l3_cache_hooks.py` | self-contained (injected scheduler, `DeviceHandle`, static replica groups; no loop reference) | `submit_requests`, `converge_prefetches` |
 | `_eplb_hooks` | `EplbHooks` — `engine/eplb_hooks.py` | glue (`ExpertRebalanceController` in `moe/expert_rebalance.py` is the state machine; handed the `DeviceHandle`, the request handler and the EP gloo group; no loop reference) | `note_round` |
+| `_gc_hooks` | `GcHooks` — `engine/gc_hooks.py` | self-contained (only its interval; no loop reference) | `note_round` |
 
 `_pause_hooks` and `_pd_hooks` also receive the `DeviceHandle`: both have
 work that must land on the data plane — the DP idle forward and the KV repair
@@ -463,7 +489,9 @@ For orientation, one iteration of `event_loop`:
    victim's bytes; a restore names the resumed request's new slot. `planned`
    is None on idle and empty rounds; the plan's own work (hygiene, the
    remote streams) still runs. The rebalance hook notes whether this rank
-   forwarded (`_eplb_hooks.note_round`). Then commit from the queue head
+   forwarded (`_eplb_hooks.note_round`), and so does the garbage-collection
+   hook, which runs a full collection every `FULL_COLLECTION_INTERVAL`
+   forwarded rounds (`_gc_hooks.note_round`). Then commit from the queue head
    down to the effective depth and poll PD transfer events.
 5. **Advance the scheduler (tail call site)** with the round's
    `request_changes`, publish KV events (once), and resolve any pending
@@ -508,6 +536,10 @@ For orientation, one iteration of `event_loop`:
   peers wait in ``all_gather_object``. Every rank stays in every
   replica-group gather, even when an earlier TP/CP intersection is empty;
   breaking out leaves a peer unmatched on the next ``all_gather_object``.
+  The poll runs these collectives only while a cache op is open (an L3
+  backup runs, and can fail, only while its write-back is): every rank
+  counts the same plans and commits the same intersections, so the open
+  count is the same everywhere and an idle replica polls nothing.
   Weight-update `flush_cache` and standalone `/flush_cache` first
   MAX-reduce flush intent across attention DP so every DP worker enters
   the same collectives — the frontend sends `FlushCacheReqInput`

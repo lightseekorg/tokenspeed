@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import time
 from concurrent import futures
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import torch
@@ -49,6 +50,19 @@ logger = get_colorful_logger(__name__)
 # A pending grammar request: the spec must be submitted to the C++ scheduler and
 # the state registered with the executor *only* after its grammar future resolves.
 QueueEntry = tuple["object", "RequestState", "object"]  # (spec, state, bootstrap_info)
+
+
+def _compile_failure_status(value) -> HTTPStatus | None:
+    """HTTP status for a request whose grammar is invalid.
+
+    A failure a retry cannot fix is the request's own: a grammar that does
+    not compile, or a key whose compile timed out more than
+    ``grammar_compile_max_retries`` times. Both are cached without an
+    expiry and answered 400, so clients do not retry them. A timeout marker
+    with an expiry lets the next request compile again, so it keeps no
+    status, as before.
+    """
+    return HTTPStatus.BAD_REQUEST if value.expires_at is None else None
 
 
 class GrammarManager:
@@ -144,9 +158,13 @@ class GrammarManager:
             return True
 
         if self.grammar_backend is None:
+            # The request asks for something this server cannot do: report a
+            # client error (400) instead of an internal one, so clients do not
+            # retry it.
             state.set_finish_with_abort(
                 "Grammar-based generation (json_schema, regex, ebnf, structural_tag) "
-                "is not supported when the server is launched with --grammar-backend none"
+                "is not supported when the server is launched with --grammar-backend none",
+                status_code=HTTPStatus.BAD_REQUEST,
             )
 
             return True
@@ -169,7 +187,8 @@ class GrammarManager:
         if cache_hit:
             if value.is_invalid:
                 state.set_finish_with_abort(
-                    f"Failed to compile {key[0]} grammar: {value.error_message}"
+                    f"Failed to compile {key[0]} grammar: {value.error_message}",
+                    status_code=_compile_failure_status(value),
                 )
 
                 state.grammar = None
@@ -297,7 +316,8 @@ class GrammarManager:
 
                 state.set_finish_with_abort(
                     f"Failed to compile {state.grammar_key[0]} grammar: "
-                    f"{value.error_message}"
+                    f"{value.error_message}",
+                    status_code=_compile_failure_status(value),
                 )
 
             else:

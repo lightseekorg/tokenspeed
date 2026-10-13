@@ -225,8 +225,16 @@ def gluon_dsv41_index_topk_gfx1250(
     )
     output_layout: gl.constexpr = gl.SliceLayout(0, wmma_layout)
     output_columns = gl.arange(0, BLOCK_N, layout=output_layout)
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, k_dot_layout))[:, None]
-    columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, k_dot_layout))[None, :]
+    # Warps split the heads, so the WMMA key operand is replicated in both.
+    # Each warp loads and decodes only half the tile: a lane owns 16
+    # contiguous packed bytes (32 dims, one scale group) of a key row, and
+    # the convert_layout before the WMMA shares the halves through LDS.
+    key_load_layout: gl.constexpr = gl.BlockedLayout(
+        [16, 1], [4, 8], [1, NUM_WARPS], [0, 1]
+    )
+    key_bytes = gl.arange(0, _PACKED_DIM, layout=gl.SliceLayout(1, key_load_layout))
+    key_bytes = key_bytes[:, None]
+    columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, key_load_layout))[None, :]
 
     for tile_offset in range(0, CHUNK_N, BLOCK_N):
         tile_start = candidate_start + tile_offset
@@ -246,21 +254,23 @@ def gluon_dsv41_index_topk_gfx1250(
             table_width,
             CANDIDATES,
         )
+        # The launcher requires 16-byte page strides, so each lane's packed
+        # bytes form one 128-bit load.
+        page_base = gl.multiple_of(pages * page_stride_bytes, [16, 16])
         packed = gl.load(
             index_k_cache
-            + pages * page_stride_bytes
+            + page_base
             + page_rows.to(gl.int64) * _PACKED_DIM
-            + dims // 2,
+            + key_bytes,
             mask=valid,
             other=0,
-        )
-        value = _e2m1_decode((packed.to(gl.int32) >> ((dims % 2) * 4)) & 15)
+        ).to(gl.int32)
         scale_u8 = gl.load(
             index_k_cache
-            + pages * page_stride_bytes
+            + page_base
             + PAGE_SIZE * _PACKED_DIM
             + page_rows.to(gl.int64) * _SCALE_DIM
-            + dims // 32,
+            + key_bytes // 16,
             mask=valid,
             other=0,
         )
@@ -269,7 +279,11 @@ def gluon_dsv41_index_topk_gfx1250(
             2.0**-127,
             (scale_u8.to(gl.int32) << 23).to(gl.float32, bitcast=True),
         )
-        key = gl.where(valid, (value * scale).to(gl.bfloat16), 0.0)
+        # Low nibbles hold even dims and high nibbles odd dims.
+        even = gl.where(valid, (_e2m1_decode(packed & 15) * scale).to(gl.bfloat16), 0.0)
+        odd = gl.where(valid, (_e2m1_decode(packed >> 4) * scale).to(gl.bfloat16), 0.0)
+        key = gl.reshape(gl.permute(gl.join(even, odd), (0, 2, 1)), [HEAD_DIM, BLOCK_N])
+        key = gl.convert_layout(key, k_dot_layout)
         acc = gl.zeros([32, BLOCK_N], gl.float32, layout=wmma_layout)
         head_scores = gl.amd.cdna5.wmma(query, key, acc)
         head_scores = gl.maximum(head_scores, 0.0, propagate_nan=tl.PropagateNan.ALL)
@@ -312,7 +326,8 @@ def dsv41_index_logits_gfx1250(
     Args:
         q: Quantized/dequantized BF16 queries shaped [T, 32, 128].
         w: FP32 head weights shaped [T, 32].
-        cache_2d: Page-planar MXFP4 bytes shaped [pages, 64 * 68].
+        cache_2d: Page-planar MXFP4 bytes shaped [pages, 64 * 68] with unit
+            byte stride and a page stride that is a multiple of 16 bytes.
         table: Physical page IDs shaped [T, logical_pages].
         visible: Visible logical row counts shaped [T].
         candidates: Optional candidate block IDs shaped [T, blocks].
@@ -325,6 +340,11 @@ def dsv41_index_logits_gfx1250(
     score_chunk_size = int(score_chunk_size)
     if score_chunk_size < 8 or score_chunk_size % 8:
         raise ValueError("score_chunk_size must be a positive multiple of 8")
+    if cache_2d.stride(1) != 1 or cache_2d.stride(0) % 16:
+        raise ValueError(
+            "cache_2d needs unit byte stride and a page stride that is a "
+            "multiple of 16 bytes"
+        )
     score_chunk_size = min(score_chunk_size, _CHUNK_N)
     chunk_n = triton.cdiv(score_chunk_size, _BLOCK_N) * _BLOCK_N
     queries, width = logits.shape

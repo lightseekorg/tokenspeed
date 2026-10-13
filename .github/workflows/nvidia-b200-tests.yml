@@ -132,7 +132,7 @@ jobs:
             matrix=$(python3 test/ci_system/pipeline.py scan \
               --root test/ci \
               --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
-              --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || 'per-commit' }}" \
+              --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
               --runner-group "nvidia-x86" \
               --workflow-stage "$workflow_stage")
             echo "${output}_matrix=${matrix}" >> "$GITHUB_OUTPUT"
