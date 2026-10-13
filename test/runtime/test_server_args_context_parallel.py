@@ -18,67 +18,190 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``--prefill-context-parallel-size``: the layouts the first landing refuses."""
+"""The three context-parallel flags: ``--kv-parallel-size`` (KVP, the sharded
+page storage of a PD role), ``--decode-context-parallel-size`` (DCP, the
+decode role's compute over it) and ``--query-context-parallel-size`` (QCP,
+the prefill role's query-row sharding over it) -- which roles take them, how
+they relate, and the QCP layouts the first landing refuses."""
 
 from __future__ import annotations
 
 import pytest
 
-from tokenspeed.runtime.utils.server_args import prepare_server_args, validate_qcp
+from tokenspeed.runtime.utils.server_args import (
+    prepare_server_args,
+    validate_context_parallel_roles,
+)
 
+# A prefill engine sharding its pages over the whole attention TP group and
+# its query rows with them.
 BASE = [
     "--model",
     "x",
     "--attn-tp-size",
     "2",
-    "--prefill-context-parallel-size",
+    "--kv-parallel-size",
+    "2",
+    "--query-context-parallel-size",
     "2",
     "--disaggregation-mode",
     "prefill",
-    "--disable-prefill-graph",
     "--attention-backend",
     "dsa",
 ]
 
-
-def test_the_prefill_role_accepts_a_full_tp_query_shard():
-    args = prepare_server_args(BASE)
-    assert args.mapping.attn.qcp_size == 2
-    assert args.mapping.attn.has_qcp
-    args.mapping.rank = 1
-    assert args.mapping.attn.qcp_group == args.mapping.attn.tp_group == (0, 1)
-    assert args.mapping.attn.qcp_rank == 1
-    # KVP equal to the shard group is the one sharded-page layout allowed
-    # (and it inherits KVP's Host KVStore refusal).
-    args = prepare_server_args(BASE + ["--kv-parallel-size", "2", "--disable-kvstore"])
-    assert args.mapping.attn.kvp_size == 2
+# A decode engine reading the shards.
+DECODE = [
+    "--model",
+    "x",
+    "--attn-tp-size",
+    "2",
+    "--kv-parallel-size",
+    "2",
+    "--decode-context-parallel-size",
+    "2",
+    "--disaggregation-mode",
+    "decode",
+]
 
 
 def test_off_by_default_everywhere():
     args = prepare_server_args(["--model", "x", "--attn-tp-size", "2"])
-    assert args.prefill_context_parallel_size == 1
+    assert args.kv_parallel_size == 1
+    assert args.decode_context_parallel_size == 1
+    assert args.query_context_parallel_size == 1
+    assert not args.mapping.attn.has_kvp and not args.mapping.attn.has_qcp
+
+
+# --- roles and size relations -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(kvp_size=1, dcp_size=1, qcp_size=1, disaggregation_mode="null"),
+        dict(kvp_size=1, dcp_size=1, qcp_size=1, disaggregation_mode="encode"),
+        # A prefill engine shards its pages with or without a query shard.
+        dict(kvp_size=4, dcp_size=1, qcp_size=1, disaggregation_mode="prefill"),
+        dict(kvp_size=4, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
+        dict(kvp_size=4, dcp_size=4, qcp_size=1, disaggregation_mode="decode"),
+    ],
+)
+def test_the_roles_that_take_the_flags(kwargs):
+    validate_context_parallel_roles(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        # KVP is a PD-role layout: an aggregated engine has no decode compute
+        # over sharded pages.
+        (
+            dict(kvp_size=2, dcp_size=1, qcp_size=1, disaggregation_mode="null"),
+            "--kv-parallel-size > 1 requires --disaggregation-mode prefill or decode",
+        ),
+        (
+            dict(kvp_size=2, dcp_size=1, qcp_size=1, disaggregation_mode="encode"),
+            "--kv-parallel-size > 1 requires --disaggregation-mode prefill or decode",
+        ),
+        # The decode role names its compute explicitly.
+        (
+            dict(kvp_size=2, dcp_size=1, qcp_size=1, disaggregation_mode="decode"),
+            "requires --decode-context-parallel-size 2",
+        ),
+        (
+            dict(kvp_size=2, dcp_size=2, qcp_size=1, disaggregation_mode="prefill"),
+            "--decode-context-parallel-size > 1 requires --disaggregation-mode decode",
+        ),
+        (
+            dict(kvp_size=4, dcp_size=2, qcp_size=1, disaggregation_mode="decode"),
+            "--decode-context-parallel-size must equal --kv-parallel-size",
+        ),
+        (
+            dict(kvp_size=1, dcp_size=2, qcp_size=1, disaggregation_mode="decode"),
+            "--decode-context-parallel-size must equal --kv-parallel-size",
+        ),
+        (
+            dict(kvp_size=1, dcp_size=0, qcp_size=1, disaggregation_mode="decode"),
+            "positive integer",
+        ),
+        # The query shard is a prefill-role layout over sharded pages.
+        (
+            dict(kvp_size=2, dcp_size=1, qcp_size=2, disaggregation_mode="decode"),
+            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
+        ),
+        (
+            dict(kvp_size=1, dcp_size=1, qcp_size=2, disaggregation_mode="prefill"),
+            "--query-context-parallel-size must equal --kv-parallel-size",
+        ),
+        (
+            dict(kvp_size=2, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
+            "--query-context-parallel-size must equal --kv-parallel-size",
+        ),
+    ],
+)
+def test_the_roles_that_refuse_the_flags(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        validate_context_parallel_roles(**kwargs)
+
+
+def test_the_decode_role_reads_the_shards_with_dcp():
+    args = prepare_server_args(DECODE)
+    assert args.decode_context_parallel_size == 2
+    assert args.mapping.attn.kvp_size == 2 and args.mapping.attn.has_kvp
     assert not args.mapping.attn.has_qcp
+    without_dcp = DECODE[:6] + DECODE[8:]
+    with pytest.raises(ValueError, match="requires --decode-context-parallel-size 2"):
+        prepare_server_args(without_dcp)
+
+
+def test_an_aggregated_engine_does_not_shard():
+    with pytest.raises(ValueError, match="prefill or decode"):
+        prepare_server_args(
+            ["--model", "x", "--attn-tp-size", "2", "--kv-parallel-size", "2"]
+        )
+
+
+# --- the query shard ------------------------------------------------------
+
+
+def test_the_prefill_role_accepts_a_full_tp_query_shard():
+    args = prepare_server_args(BASE)
+    assert args.mapping.attn.qcp_size == args.mapping.attn.kvp_size == 2
+    assert args.mapping.attn.has_qcp
+    args.mapping.rank = 1
+    assert args.mapping.attn.qcp_group == args.mapping.attn.tp_group == (0, 1)
+    assert args.mapping.attn.qcp_rank == 1
+    # The GPU DSA backend keeps its prefill eager under a shard; the launch
+    # does not have to say so.
+    assert not args.disable_prefill_graph
+
+
+def test_the_prefill_role_shards_its_pages_without_a_query_shard():
+    args = prepare_server_args(BASE[:6] + BASE[8:])
+    assert args.mapping.attn.has_kvp and not args.mapping.attn.has_qcp
 
 
 @pytest.mark.parametrize(
     "argv,match",
     [
         (
-            # The mapping refuses the partial shard first (a query shard spans
-            # the whole group); validate_qcp repeats the rule for its callers.
-            ["--attn-tp-size", "4", "--prefill-context-parallel-size", "2"],
+            # The mapping refuses the partial shard: a query shard spans the
+            # whole group.
+            ["--attn-tp-size", "4", "--kv-parallel-size", "2"],
             "must be 1 or the attention TP size",
         ),
-        (["--disaggregation-mode", "null"], "requires --disaggregation-mode prefill"),
-        (["--disaggregation-mode", "decode"], "requires --disaggregation-mode prefill"),
+        (["--disaggregation-mode", "null"], "prefill or decode"),
+        (
+            ["--disaggregation-mode", "decode"],
+            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
+        ),
+        (["--kv-parallel-size", "1"], "must equal --kv-parallel-size"),
         (["--enable-mixed-batch"], "--enable-mixed-batch"),
-        (["--attention-backend", "flashmla"], "DSA-family attention backend"),
-        (["--kv-cache-dtype", "fp8_e4m3"], "bf16 KV cache"),
-        (["--kv-cache-dtype", "mxfp8"], "bf16 KV cache"),
-        (["--kv-cache-quant-method", "per_token_head"], "bf16 KV cache"),
+        (["--data-parallel-size", "2"], "attention DP 1"),
     ],
 )
-def test_refusals(argv, match):
+def test_query_shard_refusals(argv, match):
     # Later flags override earlier ones, so BASE + argv applies the override.
     with pytest.raises(ValueError, match=match):
         prepare_server_args(BASE + argv)
@@ -86,19 +209,8 @@ def test_refusals(argv, match):
 
 def test_refuses_kvp_narrower_than_the_shard_group():
     argv = [flag if flag != "2" else "4" for flag in BASE]
-    with pytest.raises(ValueError, match="--kv-parallel-size must be 1"):
+    with pytest.raises(ValueError, match="must equal --kv-parallel-size"):
         prepare_server_args(argv + ["--kv-parallel-size", "2"])
-
-
-def test_refuses_the_prefill_graph():
-    argv = [flag for flag in BASE if flag != "--disable-prefill-graph"]
-    with pytest.raises(ValueError, match="--disable-prefill-graph"):
-        prepare_server_args(argv)
-
-
-def test_refuses_attention_dp():
-    with pytest.raises(ValueError, match="attention DP 1"):
-        prepare_server_args(BASE + ["--data-parallel-size", "2"])
 
 
 def test_dense_and_moe_groups_are_one_or_the_attention_width():
@@ -216,40 +328,6 @@ def test_head_tp_on_the_prefill_role_still_needs_the_shard():
         )
 
 
-def test_validate_qcp_rejects_a_shard_below_the_tp_width():
-    with pytest.raises(ValueError, match="must equal the attention TP size"):
-        validate_qcp(
-            qcp_size=2,
-            attn_tp_size=4,
-            attn_dp_size=1,
-            dense_tp_size=1,
-            moe_tp_ep_size=4,
-            kvp_size=1,
-            disaggregation_mode="prefill",
-            disable_prefill_graph=True,
-            enable_mixed_batch=False,
-            attention_backend="dsa",
-            kv_cache_dtype="auto",
-            kv_cache_quant_method="none",
-        )
-    # An unset backend resolves to the architecture's default; the attention
-    # config pins it to GPU DSA when the model is known.
-    validate_qcp(
-        qcp_size=4,
-        attn_tp_size=4,
-        attn_dp_size=1,
-        dense_tp_size=4,
-        moe_tp_ep_size=4,
-        kvp_size=4,
-        disaggregation_mode="prefill",
-        disable_prefill_graph=True,
-        enable_mixed_batch=False,
-        attention_backend=None,
-        kv_cache_dtype="bfloat16",
-        kv_cache_quant_method="none",
-    )
-
-
 def _dsa_attn_config(**overrides):
     import torch
 
@@ -293,7 +371,8 @@ def _dsa_attn_config(**overrides):
 def test_the_attention_config_pins_query_sharding_to_a_bf16_native_cache():
     """The sharded KV write stores gathered rows with ``latent_store``, which
     writes native rows only: an FP8 / MXFP8 / per-token-head cache is refused
-    where the config is built, not at the first write."""
+    where the config is built -- the one place that sees the resolved cache
+    dtype -- not at the first write."""
     import torch
 
     assert _dsa_attn_config().qcp_size == 2

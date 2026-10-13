@@ -314,7 +314,6 @@ class EventLoop:
         # Planning reads this every round; keep the value, not the handle.
         self._uses_eager_grammar = specs.uses_eager_grammar
         cache_groups = specs.cache_groups
-        # The builder may have lowered this to the cache-group checkpoint grain.
         max_scheduled_tokens = server_args.chunked_prefill_size
         # The forward token bound also caps each multimodal encoder call.
         self._max_encoder_tokens = max_scheduled_tokens

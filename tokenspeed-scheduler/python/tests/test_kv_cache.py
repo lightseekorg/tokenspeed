@@ -218,7 +218,8 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
     cfg.max_scheduled_tokens = 8_192
     cfg.max_batch_size = 1
     for group in cfg.cache_groups:
-        group.block_granularity = cfg.prefix_granularity
+        if group.group_id == K3_GROUP_IDS[0]:
+            group.block_granularity = cfg.prefix_granularity
         group.cache_blocks_per_lcm_block = (
             12 if group.group_id == K3_GROUP_IDS[0] else 1
         )
@@ -229,25 +230,26 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
 
 
 def test_k3_reports_group_aware_single_request_capacity() -> None:
-    # Each sparse State group needs input, aligned checkpoint, final state,
-    # and banked growth. The three groups therefore leave 272
-    # of the 284 usable parents for Full KV. K_full=12 and P=128 expose
-    # 272 * 12 * 128 tokens.
+    # Each State group holds two slots (the input checkpoint and the live
+    # state) whatever the prompt length. The three groups therefore leave 278
+    # of the 284 usable parents for Full KV: 278 * 12 child pages, one of
+    # which a tail handover holds, so P=128 exposes (278 * 12 - 1) * 128
+    # tokens.
     scheduler = ts.Scheduler(_make_k3_128k_config(285))
-    assert scheduler.max_single_request_tokens() == 417_792
+    assert scheduler.max_single_request_tokens() == 426_880
 
 
 def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     prompt = _spec("128k", list(range(131_072)))
 
-    # Twelve State parents plus 86 Full parents admit 128K; one fewer Full parent
+    # Six State parents plus 86 Full parents admit 128K; one fewer Full parent
     # is 512 tokens short because each Full parent carries 12 * 128 tokens.
-    undersized = ts.Scheduler(_make_k3_128k_config(98))
+    undersized = ts.Scheduler(_make_k3_128k_config(92))
     assert undersized.max_single_request_tokens() < 131_072
 
-    corrected = ts.Scheduler(_make_k3_128k_config(99))
+    corrected = ts.Scheduler(_make_k3_128k_config(93))
     before = corrected.available_lcm_blocks()
-    assert before == 98
+    assert before == 92
     corrected.submit_requests([prompt])
     completed_tokens = 0
     for chunk in range(32):
@@ -256,21 +258,25 @@ def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
         completed_tokens += op.input_lengths[0]
         if completed_tokens == 131_072:
             break
+        _advance_tokens(
+            corrected, "128k", []
+        )  # an intermediate chunk lands without a token
     assert completed_tokens == 131_072
     _advance_tokens(corrected, "128k", [131_072])
     assert _find_forward_op(corrected.next_execution_plan()) is not None
-    _finish(corrected, "128k")
+    _advance_tokens(corrected, "128k", [131_073])  # the decode lands
+    _finish(
+        corrected, "128k"
+    )  # quiescent: publishes the frontier and releases the pages
     corrected.next_execution_plan()
     assert corrected.available_lcm_blocks() == before
 
 
-@pytest.mark.parametrize("block_granularity", [1, 2, 4])
 @pytest.mark.parametrize("chunk_tokens", [4, 8, 9])
 @pytest.mark.parametrize("decode_width", [1, 3])
 @pytest.mark.parametrize("overlap_depth", [0, 1])
 @pytest.mark.parametrize("prefix_cache_enabled", [False, True])
 def test_accepted_state_prompts_can_prefill_and_start_decode(
-    block_granularity: int,
     chunk_tokens: int,
     decode_width: int,
     overlap_depth: int,
@@ -291,7 +297,7 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
         cfg.cache_groups = [
             ts.CacheGroupConfig(
                 group_id="state",
-                block_granularity=block_granularity,
+                block_granularity=0,
                 total_pages=usable_blocks + 1,
                 retention=ts.CacheRetention.FullHistory,
                 family=ts.CacheGroupFamily.State,
@@ -325,16 +331,18 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
 
 @pytest.mark.parametrize("finish_after_first_decode", [False, True])
 @pytest.mark.parametrize("decode_width", [1, 3])
-@pytest.mark.parametrize("state_granularity", [1, 2, 4])
 @pytest.mark.parametrize("prompt_tokens", [3, 7, 8])
 @pytest.mark.parametrize("truncate_output", [False, True])
-def test_decode_reuses_only_prefill_state_boundary(
+def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     finish_after_first_decode: bool,
     decode_width: int,
-    state_granularity: int,
     prompt_tokens: int,
     truncate_output: bool,
 ) -> None:
+    """A State group publishes its state where its owner stops writing it: the
+    prompt end (whatever its alignment) and the finish frontier. Decode steps in
+    between publish nothing, so a prompt sharing the decoded tokens resumes at
+    the finish frontier when it reaches it and at the prompt end otherwise."""
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = 4
     cfg.num_device_pages = 33
@@ -349,7 +357,7 @@ def test_decode_reuses_only_prefill_state_boundary(
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id="state",
-            block_granularity=state_granularity,
+            block_granularity=0,
             total_pages=33,
             retention=ts.CacheRetention.FullHistory,
             family=ts.CacheGroupFamily.State,
@@ -376,15 +384,25 @@ def test_decode_reuses_only_prefill_state_boundary(
         )
     _finish(scheduler, "r")
     scheduler.next_execution_plan()
+    # Every token but the last sampled one was computed when r finished.
+    finish_frontier = (
+        prompt_tokens + 1 + visible_tokens * (1 if finish_after_first_decode else 2) - 1
+    )
 
-    # Decode cannot create a reusable checkpoint, even at an aligned accepted
-    # endpoint or when host-side stopping truncates the accepted output.
-    reuse = _spec("reuse", list(range(1, next_token + visible_tokens)) + [90, 91])
+    # `reuse` shares r's prompt, its first sampled token and the first decode's
+    # accepted tokens, then diverges.
+    shared = list(range(1, next_token + visible_tokens))
+    reuse = _spec("reuse", shared + [90, 91])
     reuse.max_new_tokens = 4
     scheduler.submit_requests([reuse])
     batch = _find_forward_op(scheduler.next_execution_plan())
     assert batch is not None
-    assert list(batch.extend_prefix_lens) == [prompt_tokens // 4 * 4]
+    expected = finish_frontier if finish_frontier <= len(shared) else prompt_tokens
+    assert list(batch.extend_prefix_lens) == [expected]
+    [state_row] = dict(batch.block_tables)["state"]
+    assert len(state_row) == 2
+    assert state_row[0] > 0, "the claimed checkpoint is the chunk's input (slot 0)"
+    assert state_row[1] > 0, "the chunk writes a fresh live state (slot 1)"
 
 
 def _ack_cache_event(scheduler, event) -> None:
@@ -435,7 +453,7 @@ def _drive_k3_to_retract(scheduler) -> tuple[object, dict[str, list[int]]]:
         if snapshot is not None:
             # Retract-and-grant happen in one round: the blocked grower runs
             # on the pages a just released.
-            assert before_plan == (29, 3, 3)
+            assert before_plan == (32, 0, 0)
             assert scheduled == ("b",)
             break
         if "a" in scheduled:
@@ -451,9 +469,9 @@ def _drive_k3_to_retract(scheduler) -> tuple[object, dict[str, list[int]]]:
 
     assert tuple(scheduler.request_token_size(r) for r in request_ids) == (
         11,
-        9,
-        9,
-        9,
+        11,
+        11,
+        11,
     )
     assert scheduler.retracted_size() == 1
     assert scheduler.waiting_size() == 1
@@ -475,9 +493,10 @@ def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     assert scheduler.snapshot_pool_free_blocks() == 32
     snapshot, a_rows = _drive_k3_to_retract(scheduler)
 
-    # The image: every positive slot of every group, 11 computed tokens = five
-    # History blocks plus one working block per State group, each copied to
-    # its own snapshot-pool page along with the slot-state blob of a's row.
+    # The image: every positive slot of every group, 10 computed tokens = five
+    # History blocks plus the live slot of every State group (slot 0 was
+    # released by the second decode), each copied to its own snapshot-pool
+    # page along with the slot-state blob of a's row.
     assert list(snapshot.request_ids) == ["a"]
     assert len(snapshot.op_ids) == 1
     [snapshot_slot] = snapshot.snapshot_slots
@@ -534,11 +553,12 @@ def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     for group_index, page in zip(restore_groups, restore_destinations):
         assert page not in zeroed[K3_GROUP_IDS[group_index]]
     assert any(len(pages) > 0 for pages in zeroed.values())
-    # The restore holds the rebuilt tables plus decode growth, yet nothing is
+    # The restore holds the rebuilt tables plus the History decode growth (a
+    # State group's decode writes its live slot in place), yet nothing is
     # schedulable until the copy lands and the pool keeps a's blocks.
     assert scheduler.retracted_size() == 1
     assert scheduler.decoding_size() == 0
-    assert scheduler.active_lcm_blocks() == 8 + 4
+    assert scheduler.active_lcm_blocks() == 8 + 1
     assert scheduler.snapshot_pool_free_blocks() == 32 - 8
     while_restoring = scheduler.next_execution_plan()
     assert _find_forward_op(while_restoring) is None
@@ -553,8 +573,9 @@ def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     assert scheduler.snapshot_pool_free_blocks() == 32
     assert scheduler.request_token_size("a") == 11
 
-    # Decode continues from token 11 with no prefill: the block tables are
-    # the restore destinations in their image slots plus one growth block.
+    # Decode continues from token 11 with no prefill: the History row is the
+    # restore destinations in their image slots plus one growth block; a
+    # State row is its two slots, slot 0 empty and slot 1 the restored copy.
     resume = _find_forward_op(scheduler.next_execution_plan())
     assert resume is not None
     assert tuple(resume.request_ids) == ("a",)
@@ -564,13 +585,12 @@ def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     restored_rows = {group_id: [] for group_id in K3_GROUP_IDS}
     for group_index, page in zip(restore_groups, restore_destinations):
         restored_rows[K3_GROUP_IDS[group_index]].append(page)
-    for group_id in K3_GROUP_IDS:
-        row = rows[group_id]
-        assert len(row) == len(a_rows[group_id]) + 1
-        assert [slot for slot, page in enumerate(row) if page == 0] == [
-            slot for slot, page in enumerate(a_rows[group_id]) if page == 0
-        ]
-        assert _positive_pages(row)[:-1] == restored_rows[group_id]
+    history_row = rows[K3_GROUP_IDS[0]]
+    assert len(history_row) == len(a_rows[K3_GROUP_IDS[0]]) + 1
+    assert all(page > 0 for page in history_row)
+    assert history_row[:-1] == restored_rows[K3_GROUP_IDS[0]]
+    for group_id in K3_GROUP_IDS[1:]:
+        assert rows[group_id] == [0] + restored_rows[group_id]
 
     _advance_tokens(scheduler, "a", [3000])
     assert _find_forward_op(scheduler.next_execution_plan()) is not None

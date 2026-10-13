@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import sys
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -97,10 +96,7 @@ def _make_backend(
 ):
     if replay and not gdn_replay_commit_supported(torch.bfloat16):
         pytest.skip("GDN ReplaySSM kernel unavailable on this platform")
-    pool = _ContractPool(
-        4,
-        {0: ("linear_attention", conv_state, recurrent_state)},
-    )
+    pool = _ContractPool({0: ("linear_attention", conv_state, recurrent_state)})
     backend = MambaAttnBackend(
         *_config(replay=replay, draft_tree=draft_tree, draft_tokens=draft_tokens)
     )
@@ -563,7 +559,6 @@ def test_qwen_replay_commits_all_layers_with_one_kernel_call(monkeypatch):
 
     def make_backend(replay, conv_states, recurrent_states):
         pool = _ContractPool(
-            4,
             {
                 layer_id: (
                     "linear_attention",
@@ -645,7 +640,7 @@ def test_rebinding_the_pool_retargets_the_verify_copy_tables(replay):
     backend.preallocate_verify_workspace(BATCH, DRAFT_TOKENS)
     stale = backend._verify_copy_tables_get()
 
-    replacement = _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=29))})
+    replacement = _ContractPool({0: ("linear_attention", *_initial_pools(seed=29))})
     backend.forward_metadata = object()
     backend._replay_state_tapes = {1: object()}
     backend.set_kv_pool(replacement)
@@ -675,9 +670,7 @@ def test_rebinding_a_pool_with_other_state_component_shapes_is_rejected():
         dtype=torch.float32,
     )
     with pytest.raises(RuntimeError, match="different state geometry"):
-        backend.set_kv_pool(
-            _ContractPool(4, {0: ("linear_attention", conv, recurrent)})
-        )
+        backend.set_kv_pool(_ContractPool({0: ("linear_attention", conv, recurrent)}))
     assert backend.kv_pool is original
 
 
@@ -685,7 +678,6 @@ def test_rebinding_rejects_geometry_change_in_a_nonfirst_state_layer():
     """Geometry validation must cover every layer, not only min(layer_id)."""
     conv, recurrent = _initial_pools(seed=37)
     original = _ContractPool(
-        4,
         {
             0: ("linear_attention", conv.clone(), recurrent.clone()),
             1: ("linear_attention", conv.clone(), recurrent.clone()),
@@ -703,7 +695,6 @@ def test_rebinding_rejects_geometry_change_in_a_nonfirst_state_layer():
         dtype=recurrent.dtype,
     )
     changed = _ContractPool(
-        4,
         {
             0: ("linear_attention", conv.clone(), recurrent.clone()),
             1: ("linear_attention", conv.clone(), changed_recurrent),
@@ -722,7 +713,6 @@ def test_rebinding_a_pool_whose_state_layers_moved_is_rejected():
 
     def pool(*layers):
         return _ContractPool(
-            4,
             {
                 layer: ("linear_attention", conv.clone(), recurrent.clone())
                 for layer in layers
@@ -744,12 +734,18 @@ def test_rebinding_a_pool_of_different_state_geometry_is_rejected():
     backend.set_cache_pool(original)
     with pytest.raises(RuntimeError, match="different state geometry"):
         backend.set_cache_pool(
-            _ContractPool(8, {0: ("linear_attention", *_initial_pools())})
+            _ContractPool(
+                {
+                    0: (
+                        "linear_attention",
+                        *_initial_pools(state_dtype=torch.bfloat16),
+                    )
+                }
+            )
         )
 
     assert backend.kv_pool is original
     assert backend.cache_pool is original
-    assert backend._checkpoint_granularity == 4
 
 
 def test_rebinding_a_state_backend_clears_sparse_metadata():
@@ -758,7 +754,7 @@ def test_rebinding_a_state_backend_clears_sparse_metadata():
     share.prefill = share.decode = share.qsa_metadata = object()
 
     backend.set_cache_pool(
-        _ContractPool(4, {0: ("linear_attention", *_initial_pools(seed=31))})
+        _ContractPool({0: ("linear_attention", *_initial_pools(seed=31))})
     )
     assert share.prefill is None
     assert share.decode is None

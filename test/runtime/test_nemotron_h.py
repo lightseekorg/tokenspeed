@@ -319,7 +319,6 @@ def test_mamba2_seams_match_the_sequential_recurrence():
         b=None,
         seq_len=total,
         num_real_tokens=total,
-        inputs_packed=False,
         cu_seqlens_cpu=bounds,
         **_UNUSED,
     )
@@ -397,7 +396,6 @@ def test_seams_refuse_inputs_of_the_other_recurrence():
         a=torch.zeros(1, 1),
         seq_len=1,
         num_real_tokens=1,
-        inputs_packed=False,
         cu_seqlens_cpu=torch.tensor([0, 1]),
         **_UNUSED,
     )
@@ -491,6 +489,7 @@ def _super_cache_recipe(
             speculative_num_draft_tokens=draft_tokens,
             speculative_eagle_topk=topk,
             enable_replay_ssm=with_draft,
+            kv_offload_config=None,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=SimpleNamespace()),
@@ -934,20 +933,21 @@ def test_mamba2_decode_reads_the_projection_view_in_place():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mamba2_layers_of_one_forward_share_its_chunk_plan():
+    """One forward has one host bounds tensor; every layer's scan reuses the
+    plan built for it, and the next forward's bounds replace it even when
+    their values repeat."""
     backend = _backend(8, 64, 2, 128)
     device = torch.device("cuda")
     bounds = torch.tensor([0, 130, 137])
     plan = backend._chunk_plan(bounds, device)
-    assert backend._chunk_plan(bounds, device) is plan
-    body, tail = torch.tensor([0, 128]), torch.tensor([0, 2, 9])
-    backend._chunk_plan(body, device)
-    backend._chunk_plan(tail, device)
-    assert backend._chunk_plan(bounds, device) is plan
-    # The next forward brings fresh bounds, even when their values repeat.
+    for _ in range(3):
+        assert backend._chunk_plan(bounds, device) is plan
     fresh = backend._chunk_plan(bounds.clone(), device)
     assert fresh is not plan
     assert torch.equal(fresh.cu_chunk_seqlens, plan.cu_chunk_seqlens)
     assert fresh.cu_chunk_seqlens.tolist() == [0, 128, 130, 137]
+    # The previous forward's bounds are forgotten: only one plan is kept.
+    assert backend._chunk_plan(bounds, device) is not plan
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -995,6 +995,7 @@ def test_mamba2_verify_scan_continues_each_request_from_its_committed_state(repl
         batch_size=batch,
         draft_token_num=steps,
         seq_len=rows,
+        replay_payload=None,
         **_UNUSED,
     )
     assert out.shape == (1, rows, heads, head_dim)
@@ -1065,8 +1066,7 @@ def test_mamba2_replay_commit_matches_the_staged_verify_states(state_dtype, tree
                 )
             )
         pool = _ContractPool(
-            4,
-            {0: ("linear_attention", conv.bfloat16(), ssm.to(state_dtype))},
+            {0: ("linear_attention", conv.bfloat16(), ssm.to(state_dtype))}
         )
         backend.set_kv_pool(pool)
         backend.init_cuda_graph_state(batch)

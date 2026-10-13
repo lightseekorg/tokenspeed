@@ -101,9 +101,11 @@ def _handle(trace, kv_transfer=None):
 
 
 def _plan(*, pages_to_zero=(), cache=(), remote_decode=None, remote_prefill=None):
-    """A round's ExecutionPlan as execute() reads it."""
+    """A round's ExecutionPlan as execute() reads it: every cache group is
+    listed under ``pages_to_zero``, empty or not."""
     return SimpleNamespace(
-        pages_to_zero=list(pages_to_zero),
+        pages_to_zero={"kv": list(pages_to_zero), "state": []},
+        pages_to_copy_arrays=dict,
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,

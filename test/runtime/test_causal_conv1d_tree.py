@@ -144,6 +144,40 @@ def test_tree_update_is_bitwise_per_path_reference(width):
     assert torch.equal(state, expected_state)
 
 
+def test_tree_update_reads_a_row_strided_projection_view():
+    """Token rows sliced out of a wider projection convolve like dense rows,
+    into a token-major output a ``[bs * t, dim]`` view can read back."""
+    torch.manual_seed(1)
+    bs, dim, width, t = len(PARENTS), 256, 4, len(PARENTS[0])
+    wide = torch.randn(bs, t, dim + 96, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    conv_state = torch.randn(
+        1 + bs * (t + 1), dim, width - 1, device="cuda", dtype=torch.bfloat16
+    )
+    base = torch.arange(bs, device="cuda", dtype=torch.int32) * (t + 1) + 1
+    out_rows = base[:, None] + 1 + torch.arange(t, device="cuda", dtype=torch.int32)
+    parents = torch.tensor(PARENTS, device="cuda", dtype=torch.int32)
+    outs, states = [], []
+    for x in (wide[:, :, :dim], wide[:, :, :dim].contiguous()):
+        state = conv_state.clone()
+        outs.append(
+            causal_conv1d_update(
+                x.transpose(1, 2),
+                state,
+                weight,
+                bias,
+                activation="silu",
+                conv_state_indices=base,
+                output_state_indices=out_rows,
+                parent_indices=parents,
+            )
+        )
+        states.append(state)
+    assert torch.equal(outs[0], outs[1]) and torch.equal(states[0], states[1])
+    assert outs[0].transpose(1, 2).is_contiguous()
+
+
 @pytest.mark.parametrize(
     "broken", ["no_base", "int64_parents", "base_shape", "cache_seqlens"]
 )

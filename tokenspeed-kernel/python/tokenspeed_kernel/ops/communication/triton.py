@@ -103,7 +103,6 @@ __all__ = [
     "create_state",
     "TritonRSAGState",
     "symm_allreduce_residual_rmsnorm",
-    "get_token_dist",
     "reduce_scatter",
     "all_gather",
     "all_gather_inner",
@@ -1781,33 +1780,6 @@ def amd_rsag_all_gather(
 # ------------------------------------------------------------------------------
 
 
-@triton.jit
-def amd_all_reduce_kernel(
-    buffer_ptrs_dev,
-    signal_pad_ptrs_dev,
-    output_ptr,
-    NUMEL,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    block_id = tl.program_id(0)
-    symm_mem_barrier(signal_pad_ptrs_dev, block_id, RANK, WORLD_SIZE)
-
-    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < NUMEL
-    buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
-    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
-
-    for peer in tl.static_range(0, WORLD_SIZE):
-        peer_base = tl.load(buffer_ptrs + peer).to(tl.pointer_type(tl.bfloat16))
-        acc += tl.load(peer_base + offsets, mask=mask, other=0.0).to(tl.float32)
-
-    tl.store(output_ptr + offsets, acc, mask=mask)
-
-    symm_mem_barrier(signal_pad_ptrs_dev, block_id, RANK, WORLD_SIZE)
-
-
 # ------------------------------------------------------------------------------
 # AMD Triton All-Reduce + RMSNorm
 # ------------------------------------------------------------------------------
@@ -2055,10 +2027,6 @@ def create_state(
         hidden_size=hidden_size,
         device=device,
     )
-
-
-def get_token_dist(state: TritonRSAGState, total_tokens_in_group: int) -> list:
-    return rsag_get_token_dist(state, total_tokens_in_group)
 
 
 def reduce_scatter(

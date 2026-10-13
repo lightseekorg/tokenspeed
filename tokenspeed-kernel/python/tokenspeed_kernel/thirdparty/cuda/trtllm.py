@@ -288,6 +288,9 @@ MNNVL_PREFER_IPC_BYTES = int(
     os.environ.get("TOKENSPEED_MNNVL_PREFER_IPC_BYTES", 12 * 1024 * 1024)
 )
 
+# Per-rank bytes where lamport stops beating multimem (4 GB300s: 0.45x at 4 KB, 0.97x at 768 KB).
+MNNVL_ALLGATHER_MAX_BYTES = 768 * 1024
+
 _MNNVL_SUPPORTED_PATTERNS = frozenset(
     {
         AllReduceFusionPattern.kAllReduce,
@@ -537,6 +540,50 @@ def trtllm_create_mnnvl_workspace_for_all_reduce_fusion(
         oneshot_token_cap=oneshot_token_cap,
         refs=(buf, handle),
     )
+
+
+def trtllm_mnnvl_allgather(
+    allgather_in: torch.Tensor,
+    workspace: MnnvlAllReduceFusionWorkspace,
+    launch_with_pdl: bool,
+) -> Optional[torch.Tensor]:
+    """One-shot all-gather on the all-reduce workspace, bit for bit.
+
+    Args:
+        allgather_in: ``[T, W]`` 16-bit rows of this rank.
+        workspace: The group's workspace.
+        launch_with_pdl: Launch with programmatic dependent launch.
+
+    Returns:
+        ``[T, world * W]`` with rank ``r``'s rows in columns ``r * W``, or None
+        when the workspace does not serve the rows.
+    """
+    token_num, width = allgather_in.shape
+    # Refuse only on what every rank shares: a rank-local refusal strands its peers.
+    if not (
+        allgather_in.dtype.itemsize == 2
+        and 0 < token_num
+        and 0 < width <= 4096
+        and width % 128 == 0
+        and token_num * width * 2 <= MNNVL_ALLGATHER_MAX_BYTES
+        # Each 16-bit value travels as a 32-bit word.
+        and token_num * workspace.tp_size * width * 4 <= workspace.buffer_size_bytes
+    ):
+        return None
+    if allgather_in.stride() != (width, 1) or allgather_in.data_ptr() % 16:
+        allgather_in = allgather_in.clone(memory_format=torch.contiguous_format)
+    out = allgather_in.new_empty((token_num, workspace.tp_size * width))
+    _load_trtllm_comm_module().trtllm_mnnvl_allgather(
+        allgather_in,
+        out,
+        workspace.tp_size,
+        workspace.tp_rank,
+        workspace.multicast_ptr,
+        workspace.local_ptr,
+        workspace.buffer_flags,
+        launch_with_pdl,
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------

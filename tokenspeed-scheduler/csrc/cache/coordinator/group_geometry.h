@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <variant>
@@ -31,17 +32,23 @@
 
 namespace tokenspeed {
 
-// One cache group's token -> page arithmetic. This is the logical side of the
-// placement seam: it turns token demands into the token-free AcquirePlan /
+// One History group's token -> page arithmetic. This is the logical side of
+// the placement seam: it turns token demands into the token-free AcquirePlan /
 // block counts that GroupAllocator executes, so the allocator never perceives
-// block_granularity or any other token quantity.
+// block_granularity or any other token quantity. A State group has no token
+// span (block_granularity 0): its two-slot table is shaped by StateStep, and
+// none of the token arithmetic below applies to it.
 class GroupGeometry {
 public:
     explicit GroupGeometry(std::int32_t block_granularity) : block_granularity_{block_granularity} {
-        _assert(block_granularity > 0, "block_granularity must be > 0");
+        _assert(block_granularity >= 0, "block_granularity must be non-negative");
     }
 
-    std::int32_t BlockGranularity() const noexcept { return block_granularity_; }
+    bool HasTokenSpan() const noexcept { return block_granularity_ > 0; }
+    std::int32_t BlockGranularity() const noexcept {
+        _assert(block_granularity_ > 0, "a State group has no token span");
+        return block_granularity_;
+    }
 
     // Blocks that num_tokens need beyond available_tokens of unconsumed tail
     // capacity -- the capacity of a live table, or of a recorded shape a
@@ -59,6 +66,9 @@ public:
         return BlocksNeededBeyond(table.AvailableTokens(), num_tokens);
     }
 
+    // A StateStep costs one fresh block when it rotates or lands (the new
+    // slot 1); the zero-state block of a first rotation is costed by the
+    // admission planner, which knows whether a checkpoint was matched.
     std::int32_t BlocksNeededFor(const BlockTable& table, const GroupDemand& demand) const {
         return std::visit(
             Overloaded{
@@ -66,15 +76,25 @@ public:
                     return BlocksNeededFor(table, dense.num_tokens + demand.reserve_tokens);
                 },
                 [&](const SparseSuffix& sparse) { return sparseSuffixBlocks(table, sparse, demand.reserve_tokens); },
+                [&](const StateStep& step) {
+                    _assert(!HasTokenSpan() && demand.reserve_tokens == 0, "a StateStep shapes a State group");
+                    return step.kind == StateStep::Kind::kRotate || step.kind == StateStep::Kind::kLand ? 1 : 0;
+                },
             },
             demand.extent);
     }
 
+    // Token-spanned groups only; a State group's table is shaped by
+    // GroupAllocator's state operations.
     AcquirePlan PlanAcquire(const BlockTable& table, const GroupDemand& demand) const {
         return std::visit(
             Overloaded{
                 [&](const DenseGrowth& dense) { return PlanAcquire(table, dense.num_tokens, demand.reserve_tokens); },
                 [&](const SparseSuffix& sparse) { return planSparseSuffix(table, sparse, demand.reserve_tokens); },
+                [&](const StateStep&) -> AcquirePlan {
+                    FatalCheck(false, "a StateStep has no token-spanned acquire plan");
+                    return AcquirePlan{};
+                },
             },
             demand.extent);
     }
@@ -91,47 +111,36 @@ public:
     }
 
     // Pages [0, result) of the table have fully expired under the group's
-    // retention policy at this progress; kFull never expires. This is where
-    // the sliding-window/state token policy meets page arithmetic, so it
+    // retention policy at this progress; kFull never expires and a State
+    // group's slots are released by StateStep, not by token retention. This
+    // is where the sliding-window token policy meets page arithmetic, so it
     // lives here and not in the (token-free) allocator.
     std::int32_t ExpiredBlocksAt(const CacheGroupSpec& spec, std::int32_t num_computed_tokens) const {
-        std::int32_t window = 0;
-        switch (spec.kind) {
-            case AttnKind::kFull:
-                return 0;
-            case AttnKind::kSlidingWindow:
-                window = spec.sliding_window;
-                break;
-            case AttnKind::kMambaState:
-                // Keep exactly the live state page plus its snapshot.
-                window = kMambaStateWindow;
-                break;
-            default:
-                FatalCheck(false, "unknown AttnKind in retention policy");
+        if (spec.kind != AttnKind::kSlidingWindow) {
+            return 0;
         }
-        _assert(window > 0, "retention window must be > 0");
-        const std::int32_t skipped = num_computed_tokens - window + 1;
+        _assert(spec.sliding_window > 0, "retention window must be > 0");
+        const std::int32_t skipped = num_computed_tokens - spec.sliding_window + 1;
         // Only fully-slid-out pages expire.
-        return skipped <= 0 ? 0 : skipped / block_granularity_;
+        return skipped <= 0 ? 0 : skipped / BlockGranularity();
     }
-
-    static constexpr std::int32_t kMambaStateWindow = 2;
 
 private:
     std::int32_t sparseSuffixBlocks(const BlockTable& table, const SparseSuffix& sparse,
                                     std::int32_t reserve_tokens) const {
-        // Decode-side prefix acquisition may have already installed aligned
-        // null holes for state. They carry no ownership and remain safe to
-        // extend sparsely up to the remote endpoint snapshot.
-        _assert(table.AvailableTokens() == 0, "sparse suffix materialization requires a page boundary");
+        // The extent is absolute, so spare rows in the table's last block (a
+        // hit's partial tail block the suffix continues right after) do not
+        // carry over; a suffix landing beyond the table leaves holes. A
+        // suffix that starts past the extent's last block lands nothing: the
+        // hit's tail copy already holds the prompt's last block (a tail hit
+        // inside it) and the reserve did not reach the next one.
         _assert(table.NumBlocks() <= sparse.first_block, "sparse suffix overlaps the existing block table");
         _assert(sparse.extent_tokens > 0 && reserve_tokens >= 0,
                 "sparse suffix materialization requires a positive extent");
         const std::int64_t extent = static_cast<std::int64_t>(sparse.extent_tokens) + reserve_tokens;
         _assert(extent <= std::numeric_limits<std::int32_t>::max(), "sparse suffix extent exceeds int32 range");
         const std::int32_t last_block = static_cast<std::int32_t>((extent - 1) / block_granularity_);
-        _assert(sparse.first_block <= last_block, "materialized suffix starts beyond the requested extent");
-        return last_block - sparse.first_block + 1;
+        return std::max(0, last_block - sparse.first_block + 1);
     }
 
     AcquirePlan planSparseSuffix(const BlockTable& table, const SparseSuffix& sparse,
@@ -140,6 +149,9 @@ private:
         const std::int64_t extent = static_cast<std::int64_t>(sparse.extent_tokens) + reserve_tokens;
         const std::int32_t logical_blocks =
             static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
+        // Nothing lands: the table already reaches the extent.
+        _assert(num_blocks > 0 || table.NumBlocks() == logical_blocks,
+                "an empty sparse suffix leaves the table at the extent");
         return AcquirePlan{
             .num_blocks = num_blocks,
             .suffix_start = sparse.first_block,

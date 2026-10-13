@@ -150,6 +150,8 @@ class DSAConfig(MLAConfig):
     def __post_init__(self) -> None:
         # None is a DSA configure-attention hook that named no plane.
         index_k_plane_dtype(self.index_k_format)
+        if self.index_topk < 0:
+            raise ValueError(f"index_topk must be nonnegative, got {self.index_topk}")
 
     @classmethod
     def _spec_kwargs(

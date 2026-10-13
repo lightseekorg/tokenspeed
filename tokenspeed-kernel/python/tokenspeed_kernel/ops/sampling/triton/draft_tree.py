@@ -32,7 +32,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
-__all__ = ["draft_tree_expand", "draft_tree_finalize", "tree_ancestry"]
+__all__ = ["draft_tree_expand", "draft_tree_finalize", "load_tree_ancestry"]
 
 
 @triton.jit
@@ -145,42 +145,61 @@ def _draft_tree_order_kernel(
 
 @triton.jit
 def _tree_ancestry_kernel(
-    parent_ptr,  # [bs, N] int32
+    parent_ptr,  # [bs, N] int32 out: the gathered parents
     depth_ptr,  # [bs, N] int32
     mask_ptr,  # [bs, N] int64
+    parent_map_ptr,  # [pool, N] parents by pool row
+    pool_rows_ptr,  # [bs] pool row of each request
+    positions_ptr,  # [bs * N] window positions vc + i, made vc + depth
+    stride_map,
     N: tl.constexpr,
     N_PAD: tl.constexpr,
 ):
     req = tl.program_id(0)
     nodes = tl.arange(0, N_PAD)
     ok = nodes < N
+    row = tl.load(pool_rows_ptr + req).to(tl.int64)
+    tree_ptr = parent_map_ptr + row * stride_map
     mask = tl.full([N_PAD], 1, tl.int64) << nodes.to(tl.int64)
     depth = tl.zeros([N_PAD], dtype=tl.int32)
-    cursor = tl.load(parent_ptr + req * N + nodes, mask=ok, other=-1)
+    cursor = tl.load(tree_ptr + nodes, mask=ok, other=-1)
+    tl.store(parent_ptr + req * N + nodes, cursor, mask=ok)
     live = cursor >= 0
     while tl.max(live.to(tl.int32), axis=0) > 0:
         safe = tl.where(live, cursor, 0)
         mask |= tl.where(live, tl.full([N_PAD], 1, tl.int64) << safe.to(tl.int64), 0)
         depth += live.to(tl.int32)
-        cursor = tl.where(
-            live, tl.load(parent_ptr + req * N + safe, mask=live, other=-1), -1
-        )
+        cursor = tl.where(live, tl.load(tree_ptr + safe, mask=live, other=-1), -1)
         live = cursor >= 0
     tl.store(depth_ptr + req * N + nodes, depth, mask=ok)
     tl.store(mask_ptr + req * N + nodes, mask, mask=ok)
+    window = positions_ptr + req * N + nodes
+    tl.store(window, tl.load(window, mask=ok) + (depth - nodes), mask=ok)
 
 
-def tree_ancestry(
-    parent: torch.Tensor, depth: torch.Tensor, mask: torch.Tensor
+def load_tree_ancestry(
+    parent_map: torch.Tensor,
+    pool_rows: torch.Tensor,
+    parent: torch.Tensor,
+    depth: torch.Tensor,
+    mask: torch.Tensor,
+    positions: torch.Tensor,
 ) -> None:
-    """Depth and ancestor-or-self mask of every tree node.
+    """One launch for a verify step's trees: gather each request's parents
+    from ``parent_map`` by pool row, derive every node's depth and
+    ancestor-or-self mask, and move the window's positions from ``vc + i`` to
+    ``vc + depth``.
 
     Args:
-        parent: ``[bs, N]`` int32 parent node, ``-1`` for the root, every
-            parent index below its child's; ``N <= 64``.
+        parent_map: ``[pool, N]`` int32 parents by pool row (unit inner
+            stride): ``-1`` for the root, every parent index below its
+            child's; ``N <= 64``.
+        pool_rows: ``[bs]`` integer pool row of each request.
+        parent: ``[bs, N]`` int32 output, the gathered parents.
         depth: ``[bs, N]`` int32 output.
         mask: ``[bs, N]`` int64 output; bit ``j`` marks node ``j`` as an
             ancestor of, or equal to, the row's node.
+        positions: ``[bs * N]`` window positions, shifted in place.
     """
     bs, num_nodes = parent.shape
     if num_nodes > 64:
@@ -191,6 +210,10 @@ def tree_ancestry(
         parent,
         depth,
         mask,
+        parent_map,
+        pool_rows,
+        positions,
+        parent_map.stride(0),
         N=num_nodes,
         N_PAD=max(16, triton.next_power_of_2(num_nodes)),
     )

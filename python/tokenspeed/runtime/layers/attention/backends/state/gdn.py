@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.ops.attention.gdn import gdn_chunk_prefill_capturable
+from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
 
 from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
     CapacityPrefillBackend,
@@ -32,6 +33,8 @@ from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import 
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 
 if TYPE_CHECKING:
+    import torch
+
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -48,6 +51,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
 
     # The scan reads its bounds on device, so packing would only add work to eager forwards.
     _capacity_layout_when_uncaptured = False
+    _verify_scan_writes_replay = True
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         super().__init__(config, spec)
@@ -63,3 +67,12 @@ class GdnAttnBackend(CapacityPrefillBackend):
 
     def _admits_capacity_prefill(self) -> bool:
         return self._prefill_capturable
+
+    def _pack_projection(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor | None,
+        b: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        # Projection views to the dense, aligned rows FlashInfer's kernels need.
+        return pack_gdn_projection(mixed_qkv, a, b)

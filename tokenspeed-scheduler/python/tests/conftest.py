@@ -17,10 +17,9 @@ K3_GROUP_IDS = (K3_HISTORY_GROUP,) + K3_STATE_GROUPS
 
 def _make_k3_config() -> "ts.SchedulerConfig":
     """Kimi-K3-shaped 4-group config: one full-attention History group plus
-    three linear-attention State groups with FullHistory retention --
-    MakeSpecsFromConfig maps State+FullHistory to AttnKind::kMambaState ->
-    MambaStateManager (SwaManager window=2), i.e. one page per
-    state-snapshot slot, exactly the production ratio."""
+    three linear-attention State groups. A State group has no token span
+    (block_granularity 0): its table is two slots, the input checkpoint and
+    the live state, each one page -- exactly the production ratio."""
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = PAGE
     cfg.num_device_pages = 33  # page 0 = null sentinel, 32 usable
@@ -34,7 +33,9 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id=group_id,
-            block_granularity=cfg.prefix_granularity,
+            block_granularity=(
+                cfg.prefix_granularity if group_id == K3_HISTORY_GROUP else 0
+            ),
             total_pages=cfg.num_device_pages,
             retention=ts.CacheRetention.FullHistory,
             family=(
