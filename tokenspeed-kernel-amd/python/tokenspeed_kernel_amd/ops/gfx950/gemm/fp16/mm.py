@@ -1051,7 +1051,7 @@ def gluon_mm_a16w16_medium_gfx950(
         # Complete each subgroup's ".wt" stores, then synchronize the workgroup
         # before incrementing the completion counter. This avoids the L2
         # writeback/invalidation of an acq_rel atomic.
-        wait_vmcnt_zero()
+        wait_vmcnt_zero(args=[offs_cm], constraints="=v,0")
         gl.barrier()
         old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
         if old != SPLIT_K - 1:

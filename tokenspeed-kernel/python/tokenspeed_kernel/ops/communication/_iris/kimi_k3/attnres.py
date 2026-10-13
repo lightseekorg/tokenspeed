@@ -332,7 +332,7 @@ def iris_k3attn_push_oneshot(
             mask=mask,
             cache=".wt",
         )
-    wait_vmcnt_zero()
+    wait_vmcnt_zero(args=[], constraints="=r,~{memory}")
     # Wait for every subgroup's stores before signaling readiness to peers.
     gl.barrier()
 

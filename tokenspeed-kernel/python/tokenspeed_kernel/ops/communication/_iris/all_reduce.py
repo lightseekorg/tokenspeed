@@ -992,7 +992,7 @@ def _iris_sync_rank_token(
         sem="acquire",
         scope="sys",
     )
-    wait_vmcnt_zero()
+    wait_vmcnt_zero(args=[], constraints="=r,~{memory}")
     # The acquire is subgroup-local. Keep every subgroup at the protocol
     # boundary until all of them have observed the peer ready flags; the
     # caller consumes the peer inbox immediately after this helper returns.

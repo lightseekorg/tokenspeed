@@ -44,7 +44,7 @@ def _row_partition_store_completion(
     NUM_WARPS: gl.constexpr,
 ):
     """Complete local stores, update ready flags, and wait for peer completion."""
-    wait_vmcnt_zero()
+    wait_vmcnt_zero(args=[], constraints="=r,~{memory}")
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)

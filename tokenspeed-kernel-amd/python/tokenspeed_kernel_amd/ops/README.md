@@ -38,17 +38,9 @@ Keep an explicit `gl.barrier()` only where the compiler cannot see the hazard:
   re-reading a global buffer other threads just wrote. Say what the barrier
   orders in a comment.
 
-On CDNA, use `tokenspeed_kernel_amd._synchronization.wait_vmcnt_zero()`
-to wait for a subgroup's outstanding vector memory operations to complete.
-It includes a compiler memory clobber; workgroup synchronization and cache
-writeback/invalidation remain with the caller.
-
-Iris push collectives also keep explicit workgroup barriers around their
-cross-rank completion signaling. The vector memory wait and system-scope
-atomics order one subgroup's traffic, but the barriers synchronize all producer
-subgroups before they update ready flags and all consumer subgroups before
-they read the peer inbox. Removing either synchronization point can increase
-cross-rank skew and regress perf even when the generated kernel remains correct.
+Iris push collectives use `wait_vmcnt_zero()` and system-scope atomics for each
+subgroup's memory ordering. Workgroup barriers synchronize producers before
+setting ready flags and consumers before reading peer data.
 
 ## GEMM
 

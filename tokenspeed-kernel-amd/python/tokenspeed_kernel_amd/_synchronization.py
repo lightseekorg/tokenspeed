@@ -26,16 +26,16 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 
 
 @gluon.jit
-def wait_vmcnt_zero():
+def wait_vmcnt_zero(args, constraints: gl.constexpr):
     """Wait for this subgroup's outstanding vector memory operations to complete.
 
-    The memory clobber also prevents compiler reordering of memory accesses.
+    ``args`` and ``constraints`` specify the assembly's compiler dependencies.
     Callers handle workgroup synchronization and cache writeback/invalidation.
     """
     gl.inline_asm_elementwise(
         asm="s_waitcnt vmcnt(0)",
-        constraints="=r,~{memory}",
-        args=[],
+        constraints=constraints,
+        args=args,
         dtype=gl.int32,
         is_pure=False,
         pack=1,
