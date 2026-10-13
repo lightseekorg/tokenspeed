@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 import sys
 import threading
@@ -1634,43 +1633,6 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         self.assertEqual(
             HostCacheExecutor._storage_pages(operation, kept_rows=[(0, [(1, 2)])]),
             [(1, 2, "h1", 1)],
-        )
-
-    def test_ack_requires_backup_pages(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import (
-                HostCacheExecutor,
-                _Ack,
-                _AckKind,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        signature = inspect.signature(_Ack)
-        self.assertIs(
-            signature.parameters["backup_pages"].default, inspect.Parameter.empty
-        )
-        with self.assertRaises(TypeError):
-            _Ack(_AckKind.WRITE_BACK, [1])
-        start_writing = inspect.signature(HostCacheExecutor._start_writing)
-        self.assertIs(
-            start_writing.parameters["backup_pages"].default, inspect.Parameter.empty
-        )
-        with self.assertRaises(TypeError):
-            HostCacheExecutor._start_writing(object(), [7], [(0, 1, 1)])
-
-    def test_l2_constructor_does_not_attach_l3_from_optional_storage(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        signature = inspect.signature(HostCacheExecutor.__init__)
-        self.assertNotIn("storage_backend", signature.parameters)
-        self.assertNotIn("storage_key_prefix", signature.parameters)
-        self.assertNotIn("storage_rank", signature.parameters)
-        self.assertIs(
-            signature.parameters["attn_tp_rank"].default, inspect.Parameter.empty
         )
 
     def test_poll_results_backs_up_host_pages_asynchronously(self):

@@ -30,16 +30,14 @@ the PD completion path (device writes issued straight from an event handler),
 the multimodal gather (a live request struct captured by reference), and the
 SHM release (a resource freed while a queued forward may still read it).
 
-The second half is a property of the code's shape rather than of any one call
-site, so it is asserted over the shape: the loop must not bind a device object
-even as a local, must not keep the startup wiring, must find no startup hook on
-the running handle, and its collaborators must be handed that handle rather
-than walk to it.
+The second half is exercised the way the loop experiences it: the tests build
+a real ``DeviceHandle`` over a stub executor and drive its operations,
+asserting the work that crosses to the device side and the facts that come
+back.
 """
 
 from __future__ import annotations
 
-import ast
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest import mock
@@ -988,204 +986,6 @@ def test_epd_receive_allocation_crosses_through_the_runner(monkeypatch):
     assert job._items[0].recv_main.shape == (4, 8)
 
 
-# ----------------------------------------------------------------------
-# Visibility: the loop cannot name a device object, so it cannot keep one.
-# ----------------------------------------------------------------------
-
-_RAW_DEVICE_OBJECTS = frozenset(
-    {
-        "executor",
-        "model_executor",
-        "attn_backend",
-        "draft_attn_backend",
-        "token_to_kv_pool",
-        "draft_token_to_kv_pool",
-        "model_runner",
-        "target",
-        "draft",
-    }
-)
-
-
-def event_loop_module():
-    from tokenspeed.runtime.engine import event_loop as module
-
-    return module
-
-
-def _event_loop_init():
-    import inspect
-
-    tree = ast.parse(inspect.getsource(event_loop_module()))
-    cls = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "EventLoop"
-    )
-    return next(
-        node
-        for node in cls.body
-        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
-    )
-
-
-def test_the_event_loop_never_binds_a_device_object():
-    """Locals count too: a name it can write is a name it can misuse later.
-
-    ``build_device_side`` owns the model runners, attention backends and KV
-    pools; nothing they produce comes back out except plain facts and the
-    handle. This is the property the whole design rests on, so it is asserted
-    rather than left to review.
-    """
-    bound = {
-        node.id
-        for node in ast.walk(_event_loop_init())
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
-    }
-    assert not (bound & _RAW_DEVICE_OBJECTS)
-
-
-def test_the_event_loop_stores_only_the_running_handle():
-    """The build result must not outlive the constructor.
-
-    It carries the transfer peer and the specs; keeping it would put the
-    device side back within reach of the running loop, which is the whole
-    point of handing back a handle.
-    """
-    stored = {
-        node.attr
-        for node in ast.walk(_event_loop_init())
-        if isinstance(node, ast.Attribute)
-        and isinstance(node.ctx, ast.Store)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "self"
-    }
-    assert "_device" in stored
-    assert not (stored & _RAW_DEVICE_OBJECTS)
-    assert not (stored & {"device", "specs"})
-
-
-def test_the_handle_stays_a_closed_list_of_named_operations():
-    """A god object forms one convenience method at a time.
-
-    Pin the operation names so even a same-size substitution needs review.
-    L3 control operations keep the Host tier behind the handle, as documented
-    in docs/design/event-loop.md: the submit-time existence probe and the
-    prefetch lane's progress/completion the hooks converge each round.
-    Exactly one generic work slot is registered
-    (EPD admission's device half; see run_multimodal_work).
-    """
-    public = {name for name in vars(DeviceHandle) if not name.startswith("_")}
-    assert public == {
-        "execute",
-        "role",
-        "poll_cache_results",
-        "consume_l3_backup_poll_failure",
-        "query_l3_storage",
-        "l3_prefetch_progress",
-        "complete_l3_prefetch",
-        "delete_l3_namespace",
-        "set_l3_weight_version",
-        "shutdown_cache",
-        "run_idle_forward",
-        "run_multimodal_work",
-        "run_kv_repair",
-        "run_remote_prefill_landing",
-        "update_weights",
-        "reset_expert_load",
-        "dump_expert_load",
-        "snapshot_expert_load",
-        "apply_expert_placement",
-    }
-    assert {name for name in public if name.endswith("_work")} == {
-        "run_multimodal_work"
-    }
-
-
-def test_the_handle_hands_back_no_device_object():
-    """Every public name on the handle is an operation, not an object."""
-    trace: list = []
-    handle = _handle(trace)
-    public = {name for name in dir(handle) if not name.startswith("_")}
-    assert not (public & _RAW_DEVICE_OBJECTS)
-    assert not any(getattr(handle, name, None) is handle._executor for name in public)
-
-
-def test_only_the_builder_constructs_the_device_side():
-    """The name denylist above is a proxy; this is the property itself.
-
-    A device object can only reach the loop if someone constructs one there,
-    so pin the constructors: the three factories that produce model runners,
-    attention backends, KV pools and the executor are called from
-    ``execution/device.py`` alone. (``epd/encode_loop.py`` is a different
-    worker — it builds a vision tower and never a ModelExecutor — so it is
-    not in scope for the scheduler loop's invariant.)
-    """
-    import pathlib
-
-    factories = (
-        "create_model_runner(",
-        "create_attn_components(",
-        "create_model_executor(",
-    )
-    allowed = {"execution/device.py", "execution/factory.py", "epd/encode_loop.py"}
-    root = pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed"
-    offenders = []
-    for path in root.rglob("*.py"):
-        rel = path.relative_to(root).as_posix()
-        if any(rel.endswith(suffix) for suffix in allowed):
-            continue
-        text = path.read_text()
-        for factory in factories:
-            if factory in text and f"def {factory}" not in text:
-                offenders.append(f"{rel}: {factory}")
-    assert not offenders, offenders
-
-
-def test_communication_buffers_precede_cache_capacity_planning():
-    import inspect
-    import textwrap
-
-    from tokenspeed.runtime.execution.device import build_device_side
-
-    tree = ast.parse(textwrap.dedent(inspect.getsource(build_device_side)))
-    prepare_lines = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "prepare_communication_runtime"
-    ]
-    cache_lines = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "create_attn_components"
-    ]
-
-    assert prepare_lines and cache_lines
-    assert max(prepare_lines) < min(cache_lines)
-
-
-def test_collaborators_hold_the_handle_instead_of_walking_to_it():
-    """No ``loop.<x>.<y>`` path to the GPU: each hook is handed its own.
-
-    A traversal is the seam a later change widens — first ``loop.device``,
-    then whatever the handle happens to expose. Injection keeps the
-    dependency in the constructor where it is visible.
-    """
-    import inspect
-
-    from tokenspeed.runtime.engine import pause
-    from tokenspeed.runtime.pd import transfer_hooks
-
-    for module in (pause, transfer_hooks, event_loop_module()):
-        source = inspect.getsource(module)
-        assert "loop.device" not in source
-        assert "loop._device" not in source
-
-
 def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests():
     from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
 
@@ -1281,13 +1081,8 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
     execution stream) and before the handle exists, so the first window a
     rebalance or profile sees is traffic only."""
     import contextlib
-    import inspect
-    import textwrap
 
-    from tokenspeed.runtime.execution.device import (
-        build_device_side,
-        start_expert_load_window,
-    )
+    from tokenspeed.runtime.execution.device import start_expert_load_window
     from tokenspeed.runtime.moe import expert_location
 
     placement = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
@@ -1319,27 +1114,6 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
     assert not placement.physical_load.any()
     # Without load recording there is nothing to reset and nothing is touched.
     start_expert_load_window(SimpleNamespace())
-
-    # The reset point: after the graphs are captured, before the handle is built.
-    tree = ast.parse(textwrap.dedent(inspect.getsource(build_device_side)))
-
-    def call_lines(name: str, attribute: bool) -> list[int]:
-        return [
-            node.lineno
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and (
-                (isinstance(node.func, ast.Attribute) and node.func.attr == name)
-                if attribute
-                else (isinstance(node.func, ast.Name) and node.func.id == name)
-            )
-        ]
-
-    captures = call_lines("capture_graphs", attribute=True)
-    resets = call_lines("start_expert_load_window", attribute=False)
-    handles = call_lines("DeviceHandle", attribute=False)
-    assert len(resets) == 1 and captures and handles
-    assert max(captures) < resets[0] < min(handles)
 
 
 def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():

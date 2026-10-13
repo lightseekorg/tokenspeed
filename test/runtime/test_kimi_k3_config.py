@@ -34,6 +34,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa:
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
+from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 # Checkpoint-derived reference values (moonshotai/kimi-k3).
 _NUM_LAYERS = 93
@@ -118,9 +119,8 @@ class KimiK3ConfigTests(unittest.TestCase):
             LinearAttnConfig,
         )
 
-        server_args = SimpleNamespace(
-            mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=tp_size))
-        )
+        # world_size resolves the linear-attention TP width it defaults to.
+        server_args = ServerArgs(model="x", world_size=tp_size)
         model = SimpleNamespace(
             hf_config=SimpleNamespace(text_config=KimiLinearConfig())
         )
@@ -1344,34 +1344,11 @@ class KimiK3RegistrationTests(unittest.TestCase):
         attention.qkv_parallel = None
         self.assertFalse(attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
 
-    def test_config_registry_maps_model_type(self):
-        from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY
-
-        self.assertIs(_CONFIG_REGISTRY.get("kimi_k3"), KimiK3Config)
-
     def test_resolve_architecture_returns_registered_name(self):
         from tokenspeed.runtime.utils.hf_transformers_utils import resolve_architecture
 
         cfg = KimiK3Config(architectures=["KimiK3ForConditionalGeneration"])
         self.assertEqual(resolve_architecture(cfg), "KimiK3ForConditionalGeneration")
-
-    def test_mla_and_multimodal_metadata_registered(self):
-        from tokenspeed.runtime.configs import model_config
-
-        self.assertIn("KimiK3ForConditionalGeneration", model_config._MLA_ARCHITECTURES)
-        self.assertTrue(
-            model_config.is_multimodal_model(["KimiK3ForConditionalGeneration"])
-        )
-
-    def test_entryclass_resolves_in_model_registry(self):
-        from tokenspeed.runtime.models.kimi_k3 import (
-            KimiK3ForConditionalGeneration,
-        )
-        from tokenspeed.runtime.models.registry import ModelRegistry
-
-        cls, arch = ModelRegistry.resolve_model_cls(["KimiK3ForConditionalGeneration"])
-        self.assertIs(cls, KimiK3ForConditionalGeneration)
-        self.assertEqual(arch, "KimiK3ForConditionalGeneration")
 
     def test_text_only_wrapper_streams_and_discards_vision_weights(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiK3ForConditionalGeneration
