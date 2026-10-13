@@ -43,7 +43,7 @@ def _row_partition_store_completion(
     RANK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    """Finish local stores, publish the epoch, and wait for peer completion."""
+    """Complete local stores, update ready flags, and wait for peer completion."""
     wait_vmcnt_zero()
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])

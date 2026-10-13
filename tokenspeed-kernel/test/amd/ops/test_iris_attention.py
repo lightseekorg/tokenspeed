@@ -46,7 +46,7 @@ def _require_iris():
     "operation,has_residual", (("reduce", False), ("reduce", True), ("gather", False))
 )
 def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
-    """Preserve vector payload traffic and publication ordering for runtime rows."""
+    """Preserve vector payload traffic and completion signaling for runtime rows."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
         iris_k3attn_pull_scatter,
@@ -102,14 +102,14 @@ def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
             sum("buffer_store_dwordx4" in line and "sc0 sc1" in line for line in lines)
             == 8
         )
-        # Every producer subgroup must drain and join before publishing flags.
+        # Complete every subgroup's stores and synchronize before setting flags.
         payload_end = assembly.rindex("\tbuffer_store_dwordx4")
-        publish = assembly.index("\tglobal_store_dword", payload_end)
-        publication = assembly[payload_end:publish]
-        drain = publication.index("\ts_waitcnt vmcnt(0)")
-        join = publication.index("\ts_barrier")
-        assert drain < join
-        assert "s_and_saveexec" not in publication[:join]
+        flag_store = assembly.index("\tglobal_store_dword", payload_end)
+        completion = assembly[payload_end:flag_store]
+        wait = completion.index("\ts_waitcnt vmcnt(0)")
+        barrier = completion.index("\ts_barrier")
+        assert wait < barrier
+        assert "s_and_saveexec" not in completion[:barrier]
     assert not re.search(r"\bbuffer_(?:load_ushort|store_short)\b", assembly)
 
 

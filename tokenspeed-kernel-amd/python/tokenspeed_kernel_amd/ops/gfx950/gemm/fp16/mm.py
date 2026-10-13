@@ -1048,10 +1048,9 @@ def gluon_mm_a16w16_medium_gfx950(
             stored_value=acc_store,
             cache=".wt",
         )
-        # Publish the partial without an acq_rel atomic, whose L2 writeback and
-        # invalidate cost more than the GEMM: ".wt" writes through to memory,
-        # every subgroup drains its stores, then the barrier joins all
-        # subgroups before the counter bump.
+        # Complete each subgroup's ".wt" stores, then synchronize the workgroup
+        # before incrementing the completion counter. This avoids the L2
+        # writeback/invalidation of an acq_rel atomic.
         wait_vmcnt_zero()
         gl.barrier()
         old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")

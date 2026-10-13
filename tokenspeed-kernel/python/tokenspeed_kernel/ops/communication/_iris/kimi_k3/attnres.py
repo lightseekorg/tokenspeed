@@ -333,7 +333,7 @@ def iris_k3attn_push_oneshot(
             cache=".wt",
         )
     wait_vmcnt_zero()
-    # Join subgroup-local drains before publishing the generation to peers.
+    # Wait for every subgroup's stores before signaling readiness to peers.
     gl.barrier()
 
     _iris_sync_rank_token(

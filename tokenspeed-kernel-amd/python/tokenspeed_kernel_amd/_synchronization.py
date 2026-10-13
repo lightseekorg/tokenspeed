@@ -27,10 +27,10 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 
 @gluon.jit
 def wait_vmcnt_zero():
-    """Wait for this subgroup's CDNA VM_CNT (vector memory) counter to reach zero.
+    """Wait for this subgroup's outstanding vector memory operations to complete.
 
     The memory clobber also prevents compiler reordering of memory accesses.
-    Callers supply any workgroup rendezvous and cache visibility operations.
+    Callers handle workgroup synchronization and cache writeback/invalidation.
     """
     gl.inline_asm_elementwise(
         asm="s_waitcnt vmcnt(0)",

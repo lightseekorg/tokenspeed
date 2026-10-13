@@ -994,7 +994,7 @@ def _iris_sync_rank_token(
     )
     wait_vmcnt_zero()
     # The acquire is subgroup-local. Keep every subgroup at the protocol
-    # boundary until all of them have observed the peer publications; the
+    # boundary until all of them have observed the peer ready flags; the
     # caller consumes the peer inbox immediately after this helper returns.
     gl.barrier()
 
