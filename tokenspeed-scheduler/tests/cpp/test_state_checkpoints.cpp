@@ -244,28 +244,68 @@ TEST_F(StateCheckpointSuite, FinishRightAfterPrefillPublishesThePrefillsLiveSlot
     EXPECT_EQ(hit->block_tables.at("full").at(0).at(0), full_row.at(0));
 }
 
-// A finish that overtakes an in-flight decode (overlap scheduling: the
-// runtime decides on the landed token while the next step is already
-// dispatched) publishes the KV rows below the frontier, which are final, but
-// not the state: the live slot is being written by the forward in flight.
-TEST_F(StateCheckpointSuite, FinishWithAForwardInFlightPublishesTheTailButNotTheState) {
+// A finish lands on the sampled token while, under the overlap schedule, the
+// decode consuming that token is already dispatched. The request parks in
+// Finishing with its pages; nothing is published at 8, where the live slot is
+// being written. When that decode's result lands the frontier is 9 (102
+// consumed, 103 the unconsumed sample) and the request settles there in the
+// same advance: the state the decode wrote, the KV tail [8, 9), the pages
+// released.
+TEST_F(StateCheckpointSuite, FinishWithAForwardInFlightSettlesAtTheFrontierThatForwardLands) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(7), .max_new_tokens = 8});
     ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
     SendForwardDone("r", {101});
     ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);  // first decode: publishes the state at 7, rotates
     SendForwardDone("r", {102});
-    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);  // second decode, in flight: writes slot 1 in place
-    SendFinish("r");                                   // frontier 8: tokens [1..7, 101], 102 never consumed
+    const ExecutionPlan second = PlanOnce();  // second decode, in flight: writes slot 1 in place
+    const ForwardBatch* batch = FindForwardBatch(second);
+    ASSERT_NE(batch, nullptr);
+    const std::vector<std::int32_t> live = StateRow(*batch, "state0", "r");
+    const std::int32_t held = scheduler_->AvailableLcmBlocks();
+    SendFinish("r");  // decided on 102, which the decode in flight consumes
     PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), held) << "the pages stay held while a forward is out";
+    EXPECT_EQ(scheduler_->TailEntries(), 1u) << "only the prompt end's tail; nothing published at 8";
 
-    // [1..7, 101, 102, 77]: the KV reaches 8 (page [4, 8) completed), but no
-    // state exists at 8 -- the block the in-flight decode was writing is not
-    // the state after eight tokens -- so the hit falls back to the checkpoint
-    // at 7, with the junction at 8.
+    SendForwardDone("r", {103});  // lands: the request settles at 9
+    EXPECT_EQ(scheduler_->TailEntries(), 2u);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks())
+        << "every block is cache-only or free";
     const Resume resume = Probe("hit", {1, 2, 3, 4, 5, 6, 7, 101, 102, 77});
-    EXPECT_EQ(resume.prefix_tokens, 7);
-    EXPECT_GT(resume.state_row.at(0), 0) << "the checkpoint at 7";
+    EXPECT_EQ(resume.prefix_tokens, 9);
+    EXPECT_EQ(resume.state_row.at(0), live.at(1)) << "the live slot the in-flight decode wrote";
+}
+
+// A finish with no forward out settles with the Finish event itself, as it
+// always did: the frontier's tail and state are published and the pages
+// released before the next plan.
+TEST_F(StateCheckpointSuite, AQuiescentFinishSettlesWithTheFinishEvent) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    Submit(RequestWithTokens("r", MakeTokens(6)));
+    PlanOnce();
+    SendForwardDone("r", {101});
+    PlanOnce();  // first decode
+    SendForwardDone("r", {102});
+    EXPECT_EQ(scheduler_->TailEntries(), 1u);
+    SendFinish("r");
+    EXPECT_EQ(scheduler_->TailEntries(), 2u) << "the frontier's tail";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+    EXPECT_EQ(Probe("hit", {1, 2, 3, 4, 5, 6, 101, 77}).prefix_tokens, 7);
+}
+
+// An abort of a finishing request releases its pages without publishing.
+TEST_F(StateCheckpointSuite, AnAbortWhileFinishingPublishesNothing) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    Submit(RequestWithTokens("r", MakeTokens(6)));
+    PlanOnce();
+    SendForwardDone("r", {101});
+    PlanOnce();  // decode in flight
+    SendFinish("r");
+    SendAbortEvent("r");
+    EXPECT_EQ(scheduler_->TailEntries(), 1u) << "the prompt end only";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+    EXPECT_EQ(Probe("miss", {1, 2, 3, 4, 5, 6, 101, 77}).prefix_tokens, 6);
 }
 
 TEST_F(StateCheckpointSuite, AbortReleasesBothSlotsAndPublishesNothing) {
@@ -327,7 +367,9 @@ TEST_F(StateCheckpointSuite, AStateCheckpointLeavesWithItsKvTail) {
         const std::string id = "flood" + std::to_string(i);
         Submit(RequestWithTokens(id, MakeTokens(24, 1000 * (i + 1))));
         PlanOnce();
+        SendForwardDone(id);
         PlanOnce();
+        SendForwardDone(id);
         PlanOnce();
         SendForwardDone(id, {7});
         SendFinish(id);

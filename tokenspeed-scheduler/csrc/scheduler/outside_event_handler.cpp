@@ -54,18 +54,16 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     Request* request = findRequest(event.request_id);
-    if (request == nullptr || request->Is<fsm::Finished>()) {
+    if (request == nullptr || request->IsAnyOf<fsm::Finishing, fsm::Finished>()) {
         return;
     }
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
     // The transfer is done and the request leaves this engine: its computed
-    // frontier is final here, so it publishes like any finish -- the P's
-    // prompt-end state and partial page, the D's final state and tail.
-    if (auto store = publishCompletedPages(*request)) {
-        pending_write_back_operations_.push_back(std::move(*store));
-    }
+    // frontier is final here, so it finishes like any request -- the P's
+    // prompt-end state and partial page, the D's final state and tail are
+    // published when it settles.
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -81,7 +79,7 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
         return;
     }
-    if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>() || request->Is<fsm::Finished>()) {
+    if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::Finished>()) {
         return;
     }
     throw std::logic_error("PD RemotePrefillDoneEvent received before destination admission; state=" +
@@ -93,28 +91,31 @@ void Scheduler::handleEvent(const forward::Finish& event) {
         if (pdTransferInFlight(*request)) {
             throw std::logic_error("PD Finish received while transfer pages are pinned");
         }
-        if (request->Is<fsm::PrefillDone>() || request->Is<fsm::Decoding>()) {
-            if (auto store = publishCompletedPages(*request)) {
-                pending_write_back_operations_.push_back(std::move(*store));
-            }
-        }
         request->Apply(fsm::FinishEvent{&coordinator_});
+    }
+}
+
+void Scheduler::settleFinishedRequests() {
+    for (const std::unique_ptr<Request>& request : requests_) {
+        if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
+            continue;
+        }
+        if (auto store = publishCompletedPages(*request)) {
+            pending_write_back_operations_.push_back(std::move(*store));
+        }
+        request->Apply(fsm::ReleaseEvent{&coordinator_});
     }
 }
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
     fsm::CacheProgress progress = request.CacheProgress();
-    // Every token but the last is computed; the last is the sampled token no
-    // landed forward consumed. A forward still in flight (an overlapped
-    // decode the finish overtook) is writing the live state slot, so that
-    // slot is not the frontier's state and stays unpublished; the KV rows
-    // below the frontier are final either way.
+    // The frontier is final: every forward has landed, so the live state slot
+    // holds the state after the last consumed token and the KV rows below it
+    // are complete.
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
-    const PublicationPoint point =
-        request.ResultsInFlight() > 0 ? PublicationPoint::kFinalKvOnly : PublicationPoint::kFinal;
     RequestProgress completed =
         AdvanceRequestProgress(request, progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false, point);
+                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
     std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages) {
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);
@@ -129,7 +130,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     // Every published entry of the request streams: its pages, its tail and
     // the state checkpoint published with the frontier.
     coordinator_.QueueCachedBlocksForStore(store_hashes);
-    // The request's pages are released right after this (FinishEvent); the
+    // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
 }

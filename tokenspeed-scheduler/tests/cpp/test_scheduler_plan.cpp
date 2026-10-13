@@ -38,21 +38,22 @@ protected:
         return cfg;
     }
 
+    // Both seeds finish right after their prefill (a zero decode width plans
+    // no decode step): the quiescent finish publishes the prompt pages, whose
+    // stream to Host rides the next plan.
     void SetupHostCache() {
         Submit(MakeRequestSpec("r_seed", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
         SendForwardDone("r_seed", {42});
+        SendFinish("r_seed");
         const ExecutionPlan seed_stream = PlanOnce();
         ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(seed_stream).empty());
         AckWriteBacks(seed_stream);
-        SendFinish("r_seed");
-        AckWriteBacks(PlanOnce());
         PlanOnce();
 
         Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
         PlanOnce();
         SendForwardDone("r_fill", {200});
-        AckWriteBacks(PlanOnce());
         SendFinish("r_fill");
         AckWriteBacks(PlanOnce());
         PlanOnce();
@@ -267,8 +268,7 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock)
     Submit(MakeRequestSpec("seed", 1));
     PlanOnce();
     SendForwardDone("seed", {42});
-    PlanOnce();
-    SendFinish("seed");
+    SendFinish("seed");  // quiescent: publishes its page and releases its blocks at once
 
     std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
     ASSERT_EQ(stored.size(), 1u);
@@ -299,7 +299,6 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFini
     Submit(spec);
     PlanOnce();
     SendForwardDone("r1", {42});
-    PlanOnce();
     SendFinish("r1");  // computed tokens [1 2 3]: page [1 2] and the tail [3]
 
     std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
@@ -391,8 +390,7 @@ TEST_F(SubpageKvCacheEventTestSuite, PublishesRemovalWhenAnyChildBlockIsEvicted)
     Submit(MakeRequestSpec("seed", 2));
     PlanOnce();
     SendForwardDone("seed", {42});
-    PlanOnce();
-    SendFinish("seed");
+    SendFinish("seed");  // quiescent: publishes its pages and releases its blocks at once
 
     std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
     ASSERT_EQ(stored.size(), 2u);
@@ -468,6 +466,7 @@ TEST_F(PrefillRoleKvCacheEventTestSuite, AdmissionThatEvictsAndRepublishesABound
     // seed's remote decode publishes the shared pages; dup's next chunk does
     // not fit while seed still holds its pages for the PD transfer.
     SendForwardDone("seed", {42});
+    SendForwardDone("dup");  // its first chunk landed: KV only
     const ExecutionPlan second_round = PlanOnce();
     ASSERT_TRUE(second_round.remote_decode.has_value());
     const ForwardBatch* second = FindForwardBatch(second_round);

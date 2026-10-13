@@ -173,6 +173,7 @@ TEST_F(ChunkedPrefillSuite, MultiChunkPrefillGrowsFullTableThenDecodes) {
     const std::size_t full_after_c1 = op1->block_tables.at("full").at(0).size();
     EXPECT_GT(full_after_c1, 0u);
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+    SendForwardDone("r1");
 
     ExecutionPlan chunk2 = PlanOnce();
     const ForwardBatch* op2 = FindForwardBatch(chunk2);
@@ -459,11 +460,16 @@ TEST_F(PoolAccountingSuite, ThreeRequestsOutOfOrderFinishReclaimExactly) {
     SendForwardDone("r2", {142});
     SendForwardDone("r3", {242});
 
+    // Each plan decodes the live requests; those decodes land before the next
+    // finish, so every finish is quiescent and releases its pages at once.
     SendFinish("r2");
     PlanOnce();
+    SendForwardDone("r1", {43});
+    SendForwardDone("r3", {243});
     SendFinish("r1");
     PlanOnce();
     EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool not fully reclaimed while r3 is still live";
+    SendForwardDone("r3", {244});
     SendFinish("r3");
     PlanOnce();
 
@@ -483,6 +489,7 @@ TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
     Submit(MakeRequestSpec("r1", /*num_pages=*/6));
     PlanOnce();  // chunk 1
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+    SendForwardDone("r1");
     // Chunk 2: N=4 -> first kept token 4-4+1=1 -> first kept page 0: no hole.
     ExecutionPlan chunk2 = PlanOnce();
     const ForwardBatch* c2op = FindForwardBatch(chunk2);
@@ -494,6 +501,7 @@ TEST_F(ChunkedPrefillSuite, ChunkedPrefillThenSwaSlidesToNullHole) {
             << "N=4, W=4: no page fully below token 1, so chunk 2 punches nothing";
     }
     EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+    SendForwardDone("r1");
     const std::int32_t free_after_c2 = scheduler_->AvailableLcmBlocks();
 
     // Chunk 3: N=8 -> first kept token 5 -> page 5/2=2: slots 0,1 punched MID-PREFILL.
@@ -890,10 +898,12 @@ TEST_F(PrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlides) {
     ExecutionPlan c1 = PlanOnce();
     ASSERT_NE(FindForwardBatch(c1), nullptr);
     ASSERT_EQ(FindForwardBatch(c1)->request_ids.size(), 1u);
+    SendForwardDone("r1");
     ExecutionPlan c2 = PlanOnce();
     ASSERT_NE(FindForwardBatch(c2), nullptr);
     ASSERT_EQ(FindForwardBatch(c2)->request_ids.size(), 1u);
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 4);
+    SendForwardDone("r1");
 
     // c3 gate: chunk + reserve = 3 blocks/group = 6 vs raw free 4; the pending
     // slide at N=8 frees the 2 swa pages below token 5 -> 4 + 2 = 6, admitted.
@@ -935,6 +945,7 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     ExecutionPlan c1 = PlanOnce();
     ASSERT_NE(FindForwardBatch(c1), nullptr);
     ASSERT_EQ(FindForwardBatch(c1)->request_ids.size(), 1u);
+    SendForwardDone("r1");
 
     ExecutionPlan c2 = PlanOnce();  // registers pages 0,1 both groups: streaming op1
     ASSERT_NE(FindForwardBatch(c2), nullptr);
@@ -946,6 +957,7 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     EXPECT_EQ(op1.src_pages.at(0).size(), 4u) << "the first completed Full+SWA pages stream together";
     EXPECT_EQ(op1.source_pinned, std::vector<bool>{true}) << "an ordinary publication pins its sources";
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 4);
+    SendForwardDone("r1");
 
     ExecutionPlan stalled = PlanOnce();  // slide credit 2 is pinned by op1: c3 cannot admit yet
     const ForwardBatch* stalled_forward = FindForwardBatch(stalled);
@@ -1014,6 +1026,9 @@ TEST_F(PrefillPlateauSuite, SwaWorkingSetPlateausWhileFullGrowsToPromptLength) {
     std::size_t swa_peak = 0;
     std::size_t full_last = 0;
     for (std::int32_t chunk = 0; chunk < 5; ++chunk) {
+        if (chunk > 0) {
+            SendForwardDone("r1");  // the previous chunk landed: KV only
+        }
         ExecutionPlan plan = PlanOnce();
         const ForwardBatch* op = FindForwardBatch(plan);
         ASSERT_NE(op, nullptr) << "chunk " << chunk;
@@ -1505,6 +1520,7 @@ TEST_F(FusedRetractionL2TestSuite, ADecodingVictimResumesDecodingWithoutRecomput
     CompleteStores(retraction);
     ASSERT_EQ(scheduler_->WaitingSize(), 1u);
     ASSERT_EQ(scheduler_->DecodingSize(), 1u);
+    SendForwardDone("r2", {145});  // the decode the grant served
 
     // r2 leaves; r1 is restored. The bound of 0 would have recomputed all 7
     // tokens on a fresh admission; the restore copies the image back instead
@@ -1514,7 +1530,7 @@ TEST_F(FusedRetractionL2TestSuite, ADecodingVictimResumesDecodingWithoutRecomput
     ASSERT_NE(r2_only, nullptr);
     ASSERT_EQ(r2_only->request_ids, std::vector<std::string>{"r2"});
     CompleteStores(resumed);
-    SendForwardDone("r2", {145});
+    SendForwardDone("r2", {146});
     SendFinish("r2");
     const ExecutionPlan readmit = PlanOnce();
     ASSERT_TRUE(FindForwardBatch(readmit)->request_ids.empty());
@@ -1645,9 +1661,10 @@ TEST_F(FusedRetractionKvEventsSuite, RetractionAndRestorePublishWithTheirDescrip
     const std::vector<std::vector<std::int32_t>> broken = missing();
     ASSERT_FALSE(broken.empty()) << "r2's grant evicted part of r1's published prefix";
     EXPECT_TRUE(published.contains({142, 143})) << "r2's own decode page was published by the same admission";
+    SendForwardDone("r2", {145});  // the decode the grant served
 
     CompleteStores(PlanOnce());
-    SendForwardDone("r2", {145});
+    SendForwardDone("r2", {146});
     SendFinish("r2");
     Apply(published, scheduler_->DrainKvEvents());  // r2's finish publishes its own decode page
     EXPECT_EQ(missing(), broken);
@@ -4855,10 +4872,12 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
     EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r2 stays intact in the waiting set";
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 6) << "a deferred first chunk must not touch the pool";
 
-    // r3 finishes -> 12 available parents, 6 of them r3's cached blocks. r2
-    // protects 4 hit parents and acquires 4 fresh plus 2 physically reserved
-    // parents: the 2 empty ones and 4 evicted from r3, leaving 2 of r3's.
+    // Both of r3's decodes land and it finishes -> 12 available parents, 6 of
+    // them r3's cached blocks. r2 protects 4 hit parents and acquires 4 fresh
+    // plus 2 physically reserved parents: the 2 empty ones and 4 evicted from
+    // r3, leaving 2 of r3's.
     SendForwardDone("r3", {600});
+    SendForwardDone("r3", {601});
     SendFinish("r3");
     ExecutionPlan plan2 = PlanOnce();
     const ForwardBatch* op2 = FindForwardBatch(plan2);
@@ -4888,7 +4907,8 @@ TEST_F(PrefixHitTightPoolSuite, ProtectedHitAndFreshDemandMustFitTogether) {
 // chain (admission: register -> slide -> acquire), so a later turn hits PAST
 // the previous prompt boundary. Fill timing: a round at container Size s has
 // N = s - 1 computed and registers pages up to N/prefix_granularity -- a tail page
-// registers one round late (finishing earlier frees its block hashless).
+// registers one round late, or at the finish, which publishes the frontier
+// once every forward has landed.
 // ---------------------------------------------------------------------------
 class DecodeCachingSuite : public PrefixHitSuite {
 protected:
@@ -4908,10 +4928,12 @@ protected:
         return rows;
     }
 
-    // Turn 1: prompt {1,2,3,4}, generated 101..105 (page=2). Finalize registers
+    // Turn 1: prompt {1,2,3,4}, generated 101..106 (page=2). Finalize registers
     // prompt pages 0,1; +103 (N=6) registers page 2; +105 (N=8) registers page
-    // 3 (tail one round late: 105 exists only to push N past 8). Returns the
-    // last round's rows: 5 slots, the first 4 = the conversation's pages 0..3.
+    // 3 (tail one round late: 105 exists only to push N past 8). That round's
+    // decode lands (106) so the finish is quiescent and publishes the tail
+    // [105], which no later turn shares. Returns the +105 round's rows: 5
+    // slots, the first 4 = the conversation's pages 0..3.
     std::map<std::string, std::vector<std::int32_t>> RunTurnOne() {
         Submit(MakeRequestSpec("r1", /*num_pages=*/2));
         ExecutionPlan prefill = PlanOnce();
@@ -4921,6 +4943,7 @@ protected:
         AdvanceOneRound("r1", 103);
         AdvanceOneRound("r1", 104);
         auto rows = AdvanceOneRound("r1", 105);
+        SendForwardDone("r1", {106});
         SendFinish("r1");
         PlanOnce();  // reap
         return rows;
@@ -4996,16 +5019,18 @@ TEST_F(DecodeCachingSuite, MultiTurnConversationReusesResponsePages) {
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
     // Turn 2: hit 4 pages, then decode 201..203: +201 finalize registers page
-    // 4 = {901,902}; +203 (N=12) registers page 5 (tail one round late).
+    // 4 = {901,902}; the finish after 203 lands publishes the frontier at N=12
+    // and registers page 5 -- a page boundary, so no tail of 203 is published
+    // for turn 3 to hit.
     Submit(MakeSpecWithTokens("r2", MakeTurnTwoPrompt()));
     ExecutionPlan turn2 = PlanOnce();
     const ForwardBatch* op2 = FindForwardBatch(turn2);
     ASSERT_NE(op2, nullptr);
     EXPECT_EQ(op2->extend_prefix_lens.at(0), 8) << "turn 2 hits r1's prompt + response pages";
     AdvanceOneRound("r2", 201);
-    AdvanceOneRound("r2", 202);
-    const auto r2_rows = AdvanceOneRound("r2", 203);
-    ASSERT_EQ(r2_rows.at("full").size(), 7u);  // ceil(13/2)
+    const auto r2_rows = AdvanceOneRound("r2", 202);
+    ASSERT_EQ(r2_rows.at("full").size(), 6u);  // ceil(12/2)
+    SendForwardDone("r2", {203});
     SendFinish("r2");
     PlanOnce();  // reap
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
@@ -5075,6 +5100,7 @@ TEST_F(DecodeCachingSmallWindowSuite, SwaPunchedDecodePageStillHittable) {
     // its block reaches the free list with the hash intact.
     const auto punched = AdvanceOneRound("r1", 106);
     EXPECT_EQ(punched.at("swa")[2], 0) << "the registered decode page must be punched by now";
+    SendForwardDone("r1", {107});  // that round's decode lands: the finish is quiescent
     SendFinish("r1");
     PlanOnce();  // reap
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
@@ -5132,7 +5158,7 @@ TEST_F(DecodeCachingSuite, PoolBalanceAcrossDecodeCaching) {
     EXPECT_LT(scheduler_->AvailableLcmBlocks(), free_at_start) << "turn 2 holds claimed + fresh pages while live";
     AdvanceOneRound("r2", 201);
     AdvanceOneRound("r2", 202);
-    AdvanceOneRound("r2", 203);
+    SendForwardDone("r2", {203});
     SendFinish("r2");
     PlanOnce();  // reap
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "turn 2: claimed and fresh pages all return";
@@ -5326,10 +5352,14 @@ TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
 
     // Both prompts end with the same generated tokens, so their tails share
     // one hash: r1's finish stores it, r2's finds it in flight and drops it.
+    // r2 finishes while its decode is still out, so it settles only when that
+    // decode lands -- after r1's store was emitted.
+    SendFinish("r2");
     auto tail_wb = FindWriteBack(FinishAndReap("r1"));
     ASSERT_TRUE(tail_wb.has_value());
     EXPECT_EQ(tail_wb->src_pages.at(0).size(), 2u);
-    EXPECT_FALSE(FindWriteBack(FinishAndReap("r2")).has_value()) << "same-round duplicates must be dropped";
+    SendForwardDone("r2", {9002});
+    EXPECT_FALSE(FindWriteBack(PlanOnce()).has_value()) << "same-round duplicates must be dropped";
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 8)
         << "one pinned source per emitted key; the dropped duplicates pin nothing";
 
@@ -5585,9 +5615,11 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "an abandoned admission must unpin its host match";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
 
-    // Free the filler (its write-back pins included) -> r2 admits with the load-back.
+    // Free the filler (its write-back pins included): both decodes planned so
+    // far land and it finishes -> r2 admits with the load-back.
     SendWriteBackDone(filler_wb->op_ids.at(0));
     SendForwardDone("filler", {9002});
+    SendForwardDone("filler", {9003});
     SendFinish("filler");
     ExecutionPlan after_finish = PlanOnce();
     AckWriteBacks(after_finish);
@@ -5820,6 +5852,9 @@ protected:
             ASSERT_NE(FindForwardBatch(plan), nullptr) << "chunk " << i;
             ASSERT_EQ(FindForwardBatch(plan)->request_ids.size(), 1u) << "chunk " << i << " must be admitted";
             AckWriteBacks(plan);
+            if (i + 1 < prefill_rounds) {
+                SendForwardDone(spec.request_id);  // an intermediate chunk lands: KV only
+            }
         }
         SendForwardDone(spec.request_id, {9001});
         AckWriteBacks(PlanOnce());  // finalize: registration + drain
@@ -5862,6 +5897,7 @@ TEST_F(ChunkedHostHitSuite, ChunkedPrefillAfterHostHit) {
     EXPECT_EQ(op1->prefill_lengths.at(0), 16);
     // 6 ext + 2 fresh/group: 10 blocks held.
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start - 10);
+    SendForwardDone("r2");
 
     // Chunk 2 completes prefill; its slide at num_computed=12 punches swa ext slots
     // 2,3 = LOADED destinations mid-copy. The ticket must keep them off the free list.

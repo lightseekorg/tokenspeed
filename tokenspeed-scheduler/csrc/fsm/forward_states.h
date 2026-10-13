@@ -317,6 +317,23 @@ struct Restoring {
     std::uint32_t restore_op{0};
 };
 
+// The request is done but its pages are not: every finish passes through
+// here, whether or not a forward is still out against the pages. The
+// scheduler settles it at the next plan once no result is in flight --
+// publishes the frontier (the state the last landed forward wrote and the KV
+// below the one unconsumed token) and releases the pages. Under the overlap
+// schedule the finish lands while the next decode is dispatched; that decode's
+// result still arrives and extends the tokens, so the frontier it published
+// is the one after the token the finish was decided on. Nothing is scheduled
+// for it, and it is no retraction victim.
+struct Finishing {
+    explicit Finishing(ForwardResources resources) : resources{std::move(resources)} {}
+
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
+
+    ForwardResources resources;
+};
+
 struct Finished {};
 
 }  // namespace tokenspeed::fsm

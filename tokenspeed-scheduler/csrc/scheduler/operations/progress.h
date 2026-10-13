@@ -37,10 +37,6 @@ enum class PublicationPoint {
     // The frontier is final for the owner (finish, retraction): the partial
     // page is published in place as a tail, and so is the state.
     kFinal,
-    // The frontier is final but a forward of the owner's is still in flight,
-    // writing its live state slot: the partial page's rows below the frontier
-    // are final and publish as a tail; the state does not.
-    kFinalKvOnly,
     // The owner keeps writing past the frontier (a prompt end followed by
     // decode): the partial page is published as a tail and the admission
     // swaps a fresh block into the owner's table, copying the published rows.

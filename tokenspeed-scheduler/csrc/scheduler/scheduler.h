@@ -229,6 +229,12 @@ private:
     void registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
                                     const CompletedPages& completed);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);
+    // Finished requests whose forwards have all landed: publish the frontier
+    // (state and KV tail) and release the pages. Runs after every batch of
+    // events, so a request that finished quiescent settles with its Finish
+    // and one whose finish overtook an overlapped decode settles with that
+    // decode's result -- paused or not, plan or no plan.
+    void settleFinishedRequests();
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
 
     std::size_t groupIndex(const std::string& group_id) const;
@@ -238,7 +244,8 @@ private:
     // the D role it is the peer's prefill writing the destination pages
     // (RemotePrefilling); on the P role it is the peer's decode reading them,
     // which begins with the first scheduled chunk and ends only with the PD
-    // ACK -- every page-holding state. A fused engine never transfers.
+    // ACK -- every page-holding state before Finishing. A fused engine never
+    // transfers.
     bool pdTransferInFlight(const Request& request) const;
 
     void handleEvent(const cache::WriteBackDone& event);

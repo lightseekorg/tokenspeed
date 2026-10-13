@@ -189,22 +189,23 @@ protected:
         return cfg;
     }
 
+    // Both seeds finish right after their prefill (a zero decode width plans
+    // no decode step): the quiescent finish publishes the prompt pages, whose
+    // stream to Host rides the next plan.
     void SetupHostCache() {
         Submit(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
         SendForwardDone("r1", {42});
+        SendFinish("r1");
         const ExecutionPlan seed_stream = PlanOnce();
         ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(seed_stream).empty())
             << "SetupHostCache: expected WriteBack op for r1";
         AckWriteBacks(seed_stream);
-        SendFinish("r1");
-        AckWriteBacks(PlanOnce());
         PlanOnce();
 
         Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
         PlanOnce();
         SendForwardDone("r_fill", {200});
-        AckWriteBacks(PlanOnce());
         SendFinish("r_fill");
         AckWriteBacks(PlanOnce());
         PlanOnce();
@@ -986,6 +987,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecod
     ASSERT_NE(later, nullptr);
     EXPECT_EQ(later->block_tables.at("state").at(0), decode_state) << "every decode writes slot 1 in place";
 
+    SendForwardDone("r0", {44});  // the last decode lands: r0 leaves quiescent
     ExecutionEvent succeeded;
     succeeded.With(pd::SucceededEvent{"r0"});
     scheduler_->Advance(succeeded);
@@ -1035,6 +1037,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     SendForwardDone("r1", {44});
     const ForwardBatch* later = FindForwardBatch(PlanOnce().Operations());
     ASSERT_NE(later, nullptr);
+    SendForwardDone("r1", {45});  // that decode lands: r1 leaves quiescent
     ExecutionEvent r1_done;
     r1_done.With(pd::SucceededEvent{"r1"});
     scheduler_->Advance(r1_done);
@@ -1119,6 +1122,7 @@ TEST_F(PdSlidingSparseDecodeAdmissionTestSuite, KeepsCachedPrefixIslandWhileMate
     SendRemotePrefillDone("seed", /*bootstrap_token=*/42);
     const ExecutionPlan seed_decode = PlanOnce();
     ASSERT_NE(FindForwardBatch(seed_decode.Operations()), nullptr);
+    SendForwardDone("seed", {43});  // the decode lands: the seed leaves quiescent
     ExecutionEvent seed_succeeded;
     seed_succeeded.With(pd::SucceededEvent{"seed"});
     scheduler_->Advance(std::move(seed_succeeded));

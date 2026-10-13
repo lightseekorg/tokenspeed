@@ -123,7 +123,9 @@ bool Scheduler::pdTransferInFlight(const Request& request) const {
         case Role::kD:
             return request.Is<fsm::RemotePrefilling>();
         case Role::kP:
-            return request.HoldsPages();
+            // Every page-holding state but Finishing: SucceededEvent moves a
+            // request there once the peer has read its pages.
+            return request.HoldsPages() && !request.Is<fsm::Finishing>();
         case Role::kFused:
             return false;
     }
@@ -495,6 +497,9 @@ void Scheduler::Advance(const ExecutionEvent& event) {
     for (const auto& item : event.Events()) {
         std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }
+    // Finishing is entered and forwards land only here, so this is the one
+    // place a finished request can become settleable.
+    settleFinishedRequests();
 }
 
 }  // namespace tokenspeed

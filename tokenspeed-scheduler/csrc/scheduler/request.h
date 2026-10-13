@@ -262,6 +262,7 @@ public:
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
                               [](const fsm::Restoring&) -> std::string { return "Restoring"; },
+                              [](const fsm::Finishing&) -> std::string { return "Finishing"; },
                               [](const fsm::Finished&) -> std::string { return "Finished"; },
                           },
                           state_);

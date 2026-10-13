@@ -72,10 +72,14 @@ std::int32_t Request::NumComputedTokens() const {
         Overloaded{
             [](const fsm::Prefilling& state) { return state.window.begin + state.window.size; },
             [](const fsm::PrefillDone& state) { return state.window.begin + state.window.size; },
+            // Every token but the last is computed; the last is the sampled
+            // token no landed forward consumed.
             [this](const fsm::Decoding&) { return TokenSize() - 1; },
+            [this](const fsm::Finishing&) { return TokenSize() - 1; },
             [this](const auto&) -> std::int32_t {
                 throw std::logic_error(
-                    "Request::NumComputedTokens: expected Prefilling, PrefillDone or Decoding; got " + StateName());
+                    "Request::NumComputedTokens: expected Prefilling, PrefillDone, Decoding or Finishing; got " +
+                    StateName());
             },
         },
         state_);

@@ -258,10 +258,16 @@ def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
         completed_tokens += op.input_lengths[0]
         if completed_tokens == 131_072:
             break
+        _advance_tokens(
+            corrected, "128k", []
+        )  # an intermediate chunk lands without a token
     assert completed_tokens == 131_072
     _advance_tokens(corrected, "128k", [131_072])
     assert _find_forward_op(corrected.next_execution_plan()) is not None
-    _finish(corrected, "128k")
+    _advance_tokens(corrected, "128k", [131_073])  # the decode lands
+    _finish(
+        corrected, "128k"
+    )  # quiescent: publishes the frontier and releases the pages
     corrected.next_execution_plan()
     assert corrected.available_lcm_blocks() == before
 

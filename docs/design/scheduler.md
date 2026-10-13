@@ -222,6 +222,24 @@ state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.
 
+**A finish settles when its last forward has landed.** `forward::Finish`
+(and the P role's `pd::SucceededEvent`) moves a page-holding request to
+`Finishing` and nothing else; after every batch of events,
+`settleFinishedRequests` publishes the frontier of each `Finishing` request
+with no forward in flight (`kFinal`: KV tail and state) and releases its
+pages (`ReleaseEvent`). One path for every schedule: a request that finished
+quiescent settles with its Finish event — the timing every caller always
+saw — and one whose finish was decided on a landed token while the overlap
+schedule had already dispatched the next decode settles when that decode's
+result lands, at the frontier that decode produced (one token further: the
+token the finish was decided on, consumed). The live slot is therefore never
+published while a forward writes it, and a paused loop, which drains its
+forwards without building plans, settles its finishes all the same. The
+runtime reports every landed forward row, tracked or not
+(`generation_output_processor`), so the count always reaches zero. A
+`Finishing` request is never scheduled and never a retraction victim; an
+abort releases it without publishing.
+
 **Hits.** The probe (§1, "What the probe may claim") resumes a hybrid model
 at the longest `T` with a published state checkpoint in every State group and
 KV coverage in every token-spanned group; the state lands in slot 0 as a
