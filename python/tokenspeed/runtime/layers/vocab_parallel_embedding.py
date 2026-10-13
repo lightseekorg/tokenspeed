@@ -583,6 +583,9 @@ class VocabParallelEmbedding(torch.nn.Module):
             if reduce_results:
                 return all_reduce(output_parallel, self.tp_group)
             return output_parallel
+        if self._fused_shard_gather(input_):
+            # One gather: an out-of-range id reads a zero row, as on the TP path.
+            return self._partial_lookup(input_)
         # Single-rank (DP / replicated) path has no shard mask, so an
         # out-of-range id (e.g. CUDA-graph capture warmup where the drafter
         # feeds argmax over uninitialized logits) hits F.embedding OOB.

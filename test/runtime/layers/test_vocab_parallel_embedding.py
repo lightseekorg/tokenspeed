@@ -57,6 +57,29 @@ def test_fp8_tp_lookup_masks_remote_rows() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused gather requires CUDA")
+def test_bf16_single_rank_lookup_is_one_gather() -> None:
+    """A replicated table gathers its rows in one kernel, bit for bit those of
+    F.embedding; ids past the table read zero rows."""
+    embedding = VocabParallelEmbedding(
+        num_embeddings=130,
+        embedding_dim=8,
+        params_dtype=torch.bfloat16,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        padding_size=64,
+    ).cuda()
+    embedding.weight.data.copy_(
+        torch.randn(embedding.weight.shape, device="cuda").to(torch.bfloat16)
+    )
+    token_ids = torch.tensor([0, 63, 64, 129, 5, 4000], device="cuda")
+    output = embedding(token_ids)
+    expected = torch.nn.functional.embedding(token_ids[:5], embedding.weight)
+    torch.testing.assert_close(output[:5], expected, rtol=0, atol=0)
+    assert torch.count_nonzero(output[5]) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="fused gather requires CUDA")
 @pytest.mark.parametrize("tp_rank", [0, 1])
 def test_bf16_tp_lookup_matches_masked_reference(tp_rank: int) -> None:
     """The one-kernel shard gather equals mask-then-lookup on every rank."""
