@@ -495,6 +495,7 @@ class Glm53FlashMoE(DeepseekV3MoE):
                 "correction_bias": self.gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
             },
+            deterministic_finalize=False,
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,

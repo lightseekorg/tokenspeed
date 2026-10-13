@@ -910,6 +910,7 @@ class InklingSparseMoeBlock(nn.Module):
                 ep_size=mapping.moe.ep_size,
                 # Inkling routing is computed in InklingGate; the MoE kernel consumes the precomputed top-k plan.
                 routing_mode="precomputed_topk",
+                deterministic_finalize=False,
             )
             assert not self.experts.support_routing
         self.comm_manager = CommManager(

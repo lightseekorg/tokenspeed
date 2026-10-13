@@ -444,6 +444,7 @@ def _make_moe_plan(api, routing_mode):
         deepep_mode=None,
         deepep_low_latency_max_num_tokens_per_gpu=None,
         solution=None,
+        requires_deterministic_finalize=False,
     )
 
 

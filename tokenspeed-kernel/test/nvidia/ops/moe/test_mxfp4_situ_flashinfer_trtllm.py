@@ -246,6 +246,7 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        requires_deterministic_finalize=False,
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
@@ -289,6 +290,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
         deepep_mode=None,
         deepep_low_latency_max_num_tokens_per_gpu=None,
         solution="flashinfer_trtllm",
+        requires_deterministic_finalize=False,
     )
     # Bound memory/time while leaving FI's native bucket policy unchanged.
     monkeypatch.setattr(tuning, "_autotune_max_num_tokens", 32)

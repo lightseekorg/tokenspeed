@@ -72,11 +72,14 @@ def test_wrapper_never_enables_pdl(monkeypatch) -> None:
     monkeypatch.setattr(cutlass_unquant, "cutlass_fused_moe", fake_cutlass_fused_moe)
     x = torch.zeros(2, 8, dtype=torch.bfloat16, device="cuda")
     cutlass_unquant.flashinfer_cutlass_unquant_moe_apply(
-        {},
+        {"deterministic_finalize": False},
         x,
         SimpleNamespace(
             w13_weight=torch.zeros(4, 16, 8, dtype=torch.bfloat16, device="cuda"),
             w2_weight=torch.zeros(4, 8, 8, dtype=torch.bfloat16, device="cuda"),
+            swiglu_alpha_t=None,
+            swiglu_beta_t=None,
+            swiglu_limit_t=None,
         ),
         None,
         topk_weights=torch.ones(2, 1, device="cuda"),
@@ -115,11 +118,14 @@ def test_wrapper_passes_one_persistent_zeroed_workspace(monkeypatch) -> None:
         ep_rank=1,
         tp_size=1,
         tp_rank=0,
+        swiglu_alpha_t=None,
+        swiglu_beta_t=None,
+        swiglu_limit_t=None,
     )
 
     def apply(tokens: int) -> None:
         cutlass_unquant.flashinfer_cutlass_unquant_moe_apply(
-            {},
+            {"deterministic_finalize": False},
             torch.zeros(tokens, hidden, dtype=torch.bfloat16, device=device),
             layer,
             None,
@@ -211,6 +217,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         fast_math=True,
         combine_order="rank",
         solution="flashinfer_cutlass",
+        requires_deterministic_finalize=False,
     )
     reference_w13 = w13.clone()
     layer = SimpleNamespace(
@@ -220,6 +227,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         ep_rank=ep_rank,
         tp_size=1,
         tp_rank=0,
+        swiglu_arg=None,
     )
     kernel_moe_process_weights(plan, layer)
     expected = _reference(
