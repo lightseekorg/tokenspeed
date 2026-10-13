@@ -1119,8 +1119,8 @@ lands in the same change as the pin, never a release apart.
   group's rotation swaps a released block for a fresh one, and the owner's
   copy-in is best effort (1). Without this a pool full of retraction-exempt
   requests wedges at their first decodes.
-  A sliding-window group's growth that recycling cannot fund is not
-  reserved (1); the empty-round retraction keeps such a pool live (2).
+  A sliding-window group's growth can outrun its reserve (1); the
+  empty-round retraction keeps such a pool live (2).
 - A store either pins its Device sources until the ack or is stream-ordered;
   never neither (2). Only the two legs of a retraction image are
   stream-ordered — their sources are granted away in the same round — and
