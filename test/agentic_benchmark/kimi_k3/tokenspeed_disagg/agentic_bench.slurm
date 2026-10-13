@@ -36,6 +36,7 @@ CONTAINER_IMAGE="${CONTAINER_IMAGE:?set CONTAINER_IMAGE to an enroot image with 
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/data:/data}"
 CONTAINER_NAME="${CONTAINER_NAME:-ts}"
 export NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
+export DISAGGREGATION_IB_DEVICE="${DISAGGREGATION_IB_DEVICE:-mlx5_0,mlx5_1,mlx5_2,mlx5_3}"
 export NO_PROXY="*" no_proxy="*"
 export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 
@@ -86,7 +87,7 @@ pip install "evalscope[perf] @ git+https://github.com/modelscope/evalscope.git@$
 launch_server() {
     local role=$1 nodes=$2
     shift 2
-    SERVER_LOG="$SWEEP_DIR/logs/${role}.log"
+    SERVER_LOG=/tmp/tokenspeed_server_pd_1adp16_1adp16_ep16_${role}.log
     "${SRUN[@]}" --job-name="k3_${role}" \
         --nodes=4 --ntasks=4 --ntasks-per-node=1 --nodelist="$nodes" \
         --mpi=pmix "${SRUN_ARGS[@]}" bash -c '
@@ -94,14 +95,12 @@ set -euo pipefail
 role=$1
 shift
 export TOKENSPEED_SKIP_GRPC_WARMUP=1
-if [[ -n ${DISAGGREGATION_IB_DEVICE:-} ]]; then
-    set -- "$@" --disaggregation-ib-device "$DISAGGREGATION_IB_DEVICE"
-fi
 exec bash configs/attn_dp16_moe_ep16.sh \
     --grpc \
     --disaggregation-mode "$role" \
     --load-balance-method round_robin \
     --disaggregation-transfer-backend mooncake \
+    --disaggregation-ib-device "$DISAGGREGATION_IB_DEVICE" \
     "$@"
 ' _ "$role" "$@" > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
@@ -159,8 +158,8 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 wait_for_port_free
-SWEEP_DIR="$SCRIPT_DIR/outputs/pd_1p1d_$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$SWEEP_DIR/logs"
+SWEEP_TS=$(date +%Y%m%d_%H%M%S)
+SWEEP_DIR="${SCRIPT_DIR}/outputs/${SWEEP_TS}"
 echo "1P1D: prefill=$P_NODES decode=$D_NODES; outputs=$SWEEP_DIR"
 
 launch_server prefill "$P_NODES" \
@@ -172,8 +171,8 @@ launch_server decode "$D_NODES" \
     --port 18347 \
     --mm-encoder-tp-mode weights
 DECODE_PID=$SERVER_PID
-wait_for_ready "$PREFILL_PID" "$SWEEP_DIR/logs/prefill.log"
-wait_for_ready "$DECODE_PID" "$SWEEP_DIR/logs/decode.log"
+wait_for_ready "$PREFILL_PID" /tmp/tokenspeed_server_pd_1adp16_1adp16_ep16_prefill.log
+wait_for_ready "$DECODE_PID" /tmp/tokenspeed_server_pd_1adp16_1adp16_ep16_decode.log
 
 # Launch the shared P/D gateway
 "${SRUN[@]}" \
@@ -195,18 +194,18 @@ wait_for_ready "$DECODE_PID" "$SWEEP_DIR/logs/decode.log"
     --decode-policy round_robin \
     --dp-aware \
     --sticky-sessions \
-    --assignment-mode min_load \
+    --assignment-mode delegate \
     --disable-retries \
     --disable-circuit-breaker \
     --disable-health-check \
     --request-timeout-secs 1800 \
     --max-concurrent-requests -1 \
-    > "$SWEEP_DIR/logs/gateway.log" 2>&1 &
+    > /tmp/tokenspeed_gateway_pd_1adp16_1adp16_ep16.log 2>&1 &
 GATEWAY_PID=$!
 START=$SECONDS
 until curl -sf -m 5 -o /dev/null "${BASE_URL}/readiness"; do
     if ! kill -0 "$GATEWAY_PID" 2>/dev/null || (( SECONDS - START > 600 )); then
-        tail -100 "$SWEEP_DIR/logs/gateway.log" >&2
+        tail -100 /tmp/tokenspeed_gateway_pd_1adp16_1adp16_ep16.log >&2
         exit 1
     fi
     sleep 5
@@ -233,9 +232,7 @@ echo "Warmup..."
     --parallel 16 \
     --dataset-offset 2784 \
     --extra-args '{"ignore_eos": true}' \
-    --name warmup \
-    --outputs-dir "$SWEEP_DIR/warmup" \
-    --no-timestamp
+    --outputs-dir /tmp/outputs
 
 echo "Benchmark..."
 "${SRUN[@]}" \
@@ -257,7 +254,7 @@ echo "Benchmark..."
     --parallel 16 32 64 128 256 384 512 \
     --extra-args '{"ignore_eos": true}' \
     --name pd_1adp16_1adp16_ep16 \
-    --outputs-dir "$SWEEP_DIR/benchmark" \
+    --outputs-dir "$SWEEP_DIR" \
     --no-timestamp
 
 echo "Benchmark complete: $SWEEP_DIR (32 GPUs total)"

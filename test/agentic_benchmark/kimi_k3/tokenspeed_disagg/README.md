@@ -23,8 +23,8 @@ CONTAINER_IMAGE=/path/to/tokenspeed-dev.sqsh \
 Use the same invocation with `p_bench.slurm` or `d_bench.slurm` for the
 separate simulations. Server settings live in `configs/`. `CONTAINER_NAME`
 and `CONTAINER_MOUNTS` override the container name and mounts; the defaults
-are `ts` and `/data:/data`. For 1P1D, set `DISAGGREGATION_IB_DEVICE` if
-Mooncake needs an explicit NIC list.
+are `ts` and `/data:/data`. For 1P1D, `DISAGGREGATION_IB_DEVICE` defaults to
+`mlx5_0,mlx5_1,mlx5_2,mlx5_3`. Override it for a different NIC layout.
 
 ## Dataset
 
@@ -40,12 +40,12 @@ runs; regenerate it when changing dataset settings.
 on the next four. Both use `configs/attn_dp16_moe_ep16.sh --grpc`, with
 Slurm step topology detected automatically. Mooncake transfers KV caches
 between them. One SMG gateway uses DP-aware sticky sessions with
-`min_load` assignment and EvalScope conversation IDs.
+round-robin assignment (`delegate`) and EvalScope conversation IDs.
 
 After a separate 16-conversation warmup, the client sweeps concurrency
 16/32/64/128/256/384/512 with two conversations per slot. Each turn generates
-500 tokens with greedy sampling. Results and P/D/gateway logs are under
-`outputs/pd_1p1d_<timestamp>/`, in `benchmark/`, `warmup/`, and `logs/`.
+500 tokens with greedy sampling.
+
 Normalize throughput by **32 GPUs**. Total token throughput includes cached
 input tokens; distinguish it from output-only throughput.
 
@@ -59,13 +59,17 @@ sticky conversation IDs for prefix reuse.
   at concurrency 512. Each turn generates one token; the client appends
   500 synthetic assistant tokens before the next user turn.
 - **Decode:** sweep concurrency 16/32/64/128/256/384/512. At each point,
-  concatenate all stored user turns, prime those prompts at concurrency 16,
-  wait 10 seconds, then generate 2,000 tokens per request in one wave.
-  Assistant responses are not included in these prompts.
+  concatenate all stored user turns, prime at concurrency 16 with the last
+  token removed after chat templating, then wait 10 seconds and generate 2,000
+  tokens from each full prompt in one wave. The shorter prime works around
+  aligned KDA checkpoint misses. Assistant responses are not included.
 
 These simulations exclude real KV-transfer costs. Prefill latency includes
-queueing; decode TPOT divides full request latency by output length and
-therefore includes cache loading. Cache hits can involve the host KV tier.
+queueing. Decode requests stream output: TTFT measures the wait for the first
+content or reasoning chunk; TPOT is the time from the first to the last output
+chunk divided by output tokens minus one. Throughput still uses the full wave's
+wall time, including startup and completion tails. Cache hits can involve the
+host KV tier.
 
 Results are under `outputs/p_<timestamp>/` and `outputs/d_<timestamp>/`;
 server logs are `/tmp/tokenspeed_server_disagg_<config>_<timestamp>.log`.

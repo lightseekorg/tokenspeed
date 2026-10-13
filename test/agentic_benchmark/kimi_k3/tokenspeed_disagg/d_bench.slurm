@@ -170,28 +170,23 @@ trap stop_server EXIT  # safety net for Ctrl-C / errors
 # Preflight: bail out if something already serves on the port
 wait_for_port_free
 
-# Ladder: parallel / number = parallel, one lockstep wave, so every rank runs
-# exactly parallel/16 requests for the whole rung (sticky placement cannot
-# keep per-rank concurrency constant under rolling admission). Each rung
-# primes its own conversations 0..number-1 right before measuring them: a
-# finished request keeps checkpoint blocks for the tokens it generated, so a
-# measured rung grows its contexts and would evict the ones a later rung needs.
-LADDER=(
-    "16 16"
-    "32 32"
-    "64 64"
-    "128 128"
-    "256 256"
-    "384 384"
-    "512 512"
-)
-
 SWEEP_TS=$(date +%Y%m%d_%H%M%S)
 SWEEP_DIR="${SCRIPT_DIR}/outputs/d_${SWEEP_TS}"
 mkdir -p "$SWEEP_DIR"
 echo "D-sim sweep outputs: ${SWEEP_DIR}"
 
 for CONFIG in "${CONFIGS[@]}"; do
+    # Ladder: parallel / number = parallel, one lockstep wave, so every rank runs
+    # exactly parallel/DP_size requests for the whole rung (sticky placement cannot
+    # keep per-rank concurrency constant under rolling admission). Each rung
+    # primes its own conversations 0..number-1 right before measuring them: a
+    # finished request keeps checkpoint blocks for the tokens it generated, so a
+    # measured rung grows its contexts and would evict the ones a later rung needs.
+    case "$CONFIG" in
+        attn_dp16_moe_ep16) LADDER=("16 16" "32 32" "64 64" "128 128" "256 256" "384 384" "512 512") ;;
+        attn_dp32_moe_ep32) LADDER=("32 32" "64 64" "128 128" "256 256" "384 384" "512 512" "768 768" "1024 1024") ;;
+    esac
+
     echo "=== Running $CONFIG ==="
     launch_server "$CONFIG"
 

@@ -56,6 +56,8 @@ def collect(sweep_dir: Path):
             "Latency p99 (s)": s.get("Latency p99 (s)"),
         }
         if phase == "d_measure":
+            row["TTFT p50 (s)"] = s.get("TTFT p50 (s)")
+            row["TTFT p99 (s)"] = s.get("TTFT p99 (s)")
             row["TPOT p50 (ms)"] = s.get("TPOT p50 (ms)")
             row["TPOT p99 (ms)"] = s.get("TPOT p99 (ms)")
         rows.append(row)
@@ -65,7 +67,7 @@ def collect(sweep_dir: Path):
 def print_tables(rows):
     print("# Boundaries: no KV-transfer cost modeled; prime-as-transfer is the")
     print("# core approximation; single deployment; P latency includes queueing.")
-    print("# P uses synthetic assistant text; D TPOT amortizes cache-hit KV load.")
+    print("# P uses synthetic assistant text; D throughput includes the full wave.")
     for phase in ("p_measure", "d_measure"):
         sub = [r for r in rows if r["phase"] == phase]
         if not sub:

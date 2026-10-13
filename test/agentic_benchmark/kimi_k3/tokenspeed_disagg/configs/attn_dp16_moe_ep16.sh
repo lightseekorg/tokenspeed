@@ -10,6 +10,7 @@ if [[ "${1:-}" == "--grpc" ]]; then
     SERVER_CMD=(python3 -m smg_grpc_servicer.tokenspeed)
 else
     SERVER_CMD=(ts serve
+        --disable-health-check
         --policy round_robin
         --dp-aware
         --sticky-sessions

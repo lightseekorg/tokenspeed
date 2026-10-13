@@ -4,7 +4,8 @@
 p-measure replays every user turn with one generated token, inserting prepared
 500-token synthetic assistant messages between turns. Each worker advances one
 conversation sequentially, then takes the next conversation from the pool.
-d-prime and d-measure replay the same concatenated user-turn prompt.
+d-prime caches the concatenated user-turn prompt minus its last rendered token;
+d-measure generates from the full prompt.
 
 Every request carries rid=pdsim-conv-<index>, so a gateway configured with
 sticky sessions keeps a conversation on the same attention-DP rank.
@@ -53,33 +54,12 @@ def parse_args():
     return args
 
 
-def first_turn_messages(conv):
-    return conv[0]["messages"]
-
-
-def conv_rid(index):
-    return f"pdsim-conv-{index}"
-
-
-def request_body(model, messages, max_tokens, rid):
-    return json.dumps(
-        {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "ignore_eos": True,
-            "rid": rid,
-        }
-    ).encode()
-
-
 def unique_first_turn_conversations(convs):
     """Deduplicate first-turn prefixes while preserving conversation order."""
     seen = set()
     out = []
     for conv in convs:
-        key = json.dumps(first_turn_messages(conv), sort_keys=True)
+        key = json.dumps(conv[0]["messages"], sort_keys=True)
         if key not in seen:
             seen.add(key)
             out.append(conv)
@@ -89,33 +69,122 @@ def unique_first_turn_conversations(convs):
 class Runner:
     def __init__(self, args):
         self.args = args
+        self.opener = urllib.request.build_opener()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.results = []
 
     def request(self, messages, max_tokens, rid):
-        body = request_body(self.args.model, messages, max_tokens, rid)
+        stream = self.args.phase == "d-measure"
+        body = json.dumps(
+            {
+                "model": self.args.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+                "ignore_eos": True,
+                "rid": rid,
+                "stream": stream,
+                "stream_options": {"include_usage": True} if stream else None,
+            }
+        ).encode()
         req = urllib.request.Request(
             self.args.url, data=body, headers={"Content-Type": "application/json"}
         )
+        first_token = last_token = None
+        usage = None
         t0 = time.monotonic()
         try:
-            with urllib.request.urlopen(req, timeout=self.args.timeout) as r:
-                out = json.load(r)
+            with self.opener.open(req, timeout=self.args.timeout) as r:
+                if stream:
+                    for line in r:
+                        if not line.startswith(b"data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == b"[DONE]":
+                            break
+                        chunk = json.loads(data)
+                        if "error" in chunk:
+                            raise RuntimeError(chunk["error"])
+                        if chunk.get("usage") is not None:
+                            usage = chunk["usage"]
+                        for choice in chunk["choices"]:
+                            delta = choice["delta"]
+                            if delta.get("content") or delta.get("reasoning_content"):
+                                last_token = time.monotonic()
+                                if first_token is None:
+                                    first_token = last_token
+                    else:
+                        raise RuntimeError("Response stream ended before [DONE]")
+                    if usage is None or first_token is None:
+                        raise RuntimeError("Response stream lacks usage or output text")
+                    if usage["completion_tokens"] < 2:
+                        raise RuntimeError(
+                            "Decode TPOT requires at least two output tokens"
+                        )
+                else:
+                    usage = json.load(r)["usage"]
         except Exception as e:
             raise SystemExit(f"request {rid} failed: {str(e)[:200]}") from e
         t1 = time.monotonic()
-        usage = out.get("usage") or {}
         details = usage.get("prompt_tokens_details") or {}
-        msg = out["choices"][0]["message"]
-        return {
+        result = {
             "latency_s": t1 - t0,
-            "prompt_tokens": usage.get("prompt_tokens", 0),
-            "completion_tokens": usage.get("completion_tokens", 0),
+            "prompt_tokens": usage["prompt_tokens"],
+            "completion_tokens": usage["completion_tokens"],
             "cached_tokens": details.get("cached_tokens") or 0,
-            "content": msg.get("content"),
-            "reasoning_content": msg.get("reasoning_content"),
         }
+        if stream:
+            result["ttft_s"] = first_token - t0
+            result["decode_s"] = last_token - first_token
+        return result
+
+    def prime(self, item):
+        if self.stop_event.is_set():
+            return
+        index, tokens = item
+        rid = f"pdsim-conv-{index}"
+        body = json.dumps(
+            {
+                "model": self.args.model,
+                "input_ids": tokens,
+                "sampling_params": {
+                    "max_new_tokens": self.args.max_tokens,
+                    "temperature": 0.0,
+                    "ignore_eos": True,
+                },
+                "rid": rid,
+                "stream": False,
+            }
+        ).encode()
+        req = urllib.request.Request(
+            self.args.url.removesuffix("/v1/chat/completions") + "/generate",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with self.opener.open(req, timeout=self.args.timeout) as r:
+                reason = json.load(r)[0]["meta_info"]["finish_reason"]
+                if reason["type"] not in ("length", "stop"):
+                    raise RuntimeError(reason)
+        except Exception as e:
+            raise SystemExit(f"request {rid} failed: {str(e)[:200]}") from e
+
+    def prepare_prime(self, items):
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            self.args.model, trust_remote_code=True, local_files_only=True
+        )
+        prepared = []
+        for index, conv in items:
+            messages = [message for turn in conv for message in turn["messages"]]
+            tokens = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True
+            )
+            # Save the state before the final token that prefix reuse must replay.
+            prepared.append((index, tokens[:-1]))
+        return prepared
 
     def prepare_prefill(self, items):
         from transformers import AutoTokenizer
@@ -155,7 +224,7 @@ class Runner:
         index, payload = item
         if self.stop_event.is_set():
             return
-        rid = conv_rid(index)
+        rid = f"pdsim-conv-{index}"
         if a.phase == "p-measure":
             conv, responses = payload
             messages = []
@@ -198,10 +267,17 @@ class Runner:
         # Items carry the conversation's absolute index so every phase sends
         # the same rid for the same conversation.
         items = list(enumerate(picked, start=a.offset))
-        payloads = self.prepare_prefill(items) if a.phase == "p-measure" else items
+        request = self.one_item
+        if a.phase == "p-measure":
+            payloads = self.prepare_prefill(items)
+        elif a.phase == "d-prime":
+            payloads = self.prepare_prime(items)
+            request = self.prime
+        else:
+            payloads = items
         # Tokenization and synthetic response generation are outside the timed run.
         t0 = time.monotonic()
-        self._map(self.one_item, payloads)
+        self._map(request, payloads)
         wall = time.monotonic() - t0
         return wall
 
@@ -209,8 +285,7 @@ class Runner:
 BOUNDARIES = (
     "no KV-transfer cost modeled; prime-as-transfer is the core "
     "approximation; single deployment; P request latency includes queueing "
-    "at max_tokens 1; TPOT amortizes the "
-    "cache-hit KV load into per-token time"
+    "at max_tokens 1; D TPOT excludes TTFT; throughput includes the full wave"
 )
 
 
@@ -255,8 +330,11 @@ def summarize(args, results, wall_s):
         "Boundaries": BOUNDARIES,
     }
     if args.phase == "d-measure" and n:
+        ttfts = sorted(r["ttft_s"] for r in ok)
+        summary["TTFT p50 (s)"] = round(_nearest_rank(ttfts, 0.50), 4)
+        summary["TTFT p99 (s)"] = round(_nearest_rank(ttfts, 0.99), 4)
         tpots = sorted(
-            1000.0 * r["latency_s"] / max(1, r["completion_tokens"]) for r in ok
+            1000.0 * r["decode_s"] / (r["completion_tokens"] - 1) for r in ok
         )
         summary["TPOT p50 (ms)"] = round(_nearest_rank(tpots, 0.50), 4)
         summary["TPOT p99 (ms)"] = round(_nearest_rank(tpots, 0.99), 4)
@@ -273,11 +351,7 @@ def main():
     wall = runner.run(convs)
 
     if args.phase == "d-prime":
-        hit = summarize(args, runner.results, wall)["KV Cache Hit Rate (%)"]
-        print(
-            f"primed {len(runner.results)} conversations in {wall:.1f}s "
-            f"(hit during prime: {hit:.1f}%)"
-        )
+        print(f"Primed {args.number} conversations in {wall:.1f}s")
         return
 
     summary = summarize(args, runner.results, wall)
