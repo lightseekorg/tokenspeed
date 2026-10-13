@@ -311,6 +311,8 @@ captures each window's raw projections in a compact payload and commits by
 replaying the accepted prefix from the committed page. The Kimi-K3 and
 GLM-5.3-Flash recipes share this workspace calculation and reserve it before
 sizing the arena — the transient conv rows plus the per-layer capture payloads.
+Kimi-K3 with BF16 recurrent storage also reserves one compact verify input
+shared across its KDA layers.
 GLM also reserves its target/draft-shared KPool tails once, so state memory does not
 disappear from the GPU budget. (Platforms without the replay kernels fall
 back to the dense `max_bs * (draft_tokens + 1)` per-position state

@@ -219,6 +219,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._verify_producer_stream: torch.cuda.Stream | None = None
         self._verify_producer_forks: dict[int, StreamFork] = {}
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
+        self._replay_state_scratch: torch.Tensor | None = None
         self._replay_weights: dict[
             int,
             tuple[
@@ -258,6 +259,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
     @override
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
+        first_state = cache_pool.get_component(
+            min(cache_pool.state_group_by_layer), "recurrent_state"
+        )
+        if first_state.dtype == torch.bfloat16 and not current_platform().is_nvidia:
+            raise ValueError("BF16 KDA state currently requires NVIDIA kernels")
         replay_active = kda_replay_commit_supported(
             self.dtype,
             recurrent_layout=self.kda_recurrent_layout,
@@ -275,6 +281,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         super()._publish_cache_pool(cache_pool)
         self._reset_replay_state()
         shape = self._replay_shape(cache_pool)
+        _, first_state = self._state_components(self._state_layer_ids()[0])
         self._replay_active = kda_replay_commit_supported(
             self.dtype,
             recurrent_layout=self.kda_recurrent_layout,
@@ -291,7 +298,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._verify_split_producers = self._replay_active and (
             kda_fused_paged_verify_uses_split_producers(
                 self.dtype,
+                state_dtype=first_state.dtype,
                 store_states=False,
+                draft_token_num=self.speculative_num_draft_tokens,
                 recurrent_layout=self.kda_recurrent_layout,
                 **shape,
             )
@@ -462,6 +471,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                         f_a_stride=strides[2],
                         beta_stride=strides[3],
                         state_stride=strides[4],
+                        state_dtype=first_state.dtype,
                         gate_stride=strides[5],
                         conv_width=conv_width,
                         lower_bound=next(iter(lower_bounds)),
@@ -487,6 +497,18 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 )
             return
         scratch = {}
+        _, first_state = self._state_components(self._state_layer_ids()[0])
+        # Verification consumes layers sequentially. Share one compact BF16
+        # input-state buffer, and rebuild it when the cache pool is rebound.
+        state_scratch = (
+            torch.empty(
+                (rows, *first_state.shape[1:]),
+                dtype=first_state.dtype,
+                device=first_state.device,
+            )
+            if first_state.dtype == torch.bfloat16
+            else None
+        )
         for layer_id in self._state_layer_ids():
             conv, _ = self._state_components(layer_id)
             if self._replay_uses_raw_gate and conv.shape[0] < rows:
@@ -502,8 +524,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
                         (rows, *conv.shape[1:]), dtype=conv.dtype, device=conv.device
                     )
                 ),
-                None,
+                state_scratch,
             )
+        self._replay_state_scratch = state_scratch
         self._verify_scratch = scratch
 
     @override
@@ -517,7 +540,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
             else sum(pair[0].nbytes for pair in self._verify_scratch.values())
         )
         payload_bytes = sum(payload.nbytes for payload in (self._replay_payloads or ()))
-        return conv_bytes + payload_bytes
+        state_bytes = (
+            0
+            if self._replay_state_scratch is None
+            else self._replay_state_scratch.nbytes
+        )
+        return conv_bytes + payload_bytes + state_bytes
 
     def _kda_gate(
         self,
@@ -714,6 +742,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
             replay_payload = {}
+            replay_capture = None
             split_producers = {}
             if self._replay_uses_raw_gate:
                 # Fused verify writes QKV, raw-g, and beta directly into the
@@ -757,14 +786,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     conv_qkv.record_stream(consumer_stream)
                 split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
             else:
-                capture_replay_payload(
-                    (mixed_qkv[:rows], f_a_out[:rows], beta_raw[:rows]),
-                    (
-                        qkv[:rows, : mixed_qkv.shape[-1]],
-                        f_a[:rows, : f_a_out.shape[-1]],
-                        beta[:rows, : beta_raw.shape[-1]],
-                    ),
-                    rows,
+                # Reuse the same persistent payload buffers. The kernel facade
+                # either captures them inside the selected producer or uses
+                # the existing separate capture for an unsupported backend.
+                replay_capture = (
+                    qkv[:rows, : mixed_qkv.shape[-1]],
+                    f_a[:rows, : f_a_out.shape[-1]],
+                    beta[:rows, : beta_raw.shape[-1]],
                 )
             num_value_heads = value_dim // attn_tp_size // head_v_dim
             if layer_id not in self._replay_weights:
@@ -792,6 +820,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 dt_bias,
                 state_pool=ssm_comp,
                 state_scratch=ssm_scratch,
+                replay_payload=replay_capture,
                 read_indices=state_in_blocks[:batch_size],
                 write_indices=output_indices[:batch_size],
                 num_heads=num_value_heads,
@@ -823,6 +852,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 beta_raw,
                 A_log,
                 dt_bias,
+                replay_payload=None,
                 state_pool=ssm_comp,
                 state_scratch=ssm_scratch,
                 read_indices=state_in_blocks[:batch_size],

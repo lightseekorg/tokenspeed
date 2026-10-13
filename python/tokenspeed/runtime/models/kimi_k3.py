@@ -73,6 +73,8 @@ from tokenspeed_kernel.ops.attention.mla import mla_normalize_project_query
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.flashinfer import get_flashinfer_moe_alltoall
 from tokenspeed_kernel.ops.gemm import (
+    fp8_linear_gated_rmsnorm,
+    fp8_linear_gated_rmsnorm_supported,
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
     kimi3_router_projection,
@@ -81,7 +83,9 @@ from tokenspeed_kernel.ops.gemm import (
     linear_attnres_partials,
     linear_attnres_partials_available,
     mm,
+    prepare_fp8_linear,
 )
+from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_fp8_blockscale
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
@@ -1361,6 +1365,7 @@ class KimiLinearKDA(nn.Module):
             w.weight_loader = sharded_weight_loader(0, tp_rank)
         # Fused (q, k, v) conv kernel bank; built once in post_load_weights.
         self.conv_weights: torch.Tensor | None = None
+        self._output_plan: object | None = None
 
         self.o_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         if output_parallel is None:
@@ -1418,6 +1423,42 @@ class KimiLinearKDA(nn.Module):
                 dim=0,
             ).squeeze(1),
         )
+
+    def prepare_output_plan(self) -> None:
+        """Prepare or refresh FP8 scales while preserving captured storage."""
+        method = self.o_proj.quant_method
+        if (
+            self.output_parallel is not None
+            or self.head_dim != 128
+            or envs.TOKENSPEED_MAMBA_SSM_DTYPE.get() != "bfloat16"
+            or not isinstance(method, Fp8LinearMethod)
+            or not method.block_quant
+            or method.quant_config.weight_block_size != [128, 128]
+            or method.quant_config.scale_fmt == "ue8m0"
+            or self.o_proj.weight.dtype != torch.float8_e4m3fn
+            or self.o_proj.weight_scale_inv.dtype != torch.float32
+            or self.o_proj.weight_scale_inv.ndim != 2
+            or any(dim % 128 for dim in self.o_proj.weight.shape)
+            or global_server_args_dict["dense_gemm_backend"] != "auto"
+            or not has_flashinfer_fp8_blockscale()
+        ):
+            if self._output_plan is not None:
+                raise ValueError(
+                    "KDA output projection changed format after preparation"
+                )
+            return
+        plan = prepare_fp8_linear(
+            self.o_proj.weight,
+            self.o_proj.weight_scale_inv,
+            method.quant_config.weight_block_size,
+        )
+        if self._output_plan is None:
+            self._output_plan = plan
+        else:
+            bind_or_copy(
+                self._output_plan.prepared_weight_scales,
+                plan.prepared_weight_scales,
+            )
 
     def _project_qkvfab(
         self,
@@ -1525,7 +1566,24 @@ class KimiLinearKDA(nn.Module):
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
         conv_weights = self.conv_weights
-        fuse_decode_output_norm = ctx.forward_mode.is_decode() and num_tokens == ctx.bs
+        # DECODE covers both T=1 and target verify. Eligibility comes from
+        # the 128-wide head and prepared scale ABI, not a row-count cutoff.
+        output_plan = None
+        if (
+            ctx.forward_mode.is_decode()
+            and hd == 128
+            and h.dtype == torch.bfloat16
+            and self.output_parallel is None
+            and projection_out is None
+            and envs.TOKENSPEED_MAMBA_SSM_DTYPE.get() == "bfloat16"
+        ):
+            if fp8_linear_gated_rmsnorm_supported(self._output_plan):
+                output_plan = self._output_plan
+        fuse_decode_output_norm = (
+            ctx.forward_mode.is_decode()
+            and num_tokens == ctx.bs
+            and output_plan is None
+        )
 
         core_out = ctx.attn_backend.forward(
             q=None,
@@ -1558,6 +1616,18 @@ class KimiLinearKDA(nn.Module):
         )
 
         core_out = core_out.reshape(num_tokens, hn * hd)
+        if output_plan is not None:
+            return fp8_linear_gated_rmsnorm(
+                output_plan,
+                core_out.contiguous(),
+                out_gate,
+                self.o_norm.weight,
+                self.o_proj.weight,
+                eps=self.o_norm.variance_epsilon,
+                num_heads=hn,
+                head_dim=hd,
+                out_dtype=h.dtype,
+            )
         if not fuse_decode_output_norm:
             # Decode kernels may fuse this epilogue; prefill retains the shared
             # per-head norm implementation.
@@ -4095,6 +4165,12 @@ class KimiLinearForCausalLM(BaseCausalLM):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    def post_quant_warmup(self) -> None:
+        """Prepare KDA output plans after the loader finalizes FP8 weights."""
+        for module in self.modules():
+            if isinstance(module, KimiLinearKDA):
+                module.prepare_output_plan()
+
     def post_load_weights(self) -> None:
         """Prepare the absorbed MLA weights (``w_kc``/``w_vc``) per MLA layer.
 
@@ -4131,6 +4207,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 )
             elif isinstance(self_attn, KimiLinearKDA):
                 self_attn.fuse_conv_weights()
+                # Initial preparation waits for quantization; live updates
+                # refresh the existing scales without changing graph pointers.
+                if self_attn._output_plan is not None:
+                    self_attn.prepare_output_plan()
                 merged = self_attn.qkvgb_proj
                 if self_attn.qkv_parallel is not None:
                     merged.verify_load_complete()
@@ -4380,6 +4460,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
         """Prepare text-model derived weights for loaders that skip checkpoints."""
         if self.language_model is not None:
             self.language_model.post_load_weights()
+
+    def post_quant_warmup(self) -> None:
+        """Prepare KDA fusion after each projection's quantization postprocess."""
+        if self.language_model is not None:
+            self.language_model.post_quant_warmup()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Route checkpoint weights by top-level prefix.

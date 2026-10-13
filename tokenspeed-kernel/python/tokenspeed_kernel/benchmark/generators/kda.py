@@ -829,6 +829,7 @@ def prepare_kda_fused_paged_decode(
         "fused_output_norm": True,
         "paged_state": True,
         "recurrent_layout": common["recurrent_layout"],
+        "state_dtype": torch.float32,
     }
 
     load_builtin_kernels()
@@ -917,11 +918,13 @@ def prepare_kda_fused_paged_verify(
     store_states = _bool_parameter(request.parameters, "store_states")
     _require_state_pages(common["state_pages"], batch + 1)
     traits = {
+        "draft_token_num": draft_token_num,
         "num_heads": profile.heads,
         "head_dim": profile.head_dim,
         "paged_state": True,
         "recurrent_layout": common["recurrent_layout"],
         "split_producers": False,
+        "state_dtype": torch.float32,
         "store_states": store_states,
     }
 
@@ -974,6 +977,7 @@ def prepare_kda_fused_paged_verify(
             weights.dt_bias,
             state_pool=state_pool,
             state_scratch=None,
+            replay_payload=None,
             read_indices=read_indices,
             write_indices=write_indices,
             num_heads=profile.heads,
@@ -1043,6 +1047,8 @@ def prepare_kda_replay_commit(
         "flat_state": True,
         "num_heads": profile.heads,
         "head_dim": profile.head_dim,
+        "recurrent_layout": common["recurrent_layout"],
+        "state_dtype": torch.float32,
     }
 
     load_builtin_kernels()
@@ -1116,6 +1122,7 @@ def prepare_kda_replay_commit(
             f_a_stride=payload_f_a.stride(1),
             beta_stride=payload_beta.stride(1),
             state_stride=first_state.stride(0),
+            state_dtype=first_state.dtype,
             gate_stride=payload_gate.stride(1),
             conv_width=common["conv_kernel_size"],
             lower_bound=common["lower_bound"],

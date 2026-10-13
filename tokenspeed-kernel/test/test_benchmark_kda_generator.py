@@ -20,13 +20,17 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import pytest
 import tokenspeed_kernel.benchmark.generators.kda as kda_generator
 import torch
 from tokenspeed_kernel.benchmark.generators.kda import prepare_kda_paged_prefill
 from tokenspeed_kernel.benchmark.harness import BenchmarkCaseError, BenchmarkRequest
 from tokenspeed_kernel.platform import PlatformInfo
-from tokenspeed_kernel.registry import KernelSpec
+from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 def test_kda_generator_rejects_unsupported_validation_before_allocating_inputs(
@@ -288,3 +292,124 @@ def test_kda_generator_builds_kimi_k3_cache_arena_state_pages() -> None:
     assert state_pool.shape == (3, 12, 128, 128)
     assert state_pool.stride() == (221184, 16384, 128, 1)
     assert conv_pool.data_ptr() - state_pool.data_ptr() == 12 * 128 * 128 * 4
+
+
+@pytest.fixture
+def cpu_fused_kda_inputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    def cpu_factory(factory, *args, **kwargs):
+        kwargs["device"] = "cpu"
+        return factory(*args, **kwargs)
+
+    for name in ("arange", "empty", "full", "ones", "randn", "tensor", "zeros"):
+        monkeypatch.setattr(torch, name, partial(cpu_factory, getattr(torch, name)))
+    monkeypatch.setattr(
+        kda_generator, "_generator", lambda seed: torch.Generator().manual_seed(seed)
+    )
+    monkeypatch.setattr(kda_generator, "load_builtin_kernels", lambda: None)
+
+
+@pytest.mark.usefixtures("cpu_fused_kda_inputs", "fresh_registry")
+@pytest.mark.parametrize(
+    ("mode", "capture_replay"),
+    [
+        ("kda_fused_paged_decode", False),
+        ("kda_fused_paged_verify", False),
+        ("kda_fused_paged_verify", True),
+        ("kda_replay_commit", False),
+    ],
+)
+def test_fused_kda_benchmarks_dispatch_with_their_fp32_arena(
+    monkeypatch: pytest.MonkeyPatch,
+    mi350_platform: PlatformInfo,
+    mode: str,
+    capture_replay: bool,
+) -> None:
+    from tokenspeed_kernel.ops.attention import kda as kda_ops
+
+    seen: dict[str, object] = {}
+
+    def record_kernel(**kwargs):
+        seen["invocation"] = kwargs
+        return object()
+
+    signature = format_signature(
+        **{role: dense_tensor_format(torch.bfloat16) for role in ("q", "k", "v")}
+    )
+    for state_dtype, priority in ((torch.float32, 10), (torch.bfloat16, 11)):
+        KernelRegistry.get().register(
+            KernelSpec(
+                name=f"test_{mode}_{state_dtype}",
+                family="attention",
+                mode=mode,
+                solution="test",
+                format_signatures=frozenset({signature}),
+                traits={
+                    "fused_output_norm": frozenset({True}),
+                    "state_dtype": frozenset({state_dtype}),
+                },
+                priority=priority,
+            ),
+            record_kernel,
+        )
+
+    def record_selection(stage, *args, traits, **kwargs):
+        seen[stage] = traits
+        kwargs["platform"] = mi350_platform
+        return select_kernel(*args, traits=traits, **kwargs)
+
+    monkeypatch.setattr(
+        kda_generator, "select_kernel", partial(record_selection, "benchmark")
+    )
+    monkeypatch.setattr(
+        kda_ops, "select_kernel", partial(record_selection, "operation")
+    )
+    request = BenchmarkRequest(
+        family="attention",
+        mode=mode,
+        parameters={
+            "model_profile": "kimi_k3_tp8",
+            "heads": 12,
+            "key_dim": 128,
+            "value_dim": 128,
+            "dtype": "bfloat16",
+            "lower_bound": -5.0,
+            "recurrent_layout": "v_major",
+            "batch": 1,
+            "conv_kernel_size": 4,
+            "state_pages": 3,
+            "state_page_bytes": 884736,
+            "state_page_relation": "in_place",
+            "norm_eps": 1e-5,
+            "draft_token_num": 4,
+            "capture_replay": capture_replay,
+            "store_states": False,
+            "accepted_length": 2,
+            "layers": 2,
+            "state_groups": 1,
+        },
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+    prepare = {
+        "kda_fused_paged_decode": kda_generator.prepare_kda_fused_paged_decode,
+        "kda_fused_paged_verify": kda_generator.prepare_kda_fused_paged_verify,
+        "kda_replay_commit": kda_generator.prepare_kda_replay_commit,
+    }[mode]
+    prepared = prepare(request, mi350_platform)
+    prepared.invocation.invoke()
+
+    assert prepared.registration.traits["state_dtype"] == frozenset({torch.float32})
+    invocation = seen["invocation"]
+    if mode == "kda_replay_commit":
+        assert invocation["state_dtype"] == torch.float32
+        assert invocation["state_stride"] == request.parameters["state_page_bytes"] // 4
+        assert invocation["descriptors"].shape == (2, 10)
+    else:
+        assert seen["benchmark"] == seen["operation"]
+        assert invocation["state_pool"].dtype == torch.float32
+        if mode == "kda_fused_paged_verify":
+            assert ("replay_gate" in invocation) is capture_replay
+            if capture_replay:
+                assert invocation["replay_gate"].shape == (4, 12 * 128)
