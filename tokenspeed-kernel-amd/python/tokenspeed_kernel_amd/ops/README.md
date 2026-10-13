@@ -462,9 +462,9 @@ preparation, validation and tiling, and runs two steps per query tile: a
 scorer writes one row of FP32 logits per query, one per candidate column, and
 a selector turns each row into that query's sorted list of logical KV row ids.
 gfx950 runs both steps in Gluon (`gluon_dsv41_index_topk_gfx950`, then
-`gluon_dsv41_index_topk_select_gfx950`) and selects candidate blocks with a
-Triton radix select (`dsv41_index_block_select_gfx950`); gfx1250 has a Gluon
-scorer and the portable torch selectors.
+`gluon_dsv41_index_topk_select_gfx950`) and selects candidate blocks with the
+portable Triton radix select (`tokenspeed_kernel` `index_block_select`);
+gfx1250 has a Gluon scorer and the portable torch selectors.
 
 #### Contract
 
@@ -522,9 +522,10 @@ lanes regardless of conflicts, so the radix passes dominate on wide rows.
 
 Block selection takes the maximum logit of each 8-row block, forces the
 newest visible block to `+inf`, and keeps the top blocks in ascending order.
-On gfx950 one Triton program per query reads only the visible blocks, runs a
-four-pass MSD radix select (8 key bits per pass) and emits the picks in block
-order, so no sort is needed; gfx1250 uses torch.
+On gfx950 the portable Triton block select runs one program per query: it
+reads only the visible blocks, runs a four-pass MSD radix select (8 key bits
+per pass) and emits the picks in block order, so no sort is needed. gfx1250
+uses torch.
 
 ### gfx950 DeepSeek V4.1 selected attention
 

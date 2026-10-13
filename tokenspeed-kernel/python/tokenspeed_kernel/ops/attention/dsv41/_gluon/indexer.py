@@ -330,16 +330,6 @@ def launch_gfx1250_logits(
     )
 
 
-def select_blocks_gfx950(logits, visible, candidate_topk, block_out, block_lens):
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
-        launch_dsv41_index_block_select_gfx950,
-    )
-
-    launch_dsv41_index_block_select_gfx950(
-        logits, visible, candidate_topk, block_out, block_lens
-    )
-
-
 def select_rows_gfx950(logits, candidates, live_widths, topk, row_out, row_lens):
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
         launch_gluon_dsv41_index_topk_select_gfx950,
