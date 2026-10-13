@@ -38,9 +38,9 @@ Keep an explicit `gl.barrier()` only where the compiler cannot see the hazard:
   re-reading a global buffer other threads just wrote. Say what the barrier
   orders in a comment.
 
-Iris push collectives use `wait_vmcnt_zero()` and system-scope atomics for each
-subgroup's memory ordering. Workgroup barriers synchronize producers before
-setting ready flags and consumers before reading peer data.
+Use `wait_vmcnt_zero()` to wait for a subgroup's vector memory operations to
+complete. Keep workgroup barriers where all producer subgroups must finish
+before signaling completion, or all consumers must wait before reading data.
 
 ## GEMM
 
