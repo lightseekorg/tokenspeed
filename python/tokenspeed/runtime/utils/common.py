@@ -37,6 +37,7 @@ import resource
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
@@ -47,6 +48,7 @@ from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Generic,
     Literal,
@@ -69,6 +71,12 @@ from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.metrics.func_timer import enable_func_timer
+from tokenspeed.runtime.utils.network import get_free_port
+
+if TYPE_CHECKING:
+    import uvicorn
+
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -948,6 +956,53 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     except RuntimeError:
         logger.info(f"Starting dummy health check server at {host!s}:{port!s}")
         server.run()
+
+
+def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
+    """Serve the engine's Prometheus /metrics endpoint on a daemon thread.
+
+    With --enable-metrics every engine process on this node writes to the
+    shared PROMETHEUS_MULTIPROC_DIR; this serves the aggregate from the
+    engine's main process, which otherwise has no HTTP surface (the gRPC
+    servicer speaks gRPC only). The daemon thread keeps the synchronous
+    launch path free of event-loop assumptions. The socket is bound eagerly
+    on the calling thread, so a bind failure degrades to an error log and
+    None — metrics must never take down serving — and the
+    allocate-then-rebind race stays closed. Returns the ``uvicorn.Server``
+    (poll ``started`` for readiness), or None when --enable-metrics is off or
+    the bind failed.
+    """
+    if not server_args.enable_metrics:
+        return None
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    host = server_args.metrics_host or server_args.host
+    port = server_args.metrics_port or get_free_port()
+
+    app = FastAPI()
+    add_prometheus_middleware(app)
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    try:
+        sock = config.bind_socket()
+    except SystemExit:
+        logger.error(
+            f"metrics server failed to bind {host!s}:{port!s}; "
+            "metrics endpoint disabled"
+        )
+        return None
+    server = uvicorn.Server(config)
+
+    def _serve():
+        try:
+            server.run(sockets=[sock])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"metrics server stopped: {e!s}")
+
+    threading.Thread(target=_serve, daemon=True, name="engine-metrics-server").start()
+    logger.info(f"Prometheus metrics available at http://{host!s}:{port!s}/metrics")
+    return server
 
 
 def set_cuda_arch():

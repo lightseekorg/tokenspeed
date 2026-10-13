@@ -81,6 +81,9 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
         launch_gluon_mla_decode_projected_value_gfx1250 as _mla_decode_projected_value_gfx1250_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
+        launch_gluon_mla_decode_query_blocks_gfx1250 as _mla_decode_query_blocks_gfx1250_impl,
+    )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.extend import (
         launch_gluon_mla_extend_gfx1250 as _mla_extend_gfx1250_impl,
     )
@@ -499,6 +502,43 @@ if current_platform().is_amd:
     )
     def gluon_mla_decode_gfx1250(*args, **kwargs):
         return _mla_decode_gfx1250_impl(*args, **kwargs)
+
+    @register_kernel(
+        "attention",
+        "mla_decode_with_kvcache",
+        name="gluon_mla_decode_query_blocks_gfx1250",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=format_signatures(
+            ("q", "kv_cache"),
+            "dense",
+            {
+                torch.float16,
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            },
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "q_len": frozenset(range(2, 17)),
+            "num_q_heads": frozenset(range(1, 129)),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False}),
+            "block_on_query_axis": frozenset({True}),
+            "noncausal_block_size": frozenset({1}),
+        },
+    )
+    def gluon_mla_decode_query_blocks_gfx1250(*args, **kwargs):
+        return _mla_decode_query_blocks_gfx1250_impl(*args, **kwargs)
 
     @register_kernel(
         "attention",

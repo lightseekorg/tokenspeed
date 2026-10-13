@@ -136,8 +136,11 @@ def _validate(
                 raise ValueError("SiTU beta must be positive")
             if situ_linear_beta is not None and situ_linear_beta <= 0:
                 raise ValueError("SiTU linear beta must be positive")
-        if hidden_size % 128 or intermediate_size % 128:
-            raise ValueError("hidden and intermediate sizes must be multiples of 128")
+        if hidden_size % 128 or intermediate_size % 64:
+            raise ValueError(
+                "hidden size must be a multiple of 128 and intermediate size "
+                "a multiple of 64"
+            )
     return topk_weights, topk_ids, activation
 
 
@@ -690,7 +693,9 @@ def _moe(
         stage1_block_n = 64
         stage2_block_n = 128
         stage1_block_k = 128
-        stage2_block_k = 128
+        # Stage 2 reduces over the intermediate size, e.g. 320 for a
+        # 640-wide expert sharded over TP2.
+        stage2_block_k = 128 if intermediate_size % 128 == 0 else 64
         quant_block_k = 256 if hidden_size % 256 == 0 else 128
         _quantize_mxfp4_kernel[
             (

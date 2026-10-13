@@ -77,6 +77,8 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
+from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeMLP,
     Qwen3_5MoeSparseMoeBlock,
@@ -677,6 +679,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
+        aux_hidden_states: list[torch.Tensor] | None = None,
         **kwargs,
     ):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -692,6 +695,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 residual,
                 self.linear_attn.input_fp8_scale(),
             )
+            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
 
             hidden_states = self.linear_attn(
@@ -709,6 +713,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 residual,
                 self.mlp.nvfp4_global_scale(),
                 ctx,
+            )
+        else:
+            # No rows, but the tap and its gather stay aligned across ranks.
+            capture_layer_input(
+                self.comm_manager, hidden_states, ctx, aux_hidden_states
             )
 
         hidden_states = self.forward_mlp(
@@ -940,6 +949,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
+        aux_hidden_states: list[torch.Tensor] | None = None,
         **kwargs,
     ):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -955,6 +965,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 residual,
                 self.qkv_proj.quant_method.static_fp8_input_scale(self.qkv_proj),
             )
+            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
             # qkv_proj is the only reader, so the FP8 copy can stand in for the rows.
             hidden_states = self.self_attention(
@@ -972,6 +983,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 residual,
                 self.mlp.nvfp4_global_scale(),
                 ctx,
+            )
+        else:
+            # No rows, but the tap and its gather stay aligned across ranks.
+            capture_layer_input(
+                self.comm_manager, hidden_states, ctx, aux_hidden_states
             )
 
         hidden_states = self.forward_mlp(
@@ -1108,26 +1124,21 @@ class Qwen3_5ForCausalLM(nn.Module):
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
-            if aux_hidden_states is not None and layer_idx in self.layers_to_capture:
-                # Under RSAG the inter-layer hidden/residual are reduce-scattered
-                # across the attn TP group; aux consumers (e.g. the DFLASH
-                # drafter) expect full rows, so gather before capturing.
-                aux = (
-                    hidden_states + residual if residual is not None else hidden_states
-                )
-                gathered = layer.comm_manager.gather_residual(aux, ctx)
-                capture_idx = self._dflash_capture_idx_map.get(layer_idx)
-                if ctx.target_capture_sink is not None and capture_idx is not None:
-                    ctx.target_capture_sink.on_target_capture(capture_idx, gathered)
-                aux_hidden_states.append(
-                    gathered if gathered is aux else gathered.clone()
-                )
+            capture = layer_idx in self.layers_to_capture
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
                 ctx=ctx,
+                aux_hidden_states=aux_hidden_states if capture else None,
             )
+            if capture and ctx.target_capture_sink is not None:
+                notify_target_capture(
+                    ctx.target_capture_sink,
+                    self._dflash_capture_idx_map,
+                    layer_idx,
+                    aux_hidden_states,
+                )
 
             # Process deepstack embeddings if provided
             if (
@@ -1136,8 +1147,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 and layer_idx < 3
             ):
                 sep = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                # Add to the residual: under all-reduce fusion hidden_states is
+                # this rank's partial sum, which the next layer reduces.
+                residual = (
+                    residual + input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
 
         # Apply final normalization with optional allreduce fusion
@@ -1519,8 +1532,8 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
         return self.model.embed_tokens
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        # DFLASH checkpoints name 0-indexed target layer outputs. The capture
-        # check runs before layer i, so capture at i + 1 for layer i's output.
+        # DFLASH checkpoints name 0-indexed target layer outputs. A layer
+        # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")

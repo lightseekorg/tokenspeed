@@ -12,20 +12,38 @@ from tokenspeed_kernel.platform import current_platform
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("activation", ["silu", "situ"])
-def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
+# 192 is a multiple of 64 but not 128, like a 640-wide expert sharded by TP2.
+@pytest.mark.parametrize("intermediate_size", [128, 192])
+def test_triton_mxfp4_moe_matches_torch(
+    activation: str, intermediate_size: int
+) -> None:
     if not current_platform().is_amd:
         pytest.skip("Triton MXFP4 MoE is registered for AMD GPUs")
 
     generator = torch.Generator(device="cuda").manual_seed(0)
     x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
     w13 = torch.randint(
-        0, 256, (4, 256, 64), device="cuda", dtype=torch.uint8, generator=generator
+        0,
+        256,
+        (4, 2 * intermediate_size, 64),
+        device="cuda",
+        dtype=torch.uint8,
+        generator=generator,
     )
-    w13_scale = torch.full((4, 256, 4), 120, device="cuda", dtype=torch.uint8)
+    w13_scale = torch.full(
+        (4, 2 * intermediate_size, 4), 120, device="cuda", dtype=torch.uint8
+    )
     w2 = torch.randint(
-        0, 256, (4, 128, 64), device="cuda", dtype=torch.uint8, generator=generator
+        0,
+        256,
+        (4, 128, intermediate_size // 2),
+        device="cuda",
+        dtype=torch.uint8,
+        generator=generator,
     )
-    w2_scale = torch.full((4, 128, 4), 120, device="cuda", dtype=torch.uint8)
+    w2_scale = torch.full(
+        (4, 128, intermediate_size // 32), 120, device="cuda", dtype=torch.uint8
+    )
     topk_ids = torch.tensor(
         [[0, 1], [1, 2], [2, 3], [3, 0]], device="cuda", dtype=torch.int32
     )
@@ -49,7 +67,7 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
         input_dtype=torch.bfloat16,
         activation=activation,
         routing_mode="precomputed_topk",
-        ispp=128,
+        ispp=intermediate_size,
         internal_activation_dtype="mxfp4",
         solution="triton",
         hidden=None,

@@ -47,12 +47,13 @@ __all__ = [
     "prepare_latent_input",
     "prepare_moe_apply",
     "prepare_sigmoid_bias_topk",
+    "prepare_softmax_topk",
     "prepare_topk",
 ]
 
 
 _IMPLEMENTED_MODEL_PROFILES = frozenset(
-    {"dsv41_flash_tp4", "glm53_flash_tp4", "kimi_k3_tp8"}
+    {"dsv41_flash_tp4", "glm53_flash_tp4", "kimi_k3_tp8", "qwen38_flash_tp2"}
 )
 _IMPLEMENTED_INPUT_DTYPES = {
     "bfloat16": torch.bfloat16,
@@ -74,7 +75,7 @@ _IMPLEMENTED_ROUTING_MODES = frozenset({"precomputed_topk"})
 _IMPLEMENTED_ROUTE_SCOPES = frozenset({"global", "local"})
 _IMPLEMENTED_ROUTE_DISTRIBUTIONS = frozenset({"router"})
 _IMPLEMENTED_TOKEN_COUNT_SCOPES = frozenset({"global", "local"})
-_IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES = frozenset({"input"})
+_IMPLEMENTED_INTERNAL_ACTIVATION_DTYPES = frozenset({"input", "mxfp4"})
 _IMPLEMENTED_FP8_BLOCK_SHAPES = frozenset({(128, 128)})
 _MXFP4_GROUP_SIZE = 32
 
@@ -561,6 +562,73 @@ def prepare_sigmoid_bias_topk(
             "router_logits_dtype": str(router_logits_dtype).removeprefix("torch."),
             "weights_dtype": str(weights_dtype).removeprefix("torch."),
             "routed_scaling_factor": routed_scaling_factor,
+            "normalize_topk_weights": normalize_topk_weights,
+        },
+        validation=None,
+    )
+
+
+def prepare_softmax_topk(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one softmax top-k router benchmark.
+
+    Covers the ``moe.softmax_topk`` registrations used by Qwen3.5/3.8-style
+    routers: a softmax over the router logits, top-k selection, and optional
+    renormalization over the selected experts.
+    """
+
+    _validate_request_options(request)
+    parameters = request.parameters
+    model_profile = _implemented_value(
+        "model_profile",
+        parameters["model_profile"],
+        _IMPLEMENTED_MODEL_PROFILES,
+    )
+    tokens = parameters["tokens"]
+    experts = parameters["num_experts"]
+    topk = parameters["topk"]
+    router_logits_dtype = _parse_dtype(
+        "router_logits_dtype",
+        parameters["router_logits_dtype"],
+        _IMPLEMENTED_ROUTER_DTYPES,
+    )
+    normalize_topk_weights = parameters["normalize_topk_weights"]
+
+    load_builtin_kernels()
+    signature = format_signature(router_logits=dense_tensor_format(router_logits_dtype))
+    spec = _selected_spec(
+        request,
+        platform,
+        signature,
+        {"tokens": tokens, "experts": experts, "topk": topk},
+    )
+    router_logits = _randn(
+        (tokens, experts),
+        generator=_generator(request.seed),
+        dtype=router_logits_dtype,
+    )
+
+    def invoke() -> object:
+        return moe_ops.moe_topk(
+            router_logits,
+            topk,
+            "softmax",
+            "topk",
+            normalize_topk_weights,
+            1.0,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            "model_profile": model_profile,
+            "tokens": tokens,
+            "num_experts": experts,
+            "topk": topk,
+            "router_logits_dtype": str(router_logits_dtype).removeprefix("torch."),
             "normalize_topk_weights": normalize_topk_weights,
         },
         validation=None,
