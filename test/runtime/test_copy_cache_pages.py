@@ -34,6 +34,7 @@ import types
 import unittest
 
 import numpy as np
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -156,6 +157,144 @@ class CopyCachePagesContractTest(unittest.TestCase):
         fake = self._fake(trace, shard_counts={"kv": 2}, rank=1)
         ModelExecutor.copy_cache_pages(fake, {"kv": np.asarray([[3, 9]])})
         self.assertEqual(trace, [])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class FinishTailHitCopyCudaTest(unittest.TestCase):
+    """The hitter's private copy of a published partial page, end to end.
+
+    The real scheduler publishes a finished request's partial page as a tail,
+    a later prompt hits inside it, and the plan's copy pair -- translated by
+    the owner filter and executed by the arena -- reproduces every field of
+    every layer of the group (k and v of target and draft layers, the fp8
+    scales) on the hitter's block, byte for byte, before any forward reads it.
+    """
+
+    PAGE = 16
+    LAYERS = 3  # two target layers and a draft continuation layer
+
+    def _arena(self):
+        fields = []
+        for layer in range(self.LAYERS):
+            fields += [
+                CacheFieldSpec(f"kv.k.{layer}", f"k.{layer}", (4, 8), "bfloat16"),
+                CacheFieldSpec(f"kv.v.{layer}", f"v.{layer}", (4, 8), "bfloat16"),
+                CacheFieldSpec(
+                    f"kv.k_scale.{layer}", f"ks.{layer}", (4,), "float8_e4m3fn"
+                ),
+                CacheFieldSpec(f"kv.v_scale.{layer}", f"vs.{layer}", (1,), "float32"),
+            ]
+        plan = pack(
+            (one_group("kv", *fields, rows_per_page=self.PAGE),),
+            prefix_granularity=self.PAGE,
+            cache_blocks_per_lcm_block={"kv": 1},
+            max_padding_fraction=1.0,
+        ).bind(16)
+        return make_arena(plan, "cuda")
+
+    def test_the_hitters_block_holds_the_published_partial_page_byte_for_byte(self):
+        ts = pytest.importorskip("tokenspeed_scheduler")
+        from tokenspeed.runtime.engine.scheduler_utils import (
+            advance_scheduler,
+            make_config,
+            make_extend_result_event,
+        )
+
+        arena = self._arena()
+        contract = arena.runtime_contract
+        page_count = arena.plan.group("kv").page_count
+        scheduler = ts.Scheduler(
+            make_config(
+                num_device_pages=page_count,
+                max_scheduled_tokens=256,
+                max_batch_size=4,
+                prefix_granularity=self.PAGE,
+                num_host_pages=0,
+                disable_l2_cache=True,
+                enable_l3_storage=False,
+                role="fused",
+                num_snapshot_pages=1,
+                max_retracted_requests=0,
+                l3_prefetch_min_pages=0,
+                cache_groups=[
+                    ts.CacheGroupConfig(
+                        group_id="kv",
+                        block_granularity=self.PAGE,
+                        total_pages=page_count,
+                        retention=ts.CacheRetention.FullHistory,
+                        family=ts.CacheGroupFamily.History,
+                    )
+                ],
+            )
+        )
+
+        def forwards(plan):
+            return [op for op in plan.forward if op.request_ids]
+
+        prompt = list(range(41))  # two full pages and a 9-row tail
+        spec = ts.RequestSpec()
+        spec.request_id = "a"
+        spec.tokens = prompt
+        spec.max_new_tokens = 1
+        scheduler.submit_requests([spec])
+        plan = scheduler.next_execution_plan()
+        (prefill,) = forwards(plan)
+        tail_block = int(prefill.block_tables_arrays()["kv"][0][2])
+        # The engine lands the one token and finishes the request; the finish
+        # publishes the partial page (rows 32..40) in place.
+        advance_scheduler(scheduler, [make_extend_result_event("a", [1000])])
+        finish = ts.ForwardEvent.Finish()
+        finish.request_id = "a"
+        advance_scheduler(scheduler, [finish])
+        self.assertEqual(scheduler.tail_entries(), 1)
+
+        # Random bytes stand in for the KV the forward wrote.
+        generator = torch.Generator(device="cpu").manual_seed(41)
+        arena.buffer.copy_(
+            torch.randint(
+                0, 256, (arena.buffer.numel(),), dtype=torch.uint8, generator=generator
+            )
+        )
+        before = arena.buffer.clone()
+
+        spec = ts.RequestSpec()
+        spec.request_id = "b"
+        spec.tokens = prompt + [7, 8, 9]
+        spec.max_new_tokens = 1
+        scheduler.submit_requests([spec])
+        plan = scheduler.next_execution_plan()
+        (hit,) = forwards(plan)
+        self.assertEqual(list(hit.extend_prefix_lens), [41])
+        copies = plan.pages_to_copy_arrays()["kv"]
+        self.assertEqual(copies.shape, (1, 2))
+        source, destination = (int(value) for value in copies[0])
+        self.assertEqual(source, tail_block)
+        self.assertEqual(int(hit.block_tables_arrays()["kv"][0][2]), destination)
+        self.assertNotIn(destination, plan.pages_to_zero["kv"])
+
+        local = local_page_pairs_by_group({"kv": copies}, contract=contract, rank=0)
+        arena.copy_blocks(local)
+        torch.cuda.synchronize()
+
+        local_source, local_destination = (int(value) for value in local["kv"][0])
+        src_segments = arena.block_byte_segments("kv", [local_source])
+        dst_segments = arena.block_byte_segments("kv", [local_destination])
+        # Every declared field of every layer, in the plan's own byte layout.
+        self.assertEqual(len(src_segments), 4 * self.LAYERS)
+        expected = before.clone()
+        for (src_off, size), (dst_off, dst_size) in zip(
+            src_segments, dst_segments, strict=True
+        ):
+            self.assertEqual(size, dst_size)
+            expected[dst_off : dst_off + size] = before[src_off : src_off + size]
+        torch.testing.assert_close(arena.buffer, expected, rtol=0, atol=0)
+        for src_off, size in src_segments:
+            self.assertTrue(
+                torch.equal(
+                    arena.buffer[src_off : src_off + size],
+                    before[src_off : src_off + size],
+                )
+            )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
