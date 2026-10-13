@@ -84,9 +84,12 @@ def test_fresh_spec_is_the_chain(nodes):
     assert torch.equal(positions, before)
     fresh = (spec.depth_buf.clone(), spec.mask_buf.clone())
     chain = torch.arange(-1, nodes - 1, dtype=torch.int32, device="cuda").repeat(8, 1)
-    spec.load_step(3, torch.tensor([0, 1, 2], device="cuda"), chain)
+    window = torch.arange(3 * nodes, device="cuda")
+    spec.load_step(3, torch.tensor([0, 1, 2], device="cuda"), chain, window)
     assert torch.equal(spec.depth_buf, fresh[0])
     assert torch.equal(spec.mask_buf, fresh[1])
+    # A chain's depth is its window offset: positions stay.
+    assert torch.equal(window, torch.arange(3 * nodes, device="cuda"))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])

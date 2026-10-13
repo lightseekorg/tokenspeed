@@ -266,6 +266,8 @@ class MambaAttnBackend(AttentionBackend):
     _verify_reads_committed_recurrent_state: bool = False
     _verify_packed_qkv_views: bool = False
     _decode_packed_qkv_views: bool = False
+    # Whether the family's chunked tree verify scan fills the ReplaySSM payload.
+    _verify_scan_writes_replay: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -720,6 +722,16 @@ class MambaAttnBackend(AttentionBackend):
             ancestors = ((1 << (steps + 1)) - 1).repeat(bs, 1)
             self._chain_ancestors_cache[key] = ancestors
         return ancestors
+
+    def _pack_projection(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor | None,
+        b: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """The conv input and gates as the dense decode kernels read them;
+        families whose models hand over dense tensors return them as is."""
+        return mixed_qkv, a, b
 
     def _verify_scratch_grid(self, bs: int, draft_token_num: int) -> torch.Tensor:
         """Scratch row grid ``[bs, draft_token_num]``: row ``req*(T+1)`` is
@@ -1427,6 +1439,8 @@ class MambaAttnBackend(AttentionBackend):
         if fused_out is not None:
             return fused_out
 
+        # A family whose model hands over projection views makes them dense here.
+        mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
         # Stride-aware fused decoders consume packed projection views directly.
         # Preserve the shared fallback's established compact input layout.
         if not self._decode_packed_qkv_views:
@@ -1700,6 +1714,9 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
+            if self.tree_verify is None:
+                # A chain verifies through the dense MTP kernels (FlashInfer's).
+                mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             # Read the committed window and write per-position states into the
             # verify scratch. The accepted position is committed afterward.
             if layer_id == self._state_layer_ids()[0]:
@@ -1785,11 +1802,20 @@ class MambaAttnBackend(AttentionBackend):
                 (a if b is None else b).view(seq_len, -1),
             )
 
+        # GDN's chunked tree verify (no node states) fills the replay payload as it reads k/v/a/b.
+        scan_replay = None
+        if (
+            replay_inputs is not None
+            and self._verify_scan_writes_replay
+            and self.tree_verify is not None
+            and self._tree_node_states is None
+        ):
+            scan_replay, replay_inputs = replay_inputs[0], None
         # KDA's verify consumes zero-copy strided views. When recurrent-state
         # replay is enabled, the split kernel also saves the persistent inputs
         # needed to reconstruct accepted state later.
         if (
-            self._verify_packed_qkv_views
+            (self._verify_packed_qkv_views or scan_replay is not None)
             and replay_inputs is None
             and mixed_qkv.stride(-1) == 1
             and is_target_verify
@@ -1837,6 +1863,7 @@ class MambaAttnBackend(AttentionBackend):
                 draft_token_num=draft_token_num,
                 seq_len=seq_len,
                 lower_bound=gate_lower_bound,
+                replay_payload=scan_replay,
             )
         else:
             metadata = self.forward_metadata
@@ -1963,6 +1990,7 @@ class MambaAttnBackend(AttentionBackend):
         draft_token_num: int,
         seq_len: int,
         lower_bound: float | None,
+        replay_payload: torch.Tensor | None,
     ) -> torch.Tensor:
         """Per-position recurrent scan of a target-verify round.
 
@@ -1993,6 +2021,9 @@ class MambaAttnBackend(AttentionBackend):
             draft_token_num: Verified positions per request.
             seq_len: Total tokens in the round (``batch_size * T``).
             lower_bound: KDA decay clamp.
+            replay_payload: ``[seq_len, width]`` ReplaySSM payload the scan
+                fills with each token's k, v, a and b, or None when the split
+                filled it.
 
         Returns:
             ``[1, seq_len, Hv, V]`` layer output.
@@ -2047,6 +2078,7 @@ class MambaAttnBackend(AttentionBackend):
             tree_ancestors=self._verify_ancestors(
                 batch_size, draft_token_num, num_value_heads
             ),
+            replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
             solution=mtp_solution,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
