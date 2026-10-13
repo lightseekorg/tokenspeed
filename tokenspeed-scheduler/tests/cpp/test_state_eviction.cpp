@@ -818,4 +818,152 @@ TEST_F(StatePublicationSuite, ADecodingVictimResumesDecodingWithOrWithoutHostCac
     }
 }
 
+// Full + one sliding window (W = 8, two lookback pages) over 8-token chunks.
+class SwaPublicationSuite : public StatePublicationSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StatePublicationSuite::MakeConfig();
+        cfg.cache_groups = {
+            CacheGroupConfig{
+                .group_id = "full",
+                .block_granularity = 4,
+                .total_pages = cfg.device_allocator.total_pages,
+                .retention = CacheGroupConfig::Retention::FullHistory,
+                .family = CacheGroupFamily::History,
+            },
+            CacheGroupConfig{
+                .group_id = "swa",
+                .block_granularity = 4,
+                .total_pages = cfg.device_allocator.total_pages,
+                .retention = CacheGroupConfig::Retention::SlidingWindow,
+                .sliding_window_tokens = 8,
+                .family = CacheGroupFamily::History,
+            },
+        };
+        return cfg;
+    }
+};
+
+TEST_F(SwaPublicationSuite, PromptChunksKeepNoWindowAndTheAlignedEndpointResumes) {
+    // 25 = 24 + 1: the last chunk completes no page, so the Endpoint at 24 must
+    // be classified when the third chunk's pages are hashed.
+    for (std::int32_t length : {24, 25, 26}) {
+        SCOPED_TRACE(length);
+        Reset(false, 1, 0);
+        const RequestSpec request = RequestWithTokens("source", MakeTokens(length, 1));
+        std::vector<ExecutionPlan> plans;
+        Prefill(request, plans);
+        SendFinish("source");
+        PlanOnce();
+
+        ExpectReplay("earlier_chunk", MakeTokens(9, 1), 0);
+        auto replay_tokens = request.tokens;
+        replay_tokens.push_back(999);
+        ExpectReplay("next_turn", std::move(replay_tokens), length / 4 * 4);
+    }
+}
+
+TEST_F(SwaPublicationSuite, HostStoresNoPromptChunkWindow) {
+    Reset(true, 1, 0);
+    const RequestSpec request = RequestWithTokens("source", MakeTokens(25, 1));
+    std::vector<ExecutionPlan> plans;
+    Prefill(request, plans);
+    SendFinish("source");
+    plans.push_back(PlanOnce());
+    AckWriteBacks(plans.back());
+    // Full pages 0..5 plus the window behind the Endpoint at 24 (pages 4, 5).
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6 + 2);
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    auto replay_tokens = request.tokens;
+    replay_tokens.push_back(999);
+    ExpectReplay("host_replay", std::move(replay_tokens), 24);
+}
+
+TEST_F(SwaPublicationSuite, DecodeAndFinishKeepOnlyThePromptWindow) {
+    Reset(false, 1, 0);
+    std::vector<ExecutionPlan> plans;
+    Prefill(RequestWithTokens("source", MakeTokens(4, 1)), plans);
+    PlanOnce();
+    for (std::int32_t token = 102; token <= 110; ++token) {
+        SendForwardDone("source", {token});
+        PlanOnce();
+    }
+    // Finish hashes the last generated page, which is no resume point either.
+    SendFinish("source");
+    PlanOnce();
+    ExpectReplay("generated_boundary", ConversationPrefix(12), 4);
+}
+
+TEST_F(SwaPublicationSuite, IncompletePrefillRetractionKeepsItsFrontierWindowInHostL2) {
+    Reset(true, 1, 0);
+    config_.device_allocator.total_pages = 13;
+    config_.max_batch_size = 2;
+    for (CacheGroupConfig& group : config_.cache_groups) {
+        group.total_pages = config_.device_allocator.total_pages;
+    }
+    SetTestSnapshotPool(config_);
+    // At the fourth plan, retract the one Prefilling request between its chunks.
+    config_.debug_force_retraction_interval = -4;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
+    Submit(RequestSpec{.request_id = "resident", .tokens = MakeTokens(8, 1)});
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("resident", {41});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("resident", {42});
+
+    Submit(RequestSpec{.request_id = "partial", .tokens = MakeTokens(20, 101)});
+    const ExecutionPlan first_chunk = PlanOnce();
+    const ForwardBatch* chunk = FindForwardBatch(first_chunk);
+    ASSERT_NE(chunk, nullptr);
+    ASSERT_EQ(chunk->request_ids, std::vector<std::string>{"partial"});
+    ASSERT_EQ(chunk->input_lengths, std::vector<std::int32_t>{8});
+    AckWriteBacks(first_chunk);
+    SendForwardDone("partial", {});
+
+    // Retraction keeps the window behind the computed frontier (8) as an
+    // Endpoint, so it rides Host L2 with the two full pages as the image's
+    // L2 leg; nothing is left for the snapshot pool.
+    const ExecutionPlan retract = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    std::int32_t window_stores = 0;
+    for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(retract)) {
+        for (const auto& group_ids : std::get<WriteBackBatch>(operation).group_ids) {
+            window_stores += static_cast<std::int32_t>(std::count(group_ids.begin(), group_ids.end(), 1u));
+        }
+    }
+    EXPECT_EQ(window_stores, 2);
+    const SnapshotStoreBatch* tail = FindSnapshotStore(retract);
+    ASSERT_NE(tail, nullptr);
+    EXPECT_TRUE(tail->src_pages.at(0).empty()) << "8 computed tokens end on a page boundary";
+    SendForwardDone("resident", {43});
+    std::int32_t next_token = 44;
+    DecodeUntilDeviceCacheIsConsumed("resident", next_token);
+    AckImageStores(retract);
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 4) << "the suspended prompt pins its four Host entries";
+    SendAbortEvent("resident");
+
+    // The restore copies the window back from Host with the full pages, and
+    // the prompt runs its second chunk from the frontier.
+    const ExecutionPlan recovery = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(recovery);
+    ASSERT_NE(restore, nullptr);
+    ASSERT_EQ(restore->request_ids, std::vector<std::string>{"partial"});
+    EXPECT_EQ(std::count(restore->group_ids.at(0).begin(), restore->group_ids.at(0).end(), 1u), 2);
+    for (const std::uint8_t tier : restore->source_tiers.at(0)) {
+        EXPECT_EQ(tier, static_cast<std::uint8_t>(HostTier::kL2));
+    }
+    AckRestores(recovery);
+
+    const ExecutionPlan resumed = PlanOnce();
+    const ForwardBatch* recovered = FindForwardBatch(resumed);
+    ASSERT_NE(recovered, nullptr);
+    ASSERT_EQ(recovered->request_ids, std::vector<std::string>{"partial"});
+    EXPECT_EQ(recovered->extend_prefix_lens, std::vector<std::int32_t>{8});
+    AckWriteBacks(resumed);
+    SendForwardDone("partial", {});
+    SendAbortEvent("partial");
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+}
+
 }  // namespace tokenspeed::test

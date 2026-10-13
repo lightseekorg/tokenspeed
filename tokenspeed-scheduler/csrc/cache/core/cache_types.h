@@ -135,13 +135,14 @@ struct GroupDemand {
 struct CompletedPages {
     std::span<const std::string> prefix_hashes{};
     std::int32_t first_new_prefix_page{0};
-    // Which kind of resumable boundary the newly completed range ends on.
+    // Which kind of resumable boundary the newly completed range holds.
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
-    // State may retain an aligned checkpoint before an unaligned endpoint.
-    // Its classification must not promote the History or sliding groups.
-    std::optional<CacheBoundaryKind> state_boundary_kind{};
-    // Prefill streams newly published history and retained state to Host.
-    // Decode leaves this false; only sliding windows keep streaming.
+    // Prefix pages up to the range's Endpoint or Promoted boundary, the only
+    // boundary groups that are not prefix-closed keep; 0 when the range holds
+    // neither.
+    std::int32_t retained_prefix_pages{0};
+    // Prefill streams newly published history and retained boundaries to Host.
+    // Decode leaves this false.
     bool stream_completed_to_host{false};
     // Exact prefill checkpoint provenance. Allocation and token progress are
     // not proof. An empty span disables state publication for this range.

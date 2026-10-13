@@ -227,7 +227,7 @@ public:
                                                            std::int32_t num_tokens) const;
     // The same slots once `progress` has been published as well: the entries
     // that exist now plus the slots CacheCompletedBlocks(progress) would
-    // register (the single publication rule, completedBlockRanges). The
+    // register (the single publication rule, completedBlockRange). The
     // victim probe reads the image's L2/pool split off this before the
     // retraction publishes, so it sees exactly what StartRetractionStores
     // will see afterwards. Without completed pages it is PublishedDataSlots.
@@ -445,11 +445,11 @@ private:
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     };
     // What publishing `completed` covers in one group -- every newly hashed
-    // page of a prefix-closed group, the lookback behind the newest boundary
-    // of a sliding group, the lookback behind each materialized checkpoint
-    // of a state group, nothing for a replayable one. The one source for
+    // page of a prefix-closed group, the lookback behind the retained
+    // boundary of any other group (for state, only where a checkpoint was
+    // written), nothing for a replayable one. The one source for
     // cacheCompletedBlocksForGroup and for PublishedDataSlotsAfter.
-    std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
+    std::optional<PublishedRange> completedBlockRange(std::size_t group_index, const CompletedPages& completed) const;
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                       std::uint64_t access_epoch);
