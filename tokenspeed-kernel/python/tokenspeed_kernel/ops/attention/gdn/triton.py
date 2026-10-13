@@ -65,6 +65,7 @@ from tokenspeed_kernel.ops.attention.gdn._triton.prefill_state_inputs import (
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
     fused_qkv_split_gdn_prefill,
+    pack_gdn_projection,
 )
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,

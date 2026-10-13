@@ -721,6 +721,16 @@ class MambaAttnBackend(AttentionBackend):
             self._chain_ancestors_cache[key] = ancestors
         return ancestors
 
+    def _pack_projection(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor | None,
+        b: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """The conv input and gates as the dense decode kernels read them;
+        families whose models hand over dense tensors return them as is."""
+        return mixed_qkv, a, b
+
     def _verify_scratch_grid(self, bs: int, draft_token_num: int) -> torch.Tensor:
         """Scratch row grid ``[bs, draft_token_num]``: row ``req*(T+1)`` is
         the seeded init window, rows ``req*(T+1)+1+t`` the per-position
@@ -1427,6 +1437,8 @@ class MambaAttnBackend(AttentionBackend):
         if fused_out is not None:
             return fused_out
 
+        # A family whose model hands over projection views makes them dense here.
+        mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
         # Stride-aware fused decoders consume packed projection views directly.
         # Preserve the shared fallback's established compact input layout.
         if not self._decode_packed_qkv_views:
@@ -1700,6 +1712,9 @@ class MambaAttnBackend(AttentionBackend):
             )
             if fused_out is not None:
                 return fused_out
+            if self.tree_verify is None:
+                # A chain verifies through the dense MTP kernels (FlashInfer's).
+                mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             # Read the committed window and write per-position states into the
             # verify scratch. The accepted position is committed afterward.
             if layer_id == self._state_layer_ids()[0]:

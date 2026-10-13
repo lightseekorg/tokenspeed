@@ -36,14 +36,16 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_step,
     gdn_tree_verify_needs_node_states,
 )
-from tokenspeed_kernel.ops.attention.gdn.triton import fused_qkv_split_gdn_prefill
+from tokenspeed_kernel.ops.attention.gdn.triton import (
+    fused_qkv_split_gdn_prefill,
+    pack_gdn_projection,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.layers.attention.linear.causal_conv1d import (
     causal_conv1d_update,
 )
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import rmsnorm_fn
-from tokenspeed.runtime.models.qwen3_5 import fused_qkvzba_split_reshape_cat_contiguous
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TEST_DIR)
@@ -198,14 +200,13 @@ def test_gdn_chain_pdl_toggle(
             BLOCK=1024,
             launch_pdl=True,
         )
-        qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
-            projection[:, :qkvz_width],
-            projection[:, qkvz_width:],
-            heads,
-            value_heads,
-            dim,
-            dim,
+        # Row-strided views of the projection, as the Qwen3.5 layer hands them on.
+        qkv, z = projection[:, :qkvz_width].split(
+            [qkv_width, value_heads * dim], dim=-1
         )
+        b, a = projection[:, qkvz_width:].split(value_heads, dim=-1)
+        # A chain or plain decode packs them for the dense kernels, as GdnAttnBackend does.
+        qkv, a, b = pack_gdn_projection(qkv, a, b)
         causal_conv1d_update(
             qkv.view(batch, steps, qkv_width).transpose(1, 2),
             conv,
@@ -262,11 +263,11 @@ def test_gdn_chain_pdl_toggle(
                 tree_ancestors=None,
             )
         return rmsnorm_fn(
-            out.reshape(-1, dim),
+            out.reshape(rows, -1),
             norm_weight,
-            z=z.reshape(-1, dim),
+            z=z,
             eps=1e-6,
-            group_size=None,
+            group_size=dim,
             norm_before_gate=True,
             sigmoid_gate=False,
             weights_independent=True,
@@ -281,7 +282,7 @@ def test_gdn_chain_pdl_toggle(
         with torch.cuda.graph(graph):
             actual = forward()
         names, edges = _graph_kernel_edges(graph)
-        stages = ("fused_qkvzba", "causal_conv1d", "gdn", "rms_norm")
+        stages = ("pack_gdn", "causal_conv1d", "gdn", "rms_norm")
         for stage in stages:
             assert any(stage in name for name in names.values()), names
         if steps > 1:

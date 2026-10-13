@@ -33,6 +33,49 @@ from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
 
+def test_pack_gdn_projection_copies_the_row_strided_views(device: str):
+    """Dense copies of a projection's [qkv | z | b | a] views, bit for bit,
+    compiled once across row counts."""
+    from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
+        _pack_gdn_projection_kernel,
+    )
+    from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
+
+    qkv_dim, z_dim, heads = 2 * 512 + 1536, 1536, 12
+
+    def views(rows):
+        projection = torch.randn(
+            rows, qkv_dim + z_dim + 2 * heads, device=device, dtype=torch.bfloat16
+        )
+        b, a = projection[:, qkv_dim + z_dim :].split(heads, dim=-1)
+        return projection[:, :qkv_dim], a, b
+
+    for rows in (1, 16):
+        sources = views(rows)
+        for packed, source in zip(pack_gdn_projection(*sources), sources):
+            assert packed.is_contiguous() and packed.data_ptr() % 16 == 0
+            assert packed.data_ptr() != source.data_ptr()
+            assert torch.equal(packed, source)
+    with assert_no_triton_compile(_pack_gdn_projection_kernel):
+        for rows in (3, 64):
+            pack_gdn_projection(*views(rows))
+
+
+def test_pack_gdn_projection_reads_rows_past_int32_offsets(device: str):
+    """Row offsets times the projection's row stride pass int32."""
+    from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
+
+    qkv_dim, heads, row_stride = 64, 4, 1 << 20
+    rows = (1 << 31) // row_stride + 2
+    projection = torch.empty(rows, row_stride, device=device, dtype=torch.uint8)
+    used = projection[:, : qkv_dim + 2 * heads]
+    used.copy_(torch.randint(0, 256, used.shape, device=device, dtype=torch.uint8))
+    b, a = used[:, qkv_dim:].split(heads, dim=-1)
+    sources = (used[:, :qkv_dim], a, b)
+    for packed, source in zip(pack_gdn_projection(*sources), sources):
+        assert torch.equal(packed, source)
+
+
 def _fla_chunk_gated_delta_rule():
     from tokenspeed_kernel.ops.attention.gdn._triton.chunk import (
         chunk_gated_delta_rule,
