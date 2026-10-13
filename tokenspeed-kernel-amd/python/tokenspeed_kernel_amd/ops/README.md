@@ -520,9 +520,11 @@ ascending without candidates and with ascending candidate lists; otherwise an
 all-pairs rank sorts them. LDS atomics cost about one wave instruction per 64
 lanes regardless of conflicts, so the radix passes dominate on wide rows.
 
-Block selection stays in torch: it takes the maximum logit of each 8-row
-block, forces the newest visible block to `+inf`, and keeps the top blocks
-in ascending order.
+Block selection takes the maximum logit of each 8-row block, forces the
+newest visible block to `+inf`, and keeps the top blocks in ascending order.
+On gfx950 one Triton program per query reads only the visible blocks, runs a
+four-pass MSD radix select (8 key bits per pass) and emits the picks in block
+order, so no sort is needed; gfx1250 uses torch.
 
 ### gfx950 DeepSeek V4.1 selected attention
 
