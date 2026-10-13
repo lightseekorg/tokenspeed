@@ -39,6 +39,9 @@ from tokenspeed_kernel.ops.attention import dsv41
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
+    DeepseekV4DSpark,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -91,7 +94,7 @@ class DeepseekV41DSpark(BaseDrafter):
             token_to_kv_pool=token_to_kv_pool,
             vocab_size=vocab_size,
         )
-        self._validate_tp_only_mapping(draft_model_runner.mapping)
+        DeepseekV4DSpark._validate_tp_only_mapping(draft_model_runner.mapping)
 
         self.device = torch.device(draft_model_runner.device)
         self.draft_model = draft_model_runner.model
@@ -118,15 +121,6 @@ class DeepseekV41DSpark(BaseDrafter):
             int(self.draft_model.lm_head.num_embeddings_per_partition),
             self.device,
         )
-
-    @staticmethod
-    def _validate_tp_only_mapping(mapping) -> None:
-        dp_size = int(mapping.attn.dp_size)
-        if dp_size != 1:
-            raise ValueError(
-                "Week-0 DSPARK supports tensor parallelism only; "
-                f"got attention dp_size={dp_size}."
-            )
 
     def idle_forward_global_num_tokens(
         self, global_num_tokens: list[int], global_bs: list[int]

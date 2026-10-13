@@ -361,7 +361,7 @@ class LeafSignatureConformanceTest(_TorchCase):
 
     The router calls every leaf with the same positional/keyword shape; a
     narrower bespoke signature TypeErrors on exactly the configs that need
-    it. Runner-facing nodes (router, composites, V4.1, state) are checked
+    it. Runner-facing nodes (router, composites, V4, state) are checked
     against the runner kwarg set separately below.
     """
 
@@ -524,6 +524,10 @@ class RunnerSignatureConformanceTest(_TorchCase):
         (
             "tokenspeed.runtime.layers.attention.backends.paged.msa",
             "MSAHybridAttnBackend",
+        ),
+        (
+            "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4",
+            "DeepseekV4AttentionBackend",
         ),
         (
             "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41",

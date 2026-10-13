@@ -7,16 +7,9 @@
 # copies of the Software, and to permit persons to whom the Software is
 # furnished to do so, subject to the following conditions:
 #
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
 # THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 # IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
 
 import unittest
 
@@ -27,7 +20,7 @@ from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.mxfp4 import create_mxfp4_weight_pair
 
 
-class TestMxfp4ExpertShards(unittest.TestCase):
+class TestDeepseekV4MegaMoE(unittest.TestCase):
     def test_standard_mxfp4_weights_load_expert_shards(self):
         experts = nn.Module()
         spec = MoELayerSpec(

@@ -649,10 +649,10 @@ things:
 
 `--kv-parallel-size N` must divide `--attn-tp-size`; the KVP subgroups are
 aligned runs of `N` consecutive attention-TP ranks. It applies to the
-full-history groups of MLA/DSA models (latent KV and index-K); groups that
-every rank reads whole (sliding windows, recurrent state) stay replicated.
-The attention backend decides how it attends the sharded pages (DCP decode,
-chunked or gathered prefill history);
+full-history groups of MLA/DSA models (latent KV and index-K) and to DeepSeek
+V4's compressed KV; groups that every rank reads whole (sliding windows,
+compressor state) stay replicated. The attention backend decides how it
+attends the sharded pages (DCP decode, chunked or gathered prefill history);
 the scheduler plans the same virtual blocks on every rank and the runtime
 translates ownership where it reads, writes or copies them
 (`docs/design/cache-concepts.md`). PD roles only: a prefill engine (with or

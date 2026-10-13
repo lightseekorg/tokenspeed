@@ -51,6 +51,9 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 # CPU-only; scheduled in runtime-1gpu because it imports the full runtime.
 register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (  # noqa: E402
+    DeepseekV4DSpark,
+)
 from tokenspeed.runtime.execution.drafter.eagle import Eagle  # noqa: E402
 from tokenspeed.runtime.execution.drafter.mtp import Mtp  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
@@ -114,6 +117,7 @@ SAMPLING_BACKENDS = (
 MAX_BS = 9
 MAX_REQ_POOL_SIZE = MAX_BS + 1
 POOL_ROWS = MAX_REQ_POOL_SIZE + 1  # 11: RuntimeStates, drafters, Inkling (max_bs + 2)
+WINDOW_SLOTS = MAX_REQ_POOL_SIZE + MAX_BS  # 19: DSpark's live + padding slots
 SPEC_TOKENS = 4
 VOCAB = 32
 HIDDEN = 8
@@ -182,6 +186,37 @@ def _eagle(states: RuntimeStates) -> Eagle:
     return Eagle(
         spec_num_tokens=SPEC_TOKENS,
         spec_num_steps=3,
+        draft_model_runner=runner,
+        runtime_states=states,
+        input_buffers=_input_buffers(),
+        vocab_size=VOCAB,
+    )
+
+
+def _dspark(states: RuntimeStates) -> DeepseekV4DSpark:
+    block_size = 4
+    inner = SimpleNamespace(
+        block_size=block_size,
+        num_stages=2,
+        window_size=3,
+        attention_params={"head_dim": HIDDEN},
+        target_layer_ids=[0, 1],
+        hidden_size=HIDDEN,
+    )
+    draft_model = SimpleNamespace(
+        model=inner,
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1)),
+        lm_head=SimpleNamespace(num_embeddings_per_partition=VOCAB),
+    )
+    runner = SimpleNamespace(
+        device="cpu",
+        model=draft_model,
+        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1, tp_size=1)),
+    )
+    # DSPARK: block_size == num_steps, num_draft_tokens == num_steps + 1.
+    return DeepseekV4DSpark(
+        spec_num_tokens=block_size + 1,
+        spec_num_steps=block_size,
         draft_model_runner=runner,
         runtime_states=states,
         input_buffers=_input_buffers(),
@@ -401,6 +436,47 @@ def test_eagle_history_frontier_round_trip():
     eagle = _eagle(states)
     assert eagle.draft_history_lengths_buf is not None
     _round_trip(eagle, src_slot=2, dst_slot=8)
+
+
+def test_dspark_windows_round_trip_and_claim_the_slot():
+    states = _runtime_states(draft_probs=False, trees=False, history=False)
+    dspark = _dspark(states)
+    # The victim ran a forward in slot 4: its windows are its own.
+    dspark._request_by_pool_slot[4] = RESTORED
+    _round_trip(dspark, src_slot=4, dst_slot=6, request_keyed=True)
+    # The import claims the new slot for the request, so the next prologue
+    # does not reset the imported windows as a previous occupant's.
+    assert dspark._request_by_pool_slot[6] == RESTORED
+    with pytest.raises(ValueError, match="persistent state domain"):
+        dspark.slot_state_rows(MAX_REQ_POOL_SIZE)
+
+
+def test_dspark_images_an_unprepared_slot_as_nobodys():
+    """A PD decode role's request retracted before its first decode never ran
+    ``prepare_request_state`` here: the slot's windows are a previous
+    occupant's, so the image carries no windows and the restore leaves the
+    new slot for the first forward to prepare, as it would have unretracted."""
+    states = _runtime_states(draft_probs=False, trees=False, history=False)
+    dspark = _dspark(states)
+    dspark._request_by_pool_slot[4] = "previous-occupant"
+    dspark.kv_windows[4].fill_(3.0)
+    dspark.context_lengths[4] = 11
+    image = torch.full((dspark.slot_state_bytes(),), 0xEE, dtype=torch.uint8)
+    dspark.export_slot_state(4, image, None, request_id=RESTORED)
+    assert not read_prepared_marker(image)
+    assert torch.all(image[PREPARED_MARKER_BYTES:] == 0xEE), "no windows imaged"
+
+    dspark._request_by_pool_slot[6] = "stale-occupant"
+    dspark.kv_windows[6].fill_(5.0)
+    dspark.context_lengths[6] = 13
+    dspark.import_slot_state(6, image, None, request_id=RESTORED)
+    assert dspark._request_by_pool_slot[6] is None
+    assert float(dspark.kv_windows[6].sum()) != 0, "the import wrote nothing"
+    # The first forward prepares the slot: a flip, so the windows are reset.
+    dspark.prepare_request_state([RESTORED], [6], num_extends=0)
+    assert dspark._request_by_pool_slot[6] == RESTORED
+    assert float(dspark.kv_windows[6].abs().sum()) == 0
+    assert int(dspark.context_lengths[6]) == 0
 
 
 def test_inkling_ring_round_trip_through_the_wrapper():
@@ -667,13 +743,15 @@ def test_every_owner_a_constructed_executor_lists_is_complete():
     executor.runtime_states = states
     executor.attn_backend = _inkling()
     executor.draft_attn_backend = _inkling()
-    executor.drafter = _mtp(states)
+    executor.drafter = _dspark(states)
     executor.sampling_backend = _sampling_backend(FlashInferFullSamplingBackend)
     exporters = executor.slot_state_exporters()
     assert len(exporters) == 7
     for owner in exporters:
         assert isinstance(owner, SlotStateExporter)
-        _assert_slot_state_complete(owner, exporter=owner, slot_domains={POOL_ROWS})
+        _assert_slot_state_complete(
+            owner, exporter=owner, slot_domains={POOL_ROWS, WINDOW_SLOTS}
+        )
 
 
 def test_runtime_states_slot_state_is_complete():
@@ -690,6 +768,11 @@ def test_drafter_slot_state_is_complete():
     _assert_slot_state_complete(mtp, exporter=mtp, slot_domains={POOL_ROWS})
     eagle = _eagle(states)
     _assert_slot_state_complete(eagle, exporter=eagle, slot_domains={POOL_ROWS})
+    dspark = _dspark(states)
+    assert dspark.kv_windows.shape[0] == WINDOW_SLOTS
+    _assert_slot_state_complete(
+        dspark, exporter=dspark, slot_domains={POOL_ROWS, WINDOW_SLOTS}
+    )
 
 
 def test_backend_slot_state_is_complete():

@@ -469,10 +469,11 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
             _ = spec.page_size
 
     def test_state_family_declares_no_rows(self):
-        # Rows of token history are a history group whatever their retention.
+        # Rows of token history -- V4's compressor tails included -- are a
+        # history group whatever their retention.
         with self.assertRaisesRegex(ValueError, "no row geometry"):
             CacheGroupSpec(
-                group_id="compressor",
+                group_id="v4.compressor",
                 retention="sliding_window",
                 rows_per_page=16,
                 entry_stride_tokens=4,
@@ -481,7 +482,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 replayable=False,
             )
         spec = CacheGroupSpec(
-            group_id="compressor",
+            group_id="v4.compressor",
             retention="sliding_window",
             rows_per_page=16,
             entry_stride_tokens=4,

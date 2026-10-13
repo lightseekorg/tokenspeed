@@ -366,6 +366,12 @@ class TestCLIConfigCompat(unittest.TestCase):
         sa.resolve_basic_defaults()
         self.assertEqual(sa.kv_cache_dtype, "fp8_e4m3")
 
+    def test_tokenizer_mode_deepseek_v4_arg(self):
+        args = self._parse_args(
+            ["--model", "test/model", "--tokenizer-mode", "deepseek_v4"]
+        )
+        self.assertEqual(args.tokenizer_mode, "deepseek_v4")
+
     def test_hf_overrides_arg(self):
         args = self._parse_args(
             ["--model", "test/model", "--hf-overrides", '{"rope_scaling": null}']

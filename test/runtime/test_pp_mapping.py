@@ -193,7 +193,7 @@ def test_pp_stage_cache_windows_scale_by_attention_instances():
         num_target_cache_layers=28,
     )
     assert uneven == [(0, 18), (18, 28)]
-    # One instance per block (K3, V4.1): the execution windows pass through.
+    # One instance per block (K3, V4): the execution windows pass through.
     assert pp_stage_cache_windows(
         pp_stage_windows(7, 3),
         cache_layers_per_execution_layer=1,

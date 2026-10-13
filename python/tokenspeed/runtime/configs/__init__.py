@@ -20,6 +20,7 @@
 
 """Runtime configuration exports."""
 
+from tokenspeed.runtime.configs.deepseek_v4_config import DeepseekV4Config
 from tokenspeed.runtime.configs.deepseek_v41_config import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
@@ -59,6 +60,7 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
 )
 
 __all__ = [
+    "DeepseekV4Config",
     "DeepseekV41Config",
     "DeepseekV41TextConfig",
     "Qwen2Config",

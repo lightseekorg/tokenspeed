@@ -51,7 +51,7 @@ tokens at all:
 `CacheGroupSpec.__post_init__` holds each family to its shape, so exactly
 three `(family, retention)` combinations exist — the C++ `AttnKind { kFull,
 kSlidingWindow, kMambaState }`. A trailing window of token rows (DeepSeek
-V4.1's SWA rows and compressor tails) is a sliding `history` group whatever a
+V4's SWA kv and compressor tails) is a sliding `history` group whatever a
 kernel calls its buffer; `state` is not a routing label for "some backend
 owns this table".
 
@@ -69,6 +69,20 @@ A fourth quantity lives outside the logical world entirely:
   set (trtllm-mla ∈ {32, 64}), and flexible kernels carry a chosen default.
   `config.kernel_page_size` overrides any default; deriving kernel_page_size
   from `prefix_granularity` is a category error and a bug.
+
+  DeepSeek V4's geometry is fully
+  registry-sourced: the compressed full-history chains declare
+  `DEEPSEEK_V4_PAGE_SIZE // ratio` rows × ratio-token stride, the SWA
+  window declares `V4_KERNEL_BLOCK_ROWS`, and the layout's field byte
+  shapes are built from the kernel page constant — nothing derives from
+  `prefix_granularity`. The V4 backend's scalar is therefore a true
+  registry-sourced `kernel_page_size` (config-overridable), and the
+  scheduler grain is free: any positive multiple of the kernel page is
+  accepted (asserted at backend construction and in the recipe's
+  `check_layout`). The V4 architecture spec defaults P to exactly one kernel
+  page by naming `DEEPSEEK_V4_PAGE_SIZE` as its
+  `default_prefix_granularity` — the registry constant itself, not a second
+  copy of the number.
 
 ### Physical world (storage units)
 
@@ -291,7 +305,7 @@ page span that paged-KV geometry math (row views, slot↔page arithmetic,
 scale-tile branching) reads. Both derive from the one plan, which is the
 single point of the prefix-page ↔ KV-page convention.
 Neither is a statement about per-group CacheBlock geometry: group spans live
-in the specs as `block_granularity`, and blocks narrower than P (V4.1's SWA
+in the specs as `block_granularity`, and blocks narrower than P (V4's SWA
 window) or spanning no tokens at all (recurrent state) are the norm, not the
 exception. A backend's
 `kernel_page_size` comes from the kernel registry or an explicit config
@@ -1091,8 +1105,8 @@ calculation, shared by pipeline stages, model construction and PD topology.
 The model/cache construction boundary maps those execution windows to explicit
 `target_cache_windows` with `pp_stage_cache_windows`: both ends of every
 window scale by the model's attention instances per decoder layer
-(`ModelProfile.attention_instances_per_layer`; one for K3, which declares
-no profile, two for LongCat's paired layer), so a block's cache layers
+(`ModelProfile.attention_instances_per_layer`; one for K3 and V4, which
+declare no profile, two for LongCat's paired layer), so a block's cache layers
 stay with the stage that executes it. `CacheLayerOwnership` then adds the
 final stage's draft cache window. Cache ownership consumes cache-ID windows;
 execution partitioning belongs to the distributed layer, and non-PP ownership
@@ -1124,7 +1138,7 @@ seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 The last answers whether speculative verify stages its scratch in the bound
 pool; a CUDA-graph memory probe arena then keeps the serving concurrency.
 `groups()` itself is a seam for the two families whose groups are not
-per-layer (Inkling appends conv columns; V4.1 declares each group
+per-layer (Inkling appends conv columns; V4 declares each group
 whole). No family restates the order of the stages, and `_RECIPES`
 (`recipes/setup.py`) is the single family → recipe map.
 
@@ -1260,8 +1274,8 @@ narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe
 fabricates, and the pool takes one parent block per fabricated row, floored at
 what a single request needs — it binds before the memory profile has run, so
 it cannot size from a budget at all. Families whose per-group demand decides
-the pool — K3's state groups riding inside MLA planes, V4.1's
-SWA and global chains, GLM-5.3-Flash — size from `parents_needed` and get
+the pool — K3's state groups riding inside MLA planes, V4's
+SWA and compressed chains, GLM-5.3-Flash — size from `parents_needed` and get
 the inverse for free from `_capacity_from_parents`, one monotonic binary
 search shared by all. `parents_needed` itself is not a Python formula: it
 hands the group specs, the layout's virtual packing and `scheduler_limits`
@@ -1329,7 +1343,11 @@ A recipe's group set never depends on the KVP size. Only groups whose every
 reader can attend to a shard may be sharded; a group some consumer must read
 whole stays replicated and is declared as its own group at every KVP size, so
 prefix matching, transfer and zeroing -- all keyed by group -- see one
-topology.
+topology. DeepSeek V4 shards its compressed-KV chains and keeps the SWA cache
+and compressor states replicated. Index-K is sharded in its own full-history
+group; its virtual IDs are independent of the compressed attention chain.
+Backend binding validates the KVP shard count for both compressed KV and
+Index-K; SWA and compressor-state groups must remain replicated.
 
 Ordinary GPU MLA and DSA use the same ownership geometry for history storage.
 MLA/KDA hybrids shard the MLA history group and keep KDA state replicated.
@@ -1354,8 +1372,9 @@ prefill instead combines local sparse-attention partials.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
 KVP does not make unsupported kernels portable. Speculative decoding runs
 on sharded caches: `OrdinaryRecipe.groups()` shards a draft group like the
-target's, and the Kimi K3 recipe shards its draft layers in the MLA history
-group, subject to its backend's `AttnConfig` gate. A verify window's queries
+target's, and the DeepSeek V4 and Kimi K3 recipes shard with their draft
+layers in the compressed-KV chains and the MLA history group respectively,
+each subject to its backend's `AttnConfig` gate. A verify window's queries
 end at different global positions, and the kernel's multi-query causal mask
 would subtract a query's global offset from a *local* length, so FlashMLA
 and CuTe MLA feed every query's global endpoint through the compact layout
@@ -1722,7 +1741,9 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   group and fails a live batch missing any of them. QSA's indexer claims
   its compressed/recent history groups separately; it does not instantiate
   attention leaves for them. State consumers (Mamba/KDA, PLE, Inkling conv)
-  index the dict by their own group ids. Mamba's group set comes from
+  index the dict by their own group ids, as does the V4 backend for the
+  several history groups one V4 layer reads at once (its pool view reports
+  no `PagedAttention` binding and no router leaf). Mamba's group set comes from
   its recurrent fields, so a PLE state group cannot arm its verify
   state. `cache_consumer_families` remains the boot-time coverage
   declaration (`validate_scheduler_config`). Extra delivered groups ride
@@ -1755,7 +1776,12 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   page) and the token-shaped resolve
   (`attention/page_table.py::group_slot_mapping_from_raw` +
   `safe_page_ids` / `mask_invalid_graph_tokens`, failing closed to the
-  `-1` skip sentinel for group buffers with no dummy page).
+  `-1` skip sentinel for group buffers with no dummy page). DeepSeek-V4 is
+  a *composer*, not an owner: its SWA / compressor-state / indexer-state
+  writes call the shared token-shaped resolve over its delivered tables;
+  only the compression-boundary orchestration (per-ratio strides, boundary
+  masks, the fused dsv4 kernel) is V4-specific
+  (`kv_cache/hybrid_deepseek_v4.py`).
 
 ### Principle 6 — provenance discipline: fixed
 
@@ -1789,7 +1815,11 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
 * Every backend's `kernel_page_size` is registry- or config-sourced
   (`kernel_page_sizes.py`); the registry LCM validator checks explicitly
   configured values, and a backend that resolves its own registry default
-  owns the divisibility check for it. ✓
+  owns the divisibility check for it. The V4 milestone closed the last
+  P-derivation: compressed-chain rows, SWA rows, and layout byte shapes all
+  build from `DEEPSEEK_V4_PAGE_SIZE`, and V4 accepts any P that is a
+  positive multiple of it (e2e-verified against the `bt_v4` baseline;
+  GSM8K 1319-question sweep: nospec 0.9651, DSpark 0.9629). ✓
 * Two arena scalars, two roles, both derived from the plan:
   `CacheArena.prefix_granularity` (identity grain; contract publication and
   plan checks) and `CacheArena.kv_page_size` (KV arena geometry, read by
@@ -1826,16 +1856,16 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   V4.1's same-checkpoint DSpark. ✓
 * Capacity has three shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
-* Kernel geometry does not live under the recipes package. DeepSeek V4.1's
-  cache formats, packing and group-id vocabulary sit in
-  `attention/deepseek_v41_geometry.py`, which the backend, model and pool
+* Kernel geometry does not live under the recipes package. DeepSeek V4's byte
+  formulas, cache layout and group-id vocabulary sit in
+  `attention/deepseek_v4_geometry.py`, which the backends, ops, model and pool
   read directly; the recipe depends on it, not the reverse. ✓
 * One kernel layout has one definition. The interleaved mxfp8 KV-scale planes
   come from `plan.mxfp8_kv_scale_fields`, which also owns the page-span and
   head-dim constraints that layout imposes, so no recipe restates the shape or
   re-checks the constraint. ✓
 
-Verified end to end for this round: DeepSeek V3.2 and R1, each
+Verified end to end for this round: DeepSeek V3.2, R1 and V4-Flash, each
 × {CUDA graph, eager} × {spec, no spec}, against pre-refactor baselines
 (accuracy equal or better; speculative accept length within noise).
 

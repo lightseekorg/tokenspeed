@@ -18,6 +18,7 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.utils.hf_transformers_utils import (
     _CONFIG_REGISTRY,
+    _find_deepseek_v4_encoding_file,
     _snapshot_commit_hash,
     get_config,
     get_generation_config,
@@ -465,6 +466,19 @@ class HFSnapshotResolutionTests(unittest.TestCase):
                 tokenizer_revision="tokenizer-revision",
                 revision="model-revision",
             )
+
+    def test_deepseek_encoding_missing_from_snapshot_fails_locally(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as snapshot,
+            patch(
+                "tokenspeed.runtime.utils.hf_transformers_utils.cached_file",
+                side_effect=AssertionError("must not re-resolve a local snapshot"),
+            ) as cached,
+            self.assertRaisesRegex(RuntimeError, "encoding/encoding_dsv4.py"),
+        ):
+            _find_deepseek_v4_encoding_file(snapshot, None)
+
+        cached.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -488,7 +488,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertLess((8192 - 1) // 128, tables["sliding_attention"].shape[1])
 
     def test_width_follows_each_groups_own_geometry(self):
-        # Sibling cache groups with different grains: each
+        # DeepSeek-V4 shape: sibling groups with very different grains. Each
         # gets ceil(extent / its own granularity) -- one rule, no width flag.
         backend = _backend()
         pool = _fake_pool(
@@ -820,7 +820,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertIsNone(unsharded["query_shard"])
 
     def test_real_active_page_backend_gets_positions_alongside_its_tables(self):
-        """A backend that validates live-page geometry is told how many
+        """A backend that validates live-page geometry (V4) is told how many
         tokens the batch carries and handed the live positions slice, and it
         still gets the metadata-derived tables. The decode wrapper is not
         consulted: capture builds its own distinct-block tables."""
