@@ -398,6 +398,10 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         self.qkv_parallel = qkv_parallel
         self.output_parallel = output_parallel
         self.use_output_gate = config.mla_use_output_gate
+        # Fused gated-layout row widths; _make_qkv_a_projection (invoked from
+        # super().__init__) fills them only for the gated layout.
+        self._qkv_a_width: int | None = None
+        self._gate_width: int | None = None
         # Without Q-LoRA the parent skips the factory that builds the gate.
         if self.use_output_gate and q_lora_rank is None:
             raise ValueError("Gated MLA requires Q-LoRA (q_lora_rank must not be None)")
