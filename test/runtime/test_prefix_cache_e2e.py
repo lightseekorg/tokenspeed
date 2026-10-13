@@ -266,13 +266,17 @@ class TestTokenLevelPrefixHits(unittest.TestCase):
 
     A cold prompt ``X`` publishes a checkpoint at its prompt end (|X|) and at
     its finish (|X| + the computed decode tokens). ``X + Y`` hits the prompt
-    end exactly; ``X[:-1]`` and ``X[:-37]`` end before any publication point
-    and hit the hash-complete pages only (a KV-only model) or nothing (a
-    recurrent-state hybrid, whose state exists only at the published points);
-    a repeat of ``X`` keeps one token to compute. The decoded continuation is
-    the oracle: a KV-only model must reproduce the cold run token for token;
-    a hybrid resumes from a state whose chunking differs from the cold scan,
-    so it must agree greedily.
+    end exactly. ``X[:-1]`` and ``X[:-37]`` end before any publication point:
+    a KV-only model resumes at the hash-complete pages its full-history group
+    holds below the cut when every other group can too (a sliding-window
+    group resumes only where its lookback was published, the cold prompt
+    end, so the deeper cut may find nothing), a recurrent-state hybrid finds
+    no state below the cut and starts cold. Each of them publishes its own
+    prompt end when it finishes, so a repeat of ``X`` then resumes at |X| - 1
+    with one token to compute. The decoded continuation is the oracle: a
+    KV-only model must reproduce the cold run token for token; a hybrid
+    resumes from a state whose chunking differs from the cold scan, so it
+    must agree greedily.
     """
 
     STEPS = 24
@@ -314,33 +318,30 @@ class TestTokenLevelPrefixHits(unittest.TestCase):
                     self.assertEqual(cached, len(prefix))
 
                     # X[:-1] and X[:-37] end inside the last page, before any
-                    # publication point.
+                    # publication point. The deeper cut runs second, so the
+                    # tail X[:-1] publishes at its finish (|X| - 1) is not a
+                    # prefix of it either.
                     for cut in (1, 37):
                         shorter = prefix[:-cut]
                         warm, cached = _greedy_ids(engine, shorter, 1)
                         self.assertLess(cached, len(shorter))
                         if hybrid:
                             self.assertEqual(cached, 0)
-                        else:
+                        elif cut == 1:
                             self.assertGreater(cached, 0)
                         self.assertEqual(len(warm), 1)
 
-                    # X again: the KV pages are cached but one token must be
-                    # computed; the continuation must match the cold run.
+                    # X again: the X[:-1] run published its prompt end at
+                    # |X| - 1 when it finished, a prefix of X with one token
+                    # left to compute; the continuation must match the cold
+                    # run.
                     warm, cached = _greedy_ids(engine, prefix, self.STEPS)
-                    self.assertLess(cached, len(prefix))
                     if hybrid:
-                        # No state checkpoint lies below |X| yet; the junction
-                        # cut ends this request's first chunk at the KV hit
-                        # (a chunk boundary the cold run did not have),
-                        # publishing the state the next repeat resumes from.
-                        self.assertEqual(cached, 0)
-                        self._assert_agreement(warm, cold)
-                        warm, cached = _greedy_ids(engine, prefix, self.STEPS)
-                        self.assertGreater(cached, 0)
+                        self.assertEqual(cached, len(prefix) - 1)
                         self._assert_agreement(warm, cold)
                     else:
                         self.assertGreater(cached, 0)
+                        self.assertLess(cached, len(prefix))
                         self.assertEqual(warm, cold)
 
                     # X + the cold continuation hits the finish checkpoint:
