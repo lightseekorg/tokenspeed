@@ -289,6 +289,72 @@ def _same_tensor_contract(
         )
 
 
+def select_gated_residual_mix_kernel(
+    flat: _torch.Tensor,
+    projection_weight: _torch.Tensor,
+    up_weight: _torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    *,
+    weights_independent: bool,
+    override: str | None,
+    solution: str | None,
+):
+    """Select the ``gated_residual_mix`` kernel for validated 2-D inputs.
+
+    Args:
+        flat: Normalized residual streams shaped ``[rows, hc_count * hidden_size]``.
+        projection_weight: Fused down/inject weight (see ``gated_residual_mix``).
+        up_weight: Mix-up weight shaped ``[hc_count * hidden_size, lowrank]``.
+        hc_count: Number of residual branches.
+        hidden_size: Width of one branch.
+        lowrank: Rank of the mix gate bottleneck.
+        weights_independent: Whether both weights stay unchanged within forward.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        The selected kernel and the selection traits.
+    """
+    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
+
+    rows = int(flat.shape[0])
+
+    traits = {
+        "weights_independent": weights_independent,
+        "fused_grid_supported": supports_fused_hc(flat.device),
+        "fused_tma_aligned": all(
+            tensor.data_ptr() % 16 == 0
+            for tensor in (flat, projection_weight, up_weight)
+        ),
+        "num_tokens": rows,
+        "hc_count": hc_count,
+        "hidden_size": hidden_size,
+        "lowrank": lowrank,
+        "contiguous": bool(
+            flat.is_contiguous()
+            and projection_weight.is_contiguous()
+            and up_weight.is_contiguous()
+        ),
+        "deterministic": _torch.are_deterministic_algorithms_enabled(),
+    }
+    signature = format_signature(
+        normalized=dense_tensor_format(flat.dtype),
+        projection_weight=dense_tensor_format(projection_weight.dtype),
+        up_weight=dense_tensor_format(up_weight.dtype),
+    )
+    kernel = select_kernel(
+        "residual",
+        "hyperconnection_mix",
+        signature,
+        traits=traits,
+        override=override,
+        solution=solution,
+    )
+    return kernel, traits
+
+
 def gated_residual_mix(
     normalized: _torch.Tensor,
     projection_weight: _torch.Tensor,
@@ -371,36 +437,14 @@ def gated_residual_mix(
         )
         return mixed, inject
 
-    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
-
-    traits = {
-        "weights_independent": weights_independent,
-        "fused_grid_supported": supports_fused_hc(flat.device),
-        "fused_tma_aligned": all(
-            tensor.data_ptr() % 16 == 0
-            for tensor in (flat, projection_weight, up_weight)
-        ),
-        "num_tokens": rows,
-        "hc_count": hc_count,
-        "hidden_size": hidden_size,
-        "lowrank": lowrank,
-        "contiguous": bool(
-            flat.is_contiguous()
-            and projection_weight.is_contiguous()
-            and up_weight.is_contiguous()
-        ),
-        "deterministic": _torch.are_deterministic_algorithms_enabled(),
-    }
-    signature = format_signature(
-        normalized=dense_tensor_format(flat.dtype),
-        projection_weight=dense_tensor_format(projection_weight.dtype),
-        up_weight=dense_tensor_format(up_weight.dtype),
-    )
-    kernel = select_kernel(
-        "residual",
-        "hyperconnection_mix",
-        signature,
-        traits=traits,
+    kernel, traits = select_gated_residual_mix_kernel(
+        flat,
+        projection_weight,
+        up_weight,
+        hc_count,
+        hidden_size,
+        lowrank,
+        weights_independent=weights_independent,
         override=override,
         solution=solution,
     )
@@ -830,6 +874,7 @@ __all__ = [
     "gated_residual_combine",
     "gated_residual_mix",
     "mhc_apply_pre",
+    "select_gated_residual_mix_kernel",
     "mhc_fused_hc",
     "mhc_mixes",
     "mhc_post",
