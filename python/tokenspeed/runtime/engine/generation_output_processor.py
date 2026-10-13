@@ -810,20 +810,30 @@ class OutputProcesser:
             else:
                 pt += output_length
 
+            # Mid-chunk extend slot by the op's own prefill_lengths: C++ owes
+            # no token and the sampled one is garbage.
+            mid_chunk = (
+                not is_decode_slot
+                and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
+                < prefill_lengths[i]
+            )
+
             if rid not in self.rid_to_state:
-                # means it's delayed token, do not process
+                # The request finished (or was aborted) on an earlier result
+                # while this forward was already dispatched. Its output goes
+                # nowhere, but the forward landed: the scheduler counts it
+                # against the request's pages and, for a finished request,
+                # publishes the frontier it consumed once nothing is in
+                # flight. The tokens keep the frontier exact (TokenSize - 1).
+                request_changes.append(
+                    make_extend_result_event(rid, [] if mid_chunk else model_output_ids)
+                )
                 continue
 
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
-            # Mid-chunk extend slot by the op's own prefill_lengths: C++ owes
-            # no token and the sampled one is garbage.
-            if (
-                not is_decode_slot
-                and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
-                < prefill_lengths[i]
-            ):
+            if mid_chunk:
                 # It owes no token, but the chunk's KV has landed -- report
                 # that much, so the scheduler stops counting a forward
                 # against these pages and may retract the request (imaging

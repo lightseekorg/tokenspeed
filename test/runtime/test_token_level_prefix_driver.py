@@ -112,7 +112,9 @@ def _state_row(forward_op) -> list[int]:
 
 
 def _run_cold(scheduler: ts.Scheduler, rid: str, tokens: list[int]) -> int:
-    """Prefill, decode once, finish; returns the computed token count."""
+    """Prefill, decode twice, finish as the runtime does under the overlap
+    schedule (on the first decode's token, with the second decode already
+    dispatched), let it land and settle; returns the published frontier."""
     _submit(scheduler, rid, tokens)
     plan = scheduler.next_execution_plan()
     (prefill,) = _forwards(plan)
@@ -127,9 +129,10 @@ def _run_cold(scheduler: ts.Scheduler, rid: str, tokens: list[int]) -> int:
     plan = scheduler.next_execution_plan()
     (decode,) = _forwards(plan)
     _finish(scheduler, decode)
-    # Computed tokens at finish: the prompt and the one landed decode token;
-    # the second decode's token was never sampled.
-    return len(tokens) + 1
+    _land(scheduler, decode, 1002)
+    # The landing settles the finish: the frontier is the prompt and the two
+    # consumed decode tokens (1002 was never consumed).
+    return len(tokens) + 2
 
 
 def _hit(scheduler: ts.Scheduler, rid: str, tokens: list[int]):
@@ -146,7 +149,7 @@ def test_prompt_end_and_finish_publish_tails_a_later_prompt_hits() -> None:
     copy for the block holding it, and computes from there."""
     scheduler = _scheduler()
     computed = _run_cold(scheduler, "a", PROMPT)
-    assert computed == 41
+    assert computed == 42
     assert scheduler.tail_entries() == 2
 
     # Shares the prompt-end tail (tokens [32, 40)) and diverges after it.
@@ -167,15 +170,16 @@ def test_prompt_end_and_finish_publish_tails_a_later_prompt_hits() -> None:
     (decode,) = _forwards(plan)
     _finish(scheduler, decode)
 
-    # Shares the finish tail (the prompt plus the decoded token, [32, 41)).
-    plan, prefill = _hit(scheduler, "c", PROMPT + [1000, 5, 6])
-    assert list(prefill.extend_prefix_lens) == [41]
+    # Shares the finish tail (the prompt plus the two consumed tokens,
+    # [32, 42)); b, finishing with a decode in flight, holds its pages still.
+    plan, prefill = _hit(scheduler, "c", PROMPT + [1000, 1001, 5, 6])
+    assert list(prefill.extend_prefix_lens) == [computed]
     assert list(prefill.input_lengths) == [2]
     assert plan.pages_to_copy_arrays()["history"].shape == (1, 2)
 
 
 def test_a_junction_nobody_ended_at_resolves_to_the_page() -> None:
-    """The tails under page 2 cover tokens [32, 40) and [32, 41); a prompt
+    """The tails under page 2 cover tokens [32, 40) and [32, 42); a prompt
     that diverges at token 37 can use neither and hits at the page."""
     scheduler = _scheduler()
     _run_cold(scheduler, "a", PROMPT)
@@ -186,7 +190,7 @@ def test_a_junction_nobody_ended_at_resolves_to_the_page() -> None:
 
 
 def test_an_identical_prompt_keeps_one_token_to_compute() -> None:
-    """The tails end at 40 and 41; a 40-token prompt must compute at least
+    """The tails end at 40 and 42; a 40-token prompt must compute at least
     one token, so neither tail serves it and the hit is the hash-complete
     pages."""
     scheduler = _scheduler()
@@ -235,12 +239,12 @@ def test_a_state_group_hits_where_its_checkpoint_was_published() -> None:
     (decode,) = _forwards(plan)
     live_block = first_decode_row[1]
     assert _state_row(decode) == [0, live_block]
-    # The second decode is in flight, writing the live block in place: a
-    # finish now publishes the KV rows below the frontier but not that block
-    # (its bytes are not the frontier's state). Land it first so the finish
-    # finds the request quiescent and publishes the state at 42 as well.
-    _land(scheduler, decode, 1002)
+    # The second decode is in flight, writing the live block in place, when
+    # the finish is decided: the request waits for it to land, and its landing
+    # publishes the frontier it produced -- 42 tokens, the live block as the
+    # state at 42.
     _finish(scheduler, decode)
+    _land(scheduler, decode, 1002)
     computed = 42
 
     plan, prefill = _hit(scheduler, "b", PROMPT + [999])

@@ -290,7 +290,9 @@ class TestTokenLevelPrefixHits(unittest.TestCase):
     same forwards itself; the warm repeat must then reproduce its continuation
     token for token, for KV-only and recurrent-state models alike. ``X + Y``
     hits the reference's prompt end exactly; ``X[:-37]`` ends inside the last
-    page before any publication point and finds no state below it.
+    page before any publication point and finds no state below it; a next
+    turn hits the reference's finish, which settled after its last forward
+    landed and so covers every token the reference sampled.
     """
 
     STEPS = 24
@@ -370,11 +372,14 @@ class TestTokenLevelPrefixHits(unittest.TestCase):
                     self.assertEqual(cached, len(prefix) - 1)
                     self.assertEqual(warm, cold)
 
-                    # X + the reference's continuation hits its finish
-                    # checkpoint: every token but the last is cached.
-                    replay = prefix + cold
-                    _, cached = _greedy_ids(engine, replay, 1, bypass_cache=False)
-                    self.assertEqual(cached, len(replay) - 1)
+                    # A next turn -- X, the reference's whole continuation and
+                    # more -- hits its finish checkpoint: the frontier the
+                    # last forward landed, the final sampled token included,
+                    # for KV and state groups alike.
+                    _, cached = _greedy_ids(
+                        engine, prefix + cold + suffix, 1, bypass_cache=False
+                    )
+                    self.assertEqual(cached, len(prefix) + len(cold))
                 finally:
                     engine.shutdown()
 

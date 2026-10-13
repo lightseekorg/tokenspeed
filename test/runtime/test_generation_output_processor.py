@@ -124,6 +124,48 @@ def test_mixed_forward_updates_reserve_for_decode_slots_only():
     assert reserve_events[0].reserve_num_tokens_in_next_schedule_event == 1
 
 
+def test_a_landed_forward_of_a_finished_request_still_reports_to_the_scheduler():
+    """A request finished on an earlier result while this forward was already
+    dispatched (the overlap schedule): its row is untracked here, but the
+    scheduler counts the landing and publishes the frontier it consumed, so
+    the row's ExtendResult goes out with its tokens -- empty for a chunk that
+    owes none."""
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+
+    events = processor.post_process_forward_op(
+        _ForwardOp(), _ExecutionResult(), is_prefill_instance=False
+    )
+
+    extends = {
+        event.request_id: list(event.tokens)
+        for event in events
+        if type(event).__name__ == "ExtendResult"
+    }
+    assert extends == {"prefill": [11], "decode": [22]}
+    assert "decode" not in processor.rid_to_state
+
+    class _MidChunkOp(_ForwardOp):
+        request_ids = ["gone"]
+        request_pool_indices = [0]
+        input_lengths = [4]
+        prefill_lengths = [8]
+
+        def num_extends(self):
+            return 1
+
+    class _OneRow(_ExecutionResult):
+        output_tokens = torch.tensor([11], dtype=torch.int32)
+        output_lengths = torch.tensor([1], dtype=torch.int32)
+
+    events = processor.post_process_forward_op(
+        _MidChunkOp(), _OneRow(), is_prefill_instance=False
+    )
+    (extend,) = [event for event in events if type(event).__name__ == "ExtendResult"]
+    assert extend.request_id == "gone"
+    assert list(extend.tokens) == []
+
+
 def test_cached_tokens_count_the_replayed_window_as_a_hit():
     """A bounded-replay chunk starts its model input below the prefix hit;
     the request still hit through the end of the replayed window, and a
