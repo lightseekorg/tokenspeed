@@ -46,15 +46,6 @@ def _specs_for_layers(**kwargs):
     return specs_for_layers(**kwargs)
 
 
-def _real_spec():
-    # The REAL package module (not the file-loaded shadow above): pool
-    # constructions need specs whose class passes the contract's
-    # isinstance check.
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
-
-    return spec
-
-
 GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12
 
 # One Inkling-style layer block: 5 sliding sub-groups + 1 full layer.

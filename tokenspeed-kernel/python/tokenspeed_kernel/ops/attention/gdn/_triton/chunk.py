@@ -231,10 +231,6 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if output_h:
-        if head_first:
-            q, k, v, beta, g = map(
-                lambda x: rearrange(x, "b h t ... -> b t h ..."), (q, k, v, beta, g)
-            )
         q, k, v, g, beta = (x.contiguous() for x in (q, k, v, g, beta))
         if initial_state is not None:
             initial_state = initial_state.contiguous()
@@ -254,8 +250,6 @@ def chunk_gated_delta_rule(
             return_h=True,
         )
         o = o.to(q.dtype)
-        if head_first:
-            o = rearrange(o, "b t h ... -> b h t ...")
         return o, final_state, h
     else:
         o, final_state = ChunkGatedDeltaRuleFunction.apply(
@@ -270,6 +264,4 @@ def chunk_gated_delta_rule(
             cu_seqlens,
             use_qk_l2norm_in_kernel,
         )
-        if head_first:
-            o = rearrange(o, "b t h ... -> b h t ...")
         return o, final_state

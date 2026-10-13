@@ -486,10 +486,6 @@ def _is_blackwell_sm103(platform: PlatformInfo) -> bool:
     return platform.is_blackwell and platform.arch_version == ArchVersion(10, 3)
 
 
-def _is_blackwell_non_sm100(platform: PlatformInfo) -> bool:
-    return platform.is_blackwell and platform.arch_version != ArchVersion(10, 0)
-
-
 def _is_blackwell_plus(platform: PlatformInfo) -> bool:
     return platform.is_blackwell_plus
 

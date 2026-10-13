@@ -28,7 +28,6 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
@@ -106,7 +105,6 @@ from tokenspeed.runtime.utils import (
     set_weight_attrs,
 )
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.triton import tl, triton
 
 logger = logging.getLogger(__name__)
 
@@ -377,7 +375,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(
             self.head_v_dim,
             eps=self.layer_norm_epsilon,
-            group_size=None,
+            group_size=self.head_v_dim,
             norm_before_gate=True,
             device=torch.get_device_module().current_device(),
             dtype=config.dtype,
@@ -552,14 +550,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if self.num_v_heads % self.num_k_heads == 0 and not getattr(
             self, "requires_qkvz_reordering", False
         ):
-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
-                projected_states_qkvz,
-                projected_states_ba,
-                triton.cdiv(self.num_k_heads, self.attn_tp_size),
-                triton.cdiv(self.num_v_heads, self.attn_tp_size),
-                self.head_k_dim,
-                self.head_v_dim,
+            # Row-strided views of [q | k | v | z] and [b | a]; consumers read them in place.
+            v_tp = self.value_dim // self.attn_tp_size
+            mixed_qkv, z = projected_states_qkvz.split(
+                [projected_states_qkvz.shape[-1] - v_tp, v_tp], dim=-1
             )
+            b, a = projected_states_ba.split(self.num_v_heads // self.attn_tp_size, -1)
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba
@@ -599,12 +595,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             **kwargs,
         )
 
-        z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        # Each head normalized on its own, rows kept whole (z may be a strided view).
+        core_attn_out = core_attn_out.reshape(seq_len, -1)
+        z = z.reshape(seq_len, -1)
         core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
         output, _ = self.out_proj(core_attn_out)
         return output
 
@@ -1858,130 +1852,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoeForConditionalGeneration):
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),  # no ``model.language_model`` scope
         )
-
-
-@triton.jit
-def fused_qkvzba_split_reshape_cat_contiguous_kernel(
-    mixed_qkv,
-    z,
-    b,
-    a,
-    mixed_qkvz,
-    mixed_ba,
-    stride_qkvz: tl.constexpr,
-    stride_ba: tl.constexpr,
-    NUM_HEADS_QK: tl.constexpr,
-    NUM_HEADS_V: tl.constexpr,
-    HEAD_QK: tl.constexpr,
-    HEAD_V: tl.constexpr,
-    BLOCK: tl.constexpr,
-    BLOCK_BA: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-):
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-        # Release successor setup; its wait still guards all dependent reads.
-        tl.extra.cuda.gdc_launch_dependents()
-    row, tile = tl.program_id(0), tl.program_id(1)
-    TOTAL_V: tl.constexpr = NUM_HEADS_V * HEAD_V
-    QKV_DIM: tl.constexpr = 2 * NUM_HEADS_QK * HEAD_QK + TOTAL_V
-    QKVZ_DIM: tl.constexpr = QKV_DIM + TOTAL_V
-    # QKVZ is already ordered, including non-power-of-two head ratios.
-    offsets = tile * BLOCK + tl.arange(0, BLOCK)
-    values = tl.load(
-        mixed_qkvz + row * stride_qkvz + offsets,
-        offsets < QKVZ_DIM,
-        other=0,
-    )
-    # Keep output bases separate: pointer selection breaks AMD canonicalization.
-    tl.store(
-        mixed_qkv + row * QKV_DIM + offsets,
-        values,
-        offsets < QKV_DIM,
-    )
-    tl.store(
-        z + row * TOTAL_V + offsets - QKV_DIM,
-        values,
-        (offsets >= QKV_DIM) & (offsets < QKVZ_DIM),
-    )
-
-    # One tile owns each row's gates; adjacent lanes copy adjacent heads.
-    if tile == 0:
-        heads = tl.arange(0, BLOCK_BA)
-        mask = heads < NUM_HEADS_V
-        b_values = tl.load(mixed_ba + row * stride_ba + heads, mask, other=0)
-        a_values = tl.load(
-            mixed_ba + row * stride_ba + NUM_HEADS_V + heads, mask, other=0
-        )
-        tl.store(b + row * NUM_HEADS_V + heads, b_values, mask)
-        tl.store(a + row * NUM_HEADS_V + heads, a_values, mask)
-
-
-def fused_qkvzba_split_reshape_cat_contiguous(
-    mixed_qkvz,
-    mixed_ba,
-    num_heads_qk,
-    num_heads_v,
-    head_qk,
-    head_v,
-):
-    """Repack Qwen3.5 projections into contiguous, independently owned outputs.
-
-    Inputs have unit inner strides; row strides and storage offsets may vary.
-    The leading dimension counts tokens, including flattened MTP tokens.
-    QKV and Z retain the QKVZ dtype; B and A retain the BA dtype.
-
-    Input layout (per row):
-        mixed_qkvz: [all_q | all_k | all_v | all_z]
-        mixed_ba:   [all_b | all_a]
-
-    Output layout:
-        mixed_qkv: [all_q | all_k | all_v]  (z stripped)
-        z: [num_v_heads, head_v]
-        b: [num_v_heads]
-        a: [num_v_heads]
-    """
-    enable_pdl = pdl_enabled()
-    batch, seq_len = mixed_qkvz.shape[0], 1
-    qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
-    mixed_qkv = torch.empty(
-        [batch * seq_len, qkv_dim_t],
-        dtype=mixed_qkvz.dtype,
-        device=mixed_qkvz.device,
-    )
-    z = torch.empty(
-        [batch * seq_len, num_heads_v, head_v],
-        dtype=mixed_qkvz.dtype,
-        device=mixed_qkvz.device,
-    )
-    b = torch.empty(
-        [batch * seq_len, num_heads_v],
-        dtype=mixed_ba.dtype,
-        device=mixed_ba.device,
-    )
-    a = torch.empty_like(b)
-    grid = (batch * seq_len, triton.cdiv(qkv_dim_t + num_heads_v * head_v, 2048))
-    fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
-        mixed_qkv,
-        z,
-        b,
-        a,
-        mixed_qkvz,
-        mixed_ba,
-        mixed_qkvz.stride(0),
-        mixed_ba.stride(0),
-        num_heads_qk,
-        num_heads_v,
-        head_qk,
-        head_v,
-        BLOCK=2048,
-        BLOCK_BA=triton.next_power_of_2(num_heads_v),
-        num_warps=4,
-        num_stages=1,
-        ENABLE_PDL=enable_pdl,
-        **({"launch_pdl": True} if enable_pdl else {}),
-    )
-    return mixed_qkv, z, b, a
 
 
 EntryClass = [

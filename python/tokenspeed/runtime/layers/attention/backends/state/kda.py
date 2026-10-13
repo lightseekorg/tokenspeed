@@ -825,9 +825,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
         draft_token_num: int,
         seq_len: int,
         lower_bound: float | None,
+        replay_payload: torch.Tensor | None,
     ) -> torch.Tensor:
 
         _reject_skip_term(D)
+        if replay_payload is not None:
+            raise ValueError("the KDA verify scan fills no replay payload")
         from tokenspeed_kernel.ops.attention.kda.triton import (
             kda_recurrent_decode_mtp,
         )

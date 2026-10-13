@@ -54,7 +54,6 @@ __all__ = [
     "copy_page_fields",
     "copy_state_rows",
     "fused_fp8_set_kv_buffer",
-    "gather_page_table_with_padding",
     "get_mla_kv_buffer_triton",
     "index_k_block_split_scatter",
     "mla_latent_norm_rope_scatter",
@@ -2134,77 +2133,6 @@ def fused_fp8_set_kv_buffer(
 # -----------------------------------------------------------------------------
 # Page Table Gather
 # -----------------------------------------------------------------------------
-
-
-@triton.jit
-def _gather_page_table_with_padding_kernel(
-    req_to_page_ptr,
-    req_pool_indices_ptr,
-    seq_lens_ptr,
-    out_ptr,
-    src_stride0,
-    out_stride0,
-    max_num_pages: tl.constexpr,
-    page_size: tl.constexpr,
-    dummy_slot: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-):
-    pid_row = tl.program_id(0)
-    pid_col = tl.program_id(1)
-
-    sl = tl.load(seq_lens_ptr + pid_row).to(tl.int32)
-    n_pages = (sl + page_size - 1) // page_size
-
-    col_offsets = pid_col * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-    in_bounds = col_offsets < max_num_pages
-    valid = col_offsets < n_pages
-
-    req_idx = tl.load(req_pool_indices_ptr + pid_row).to(tl.int64)
-    src_addr = req_to_page_ptr + req_idx * src_stride0 + col_offsets
-    gathered = tl.load(src_addr, mask=valid & in_bounds, other=dummy_slot)
-
-    out_addr = out_ptr + pid_row * out_stride0 + col_offsets
-    tl.store(out_addr, gathered, mask=in_bounds)
-
-
-def gather_page_table_with_padding(
-    req_to_page: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    out: torch.Tensor,
-    *,
-    bs: int,
-    max_num_pages: int,
-    page_size: int,
-    dummy_slot: int = 0,
-) -> None:
-    """Gather active request page tables and clear padding columns.
-
-    Args:
-        req_to_page: Source page table with request rows.
-        req_pool_indices: Request row indices to gather, shape ``[bs]``.
-        seq_lens: Per-request KV lengths, shape ``[bs]``.
-        out: Destination page table, shape ``[max_bs, max_num_pages]``.
-        bs: Number of active rows to gather.
-        max_num_pages: Number of destination page-table columns.
-        page_size: Number of tokens per page.
-        dummy_slot: Value written into padding columns.
-    """
-    block_cols = 128
-    grid = (bs, triton.cdiv(max_num_pages, block_cols))
-    _gather_page_table_with_padding_kernel[grid](
-        req_to_page,
-        req_pool_indices,
-        seq_lens,
-        out,
-        req_to_page.stride(0),
-        out.stride(0),
-        max_num_pages,
-        page_size,
-        dummy_slot,
-        BLOCK_COLS=block_cols,
-        num_warps=4,
-    )
 
 
 # -----------------------------------------------------------------------------

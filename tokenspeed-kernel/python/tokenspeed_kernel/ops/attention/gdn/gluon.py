@@ -126,9 +126,10 @@ if current_platform().is_amd:
         output_state_indices: torch.Tensor | None,
         output_state: torch.Tensor | None,
         tree_ancestors: torch.Tensor | None,
+        replay_payload: torch.Tensor | None,
     ) -> torch.Tensor:
         """gfx950 chain ``gdn_decode_mtp`` (draft trees run the Triton kernel)."""
-        if tree_ancestors is not None:
+        if tree_ancestors is not None or replay_payload is not None:
             raise NotImplementedError("the gfx950 GDN verify kernel follows a chain")
         # Per-token rows (in output_state, default the pool itself) or the
         # dense intermediate buffer; the read row takes the final state only

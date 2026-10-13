@@ -662,7 +662,6 @@ class DummyGroupTablesTest(unittest.TestCase):
         order, and every entry inside ``group_page_counts - 1``; a capture
         they refuse kills the boot, so they are the assertion.
         """
-        from unittest import mock
 
         import torch
 
