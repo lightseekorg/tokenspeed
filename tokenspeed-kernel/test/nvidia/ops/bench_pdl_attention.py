@@ -162,6 +162,7 @@ def _qsa(rows, solution):
             v_scale=None,
             override=None,
             solution="cute_dsl",
+            prefill_metadata=None,
         )
 
     return forward

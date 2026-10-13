@@ -850,12 +850,27 @@ Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
-The QSA API preserves `decode_query_lengths`: uniform decode/verification
-uses a positive width, as does every single-request forward. Multi-request
-prefill and mixed/ragged queries use `None`.
-Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
-single-token prefill. Adapting ragged rows to one-token queries must retain
-this distinction. Both use the same cache writer and sparse-attention call.
+QSA uses positive `decode_query_lengths` for uniform decode/verification and
+`None` for prefill or mixed/ragged queries, including one-token prefill.
+Only decode may use CuTe. Supported BF16 prefill on SM100/SM103 uses FlashInfer
+PrimTS with logical block candidates; query groups stay within each request.
+The pinned FlashInfer 0.7.1rc5 supports block sizes 4/8/16/32/64/128;
+other block sizes retain FA2. The sparse-attention API requires explicit
+`prefill_metadata=None` when only physical slots are available, and the
+benchmark uses the same selection helper and dispatch traits as execution.
+Other supported NVIDIA inputs use FA2 over equivalent physical slots.
+All kernels share the cache writer and sparse-attention call. The indexer
+returns physical slots across graph breaks and keeps logical candidates
+in the existing per-forward share.
+
+PrimTS plans share one workspace per stream. With packed query offsets and
+`split_kv=False`, each run rewrites every live route before attention reads
+it; split scratch and attention sinks are unused. No previous workspace
+contents are required, even when eager calls and graph replays interleave
+geometries. Plans retain K/V storage identity because the pinned FlashInfer
+wrapper binds those addresses during preparation; warming one layer must
+not force another layer to replan during capture. Captured plans pin the
+workspace allocation, so its largest size must be warmed before capture.
 
 QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
 candidates from the zero-initialized slot 1 of the reserved null page.

@@ -89,13 +89,25 @@ def test_qsa_generator_selection_matches_operation_api(
         qsa_generator.prepare_qsa_sparse_attention(request, None)
 
     rows_per_request = q_len or 8
-    assert captured[0] == {
-        "batch_size": 2 if is_decode else 2 * rows_per_request,
-        "q_len": rows_per_request if is_decode else 1,
-        "num_q_heads": 12,
-        "num_kv_heads": 1,
-        "head_dim": 256,
-        "value_head_dim": 256,
-        "selected_width": 2051,
-        "is_decode": is_decode,
-    }
+    rows = 2 * rows_per_request
+    q = torch.empty((rows, 12, 256), dtype=torch.bfloat16)
+    cache = torch.empty((18, 1, 256), dtype=torch.bfloat16)
+    slots = torch.empty((rows, 2051), dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="selection captured"):
+        qsa_ops.qsa_sparse_attention(
+            q,
+            cache,
+            cache,
+            slots,
+            scale=1 / 16,
+            max_seqlen_q=q_len,
+            metadata_capacity_rows=rows,
+            k_scale=None,
+            v_scale=None,
+            override=None,
+            solution=None,
+            prefill_metadata=None,
+        )
+    assert captured[0] == captured[1]
+    assert captured[0]["is_decode"] is is_decode
+    assert captured[0]["q_len"] == (q_len if is_decode else 1)

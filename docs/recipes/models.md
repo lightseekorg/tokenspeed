@@ -745,6 +745,9 @@ with optional predictive latent embeddings (PLE), optional QSA sparse
 attention, and a one-layer MTP draft. Dense and MoE checkpoints share the same
 launch command.
 
+QSA BF16 prefill on B200 (SM100) and B300 (SM103), including one-token
+prefill, uses FlashInfer PrimTS (requires 0.7.1rc5). FP8 KV prefill and other
+inputs unsupported by PrimTS use FA2.
 
 ### NVIDIA
 

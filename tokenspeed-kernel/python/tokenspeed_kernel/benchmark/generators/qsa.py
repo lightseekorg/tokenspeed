@@ -196,6 +196,9 @@ def prepare_qsa_sparse_attention(
             v_cache,
             selected,
             max_seqlen_q=max_seqlen_q,
+            k_scale=descale,
+            v_scale=descale,
+            prefill_metadata=None,
             override=request.registration,
             solution=request.solution,
         )
@@ -221,6 +224,7 @@ def prepare_qsa_sparse_attention(
             v_scale=descale,
             override=request.registration,
             solution=request.solution,
+            prefill_metadata=None,
         )
 
     return PreparedBenchmark(
