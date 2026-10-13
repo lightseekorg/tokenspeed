@@ -204,7 +204,8 @@ class GrammarManager:
             # all_gather admits the request on every rank in one iteration.
             done = futures.Future()
             done.set_result(value)
-            value, cache_hit = done, False
+            state.grammar = done
+            return False
 
         if cache_hit:
             if value.is_invalid:
