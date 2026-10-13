@@ -60,23 +60,6 @@ def _glm53_flash_recipe():
     return _recipe(tp_size=8, mla_cache_dtype=torch.bfloat16)
 
 
-def _deepseek_v4_recipe():
-    from test.runtime.test_deepseek_v4_config import _v4_recipe
-
-    return _v4_recipe(
-        SimpleNamespace(
-            num_hidden_layers=3,
-            compress_ratios=[0, 4, 128],
-            num_attention_heads=64,
-            head_dim=512,
-            qk_rope_head_dim=64,
-            sliding_window=128,
-            index_head_dim=128,
-            attention_config={},
-        )
-    )
-
-
 def _deepseek_v41_recipe():
     from test.runtime.test_deepseek_v41_cache import _recipe
 
@@ -87,7 +70,6 @@ def _deepseek_v41_recipe():
 _RECIPES = {
     "kimi_k3": _kimi_k3_recipe,
     "glm53_flash": _glm53_flash_recipe,
-    "deepseek_v4": _deepseek_v4_recipe,
     "deepseek_v41": _deepseek_v41_recipe,
 }
 _NO_FIXTURE = {

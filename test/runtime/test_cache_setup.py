@@ -187,73 +187,6 @@ def _mha_config() -> AttnConfig:
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
 
 
-def test_deepseek_v4_mtp_reads_window_from_cache_group():
-    from tokenspeed.runtime.layers.attention import registry
-    from tokenspeed.runtime.utils.server_args import ServerArgs
-
-    args = ServerArgs(
-        model="x",
-        device="cpu",
-        prefix_granularity=256,
-        max_num_seqs=2,
-        chunked_prefill_size=256,
-        speculative_algorithm="EAGLE",
-        speculative_num_steps=3,
-        speculative_num_draft_tokens=4,
-        attention_use_fp4_indexer_cache=False,
-    )
-    args.mapping.rank = 0
-    model_fields = dict(
-        model_profile=None,
-        attention_arch=registry.AttentionArch.MLA,
-        dtype=torch.bfloat16,
-        context_len=512,
-        num_attention_heads=64,
-        num_key_value_heads=1,
-        head_dim=512,
-        kv_lora_rank=512,
-        qk_nope_head_dim=448,
-        qk_rope_head_dim=64,
-        v_head_dim=512,
-        scaling=512**-0.5,
-    )
-    hf_fields = dict(
-        compress_ratios=(1, 4, 1),
-        head_dim=512,
-        qk_rope_head_dim=64,
-        index_head_dim=128,
-        sliding_window=256,
-    )
-    target = SimpleNamespace(
-        **model_fields,
-        num_attention_layers=2,
-        hf_config=SimpleNamespace(**hf_fields, architectures=["DeepseekV4ForCausalLM"]),
-    )
-    draft = SimpleNamespace(
-        **model_fields,
-        num_attention_layers=1,
-        hf_config=SimpleNamespace(
-            **hf_fields, architectures=["DeepseekV4ForCausalLMNextN"]
-        ),
-    )
-    build = registry.create_attn_components(
-        args,
-        target,
-        gpu_id=0,
-        rank=0,
-        gpu_memory=0,
-        draft_model_config=draft,
-        graph_reserve_bytes=0,
-        post_profile_bytes=0,
-        probe_batch_rows=1,
-        profiled_cache_bytes=32 << 20,
-        reuse_target_backend=None,
-        reuse_draft_backend=None,
-    )
-    assert build.attn_backend._swa_window_tokens() == 256
-    assert build.draft_attn_backend._swa_window_tokens() == 256
-
-
 @pytest.mark.parametrize(
     "is_draft,width,num_layers,layerwise,ring_rows",
     [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
@@ -977,54 +910,6 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         )
 
 
-def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import tokenspeed.runtime.layers.attention.registry as registry
-
-    monkeypatch.setattr(
-        registry,
-        "is_deepseek_v4",
-        lambda config: getattr(config, "is_deepseek_v4", False),
-    )
-    server_args = SimpleNamespace(
-        kv_offload_config=None,
-        attention_backend=None,
-        drafter_attention_backend=None,
-        disaggregation_mode="prefill",
-    )
-    target = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("LlamaForCausalLM",),
-            is_deepseek_v4=False,
-        ),
-        model_profile=None,
-    )
-    draft = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("DeepseekV4ForCausalLMNextN",),
-            is_deepseek_v4=True,
-        ),
-        model_profile=None,
-    )
-
-    with pytest.raises(NotImplementedError, match="target-only"):
-        registry.create_attn_components(
-            server_args,
-            target,
-            gpu_id=0,
-            rank=0,
-            gpu_memory=0,
-            draft_model_config=draft,
-            graph_reserve_bytes=0,
-            post_profile_bytes=0,
-            probe_batch_rows=None,
-            profiled_cache_bytes=None,
-            reuse_target_backend=None,
-            reuse_draft_backend=None,
-        )
-
-
 def test_hybrid_draft_layers_share_plan_with_disjoint_views() -> None:
     setup = _hybrid_setup_with_narrow_draft()
 
@@ -1381,7 +1266,6 @@ def _fake_around_the_budget(monkeypatch, free):
     )
     monkeypatch.setattr(common.torch, "get_device_module", lambda device: gpu)
     side = SimpleNamespace(
-        is_deepseek_v4=False,
         is_hybrid_linear=False,
         is_dspark=False,
         requested_backend=None,

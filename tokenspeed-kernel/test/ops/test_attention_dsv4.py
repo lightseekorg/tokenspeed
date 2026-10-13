@@ -69,12 +69,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     read_deepseek_v4_indexer_fp8_cache,
     save_deepseek_v4_compressor_state,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
-    _mask_invalid_graph_tokens,
-)
-from tokenspeed.runtime.models.deepseek_v4 import (
-    _deepseek_v4_sanitize_swa_slot_mapping,
-)
 
 HEAD_DIM = 512
 NOPE_DIM = 448
@@ -607,59 +601,6 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
                     expected,
                 )
 
-    def test_swa_slot_mapping_guard_masks_out_of_range_slots(self):
-        slots = torch.tensor([-3, -1, 0, 7, 8, 99], dtype=torch.int64)
-
-        sanitized = _deepseek_v4_sanitize_swa_slot_mapping(slots, capacity=2 * 4)
-
-        torch.testing.assert_close(
-            sanitized,
-            torch.tensor([-1, -1, 0, 7, -1, -1], dtype=torch.int64),
-        )
-
-    def test_swa_slot_mapping_guard_masks_invalid_graph_tokens(self):
-        slots = torch.tensor([0, 1, 2, 9, -1, 3], dtype=torch.int64)
-        is_valid_token = torch.tensor([True, False, True, True, True, False])
-
-        sanitized = _deepseek_v4_sanitize_swa_slot_mapping(
-            slots,
-            capacity=2 * 4,
-            is_valid_token=is_valid_token,
-        )
-
-        torch.testing.assert_close(
-            sanitized,
-            torch.tensor([0, -1, 2, -1, -1, -1], dtype=torch.int64),
-        )
-
-    def test_slot_mapping_guard_masks_invalid_graph_tokens(self):
-        slots = torch.tensor([0, 1, -1, 3], dtype=torch.int64)
-        is_valid_token = torch.tensor([True, False, True, False])
-
-        sanitized = _mask_invalid_graph_tokens(
-            slots,
-            is_valid_token,
-        )
-
-        torch.testing.assert_close(
-            sanitized,
-            torch.tensor([0, -1, -1, -1], dtype=torch.int64),
-        )
-
-    def test_slot_mapping_guard_expands_per_request_validity(self):
-        slots = torch.tensor([0, 1, 2, 3, 4, 5], dtype=torch.int64)
-        is_valid_token = torch.tensor([True, False])
-
-        sanitized = _mask_invalid_graph_tokens(
-            slots,
-            is_valid_token,
-        )
-
-        torch.testing.assert_close(
-            sanitized,
-            torch.tensor([0, 1, 2, -1, -1, -1], dtype=torch.int64),
-        )
-
     def test_indexer_q_mxfp4_requires_cuda(self):
         q = torch.zeros(1, 1, 128, dtype=torch.bfloat16)
         positions = torch.zeros(1, dtype=torch.int64)
@@ -770,14 +711,9 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
-    def test_sanitized_insert_write_safety_under_graph_replay(self):
-        # Full producer -> sanitize -> CUDA graph replay -> cache write path.
-        # Slots and validity mutate between replays through static buffers;
-        # sentinel bytes prove only legal cache slots are ever written.
-        from tokenspeed.runtime.models.deepseek_v4 import (
-            _deepseek_v4_sanitize_swa_slot_mapping,
-        )
-
+    def test_insert_write_safety_under_graph_replay(self):
+        # Slots mutate between replays through a static buffer;
+        # sentinel bytes prove only nonnegative cache slots are written.
         torch.manual_seed(7)
         device = torch.device("cuda")
         dtype = torch.bfloat16
@@ -806,18 +742,14 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         kv = torch.randn(num_tokens, HEAD_DIM, device=device, dtype=dtype)
         positions = torch.tensor([0, 3, 5, 7], dtype=torch.int64, device=device)
         cos_sin = torch.randn(16, ROPE_DIM, device=device, dtype=torch.float32) * 0.1
-        raw_slots = torch.zeros(num_tokens, dtype=torch.int64, device=device)
-        is_valid = torch.ones(num_tokens, dtype=torch.bool, device=device)
+        slot_mapping = torch.zeros(num_tokens, dtype=torch.int64, device=device)
 
         def run_once():
-            sanitized = _deepseek_v4_sanitize_swa_slot_mapping(
-                raw_slots, capacity, is_valid
-            )
             fused_qnorm_rope_kv_insert(
                 q=q,
                 kv=kv,
                 swa_kv_cache_2d=cache,
-                slot_mapping=sanitized,
+                slot_mapping=slot_mapping,
                 positions=positions,
                 cos_sin_cache=cos_sin,
                 rms_norm_eps=eps,
@@ -855,14 +787,13 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             return mask
 
         replays = [
-            # (raw slots, validity, slots the kernel may legally write)
-            ([0, 5, 99, -1], [True, True, True, True], [0, 5]),
-            ([2, 0, 7, 3], [True, False, True, True], [2, 7, 3]),
+            # (slot mapping, slots the kernel may legally write)
+            ([0, 5, -1, -1], [0, 5]),
+            ([2, -1, 7, 3], [2, 7, 3]),
         ]
-        for slots, valid, expected in replays:
+        for slots, expected in replays:
             storage.fill_(sentinel)
-            raw_slots.copy_(torch.tensor(slots, dtype=torch.int64, device=device))
-            is_valid.copy_(torch.tensor(valid, dtype=torch.bool, device=device))
+            slot_mapping.copy_(torch.tensor(slots, dtype=torch.int64, device=device))
             graph.replay()
             torch.cuda.synchronize()
             host = storage.cpu()

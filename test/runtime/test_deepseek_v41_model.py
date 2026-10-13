@@ -68,8 +68,8 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
-from tokenspeed.runtime.models import deepseek_v4 as v4
 from tokenspeed.runtime.models import deepseek_v41 as v41
+from tokenspeed.runtime.models import deepseek_v41_moe as v41_moe
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41Attention,
     DeepseekV41DecoderLayer,
@@ -430,7 +430,7 @@ def test_scale_expansion_then_tp_and_merged_sharding():
             elif isinstance(linear, v41.RowParallelLinear):
                 expected = expected.chunk(4, dim=1)[rank]
             assert torch.equal(linear.weight_scale_inv, expected)
-        # Shared experts consume the config through the unchanged V4 MLP.
+        # Shared experts consume the config through the unchanged MLP.
         shared = v41.DeepseekV4MLP(
             128,
             128,
@@ -1745,7 +1745,7 @@ def test_distributed_attention_tp4(monkeypatch, tmp_path):
         torch.testing.assert_close(out, expected, rtol=0.02, atol=0.003)
         # Exercise the real packed-weight MegaMoE lifecycle, not the CPU loader
         # plan mocks: load -> process -> dense preparation -> full text forward.
-        monkeypatch.setattr(v4, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
+        monkeypatch.setattr(v41_moe, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
         monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
         monkeypatch.setattr(
             expert_module, "get_moe_backend", lambda: MoeBackend.MEGA_MOE
@@ -1821,7 +1821,7 @@ def _loader_config():
 def _mock_loader_hardware(monkeypatch, mapping):
     # Keep standard MXFP4 allocation and per-expert loading; only hardware
     # planning and processing are mocked in CPU/meta checkpoint tests.
-    monkeypatch.setattr(v4, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
+    monkeypatch.setattr(v41_moe, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
     monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
     monkeypatch.setattr(expert_module, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
     monkeypatch.setattr(

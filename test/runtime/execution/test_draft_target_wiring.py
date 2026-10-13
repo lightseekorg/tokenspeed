@@ -32,9 +32,6 @@ from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.drafter import get_drafter_impl  # noqa: E402
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
-from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (  # noqa: E402
-    DeepseekV4DSpark,
-)
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (  # noqa: E402
     DeepseekV41DSpark,
 )
@@ -85,9 +82,6 @@ def _head_layout(**overrides) -> SimpleNamespace:
 
 
 def test_get_drafter_impl_routing():
-    from tokenspeed.runtime.models.deepseek_v4_dspark import (
-        DeepseekV4ForCausalLMDSpark,
-    )
     from tokenspeed.runtime.models.deepseek_v41_dspark import (
         DeepseekV41ForCausalLMDSpark,
     )
@@ -106,21 +100,17 @@ def test_get_drafter_impl_routing():
     assert get_drafter_impl("DFLASH", mock.MagicMock()) is DFlash
     assert get_drafter_impl("DSPARK", mock.MagicMock()) is DSpark
     assert (
-        get_drafter_impl("DSPARK", mock.MagicMock(spec=DeepseekV4ForCausalLMDSpark))
-        is DeepseekV4DSpark
-    )
-    assert (
         get_drafter_impl("DSPARK", mock.MagicMock(spec=DeepseekV41ForCausalLMDSpark))
         is DeepseekV41DSpark
     )
 
 
 def test_shares_target_embed_head_flags():
-    # Eagle-like drafters and the checkpoint-local V4 DSpark reuse the
+    # Eagle-like drafters and the checkpoint-local V4.1 DSpark reuse the
     # target's embed/LM head; DFlash and generic DSpark ship their own.
     assert Eagle.shares_target_embed_head
     assert Mtp.shares_target_embed_head
-    assert DeepseekV4DSpark.shares_target_embed_head
+    assert DeepseekV41DSpark.shares_target_embed_head
     assert not DFlash.shares_target_embed_head
     assert not DSpark.shares_target_embed_head
     assert not BaseDrafter.shares_target_embed_head
@@ -133,7 +123,7 @@ def test_pd_layerwise_finalization_capability_matches_supported_drafters():
     # Mtp.run enqueues every depth's forward (and its plane's KV write) on
     # the caller's stream before returning, so the draft-final step is exact.
     assert Mtp.supports_pd_layerwise_finalization
-    assert not DeepseekV4DSpark.supports_pd_layerwise_finalization
+    assert not DeepseekV41DSpark.supports_pd_layerwise_finalization
     assert not BaseDrafter.supports_pd_layerwise_finalization
 
 
@@ -180,7 +170,7 @@ class _ModuleSharingDraft:
 
 
 class _WeightSharingDraft:
-    """A draft aliasing the target's weights (the K3 / V4 NextN contract)."""
+    """A draft aliasing the target's weights (the K3 NextN contract)."""
 
     def __init__(self):
         self.shared = None
@@ -781,7 +771,7 @@ def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
 
 
 def test_deepseek_dspark_wire_target_only_binds_resources():
-    drafter = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
+    drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
     draft_head = object()
     drafter.draft_model = SimpleNamespace(lm_head=draft_head)
     target = SimpleNamespace(
@@ -796,16 +786,16 @@ def test_deepseek_dspark_wire_target_only_binds_resources():
     target.set_dspark_layers_to_capture.assert_not_called()
 
 
-@pytest.mark.parametrize("drafter_cls", [DeepseekV4DSpark, DeepseekV41DSpark])
-def test_dspark_weight_update_needs_no_derived_head_refresh(drafter_cls):
+def test_dspark_weight_update_needs_no_derived_head_refresh():
     # The draft reads the target's BF16 head in place, so an in-place target
     # weight update needs no drafter-side refresh: the base no-op applies.
     assert (
-        drafter_cls.on_target_weights_updated is BaseDrafter.on_target_weights_updated
+        DeepseekV41DSpark.on_target_weights_updated
+        is BaseDrafter.on_target_weights_updated
     )
-    drafter = mock.MagicMock(spec=drafter_cls)
+    drafter = mock.MagicMock(spec=DeepseekV41DSpark)
     drafter.model = mock.MagicMock()
-    drafter_cls.on_target_weights_updated(drafter)
+    DeepseekV41DSpark.on_target_weights_updated(drafter)
     assert drafter.model.mock_calls == []
 
 
@@ -1119,20 +1109,13 @@ def test_ordinary_block_models_declare_capture_setup(family):
     target.set_dflash_layers_to_capture.assert_called_once_with([2, 7])
 
 
-@pytest.mark.parametrize("family", ["v4", "v41"])
-def test_deepseek_block_models_configure_capture_through_common_setup(
-    monkeypatch, family
-):
-    from tokenspeed.runtime.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+def test_deepseek_block_models_configure_capture_through_common_setup(monkeypatch):
     from tokenspeed.runtime.models.deepseek_v41_dspark import (
         DeepseekV41ForCausalLMDSpark,
     )
     from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 
-    model_class = (
-        DeepseekV4ForCausalLMDSpark if family == "v4" else DeepseekV41ForCausalLMDSpark
-    )
-    draft = model_class.__new__(model_class)
+    draft = DeepseekV41ForCausalLMDSpark.__new__(DeepseekV41ForCausalLMDSpark)
     torch.nn.Module.__init__(draft)
     draft.model = SimpleNamespace(target_layer_ids=(10, 20))
     target = SimpleNamespace(set_dspark_layers_to_capture=mock.Mock())
@@ -1155,8 +1138,7 @@ def test_deepseek_block_models_configure_capture_through_common_setup(
     )
     draft.lm_head = object()
     target.logits_processor = SimpleNamespace(tp_group=(0, 1))
-    drafter_class = DeepseekV4DSpark if family == "v4" else DeepseekV41DSpark
-    drafter = drafter_class.__new__(drafter_class)
+    drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
     drafter.draft_model = draft
     drafter.wire_target(target)
     assert drafter.target_model is target

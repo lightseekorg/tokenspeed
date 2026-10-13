@@ -832,7 +832,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         == 1
     )
     side = attention_registry._resolve_attn_side(draft, None)
-    assert side.is_dspark and not side.is_deepseek_v4
+    assert side.is_dspark
 
     # Stop at the allocation boundary, after the real registry chooses both sides.
     config_builder = Mock(

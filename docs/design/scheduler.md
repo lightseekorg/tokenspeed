@@ -124,8 +124,6 @@ It picks the rule by the group's retention, never by call site:
   stranded.
 - *Sliding-window* groups recycle slid-out pages, so the rest
   of the prompt costs them nothing: they hold only the decode slot.
-  Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
-  waiting on a pool that had room for it.
 - *State* groups reserve nothing: their table is two slots whatever the
   prompt length, and a decode step writes the live slot in place (§1.2).
 

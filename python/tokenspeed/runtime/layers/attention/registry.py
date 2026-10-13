@@ -27,11 +27,7 @@ from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_config import (
-    AttentionArch,
-    is_deepseek_v4,
-    is_qwen4_exp,
-)
+from tokenspeed.runtime.configs.model_config import AttentionArch, is_qwen4_exp
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
@@ -308,9 +304,7 @@ _INKLING_ARCHITECTURES = {
     "InklingForConditionalGenerationNextN",
 }
 
-_DSPARK_DRAFT_ARCHITECTURES = frozenset(
-    {"DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark"}
-)
+_DSPARK_DRAFT_ARCHITECTURES = frozenset({"DeepseekV41ForCausalLMDSpark"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -334,7 +328,6 @@ class _AttnSideProfile:
     is_qwen4_exp: bool
     is_qsa: bool
     is_inkling: bool
-    is_deepseek_v4: bool
     is_dspark: bool
     # The model's own profile, when it declares one; the facts above are then
     # all False and the profile answers for the model.
@@ -378,7 +371,6 @@ def _resolve_attn_side(
             is_qwen4_exp=False,
             is_qsa=False,
             is_inkling=False,
-            is_deepseek_v4=False,
             is_dspark=False,
             model_profile=model_config.model_profile,
         )
@@ -397,9 +389,6 @@ def _resolve_attn_side(
         is_qwen4_exp=qwen4_exp,
         is_qsa=qwen4_exp and getattr(text_config, "indexer_n_heads", None) is not None,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in architectures),
-        # The DSpark draft resolves as a V4 architecture but has no paged
-        # attention config of its own; it must not take the V4 branches.
-        is_deepseek_v4=not is_dspark and is_deepseek_v4(hf_config),
         is_dspark=is_dspark,
         model_profile=None,
     )
@@ -415,11 +404,6 @@ def _check_pd_support(
     """Every disaggregated-serving support gate, raised up front."""
     if server_args.disaggregation_mode not in ("prefill", "decode"):
         return
-    if draft is not None and draft.is_deepseek_v4:
-        raise NotImplementedError(
-            "DeepSeek V4 PD supports target-only decoding; a DeepSeek V4 "
-            "draft cache is not transferable"
-        )
     if (target.is_inkling or (draft is not None and draft.is_inkling)) and (
         has_draft_model or server_args.speculative_algorithm is not None
     ):
@@ -443,10 +427,6 @@ def _apply_backend_overrides(
     """
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
-    elif target.is_deepseek_v4:
-        server_args.attention_backend = "deepseek_v4"
-    if draft is not None and draft.is_deepseek_v4:
-        server_args.drafter_attention_backend = "deepseek_v4"
 
     if target.is_hybrid_linear:
         # GDN (Qwen3.5) / KDA (Kimi-K3) hybrid models always need
@@ -541,8 +521,6 @@ def _resolve_cache_family(
         return profile.model_profile.cache_family
     if config.component(DeepseekV41Config) is not None:
         return "deepseek_v41"
-    if profile.is_deepseek_v4:
-        return "deepseek_v4"
     # PLE and QSA are cache consumers even in a view without GDN layers.
     if profile.is_qwen4_exp:
         return "qwen4_exp"
@@ -1242,13 +1220,8 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
-    # DeepSeek V4 validates its specialized KVP cache contract in its backend.
-    if (
-        config.kvp_size > 1
-        and not target.is_deepseek_v4
-        and (
-            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
-        )
+    if config.kvp_size > 1 and (
+        model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
     ):
         _validate_mla_dcp_backend(
             target_full_attn_backend_name, model_config.attention_arch
@@ -1336,7 +1309,7 @@ def create_attn_components(
         # Stage windows partition execution blocks; cache ownership speaks
         # cache-layer IDs, one per attention instance. A model's profile says
         # how many instances each block owns (LongCat's paired layout: two);
-        # the in-tree PP targets K3 and V4 declare no profile and own one.
+        # the in-tree PP targets declare no profile and own one.
         # Cache ownership itself does not partition execution blocks.
         profile = model_config.model_profile
         target_cache_windows = pp_stage_cache_windows(

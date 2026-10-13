@@ -200,25 +200,6 @@ def test_gluon_petit_rejects_decode_capacity_above_workspace_limit() -> None:
         ServerArgs.validate_petit_moe_options(args)
 
 
-def test_dsv4_gluon_petit_zero_token_routing_shapes() -> None:
-    from tokenspeed.runtime.models.deepseek_v4 import DeepseekV4MoE
-
-    layer = DeepseekV4MoE.__new__(DeepseekV4MoE)
-    layer.config = SimpleNamespace(num_experts_per_tok=6, n_routed_experts=384)
-    hidden_states = torch.empty((0, 7168), dtype=torch.bfloat16)
-
-    layer.gate = SimpleNamespace(tid2eid=None, e_score_correction_bias=None)
-    scores, correction, hashes, input_ids = layer._routing_inputs(
-        hidden_states, input_ids=None
-    )
-
-    assert scores.shape == (0, 384)
-    assert scores.dtype == torch.float32
-    assert correction is None
-    assert hashes is None
-    assert input_ids is None
-
-
 @pytest.fixture
 def petit_args() -> SimpleNamespace:
     return _validation_args(

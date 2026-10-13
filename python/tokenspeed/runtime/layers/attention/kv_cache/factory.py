@@ -135,35 +135,6 @@ def _deepseek_v41_pool(
     )
 
 
-def _deepseek_v4_pool(
-    spec: CachePoolSpec,
-    config: AttnConfig,
-    arena: CacheArena,
-    *,
-    num_layers: int,
-    rank: int,
-    field_layer_offset: int,
-) -> CachePool:
-    del config
-    from tokenspeed.runtime.layers.attention.kv_cache.hybrid_deepseek_v4 import (
-        HybridDeepseekV4TokenToKVPool,
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
-        DeepseekV4PoolOptions,
-    )
-
-    options = spec.pool_options
-    if not isinstance(options, DeepseekV4PoolOptions):
-        raise TypeError("DeepSeek V4 cache spec is missing pool options")
-    return HybridDeepseekV4TokenToKVPool(
-        arena,
-        layout=options.layout,
-        layer_num=num_layers,
-        rank=rank,
-        field_layer_offset=field_layer_offset,
-    )
-
-
 def _dsa_pool(
     spec: CachePoolSpec,
     config: AttnConfig,
@@ -316,7 +287,6 @@ _POOL_FACTORIES: dict[str, Callable[..., CachePool]] = {
     "dsa": _dsa_pool,
     "msa": _msa_pool,
     "glm53_flash": _glm53_flash_pool,
-    "deepseek_v4": _deepseek_v4_pool,
     "deepseek_v41": _deepseek_v41_pool,
 }
 
