@@ -312,10 +312,10 @@ protected:
         for (std::size_t i = 0; i < GroupIds().size(); ++i) {
             CacheGroupConfig group;
             group.group_id = GroupIds()[i];
-            group.block_granularity = cfg.prefix_granularity;
+            group.family = i == 0 ? CacheGroupFamily::History : CacheGroupFamily::State;
+            group.block_granularity = i == 0 ? cfg.prefix_granularity : 0;
             group.total_pages = cfg.device_allocator.total_pages;
             group.retention = CacheGroupConfig::Retention::FullHistory;
-            group.family = i == 0 ? CacheGroupFamily::History : CacheGroupFamily::State;
             cfg.cache_groups.push_back(std::move(group));
         }
         SetTestSnapshotPool(cfg);

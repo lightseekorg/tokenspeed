@@ -162,6 +162,10 @@ class DSABackend(PagedAttentionBackend):
     cuda_graph_support = CudaGraphSupport(prefill_graph=False)
 
     def __init__(self, config: AttnConfig, spec: DSAConfig, *, kernel_page_size: int):
+        if len(config.kvp_group) > 1 and (
+            spec.index_topk <= 0 or spec.index_topk & (spec.index_topk - 1)
+        ):
+            raise ValueError("DSA KVP candidate topk must be a positive power of two")
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         platform = current_platform()
         self._dense_backend = _make_dense_leaf(config, spec, platform, kernel_page_size)
@@ -220,6 +224,10 @@ class DSABackend(PagedAttentionBackend):
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
         if len(self.qcp_group) > 1:
+            # The sharded extend arm gathers each request's history in the
+            # eager attention break; a captured prefill would replay the
+            # dummy's gather. Overrides the KPool consumer's declaration too.
+            self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
             self._probe_history_gather_topk_leaf(spec)
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:

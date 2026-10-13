@@ -216,37 +216,52 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
     tokens_before = scheduler.request_token_size("a")
 
     # The third plan arms the oldest quiescent Decoding request and retracts
-    # it: no forward, one snapshot store of its tail (the whole image without
-    # L2), the request suspended.
+    # it: no forward, the image's stores, the request suspended. Retraction
+    # publishes the victim's completed prefix like a finish, partial page
+    # included (a tail under its token count), so with L2 every page rides
+    # the stream-ordered L2 write-back and the pool holds the slot state
+    # alone; without L2 the whole image goes to the pool.
     rnd = driver.round()
     assert rnd.forwards == []
-    (store,) = rnd.ops
+    if l2:
+        tail_store, store = rnd.ops
+        assert isinstance(tail_store, ts.Cache.WriteBackOp)
+        assert list(tail_store.source_pinned) == [False]
+        assert scheduler.tail_entries() == 2
+    else:
+        (store,) = rnd.ops
     assert isinstance(store, SnapshotOp)
     assert store.request_id == "a" and store.request_pool_index == slot
-    assert store.transfers, "the unaligned tail page always goes to the pool"
     pages_in_pool = {t.destination_page for t in store.transfers}
     assert len(pages_in_pool) == len(store.transfers)
     if l2:
         # The two hash-complete pages were published to L2 at the end of the
-        # prefill and are pinned there by the suspended request; only the
-        # tail is in the pool.
-        assert len(store.transfers) == 1
-        assert scheduler.host_pool_pinned_blocks() == 2
+        # prefill, the tail by the retraction itself: nothing is left for the
+        # pool's page rows.
+        assert store.transfers == ()
+        assert scheduler.host_pool_pinned_blocks() >= 2
     else:
         assert len(store.transfers) == 3
         assert scheduler.host_pool_pinned_blocks() == 0
     assert scheduler.retracted_size() == 1 and scheduler.decoding_size() == 0
     assert scheduler.waiting_size() == 1
-    assert scheduler.snapshot_pool_free_blocks() < pool_free
+    if l2:
+        assert scheduler.snapshot_pool_free_blocks() == pool_free
+    else:
+        assert scheduler.snapshot_pool_free_blocks() < pool_free
 
-    # Until the store's ACK lands the image is not landed: no restore.
+    # Until every store's ACK lands the image is not landed: no restore.
     rnd = driver.round()
     assert rnd.ops == [] and rnd.forwards == []
     driver.complete([store])
+    if l2:
+        rnd = driver.round()
+        assert rnd.ops == [] and rnd.forwards == []
+        driver.complete([tail_store])
 
-    # The ACK makes the image eligible; the next plan restores: one op whose
-    # rows copy the pool pages back into fresh Device pages, naming the new
-    # slot and the same blob slot; the request stays unschedulable until the
+    # The ACKs make the image eligible; the next plan restores: one op whose
+    # rows copy the image back into fresh Device pages, naming the new slot
+    # and the same blob slot; the request stays unschedulable until the
     # restore's ACK.
     rnd = driver.round()
     assert rnd.forwards == []
@@ -254,9 +269,15 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
     assert isinstance(restore, RestoreOp)
     assert restore.request_id == "a" and restore.snapshot_slot == store.snapshot_slot
     assert restore.request_pool_index != slot
-    assert {t.source_page for t in restore.transfers} == pages_in_pool
-    assert set(restore.source_tier) == {HostTier.SNAPSHOT_POOL}
-    assert all(t.content_hash == "" for t in restore.transfers)
+    if l2:
+        # The hash-complete pages still cached on the Device are claimed in
+        # place; what the Device lost comes back from L2.
+        assert set(restore.source_tier) == {HostTier.L2}
+        assert restore.transfers
+    else:
+        assert {t.source_page for t in restore.transfers} == pages_in_pool
+        assert set(restore.source_tier) == {HostTier.SNAPSHOT_POOL}
+        assert all(t.content_hash == "" for t in restore.transfers)
     assert scheduler.retracted_size() == 1 and scheduler.decoding_size() == 0
     rnd = driver.round()
     assert rnd.ops == [] and rnd.forwards == []

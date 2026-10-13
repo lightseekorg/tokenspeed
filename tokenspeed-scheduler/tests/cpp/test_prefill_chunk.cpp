@@ -19,9 +19,9 @@
 // SOFTWARE.
 
 // How a local prefill chunk is cut (scheduler/operations/prefill_chunk.h):
-// the alignment rules for snapshot-state and promotion boundaries, the
-// bounded-replay budget debit and final-window rule, and the mixed-mode
-// reserve, all as pure arithmetic on the coordinator's facts.
+// the junction cut, the bounded-replay budget debit and final-window rule,
+// and the mixed-mode reserve, all as pure arithmetic on the coordinator's
+// facts.
 
 #include <gtest/gtest.h>
 
@@ -35,34 +35,6 @@
 
 namespace tokenspeed::test {
 namespace {
-
-TEST(AlignPrefillChunkTest, RespectsBudgetPromotionAndFinalExtent) {
-    const struct {
-        const char* name;
-        std::int32_t first_pos;
-        std::int32_t unscheduled;
-        std::int32_t token_budget;
-        std::int32_t prefix_granularity;
-        std::int32_t promotion_boundary;
-        std::int32_t expected_tokens;
-    } cases[] = {
-        {"first chunk reaches promotion", 16, 24, 24, 4, 32, 16},
-        {"budget precedes promotion", 16, 24, 8, 4, 32, 8},
-        {"later chunk reaches promotion", 24, 16, 16, 4, 32, 8},
-        {"prompt ends before promotion", 24, 4, 16, 4, 32, 4},
-        {"promotion already reached", 32, 16, 10, 4, 32, 8},
-        {"final extent crosses checkpoint", 50432, 868, 868, 128, 0, 868},
-        {"budget truncates final extent", 50432, 868, 800, 128, 0, 768},
-        {"aligned final extent", 51200, 768, 868, 128, 0, 768},
-        {"final extent has no internal checkpoint", 51200, 100, 868, 128, 0, 100},
-    };
-    for (const auto& c : cases) {
-        SCOPED_TRACE(c.name);
-        EXPECT_EQ(
-            AlignPrefillChunk(c.first_pos, c.unscheduled, c.token_budget, c.prefix_granularity, c.promotion_boundary),
-            c.expected_tokens);
-    }
-}
 
 TEST(ChunkKeepingFinalWindowTest, NeverLeavesAShortFinalChunk) {
     constexpr std::int32_t kW = 8;
@@ -136,31 +108,44 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     // a budget of 64 leaves 62 so that 8 remain; the remainder itself fits.
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/0, /*resumes_hit=*/true, 70, 64, 0), 62);
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/62, /*resumes_hit=*/false, 8, 64, 0), 8);
-    // A promotion boundary still aligns the chunk (host tier), under the
-    // debited budget.
-    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, /*promotion=*/24), 8);
-    // A promotion boundary inside the final window cannot be honored without
-    // leaving a short final chunk: the chunk passes it and completes the
-    // prompt instead of waiting forever; when the whole remainder does not
-    // fit the budget yet, it waits like any other final window.
+    // A junction cuts the chunk at any token, under the debited budget.
+    EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, /*junction=*/27), 11);
+    // A junction inside the final window cannot be honored without leaving a
+    // short final chunk: the chunk passes it and completes the prompt instead
+    // of waiting forever; when the whole remainder does not fit the budget
+    // yet, it waits like any other final window.
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/48, /*resumes_hit=*/false, /*unscheduled=*/8, 64,
-                                 /*promotion=*/52),
+                                 /*junction=*/52),
               8);
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/48, /*resumes_hit=*/false, /*unscheduled=*/8, 6,
-                                 /*promotion=*/52),
+                                 /*junction=*/52),
               0);
 
-    // Without replayable groups the helper is min(budget, unscheduled) plus
-    // the alignment the state/promotion cases already had.
+    // Without replayable groups the helper is min(budget, unscheduled), cut
+    // at a pending junction.
     BlockPool plain_pool(16, {1});
     const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr,
                                                    /*snapshot_pool=*/nullptr, false);
     EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 100, 40, 0), 40);
     EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 30, 40, 0), 30);
-    EXPECT_EQ(PrefillChunkTokens(plain, 16, false, 100, 40, /*promotion=*/24), 8);
+    EXPECT_EQ(PrefillChunkTokens(plain, 16, false, 100, 40, /*junction=*/21), 5);
+    EXPECT_EQ(PrefillChunkTokens(plain, 21, false, 95, 40, /*junction=*/21), 40) << "a junction already passed";
+    // A State group adds no alignment: chunks are cut by budget alone.
+    BlockPool state_pool(16, {1, 1});
+    const std::vector<CacheGroupSpec> with_state = {
+        FullOnlySpecs()[0],
+        CacheGroupSpec{.kind = AttnKind::kMambaState,
+                       .sliding_window = 0,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 0},
+    };
+    const CacheCoordinator hybrid = MakeCoordinator(with_state, 4, state_pool, /*enable_l3_storage=*/false, nullptr,
+                                                    /*snapshot_pool=*/nullptr, false);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 100, 7, 0), 7);
+    EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0), 5);
 }
 
-TEST(MinPrefillChunkTokensTest, ReservesACheckpointPageOrReplayPlusAWindowOrPage) {
+TEST(MinPrefillChunkTokensTest, ReservesReplayPlusAWindowOrPage) {
     BlockPool pool(16, {1, 1, 1});
     // W = 8 > P = 4: replay plus another window.
     EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(ReplayableSpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr,
@@ -175,17 +160,18 @@ TEST(MinPrefillChunkTokensTest, ReservesACheckpointPageOrReplayPlusAWindowOrPage
     EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false,
                                                     nullptr, /*snapshot_pool=*/nullptr, false)),
               0);
+    // A State group reserves nothing: its chunks are cut by budget alone.
     BlockPool state_pool(16, {1, 1});
     const std::vector<CacheGroupSpec> with_state = {
         FullOnlySpecs()[0],
         CacheGroupSpec{.kind = AttnKind::kMambaState,
                        .sliding_window = 0,
                        .cache_blocks_per_lcm_block = 1,
-                       .block_granularity = 4},
+                       .block_granularity = 0},
     };
     EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(with_state, 4, state_pool, /*enable_l3_storage=*/false, nullptr,
                                                     /*snapshot_pool=*/nullptr, false)),
-              4);
+              0);
 }
 
 }  // namespace

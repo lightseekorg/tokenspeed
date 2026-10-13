@@ -106,6 +106,10 @@ public:
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
+    // Published tail boundaries the probe can enumerate, and how many the
+    // per-prior cap has dropped since start.
+    std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }
+    std::int64_t TailCapEvictions() const { return coordinator_.TailCapEvictions(); }
     // Empty parents of the request-private snapshot pool: every block of it
     // belongs to some retracted request's image, so a request that finished
     // or aborted while retracted must have returned its share (leak check).
@@ -186,6 +190,9 @@ private:
     // is Prefetching; it is considered again once the fill landed), or
     // neither (feedback says whether capacity was the reason).
     struct FirstChunkOutcome {
+        // The D role: every State group's prompt-end checkpoint was claimed,
+        // so the peer omits the state transfer (PrefillOperation::state_prefix_cached).
+        bool state_prefix_cached{false};
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
         bool prefetching{false};
     };
@@ -204,6 +211,8 @@ private:
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
+    // Records an admission's fresh pages (to zero) and copies on the plan.
+    void recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator::AdmissionResult& result);
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            CacheCoordinator::PrefixProbe&& prefix,
                                                            std::span<const GroupDemand> demands,
@@ -214,7 +223,18 @@ private:
                                   const RequestProgress& progress);
     void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
+    // The descriptors a publication mutates: its newly hashed full pages and,
+    // at a tail, the partial page under its tail hash (token_ids = the rows
+    // below T, parent = the last full page).
+    void registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+                                    const CompletedPages& completed);
     void markKvEventBoundaryForReconcile(const CacheKey& boundary);
+    // Finished requests whose forwards have all landed: publish the frontier
+    // (state and KV tail) and release the pages. Runs after every batch of
+    // events, so a request that finished quiescent settles with its Finish
+    // and one whose finish overtook an overlapped decode settles with that
+    // decode's result -- paused or not, plan or no plan.
+    void settleFinishedRequests();
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
 
     std::size_t groupIndex(const std::string& group_id) const;
@@ -224,7 +244,8 @@ private:
     // the D role it is the peer's prefill writing the destination pages
     // (RemotePrefilling); on the P role it is the peer's decode reading them,
     // which begins with the first scheduled chunk and ends only with the PD
-    // ACK -- every page-holding state. A fused engine never transfers.
+    // ACK -- every page-holding state before Finishing. A fused engine never
+    // transfers.
     bool pdTransferInFlight(const Request& request) const;
 
     void handleEvent(const cache::WriteBackDone& event);
@@ -270,7 +291,7 @@ private:
         // Budget the decode batch must leave untouched for a pending local
         // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
         // fused mixed mode only).
-        std::int32_t state_prefill_reserve{0};
+        std::int32_t pending_prefill_reserve{0};
         bool pushed_prefill{false};
         bool pushed_decode{false};
         bool Full(std::int32_t max_batch_size) const {

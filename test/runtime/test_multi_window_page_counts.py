@@ -121,8 +121,12 @@ class MultiWindowPageCountsTest(unittest.TestCase):
 
     Per live request a sliding group retains ceil((W - 1 + decode + page - 1)
     / page) pages -- its window, the next decode token, at any alignment --
-    and one in-flight prefill chunk adds its lookback plus ceil(chunk / page)
-    rows before they slide out.
+    and one in-flight prefill chunk adds its lookback -- the most pages a
+    window can span at any alignment, ceil((W - 1 + page - 1) / page) -- plus
+    ceil(chunk / page) rows before they slide out. Every group that publishes a prefix also
+    charges one tail-handover page per live request: the blocks a request
+    holds while its published tail changes hands at prompt end (a sliding
+    group at most its lookback, so a window of one charges none).
     """
 
     def test_each_window_budgets_independently(self):
@@ -134,13 +138,16 @@ class MultiWindowPageCountsTest(unittest.TestCase):
             ]
         )
         # full: ceil(4096/64) dense + one unaligned tail page per request
-        self.assertEqual(pages["full_attention"], 64 + 4)
-        # W=128: ceil((127 + 1 + 63)/64) = 3 per request; lookback ceil(127/64)
-        # = 2 and ceil(512/64) = 8 rows for the chunk in flight
-        self.assertEqual(pages["sliding_attention_128"], 4 * 3 + 2 + 8)
+        # + one tail-handover page per request
+        self.assertEqual(pages["full_attention"], 64 + 4 + 4)
+        # W=128: ceil((127 + 1 + 63)/64) = 3 per request; lookback
+        # ceil((127 + 63)/64) = 3 and ceil(512/64) = 8 rows for the chunk in
+        # flight; handover 1 per request
+        self.assertEqual(pages["sliding_attention_128"], 4 * 3 + 3 + 8 + 4)
         # W=4: ceil((3 + 1 + 63)/64) = 2 per request -- a sub-page window can
-        # still straddle two pages while its partial tail is live; lookback 1
-        self.assertEqual(pages["sliding_attention_4"], 4 * 2 + 1 + 8)
+        # still straddle two pages while its partial tail is live; lookback
+        # ceil((3 + 63)/64) = 2; handover min(1, lookback) = 1 per request
+        self.assertEqual(pages["sliding_attention_4"], 4 * 2 + 2 + 8 + 4)
         self.assertGreater(pages["sliding_attention_128"], pages["sliding_attention_4"])
 
     def test_window_one_holds_only_the_token_being_written(self):
@@ -152,8 +159,9 @@ class MultiWindowPageCountsTest(unittest.TestCase):
     def test_resident_window_clamped_by_context_len(self):
         wide = _pages([_spec("s", "sliding_window", window=128)], max_context_len=32)
         # min(127, 32) = 32 -> ceil((32 + 1 + 63)/64) = 2 pages per request
-        # instead of 3; the resumable-boundary lookback still follows the window.
-        self.assertEqual(wide["s"], 4 * 2 + 2 + 8)
+        # instead of 3; the resumable-boundary lookback still follows the
+        # window (3 pages); handover 1 per request.
+        self.assertEqual(wide["s"], 4 * 2 + 3 + 8 + 4)
 
     def test_scheduled_tokens_capped_by_total(self):
         pages = _pages(
@@ -161,7 +169,7 @@ class MultiWindowPageCountsTest(unittest.TestCase):
             max_scheduled_tokens=10_000,
             max_total_tokens=4096,
         )
-        self.assertEqual(pages["s"], 4 * 3 + 2 + math.ceil(4096 / PAGE))
+        self.assertEqual(pages["s"], 4 * 3 + 3 + math.ceil(4096 / PAGE) + 4)
 
     def test_sliding_without_window_raises(self):
         with self.assertRaises(ValueError):

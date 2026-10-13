@@ -151,7 +151,6 @@ def layout(
                 sliding_window_tokens=entry.sliding_window_tokens,
                 family=entry.family,
                 transfer_policy=entry.transfer_policy,
-                checkpoint_granularity=entry.prefix_granularity,
                 replayable=False,
                 shard_count=entry.shard_count,
             )
@@ -234,11 +233,13 @@ def block_manifest(
     *groups: tuple[str, tuple[int, ...]],
     prefix: int = 0,
     prompt: int = 2,
+    state_prefix_cached: bool = False,
 ) -> CachePDBlockManifest:
     return CachePDBlockManifest(
         groups=tuple(CachePDGroupBlocks(*entry) for entry in groups),
         prefix_len=prefix,
         prompt_len=prompt,
+        state_prefix_cached=state_prefix_cached,
     )
 
 

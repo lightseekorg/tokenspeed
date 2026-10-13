@@ -30,26 +30,36 @@ TransferPolicy = Literal["full_suffix", "latest_snapshot"]
 # None at full-history positions), or None for a model with no sliding layers.
 SlidingWindowTokens = int | Sequence[int | None] | None
 
+# A state group's block table holds two slots per request: the input
+# checkpoint the forward reads (a claimed prefix hit, the block the previous
+# forward wrote before the scheduler rotated it, or a fresh zeroed block for a
+# prompt with no history; null once consumed) and the live block it writes.
+# The scheduler and the state kernels address them by these fixed positions.
+STATE_INPUT_SLOT = 0
+STATE_LIVE_SLOT = 1
+STATE_TABLE_SLOTS = 2
+
 
 @dataclass(frozen=True)
 class CacheGroupSpec:
     """One cache group's scheduler-facing layout.
 
-    A spec declares exactly one geometry shape, and the family names it:
+    The family names the geometry a spec declares:
 
-    * **Row geometry** (``rows_per_page`` + ``entry_stride_tokens``) — the
+    * **Row geometry** (``rows_per_page`` + ``entry_stride_tokens``) -- the
       ``"history"`` family: paged KV-cache consumers whose CacheBlocks
       physically hold rows of entries (per-token KV, sliding windows,
       compressed entries). Retention is full-history or sliding.
-    * **Checkpoint** (``checkpoint_granularity``) — the ``"state"`` family:
-      snapshot-style groups (recurrent/conv state) whose CacheBlocks each
-      hold one state snapshot taken every ``checkpoint_granularity`` tokens.
-      Such a group has no rows and no pages, and a snapshot summarizes
-      everything before it, so nothing in it ever slides out: retention is
-      always full-history.
+    * **No span** -- the ``"state"`` family: snapshot-style groups
+      (recurrent/conv state) whose CacheBlocks each hold one state. A state
+      summarizes everything before it, so a block covers no token span and
+      nothing in it ever slides out: retention is always full-history. The
+      scheduler keeps two blocks per live request (the input checkpoint it
+      resumes from and the live block it writes) and publishes a block under
+      the token count at which the forward that wrote it ended.
 
-    Family-agnostic consumers address either shape through
-    ``block_granularity``; ``page_size`` exists only for row geometry.
+    Family-agnostic consumers address row geometry through
+    ``block_granularity``; a state group has none.
     """
 
     group_id: str
@@ -63,13 +73,11 @@ class CacheGroupSpec:
     # model can rebuild every row the group retains. Stated by every caller:
     # a group silently left cached would change what a prefix hit means.
     replayable: bool = field(kw_only=True)
-    # History stores token history in rows; State stores recurrent-state
-    # checkpoints. __post_init__ holds the family to its shape.
+    # History stores token history in rows; State stores recurrent state
+    # blocks without a token span. __post_init__ holds the family to its shape.
     family: Family = "history"
     # None preserves standalone/non-PD behavior; PD plans set this explicitly.
     transfer_policy: TransferPolicy | None = None
-    # Snapshot-state shape: raw-token span between two state checkpoints.
-    checkpoint_granularity: int | None = None
 
     # Number of cyclic owners of this group's virtual blocks. One keeps the
     # same block IDs on every rank; local field geometry is independent of it.
@@ -85,39 +93,29 @@ class CacheGroupSpec:
         has_rows = (
             self.rows_per_page is not None or self.entry_stride_tokens is not None
         )
-        if self.checkpoint_granularity is not None:
+        if self.family == "state":
             if has_rows:
                 raise ValueError(
-                    f"group {self.group_id!r}: checkpoint_granularity is "
-                    "mutually exclusive with rows_per_page/entry_stride_tokens"
-                )
-            if self.family != "state":
-                raise ValueError(
-                    f"group {self.group_id!r}: checkpoint_granularity is only "
-                    "valid for state-family groups"
-                )
-            if self.checkpoint_granularity <= 0:
-                raise ValueError(
-                    f"group {self.group_id!r}: checkpoint_granularity must be "
-                    f"> 0, got {self.checkpoint_granularity}"
+                    f"group {self.group_id!r}: a state-family group holds one "
+                    "state per block and declares no row geometry; rows of "
+                    "token history -- a sliding window included -- are a "
+                    "history-family group"
                 )
             if self.retention != "full_history":
                 raise ValueError(
                     f"group {self.group_id!r}: a state group keeps checkpoints "
                     "that never slide out; declare full_history retention"
                 )
+            if self.replayable:
+                raise ValueError(
+                    f"group {self.group_id!r}: a state group is never regenerated "
+                    "by bounded replay"
+                )
             return
-        if self.family == "state":
-            raise ValueError(
-                f"group {self.group_id!r}: a state-family group declares "
-                "checkpoint_granularity; rows of token history -- a sliding "
-                "window included -- are a history-family group"
-            )
         if self.rows_per_page is None or self.entry_stride_tokens is None:
             raise ValueError(
-                f"group {self.group_id!r}: declare either row geometry "
-                "(rows_per_page + entry_stride_tokens) or "
-                "checkpoint_granularity"
+                f"group {self.group_id!r}: a history-family group declares row "
+                "geometry (rows_per_page + entry_stride_tokens)"
             )
         if self.rows_per_page <= 0 or self.entry_stride_tokens <= 0:
             raise ValueError(
@@ -137,17 +135,14 @@ class CacheGroupSpec:
         """Raw-token span of one CacheBlock; row-geometry (paged KV) only."""
         if self.rows_per_page is None or self.entry_stride_tokens is None:
             raise TypeError(
-                f"group {self.group_id!r}: page_size is undefined for "
-                "checkpoint (snapshot-state) groups; use block_granularity "
-                "or checkpoint_granularity"
+                f"group {self.group_id!r}: page_size is undefined for a "
+                "state group; its blocks cover no token span"
             )
         return self.rows_per_page * self.entry_stride_tokens
 
     @property
     def block_granularity(self) -> int:
-        """Raw-token span of one block-table slot, valid for every shape."""
-        if self.checkpoint_granularity is not None:
-            return self.checkpoint_granularity
+        """Raw-token span of one block-table slot; row geometry only."""
         return self.page_size
 
 
@@ -218,7 +213,8 @@ def compute_max_logical_pages_for_capture(
     """Return the decode CUDA Graph block-table width for one cache group.
 
     Decode only: a decode row describes live cache history, so a sliding group
-    is bounded by its window. Prefill capture fabricates one extend across the
+    is bounded by its window and a state group's row is its two slots
+    whatever the context. Prefill capture fabricates one extend across the
     whole extent and derives a write column per position in it, so it sizes
     its own tables -- see ``PrefillGraph._dummy_group_tables``.
 
@@ -245,6 +241,8 @@ def compute_max_logical_pages_for_capture(
         raise ValueError(
             f"overlap_schedule_depth must be 0 or 1, got {overlap_schedule_depth}"
         )
+    if spec.family == "state":
+        return STATE_TABLE_SLOTS
     block_granularity = spec.block_granularity
     reservation_horizon = (overlap_schedule_depth + 1) * max_tokens_per_req
     if spec.retention == "sliding_window":
@@ -618,14 +616,12 @@ def _layer_group_spec(
 ) -> CacheGroupSpec:
     """One group's spec in the shape its family declares."""
     if family == "state":
-        # Snapshot-state groups have no rows: one CacheBlock holds one
-        # recurrent-state checkpoint taken every `block_tokens` tokens.
+        # State groups have no rows: one CacheBlock holds one recurrent state.
         return CacheGroupSpec(
             group_id=group_id,
             retention=retention,
             sliding_window_tokens=window,
             family=family,
-            checkpoint_granularity=block_tokens,
             replayable=False,
         )
     return CacheGroupSpec(
@@ -666,7 +662,10 @@ __all__ = [
     "CacheGroupSpec",
     "Retention",
     "SlidingWindowTokens",
+    "STATE_INPUT_SLOT",
     "STATE_LAYER_TYPES",
+    "STATE_LIVE_SLOT",
+    "STATE_TABLE_SLOTS",
     "apply_pd_transfer_policies",
     "group",
     "compute_max_logical_pages_for_capture",

@@ -12,7 +12,7 @@ shapes, while metadata supplies the live request boundaries and state pages.
 
 The feature is on by default for supported prefill batches on the
 `cutedsl_kda` backend when prefill graphs are on. It uses the existing
-prefill computation and scheduler-owned checkpoints.
+prefill computation and the scheduler-owned two-slot state table.
 
 ## How it works
 
@@ -24,19 +24,18 @@ those segments alongside its input projections, gated RMSNorm, output projection
 and neighboring model operations. Consecutive KDA layers can therefore share a
 segment. MLA attention calls still form breaks.
 
-For a KDA layer that writes an internal checkpoint, the logical flow is:
+For a KDA layer, the logical flow is:
 
 ```text
 Input projections
-  → KDA main: process new tokens up to the checkpoint boundary
-  → Preserve the boundary checkpoint
-  → KDA tail: continue from that boundary to the request's final state
-  → Restore token order, normalize and project the output
+  → KDA scan: read each request's input state (slot 0), process its new
+    tokens, write its final state to its live block (slot 1)
+  → Normalize and project the output
 ```
 
-Main and tail are parts of the same outer capture, not separately selected
-graphs. This removes the per-layer KDA graph launch and the output handoff copy
-at the attention break.
+The scan is part of the outer capture, not a separately selected graph. This
+removes the per-layer KDA graph launch and the output handoff copy at the
+attention break.
 
 The server captures the configured variants at startup. Requests select an
 existing capture. Encountering another batch size or token length does not
@@ -44,14 +43,14 @@ create a new graph during serving.
 
 With the feature enabled, supported pure-prefill forwards use the same
 capacity-shaped metadata for eager execution, capture and replay. Before the
-forward, the backend prepares request boundaries, convolution maps, token maps
-and state-page indices once for all KDA layers. Captured shapes refresh retained
+forward, the backend prepares request boundaries, convolution maps and
+state-block indices once for all KDA layers. Captured shapes refresh retained
 buffers at their original addresses. Uncaptured shapes use temporary storage.
-The scheduler remains responsible for cache allocation and checkpoint ownership.
-This preparation happens outside the graph and still includes CPU work and
-host-to-device copies.
+The scheduler remains responsible for cache allocation and for which block a
+request reads and writes. This preparation happens outside the graph and still
+includes CPU work and host-to-device copies.
 
-### Reuse captures across lengths and checkpoint patterns
+### Reuse captures across lengths and request counts
 
 Two values select a merged capture:
 
@@ -62,47 +61,28 @@ Two values select a merged capture:
   requests. With `[1, 2, 4]`, BS 1 and 2 use their own captures. BS 3 and 4 use
   BS 4. Padding adds execution slots, not scheduler requests.
 
-Each unused request slot needs one masked dummy token in the native main scan.
-Selection reserves room for those tokens in addition to the live input length.
-If the smallest token bucket is full, the runtime can use the next configured
-token bucket. If no token/request-capacity pair fits, execution takes the
-ordinary fallback. A larger token bucket also pads outer projections and
-MoE work, so crossing that boundary can cost more than padding only the
-request dimension.
+Each unused request slot scans one padding row past the live tokens: the
+native scan needs a positive length per sequence. Selection reserves room for
+those rows in addition to the live input length. If the smallest token bucket
+is full, the runtime can use the next configured token bucket. If no
+token/request-capacity pair fits, execution takes the ordinary fallback. A
+larger token bucket also pads outer projections and MoE work, so crossing that
+boundary can cost more than padding only the request dimension.
 
-Each capture reserves one checkpoint/tail slot per request, so the number and
-identity of requests with checkpoints can change without another capture.
-The main scan reserves the outer token capacity. Tail storage is
-`min(token_capacity, BS * max(1, prefix_granularity - 1))`.
-Here BS is the captured request capacity, including unused slots.
+For example, two requests that add 868 and 869 tokens use the
+`(2048 tokens, BS 2)` capture; so does a batch of one request adding 1737
+tokens, whose unused slot scans one padding row. The live tokens keep the
+packing of an unpadded forward, so the captured replay and the eager forward
+agree bit for bit.
 
-For example, consider two requests with aligned cached prefixes that add
-868 and 869 tokens at checkpoint granularity 128:
-
-| Stage | Request 1 | Request 2 | Combined live tokens | Reserved capacity |
-|---|---:|---:|---:|---:|
-| Full prefill | 868 | 869 | 1737 | 2048 |
-| KDA main | 768 | 768 | 1536 | 2048 |
-| KDA tail | 100 | 101 | 201 | 254 |
-
-Both requests use the `(2048 tokens, BS 2)` capture. A two-request batch with
-zero, one or two internal checkpoints can reuse it, provided its live tokens
-fit the bucket.
-
-A request without an internal checkpoint runs entirely in main. Its tail slot
-contains a dummy token whose output and state writes the tail scan suppresses.
-This keeps the scan topology fixed and preserves main's final state.
-The tradeoff is that the fixed-slot tail scan still runs when no request needs
-a checkpoint, including eligible eager forwards while the feature is enabled.
-Padding never becomes a
-scheduler request or a persistent cache entry.
-
-An unused request slot has zero convolution length and negative input/output
-state-block indices. Its main and tail scans each receive one zero-input dummy
-token. Their output maps and checkpoint destinations are negative. No dummy
-result reaches a real request or cache block. The live batch size is unchanged
-for MLA, output sampling and scheduling. The backend refreshes retained metadata
-in place when a capture alternates between partially and fully occupied batches.
+An unused request slot has zero convolution length, negative input/output
+state-block indices and one zero-input padding row in the scan. No padding
+result reaches a real request or cache block: the masked state writer drops
+rows whose block is negative, and the padded output rows are zeroed. Padding
+never becomes a scheduler request or a persistent cache entry. The live batch
+size is unchanged for MLA, output sampling and scheduling. The backend
+refreshes retained metadata in place when a capture alternates between
+partially and fully occupied batches.
 
 ## Configure the feature
 
@@ -167,8 +147,8 @@ metadata remain resident per configuration.
 ## Coverage and fallback
 
 Merged KDA capture applies to pure prefill batches with a fitting request capacity
-and token bucket. Live counts, lengths and checkpoint patterns can vary
-within that configuration.
+and token bucket. Live counts, lengths and prefix hits can vary within that
+configuration.
 
 - Mixed prefill/decode batches and request counts above captured capacity retain the
   ordinary outer graph, with attention breaks.

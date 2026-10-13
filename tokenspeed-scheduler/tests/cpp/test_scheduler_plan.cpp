@@ -38,21 +38,22 @@ protected:
         return cfg;
     }
 
+    // Both seeds finish right after their prefill (a zero decode width plans
+    // no decode step): the quiescent finish publishes the prompt pages, whose
+    // stream to Host rides the next plan.
     void SetupHostCache() {
         Submit(MakeRequestSpec("r_seed", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
         SendForwardDone("r_seed", {42});
+        SendFinish("r_seed");
         const ExecutionPlan seed_stream = PlanOnce();
         ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(seed_stream).empty());
         AckWriteBacks(seed_stream);
-        SendFinish("r_seed");
-        AckWriteBacks(PlanOnce());
         PlanOnce();
 
         Submit(MakeRequestSpec("r_fill", /*num_pages=*/3, /*start=*/100));
         PlanOnce();
         SendForwardDone("r_fill", {200});
-        AckWriteBacks(PlanOnce());
         SendFinish("r_fill");
         AckWriteBacks(PlanOnce());
         PlanOnce();
@@ -96,6 +97,54 @@ TEST_F(SchedulerTestSuite, NoCacheOps_PlainRequestNoCacheHit) {
     auto plan = PlanOnce();
     auto cache_ops = ExtractCacheOps(plan);
     EXPECT_TRUE(cache_ops.empty());
+}
+
+// A tail hit's copy source may be evicted by a later admission of the same
+// round, once the hitter's table holds the fresh copy and the source is
+// cache-only again. The plan then carries the pair in pages_to_copy and the
+// source in pages_to_zero: the runtime's copies-before-zeroing order is what
+// keeps the copy reading the old bytes.
+class CopySourceRegrantSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.disable_l2_cache = true;
+        cfg.host_allocator.total_pages = 0;
+        // 7 usable: r1 leaves 2 cached blocks; r2 claims one and needs 2
+        // (its copy and growth); r3 needs 4 and must evict r2's copy source.
+        cfg.device_allocator.total_pages = 8;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(CopySourceRegrantSuite, ACopySourceEvictedInTheSameRoundIsBothCopiedAndZeroed) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3}});
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    PlanOnce();  // prompt end: tail [3] published, r1 moves to a copy
+    SendForwardDone("r1", {43});
+    SendFinish("r1");  // frontier 4: page [3 42] published, nothing new is a tail
+    PlanOnce();
+    ASSERT_EQ(scheduler_->TailEntries(), 1u);
+
+    Submit(RequestSpec{.request_id = "r2", .tokens = {1, 2, 3, 7}});
+    Submit(RequestSpec{.request_id = "r3", .tokens = {101, 102, 103, 104, 105, 106}});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"r2", "r3"}));
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 3) << "r2 resumes at the tail";
+    EXPECT_EQ(batch->extend_prefix_lens.at(1), 0);
+    const auto& copies = plan.pages_to_copy.at("full_attention");
+    ASSERT_EQ(copies.size(), 1u);
+    const auto [source, destination] = copies.front();
+    EXPECT_EQ(batch->block_tables.at("full_attention").at(0).at(1), destination);
+    const auto& zeroed = plan.pages_to_zero.at("full_attention");
+    EXPECT_NE(std::ranges::find(zeroed, source), zeroed.end()) << "r3 took the source once the copy left it cache-only";
+    EXPECT_EQ(std::ranges::find(zeroed, destination), zeroed.end()) << "the copy fills the destination whole";
+    EXPECT_EQ(scheduler_->TailEntries(), 0u) << "the tail left the index with its block";
 }
 
 class DisablePrefixCacheTestSuite : public SchedulerTestSuite {
@@ -192,7 +241,7 @@ class SchedulerKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
-        cfg.device_allocator.total_pages = 3;
+        cfg.device_allocator.total_pages = 5;  // four usable: two one-page prompts with their decode slots
         cfg.disable_l2_cache = true;
         cfg.enable_kv_cache_events = true;
         SetTestSnapshotPool(cfg);
@@ -219,20 +268,67 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock)
     Submit(MakeRequestSpec("seed", 1));
     PlanOnce();
     SendForwardDone("seed", {42});
-    PlanOnce();
-    SendFinish("seed");
+    SendFinish("seed");  // quiescent: publishes its page and releases its blocks at once
 
     std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
     ASSERT_EQ(stored.size(), 1u);
     const std::uint64_t stored_hash = std::get<KvBlockStoredEvent>(stored[0]).block_hashes.front();
 
-    Submit(MakeRequestSpec("replacement", 1, 100));
+    // The filler takes two of the three free blocks; the replacement's
+    // admission then evicts the seed's page for its second.
+    Submit(MakeRequestSpec("filler", 1, 100));
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+    Submit(MakeRequestSpec("replacement", 1, 200));
     PlanOnce();
 
     std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
     ASSERT_EQ(removed.size(), 1u);
     ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[0]));
     EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes, std::vector<std::uint64_t>{stored_hash});
+}
+
+// A finish whose frontier is not page-aligned publishes the partial page as a
+// tail: one more BlockStored whose token_ids are the rows below T (shorter
+// than block_size), chained to the last full page, and removed with it.
+TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFinish) {
+    config_.device_allocator.total_pages = 5;
+    config_.cache_groups.front().total_pages = config_.device_allocator.total_pages;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const RequestSpec spec{.request_id = "r1", .tokens = {1, 2, 3}};
+    Submit(spec);
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    SendFinish("r1");  // computed tokens [1 2 3]: page [1 2] and the tail [3]
+
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[1]));
+    const auto& page = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& tail = std::get<KvBlockStoredEvent>(events[1]);
+    EXPECT_EQ(page.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_FALSE(page.parent_block_hash.has_value());
+    EXPECT_EQ(tail.token_ids, (std::vector<std::int32_t>{3}));
+    EXPECT_EQ(tail.parent_block_hash, page.block_hashes.front()) << "the tail chains to the last full page";
+    EXPECT_EQ(tail.block_size, PrefixGranularity());
+    EXPECT_NE(tail.block_hashes.front(), page.block_hashes.front());
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    // Two prompts sharing nothing fill the pool: the first takes the two
+    // free blocks, the second's admission evicts both boundaries, the tail
+    // (deeper) first.
+    Submit(MakeRequestSpec("filler", 1, 100));
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+    Submit(MakeRequestSpec("replacement", 1, 200));
+    PlanOnce();
+    std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
+    ASSERT_EQ(removed.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[0]));
+    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[1]));
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes, tail.block_hashes);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[1]).block_hashes, page.block_hashes);
 }
 
 class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
@@ -294,8 +390,7 @@ TEST_F(SubpageKvCacheEventTestSuite, PublishesRemovalWhenAnyChildBlockIsEvicted)
     Submit(MakeRequestSpec("seed", 2));
     PlanOnce();
     SendForwardDone("seed", {42});
-    PlanOnce();
-    SendFinish("seed");
+    SendFinish("seed");  // quiescent: publishes its pages and releases its blocks at once
 
     std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
     ASSERT_EQ(stored.size(), 2u);
@@ -371,6 +466,7 @@ TEST_F(PrefillRoleKvCacheEventTestSuite, AdmissionThatEvictsAndRepublishesABound
     // seed's remote decode publishes the shared pages; dup's next chunk does
     // not fit while seed still holds its pages for the PD transfer.
     SendForwardDone("seed", {42});
+    SendForwardDone("dup");  // its first chunk landed: KV only
     const ExecutionPlan second_round = PlanOnce();
     ASSERT_TRUE(second_round.remote_decode.has_value());
     const ForwardBatch* second = FindForwardBatch(second_round);
@@ -529,7 +625,7 @@ TEST_F(SchedulerTestSuite, SubmitRequestsValidatesWholeBatchBeforeInsertion) {
     EXPECT_NO_THROW(Submit(valid));
 }
 
-class HybridPrefixPromotionTestSuite : public SchedulerTestSuite {
+class HybridJunctionCutTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
@@ -539,6 +635,7 @@ protected:
             CacheGroupConfig state = cfg.cache_groups.front();
             state.group_id = "linear_attention_" + std::to_string(i);
             state.family = CacheGroupFamily::State;
+            state.block_granularity = 0;
             cfg.cache_groups.push_back(std::move(state));
         }
         SetTestSnapshotPool(cfg);
@@ -554,7 +651,11 @@ protected:
     }
 };
 
-TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) {
+// The seed publishes KV and state at its prompt end (11) only. The second
+// request shares the first 8 tokens: KV reaches 8, no state does, so its first
+// chunk is cut at the junction and publishes a state checkpoint there. The
+// third request then resumes from 8 in both families.
+TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint) {
     Submit(MakeHybridRequest("seed", 100));
     const ExecutionPlan seed_plan = PlanOnce();
     const ForwardBatch* seed = FindForwardBatch(seed_plan);
@@ -565,19 +666,19 @@ TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) 
     SendFinish("seed");
     PlanOnce();
 
-    Submit(MakeHybridRequest("promote", 200));
-    const ExecutionPlan promotion_plan = PlanOnce();
-    const ForwardBatch* promotion = FindForwardBatch(promotion_plan);
-    ASSERT_NE(promotion, nullptr);
-    ASSERT_EQ(promotion->request_ids, std::vector<std::string>{"promote"});
-    EXPECT_EQ(promotion->input_lengths, std::vector<std::int32_t>{8});
+    Submit(MakeHybridRequest("junction", 200));
+    const ExecutionPlan junction_plan = PlanOnce();
+    const ForwardBatch* junction = FindForwardBatch(junction_plan);
+    ASSERT_NE(junction, nullptr);
+    ASSERT_EQ(junction->request_ids, std::vector<std::string>{"junction"});
+    EXPECT_EQ(junction->input_lengths, std::vector<std::int32_t>{8});
     const ExecutionPlan remainder_plan = PlanOnce();
     const ForwardBatch* remainder = FindForwardBatch(remainder_plan);
     ASSERT_NE(remainder, nullptr);
     EXPECT_EQ(remainder->input_lengths, std::vector<std::int32_t>{3});
-    SendForwardDone("promote", {901});
+    SendForwardDone("junction", {901});
     PlanOnce();
-    SendFinish("promote");
+    SendFinish("junction");
     PlanOnce();
 
     Submit(MakeHybridRequest("reuse", 300));
@@ -586,6 +687,10 @@ TEST_F(HybridPrefixPromotionTestSuite, ThirdRequestReusesPromotedStateBoundary) 
     ASSERT_NE(reuse, nullptr);
     ASSERT_EQ(reuse->request_ids, std::vector<std::string>{"reuse"});
     EXPECT_EQ(reuse->extend_prefix_lens, std::vector<std::int32_t>{8});
+    for (std::int32_t i = 0; i < 3; ++i) {
+        const auto& row = reuse->block_tables.at("linear_attention_" + std::to_string(i)).at(0);
+        EXPECT_GT(row.at(0), 0) << "the junction checkpoint is the chunk's input";
+    }
 }
 
 TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {

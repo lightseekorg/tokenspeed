@@ -547,7 +547,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
 TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeTokens) {
     SchedulerConfig config;
     config.prefix_granularity = 2;
-    config.device_allocator.total_pages = 4;
+    config.device_allocator.total_pages = 5;
     config.host_allocator.total_pages = 10;
     config.max_scheduled_tokens = 8;
     config.max_batch_size = 2;
@@ -555,13 +555,15 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
         .block_granularity = 2,
-        .total_pages = 4,
+        .total_pages = 5,
         .retention = CacheGroupConfig::Retention::FullHistory,
         .family = CacheGroupFamily::History,
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
     SetTestSnapshotPool(config);
     Scheduler scheduler{std::move(config)};
+    // Four usable blocks: three for the prompt and the decode width the P
+    // reserves for its drafter, one for a tail changing hands.
     ASSERT_EQ(scheduler.MaxSingleRequestTokens(), 6);
     RequestSpec spec{
         .request_id = "prefill-only-capacity",
@@ -572,25 +574,29 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     EXPECT_NO_THROW(scheduler.SubmitRequests({spec}));
 }
 
-TEST(CacheOperationTest, ComputedStateChunkDoesNotQueueAStoreButEndpointUsesNormalGuards) {
+// A State group's slot 1 is published only at a natural checkpoint
+// (publish_state) and then streams to Host like any other entry; an ordinary
+// chunk end leaves it request-private.
+TEST(CacheOperationTest, StateCheckpointStreamsOnlyWhenPublished) {
     for (const auto guard : {StoreSourceGuard::kPinnedUntilAck, StoreSourceGuard::kStreamOrdered}) {
         SCOPED_TRACE(static_cast<int>(guard));
         BlockPool pool(2, {1});
         BlockPool host_pool(2, {1});
-        const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
+        const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 0}};
         auto coordinator =
             MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr, true);
         TierTransferManager transfers(coordinator);
         const std::vector<std::string> hashes{"state2"};
         const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
-        std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
+        std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0), pool.AcquireBlock(0)}, 0)};
         CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, CacheBoundaryKind::kChunk, true,
-                                    std::array{2});
+                                    /*publish_state=*/false);
         EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
-        coordinator.QueueLatestSnapshotBlocksForStore(hashes);
         EXPECT_FALSE(transfers.StartPendingStores(guard));
         CacheCompletedBlocksForTest(coordinator, tables, hashes, 2, 0, 2, CacheBoundaryKind::kEndpoint, true,
-                                    std::array{2});
+                                    /*publish_state=*/true);
+        EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
+        EXPECT_EQ(coordinator.GroupPrefixIndex(0).Find(pool, key), tables[0].Blocks()[1]) << "slot 1 is the checkpoint";
         const auto store = transfers.StartPendingStores(guard);
         ASSERT_TRUE(store);
         ASSERT_EQ(store->transfers.size(), 1u);
@@ -605,10 +611,10 @@ TEST(CacheOperationTest, ComputedStateChunkDoesNotQueueAStoreButEndpointUsesNorm
     }
 }
 
-TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorkingRelease) {
+TEST(CacheOperationTest, HostRestoredStateCheckpointRemainsCachedAfterLoadAckAndWorkingRelease) {
     BlockPool pool(1, {1});
     BlockPool host_pool(1, {1});
-    const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 2}};
+    const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 0}};
     auto coordinator =
         MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr, false);
     TierTransferManager transfers(coordinator);
@@ -617,9 +623,10 @@ TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorki
     CacheBlockRef source = coordinator.AcquireHostBlock(0, /*bucket=*/0);
     ASSERT_TRUE(source);
     coordinator.CacheHostBlock(source, key);
-    std::vector<BlockTable> tables{BlockTable::FromBlocks({pool.AcquireBlock(0)}, 0)};
-    const auto location = tables[0].Blocks()[0]->Location();
-    coordinator.CacheFullBlocks(tables, hashes, 1, 0, CacheBoundaryKind::kChunk);
+    CacheBlockRef destination = pool.AcquireBlock(0);
+    const auto location = destination->Location();
+    coordinator.CacheDeviceBlock(destination, key, /*logical_block_index=*/-1, CacheBoundaryKind::kEndpoint);
+    std::vector<BlockTable> tables{BlockTable::FromBlocks({std::move(destination)}, 0)};
     std::vector<BlockTransfer> pairs;
     pairs.push_back(BlockTransfer{.source = std::move(source), .destination = tables[0].Blocks()[0]});
     const auto load = transfers.StartPrefixLoad(std::move(pairs));
@@ -631,7 +638,7 @@ TEST(CacheOperationTest, HostRestoredStateChunkRemainsCachedAfterLoadAckAndWorki
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
     const auto metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
     ASSERT_TRUE(metadata);
-    EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kChunk);
+    EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kEndpoint);
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 2);
     EXPECT_TRUE(coordinator.ClearDeviceCache());
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);

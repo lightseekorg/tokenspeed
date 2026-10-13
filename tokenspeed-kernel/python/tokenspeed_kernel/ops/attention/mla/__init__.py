@@ -139,7 +139,8 @@ def mla_project_value(
 
     The headwise projection accumulates in FP32 and is materialized in the
     input dtype before the optional gate, preserving the unfused numerical
-    boundary.
+    boundary. The caller supplies attention in the prepared weight
+    dtype/device; the loader establishes weight geometry once.
 
     Args:
         attention: Absorbed values shaped ``[batch, heads, latent_dim]``.
@@ -153,28 +154,27 @@ def mla_project_value(
     Returns:
         Projected values shaped ``[batch, heads * value_dim]``.
     """
-    if attention.ndim != 3 or attention.shape[0] < 1:
+    # Weight geometry is fixed by the loader; only activation rows vary.
+    heads, latent_dim, value_dim = weight.shape
+    if (
+        attention.ndim != 3
+        or attention.shape[0] < 1
+        or attention.shape[1:] != (heads, latent_dim)
+    ):
         raise ValueError("attention must have shape [batch, heads, latent_dim]")
-    if weight.ndim != 3 or weight.shape[:2] != attention.shape[1:]:
-        raise ValueError("weight must have shape [heads, latent_dim, value_dim]")
-    if attention.dtype != weight.dtype or attention.device != weight.device:
-        raise ValueError("attention and weight must match dtype and device")
 
-    batch, heads, latent_dim = attention.shape
-    value_dim = weight.shape[2]
+    batch = attention.shape[0]
     expected_output = (batch, heads * value_dim)
     if gate is not None and (
-        tuple(gate.shape) != expected_output
-        or gate.dtype != attention.dtype
-        or gate.device != attention.device
+        tuple(gate.shape) != expected_output or gate.dtype != attention.dtype
     ):
         raise ValueError(f"gate must match attention and have shape {expected_output}")
+
     if out is None:
         out = attention.new_empty(expected_output)
     elif (
         tuple(out.shape) != expected_output
         or out.dtype != attention.dtype
-        or out.device != attention.device
         or not out.is_contiguous()
     ):
         raise ValueError(f"out must be contiguous and have shape {expected_output}")
@@ -271,6 +271,49 @@ def mla_project_value(
     return out
 
 
+def validate_mla_query_projection(
+    query_norm_weight: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    projection_weight: torch.Tensor,
+    *,
+    eps: float,
+    qk_nope_head_dim: int | None,
+    qk_rope_head_dim: int | None,
+) -> None:
+    """Validate fixed MLA projection parameters during model/benchmark setup.
+
+    Call again if weights are replaced with a different shape, dtype, device,
+    or layout. The execution entry validates activations against these weights;
+    it does not repeat their structural checks on every forward. Pass both head
+    dimensions as None when the caller never prepares an absorbed query.
+    Otherwise, the model configuration supplies both positive dimensions.
+    """
+    if eps <= 0.0:
+        raise ValueError("eps must be positive")
+    if (
+        query_norm_weight.ndim != 1
+        or kv_norm_weight.ndim != 1
+        or projection_weight.ndim != 2
+        or projection_weight.shape[1] != query_norm_weight.numel()
+    ):
+        raise ValueError(
+            "MLA requires query/KV norm vectors and a projection weight "
+            "shaped [output_width, query_width]"
+        )
+    if any(
+        tensor.dtype != projection_weight.dtype
+        or tensor.device != projection_weight.device
+        or tensor.stride(-1) != 1
+        for tensor in (query_norm_weight, kv_norm_weight, projection_weight)
+    ):
+        raise ValueError("MLA weights must share dtype/device and unit inner stride")
+
+    if qk_nope_head_dim is None and qk_rope_head_dim is None:
+        return
+    if projection_weight.shape[0] % (qk_nope_head_dim + qk_rope_head_dim):
+        raise ValueError("MLA projection width must be divisible by the head width")
+
+
 def mla_normalize_project_query(
     query: torch.Tensor,
     kv: torch.Tensor,
@@ -285,121 +328,85 @@ def mla_normalize_project_query(
     override: str | None = None,
     solution: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Normalize MLA query/KV latents and project the normalized query.
+    """RMS-normalize Q/KV latents, then project Q; KV is updated in place.
 
-    The query normalization is materialized in its input dtype before the
-    projection. ``kv`` is normalized in place so callers can retain a view
-    into a larger latent-cache tensor.
+    Validate fixed weights, epsilon, and head geometry once with
+    ``validate_mla_query_projection`` during setup. The caller supplies query
+    and KV in the same dtype/device as the weights. Query normalization rounds
+    to the input dtype before the projection, including on the fused path.
 
     Args:
         query: Query latent shaped ``[tokens, query_width]``.
         kv: KV latent shaped ``[tokens, kv_width]``; modified in place.
         query_norm_weight: Query RMSNorm weight shaped ``[query_width]``.
         kv_norm_weight: KV RMSNorm weight shaped ``[kv_width]``.
-        projection_weight: Query projection weight shaped
-            ``[output_width, query_width]``.
-        eps: Positive RMSNorm epsilon.
-        prepare_absorbed_query: Whether to prepare the per-head query layout
-            consumed by MLA absorb decode when a compatible kernel is available.
-        qk_nope_head_dim: Per-head NoPE width required when preparing an
-            absorbed query.
-        qk_rope_head_dim: Per-head RoPE width required when preparing an
-            absorbed query.
+        projection_weight: Weight shaped ``[output_width, query_width]``.
+        eps: Positive RMSNorm epsilon validated at setup.
+        prepare_absorbed_query: Try a split output for the absorb decode BMM.
+        qk_nope_head_dim: Validated NoPE width, required for split output.
+        qk_rope_head_dim: Validated RoPE width, required for split output.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
     Returns:
-        A ``(query, absorbed_query)`` pair. ``query`` normally has shape
-        ``[tokens, output_width]`` and ``absorbed_query`` is ``None``. When an
-        absorbed destination is prepared, ``query`` instead has shape
-        ``[tokens, heads, qk_nope_head_dim]`` and ``absorbed_query`` has shape
-        ``[tokens, heads, kv_width + qk_rope_head_dim]``; only its RoPE tail is
-        populated because the absorb BMM owns the latent prefix.
+        Normally ``([tokens, output_width], None)``. A selected split kernel
+        returns ``([tokens, heads, nope], [tokens, heads, kv_width + rope])``.
+        Only the second tensor's RoPE tail is filled; the absorb BMM writes
+        its latent prefix. No matching split kernel falls back to flat output.
     """
-    if query.ndim != 2 or query.shape[0] < 1:
+    # Only activation contracts depend on the current forward.
+    if (
+        query.ndim != 2
+        or query.shape[0] < 1
+        or query.shape[1] != query_norm_weight.numel()
+    ):
         raise ValueError("query must have shape [tokens, query_width]")
     tokens, query_width = query.shape
-    if kv.ndim != 2 or kv.shape[0] != tokens:
-        raise ValueError("kv must have shape [tokens, kv_width]")
-    kv_width = kv.shape[1]
-    output_width = projection_weight.shape[0] if projection_weight.ndim == 2 else 0
-    expected = (
-        (query_norm_weight, (query_width,), "query_norm_weight"),
-        (kv_norm_weight, (kv_width,), "kv_norm_weight"),
-        (projection_weight, (output_width, query_width), "projection_weight"),
-    )
-    for tensor, shape, name in expected:
-        if tuple(tensor.shape) != shape:
-            raise ValueError(f"{name} must have shape {shape}")
-    for tensor, name in (
-        (kv, "kv"),
-        (query_norm_weight, "query_norm_weight"),
-        (kv_norm_weight, "kv_norm_weight"),
-        (projection_weight, "projection_weight"),
-    ):
-        if tensor.dtype != query.dtype or tensor.device != query.device:
-            raise ValueError(f"{name} must match query dtype and device")
-        if tensor.stride(-1) != 1:
-            raise ValueError(f"{name} must have unit inner stride")
-    if eps <= 0.0:
-        raise ValueError("eps must be positive")
 
-    num_heads = None
-    if prepare_absorbed_query:
-        if qk_nope_head_dim is None or qk_nope_head_dim <= 0:
-            raise ValueError(
-                "qk_nope_head_dim must be positive when preparing an absorbed query"
+    if kv.ndim != 2 or kv.shape != (tokens, kv_norm_weight.numel()):
+        raise ValueError("kv must have shape [tokens, kv_width]")
+
+    kv_width = kv.shape[1]
+    output_width = projection_weight.shape[0]
+    roles = {
+        "query": dense_tensor_format(query.dtype),
+        "kv": dense_tensor_format(kv.dtype),
+        "projection_weight": dense_tensor_format(projection_weight.dtype),
+        "out": dense_tensor_format(query.dtype),
+    }
+    traits = {
+        "num_tokens": tokens,
+        "query_width": query_width,
+        "kv_width": kv_width,
+        "output_width": output_width,
+        "inputs_contiguous": all(
+            tensor.is_contiguous()
+            for tensor in (
+                query,
+                kv,
+                query_norm_weight,
+                kv_norm_weight,
+                projection_weight,
             )
-        if qk_rope_head_dim is None or qk_rope_head_dim <= 0:
-            raise ValueError(
-                "qk_rope_head_dim must be positive when preparing an absorbed query"
-            )
-        head_width = qk_nope_head_dim + qk_rope_head_dim
-        if output_width % head_width != 0:
-            raise ValueError(
-                f"projection width {output_width} is not divisible by head width {head_width}"
-            )
-        num_heads = output_width // head_width
+        ),
+        "outputs_inner_contiguous": True,
+    }
 
     def select_for_layout(
-        *, prefix_width: int, tail_width: int, required: bool = False
+        prefix_width: int, tail_width: int, *, required: bool = False
     ):
-        tensor_roles = {
-            "query": dense_tensor_format(query.dtype),
-            "kv": dense_tensor_format(kv.dtype),
-            "projection_weight": dense_tensor_format(projection_weight.dtype),
-            "out": dense_tensor_format(query.dtype),
-        }
-        split_output = tail_width > 0
-        if split_output:
-            tensor_roles["tail_out"] = dense_tensor_format(query.dtype)
-        signature = format_signature(**tensor_roles)
-        traits = {
-            "num_tokens": tokens,
-            "query_width": query_width,
-            "kv_width": kv_width,
-            "output_width": output_width,
-            "output_prefix_width": prefix_width,
-            "output_tail_width": tail_width,
-            "inputs_contiguous": all(
-                tensor.is_contiguous()
-                for tensor in (
-                    query,
-                    kv,
-                    query_norm_weight,
-                    kv_norm_weight,
-                    projection_weight,
-                )
-            ),
-            "outputs_inner_contiguous": True,
-            "split_output": split_output,
-        }
+        layout_roles = {**roles, "tail_out": roles["out"]} if tail_width else roles
         try:
             return select_kernel(
                 "attention",
                 "mla_normalize_project_query",
-                signature,
-                traits=traits,
+                format_signature(**layout_roles),
+                traits={
+                    **traits,
+                    "output_prefix_width": prefix_width,
+                    "output_tail_width": tail_width,
+                    "split_output": tail_width > 0,
+                },
                 solution=solution,
                 override=override,
             )
@@ -408,57 +415,70 @@ def mla_normalize_project_query(
                 raise
             return None
 
+    # Select the layout before allocating it. Geometry was validated at setup;
+    # only the presence of the optional split arguments depends on this call.
     kernel = None
-    split_selected = False
-    if num_heads is not None:
-        assert qk_nope_head_dim is not None and qk_rope_head_dim is not None
+    absorbed_query = None
+    tail_out = None
+    if prepare_absorbed_query:
+        if qk_nope_head_dim is None or qk_rope_head_dim is None:
+            raise ValueError(
+                "preparing an absorbed query requires both head dimensions"
+            )
+
         kernel = select_for_layout(
-            prefix_width=qk_nope_head_dim,
-            tail_width=qk_rope_head_dim,
+            prefix_width=qk_nope_head_dim, tail_width=qk_rope_head_dim
         )
-        split_selected = kernel is not None
+        if kernel is not None:
+            heads = output_width // (qk_nope_head_dim + qk_rope_head_dim)
+            out = query.new_empty(tokens, heads, qk_nope_head_dim)
+            absorbed_query = query.new_empty(tokens, heads, kv_width + qk_rope_head_dim)
+            tail_out = absorbed_query[..., kv_width:]
+
     if kernel is None:
         kernel = select_for_layout(
             prefix_width=output_width,
             tail_width=0,
             required=override is not None or solution is not None,
         )
-
-    absorbed_query = None
-    tail_out = None
-    if split_selected:
-        assert num_heads is not None
-        assert qk_nope_head_dim is not None and qk_rope_head_dim is not None
-        out = query.new_empty(tokens, num_heads, qk_nope_head_dim)
-        absorbed_query = query.new_empty(tokens, num_heads, kv_width + qk_rope_head_dim)
-        tail_out = absorbed_query[..., kv_width:]
-    else:
         out = query.new_empty((tokens, output_width))
 
-    if kernel is not None:
-        shape_params = {
-            "num_tokens": tokens,
-            "query_width": query_width,
-            "kv_width": kv_width,
-            "output_width": output_width,
-        }
-        if override is None and solution is None:
-            autotune_bf16_gemm(query, projection_weight)
-        ShapeCapture.get().record(
-            "attention",
-            "mla_normalize_project_query",
-            kernel.name,
-            query.dtype,
-            shape_params,
+    if kernel is None:
+        _mla_normalize_project_query_fallback(
+            query,
+            kv,
+            query_norm_weight,
+            kv_norm_weight,
+            projection_weight,
+            eps=eps,
+            out=out,
         )
-        with kernel_scope(
-            "attention",
-            "mla_normalize_project_query",
-            query.dtype,
-            kernel_name=kernel.name,
-            **shape_params,
-        ):
-            output = kernel(
+        return out, None
+
+    shape_params = {
+        "num_tokens": tokens,
+        "query_width": query_width,
+        "kv_width": kv_width,
+        "output_width": output_width,
+    }
+    if override is None and solution is None:
+        autotune_bf16_gemm(query, projection_weight)
+    ShapeCapture.get().record(
+        "attention",
+        "mla_normalize_project_query",
+        kernel.name,
+        query.dtype,
+        shape_params,
+    )
+    with kernel_scope(
+        "attention",
+        "mla_normalize_project_query",
+        query.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return (
+            kernel(
                 query=query,
                 kv=kv,
                 query_norm_weight=query_norm_weight,
@@ -467,55 +487,23 @@ def mla_normalize_project_query(
                 eps=eps,
                 out=out,
                 tail_out=tail_out,
-            )
-            return output, absorbed_query
-
-    projection_out = out
-    if query.is_cuda and query.dtype == torch.bfloat16:
-        if current_platform().is_amd:
-            from tokenspeed_kernel.ops.layernorm.triton import (
-                rmsnorm_fused_parallel,
-            )
-        else:
-            from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
-
-        query_norm = torch.empty_like(query)
-        rmsnorm_fused_parallel(
-            input1=query,
-            weight1=query_norm_weight,
-            output1=query_norm,
-            input2=kv,
-            weight2=kv_norm_weight,
-            output2=kv,
-            eps=eps,
+            ),
+            absorbed_query,
         )
-        if current_platform().is_cdna5 and tokens > 1:
-            from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250
 
-            if (
-                _try_gluon_largem_gfx1250(
-                    query_norm,
-                    projection_weight,
-                    out=projection_out,
-                )
-                is None
-            ):
-                from tokenspeed_kernel.ops.gemm.triton_gemv import (
-                    decode_gemv,
-                    use_decode_gemv,
-                )
 
-                if use_decode_gemv(query_norm, projection_weight):
-                    decode_gemv(query_norm, projection_weight, out=projection_out)
-                else:
-                    from tokenspeed_kernel.ops.gemm import mm
-
-                    mm(query_norm, projection_weight, out=projection_out)
-        else:
-            from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
-            decode_gemv(query_norm, projection_weight, out=projection_out)
-    else:
+def _mla_normalize_project_query_fallback(
+    query: torch.Tensor,
+    kv: torch.Tensor,
+    query_norm_weight: torch.Tensor,
+    kv_norm_weight: torch.Tensor,
+    projection_weight: torch.Tensor,
+    *,
+    eps: float,
+    out: torch.Tensor,
+) -> None:
+    """Unfused RMSNorm + projection, preserving the intermediate dtype."""
+    if not (query.is_cuda and query.dtype == torch.bfloat16):
         query_fp32 = query.float()
         query_norm = query_fp32 * torch.rsqrt(
             query_fp32.square().mean(dim=-1, keepdim=True) + eps
@@ -526,8 +514,43 @@ def mla_normalize_project_query(
             kv_fp32.square().mean(dim=-1, keepdim=True) + eps
         )
         kv.copy_((kv_norm * kv_norm_weight.float()).to(kv.dtype))
-        torch.mm(query_norm, projection_weight.t(), out=projection_out)
-    return out, None
+        torch.mm(query_norm, projection_weight.t(), out=out)
+        return
+
+    platform = current_platform()
+    if platform.is_amd:
+        from tokenspeed_kernel.ops.layernorm.triton import rmsnorm_fused_parallel
+    else:
+        from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
+
+    query_norm = torch.empty_like(query)
+    rmsnorm_fused_parallel(
+        input1=query,
+        weight1=query_norm_weight,
+        output1=query_norm,
+        input2=kv,
+        weight2=kv_norm_weight,
+        output2=kv,
+        eps=eps,
+    )
+    if platform.is_cdna5 and query.shape[0] > 1:
+        from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250
+        from tokenspeed_kernel.ops.gemm.triton_gemv import use_decode_gemv
+
+        if (
+            _try_gluon_largem_gfx1250(query_norm, projection_weight, out=out)
+            is not None
+        ):
+            return
+        if not use_decode_gemv(query_norm, projection_weight):
+            from tokenspeed_kernel.ops.gemm import mm
+
+            mm(query_norm, projection_weight, out=out)
+            return
+
+    from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+    decode_gemv(query_norm, projection_weight, out=out)
 
 
 def mla_prefill_traits(
@@ -1045,51 +1068,34 @@ def mla_decode_with_kvcache(
     """
     if gate is not None and value_weight is None:
         raise ValueError("gate requires value_weight")
-    if window_left < -1:
-        raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
-    if noncausal_block_size <= 0:
+    if (
+        window_left < -1
+        or noncausal_block_size <= 0
+        or 0 <= window_left < noncausal_block_size - 1
+    ):
         raise ValueError(
-            f"noncausal_block_size must be positive, got {noncausal_block_size}"
-        )
-    if 0 <= window_left < noncausal_block_size - 1:
-        raise ValueError(
-            "window_left must cover the complete non-causal block; got "
+            "MLA decode requires window_left >= -1, a positive block size, "
+            "and a window covering the non-causal block; got "
             f"window_left={window_left}, block_size={noncausal_block_size}"
         )
 
     projected_value = value_weight is not None
     if projected_value:
-        if q.ndim != 4:
-            raise ValueError(
-                "projected MLA decode requires q shape [batch,q_len,heads,dim]"
-            )
-        if value_weight.ndim != 3 or value_weight.shape[:2] != (
-            q.shape[2],
-            kv_lora_rank,
-        ):
-            raise ValueError(
-                "value_weight must have shape [heads,kv_lora_rank,value_head_dim]"
-            )
-        if out is None:
-            raise ValueError("projected MLA decode requires out")
+        if return_lse:
+            raise ValueError("projected MLA decode does not support return_lse")
+
         expected_output = (
             q.shape[0] * q.shape[1],
             q.shape[2] * value_weight.shape[2],
         )
-        if out.shape != expected_output:
-            raise ValueError(f"out must have shape {expected_output}")
-        if (
-            out.dtype != value_weight.dtype
-            or out.device != q.device
-            or not out.is_contiguous()
-        ):
+        if out is None or out.shape != expected_output:
             raise ValueError(
-                "out must match value_weight dtype and be contiguous and colocated with q"
+                f"projected MLA decode requires out with shape {expected_output}"
             )
+        if out.dtype != value_weight.dtype or not out.is_contiguous():
+            raise ValueError("out must match value_weight dtype and be contiguous")
         if gate is not None and gate.shape != expected_output:
             raise ValueError(f"gate must have shape {expected_output}")
-        if return_lse:
-            raise ValueError("projected MLA decode does not support return_lse")
 
     # The fused projected-value kernel serves only unwindowed single-query
     # decode. Otherwise compose latent decode with the standalone projection;
@@ -1288,6 +1294,7 @@ __all__ = [
     "mla_project_value_prefers_contiguous_weight",
     "mla_project_value",
     "mla_normalize_project_query",
+    "validate_mla_query_projection",
     "mla_prefill",
     "mla_prefill_traits",
     "mla_use_absorbed_extend",
