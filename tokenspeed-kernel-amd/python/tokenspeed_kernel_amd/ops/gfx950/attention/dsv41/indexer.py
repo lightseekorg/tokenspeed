@@ -575,6 +575,16 @@ def gluon_dsv41_index_topk_select_gfx950(
     if HAS_LIMITS:
         # Columns at or past the row's live width are -inf: skip them.
         width = gl.minimum(width, gl.maximum(gl.load(row_limits + q).to(gl.int32), 0))
+    if HAS_CANDIDATES:
+        # Columns past the last listed candidate block are -inf: skip them.
+        last = -1
+        for b0 in range(0, (width + 7) // 8, BLOCK):
+            b = b0 + gl.arange(0, BLOCK, layout=L)
+            ids = gl.load(
+                candidates + q * cand_stride + b, mask=b < (width + 7) // 8, other=-1
+            )
+            last = gl.maximum(last, gl.max(gl.where(ids >= 0, b, -1), 0))
+        width = gl.minimum(width, (last + 1) * 8)
     hist_smem = gl.allocate_shared_memory(gl.int32, [BINS], SL)
     ones = gl.full([BLOCK], 1, gl.int32, layout=L)
     d = gl.arange(0, BINS, layout=LBIN)
