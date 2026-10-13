@@ -195,6 +195,7 @@ class TestNumericsMode(unittest.TestCase):
 
     def test_ordered_fold_matches_the_sum_and_only_depends_on_rank_order(self):
         import torch
+
         from tokenspeed.runtime.distributed.comm_backend.auto import ordered_fold_sum
 
         torch.manual_seed(7)
@@ -216,6 +217,7 @@ class TestNumericsMode(unittest.TestCase):
         from unittest import mock
 
         import torch
+
         from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
 
         group = (0, 1, 2)
@@ -353,6 +355,7 @@ class TestModelVerificationGate(unittest.TestCase):
 class TestCanonicalGreedyTies(unittest.TestCase):
     def test_sampled_greedy_rows_take_the_lowest_tied_id(self):
         import torch
+
         from tokenspeed.runtime.sampling.backends.flashinfer import (
             canonical_greedy_tokens,
         )
@@ -368,6 +371,7 @@ class TestCanonicalGreedyTies(unittest.TestCase):
 
     def test_verified_greedy_rows_follow_the_exact_match_chain(self):
         import torch
+
         from tokenspeed.runtime.sampling.backends.flashinfer import (
             canonical_greedy_verify,
         )

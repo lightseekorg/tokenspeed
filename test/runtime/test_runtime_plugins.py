@@ -34,6 +34,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import PretrainedConfig
+
 from tokenspeed.runtime import plugins
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
@@ -46,7 +48,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes import setup as recipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.plugins import registry
 from tokenspeed.runtime.utils import hf_transformers_utils
-from transformers import PretrainedConfig
 
 
 def _profile(**overrides) -> ModelProfile:
