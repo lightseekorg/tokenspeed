@@ -43,10 +43,17 @@ concurrently with unit tests. Matrix entries within
 each stage run in parallel. The workflow treats a stage with no matching tasks
 as successfully satisfied.
 
-`ut-tokenspeed-kernel-part-i` runs tests outside `tokenspeed-kernel/test/ops/`,
-keeping the numerics, TRT-LLM communication and CUDA suites in separate processes.
-`ut-tokenspeed-kernel-part-ii` runs `tokenspeed-kernel/test/ops/`. Together the
-two tasks cover the kernel suite once.
+On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
+`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication and
+CUDA suites in separate processes. `ut-tokenspeed-kernel-part-ii` runs
+`tokenspeed-kernel/test/ops/`. Together the two tasks cover the kernel suite
+once. AMD runners run the same commands in the single `ut-tokenspeed-kernel`
+task.
+
+Conversely, AMD runners split the `runtime-1gpu` suite across
+`ut-runtime-1gpu-part-i` and `ut-runtime-1gpu-part-ii`, which balance test files
+by their registered `est_time` (`run_ci_suite.py --auto-partition-*`). Other
+runners run the whole suite in `ut-runtime-1gpu`.
 
 PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
 Applying the label starts a new CI run immediately and cancels the older run

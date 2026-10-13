@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "qwen38_flash_tp2"
+  },
+  "cases": [
+    {
+      "id": "qwen38_flash.residual.hyperconnection_mix/decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "residual",
+        "mode": "hyperconnection_mix",
+        "parameters": {
+          "tokens": [
+            16,
+            64
+          ],
+          "inject": [
+            true,
+            false
+          ],
+          "hc_count": 4,
+          "hidden_size": 2560,
+          "lowrank": 320,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5105
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.residual.hyperconnection_mix/prefill-bfloat16",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "residual",
+        "mode": "hyperconnection_mix",
+        "parameters": {
+          "tokens": [
+            8192
+          ],
+          "inject": true,
+          "hc_count": 4,
+          "hidden_size": 2560,
+          "lowrank": 320,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5106
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0
+      }
+    }
+  ]
+}

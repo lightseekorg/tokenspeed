@@ -42,6 +42,14 @@ _VIT_DIMS = {
     "vit_huge_patch16_224": (1280, 32, 16, 5120),
 }
 
+# RADIO ``args`` layer settings the encoder implements; a checkpoint may only repeat these values.
+_RADIO_FIXED_ARGS = {
+    "hidden_act": "gelu",
+    "qkv_bias": True,
+    "qk_normalization": False,
+    "norm_type": "layer_norm",
+}
+
 
 class RadioVisionConfig(PretrainedConfig):
     """C-RADIO ViT geometry, read from the checkpoint's RADIO ``args``."""
@@ -58,6 +66,12 @@ class RadioVisionConfig(PretrainedConfig):
         **kwargs: Any,
     ) -> None:
         self.args = dict(args or {})
+        for name, value in _RADIO_FIXED_ARGS.items():
+            if self.args.get(name, value) != value:
+                raise ValueError(
+                    f"C-RADIO args.{name}={self.args[name]!r} is not supported; "
+                    f"the encoder implements {value!r}"
+                )
         self.patch_size = patch_size
         self.video_temporal_patch_size = video_temporal_patch_size
         self.separate_video_embedder = separate_video_embedder
@@ -111,6 +125,11 @@ class RadioVisionConfig(PretrainedConfig):
     def final_norm(self) -> bool:
         return self.args["model_norm"]
 
+    @property
+    def layer_norm_eps(self) -> float:
+        """LayerNorm epsilon of the blocks and the final norm; RADIO's 1e-6 unless ``args`` sets it."""
+        return self.args.get("layer_norm_eps", 1e-6)
+
 
 class ParakeetAudioConfig(PretrainedConfig):
     """Parakeet (FastConformer) encoder and its projector into the language model."""
@@ -136,8 +155,13 @@ class ParakeetAudioConfig(PretrainedConfig):
         projection_bias: bool = False,
         projection_eps: float = 1e-5,
         sampling_rate: int = 16000,
+        hidden_act: str = "silu",
         **kwargs: Any,
     ) -> None:
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Parakeet hidden_act {hidden_act!r} is not supported; the encoder implements silu"
+            )
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
@@ -154,7 +178,29 @@ class ParakeetAudioConfig(PretrainedConfig):
         self.projection_bias = projection_bias
         self.projection_eps = projection_eps
         self.sampling_rate = sampling_rate
+        self.hidden_act = hidden_act
         super().__init__(**kwargs)
+
+
+# The sound_config fields that shape the Parakeet encoder and its projector. The ref
+# engine requires the projector's and fills the encoder's from transformers' defaults,
+# which differ from this checkpoint family's, so a checkpoint must state every one.
+_PARAKEET_ARCHITECTURE_FIELDS = (
+    "hidden_size",
+    "num_attention_heads",
+    "num_hidden_layers",
+    "intermediate_size",
+    "conv_kernel_size",
+    "convolution_bias",
+    "subsampling_conv_channels",
+    "subsampling_conv_kernel_size",
+    "subsampling_conv_stride",
+    "subsampling_factor",
+    "num_mel_bins",
+    "projection_hidden_size",
+    "projection_bias",
+    "sampling_rate",
+)
 
 
 class NemotronHOmniConfig(PretrainedConfig):
@@ -189,11 +235,14 @@ class NemotronHOmniConfig(PretrainedConfig):
             if isinstance(vision_config, RadioVisionConfig)
             else RadioVisionConfig(**(vision_config or {}))
         )
-        self.sound_config = (
-            sound_config
-            if sound_config is None or isinstance(sound_config, ParakeetAudioConfig)
-            else ParakeetAudioConfig(**sound_config)
-        )
+        if isinstance(sound_config, dict):
+            missing = [
+                f for f in _PARAKEET_ARCHITECTURE_FIELDS if f not in sound_config
+            ]
+            if missing:
+                raise ValueError(f"Nemotron-H Omni sound_config lacks {missing}")
+            sound_config = ParakeetAudioConfig(**sound_config)
+        self.sound_config = sound_config
         self.image_token_id = img_context_token_id
         # Video tubelets embed on the image placeholder; the checkpoint's video id is unused.
         self.video_token_id = img_context_token_id

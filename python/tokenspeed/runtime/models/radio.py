@@ -63,7 +63,7 @@ class RadioBlock(nn.Module):
     ) -> None:
         super().__init__()
         hidden_size = config.hidden_size
-        self.norm1 = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.norm1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
         self.attn = VisionAttention(
             embed_dim=hidden_size,
             num_heads=config.num_attention_heads,
@@ -73,7 +73,7 @@ class RadioBlock(nn.Module):
             prefix=f"{prefix}.attn",
             mm_attention_backend=mm_attention_backend,
         )
-        self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.norm2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
         self.mlp = RadioMLP(hidden_size, config.intermediate_size)
 
     def forward(
@@ -97,6 +97,10 @@ class RadioVisionModel(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
+        if mm_attention_backend == "flashinfer_cudnn":
+            raise NotImplementedError(
+                "C-RADIO with the flashinfer_cudnn encoder attention backend"
+            )
         if config.video_temporal_patch_size < 2 or not config.separate_video_embedder:
             raise NotImplementedError(
                 "C-RADIO video without a separate tubelet embedder"
@@ -120,7 +124,11 @@ class RadioVisionModel(nn.Module):
             RadioBlock(config, mapping, f"{prefix}.blocks.{i}", mm_attention_backend)
             for i in range(config.num_hidden_layers)
         )
-        self.norm = nn.LayerNorm(hidden_size, eps=1e-6) if config.final_norm else None
+        self.norm = (
+            nn.LayerNorm(hidden_size, eps=config.layer_norm_eps)
+            if config.final_norm
+            else None
+        )
 
     @property
     def dtype(self) -> torch.dtype:
