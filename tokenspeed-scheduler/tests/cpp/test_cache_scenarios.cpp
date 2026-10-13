@@ -1275,7 +1275,8 @@ TEST_F(ConsumedHeadroomRetractionSuite, ConsumedPartialHeadroomDoesNotDisableRet
     SendForwardDone("b", {43});
 
     const std::vector<std::int32_t> decode_result(1024, 7);
-    for (std::int32_t round = 0; round < 4; ++round) {
+    // Each decode also holds the next 1024-token verify window, so three rounds fill the headroom block.
+    for (std::int32_t round = 0; round < 3; ++round) {
         const ExecutionPlan decode_plan = PlanOnce();
         const ForwardBatch* decode = FindForwardBatch(decode_plan);
         ASSERT_NE(decode, nullptr) << "decode round " << round;
@@ -1299,8 +1300,8 @@ TEST_F(ConsumedHeadroomRetractionSuite, ConsumedPartialHeadroomDoesNotDisableRet
     AckImageStores(blocked_plan);
     SendForwardDone("b", decode_result);
     SendFinish("b");
-    // "a" is restored -- its 4097 computed tokens come back by copy, not by a
-    // 4097-token prefill -- and resumes decoding.
+    // "a" is restored -- its computed tokens come back by copy, not by a
+    // prefill -- and resumes decoding.
     const ExecutionPlan readmit_plan = PlanOnce();
     ASSERT_TRUE(FindForwardBatch(readmit_plan)->request_ids.empty());
     const SnapshotRestoreBatch* restore = FindRestore(readmit_plan);
