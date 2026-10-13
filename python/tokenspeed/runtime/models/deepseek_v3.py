@@ -123,6 +123,8 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
+from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import (
     LazyValue,
@@ -1866,6 +1868,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         residual: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
 
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
@@ -1881,6 +1884,10 @@ class DeepseekV3DecoderLayer(nn.Module):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
             )
+            # No rows, but the tap and its gather stay aligned across ranks.
+            capture_layer_input(
+                self.comm_manager, hidden_states, ctx, aux_hidden_states
+            )
             hidden_states = self.forward_mlp(
                 hidden_states,
                 residual,
@@ -1893,6 +1900,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states, residual = self.comm_manager.input_reduce_norm(
             hidden_states, residual
         )
+        capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -2003,27 +2011,22 @@ class DeepseekV3Model(nn.Module):
         residual = None
         aux_hidden_states = [] if self.layers_to_capture else None
         for i in range(len(self.layers)):
-            if aux_hidden_states is not None and i in self.layers_to_capture:
-                # Under RSAG the inter-layer hidden/residual are reduce-
-                # scattered across the attn TP group; aux consumers (e.g. the
-                # EAGLE3 drafter) expect full rows, so gather before capturing.
-                aux = (
-                    hidden_states + residual if residual is not None else hidden_states
-                )
-                gathered = self.layers[i].comm_manager.gather_residual(aux, ctx)
-                capture_idx = self._dflash_capture_idx_map.get(i)
-                if ctx.target_capture_sink is not None and capture_idx is not None:
-                    ctx.target_capture_sink.on_target_capture(capture_idx, gathered)
-                aux_hidden_states.append(
-                    gathered if gathered is aux else gathered.clone()
-                )
             layer = self.layers[i]
+            capture = i in self.layers_to_capture
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 ctx,
                 residual,
+                aux_hidden_states=aux_hidden_states if capture else None,
             )
+            if capture and ctx.target_capture_sink is not None:
+                notify_target_capture(
+                    ctx.target_capture_sink,
+                    self._dflash_capture_idx_map,
+                    i,
+                    aux_hidden_states,
+                )
         if not ctx.forward_mode.is_idle():
             hidden_states, _ = layer.comm_manager.final_norm(
                 hidden_states, residual, ctx, self.norm
@@ -2080,8 +2083,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         return self._routed_experts_weights_of_layer.value
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
-        # layer_ids are 0-indexed from the external API; +1 because the capture
-        # check runs *before* the layer forward, so index i captures layer i-1's output.
+        # layer_ids are 0-indexed from the external API; +1 because a layer
+        # captures the residual entering it, so index i captures layer i-1's output.
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = {2, num_layers // 2, num_layers - 3}
@@ -2089,8 +2092,8 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
-        # DFlash checkpoints name 0-indexed target layer outputs. The capture
-        # check runs before layer i, so capture at i + 1 for layer i's output.
+        # DFlash checkpoints name 0-indexed target layer outputs. A layer
+        # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")

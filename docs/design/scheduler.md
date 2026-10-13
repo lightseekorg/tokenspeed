@@ -650,6 +650,9 @@ phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
    arrives. Head-of-line (1.1) does not apply — there is no mid-way. A restore
    that failed for capacity in phase 1 **seals** this phase: a newcomer taking
    the pages it waits for would starve it.
+   Remote admission therefore bypasses local prefill chunking and prefix
+   promotion boundaries; the destination tables must cover the entire
+   unmatched suffix advertised by the transfer manifest.
 4. `maybeRetractForCapacity` (§2), whose grant also rides beside the batch
    (a remote admission) or joins it (a blocked decode).
 

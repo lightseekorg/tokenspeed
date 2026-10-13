@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     DeepseekV3DecoderLayer,
@@ -1188,6 +1189,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         residual: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
@@ -1197,6 +1199,7 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
             hidden_states, residual = self.comm_manager.input_reduce_norm(
                 hidden_states, residual
             )
+            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1216,6 +1219,10 @@ class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
                 max_num_tokens_per_gpu,
             )
         else:
+            # No rows, but the tap and its gather stay aligned across ranks.
+            capture_layer_input(
+                self.comm_manager, hidden_states, ctx, aux_hidden_states
+            )
             hidden_states = self.forward_mlp(
                 hidden_states,
                 residual,
@@ -1279,6 +1286,8 @@ class GlmMoeDsaModel(DeepseekV3Model):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture: set = set()
+        # DFLASH: each capture layer's positional tap index.
+        self._dflash_capture_idx_map: dict[int, int] = {}
 
 
 def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:
