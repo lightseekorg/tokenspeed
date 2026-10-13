@@ -324,14 +324,20 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                 (promotion_boundary_tokens % prefix_granularity == 0 && promotion_boundary_tokens > hit_tokens &&
                  promotion_boundary_tokens < request->PrefillSize()),
             "promotion boundary must be page-aligned and inside the unmatched prompt");
+    // Promotion alignment ends a chunk on a prefix page, so a chunk budget
+    // below one page could never reach the boundary and the request would
+    // wait forever. The boundary is a reuse opportunity, not an invariant
+    // (PrefillChunkTokens passes it inside the final window too): pass it.
+    const bool passes_promotion_boundary = config_.max_scheduled_tokens < prefix_granularity;
 
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     // A remote landing completes the prompt in one transfer. Local chunk
     // promotion must not truncate its window or drop the first decode reserve.
-    const std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
-                                               ? unscheduled
-                                               : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
-                                                                    unscheduled, remaining, promotion_boundary_tokens);
+    const std::int32_t tokens_this_round =
+        source == fsm::PrefillSource::kRemote
+            ? unscheduled
+            : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
+                                 passes_promotion_boundary ? 0 : promotion_boundary_tokens);
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
@@ -416,7 +422,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     fsm::CacheProgress cache_progress{
         .prefix_hashes = std::move(match.prefix_hashes),
         .access_epoch = admission->access_epoch,
-        .promotion_boundary_tokens = admission->promotion_boundary_tokens,
+        .promotion_boundary_tokens = passes_promotion_boundary ? 0 : admission->promotion_boundary_tokens,
     };
     recordPrefillStateCheckpoint(cache_progress, source, hit_tokens + tokens_this_round, prefix_granularity);
     return FirstChunkOutcome{.event = fsm::SchedulePrefillFirstChunkEvent{
