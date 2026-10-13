@@ -226,5 +226,4 @@ import tokenspeed_kernel.ops.attention.qsa.flashinfer  # noqa: E402,F401
 
 __all__ = [
     "qsa_sparse_attention",
-    "select_qsa_sparse_attention_kernel",
 ]

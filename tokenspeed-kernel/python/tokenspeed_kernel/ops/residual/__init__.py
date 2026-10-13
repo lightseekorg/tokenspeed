@@ -874,7 +874,6 @@ __all__ = [
     "gated_residual_combine",
     "gated_residual_mix",
     "mhc_apply_pre",
-    "select_gated_residual_mix_kernel",
     "mhc_fused_hc",
     "mhc_mixes",
     "mhc_post",
