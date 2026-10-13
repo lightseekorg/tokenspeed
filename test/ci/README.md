@@ -85,6 +85,10 @@ invalid TPOT fails collection instead of producing a zero-throughput report.
 Unavailable acceptance metrics appear as `N/A` (empty CSV cells). An aggregate
 is unavailable if any run for that prompt length lacks the metric.
 
+Model performance CSVs support `Throughput (tps/gpu)` and
+`Output Throughput (tok/min/gpu)`. The second value in each `perf_reference`
+pair uses the throughput column's units and token-counting definition.
+
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
 jobs in include-list order, so `high` entries reach a contended runner pool
