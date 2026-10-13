@@ -33,10 +33,13 @@ from tokenspeed_kernel.ops.attention.dsa.cuda import (
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     triton_topk_from_logits,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _is_nvidia = current_platform().is_nvidia
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
+LOG2E = math.log2(math.e)
 
 
 @triton.jit
@@ -2163,10 +2166,282 @@ def qwen4_exp_qsa_selected_slots(
     return output
 
 
+# ===-----------------------------------------------------------------------===#
+# Sparse attention over selected slots
+# ===-----------------------------------------------------------------------===#
+
+# Selected slots attended per inner-loop step.
+_SPARSE_BLOCK_N = 32
+# Target number of (row, kv_head, split) programs. Small decode batches split
+# each row's selected slots across programs and merge the partials afterwards.
+_SPARSE_TARGET_PROGRAMS = 512
+_SPARSE_MAX_SPLITS = 16
+
+
+@triton.jit
+def _triton_qsa_sparse_attention_kernel(
+    q,
+    k_cache,
+    v_cache,
+    selected_slots,
+    output,
+    partial_out,
+    partial_lse,
+    scale_log2,
+    k_scale,
+    v_scale,
+    width,
+    split_len,
+    num_splits,
+    stride_q_n,
+    stride_q_h,
+    stride_k_n,
+    stride_k_h,
+    stride_v_n,
+    stride_v_h,
+    stride_s_n,
+    stride_o_n,
+    stride_o_h,
+    GROUP: tl.constexpr,
+    GROUP_PAD: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLIT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split = tl.program_id(2)
+
+    heads = tl.arange(0, GROUP_PAD)
+    head_mask = heads < GROUP
+    q_heads = kv_head * GROUP + heads
+    d = tl.arange(0, HEAD_DIM)
+    dv = tl.arange(0, VALUE_DIM)
+    q_tile = tl.load(
+        q + row * stride_q_n + q_heads[:, None] * stride_q_h + d[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.full([GROUP_PAD], float("-inf"), tl.float32)
+    l_i = tl.zeros([GROUP_PAD], tl.float32)
+    acc = tl.zeros([GROUP_PAD, VALUE_DIM], tl.float32)
+    start = split * split_len
+    end = tl.minimum(start + split_len, width)
+    for block_start in range(start, end, BLOCK_N):
+        cols = block_start + tl.arange(0, BLOCK_N)
+        slots = tl.load(
+            selected_slots + row * stride_s_n + cols, mask=cols < end, other=-1
+        ).to(tl.int64)
+        valid = slots > 0
+        # Slot 0 may hold NaN padding; slot 1 is the finite masked-read target.
+        slots = tl.where(valid, slots, 1)
+        keys = tl.load(
+            k_cache + slots[:, None] * stride_k_n + kv_head * stride_k_h + d[None, :]
+        ).to(q_tile.dtype)
+        scores = tl.dot(q_tile, tl.trans(keys)) * (scale_log2 * k_scale)
+        scores = tl.where(valid[None, :], scores, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        # Rows with no valid slot so far keep m = -inf; avoid -inf - -inf.
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p = tl.exp2(scores - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        values = tl.load(
+            v_cache + slots[:, None] * stride_v_n + kv_head * stride_v_h + dv[None, :]
+        ).to(q_tile.dtype)
+        acc = acc * alpha[:, None] + tl.dot(p.to(q_tile.dtype), values)
+        m_i = m_new
+
+    # Rows without any valid slot produce zeros.
+    out = acc * (v_scale / tl.where(l_i > 0, l_i, 1.0))[:, None]
+    if SPLIT:
+        part = (row * GROUP * tl.num_programs(1) + q_heads) * num_splits + split
+        tl.store(
+            partial_out + part[:, None] * VALUE_DIM + dv[None, :],
+            out,
+            mask=head_mask[:, None],
+        )
+        # Base-2 log-sum-exp; -inf marks a split without valid slots.
+        lse = tl.where(l_i > 0, m_i + tl.log2(l_i), float("-inf"))
+        tl.store(partial_lse + part, lse, mask=head_mask)
+    else:
+        tl.store(
+            output + row * stride_o_n + q_heads[:, None] * stride_o_h + dv[None, :],
+            out.to(output.dtype.element_ty),
+            mask=head_mask[:, None],
+        )
+
+
+@triton.jit
+def _triton_qsa_sparse_attention_merge_kernel(
+    partial_out,
+    partial_lse,
+    output,
+    num_splits,
+    stride_o_n,
+    stride_o_h,
+    NUM_HEADS: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    dv = tl.arange(0, VALUE_DIM)
+    base = (row * NUM_HEADS + head) * num_splits
+    lse_max = float("-inf")
+    for split in range(num_splits):
+        lse_max = tl.maximum(lse_max, tl.load(partial_lse + base + split))
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    total = 0.0
+    acc = tl.zeros([VALUE_DIM], tl.float32)
+    for split in range(num_splits):
+        # Splits without valid slots carry lse = -inf and weigh zero.
+        weight = tl.exp2(tl.load(partial_lse + base + split) - lse_max)
+        total += weight
+        acc += weight * tl.load(partial_out + (base + split) * VALUE_DIM + dv)
+    acc = acc / tl.where(total > 0, total, 1.0)
+    tl.store(
+        output + row * stride_o_n + head * stride_o_h + dv,
+        acc.to(output.dtype.element_ty),
+    )
+
+
+def _scalar_descale(scale: float | torch.Tensor | None, name: str) -> float:
+    if scale is None:
+        return 1.0
+    if isinstance(scale, torch.Tensor):
+        raise TypeError(f"Triton QSA sparse attention expects a float {name}")
+    return float(scale)
+
+
+def triton_qsa_sparse_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    *,
+    scale: float,
+    max_seqlen_q: int,
+    metadata_capacity_rows: int | None,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
+) -> torch.Tensor:
+    """Portable QSA sparse attention; see ``qsa_sparse_attention``.
+
+    Every query row attends independently to its own selected slots, so
+    ``max_seqlen_q`` does not change the computation, and this kernel keeps no
+    metadata workspace sized by ``metadata_capacity_rows``.
+    """
+
+    del max_seqlen_q, metadata_capacity_rows
+    rows, num_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[1]
+    value_dim = v_cache.shape[-1]
+    width = selected_slots.shape[1]
+    if num_heads % num_kv_heads:
+        raise ValueError("QSA query heads must be a multiple of KV heads")
+    if q.stride(-1) != 1 or k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1:
+        raise ValueError("QSA Q/K/V head dimensions must be contiguous")
+    if selected_slots.stride(-1) != 1:
+        raise ValueError("QSA selected slots must be contiguous per row")
+    group = num_heads // num_kv_heads
+    output = q.new_empty((rows, num_heads, value_dim))
+
+    programs = rows * num_kv_heads
+    max_splits = min(_SPARSE_MAX_SPLITS, triton.cdiv(width, _SPARSE_BLOCK_N))
+    num_splits = max(1, min(max_splits, triton.cdiv(_SPARSE_TARGET_PROGRAMS, programs)))
+    split_len = triton.cdiv(triton.cdiv(width, num_splits), _SPARSE_BLOCK_N)
+    split_len *= _SPARSE_BLOCK_N
+    num_splits = triton.cdiv(width, split_len)
+    use_split = num_splits > 1
+    if use_split:
+        partial_out = torch.empty(
+            (rows, num_heads, num_splits, value_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        partial_lse = torch.empty(
+            (rows, num_heads, num_splits), dtype=torch.float32, device=q.device
+        )
+    else:
+        partial_out = partial_lse = output
+    _triton_qsa_sparse_attention_kernel[(rows, num_kv_heads, num_splits)](
+        q,
+        k_cache,
+        v_cache,
+        selected_slots,
+        output,
+        partial_out,
+        partial_lse,
+        scale * LOG2E,
+        _scalar_descale(k_scale, "k_scale"),
+        _scalar_descale(v_scale, "v_scale"),
+        width,
+        split_len,
+        num_splits,
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        selected_slots.stride(0),
+        output.stride(0),
+        output.stride(1),
+        GROUP=group,
+        GROUP_PAD=max(16, triton.next_power_of_2(group)),
+        HEAD_DIM=head_dim,
+        VALUE_DIM=value_dim,
+        BLOCK_N=_SPARSE_BLOCK_N,
+        SPLIT=use_split,
+        num_warps=4,
+        num_stages=1,
+    )
+    if use_split:
+        _triton_qsa_sparse_attention_merge_kernel[(rows, num_heads)](
+            partial_out,
+            partial_lse,
+            output,
+            num_splits,
+            output.stride(0),
+            output.stride(1),
+            NUM_HEADS=num_heads,
+            VALUE_DIM=value_dim,
+            num_warps=1,
+        )
+    return output
+
+
+register_kernel(
+    "attention",
+    "qsa_sparse_attention",
+    name="triton_qsa_sparse_attention",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                k_cache=dense_tensor_format(cache_dtype),
+                v_cache=dense_tensor_format(cache_dtype),
+            )
+            for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        }
+    ),
+    traits={
+        "head_dim": frozenset({64, 128, 256}),
+        "value_head_dim": frozenset({64, 128, 256}),
+    },
+    priority=Priority.PORTABLE,
+)(triton_qsa_sparse_attention)
+
+
 __all__ = [
     "qwen4_exp_qsa_block_topk",
     "qwen4_exp_qsa_compress_and_store",
     "qwen4_exp_qsa_prepare_metadata",
     "qwen4_exp_qsa_recent_write",
     "qwen4_exp_qsa_selected_slots",
+    "triton_qsa_sparse_attention",
 ]

@@ -713,3 +713,18 @@ def test_triton_fp8_scaled_mm_per_channel_matches_reference(
     expected = (a.float() * a_scales) @ (b.float() * b_scales).t()
     # FP32 accumulation, then BF16 output rounding.
     torch.testing.assert_close(out.float(), expected, rtol=2**-8, atol=5e-4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_grouped_bf16_projection_torch_writes_contiguous_einsum_result():
+    from tokenspeed_kernel.numerics.reference.gemm import (
+        grouped_bf16_projection_torch,
+    )
+
+    # Strided token rows from padded attention heads, as V4.1 wo_a reads them.
+    rows = torch.randn(37, 3 * 2 * 256, device="cuda").bfloat16()
+    x = rows[:, : 2 * 256].unflatten(1, (2, 256))
+    weight = torch.randn(2, 128, 256, device="cuda").bfloat16()
+    out = grouped_bf16_projection_torch(x, weight, None)
+    assert out.is_contiguous()
+    assert torch.equal(out, torch.einsum("tgd,grd->tgr", x, weight))

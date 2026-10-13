@@ -5,7 +5,8 @@
 
 Current trigger values:
 
-- `per-commit`
+- `per-commit`: pull requests and pushes to `main`
+- `post-submit`: pushes to `main` only
 - `manual`
 - `nightly`
 - `debug`
@@ -66,6 +67,10 @@ The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
 tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
 of at least 0.96.
+
+The AMD variant runs the AMD Quark MXFP4 checkpoint the same way on two MI35x
+GPUs. Its MTP layer is BF16 in the checkpoint, so the draft model runs
+unquantized.
 
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or

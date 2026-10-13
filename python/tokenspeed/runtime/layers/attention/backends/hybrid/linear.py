@@ -98,6 +98,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     def forward_extend_chunked(self, *args, **kwargs):
         return self.full_attn_backend.forward_extend_chunked(*args, **kwargs)
 
+    def read_prefix_history(self, *args, **kwargs):
+        return self.full_attn_backend.read_prefix_history(*args, **kwargs)
+
     # Composite: the full-attention child owns the per-request decode lengths
     # the draft reads, so every drafter length-edit hook reaches it (the
     # linear child's state follows the committed position, not seq_lens).
