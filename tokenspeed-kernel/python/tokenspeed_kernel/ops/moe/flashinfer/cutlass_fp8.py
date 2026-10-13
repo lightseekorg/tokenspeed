@@ -89,7 +89,10 @@ if platform.is_nvidia:
         weight_preprocessor=flashinfer_cutlass_fp8_moe_weights,
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
+            # FlashInfer compiles DeepSeek FP8 block scaling into its SM90
+            # CUTLASS MoE module only and refuses it on other archs.
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
         ),
         signatures=format_signatures(
             "x",
