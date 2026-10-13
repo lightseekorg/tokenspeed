@@ -1760,10 +1760,20 @@ def test_kvp_pd_copies_logical_history_between_independently_allocated_pages(
         destination_tables
     )
     src_manifest = build_cache_block_manifest(
-        source_op, layout=source, request_row=0, prefix_len=2, prompt_len=9
+        source_op,
+        layout=source,
+        request_row=0,
+        prefix_len=2,
+        prompt_len=9,
+        state_prefix_cached=False,
     )
     dst_manifest = build_cache_block_manifest(
-        destination_op, layout=destination, request_row=0, prefix_len=2, prompt_len=9
+        destination_op,
+        layout=destination,
+        request_row=0,
+        prefix_len=2,
+        prompt_len=9,
+        state_prefix_cached=False,
     )
     validate_cache_manifest(src_manifest, layout=source, peer="source")
     validate_cache_manifest(dst_manifest, layout=destination, peer="destination")
@@ -1818,6 +1828,7 @@ def test_kvp_pd_copies_logical_history_between_independently_allocated_pages(
                         prompt_len=9,
                         chunk_start=chunk[0],
                         chunk_end=chunk[1],
+                        state_prefix_cached=False,
                     )
                 )
                 copies = manager._cache_transfer_blocks(
@@ -1901,6 +1912,7 @@ def test_kvp_pd_manifest_preserves_virtual_ids_and_checks_virtual_bounds():
         request_row=0,
         prefix_len=0,
         prompt_len=1,
+        state_prefix_cached=False,
     )
     validate_cache_manifest(manifest, layout=restored, peer="decode")
     assert manifest.groups[0].block_ids[0] >= restored.plan.group("kv").page_count
@@ -1912,6 +1924,7 @@ def test_kvp_pd_manifest_preserves_virtual_ids_and_checks_virtual_bounds():
             request_row=0,
             prefix_len=0,
             prompt_len=1,
+            state_prefix_cached=False,
         )
 
 
