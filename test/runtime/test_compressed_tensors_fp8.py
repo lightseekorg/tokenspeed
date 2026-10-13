@@ -120,6 +120,10 @@ TENSOR_STATIC = _config(
         for name in ("weights", "input_activations")
     )
 )
+CHANNEL_STATIC = _config(
+    FP8_DYNAMIC["weights"],
+    preset_name_to_scheme("FP8", ["Linear"]).input_activations,
+)
 
 
 def _parse(raw):
@@ -750,11 +754,18 @@ def _mla_attention(config, q_lora_rank):
     )
 
 
-@pytest.mark.parametrize("q_lora_rank", [32, None], ids=["dsv3", "moonlight"])
 @pytest.mark.parametrize(
-    "raw",
-    [GLM_5_1_FP8_DYNAMIC, CHANNEL_DYNAMIC, TENSOR_STATIC],
-    ids=["glm-5.1-fp8-dynamic", "fp8-dynamic", "fp8-static"],
+    "raw,q_lora_rank",
+    [
+        pytest.param(GLM_5_1_FP8_DYNAMIC, 32, id="glm-5.1-fp8-dynamic-dsv3"),
+        pytest.param(GLM_5_1_FP8_DYNAMIC, None, id="glm-5.1-fp8-dynamic-moonlight"),
+        pytest.param(CHANNEL_DYNAMIC, 32, id="fp8-dynamic-dsv3"),
+        pytest.param(CHANNEL_DYNAMIC, None, id="fp8-dynamic-moonlight"),
+        # The DeepSeek V3 layout refuses static input scales earlier, at its
+        # fused q/kv latent projection; see
+        # test_fused_qkv_a_refuses_per_tensor_and_static_scales.
+        pytest.param(TENSOR_STATIC, None, id="fp8-static-moonlight"),
+    ],
 )
 def test_mla_kv_b_proj_in_fp8_is_refused(platform, monkeypatch, raw, q_lora_rank):
     """MLA models absorb kv_b_proj into w_kc/w_vc while loading, before the
@@ -776,6 +787,73 @@ def test_mla_kv_b_proj_in_fp8_is_refused(platform, monkeypatch, raw, q_lora_rank
     first = attn.q_b_proj if q_lora_rank else attn.q_proj
     assert type(first.quant_method) is ct.CompressedTensorsLinearMethod
     assert first.weight.dtype == FP8
+
+
+def _fused_qkv_a(config):
+    """The fused q/kv latent projection of _mla_attention's DeepSeek V3
+    layout: q_lora_rank 32, then kv_lora_rank 32 plus 8 rope rows."""
+    from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3FusedQkvAProjWithMqa
+
+    return DeepseekV3FusedQkvAProjWithMqa(
+        64,
+        32 + 32 + 8,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="model.layers.0.self_attn.fused_qkv_a_proj_with_mqa",
+    )
+
+
+@pytest.mark.parametrize(
+    "raw,combination",
+    [
+        (TENSOR_DYNAMIC, "per-tensor weight scales with dynamic activations"),
+        (TENSOR_STATIC, "per-tensor weight scales with static input scales"),
+        (CHANNEL_STATIC, "per-channel weight scales with static input scales"),
+    ],
+    ids=["tensor-dynamic", "tensor-static", "channel-static"],
+)
+def test_fused_qkv_a_refuses_per_tensor_and_static_scales(
+    platform, monkeypatch, raw, combination
+):
+    """DeepSeek V3 loads q_a_proj and kv_a_proj_with_mqa into one fused linear
+    at row offsets: per-channel weight scales follow their rows, but a
+    per-tensor weight scale or a static input scale has one slot for both
+    layers. Those schemes are refused when the layer is built, which the
+    attention layer does before kv_b_proj."""
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "tp_batch_invariant", "none")
+    match = (
+        "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa: compressed-tensors "
+        f"FP8 {combination} are not supported on the fused q_a_proj and "
+        "kv_a_proj_with_mqa linear.* Per-channel weight scales with dynamic "
+        "per-token activations are supported"
+    )
+    with pytest.raises(ValueError, match=match):
+        _fused_qkv_a(_parse(raw))
+    with pytest.raises(ValueError, match=match):
+        _mla_attention(_parse(raw), 32)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [GLM_5_1_FP8_DYNAMIC, CHANNEL_DYNAMIC],
+    ids=["glm-5.1-fp8-dynamic", "fp8-dynamic"],
+)
+def test_fused_qkv_a_loads_per_channel_dynamic_scales(platform, raw):
+    """Per-channel weights with dynamic activations: each layer's rows and
+    scales land at the DeepSeek V3 loader's row offset (begin_size)."""
+    layer = _fused_qkv_a(_parse(raw))
+    assert type(layer.scheme) is CompressedTensorsW8A8Fp8
+    q_a, kv_a = _fp8_checkpoint(32, 64), _fp8_checkpoint(40, 64)
+    for (codes, scale), begin_size in ((q_a, 0), (kv_a, 32)):
+        layer.weight_loader(layer.weight, codes, begin_size=begin_size)
+        layer.weight_loader(layer.weight_scale, scale, begin_size=begin_size)
+    layer.quant_method.process_weights_after_loading(layer)
+    codes = torch.cat([q_a[0], kv_a[0]])
+    assert torch.equal(layer.weight.t().view(torch.uint8), codes.view(torch.uint8))
+    assert torch.equal(layer.weight_scale, torch.cat([q_a[1], kv_a[1]]).float())
 
 
 if __name__ == "__main__":
