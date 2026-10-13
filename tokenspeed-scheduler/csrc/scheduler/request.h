@@ -23,6 +23,7 @@
 #include <concepts>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -31,6 +32,7 @@
 #include <variant>
 #include <vector>
 
+#include "cache/core/cache_types.h"
 #include "core/token_container.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
@@ -175,6 +177,13 @@ public:
     std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
         return token_container_.FullPrefixPages(prefix_granularity_, except_last);
     }
+    std::span<const std::int32_t> TokenSlice(std::int32_t begin, std::int32_t size) const {
+        return token_container_.TokenSlice(TokenContainer::Window{.begin = begin, .size = size});
+    }
+    // The partial prefix page ending at num_computed_tokens, hashed under
+    // `prior` (the chain hash of the last full page below it, "" for page 0);
+    // nullopt when the frontier is page-aligned.
+    std::optional<TailPublication> TailPublicationAt(std::int32_t num_computed_tokens, const std::string& prior) const;
 
     std::int32_t TokenSize() const { return token_container_.Size(); }
     std::int32_t LastToken() const { return token_container_.LastToken(); }
@@ -253,6 +262,7 @@ public:
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
                               [](const fsm::Restoring&) -> std::string { return "Restoring"; },
+                              [](const fsm::Finishing&) -> std::string { return "Finishing"; },
                               [](const fsm::Finished&) -> std::string { return "Finished"; },
                           },
                           state_);

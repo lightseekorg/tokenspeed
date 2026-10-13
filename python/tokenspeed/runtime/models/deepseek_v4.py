@@ -2229,6 +2229,12 @@ class DeepseekV4Indexer(nn.Module):
         self.n_head = int(config.index_n_heads)
         self.head_dim = int(config.index_head_dim)
         self.topk_tokens = int(config.index_topk)
+        if self.topk_tokens < 0:
+            raise ValueError(f"index_topk must be nonnegative, got {self.topk_tokens}")
+        if mapping.attn.kvp_size > 1 and (
+            self.topk_tokens <= 0 or self.topk_tokens & (self.topk_tokens - 1)
+        ):
+            raise ValueError("DSV4 KVP candidate topk must be a positive power of two")
         self.topk_buffer = topk_buffer
         self.softmax_scale = self.head_dim**-0.5
         value_bytes = deepseek_v4_indexer_mxfp4_value_bytes(self.head_dim)
@@ -2840,6 +2846,10 @@ class DeepseekV4Attention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("fused_wqa_wkv", prefix),
         )
+        if config.rms_norm_eps <= 0.0:
+            raise ValueError(
+                f"rms_norm_eps must be positive, got {config.rms_norm_eps}"
+            )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,

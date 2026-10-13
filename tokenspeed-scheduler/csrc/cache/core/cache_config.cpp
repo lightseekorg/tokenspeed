@@ -39,7 +39,13 @@ void CacheGroupConfig::ValidateCapacityInputs() const {
     // Every remaining message names the group: a model mixes several of them,
     // and the offending one is the only actionable part of the diagnostic.
     const std::string where = "Cache group '" + group_id + "': ";
-    if (block_granularity <= 0) {
+    if (family == CacheGroupFamily::State) {
+        if (block_granularity != 0) {
+            throw std::invalid_argument(where +
+                                        "a State group has no token span: block_granularity must be 0 (its two "
+                                        "slots hold whole recurrent states, not token rows)");
+        }
+    } else if (block_granularity <= 0) {
         throw std::invalid_argument(where + "block_granularity must be > 0");
     }
     if (cache_blocks_per_lcm_block <= 0) {

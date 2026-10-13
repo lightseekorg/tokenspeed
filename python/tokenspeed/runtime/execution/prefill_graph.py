@@ -86,6 +86,10 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_LIVE_SLOT,
+    STATE_TABLE_SLOTS,
+)
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
 from tokenspeed.runtime.moe.expert_location import (
@@ -500,7 +504,6 @@ class PrefillGraph:
         self._captured_hidden_mode = None
         # One owner for ordinary and attention-containing captures. None is the
         # batch-independent attention-break variant; integers require exact BS.
-        # Checkpoint counts are refreshed metadata, never another capture key.
         self._captures: dict[
             tuple[int, int | None], tuple[BreakableCapture, CapturedForward]
         ] = {}
@@ -665,7 +668,7 @@ class PrefillGraph:
                 logger.info(
                     "prefill inline attention: captured (tokens, requests) "
                     f"{sorted(variants)!s} "
-                    "with fixed checkpoint slots "
+                    "with fixed request slots "
                     f"(segments={next(iter(variants.values()))[0].num_segments:d}, "
                     "ordinary captures retained for fallback)",
                 )
@@ -1020,7 +1023,7 @@ class PrefillGraph:
         """Build the capture batch's group tables: one row per fabricated
         request, one width per group, row ``i`` holding block ``i + 1``.
 
-        Width is ``ceil(physical_context_len / grain)`` for every group,
+        A history group's width is ``ceil(physical_context_len / grain)``,
         whatever its retention. The physical extent is the quantity every
         backend sizes its own per-request tables from
         (``BaseAttnConfig.context_len`` is the model context plus
@@ -1030,7 +1033,9 @@ class PrefillGraph:
         router's table stacks; V4's bespoke metadata build). The width is
         a property of the group's published
         spec, not of the kernel that reads it, which is why no per-backend
-        knob is needed.
+        knob is needed. A state group's row is its two slots: a null input
+        checkpoint (the fabricated request starts from the zero state) and
+        the live block.
 
         Deliberately NOT ``compute_max_logical_pages_for_capture``: that
         helper answers the decode question, where a row describes live cache
@@ -1042,9 +1047,9 @@ class PrefillGraph:
         locations out of table bounds" -- its ``sliding_attention_0`` row was
         6 columns against the 63 the bucket needed.
 
-        Blocks are distinct per row because a state group takes one working
+        Blocks are distinct per row because a state group takes one live
         block per request; two rows sharing one clobber each other. Note the
-        runtime check for that (``_gather_state_block_indices``) is gated on
+        runtime check for that (``compute_state_block_indices``) is gated on
         ``TOKENSPEED_CACHE_DEBUG``, so a regression here would be silent --
         ``test_each_capture_row_gets_its_own_block`` is the guard.
 
@@ -1061,6 +1066,11 @@ class PrefillGraph:
         # would be allocated and copied straight back off per group per bucket.
         first_block = torch.arange(1, bs + 1, dtype=torch.int32)
         for spec in self.token_to_kv_pool.arena.cache_group_specs:
+            if spec.family == "state":
+                rows = torch.zeros((bs, STATE_TABLE_SLOTS), dtype=torch.int32)
+                rows[:, STATE_LIVE_SLOT] = first_block
+                out[str(spec.group_id)] = rows
+                continue
             cols = -(-extent // int(spec.block_granularity))
             # Never the reserved block 0: attention runs eager inside the
             # break, so capture really does write KV, and block 0 must stay

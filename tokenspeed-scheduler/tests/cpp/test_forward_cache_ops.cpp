@@ -403,7 +403,7 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     full_grp.retention = CacheGroupConfig::Retention::FullHistory;
     CacheGroupConfig state_grp;
     state_grp.group_id = "linear_attention";
-    state_grp.block_granularity = 4;
+    state_grp.block_granularity = 0;
     state_grp.family = CacheGroupFamily::State;
     config.cache_groups = {full_grp, state_grp};
 
@@ -412,6 +412,7 @@ TEST(MakeSpecsFromConfigTest, StateFamilyMapsToMambaStateKind) {
     EXPECT_EQ(specs[0].kind, AttnKind::kFull);
     EXPECT_EQ(specs[1].kind, AttnKind::kMambaState);
     EXPECT_EQ(specs[1].sliding_window, 0);
+    EXPECT_EQ(specs[1].block_granularity, 0) << "a State group has no token span";
     EXPECT_EQ(specs[1].cache_blocks_per_lcm_block, 1);
 }
 
@@ -441,7 +442,7 @@ TEST(MakeSpecsFromConfigTest, Qwen35Fp8UsesOneLogicalPAndPerGroupPacking) {
     full.cache_blocks_per_lcm_block = 16;
     CacheGroupConfig state0;
     state0.group_id = "state0";
-    state0.block_granularity = 128;
+    state0.block_granularity = 0;
     state0.family = CacheGroupFamily::State;
     CacheGroupConfig state1 = state0;
     state1.group_id = "state1";
@@ -464,11 +465,10 @@ TEST(MakeSpecsFromConfigTest, PreservesPerGroupCachePageTokens) {
     CacheGroupConfig history;
     history.group_id = "history";
     history.block_granularity = 256;
-    CacheGroupConfig state;
-    state.group_id = "compressor_state";
-    state.family = CacheGroupFamily::State;
-    state.block_granularity = 4;
-    config.cache_groups = {history, state};
+    CacheGroupConfig fine;
+    fine.group_id = "compressor";
+    fine.block_granularity = 4;
+    config.cache_groups = {history, fine};
 
     const std::vector<CacheGroupSpec> specs = MakeSpecsFromConfig(config);
 
@@ -564,20 +564,28 @@ TEST(SchedulerConfigValidateTest, RejectsSlidingWindowStateGroupWithGroupId) {
     group.retention = CacheGroupConfig::Retention::SlidingWindow;
     group.sliding_window_tokens = 256;
     group.family = CacheGroupFamily::State;
+    group.block_granularity = 0;
     ExpectRejectedNamingGroup(config, "sliding_state");
 
     group.family = CacheGroupFamily::History;
+    group.block_granularity = 128;
     EXPECT_NO_THROW(config.Validate());
 }
 
-TEST(SchedulerConfigValidateTest, RejectsSnapshotStateGroupBelowOneCacheBlock) {
+TEST(SchedulerConfigValidateTest, StateGroupHasNoTokenSpanAndNoChunkAlignmentRule) {
+    // A State group's two slots hold whole states: it declares no span, and
+    // the chunk budget owes it nothing (a chunk may be any length).
     SchedulerConfig config = MakeValidConfig();
+    config.cache_groups[0].group_id = "state";
     config.cache_groups[0].family = CacheGroupFamily::State;
-    config.max_scheduled_tokens = config.prefix_granularity - 1;
-    EXPECT_THROW(config.Validate(), std::invalid_argument);
-
-    config.max_scheduled_tokens = config.prefix_granularity;
+    ExpectRejectedNamingGroup(config, "state");
+    config.cache_groups[0].block_granularity = 0;
     EXPECT_NO_THROW(config.Validate());
+    config.max_scheduled_tokens = 1;
+    EXPECT_NO_THROW(config.Validate());
+    // A History group still declares a positive span that divides P.
+    config.cache_groups[0].family = CacheGroupFamily::History;
+    ExpectRejectedNamingGroup(config, "state");
 }
 
 TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
@@ -596,8 +604,9 @@ TEST(SchedulerConfigValidateTest, RejectsPdTransferPolicyMismatch) {
     history.transfer_policy = CacheTransferPolicy::FullSuffix;
     EXPECT_NO_THROW(config.Validate());
 
-    // A snapshot-state group is the mirror image.
+    // A State group is the mirror image.
     history.family = CacheGroupFamily::State;
+    history.block_granularity = 0;
     ExpectRejectedNamingGroup(config, history.group_id);
     history.transfer_policy = CacheTransferPolicy::LatestSnapshot;
     EXPECT_NO_THROW(config.Validate());
@@ -618,10 +627,11 @@ TEST(SchedulerConfigValidateTest, ReplayableRequiresASlidingHistoryGroup) {
     full.cache_groups[0].replayable = true;
     ExpectRejectedNamingGroup(full, full.cache_groups[0].group_id);
     group.family = CacheGroupFamily::State;
+    group.block_granularity = 0;
     ExpectRejectedNamingGroup(config, "swa");
 }
 
-TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowAndNoSnapshotStateOnEveryRole) {
+TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     SchedulerConfig config = MakeValidConfig();
     CacheGroupConfig swa;
     swa.group_id = "swa";
@@ -645,14 +655,16 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowAndNoSnapshotStateO
     small.max_scheduled_tokens = 130;
     EXPECT_NO_THROW(small.Validate());
 
+    // A State group beside a replayable one adds no rule of its own: chunks
+    // are cut by budget and the replay window alone.
     SchedulerConfig with_state = config;
     CacheGroupConfig state;
     state.group_id = "state";
-    state.block_granularity = 128;
+    state.block_granularity = 0;
     state.total_pages = config.device_allocator.total_pages;
     state.family = CacheGroupFamily::State;
     with_state.cache_groups.push_back(state);
-    EXPECT_THROW(with_state.Validate(), std::invalid_argument) << "replay and snapshot-state groups do not mix";
+    EXPECT_NO_THROW(with_state.Validate());
 
     // PD roles transfer a replayable group as any sliding window's retained
     // tail; the prefill role replays locally, the decode role never does.

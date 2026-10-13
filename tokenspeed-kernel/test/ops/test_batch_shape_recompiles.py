@@ -598,7 +598,7 @@ def test_kda_prepare_capacity_scan_token_and_sequence_counts():
         beta = randn(heads)
         bounds = F.pad(torch.tensor(lengths).cumsum(0), (1, 0)).int().to(DEVICE)
         oq, ok, ov, og, ob, chunks, chunk_rows = scan.prepare_capacity_scan(
-            q, k, v, gate, beta, bounds, inputs_packed=False
+            q, k, v, gate, beta, bounds
         )
         rows = torch.arange(capacity, device=DEVICE) < live
         for got, x in ((oq, q), (ok, k), (ov, v), (og, gate.float())):
@@ -727,57 +727,6 @@ def test_dp_sampling_kernels_bucket_size():
 
 def triton_cdiv(a, b):
     return (a + b - 1) // b
-
-
-def test_merge_prefill_checkpoint_outputs_token_counts():
-    from tokenspeed_kernel.ops.attention._triton import (
-        prefill_state_checkpoints as ckpt,
-    )
-
-    def run(body_tokens, tail_tokens, extent):
-        body = torch.randn(body_tokens, 3, 4, device=DEVICE).transpose(-1, -2)
-        tail = torch.randn(tail_tokens, 3, 4, device=DEVICE).transpose(-1, -2)
-        # Index views start one element in, off 16-byte alignment, as batch slices do.
-        order = torch.cat(
-            [
-                torch.zeros(1, device=DEVICE, dtype=torch.int64),
-                torch.randperm(extent, device=DEVICE),
-            ]
-        )[1:]
-        body_indices = order[:body_tokens]
-        tail_indices = order[body_tokens : body_tokens + tail_tokens]
-        body_indices[::5] = -1
-        expected = torch.zeros(extent, 4, 3, device=DEVICE)
-        for source, indices in ((body, body_indices), (tail, tail_indices)):
-            live = indices >= 0
-            expected[indices[live]] = source[live]
-        merged = ckpt.merge_prefill_checkpoint_outputs(
-            body, tail, body_indices, tail_indices, 0, extent, None
-        )
-        torch.testing.assert_close(merged, expected, rtol=0, atol=0)
-
-        sources = torch.full((extent + 1,), -1, dtype=torch.int64, device=DEVICE)[1:]
-        concat = torch.cat((body_indices, tail_indices))
-        live = concat >= 0
-        sources[concat[live]] = torch.arange(concat.numel(), device=DEVICE)[live]
-        gathered = ckpt.merge_prefill_checkpoint_outputs(
-            body, tail, body_indices, tail_indices, 0, extent, sources
-        )
-        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
-
-    run(16, 16, 40)
-    with assert_no_triton_compile(
-        ckpt._scatter_checkpoint_output_kernel, ckpt._gather_checkpoint_output_kernel
-    ):
-        for body_tokens, tail_tokens, extent in (
-            (9, 7, 21),
-            (1, 1, 2),
-            (11, 5, 19),
-            (32, 16, 48),
-            (37, 13, 60),
-            (70, 3, 90),
-        ):
-            run(body_tokens, tail_tokens, extent)
 
 
 def test_mla_decode_table_width_and_max_seqlen():

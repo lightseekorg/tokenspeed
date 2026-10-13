@@ -21,25 +21,26 @@
 """Triton kernels for short causal convolution (sconv).
 
 Two kernels backing the public API in :mod:`tokenspeed_kernel.ops.conv`,
-split by forward family — each hard-codes its state source so neither
-carries the other's paths:
+split by forward family -- each hard-codes its state source so neither
+carries the other's paths. Both address the conv checkpoint cache through a
+two-slot block table per request: slot 0 is the input checkpoint (the conv
+window at the chunk start: a prefix hit, or the previous chunk's window the
+scheduler rotated there; a hole for the zero state), slot 1 the live block
+that receives the window at the chunk end.
 
 - ``_inkling_ring_sconv_prefill_kernel``: varlen extend chunks. Pre-chunk
-  conv taps read the PAGED checkpoint at the chunk-start boundary (extends
-  always start on an aligned boundary; zeros when the request has no
+  conv taps read the checkpoint in slot 0 (zeros when the request has no
   prefix); the ring is never read. Persists the last
-  ``min(chunk_len + (W-1), R)`` positions to the ring — the chunk rows plus
+  ``min(chunk_len + (W-1), R)`` positions to the ring -- the chunk rows plus
   the checkpoint window itself, one writer per row via the
-  ``pos >= through - R`` gate — and publishes the conv window at every
-  covered boundary.
+  ``pos >= through - R`` gate -- and publishes the chunk-end window to slot 1.
 - ``_inkling_ring_sconv_decode_kernel``: fixed-shape decode/verify
   chunks (uniform tokens per request). Pre-chunk taps read the RING; the
-  paged cache is never read. Persists every chunk row (the wrapper asserts
-  the uniform chunk fits ``R - (W - 1)``, so writes never alias another
-  request's taps) and publishes the at-most-one covered boundary.
+  checkpoint cache is never read. Persists every chunk row (the wrapper
+  asserts the uniform chunk fits ``R - (W - 1)``, so writes never alias
+  another request's taps) and, when ``PUBLISH`` is set, publishes the
+  chunk-end window to slot 1.
 
-Both publish unconditionally (there is no non-paged mode); the publish body
-sits behind a tile-uniform early-exit so tiles covering no boundary skip it.
 The ring row of absolute position ``p`` is ``p % R``; positions derive from
 the through-chunk ``seq_lens``, there is no stored cursor, and rejected
 speculative rows are overwritten when their positions recur.
@@ -109,7 +110,7 @@ def _inkling_ring_sconv_decode_kernel(
     has_initial_state_ptr,  # [B] bool
     y_ptr,  # [T, D]
     seq_lens_ptr,  # [B] int32 lengths THROUGH the chunk
-    block_table_ptr,  # [B, num_blocks] int32, the stream's conv group
+    block_table_ptr,  # [B, 2] int32: (input checkpoint, live block)
     ckpt_a_ptr,  # [pages, W-1, a_width] checkpoint field
     ckpt_b_ptr,  # second field for d >= a_width (fused K+V), or ckpt_a
     stride_x_t,
@@ -130,12 +131,11 @@ def _inkling_ring_sconv_decode_kernel(
     stride_b_w,
     stride_b_c,
     a_width,
-    num_blocks,
     T,
     D,
     USE_SILU: tl.constexpr,
     USE_RESIDUAL: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
+    PUBLISH: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     R: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -143,14 +143,15 @@ def _inkling_ring_sconv_decode_kernel(
     W: tl.constexpr,
     W_POW2: tl.constexpr,
 ):
-    """Decode/verify sconv: ring taps, write-all, one boundary.
+    """Decode/verify sconv: ring taps, write-all, chunk-end publish.
 
     Chunks are uniform per request (1 / K tokens) and fit
     ``R - (W - 1)``, so every chunk row persists at its position's ring row
     with no aliasing (the wrapper asserts the bound). Pre-chunk taps read
-    the request's ring; the paged cache is never read. A token whose
-    absolute length is page-aligned publishes the conv window at that
-    boundary's page — accept-independent, healed by overwrite.
+    the request's ring; the checkpoint cache is never read. With ``PUBLISH``
+    the request's last token writes the conv window ending at ``through`` to
+    the live block -- the committed window of a one-token decode, or of a
+    draft chunk re-anchored at the committed frontier.
     """
     t_off = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     d_off = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -234,57 +235,53 @@ def _inkling_ring_sconv_decode_kernel(
         mask=do_write[:, None] & d_mask[None, :],
     )
 
-    # Absolute length after this token (int32: lengths fit); pad rows
-    # carry stale lengths, so gate on the slot BEFORE the alignment test.
-    abs_len = pos + 1
-    valid_tok = t_mask & (ci != -1)
-    is_boundary = valid_tok & (abs_len > 0) & (abs_len % PAGE_SIZE == 0)
-    # Boundaries are one token in PAGE_SIZE: skip the whole publish body
-    # unless this tile actually holds one (tile-uniform branch).
-    if tl.max(is_boundary.to(tl.int32), axis=0) > 0:
-        blk = (abs_len // PAGE_SIZE - 1).to(tl.int64)
-        blk_ok = is_boundary & (blk >= 0) & (blk < num_blocks)
-        page = tl.load(
-            block_table_ptr + si * stride_bt_b + blk * stride_bt_c,
-            mask=blk_ok,
-            other=0,
-        ).to(tl.int64)
-        pub = blk_ok & (page > 0)
-        use_a = d_off < a_width
-        col_b = tl.maximum(d_off - a_width, 0)
-        for w in tl.static_range(W - 1):
-            src_t = t64 - (W - 2) + w
-            in_x2 = src_t >= bos
-            x_row = tl.load(
-                x_ptr + src_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
-                mask=(pub & in_x2)[:, None] & d_mask[None, :],
-                other=0,
-            )
-            src_pos = pre_len + (src_t - bos).to(tl.int32)
-            in_ring2 = (src_t < bos) & (src_pos >= 0) & use_cache
-            src_row = (tl.maximum(src_pos, 0) % R).to(tl.int64)
-            p_row = tl.load(
-                cache_base + src_row[:, None] * stride_c_w,
-                mask=(pub & in_ring2)[:, None] & d_mask[None, :],
-                other=0,
-            )
-            val = tl.where(in_x2[:, None], x_row.to(tl.float32), p_row.to(tl.float32))
-            tl.store(
-                ckpt_a_ptr
-                + page[:, None] * stride_a_page
-                + w * stride_a_w
-                + d_off[None, :] * stride_a_c,
-                val.to(ckpt_a_ptr.dtype.element_ty),
-                mask=pub[:, None] & d_mask[None, :] & use_a[None, :],
-            )
-            tl.store(
-                ckpt_b_ptr
-                + page[:, None] * stride_b_page
-                + w * stride_b_w
-                + col_b[None, :] * stride_b_c,
-                val.to(ckpt_b_ptr.dtype.element_ty),
-                mask=pub[:, None] & d_mask[None, :] & (d_off >= a_width)[None, :],
-            )
+    if PUBLISH:
+        # The request's last token publishes the window [through - (W-1),
+        # through) to the live block. Pad rows carry stale lengths, so gate
+        # on the slot first; a tile without a chunk end skips the body.
+        is_end = t_mask & (ci != -1) & (t_off == eos - 1)
+        if tl.max(is_end.to(tl.int32), axis=0) > 0:
+            page = tl.load(
+                block_table_ptr + si * stride_bt_b + stride_bt_c, mask=is_end, other=0
+            ).to(tl.int64)
+            pub = is_end & (page > 0)
+            use_a = d_off < a_width
+            col_b = tl.maximum(d_off - a_width, 0)
+            for w in tl.static_range(W - 1):
+                src_t = t64 - (W - 2) + w
+                in_x2 = src_t >= bos
+                x_row = tl.load(
+                    x_ptr + src_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
+                    mask=(pub & in_x2)[:, None] & d_mask[None, :],
+                    other=0,
+                )
+                src_pos = pre_len + (src_t - bos).to(tl.int32)
+                in_ring2 = (src_t < bos) & (src_pos >= 0) & use_cache
+                src_row = (tl.maximum(src_pos, 0) % R).to(tl.int64)
+                p_row = tl.load(
+                    cache_base + src_row[:, None] * stride_c_w,
+                    mask=(pub & in_ring2)[:, None] & d_mask[None, :],
+                    other=0,
+                )
+                val = tl.where(
+                    in_x2[:, None], x_row.to(tl.float32), p_row.to(tl.float32)
+                )
+                tl.store(
+                    ckpt_a_ptr
+                    + page[:, None] * stride_a_page
+                    + w * stride_a_w
+                    + d_off[None, :] * stride_a_c,
+                    val.to(ckpt_a_ptr.dtype.element_ty),
+                    mask=pub[:, None] & d_mask[None, :] & use_a[None, :],
+                )
+                tl.store(
+                    ckpt_b_ptr
+                    + page[:, None] * stride_b_page
+                    + w * stride_b_w
+                    + col_b[None, :] * stride_b_c,
+                    val.to(ckpt_b_ptr.dtype.element_ty),
+                    mask=pub[:, None] & d_mask[None, :] & (d_off >= a_width)[None, :],
+                )
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -301,7 +298,7 @@ def _inkling_ring_sconv_prefill_kernel(
     has_initial_state_ptr,  # [B] bool
     y_ptr,  # [T, D]
     seq_lens_ptr,  # [B] int32 lengths THROUGH the chunk
-    block_table_ptr,  # [B, num_blocks] int32, the stream's conv group
+    block_table_ptr,  # [B, 2] int32: (input checkpoint, live block)
     ckpt_a_ptr,  # [pages, W-1, a_width] checkpoint field
     ckpt_b_ptr,  # second field for d >= a_width (fused K+V), or ckpt_a
     stride_x_t,
@@ -322,12 +319,11 @@ def _inkling_ring_sconv_prefill_kernel(
     stride_b_w,
     stride_b_c,
     a_width,
-    num_blocks,
     T,
     D,
     USE_SILU: tl.constexpr,
     USE_RESIDUAL: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
+    PUBLISH: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     R: tl.constexpr,
     BLOCK_T: tl.constexpr,
@@ -335,17 +331,16 @@ def _inkling_ring_sconv_prefill_kernel(
     W: tl.constexpr,
     W_POW2: tl.constexpr,
 ):
-    """Prefill/extend sconv: checkpoint taps, gated write, all boundaries.
+    """Prefill/extend sconv: checkpoint taps, gated write, chunk-end publish.
 
-    Extend chunks always start on an aligned boundary, so pre-chunk taps
-    read the PAGED checkpoint window at ``pre_len`` (zeros when the request
-    has no prefix or the entry is a hole); the ring is never read. The last
-    ``min(chunk_len + (W - 1), R)`` positions persist to the ring — chunk
-    rows from ``x`` plus the checkpoint window itself (materialized by the
-    request's first-token lane), one writer per row via the
-    ``pos >= through - R`` gate. Every covered boundary publishes its conv
-    window; boundaries are >= PAGE_SIZE past the aligned chunk start, so
-    publish sources are always in-chunk ``x`` rows.
+    Pre-chunk taps read the checkpoint window in slot 0 (zeros when the
+    request has no prefix or the slot is a hole); the ring is never read. The
+    last ``min(chunk_len + (W - 1), R)`` positions persist to the ring --
+    chunk rows from ``x`` plus the checkpoint window itself (materialized by
+    the request's first-token lane), one writer per row via the
+    ``pos >= through - R`` gate. The request's last token publishes the
+    window ending at ``through`` to the live block in slot 1; its rows come
+    from ``x`` or, for a chunk shorter than ``W - 1``, from the checkpoint.
     """
     t_off = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     d_off = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -368,17 +363,13 @@ def _inkling_ring_sconv_prefill_kernel(
 
     bos32 = bos.to(tl.int32)
     chunk_len = eos - bos32
-    pre_len = through - chunk_len  # aligned chunk-start boundary (0 = cold)
+    pre_len = through - chunk_len  # chunk-start position (0 = cold)
 
-    # The chunk-start boundary's page: the tap (and restore) source.
-    blk0 = (pre_len // PAGE_SIZE - 1).to(tl.int64)
-    blk0_ok = use_cache & t_mask & (pre_len > 0) & (blk0 >= 0) & (blk0 < num_blocks)
+    # The input checkpoint in slot 0: the tap (and restore) source.
     page0 = tl.load(
-        block_table_ptr + si * stride_bt_b + tl.maximum(blk0, 0) * stride_bt_c,
-        mask=blk0_ok,
-        other=0,
+        block_table_ptr + si * stride_bt_b, mask=use_cache & t_mask, other=0
     ).to(tl.int64)
-    ckpt_ok = blk0_ok & (page0 > 0)
+    ckpt_ok = use_cache & t_mask & (pre_len > 0) & (page0 > 0)
     use_a = d_off < a_width
     col_b = tl.maximum(d_off - a_width, 0)
 
@@ -406,9 +397,9 @@ def _inkling_ring_sconv_prefill_kernel(
                 mask=in_x[:, None] & d_mask[None, :],
                 other=0,
             )
-            # Pre-chunk taps: checkpoint window row j at the chunk-start
-            # page. No `other` filler (an int cannot cast to fp8 sources);
-            # masked-off lanes are discarded by the selects below.
+            # Pre-chunk taps: checkpoint window row j. No `other` filler (an
+            # int cannot cast to fp8 sources); masked-off lanes are discarded
+            # by the selects below.
             j = (shifted_t - bos + (W - 1)).to(tl.int64)
             in_ck = (shifted_t < bos) & ckpt_ok
             a_val = tl.load(
@@ -435,8 +426,8 @@ def _inkling_ring_sconv_prefill_kernel(
             if iw < W - 1:
                 # Fused restore: the request's first-token lane materializes
                 # the checkpoint window into the ring so later decode rounds
-                # can rewind past the boundary. Gated to the last R
-                # positions — one writer per row beside the chunk stores.
+                # can rewind past the chunk start. Gated to the last R
+                # positions -- one writer per row beside the chunk stores.
                 tap_pos = pre_len - (W - 1) + iw
                 do_restore = (
                     (t64 == bos) & in_ck & (tap_pos >= through - R) & (tap_pos >= 0)
@@ -477,7 +468,7 @@ def _inkling_ring_sconv_prefill_kernel(
     )
 
     # Ring persistence, gated to the last R positions: one writer per row
-    # regardless of chunk length (no epilogue, no aliasing — this kernel
+    # regardless of chunk length (no epilogue, no aliasing -- this kernel
     # never reads the ring).
     pos = through - eos + t_off  # 0-based absolute position of token t
     do_write = t_mask & (ci != -1) & (pos >= through - R)
@@ -488,44 +479,63 @@ def _inkling_ring_sconv_prefill_kernel(
         mask=do_write[:, None] & d_mask[None, :],
     )
 
-    # Publish every covered boundary. Boundaries sit >= PAGE_SIZE past the
-    # aligned chunk start, so the W-1 window rows are always in-chunk.
-    abs_len = pos + 1
-    valid_tok = t_mask & (ci != -1)
-    is_boundary = valid_tok & (abs_len > 0) & (abs_len % PAGE_SIZE == 0)
-    if tl.max(is_boundary.to(tl.int32), axis=0) > 0:
-        blk = (abs_len // PAGE_SIZE - 1).to(tl.int64)
-        blk_ok = is_boundary & (blk >= 0) & (blk < num_blocks)
-        page = tl.load(
-            block_table_ptr + si * stride_bt_b + blk * stride_bt_c,
-            mask=blk_ok,
-            other=0,
-        ).to(tl.int64)
-        pub = blk_ok & (page > 0)
-        for w in tl.static_range(W - 1):
-            src_t = t64 - (W - 2) + w
-            x_row = tl.load(
-                x_ptr + src_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
-                mask=pub[:, None] & d_mask[None, :],
-                other=0,
-            )
-            val = x_row.to(tl.float32)
-            tl.store(
-                ckpt_a_ptr
-                + page[:, None] * stride_a_page
-                + w * stride_a_w
-                + d_off[None, :] * stride_a_c,
-                val.to(ckpt_a_ptr.dtype.element_ty),
-                mask=pub[:, None] & d_mask[None, :] & use_a[None, :],
-            )
-            tl.store(
-                ckpt_b_ptr
-                + page[:, None] * stride_b_page
-                + w * stride_b_w
-                + col_b[None, :] * stride_b_c,
-                val.to(ckpt_b_ptr.dtype.element_ty),
-                mask=pub[:, None] & d_mask[None, :] & (d_off >= a_width)[None, :],
-            )
+    if PUBLISH:
+        # The request's last token publishes the window [through - (W-1),
+        # through) to the live block; rows before the chunk start come from
+        # the input checkpoint (a chunk shorter than W-1 tokens).
+        is_end = t_mask & (ci != -1) & (t_off == eos - 1)
+        if tl.max(is_end.to(tl.int32), axis=0) > 0:
+            page = tl.load(
+                block_table_ptr + si * stride_bt_b + stride_bt_c, mask=is_end, other=0
+            ).to(tl.int64)
+            pub = is_end & (page > 0)
+            for w in tl.static_range(W - 1):
+                src_t = t64 - (W - 2) + w
+                in_x2 = src_t >= bos
+                x_row = tl.load(
+                    x_ptr + src_t[:, None] * stride_x_t + d_off[None, :] * stride_x_d,
+                    mask=(pub & in_x2)[:, None] & d_mask[None, :],
+                    other=0,
+                )
+                j2 = (src_t - bos + (W - 1)).to(tl.int64)
+                in_ck2 = (src_t < bos) & ckpt_ok
+                a_row = tl.load(
+                    ckpt_a_ptr
+                    + page0[:, None] * stride_a_page
+                    + j2[:, None] * stride_a_w
+                    + d_off[None, :] * stride_a_c,
+                    mask=(pub & in_ck2)[:, None] & d_mask[None, :] & use_a[None, :],
+                )
+                b_row = tl.load(
+                    ckpt_b_ptr
+                    + page0[:, None] * stride_b_page
+                    + j2[:, None] * stride_b_w
+                    + col_b[None, :] * stride_b_c,
+                    mask=(pub & in_ck2)[:, None]
+                    & d_mask[None, :]
+                    & (d_off >= a_width)[None, :],
+                )
+                ck_row = tl.where(
+                    use_a[None, :], a_row.to(tl.float32), b_row.to(tl.float32)
+                )
+                ck_row = tl.where(in_ck2[:, None] & d_mask[None, :], ck_row, 0.0)
+                val = tl.where(in_x2[:, None], x_row.to(tl.float32), ck_row)
+                tl.store(
+                    ckpt_a_ptr
+                    + page[:, None] * stride_a_page
+                    + w * stride_a_w
+                    + d_off[None, :] * stride_a_c,
+                    val.to(ckpt_a_ptr.dtype.element_ty),
+                    mask=pub[:, None] & d_mask[None, :] & use_a[None, :],
+                )
+                tl.store(
+                    ckpt_b_ptr
+                    + page[:, None] * stride_b_page
+                    + w * stride_b_w
+                    + col_b[None, :] * stride_b_c,
+                    val.to(ckpt_b_ptr.dtype.element_ty),
+                    mask=pub[:, None] & d_mask[None, :] & (d_off >= a_width)[None, :],
+                )
 
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()

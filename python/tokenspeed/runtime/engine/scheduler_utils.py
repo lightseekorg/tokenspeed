@@ -20,7 +20,6 @@
 
 """Helper functions for constructing scheduler specs and events."""
 
-import math
 import os
 import weakref
 from collections.abc import Mapping, Sequence
@@ -32,7 +31,6 @@ import torch
 from tokenspeed_scheduler import (
     Cache,
     CacheGroupConfig,
-    CacheGroupFamily,
     ExecutionEvent,
     ForwardEvent,
     RequestSpec,
@@ -281,52 +279,6 @@ def scheduler_cache_geometry_from_pool(pool: Any) -> SchedulerCacheGeometry:
         num_usable_pages=num_lcm_blocks,
         token_capacity=contract.token_capacity,
     )
-
-
-def aligned_max_scheduled_tokens(
-    max_scheduled_tokens: int,
-    cache_groups,
-) -> int:
-    """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
-
-    Recurrent-state groups (family=State, the C++ ``AttnKind::kMambaState``
-    kind) register their state snapshot only when a prefill chunk ends
-    exactly on a CacheBlock boundary (``RegistersAlignedFinalPageOnly``);
-    interior boundaries never received a state write. A chunk size that is
-    not a multiple of every such group's CacheBlock token span therefore
-    never registers a state block. Since the admission probe takes the
-    minimum hit across groups, prefix-cache reuse silently degrades to zero
-    for the whole model.
-
-    Args:
-        max_scheduled_tokens: Requested per-step token budget
-            (``--chunked-prefill-size``).
-        cache_groups: Scheduler ``CacheGroupConfig`` sequence, or
-            None/empty when the model declares no cache groups.
-    Returns:
-        ``max_scheduled_tokens`` floored to the LCM of the state groups'
-        CacheBlock token spans. Returned unchanged when no such group exists
-        or the value is already aligned.
-
-    Raises:
-        ValueError: If the configured budget is smaller than one state CacheBlock.
-            Raising is safer than increasing a limit that may already have
-            sized executor buffers.
-    """
-    require_positive_int("max_scheduled_tokens", max_scheduled_tokens)
-    grain = 1
-    for group in cache_groups or ():
-        if group.family != CacheGroupFamily.State:
-            continue
-        grain = math.lcm(grain, int(group.block_granularity))
-    if grain == 1:
-        return max_scheduled_tokens
-    if max_scheduled_tokens < grain:
-        raise ValueError(
-            "chunked_prefill_size must be at least one recurrent-state CacheBlock: "
-            f"got {max_scheduled_tokens}, minimum {grain}"
-        )
-    return max_scheduled_tokens - max_scheduled_tokens % grain
 
 
 # "No bound" for RequestSpec.max_cached_prefix_tokens (the C++ default).
@@ -1128,9 +1080,12 @@ def _kv_pool_bytes(*pools) -> int:
     in the target's arena), so counting both naively would double the KV.
     Dedupe by arena identity -- the allocation each view reports on.
 
-    Return types differ (int, or a tuple like MSA's (kv, index); a hybrid pool
-    may nest several) -- sum any numeric leaves.
+    Arena-backed pools report actual device allocations, including residency
+    workspace and excluding authoritative host history. Legacy pools may
+    report nested numeric totals.
     """
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+
     seen: set[int] = set()
     total = 0
     for pool in pools:
@@ -1140,6 +1095,9 @@ def _kv_pool_bytes(*pools) -> int:
         if id(arena) in seen:
             continue
         seen.add(id(arena))
+        if isinstance(arena, CacheArena):
+            total += arena.allocated_device_bytes
+            continue
         getter = getattr(pool, "get_kv_size_bytes", None)
         if getter is None:
             continue

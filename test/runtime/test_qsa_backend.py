@@ -143,6 +143,7 @@ def _qsa_pool(*, device: str, layer_offset: int) -> SimpleNamespace:
         )
     pool = SimpleNamespace(
         arena=SimpleNamespace(
+            offload=None,
             plan=SimpleNamespace(
                 fields=[
                     SimpleNamespace(

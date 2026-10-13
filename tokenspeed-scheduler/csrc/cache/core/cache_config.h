@@ -46,9 +46,11 @@ struct CacheGroupConfig {
     };
 
     std::string group_id;
-    // Tokens covered by one block-table slot. The Python declaration shape
-    // (row geometry or state checkpoint) folds to this span before crossing
-    // the bridge; the scheduler never sees rows, strides or checkpoints.
+    // History groups: tokens covered by one block-table slot; the Python row
+    // geometry folds to this span before crossing the bridge, and the
+    // scheduler never sees rows or strides. State groups carry 0: a state
+    // block positions nothing, the table is two slots (Validate rejects a
+    // span on a State group).
     std::int32_t block_granularity{};
     // Scheduler-facing (virtual) block count including the null block: the
     // physical page count of one rank times shard_count, as the Python
@@ -77,14 +79,15 @@ struct CacheGroupConfig {
     std::int32_t shard_count{1};
 
     // The scheduler-facing kind of this group, and the only classification
-    // scheduler logic reads. A State group keeps one recurrent-state
-    // checkpoint per block instead of a token history: the mamba-style group
-    // (GDN linear attention, conv columns), kMambaState, whose PD destination
-    // layout is a LatestSnapshot. A checkpoint summarizes everything before
-    // it, so nothing in such a group ever slides out: Validate() rejects State
-    // with SlidingWindow retention, and a trailing token window (SWA kv,
-    // compressor tails) is a sliding History group, kSlidingWindow. Every
-    // other History group is kFull. The mapping is therefore one-to-one.
+    // scheduler logic reads. A State group keeps whole recurrent states
+    // instead of a token history: the mamba-style group (GDN linear
+    // attention, conv columns), kMambaState, whose PD destination layout is a
+    // LatestSnapshot and whose table is two slots (input checkpoint, live
+    // block). A state summarizes everything before it, so nothing in such a
+    // group ever slides out: Validate() rejects State with SlidingWindow
+    // retention, and a trailing token window (SWA kv, compressor tails) is a
+    // sliding History group, kSlidingWindow. Every other History group is
+    // kFull. The mapping is therefore one-to-one.
     AttnKind Kind() const {
         if (family == CacheGroupFamily::State) {
             return AttnKind::kMambaState;

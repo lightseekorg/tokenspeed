@@ -365,7 +365,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
         **kwargs,
     ) -> None:
         super().__init__(
-            server_args=SimpleNamespace(max_total_tokens=None),
+            server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
             model_config=None,
             attn_config=_ns_config(
                 prefix_granularity=4,
@@ -421,7 +421,6 @@ class _SyntheticHybridRecipe(CacheRecipe):
                     retention="full_history",
                     sliding_window_tokens=None,
                     family="state",
-                    checkpoint_granularity=self.prefix_granularity,
                     replayable=False,
                 ),
                 (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),
@@ -503,6 +502,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         **_model_wide_kwargs(),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         prefix_granularity=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
@@ -601,6 +601,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         components=(replace(target_spec, cache_layer_types=(FULL_ATTENTION,)),),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=draft_tokens,
@@ -666,6 +667,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         else None
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=width,
@@ -742,7 +744,7 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget(
         sliding_window_tokens=512,
     )
     attn_config = replace(attn_config, components=(mha,))
-    server_args = SimpleNamespace(max_total_tokens=None)
+    server_args = SimpleNamespace(kv_offload_config=None, max_total_tokens=None)
 
     setup = prepare_cache_setup(
         family="mha",
@@ -782,7 +784,7 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
         hf_config=SimpleNamespace(),
     )
     attn_config = _mla_config()
-    server_args = SimpleNamespace(max_total_tokens=None)
+    server_args = SimpleNamespace(kv_offload_config=None, max_total_tokens=None)
 
     setup = prepare_cache_setup(
         family="mla",
@@ -828,7 +830,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
 
     setup = prepare_cache_setup(
         family=family,
-        server_args=SimpleNamespace(max_total_tokens=None),
+        server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
         model_config=model_config,
         attn_config=target_attn_config,
         draft_model_config=draft_model_config,
@@ -986,6 +988,7 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
         lambda config: getattr(config, "is_deepseek_v4", False),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         attention_backend=None,
         drafter_attention_backend=None,
         disaggregation_mode="prefill",

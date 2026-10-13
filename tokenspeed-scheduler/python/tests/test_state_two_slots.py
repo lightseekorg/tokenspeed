@@ -18,19 +18,19 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Local (Fused-role) counterpart of the D-role state-group growth reserve.
+"""Fused-role State groups: two slots per request, no growth.
 
-An aligned prompt has no tail to split, so its completing admission used to
-materialize one state block with zero spare and its first decode step needed a
-fresh EMPTY parent per state group -- the D-role wedge, on the local path.
-``groupReserveTokens`` banks one growth block on every admission that
-finishes shaping a state group, so the first decode step is consumed in place.
+A State group's row is ``[slot0, slot1]``: the checkpoint a forward reads and
+the block it writes. A prompt with no checkpoint to resume from starts from a
+fresh zeroed block, so a request holds its two blocks from its first admission
+on; every later rotation swaps the released input for the fresh live slot, and
+a decode step writes slot 1 in place. A pool sized at two blocks per live
+request therefore back-pressures at admission and never wedges at the first
+decode.
 
 Shape: K3-shaped 4-group config (P = 2 tokens per block, 32 usable pages),
-one-block aligned prompts, max_new_tokens = 4.  Unfixed: 3 History pages + 3
-state blocks = 6 pages per admission, five of six prompts admit (30/32) and
-wedge at their first decode.  Fixed: 9 pages per admission, three admit, three
-queue, everything finishes.
+one-block prompts, max_new_tokens = 4: 2 History pages + 3 x 2 state blocks
+per admitted request, four requests fill the pool.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ from conftest import K3_STATE_GROUPS, _make_k3_config
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
-PROMPT_TOKENS = 2  # exactly one block at P=2 -> aligned, no tail to split
+PROMPT_TOKENS = 2  # exactly one block at P=2
 MAX_NEW_TOKENS = 4
 NUM_REQUESTS = 6
 MAX_ROUNDS = 200
@@ -93,11 +93,11 @@ def _dispatched(plan) -> list:
     return [op for op in plan.forward if list(op.request_ids)]
 
 
-def _state_blocks(batch, request_id: str) -> dict[str, list[int]]:
-    """Positive block ids per snapshot-state group for one request row of a Batch."""
+def _state_rows(batch, request_id: str) -> dict[str, list[int]]:
+    """The two-slot row per State group for one request row of a Batch."""
     row = list(batch.request_ids).index(request_id)
     tables = dict(batch.block_tables)
-    return {g: [p for p in tables[g][row] if p > 0] for g in K3_STATE_GROUPS}
+    return {g: list(tables[g][row]) for g in K3_STATE_GROUPS}
 
 
 def _submit(scheduler, rids: list[str]) -> None:
@@ -147,12 +147,10 @@ def _run_closed_loop(scheduler, rids: list[str]) -> dict:
     }
 
 
-class TestLocalStateGroupGrowthReserve:
-    def test_aligned_prompts_filling_the_pool_never_wedge(self):
-        """Six aligned one-block prompts.  Unfixed: five admit (30/32 pages) and
-        every first decode step needs 3 empty parents while 2 exist -> no forward op
-        is ever produced again.  Fixed: admission back-pressures at three and every
-        request runs to completion."""
+class TestFusedStateTwoSlots:
+    def test_prompts_filling_the_pool_never_wedge(self):
+        """Six one-block prompts against a pool that holds four: admission
+        back-pressures and every request runs to completion."""
         scheduler = ts.Scheduler(_fused_config(decode_input_tokens=1))
         rids = [f"r{i}" for i in range(NUM_REQUESTS)]
         _submit(scheduler, rids)
@@ -162,20 +160,61 @@ class TestLocalStateGroupGrowthReserve:
         assert result["waiting"] == 0 and result["decoding"] == 0
         assert result["active"] == 0
 
-    def test_completing_admission_banks_one_growth_block_per_state_group(self):
-        """An aligned two-block prompt ends its (single-chunk) prefill owning the
-        endpoint block plus one banked growth block in every state group, and the
-        first decode step reuses that block instead of acquiring a fresh one."""
+    def test_two_slots_rotate_into_the_first_decode_and_decode_in_place(self):
+        """The prefill row reads a fresh zeroed block (slot 0) and writes slot 1;
+        the first decode rotates (the prompt-end state becomes slot 0, a fresh
+        slot 1 is written); every later decode releases slot 0 and writes slot 1
+        in place."""
         scheduler = ts.Scheduler(_fused_config(decode_input_tokens=1))
         scheduler.submit_requests([_spec("r0", [1, 2, 3, 4], MAX_NEW_TOKENS)])
-        prefill = _dispatched(scheduler.next_execution_plan())
-        assert len(prefill) == 1 and list(prefill[0].request_ids) == ["r0"]
-        banked = _state_blocks(prefill[0], "r0")
-        for group, blocks in banked.items():
-            assert len(blocks) == 2, (group, blocks)
-        # PrefillDone already carries the decode reserve for the first step.
+        plan = scheduler.next_execution_plan()
+        [prefill] = _dispatched(plan)
+        assert list(prefill.request_ids) == ["r0"]
+        zeroed = dict(plan.pages_to_zero)
+        prefill_rows = _state_rows(prefill, "r0")
+        for group, (slot0, slot1) in prefill_rows.items():
+            assert slot0 > 0 and slot1 > 0 and slot0 != slot1, (group, slot0, slot1)
+            assert slot0 in zeroed[group] and slot1 in zeroed[group], group
+
         _advance(scheduler, "r0", [201])
-        decode = _dispatched(scheduler.next_execution_plan())
-        assert len(decode) == 1 and list(decode[0].request_ids) == ["r0"]
-        for group, blocks in _state_blocks(decode[0], "r0").items():
-            assert blocks == banked[group], (group, blocks, banked[group])
+        plan = scheduler.next_execution_plan()
+        [decode1] = _dispatched(plan)
+        zeroed = dict(plan.pages_to_zero)
+        decode1_rows = _state_rows(decode1, "r0")
+        for group, (slot0, slot1) in decode1_rows.items():
+            assert slot0 == prefill_rows[group][1], "the prompt-end state is the input"
+            assert slot1 > 0 and slot1 != slot0
+            assert zeroed[group] == [slot1], "only the fresh live slot is new"
+
+        _advance(scheduler, "r0", [202])
+        _reserve(scheduler, "r0", 1)
+        plan = scheduler.next_execution_plan()
+        [decode2] = _dispatched(plan)
+        for group, row in _state_rows(decode2, "r0").items():
+            assert row == [0, decode1_rows[group][1]], (group, row)
+        assert all(not pages for pages in dict(plan.pages_to_zero).values())
+
+    def test_a_repeated_prompt_resumes_from_the_published_prompt_end_state(self):
+        """The first decode's admission publishes the prompt-end state; a later
+        prompt extending the same tokens claims it as slot 0 and skips the prefix."""
+        scheduler = ts.Scheduler(_fused_config(decode_input_tokens=1))
+        scheduler.submit_requests([_spec("seed", [1, 2, 3, 4], MAX_NEW_TOKENS)])
+        [prefill] = _dispatched(scheduler.next_execution_plan())
+        _advance(scheduler, "seed", [201])
+        [decode1] = _dispatched(scheduler.next_execution_plan())
+        checkpoints = {g: row[0] for g, row in _state_rows(decode1, "seed").items()}
+        _advance(scheduler, "seed", [202])
+        _finish(scheduler, "seed")
+        scheduler.next_execution_plan()
+
+        scheduler.submit_requests([_spec("reuse", [1, 2, 3, 4, 5, 6], MAX_NEW_TOKENS)])
+        plan = scheduler.next_execution_plan()
+        [reuse] = _dispatched(plan)
+        assert list(reuse.extend_prefix_lens) == [4]
+        assert list(reuse.input_lengths) == [2]
+        for group, (slot0, slot1) in _state_rows(reuse, "reuse").items():
+            assert slot0 == checkpoints[group], "the published checkpoint is slot 0"
+            assert slot1 > 0 and slot1 != slot0
+        assert all(
+            not pairs for pairs in dict(plan.pages_to_copy).values()
+        ), "an aligned hit copies nothing"

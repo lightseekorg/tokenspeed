@@ -19,8 +19,6 @@ the kernel is unchanged.
 
 from __future__ import annotations
 
-import os
-
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import Platform

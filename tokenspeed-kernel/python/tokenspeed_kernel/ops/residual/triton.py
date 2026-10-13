@@ -28,7 +28,6 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import (
-    ArchVersion,
     CapabilityRequirement,
     current_platform,
     pdl_enabled,
@@ -257,11 +256,14 @@ def triton_hyperconnection_mix(
     hc_count: int,
     hidden_size: int,
     lowrank: int,
+    projection_rows: int,
     projection_scale: float,
     weights_independent: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """GEMM plus Triton-epilogue path for general decode and prefill shapes."""
-    projected = F.linear(normalized, projection_weight)
+    # Model loading aligns BF16/FP16 GEMM output widths; discard only the
+    # extra output columns, preserving the GEMM's aligned row stride.
+    projected = F.linear(normalized, projection_weight)[:, :projection_rows]
     activated, inject = _launch_projection_epilogue(
         projected, lowrank, hc_count, projection_scale
     )
@@ -1724,127 +1726,6 @@ def _mhc_prefill_config_hc4(num_tokens: int) -> tuple[int, int, int]:
     if num_tokens <= 8192:
         return 2, 64, 256
     return 1, 64, 256
-
-
-def fused_mhc_prefill_hc4(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    norm_weight: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-    norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the tiled hc=4 mHC prefill path with fused output RMSNorm.
-
-    Args:
-        residual: Contiguous BF16 residual streams shaped ``[T, 4, H]``.
-        fn: Contiguous FP32 projection weights shaped ``[24, 4 * H]``.
-        hc_scale: Contiguous FP32 pre, post, and combination scales shaped
-            ``[3]``.
-        hc_base: Contiguous FP32 projection bias shaped ``[24]``.
-        norm_weight: Contiguous BF16 or FP32 RMSNorm weight shaped ``[H]``.
-        rms_eps: Epsilon used by the pre-projection RMS normalization.
-        hc_eps: Epsilon used by the mHC mapping transforms.
-        sinkhorn_iters: Number of row/column Sinkhorn normalization rounds.
-        norm_eps: Epsilon used by the output RMSNorm.
-
-    Returns:
-        A tuple of BF16 normalized layer input ``[T, H]``, FP32 post
-        coefficients ``[T, 4, 1]``, and FP32 combination coefficients
-        ``[T, 4, 4]``.
-    """
-    if residual.ndim != 3 or residual.shape[1] != 4:
-        raise ValueError("fused_mhc_prefill_hc4 requires residual shaped [T, 4, H]")
-    if residual.dtype != torch.bfloat16 or fn.dtype != torch.float32:
-        raise ValueError(
-            "fused_mhc_prefill_hc4 requires BF16 residual and FP32 weights"
-        )
-    if hc_scale.dtype != torch.float32 or hc_base.dtype != torch.float32:
-        raise ValueError("fused_mhc_prefill_hc4 requires FP32 scales and biases")
-    if norm_weight.dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError("fused_mhc_prefill_hc4 requires BF16 or FP32 norm weight")
-    tensors = (residual, fn, hc_scale, hc_base, norm_weight)
-    if not all(tensor.is_cuda for tensor in tensors):
-        raise ValueError("fused_mhc_prefill_hc4 requires CUDA tensors")
-    if not all(tensor.device == residual.device for tensor in tensors):
-        raise ValueError("fused_mhc_prefill_hc4 tensors must share one device")
-    if not all(tensor.is_contiguous() for tensor in tensors):
-        raise ValueError("fused_mhc_prefill_hc4 tensors must be contiguous")
-    if sinkhorn_iters < 1:
-        raise ValueError("sinkhorn_iters must be positive")
-
-    num_tokens, _, hidden_size = residual.shape
-    if hidden_size < 1:
-        raise ValueError("hidden size must be positive")
-    if fn.shape != (24, 4 * hidden_size):
-        raise ValueError(
-            f"fn shape mismatch: expected {(24, 4 * hidden_size)}, "
-            f"got {tuple(fn.shape)}"
-        )
-    if hc_scale.shape != (3,) or hc_base.shape != (24,):
-        raise ValueError("hc_scale and hc_base must have shapes [3] and [24]")
-    if norm_weight.shape != (hidden_size,):
-        raise ValueError(
-            f"norm_weight shape mismatch: expected {(hidden_size,)}, "
-            f"got {tuple(norm_weight.shape)}"
-        )
-    if num_tokens == 0:
-        return (
-            residual.new_empty(0, hidden_size),
-            torch.empty(0, 4, 1, device=residual.device, dtype=torch.float32),
-            torch.empty(0, 4, 4, device=residual.device, dtype=torch.float32),
-        )
-
-    n_splits, block_m, block_k = _mhc_prefill_config_hc4(num_tokens)
-    n_splits = min(n_splits, triton.cdiv(4 * hidden_size, block_k))
-    projection = torch.empty(
-        n_splits, num_tokens, 24, device=residual.device, dtype=torch.float32
-    )
-    square_sum = torch.empty(
-        n_splits, num_tokens, device=residual.device, dtype=torch.float32
-    )
-    pre_mix = torch.empty(num_tokens, 4, device=residual.device, dtype=torch.float32)
-    post_mix = torch.empty_like(pre_mix)
-    comb_mix = torch.empty(num_tokens, 16, device=residual.device, dtype=torch.float32)
-    layer_input = torch.empty(
-        num_tokens, hidden_size, device=residual.device, dtype=torch.bfloat16
-    )
-
-    mhc_prefill_project_hc4(
-        residual,
-        fn,
-        projection,
-        square_sum,
-        n_splits=n_splits,
-        block_m=block_m,
-        block_k=block_k,
-    )
-    mhc_pre_mix_hc4(
-        projection,
-        square_sum,
-        hc_scale,
-        hc_base,
-        pre_mix,
-        post_mix,
-        comb_mix,
-        hidden_size=hidden_size,
-        rms_eps=rms_eps,
-        hc_eps=hc_eps,
-        sinkhorn_iters=sinkhorn_iters,
-        n_splits=n_splits,
-        num_tokens=num_tokens,
-    )
-    mhc_pre_layer_norm_hc4(
-        pre_mix,
-        residual,
-        norm_weight,
-        layer_input,
-        eps=norm_eps,
-    )
-    return layer_input, post_mix.unsqueeze(-1), comb_mix.view(num_tokens, 4, 4)
 
 
 def _mhc_mixes_impl(

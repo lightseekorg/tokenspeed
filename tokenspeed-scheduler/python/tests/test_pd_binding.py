@@ -165,10 +165,12 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
 
 
 @pytest.mark.parametrize("decode_input_tokens", [1, 4])
-def test_remote_admission_passes_partial_prefix_promotion_and_reserves_decode(
+def test_remote_admission_lands_the_state_in_slot_one_and_decodes_in_place(
     decode_input_tokens,
 ):
-    """A History hit without its sliding lookback cannot split a remote landing."""
+    """A History hit without its sliding lookback cannot split a remote landing;
+    the landed state is slot 1 of a two-slot row and every decode writes it in
+    place."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.D
     cfg.prefix_granularity = 4
@@ -191,7 +193,7 @@ def test_remote_admission_passes_partial_prefix_promotion_and_reserves_decode(
         ),
         CacheGroupConfig(
             group_id="state",
-            block_granularity=4,
+            block_granularity=0,
             total_pages=128,
             retention=CacheRetention.FullHistory,
             family=CacheGroupFamily.State,
@@ -243,18 +245,19 @@ def test_remote_admission_passes_partial_prefix_promotion_and_reserves_decode(
     assert list(landing.extend_prefix_lens) == [0]
     assert list(landing.prefill_lengths) == [11]
     assert list(landing.input_lengths) == [11]
+    assert list(landing.state_prefix_cached) == [False]
+    [slot0, slot1] = dict(landing.block_tables)["state"][0]
+    assert slot0 == 0, "no prompt-end checkpoint: nothing to read"
+    assert slot1 > 0, "the peer's state lands in slot 1"
     scheduler.advance(
         ExecutionEvent().add_event(PD.RemotePrefillDoneEvent("next", 200))
     )
 
     # Dispatch the next decode before committing the previous one, as the
-    # runtime does. Crossing token 16 must already own the fifth state block.
+    # runtime does. Every decode step writes the landed slot in place.
     for step in range(10):
-        before = 11 + step
         batch = scheduler.next_execution_plan().forward[0]
-        state = dict(batch.block_tables)["state"][0]
-        output_slot = before // cfg.prefix_granularity
-        assert len(state) > output_slot and state[output_slot] > 0, (before, state)
+        assert list(dict(batch.block_tables)["state"][0]) == [0, slot1], step
         if step > 0:
             complete_decode("next", 200 + step)
     complete_decode("next", 210)

@@ -358,6 +358,7 @@ def test_residual_family_exports_and_modes():
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "pad_gated_residual_projection_weight",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -483,10 +484,6 @@ def _is_blackwell_sm100(platform: PlatformInfo) -> bool:
 
 def _is_blackwell_sm103(platform: PlatformInfo) -> bool:
     return platform.is_blackwell and platform.arch_version == ArchVersion(10, 3)
-
-
-def _is_blackwell_non_sm100(platform: PlatformInfo) -> bool:
-    return platform.is_blackwell and platform.arch_version != ArchVersion(10, 0)
 
 
 def _is_blackwell_plus(platform: PlatformInfo) -> bool:

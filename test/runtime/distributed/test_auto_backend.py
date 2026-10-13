@@ -594,6 +594,17 @@ def test_auto_routes_keep_the_performance_defaults(routing, monkeypatch):
     assert routing.route(Collective.TOKEN_REDUCE_SCATTER, ROWS, GROUP) is Route.MULTIMEM
 
 
+def test_all_gather_takes_the_workspace_exchange_where_it_serves(routing, monkeypatch):
+    _switches(monkeypatch, force=False, invariant=False)
+    gathered = torch.empty(4, 32, dtype=torch.bfloat16)
+    routing._trtllm_ar.lamport_all_gather.return_value = gathered
+    assert routing.all_gather(ROWS, GROUP, -1) is gathered
+    routing._rsag.all_gather.assert_not_called()
+    routing._trtllm_ar.lamport_all_gather.return_value = None
+    assert routing.all_gather(ROWS, GROUP, -1) is routing._rsag.all_gather.return_value
+    routing._rsag.all_gather.assert_called_once_with(ROWS, GROUP, -1)
+
+
 def test_route_never_reads_the_row_count(routing, monkeypatch):
     # A site's route must not move with the batch; only the capacity check
     # inside the multimem all-reduce sees the rows, and it refuses rather

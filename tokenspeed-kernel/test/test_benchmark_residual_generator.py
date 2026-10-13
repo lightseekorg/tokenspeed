@@ -171,6 +171,7 @@ def test_hyperconnection_mix_generator_selection_matches_operation_api(
             hc_count,
             hidden_size,
             lowrank,
+            projection_rows=lowrank + (hc_count if inject else 0),
             weights_independent=True,
         )
     request = BenchmarkRequest(
@@ -194,3 +195,48 @@ def test_hyperconnection_mix_generator_selection_matches_operation_api(
         residual_generator.prepare_hyperconnection_mix(request, None)
 
     assert captured[0] == captured[1]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("inject", [True, False])
+def test_hyperconnection_mix_generator_invokes_with_padded_storage(
+    monkeypatch: pytest.MonkeyPatch, inject: bool
+) -> None:
+    from tokenspeed_kernel.ops import residual as residual_ops
+
+    hc_count, hidden_size, lowrank, tokens = 4, 32, 5, 16
+    projection_rows = lowrank + (hc_count if inject else 0)
+    select = residual_ops.select_gated_residual_mix_kernel
+    selected_weights: list[torch.Tensor] = []
+
+    def capture_selection(normalized, projection_weight, *args, **kwargs):
+        selected_weights.append(projection_weight)
+        return select(normalized, projection_weight, *args, **kwargs)
+
+    monkeypatch.setattr(
+        residual_ops, "select_gated_residual_mix_kernel", capture_selection
+    )
+    request = _request(
+        "hyperconnection_mix",
+        model_profile="qwen38_flash_tp2",
+        tokens=tokens,
+        hc_count=hc_count,
+        hidden_size=hidden_size,
+        lowrank=lowrank,
+        inject=inject,
+    )
+    prepared = residual_generator.prepare_hyperconnection_mix(request, None)
+    mixed, inject_logits = prepared.invocation.invoke()
+
+    assert mixed.shape == (tokens, hidden_size)
+    if inject:
+        assert inject_logits.shape == (tokens, hc_count)
+    else:
+        assert inject_logits is None
+    prepared_weight, invoked_weight = selected_weights
+    assert invoked_weight is prepared_weight
+    assert prepared_weight.shape == (
+        (projection_rows + 7) // 8 * 8,
+        hc_count * hidden_size,
+    )
+    assert torch.count_nonzero(prepared_weight[projection_rows:]) == 0

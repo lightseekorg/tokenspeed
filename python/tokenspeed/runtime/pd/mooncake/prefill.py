@@ -591,16 +591,14 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     key = (fragment.group_id, fragment.field_id)
                     src_segment = local_segments[key]
                     dst_segment = peer_segments[key]
+                    if field_ids is not None and src_segment.field_id not in field_ids:
+                        continue
                     src_base = (
-                        src_ptr
-                        + layout.plan.field_page_byte_offset(src_segment.field_id, 0)
+                        layout.field_address(src_ptr, src_segment.field_id)
                         + fragment.src_byte_offset
                     )
                     dst_base = (
-                        dst_ptr
-                        + dst_cache_layout.plan.field_page_byte_offset(
-                            dst_segment.field_id, 0
-                        )
+                        dst_cache_layout.field_address(dst_ptr, dst_segment.field_id)
                         + fragment.dst_byte_offset
                     )
                     if fragment.rows_per_page == 1:
@@ -632,14 +630,10 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                     ]
                     field_rows.append(
                         (
-                            src_ptr
-                            + layout.plan.field_page_byte_offset(
-                                src_segment.field_id, 0
-                            ),
+                            layout.field_address(src_ptr, src_segment.field_id),
                             src_segment.page_stride_bytes,
-                            dst_ptr
-                            + dst_cache_layout.plan.field_page_byte_offset(
-                                dst_segment.field_id, 0
+                            dst_cache_layout.field_address(
+                                dst_ptr, dst_segment.field_id
                             ),
                             dst_segment.page_stride_bytes,
                             src_segment.payload_bytes,

@@ -39,7 +39,6 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _LAYOUTS,
     _finish_topk,
     _index_topk_outputs,
-    block_maxima,
     block_maxima_with_lengths,
     candidate_scores,
     clean_block_maxima,
@@ -433,10 +432,6 @@ def _hopper_paged_scores(
         capacity,
         64,
     )
-
-
-def _block_maxima(logits, visible):
-    return block_maxima(logits, visible)
 
 
 # V4.1 selects at most 512 rows and at most 2048 candidate blocks per query;

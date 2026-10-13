@@ -107,9 +107,7 @@ decoder layers, excluding draft layers. The automatic split of 93 layers is
 `--pp-layer-partition 24,24,24,21` is another candidate: its first three
 boundaries align with the standard AttnRes blocks and the last stage owns
 fewer target layers alongside context writing and draft execution. Measure
-stage time before choosing a partition for throughput. KDA geometry can
-reduce the effective prefill chunk size to align state checkpoints.
-Startup logs report the effective chunk size.
+stage time before choosing a partition for throughput.
 
 D arguments:
 

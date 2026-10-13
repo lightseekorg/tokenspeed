@@ -327,6 +327,10 @@ class DeviceHandle:
         # The transfer peer's submissions, settled at the next round's
         # execute (see ``_settle``).
         self._transfer_submissions: deque = deque()
+        # The plan's page copies, settled likewise: a copy has no ACK, so a
+        # submission that raised would otherwise vanish with the hitter's
+        # block left unfilled.
+        self._copy_submissions: deque = deque()
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -349,7 +353,11 @@ class DeviceHandle:
         forward thread's default stream before anything else of the plan is
         enqueued; a pinned write-back -- an ordinary publication, whose
         sources the scheduler holds until the ACK -- rides the write stream
-        and fences nothing), then page zeroing (the new owner's
+        and fences nothing), then the Device-to-Device block copies
+        (``pages_to_copy``: a prefix hit's private copy of the block holding
+        its boundary, an owner's move off the block it just published; the
+        source may be re-granted by this very plan, so the copy precedes the
+        zeroing), then page zeroing (the new owner's
         sanitization), then the L3 prefetches (``PrefetchOp``: a waiting
         request's Host pages filled from L3 on a CPU lane -- no stream, no
         Device page, acknowledged after the replica converges on the landed
@@ -391,6 +399,11 @@ class DeviceHandle:
             "PD transfer submission failed on the data plane; it produces no "
             "transfer event, so its request would hang silently",
         )
+        _settle(
+            self._copy_submissions,
+            "page copy submission failed on the data plane; it has no "
+            "completion event, so the destination block would stay unfilled",
+        )
 
         executor = self._executor
         cache_ops = cache_ops_from_plan(execution_plan)
@@ -410,7 +423,28 @@ class DeviceHandle:
                     )
                 )
             )
-        pages = execution_plan.pages_to_zero
+        # Between the stores and the zeroing: a copy's source may be a block
+        # this plan re-grants (and zeroes); its destination is already in the
+        # hitter's table and is never zeroed. Stream order on the default
+        # stream, behind the execution stream, is the whole argument.
+        copies = {
+            group_id: pairs
+            for group_id, pairs in execution_plan.pages_to_copy_arrays().items()
+            if len(pairs)
+        }
+        if copies:
+            self._copy_submissions.append(
+                self._thread.submit(lambda: executor.copy_cache_pages(copies))
+            )
+        # The plan lists every group, empty or not; only groups with pages
+        # are work. An empty submission per idle round would flood the FIFO
+        # faster than the data plane drains it, starving the real work
+        # queued behind (a D role's remote-prefill receive).
+        pages = {
+            group_id: page_ids
+            for group_id, page_ids in execution_plan.pages_to_zero.items()
+            if len(page_ids)
+        }
         zero_future = (
             self._thread.submit(lambda: executor.zero_cache_pages(pages))
             if pages
@@ -622,18 +656,27 @@ class DeviceHandle:
             self._l2.set_l3_weight_version(weight_version)
 
     def shutdown_cache(self) -> None:
-        """Join queued cache submissions, then close the Host cache (L2/L3, pool)."""
+        """Join every queued data-plane submission, then close the Host cache.
 
-        if self._l2 is None:
-            return
+        A cache plan, a PD transfer or a page copy the last round queued is
+        settled by the next round's execute or poll; at shutdown there is no
+        next round, so they are joined here and the first failure re-raised
+        after the Host cache (L2/L3, pool) is closed.
+        """
         errors = []
-        while self._l2_submissions:
-            future = self._l2_submissions.popleft()
-            try:
-                future.result()
-            except BaseException as exc:  # noqa: BLE001 — surface after close
-                errors.append(exc)
-        self._thread.run(self._l2.shutdown)
+        for submissions in (
+            self._l2_submissions,
+            self._transfer_submissions,
+            self._copy_submissions,
+        ):
+            while submissions:
+                future = submissions.popleft()
+                try:
+                    future.result()
+                except BaseException as exc:  # noqa: BLE001 — surface after close
+                    errors.append(exc)
+        if self._l2 is not None:
+            self._thread.run(self._l2.shutdown)
         if errors:
             raise errors[0]
 
@@ -1201,13 +1244,10 @@ def build_device_side(
     and persistent communication buffers must be prepared after weights are
     loaded and before ``create_attn_components`` profiles memory for the KV
     budget (the EPD receive pool, which the admission allocates later, is left
-    out of that budget instead), and the chunked-prefill limit must be aligned
-    to the cache groups before ``ModelExecutorConfig`` sizes the input buffers
-    from it.
+    out of that budget instead).
 
     Args:
-        server_args: Parsed server arguments. ``chunked_prefill_size`` may
-            be lowered here to the cache-group checkpoint grain.
+        server_args: Parsed server arguments.
         model_config: The target model's config.
         draft_model_config: The draft model's config, or None.
         gpu_id: Local device index.
@@ -1228,10 +1268,7 @@ def build_device_side(
     """
     # Imported here: these pull in the model/backend registries, which
     # import execution types — a module-level import would cycle.
-    from tokenspeed.runtime.engine.scheduler_utils import (
-        aligned_max_scheduled_tokens,
-        log_gpu_memory_summary,
-    )
+    from tokenspeed.runtime.engine.scheduler_utils import log_gpu_memory_summary
     from tokenspeed.runtime.execution.factory import (
         ModelExecutorConfig,
         _eagle_aux_layer_ids,
@@ -1243,6 +1280,7 @@ def build_device_side(
         DriverMemoryDeltaObserver,
     )
     from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
+    from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
@@ -1335,22 +1373,6 @@ def build_device_side(
         reuse_draft_backend=None,
     )
     views = pool_views(attention)
-    # Lowering the limit is safe; a configured chunk smaller than one
-    # state checkpoint block is rejected by aligned_max_scheduled_tokens
-    # instead of silently increasing a frozen buffer limit.
-    if server_args.enable_prefix_caching:
-        aligned = aligned_max_scheduled_tokens(
-            server_args.chunked_prefill_size, views.cache_groups
-        )
-        if aligned != server_args.chunked_prefill_size:
-            logger.warning(
-                f"chunked_prefill_size={server_args.chunked_prefill_size!s} is not a "
-                "multiple of the "
-                f"state-snapshot checkpoint grain; using {aligned!s} so recurrent-state"
-                " "
-                "pages can register for prefix-cache reuse.",
-            )
-            server_args.chunked_prefill_size = aligned
 
     # On CUDA, what startup keeps resident after the probe build joins the reserve.
     startup_memory = (
@@ -1364,7 +1386,7 @@ def build_device_side(
             config=ModelExecutorConfig.from_server_args(
                 server_args=server_args,
                 model_config=model_config,
-                max_req_pool_size=max_batch_size + 1,
+                max_req_pool_size=RequestSlotLayout(max_batch_size).padding,
                 gpu_id=gpu_id,
                 global_rank=global_rank,
                 prefix_granularity=views.cache_geometry.prefix_granularity,

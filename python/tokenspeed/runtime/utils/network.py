@@ -55,19 +55,6 @@ def get_free_port():
             return s.getsockname()[1]
 
 
-def set_uvicorn_logging_configs():
-    from uvicorn.config import LOGGING_CONFIG
-
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
-    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
-    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-
-
 def get_local_ip_by_remote() -> str | None:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:

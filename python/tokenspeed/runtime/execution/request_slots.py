@@ -18,30 +18,25 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Selection helpers for scheduler-exported per-group block tables."""
+"""Request-pool geometry shared by cache sizing and executor construction."""
 
-from __future__ import annotations
-
-
-def select_block_table(forward_op, group_id: str | None = None):
-    tables = forward_op.block_tables_arrays()
-    if group_id is not None:
-        if group_id not in tables:
-            raise ValueError(
-                f"history_group_id {group_id!r} is missing from block tables "
-                f"{sorted(tables)}"
-            )
-        return tables[group_id]
-    if len(tables) != 1:
-        raise ValueError(
-            "history_group_id is required when the scheduler exports "
-            f"{len(tables)} block tables"
-        )
-    return next(iter(tables.values()))
+from dataclasses import dataclass
 
 
-def unpadded_block_table_row(table, row_index: int) -> list[int]:
-    row = list(table[row_index])
-    if -1 in row:
-        row = row[: row.index(-1)]
-    return row
+@dataclass(frozen=True)
+class RequestSlotLayout:
+    """C++ owns 1..max_requests; zero and padding never own requests."""
+
+    max_requests: int
+
+    def __post_init__(self):
+        if type(self.max_requests) is not int or self.max_requests <= 0:
+            raise ValueError("request capacity must be a positive integer")
+
+    @property
+    def padding(self) -> int:
+        return self.max_requests + 1
+
+    @property
+    def capacity(self) -> int:
+        return self.padding + 1
