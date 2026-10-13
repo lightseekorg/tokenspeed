@@ -863,9 +863,14 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
 
     while (true) {
         VictimChoice choice = chooseVictim(candidates, /*ignore_exemption=*/false);
-        const bool empty_round = choice.victim == nullptr && build.operations.empty() &&
-                                 build.snapshot_restores.empty() && build.remote_prefill.empty() &&
-                                 build.remote_decode.empty();
+        // A finished request whose last forward is still out frees its pages
+        // when that forward lands (settleFinishedRequests), so a round that
+        // waits for it is not empty either.
+        const bool empty_round =
+            choice.victim == nullptr && build.operations.empty() && build.snapshot_restores.empty() &&
+            build.remote_prefill.empty() && build.remote_decode.empty() &&
+            std::ranges::none_of(requests_,
+                                 [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Finishing>(); });
         if (empty_round) {
             // Nothing is retractable under the exemption and the round runs
             // nothing: the empty-round retraction (docs/design/scheduler.md §2).

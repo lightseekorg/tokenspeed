@@ -635,7 +635,9 @@ the exemption and the round built nothing — no forward, restore, remote
 prefill or decode — no completion of it can free capacity, so the choice is
 repeated with the exemption dropped. A round that runs anything keeps the
 exemption: that work moves toward completions that free capacity without a
-retraction. The empty-round retraction changes who may be chosen and where
+retraction. So does a round in which a finished request still waits for its
+last forward (`Finishing`, §1.2): its pages come back when that forward
+lands. The empty-round retraction changes who may be chosen and where
 the freed pages go first; the quiescence checks, the global gates and the
 abort of a victim whose image does not fit still apply. The round ran
 nothing, so none of its decodes got a page, and they are offered the freed
@@ -1153,10 +1155,12 @@ lands in the same change as the pin, never a release apart.
   new prompts for the round, and never triggers retraction (4).
 - A request whose admission prepaid the generation budget open at that
   admission is never a victim (2) in a round that builds a forward, restore,
-  remote prefill or remote decode; with the
+  remote prefill or remote decode, or waits for a finished request's last
+  forward; with the
   fresh-admission prepay this bounds such retraction to requests whose
   `max_new_tokens` exceeds one safe-step window (or is undeclared). Spending
   a partial reserve never makes it qualify: the
   exemption is judged against the budget open at admission, not the current
   remainder (4). Only the empty-round retraction (2), in a round that builds
-  nothing, retracts or aborts an exempt request.
+  nothing and waits for no finished request, retracts or aborts an exempt
+  request.

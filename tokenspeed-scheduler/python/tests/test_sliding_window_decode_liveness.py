@@ -331,12 +331,10 @@ class TestSlidingWindowDecodeLiveness:
         publishing the completed prompt pages still dedupes identical ones
         onto a single shared page. Unfixed: eight requests sharing a 96-token
         prefix stall with the pool full, 7 decoding and 1 waiting. Fixed: the
-        empty-round retraction retracts an exempt request and its pages go to
+        empty-round retraction retracts one exempt request and its pages go to
         the other blocked decodes, not to the waiting prompt, which would need
-        three victims at once. A second one follows in a round where three
-        finished requests still hold their pages until their last rows land.
-        The bound on retractions keeps that from turning into retract/restore
-        churn."""
+        three victims at once; the bound on retractions keeps that from turning
+        into retract/restore churn."""
         result = _run_closed_loop(
             64,
             num_requests=8,
@@ -347,7 +345,7 @@ class TestSlidingWindowDecodeLiveness:
             prefix_cache=False,
         )
         assert result["outcome"] == "done", result
-        assert result["retractions"] <= 2, result
+        assert result["retractions"] <= 1, result
         assert result["active"] == 0, result
 
     @pytest.mark.parametrize(
