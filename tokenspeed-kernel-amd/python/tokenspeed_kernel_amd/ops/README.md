@@ -38,6 +38,11 @@ Keep an explicit `gl.barrier()` only where the compiler cannot see the hazard:
   re-reading a global buffer other threads just wrote. Say what the barrier
   orders in a comment.
 
+On CDNA, use `tokenspeed_kernel_amd._synchronization.wait_vmcnt_zero()`
+to wait for a subgroup's VM_CNT counter to reach zero before publication.
+It includes a compiler memory clobber; workgroup barriers and cache visibility
+remain with the caller.
+
 Iris push collectives also keep explicit workgroup barriers around their
 cross-rank publication protocol. The VMEM drain and system-scope atomics order
 one subgroup's traffic, but the barriers join all producer subgroups before

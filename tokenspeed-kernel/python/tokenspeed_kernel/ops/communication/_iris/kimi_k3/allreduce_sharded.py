@@ -25,11 +25,9 @@ import math
 import torch
 from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.communication._iris import allocation_bytes
-from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-    ProducerPull,
-    _iris_drain_subgroup_vmem,
-)
+from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerPull
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel_amd._synchronization import wait_vmcnt_zero
 
 REDUCE_PROGRAMS = 24
 GATHER_PROGRAMS = 128
@@ -46,7 +44,7 @@ def _row_partition_store_completion(
     NUM_WARPS: gl.constexpr,
 ):
     """Finish local stores, publish the epoch, and wait for peer completion."""
-    _iris_drain_subgroup_vmem()
+    wait_vmcnt_zero()
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)

@@ -46,7 +46,7 @@ def _require_iris():
     "operation,has_residual", (("reduce", False), ("reduce", True), ("gather", False))
 )
 def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
-    """Runtime rows must preserve vector payload traffic, including tail tiles."""
+    """Preserve vector payload traffic and publication ordering for runtime rows."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
         iris_k3attn_pull_scatter,
@@ -102,6 +102,14 @@ def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
             sum("buffer_store_dwordx4" in line and "sc0 sc1" in line for line in lines)
             == 8
         )
+        # Every producer subgroup must drain and join before publishing flags.
+        payload_end = assembly.rindex("\tbuffer_store_dwordx4")
+        publish = assembly.index("\tglobal_store_dword", payload_end)
+        publication = assembly[payload_end:publish]
+        drain = publication.index("\ts_waitcnt vmcnt(0)")
+        join = publication.index("\ts_barrier")
+        assert drain < join
+        assert "s_and_saveexec" not in publication[:join]
     assert not re.search(r"\bbuffer_(?:load_ushort|store_short)\b", assembly)
 
 

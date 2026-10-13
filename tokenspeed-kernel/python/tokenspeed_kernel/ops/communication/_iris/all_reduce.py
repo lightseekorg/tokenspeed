@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.communication.iris import (
     producer_direct_all_reduce_can_run,
 )
 from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel_amd._synchronization import wait_vmcnt_zero
 
 hip_utils = triton.language.extra.hip.utils
 
@@ -991,7 +992,7 @@ def _iris_sync_rank_token(
         sem="acquire",
         scope="sys",
     )
-    _iris_drain_subgroup_vmem()
+    wait_vmcnt_zero()
     # The acquire is subgroup-local. Keep every subgroup at the protocol
     # boundary until all of them have observed the peer publications; the
     # caller consumes the peer inbox immediately after this helper returns.
