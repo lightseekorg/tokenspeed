@@ -51,6 +51,7 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
 from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
+    count_dspark_stages,
     read_checkpoint_block_size,
     resolve_block_widths,
     validate_block_widths,
@@ -549,11 +550,6 @@ class ModelConfig:
             and resolve_architecture(self.hf_config)
             in ("DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark")
         ):
-            from tokenspeed.runtime.models.deepseek_v4_dspark import (
-                DEFAULT_DSPARK_WINDOW_SIZE,
-                count_dspark_stages,
-            )
-
             if self.spec_block_size is None:
                 raise ValueError(
                     "DSPARK same-checkpoint decoding requires the checkpoint to "
@@ -563,7 +559,7 @@ class ModelConfig:
                 getattr(
                     self.hf_text_config,
                     "dspark_window_size",
-                    DEFAULT_DSPARK_WINDOW_SIZE,
+                    128,
                 )
             )
             if dspark_window_size <= 0:
