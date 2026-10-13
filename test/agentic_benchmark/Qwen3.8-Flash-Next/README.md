@@ -125,11 +125,11 @@ python3 test/agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed/collect_outputs.py 
 The manual CI task is
 `test/ci/perf/qwen3.8-flash-next-nvfp4-tp4ep4-evalscope-agentic.yaml`.
 It uses the same server config, setup and benchmark scripts, and emits the CSV
-recognized by the CI GitHub step summary. Select it in K8s Dispatch with the
-`gb200` runner pool or in Slurm Dispatch. At each of the six concurrency levels,
+recognized by the CI GitHub step summary. Select this YAML in Slurm Dispatch
+with cluster `gb300`. It uses one node with four GPUs (`slurm-gb300-4gpu`).
+At each of the six concurrency levels,
 both `Latency (tps/user)` and `Output Throughput (tok/min/gpu)` must reach
 90% of their `perf_reference` values (`perf_threshold: 0.9`).
 The initial references use the four-GPU SM103 measurements in
 [#2216](https://github.com/lightseekorg/tokenspeed/pull/2216), converting output
-throughput to tokens per minute per GPU. They need recalibration on the
-configured GB200 runner.
+throughput to tokens per minute per GPU.
