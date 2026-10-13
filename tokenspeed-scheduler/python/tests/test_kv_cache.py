@@ -379,7 +379,7 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     _finish(scheduler, "r")
     scheduler.next_execution_plan()
     # Every token but the last sampled one was computed when r finished.
-    finish_frontier = scheduler_tokens = (
+    finish_frontier = (
         prompt_tokens + 1 + visible_tokens * (1 if finish_after_first_decode else 2) - 1
     )
 
