@@ -302,6 +302,9 @@ def gdn_decode_step(
         q: Query tensor shaped ``[B, 1, num_q_heads, head_dim]``.
         k: Key tensor shaped ``[B, 1, num_q_heads, head_dim]``.
         v: Value tensor shaped ``[B, 1, num_v_heads, head_v_dim]``.
+            q/k/v may be row-strided views with contiguous heads, which only
+            kernels declaring the ``strided_qkv`` trait accept (see
+            ``gdn_decode_supports``).
         A_log: Floating-point log decay parameter shaped ``[num_v_heads]``.
             Backends that require FP32 normalize it internally.
         a: Input-dependent decay shaped ``[B, 1, num_v_heads]``.
@@ -326,11 +329,14 @@ def gdn_decode_step(
     """
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
+    traits = {"head_dim": head_dim}
+    if not all(t.is_contiguous() for t in (q, k, v)):
+        traits["strided_qkv"] = True
     kernel = select_kernel(
         "attention",
         "gdn_decode_step",
         signature,
-        traits={"head_dim": head_dim},
+        traits=traits,
         solution=solution,
         override=override,
     )
@@ -463,7 +469,7 @@ def gdn_decode_mtp(
             place and stage its per-token states elsewhere. Requires
             ``output_state_indices``; only kernels declaring the
             ``separate_output_state`` trait accept it (see
-            ``gdn_decode_mtp_supports``).
+            ``gdn_decode_supports``).
         tree_ancestors: Optional contiguous int64 ``[B, T]`` draft-tree
             ancestor-or-self bitmask, ``T <= 64``: bit ``s`` of row ``t`` is
             set when step ``s`` is ``t`` or one of its ancestors, and ancestors
@@ -649,21 +655,24 @@ def validate_replay_commit_setup(
         )
 
 
-def gdn_decode_mtp_supports(
+def gdn_decode_supports(
+    op: str,
     dtype: torch.dtype,
     *,
     head_dim: int,
     trait: str,
     solution: str | None,
 ) -> bool:
-    """Whether the kernel ``gdn_decode_mtp`` selects by default also accepts a
+    """Whether the kernel a GDN decode op selects by default also accepts a
     feature, so a caller can use it without changing the selected kernel.
 
     Args:
-        dtype: q/k/v dtype of the verify.
+        op: ``"gdn_decode_step"`` or ``"gdn_decode_mtp"``.
+        dtype: q/k/v dtype.
         head_dim: Key head dimension.
         trait: ``"separate_output_state"`` (an ``output_state`` pool) or
-            ``"strided_qkv"`` (non-contiguous q/k/v views with contiguous heads).
+            ``"strided_qkv"`` (non-contiguous q/k/v views with contiguous
+            heads; such kernels read a/b by stride too).
         solution: The solution the caller forces, or ``None``.
 
     Returns:
@@ -675,14 +684,14 @@ def gdn_decode_mtp_supports(
     try:
         default = select_kernel(
             "attention",
-            "gdn_decode_mtp",
+            op,
             signature,
             traits={"head_dim": head_dim},
             solution=solution,
         )
         featured = select_kernel(
             "attention",
-            "gdn_decode_mtp",
+            op,
             signature,
             traits={"head_dim": head_dim, trait: True},
             solution=solution,
@@ -884,7 +893,7 @@ __all__ = [
     "gdn_chunk_prefill_capturable",
     "gdn_decode_step",
     "gdn_decode_mtp",
-    "gdn_decode_mtp_supports",
+    "gdn_decode_supports",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
     "gdn_tree_verify_needs_node_states",

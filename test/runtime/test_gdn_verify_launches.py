@@ -42,11 +42,10 @@ from tokenspeed_kernel.ops.attention.gdn import flashinfer as gdn
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
 
-pytestmark = pytest.mark.skipif(
+
+@pytest.mark.skipif(
     not gdn.is_decode_available(), reason="FlashInfer GDN MTP requires SM90+"
 )
-
-
 @pytest.mark.parametrize("batch", [1, 8])
 @pytest.mark.parametrize("replay_ssm", [False, True])
 @pytest.mark.parametrize("cuda_graph", [False, True])
@@ -175,8 +174,9 @@ def test_verify_has_no_elementwise_launches(
 @pytest.mark.parametrize("steps", [1, 3])
 def test_gdn_backend_reads_projection_views_like_dense_inputs(steps: int) -> None:
     """Plain decode and chain verify pack the model's row-strided projection
-    views (here with a misaligned ``a``) for FlashInfer's kernels: outputs and
-    states match dense inputs bit for bit."""
+    views (here with a misaligned ``a``) for FlashInfer's kernels, or hand them
+    to kernels that read by stride: outputs and states match dense inputs bit
+    for bit."""
     from tokenspeed.runtime.layers.attention.backends.state.gdn import GdnAttnBackend
 
     torch.manual_seed(5)

@@ -52,7 +52,10 @@ if current_platform().is_amd:
             ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
         ),
         priority=Priority.SPECIALIZED,
-        traits={"head_dim": frozenset({128})},
+        traits={
+            "head_dim": frozenset({128}),
+            "strided_qkv": frozenset({False, True}),
+        },
     )
     def gluon_gdn_decode_step_gfx950(
         q: torch.Tensor,

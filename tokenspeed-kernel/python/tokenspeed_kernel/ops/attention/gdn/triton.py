@@ -547,6 +547,7 @@ def _launch_fused_gdn_decode_update(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
+    traits={"strided_qkv": frozenset({False, True})},
 )
 def triton_gdn_decode_step(
     q: torch.Tensor,

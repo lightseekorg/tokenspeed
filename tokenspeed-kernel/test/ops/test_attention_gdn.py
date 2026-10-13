@@ -1351,13 +1351,21 @@ def test_flashinfer_mtp_preserves_fp16_output_dtype(device: str, require) -> Non
 
 
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
-@pytest.mark.parametrize("steps", [1, 3])
+@pytest.mark.parametrize(
+    ("op", "steps"),
+    [("gdn_decode_step", 1), ("gdn_decode_mtp", 1), ("gdn_decode_mtp", 3)],
+)
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 def test_gdn_packed_decode_inputs(
-    device: str, solution: str, steps: int, state_dtype: torch.dtype, require
+    device: str,
+    solution: str,
+    op: str,
+    steps: int,
+    state_dtype: torch.dtype,
+    require,
 ):
     """Packed QKV and strided scalar gates must match the independent oracle."""
-    require("attention", "gdn_decode_mtp", solution, torch.bfloat16, "q")
+    require("attention", op, solution, torch.bfloat16, "q")
     batch, heads, value_heads, dim = 4, 4, 12, 128
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
         device=device,
@@ -1387,7 +1395,7 @@ def test_gdn_packed_decode_inputs(
     packed = torch.cat([x.flatten(2) for x in (q, k, v)], dim=-1)
     q, k, v = packed.split([heads * dim, heads * dim, value_heads * dim], dim=-1)
     gates = torch.stack((a, b), dim=-1)
-    actual = gdn_decode_mtp(
+    inputs = dict(
         q=q.view(batch, steps, heads, dim),
         k=k.view(batch, steps, heads, dim),
         v=v.view(batch, steps, value_heads, dim),
@@ -1399,13 +1407,19 @@ def test_gdn_packed_decode_inputs(
         initial_state_indices=reads,
         scale=dim**-0.5,
         use_qk_l2norm=True,
-        disable_state_update=False,
-        intermediate_states_buffer=None,
         output_state_indices=None,
         solution=solution,
         override=None,
-        tree_ancestors=None,
     )
+    if op == "gdn_decode_step":
+        actual = gdn_decode_step(**inputs)
+    else:
+        actual = gdn_decode_mtp(
+            **inputs,
+            disable_state_update=False,
+            intermediate_states_buffer=None,
+            tree_ancestors=None,
+        )
     torch.testing.assert_close(
         actual.float(), expected.to(actual.dtype).float(), rtol=2e-2, atol=2e-2
     )
