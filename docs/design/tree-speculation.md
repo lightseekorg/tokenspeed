@@ -44,7 +44,7 @@ payload packing).
 
 Node `i` of a request's verify window has RoPE position `vc + depth[i]` and KV
 slot `write_locations[b * N + i]`. Only positions change for a tree:
-`TreeSpec.depth_positions` shifts the window's `vc + i` to `vc + depth` before
+`TreeSpec.load_step` shifts the window's `vc + i` to `vc + depth` before
 the forward, and `TreeSpec.compact_rows` shifts them back after the forward
 (row `i` then holds the path node at depth `i`).
 
