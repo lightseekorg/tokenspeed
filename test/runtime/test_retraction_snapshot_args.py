@@ -279,7 +279,9 @@ def test_describe_states_the_pool_or_that_capacity_blocks_abort():
     sizing = _resolve(_request(ratio=0.25), l2_tier=True)
     line = sizing.describe(host_lcm_block_bytes=BLOCK, blob_bytes=250_000, l2_tier=True)
     assert "0.01 GB (10 LCM blocks" in line
-    assert "up to 8 retracted requests (2.00 MB slot-state arena)" in line
+    # Blob slots are numbered from 1, so the arena carries one row per slot
+    # plus the unused row 0.
+    assert "up to 8 retracted requests (2.25 MB slot-state arena)" in line
     assert "tails to the pool" in line
 
 
