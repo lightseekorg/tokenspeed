@@ -1557,7 +1557,7 @@ The contract a model (in tree or a plugin) implements:
   head on the batch's `[bs, hidden]` rows, so the vocab all-gather is the
   TP one. The group of both gathers is the processor's TP group: the LM
   head is vocab-sharded over it, every rank of it must end with the same
-  rows, and `validate_qcp` makes the query shard group exactly that group
+  rows, and the mapping makes the query shard group exactly that group
   (`qcp_size == attn_tp_size`); the processor refuses a plan of another
   width. The processor is the only caller of `gather_sampled_rows`
   (`CommManager` has no sampled-row leg: `needs_final_all_gather` is False
