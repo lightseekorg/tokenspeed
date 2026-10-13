@@ -126,12 +126,15 @@ def test_mtp_shares_complete_quantized_lm_head(monkeypatch, tied):
     assert should_apply_lm_head_quant_method(draft.lm_head, draft.lm_head.quant_method)
 
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="qwen3_5", vocab_size=4)
+        config=SimpleNamespace(model_type="qwen3_5", vocab_size=4),
+        dp_lm_head_tp=False,
     )
     hidden_states = torch.ones((1, 4), dtype=torch.bfloat16)
-    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     with mock.patch("torch.matmul", side_effect=AssertionError("dense fallback")):
-        logits = processor._get_logits(hidden_states, draft.lm_head, metadata)
+        logits = processor._get_logits(
+            hidden_states, draft.lm_head, metadata, require_full_vocab=False
+        )
 
     torch.testing.assert_close(logits, expected_logits)
     target_lm_head.quant_method.apply.assert_called_once_with(

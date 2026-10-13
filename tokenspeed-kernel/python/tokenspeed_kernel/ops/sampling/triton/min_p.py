@@ -66,7 +66,7 @@ def _gumbel_sample_min_p_pool_kernel(
         cols = start + offsets
         mask = cols < vocab_size
         vals = tl.load(
-            logits_ptr + row * logits_row_stride + cols,
+            logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
             mask=mask,
             other=float("-inf"),
         ).to(tl.float32)
@@ -86,7 +86,7 @@ def _gumbel_sample_min_p_pool_kernel(
         cols = start + offsets
         mask = cols < vocab_size
         vals = tl.load(
-            logits_ptr + row * logits_row_stride + cols,
+            logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
             mask=mask,
             other=float("-inf"),
         ).to(tl.float32)
@@ -196,7 +196,7 @@ def _min_p_local_max_kernel(
         tl.load(temperature_pool_ptr + pool_idx).to(tl.float32), 1.0e-20
     )
     vals = tl.load(
-        logits_ptr + row * logits_row_stride + cols,
+        logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
@@ -260,7 +260,7 @@ def _min_p_local_gumbel_kernel(
     rng_seed = tl.randint(seed, step_offset)
 
     vals = tl.load(
-        logits_ptr + row * logits_row_stride + cols,
+        logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)

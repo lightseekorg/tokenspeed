@@ -60,12 +60,15 @@ public:
     using CacheMutationSink = std::function<void(const CacheKey&, CacheMutation)>;
 
     // The Host pool is available to explicit tier operations. Streaming controls
-    // whether ordinary Device prefix publication also feeds the Host tier.
-    // enable_l3_storage, host_pool, and stream_device_cache_to_host have no
-    // defaults: a four-argument call would convert a Host-pool pointer to
-    // bool and silently disable L2 instead of failing to compile.
+    // whether ordinary Device prefix publication also feeds the Host tier. The
+    // snapshot pool holds retracted requests' private KV images (Snapshot /
+    // Restore); nullptr means the engine never retracts. enable_l3_storage,
+    // host_pool, snapshot_pool and stream_device_cache_to_host have no
+    // defaults: a shorter call would convert a pool pointer to bool and
+    // silently disable a tier instead of failing to compile.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
-                     bool enable_l3_storage, BlockPool* host_pool, bool stream_device_cache_to_host);
+                     bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
+                     bool stream_device_cache_to_host);
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
     std::int32_t PrefixGranularity() const noexcept { return prefix_granularity_; }
@@ -134,7 +137,15 @@ public:
 
         std::vector<std::vector<CacheKey>> group_keys;
         Tier device;
+        // Entries the Host tier holds beyond the Device hit. Admission loads
+        // these; nothing an admission touches can miss.
         Tier host;
+        // L3 only: the prefix the storage shadow (keys known to exist in the
+        // remote store) extends beyond the Host hit, matched by the same
+        // matchers over "Host-cached or registered". Never admitted directly:
+        // PlanPrefetch turns it into a pre-admission Host fill, after which
+        // it is an ordinary Host hit. Empty without L3.
+        Tier storage;
     };
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
@@ -142,9 +153,16 @@ public:
         // Longer prefix-closed coverage worth materializing for non-closed groups.
         std::int32_t promotion_boundary_tokens{0};
         std::uint64_t access_epoch{0};
+        // Host L2 -> Device copies: an admission's Host prefix hits (unkeyed;
+        // their Device destinations are published at admission), or a
+        // restore's published slots (keyed, re-published at the ACK).
         std::vector<BlockTransfer> load_pairs;
+        // Restore only: snapshot pool -> Device copies of the private slots.
+        std::vector<BlockTransfer> snapshot_pairs;
         // Fresh device child pages appended by ordinary Acquire, aligned by
-        // group_id. Cache hits and host-loaded destinations are excluded.
+        // group_id, for the plan to zero. Cache hits and copy destinations
+        // (Host hits, a restore's rebuilt slots) are excluded: the copy fills
+        // them whole.
         std::vector<std::vector<std::int32_t>> new_page_ids;
     };
 
@@ -155,6 +173,33 @@ public:
     // request. Once commit starts, an internal plan/pool mismatch is fatal
     // because partial commit is not rolled back.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
+
+    // One L3 object to fetch into a Host block, in prefix order. page_index
+    // is the prompt's prefix page the row belongs to, so the runtime can turn
+    // the rows that landed into a landed prefix-page count.
+    struct PrefetchRow {
+        std::uint32_t group_id{0};
+        CacheKey key{};
+        CacheBlockRef host_block;
+        std::int32_t page_index{0};
+    };
+    // The Host fill an L3-extended probe calls for: rows in prefix-page order
+    // (every group's rows of a page before the next page's), so a landed
+    // prefix length maps to a row prefix; page_row_ends[i] is the row count
+    // covering the first i + 1 prefetched pages.
+    struct PrefetchPlan {
+        std::vector<PrefetchRow> rows;
+        std::vector<std::size_t> page_row_ends;
+        std::int32_t first_page{0};  // prefix page index the fill starts at (the Host hit's end)
+    };
+    // Acquires a Host block for every storage-tier hit of `probe` beyond its
+    // Host hit, page by page, stopping at the first page a block cannot be
+    // had for (the pages before it stay); nullopt -- holding nothing -- when
+    // fewer than min_pages whole pages could be planned, so the request
+    // admits normally and computes them. Keys already Host-cached need no
+    // row. Mutates nothing but the Host allocation (which may evict unpinned
+    // entries).
+    std::optional<PrefetchPlan> PlanPrefetch(const PrefixProbe& probe, std::int32_t min_pages);
     // Decode-side PD reuses local history pages, while final-state groups are
     // restored from the remote endpoint snapshot. Their aligned null holes do
     // not count as cache hits.
@@ -167,6 +212,77 @@ public:
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch);
+
+    // The data slots of a retracted request are the non-null slots covering
+    // [0, num_tokens) in every group -- the unaligned tail block included;
+    // reserve blocks beyond are not imaged, a restore re-reserves them. The
+    // geometry turns num_tokens into each group's slot count here, so the
+    // allocator stays token-free.
+    //
+    // Those data slots whose Device block is a published prefix entry, with
+    // the key it is published under: they can ride Host L2 as that entry
+    // (ImageSlot::block is the Device block here; the transfer manager
+    // swaps in the Host block). Everything else goes to the snapshot pool.
+    std::vector<std::vector<ImageSlot>> PublishedDataSlots(std::span<const BlockTable> tables,
+                                                           std::int32_t num_tokens) const;
+    // The same slots once `progress` has been published as well: the entries
+    // that exist now plus the slots CacheCompletedBlocks(progress) would
+    // register (the single publication rule, completedBlockRanges). The
+    // victim probe reads the image's L2/pool split off this before the
+    // retraction publishes, so it sees exactly what StartRetractionStores
+    // will see afterwards. Without completed pages it is PublishedDataSlots.
+    std::vector<std::vector<ImageSlot>> PublishedDataSlotsAfter(std::span<const BlockTable> tables,
+                                                                std::int32_t num_tokens,
+                                                                const RequestProgress& progress) const;
+
+    // A retracted request's KV image plus the Device -> snapshot-pool copies
+    // that fill its snapshot-pool slots. The pairs pin the Device sources
+    // only until the caller resolves them into a wire op; the image's
+    // references keep the Host blocks for as long as the request may be
+    // restored.
+    struct ImageTaken {
+        RetractionImage image;
+        std::vector<BlockTransfer> store_pairs;
+    };
+    // Images every data slot not already served by Host L2 (host_cached_slots,
+    // per group, each with its pinned Host block) into the snapshot pool, in
+    // the bucket of the Device block it images, and merges both legs into
+    // one shape per group. Returns nullopt without any mutation when the pool
+    // cannot place some group's bucket demand (or no snapshot pool exists):
+    // the probe over every group precedes the first acquisition.
+    std::optional<ImageTaken> TakeImage(std::span<const BlockTable> tables, std::int32_t num_tokens,
+                                        std::span<const std::vector<ImageSlot>> host_cached_slots);
+    // TakeImage's fit probe alone, no mutation: whether the snapshot pool
+    // holds every data slot of [0, num_tokens) that host_served_slots (per
+    // group, by slot_index and key; the blocks are not read) does not cover.
+    // The victim policy asks this before choosing a victim.
+    bool SnapshotPoolHolds(std::span<const BlockTable> tables, std::int32_t num_tokens,
+                           std::span<const std::vector<ImageSlot>> host_served_slots) const;
+    // Slots covering [0, num_tokens) of a table and the capacity left inside
+    // the last of them.
+    struct DataSpan {
+        std::int32_t blocks{0};
+        std::int32_t tail_tokens{0};
+    };
+    // Rebuilds every group's table from its image -- identical block count,
+    // null holes, tail capacity and reclaimed prefix, one fresh Device block
+    // per imaged slot in the imaged bucket -- and then admits `demands` on
+    // the rebuilt tables (a dense growth, normally zero, plus each group's
+    // reserve) inside the same AdmissionPlanner pass, so cache-only blocks
+    // are evicted exactly as for an admission and a failed restore leaves
+    // nothing allocated. load_pairs carries the Host L2 -> Device copies
+    // (keyed, like an ordinary prefix load-back), snapshot_pairs the snapshot
+    // pool -> Device copies, new_page_ids only the reserve pages appended
+    // beyond the imaged shape (the copies fill their destinations whole, so
+    // the plan zeroes nothing it restores). request_access_epoch is the
+    // request's first-admission epoch, carried on.
+    std::optional<AdmissionResult> Restore(const RetractionImage& snapshot, std::span<const GroupDemand> demands,
+                                           std::uint64_t request_access_epoch);
+    bool HasHostPool() const { return host_pool_ != nullptr; }
+    bool HasSnapshotPool() const { return snapshot_pool_ != nullptr; }
+    std::int32_t NumFreeSnapshotLcmBlocks() const {
+        return snapshot_pool_ == nullptr ? 0 : snapshot_pool_->NumEmptyLcmBlocks();
+    }
     // Capacity views for scheduling code, counted in LCM parent blocks. The
     // counts are opaque capacity units to the scheduler: all packing/geometry
     // arithmetic stays behind these methods.
@@ -230,8 +346,16 @@ public:
     void QueueLatestSnapshotBlocksForStore(std::span<const std::string> prefix_hashes);
     std::vector<StoreCandidate> TakePendingStores() { return std::exchange(pending_stores_, {}); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
-    HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids);
-    CacheBlockRef AcquireHostBlock(std::uint32_t group_id);
+    // One Host block per (group, bucket) entry, in the bucket of the Device
+    // block it will mirror -- under page-cyclic sharding the owner of a Host
+    // page must be the owner of its Device page, so a copy's two ends select
+    // the same rows on every rank. Free capacity first, then the group's own
+    // least valuable entries in the needed buckets, then whole parents of
+    // any group; a shortfall leaves an empty reference.
+    HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
+                                          std::span<const std::int32_t> buckets);
+    CacheBlockRef AcquireHostBlock(std::uint32_t group_id, std::int32_t bucket);
+    CacheBlockRef FindHostCachedBlock(const CacheKey& key) const;
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
     bool ContainsHostCachedBlock(const CacheKey& key) const;
@@ -239,21 +363,22 @@ public:
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
-    // Publishes a filled Device destination after a successful L3 prefetch
-    // ACK. First-chunk admit must not CacheFullBlocks those pages: they are
-    // empty until LoadBackDone.success, and a vanished object must not leave
-    // Device prefix hits for the next admit to reuse.
-    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key);
+    // Publishes a Device block a restore filled from Host L2
+    // (CompleteSnapshotRestore): the entry comes back with the logical block
+    // index and boundary kind it was published under before the retraction,
+    // so eviction ranks it as it did the original.
+    void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
+                          CacheBoundaryKind boundary_kind);
 
     // L3 storage sits below Host: a bounded shadow of keys known to exist in
-    // the remote store, with no local Host block. Probe treats them as Host
-    // hits that require prefetch. Capacity tracks Host pages so the set
-    // cannot grow with every historical writeback. A single registration
-    // keeps the earliest contiguous prefix keys so prefix-closed matchers
-    // still hit, even when sequential write-backs already filled the
-    // shadow with this prompt's suffix. Later unrelated keys LRU-evict
-    // older prompts. Admit-time revalidation re-inserts keys that were
-    // dropped from the shadow.
+    // the remote store, with no local Host block. ProbePrefix reports them as
+    // the storage tier beyond the Host hit, which PlanPrefetch turns into a
+    // pre-admission Host fill. Capacity tracks Host pages so the set cannot
+    // grow with every historical writeback. A single registration keeps the
+    // earliest contiguous prefix keys so prefix-closed matchers still hit,
+    // even when sequential write-backs already filled the shadow with this
+    // prompt's suffix. Later unrelated keys LRU-evict older prompts;
+    // submit-time registration re-inserts keys that were dropped.
     bool EnablesL3Storage() const { return enable_l3_storage_; }
     void RegisterStorageKeys(std::span<const CacheKey> keys);
     void UnregisterStorageKeys(std::span<const CacheKey> keys);
@@ -279,6 +404,15 @@ private:
         CoordinatorMatch host;
     };
 
+    // The snapshot pool's share of an image, probed without acquiring: per
+    // group the data span and the slots (with their buckets) that ride the pool.
+    struct SnapshotPoolPlan {
+        std::vector<DataSpan> spans;
+        std::vector<std::vector<std::int32_t>> private_slots;
+        std::vector<std::vector<std::int32_t>> private_buckets;
+    };
+    std::optional<SnapshotPoolPlan> planSnapshotPool(std::span<const BlockTable> tables, std::int32_t num_tokens,
+                                                     std::span<const std::vector<ImageSlot>> host_served_slots) const;
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     void rememberStorageKey(const CacheKey& key);
     void evictStorageKeysToLimit();
@@ -289,20 +423,33 @@ private:
     BlockPool& tierPool();
     template <CacheTier Tier>
     const BlockPool& tierPool() const;
+    // with_storage_keys treats the L3 shadow's keys as hits beside the tier's
+    // entries (the Host tier only): the storage probe of ProbePrefix.
     template <CacheTier Tier>
     PrefixProbe::Tier probeTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
-                                        std::int32_t floor_tokens) const;
+                                        std::int32_t floor_tokens, bool with_storage_keys) const;
     template <CacheTier Tier>
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
-                                         PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
-    CoordinatorMatch acquireHostWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+    // One run of cache blocks a publication registers in a group, and the
+    // boundary kind it registers them under.
+    struct PublishedRange {
+        std::int32_t first_cache_block{0};
+        std::int32_t num_blocks{0};
+        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+    };
+    // What publishing `completed` covers in one group -- every newly hashed
+    // page of a prefix-closed group, the lookback behind the newest boundary
+    // of a sliding group, the lookback behind each materialized checkpoint
+    // of a state group, nothing for a replayable one. The one source for
+    // cacheCompletedBlocksForGroup and for PublishedDataSlotsAfter.
+    std::vector<PublishedRange> completedBlockRanges(std::size_t group_index, const CompletedPages& completed) const;
     template <CacheTier Tier>
     void cacheCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                       std::uint64_t access_epoch);
@@ -324,6 +471,8 @@ private:
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
+    // Request-private retraction images: never prefix-indexed, never evicted.
+    BlockPool* snapshot_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
     bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
@@ -346,5 +495,5 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec);
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
-                                 bool stream_device_cache_to_host);
+                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host);
 }  // namespace tokenspeed

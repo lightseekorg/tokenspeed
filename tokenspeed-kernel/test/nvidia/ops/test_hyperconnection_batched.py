@@ -24,8 +24,7 @@ from unittest import mock
 
 import pytest
 import torch
-from tokenspeed_kernel import gated_residual_mix
-from tokenspeed_kernel.ops.residual import cute_fused
+from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 
@@ -88,6 +87,7 @@ def mix(values, scale, independent):
         4,
         2560,
         320,
+        projection_rows=320 if values[1].shape[0] == 320 else 324,
         projection_scale=scale,
         weights_independent=independent,
         override="cute_fused_hyperconnection_mix",
@@ -124,6 +124,7 @@ def test_batched_default_dispatch_respects_row_limit(
         4,
         2560,
         320,
+        projection_rows=324,
         projection_scale=0.25,
         weights_independent=True,
         override=None,
@@ -155,6 +156,7 @@ def test_default_dispatch_boundary_graph_replays(rows, expected_kernel, dtype):
             4,
             2560,
             320,
+            projection_rows=324,
             projection_scale=0.25,
             weights_independent=True,
             override=None,

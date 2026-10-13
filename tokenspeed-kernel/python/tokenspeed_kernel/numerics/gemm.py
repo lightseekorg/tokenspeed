@@ -44,18 +44,20 @@ _ATOL = {
     # baseline at the rounding floor and use a K-independent scale.
     torch.float16: 1.5e-2,
     torch.bfloat16: 1.5e-2,
-    torch.float8_e4m3fn: 5e-3,
-    torch.float8_e4m3fnuz: 5e-3,
+    # fp8 inputs: the reference dequantizes exactly and the GEMMs emit bf16, so
+    # the same output-cast floor applies. Kernels accumulate in fp32, or on
+    # sm90 promote the tensor-core accumulator to fp32 at every scale block,
+    # which keeps accumulation error well below the floor at any K.
+    torch.float8_e4m3fn: 1.5e-2,
+    torch.float8_e4m3fnuz: 1.5e-2,
 }
 
-_FP8_DTYPES: set[torch.dtype] = {
-    torch.float8_e4m3fn,
-    torch.float8_e4m3fnuz,
-}
-
-_BF16_FP16_DTYPES: set[torch.dtype] = {
+# Dtypes whose GEMM error is set by the output cast rather than by K.
+_OUTPUT_CAST_BOUND_DTYPES: set[torch.dtype] = {
     torch.float16,
     torch.bfloat16,
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
 }
 
 
@@ -72,8 +74,9 @@ def tolerance(
     - fp32: error grows as sqrt(K) under fp32 accumulation noise.
     - fp16/bf16: K-independent — fp32 accumulation is well below the output
       dtype's rounding floor, so error is dominated by the final cast.
-    - fp8: error grows linearly with K for blockwise kernels, with a floor for
-      the output dtype rounding error on small K.
+    - fp8: K-independent for the same reason. The reference dequantizes the
+      FP8 operands exactly, so any error that grows with K is a kernel
+      accumulation bug, not quantization noise.
     """
     if dtype not in _ATOL:
         raise KeyError(f"No GEMM tolerance baseline for dtype={dtype}")
@@ -84,10 +87,7 @@ def tolerance(
         raise ValueError("GEMM tolerance requires K or inputs['A']")
 
     base = _ATOL[dtype]
-    if dtype in _FP8_DTYPES:
-        output_rounding_floor = max(_ATOL[d] for d in _BF16_FP16_DTYPES)
-        scale = max(base * max(K, 1) / 128.0, output_rounding_floor) / base
-    elif dtype in _BF16_FP16_DTYPES:
+    if dtype in _OUTPUT_CAST_BOUND_DTYPES:
         scale = 1.0
     else:
         scale = math.sqrt(max(K, 1) / 128.0)

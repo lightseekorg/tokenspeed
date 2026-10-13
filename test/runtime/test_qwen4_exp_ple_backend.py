@@ -216,6 +216,7 @@ def test_ple_non_verify_metadata_disarms_previous_round(backend, mode, monkeypat
         extend_replay_lens_cpu=torch.zeros_like(prefix),
         extend_prompt_lens_cpu=prefix + lengths,
         extend_with_prefix=True,
+        query_shard=None,
     )
     if mode != ForwardMode.IDLE:
         metadata = backend.forward_metadata

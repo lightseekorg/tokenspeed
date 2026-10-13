@@ -28,9 +28,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     reject_bounded_replay,
+    reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
@@ -72,8 +74,9 @@ class QSAIndexerMetadata:
 class QSAIndexerBackend(AttentionBackend):
     """Prepare the two indexer cache groups once for all local QSA layers."""
 
-    # Token-shaped side writes do not support padded prefill-graph replay.
-    cuda_graph_support = CudaGraphSupport(prefill_graph=False)
+    # The indexer's break runs request-shaped writes eagerly and slices padded
+    # token rows before building its live QSA layout.
+    cuda_graph_support = CudaGraphSupport(prefill_graph=True)
     cache_consumer_families = frozenset({"history"})
 
     def __init__(self, config: AttnConfig, full_attn_backend: CacheGroupRouter) -> None:
@@ -171,6 +174,7 @@ class QSAIndexerBackend(AttentionBackend):
             self._table_specs,
             max_bs=max_bs,
             max_tokens_per_req=self.spec_num_tokens,
+            max_extend_tokens=0,
             device=self.device,
         )
         self._seq_lens = torch.empty(max_bs, dtype=torch.int32, device=self.device)
@@ -230,8 +234,10 @@ class QSAIndexerBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
+        reject_query_shard(query_shard, "QSAIndexerBackend")
         del req_pool_indices, extend_prefix_lens
         del extend_prompt_lens_cpu, extend_with_prefix, kwargs
         reject_bounded_replay(extend_replay_lens_cpu, "QSAIndexerBackend")

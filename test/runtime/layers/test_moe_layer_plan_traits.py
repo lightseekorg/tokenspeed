@@ -27,10 +27,13 @@ the MoE input width, the SwiGLU form and whether expert ids may repeat.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer
+from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -42,7 +45,7 @@ def _plan_kwargs(monkeypatch, **layer_kwargs) -> dict:
         plans.append(kwargs)
         return {"solution": "fake", "apply_kernel_name": "fake"}
 
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_plan)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_plan)
     monkeypatch.setattr(expert_module, "create_layer_weights", lambda *a, **k: None)
     monkeypatch.setitem(global_server_args_dict, "moe_mxfp4_fp8_activation", False)
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
@@ -88,9 +91,7 @@ def test_swiglu_form_follows_alpha_and_beta(monkeypatch, layer, form):
 def test_zero_experts_declare_repeated_expert_ids(monkeypatch):
     plain = _plan_kwargs(monkeypatch, activation="swiglu")
     assert plain["expert_id_repeats"] is False
-    longcat = _plan_kwargs(
-        monkeypatch, activation="swiglu", zero_expert_type="copy", zero_expert_num=2
-    )
+    longcat = _plan_kwargs(monkeypatch, activation="swiglu", zero_expert_num=2)
     assert longcat["expert_id_repeats"] is True
 
 
@@ -106,3 +107,84 @@ def test_activation_clamped_follows_the_swiglu_limit(monkeypatch, layer, clamped
     # The W4A8 kernel's fixed FC2 activation scale assumes a bounded SwiGLU
     # output; the plan states whether the checkpoint provides that bound.
     assert _plan_kwargs(monkeypatch, **layer)["activation_clamped"] is clamped
+
+
+def test_combine_order_follows_the_launch_switch(monkeypatch):
+    assert _plan_kwargs(monkeypatch, activation="swiglu")["combine_order"] == "rank"
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "slot")
+    plan = _plan_kwargs(monkeypatch, activation="swiglu")
+    assert plan["combine_order"] == "slot"
+    # One EP rank folds locally: no exchange group.
+    assert plan["process_group"] is None
+
+
+def test_slot_order_hands_the_leaf_the_ep_group(monkeypatch):
+    ep_group = (0, 1, 2, 3)
+    process_group = object()
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "slot")
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(moe=SimpleNamespace(ep_group=ep_group)),
+    )
+    monkeypatch.setattr(
+        expert_module.pg_manager,
+        "get_device_process_group",
+        lambda group: process_group if group == ep_group else None,
+    )
+    plan = _plan_kwargs(
+        monkeypatch, activation="swiglu", ep_rank=1, ep_size=4, tp_rank=0, tp_size=1
+    )
+    assert plan["combine_order"] == "slot"
+    assert plan["process_group"] is process_group
+
+
+def test_slot_order_hands_the_leaf_the_ep_device_group_over_the_planned_one(
+    monkeypatch,
+):
+    # A solution that already carries a group (mega_moe) gets the same EP
+    # device group; the slot fold runs on it whatever the plan's solution.
+    ep_group = (0, 1)
+    process_group = object()
+    monkeypatch.setitem(global_server_args_dict, "moe_combine_order", "slot")
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(moe=SimpleNamespace(ep_group=ep_group)),
+    )
+    monkeypatch.setattr(
+        expert_module, "get_moe_backend", lambda: SimpleNamespace(value="mega_moe")
+    )
+    monkeypatch.setattr(
+        expert_module.pg_manager,
+        "get_device_process_group",
+        lambda group: process_group if group == ep_group else None,
+    )
+    plan = _plan_kwargs(
+        monkeypatch, activation="swiglu", ep_rank=0, ep_size=2, tp_rank=0, tp_size=1
+    )
+    assert plan["process_group"] is process_group
+
+
+def test_fp32_correction_bias_is_requested_from_the_routing_config(monkeypatch):
+    assert (
+        _plan_kwargs(monkeypatch, activation="swiglu")["fp32_correction_bias"] is False
+    )
+    requested = _plan_kwargs(
+        monkeypatch,
+        activation="swiglu",
+        routing_config={"fp32_correction_bias": True},
+    )
+    assert requested["fp32_correction_bias"] is True
+
+
+def test_fp32_correction_bias_requires_deepseek_v3_routing(monkeypatch):
+    with pytest.raises(ValueError, match="requires DeepSeekV3 routing"):
+        _plan_kwargs(
+            monkeypatch,
+            activation="swiglu",
+            routing_config={
+                "fp32_correction_bias": True,
+                "routing_method_type": RoutingMethodType.MiniMax2,
+            },
+        )

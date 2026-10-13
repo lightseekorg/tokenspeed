@@ -23,11 +23,13 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
+    _gather_checkpoint_output_kernel,
     merge_prefill_checkpoint_outputs,
     pack_prefill_recurrent_checkpoint_inputs,
     write_prefill_conv_checkpoints,
     write_prefill_recurrent_checkpoints,
 )
+from utils import assert_no_triton_compile
 
 
 def _device() -> torch.device:
@@ -123,6 +125,36 @@ def test_padded_checkpoint_pack_and_output_merge(device_name, token_dim):
     assert torch.count_nonzero(merged.narrow(token_dim, 7, 2)) == 0
 
 
+def test_checkpoint_pack_compiles_once_across_token_slices():
+    """Body and tail index vectors are slices at any offset; that must not key a binary."""
+    from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
+        _pack_prefill_recurrent_inputs_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    device = _device()
+    q = torch.arange(40 * 2 * 4, dtype=torch.float32, device=device).view(1, 40, 2, 4)
+    state = torch.arange(3 * 2 * 4 * 4, dtype=torch.float32, device=device)
+    state = state.view(3, 2, 4, 4)
+    rows = torch.tensor([2, 0], device=device)
+    gate = q.squeeze(0)
+    order = torch.arange(40, device=device).flip(0)
+
+    def run(start, count):
+        indices = order[start : start + count]
+        packed = pack_prefill_recurrent_checkpoint_inputs(
+            q, q, q, state, rows, indices, gate, gate, gate, gate, gate
+        )
+        torch.testing.assert_close(
+            packed.value.squeeze(0)[:count], gate[indices], rtol=0, atol=0
+        )
+
+    run(0, 8)
+    with assert_no_triton_compile(_pack_prefill_recurrent_inputs_kernel):
+        for start, count in ((1, 1), (3, 16), (0, 17), (5, 33)):
+            run(start, count)
+
+
 @pytest.mark.parametrize("token_dim", [0, 1])
 @pytest.mark.parametrize("strided", [False, True])
 def test_shared_inverse_gather_replay(token_dim, strided):
@@ -174,6 +206,47 @@ def test_shared_inverse_gather_replay(token_dim, strided):
         )
         graph.replay()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("token_dim", [0, 1])
+@pytest.mark.parametrize("strided", [False, True])
+def test_inverse_gather_variable_token_extents(token_dim, strided):
+    device = _device()
+
+    def check(body_rows, tail_rows, padding):
+        body = torch.randn(body_rows, 3, 8, device=device, dtype=torch.bfloat16)
+        tail = torch.randn(tail_rows, 3, 8, device=device, dtype=torch.bfloat16)
+        if strided:
+            body, tail = body.transpose(-1, -2), tail.transpose(-1, -2)
+        if token_dim == 1:
+            body, tail = body.unsqueeze(0), tail.unsqueeze(0)
+        total = body_rows + tail_rows
+        extent = total + padding
+        sources = torch.full((extent,), -1, device=device, dtype=torch.int64)
+        sources[:total] = torch.randperm(total, device=device)
+        actual = merge_prefill_checkpoint_outputs(
+            body,
+            tail,
+            torch.empty(body_rows, device=device, dtype=torch.int64),
+            torch.empty(tail_rows, device=device, dtype=torch.int64),
+            token_dim,
+            extent,
+            sources,
+        )
+        expected = torch.zeros_like(actual)
+        expected.narrow(token_dim, 0, total).copy_(
+            torch.cat((body, tail), dim=token_dim).index_select(
+                token_dim, sources[:total]
+            )
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    # Warm both alignment classes retained by Triton for these runtime scalars.
+    check(1024, 128, 0)
+    check(1031, 127, 3)
+    with assert_no_triton_compile(_gather_checkpoint_output_kernel):
+        for shape in ((1061, 137, 1), (1093, 149, 5), (1040, 144, 16)):
+            check(*shape)
 
 
 @pytest.fixture
@@ -318,6 +391,56 @@ def test_conv_checkpoint_fused_kernel(
         lengths,
     )
     torch.testing.assert_close(conv_states, expected, rtol=0, atol=0)
+
+
+def test_conv_checkpoints_compile_once_across_batches() -> None:
+    """Checkpoint rows and their token starts follow the batch; neither keys a binary."""
+    from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
+        _write_prefill_conv_checkpoints_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    device = _device()
+    raw_inputs = torch.arange(1000, dtype=torch.float32, device=device).view(250, 4)
+
+    def run(count: int, offset: int) -> None:
+        conv_states = torch.arange(40 * 12, dtype=torch.float32, device=device)
+        conv_states = conv_states.view(40, 4, 3)
+        state_in, state_out, destinations = (
+            torch.arange(first, first + count, dtype=torch.int32, device=device)
+            for first in (1, 13, 25)
+        )
+        rows = torch.arange(count, dtype=torch.int64, device=device)
+        # A starts view one element in sits off 16-byte alignment, as batch slices do.
+        starts = torch.arange(-offset, count, dtype=torch.int64, device=device) * 20
+        starts = starts[offset:]
+        lengths = torch.full((count,), 5, dtype=torch.int64, device=device)
+        expected = _reference_conv(
+            raw_inputs,
+            conv_states,
+            state_in,
+            state_out,
+            destinations,
+            rows,
+            starts,
+            lengths,
+        )
+        write_prefill_conv_checkpoints(
+            raw_inputs,
+            conv_states,
+            state_in,
+            state_out,
+            destinations,
+            rows,
+            starts,
+            lengths,
+        )
+        torch.testing.assert_close(conv_states, expected, rtol=0, atol=0)
+
+    run(2, 0)
+    with assert_no_triton_compile(_write_prefill_conv_checkpoints_kernel):
+        for count, offset in ((1, 0), (1, 1), (5, 1), (12, 0), (12, 1)):
+            run(count, offset)
 
 
 @pytest.mark.parametrize("num_rows", [1, 2])

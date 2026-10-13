@@ -125,7 +125,9 @@ def _pack_kernel(
     CB: tl.constexpr,
     SS,
     PAGE_ROWS: tl.constexpr,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -243,7 +245,9 @@ def _gather_kernel(
     OS0,
     OS1,
     PAGE_ROWS: tl.constexpr,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
     D: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -538,7 +542,9 @@ def _compressor_tail_scatter_kernel(
     TK,
     TD,
     LS,
-    CAPACITY: tl.constexpr,
+    # Rows the destination holds; it follows the buffer's size, which can
+    # track the batch, so it stays a runtime bound.
+    CAPACITY,
 ):
     row = tl.program_id(0)
     slot = tl.load(Slots + row * LS).to(tl.int64)
@@ -843,7 +849,9 @@ def _index_scan_kernel(
     CS0,
     CS1,
     PAGES: tl.constexpr,
-    TABLE_WIDTH: tl.constexpr,
+    # The page-table width follows the batch; a compile-time value would
+    # recompile the scan for every new longest request.
+    TABLE_WIDTH,
     CANDIDATES: tl.constexpr,
     HEADS: tl.constexpr,
     SHARD_HEADS: tl.constexpr,
@@ -1879,7 +1887,7 @@ def triton_dsv41_dspark_rows(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["EXTENDS", "PREFILL_OUTPUTS"])
 def _dspark_anchors_kernel(
     TOKENS,
     ACCEPT,
@@ -1888,6 +1896,7 @@ def _dspark_anchors_kernel(
     START,
     N0,
     EXTENDS,
+    PREFILL_OUTPUTS,
     WIDTH: tl.constexpr,
     SPEC: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -1897,10 +1906,15 @@ def _dspark_anchors_kernel(
     decode = row >= EXTENDS
     index = row - EXTENDS
     accepted = tl.minimum(tl.maximum(tl.load(ACCEPT + row).to(tl.int64), 1), WIDTH)
-    verify = EXTENDS + index * WIDTH + accepted - 1
-    bonus = tl.load(TOKENS + tl.where(decode, verify, row)).to(tl.int32)
+    active = (row < PREFILL_OUTPUTS) | decode
+    verify = PREFILL_OUTPUTS + index * WIDTH + accepted - 1
+    bonus = tl.load(TOKENS + tl.where(decode, verify, row), active, 0).to(tl.int32)
     columns = tl.arange(0, BLOCK)
-    tl.store(NEXT + row * N0 + columns, tl.zeros_like(columns) + bonus, columns < SPEC)
+    tl.store(
+        NEXT + row * N0 + columns,
+        tl.zeros_like(columns) + bonus,
+        active & (columns < SPEC),
+    )
     anchor_mask = decode & (one == 0)
     anchor = tl.load(POSITIONS + index * WIDTH + accepted - 1 + one, anchor_mask, -1)
     tl.store(START + index + one, anchor.to(tl.int64), anchor_mask)
@@ -1917,7 +1931,14 @@ def _dspark_anchors_kernel(
     priority=Priority.PORTABLE,
 )
 def triton_dsv41_dspark_anchors(
-    output_tokens, accept_lengths, positions, num_extends, width, next_tokens, start_pos
+    output_tokens,
+    accept_lengths,
+    positions,
+    num_extends,
+    num_prefill_outputs,
+    width,
+    next_tokens,
+    start_pos,
 ):
     rows = accept_lengths.shape[0]
     if rows == 0:
@@ -1930,6 +1951,7 @@ def triton_dsv41_dspark_anchors(
         start_pos,
         next_tokens.stride(0),
         num_extends,
+        num_prefill_outputs,
         WIDTH=width,
         SPEC=next_tokens.shape[1],
         BLOCK=triton.next_power_of_2(next_tokens.shape[1]),
@@ -2829,7 +2851,7 @@ def decode_rows(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS"])
 def _decode_window_kernel(
     Positions,
     Requests,
@@ -2905,7 +2927,7 @@ def decode_window(
         )
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
 def _global_slots_kernel(
     Rows,
     P,
@@ -2973,7 +2995,7 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     return out
 
 
-@triton.jit(do_not_specialize=["N", "TC"])
+@triton.jit(do_not_specialize=["N", "TC", "TR", "TS0", "TS1"])
 def _selection_table_kernel(
     P,
     Req,
@@ -3034,7 +3056,7 @@ def selection_table(positions, requests, table, ratio):
     return out, lengths
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
 def _compressor_metadata(
     Positions,
     Requests,
@@ -3143,3 +3165,202 @@ def compressor_metadata(
             BLOCK=256,
             num_warps=4,
         )
+
+
+@triton.jit
+def _block_maxima_kernel(
+    Logits,
+    Visible,
+    Output,
+    Ends,
+    width,
+    stride_row,
+    stride_col,
+    visible_stride,
+    blocks,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    col = block[:, None] * 8 + tl.arange(0, 8)[None, :]
+    values = tl.load(
+        Logits + row * stride_row + col * stride_col,
+        mask=col < width,
+        other=-float("inf"),
+    ).to(tl.float32)
+    # torch.amax propagates NaNs, including in the pinned newest block.
+    has_nan = tl.sum((values != values).to(tl.int32), axis=1) != 0
+    maxima = tl.max(values, axis=1)
+    maxima = tl.where(has_nan, float("nan"), maxima)
+    visible = tl.load(Visible + row * visible_stride).to(tl.int64)
+    if tl.program_id(1) == 0:
+        end = (tl.minimum(tl.maximum(visible, 0), width) + 7) // 8
+        tl.store(Ends + row, end.to(tl.int32))
+    newest = tl.minimum(tl.maximum(visible - 1, 0) // 8, blocks - 1)
+    maxima = tl.where(
+        (block == newest) & (maxima > -float("inf")), float("inf"), maxima
+    )
+    tl.store(Output + row * blocks + block, maxima, mask=block < blocks)
+
+
+def block_maxima(logits: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
+    """Reduce each eight-score block and pin the valid newest block to +inf.
+
+    Preserve input row order, NaNs and -inf padding. Widths and tensor strides
+    remain runtime arguments so varying history capacity does not recompile.
+    """
+    return block_maxima_with_lengths(logits, visible)[0]
+
+
+def block_maxima_with_lengths(
+    logits: torch.Tensor, visible: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return eight-score maxima and GPU-resident valid block counts.
+
+    Consumers may ignore scores at or after each returned block count only
+    when scores outside the visible prefix have already been masked to -inf.
+    """
+    rows, width = logits.shape
+    if width == 0:
+        raise ValueError("block maxima requires a positive score width")
+    blocks = triton.cdiv(width, 8)
+    output = torch.empty((rows, blocks), dtype=logits.dtype, device=logits.device)
+    ends = torch.empty((rows,), dtype=torch.int32, device=logits.device)
+    if rows:
+        _block_maxima_kernel[(rows, triton.cdiv(blocks, 128))](
+            logits,
+            visible,
+            output,
+            ends,
+            width,
+            logits.stride(0),
+            logits.stride(1),
+            visible.stride(0),
+            blocks,
+            128,
+        )
+    return output, ends
+
+
+@triton.jit(
+    do_not_specialize=[
+        "width",
+        "score_stride",
+        "length_stride",
+        "table_stride",
+        "page_stride",
+        "table_width",
+        "num_pages",
+        "blocks",
+        "workers",
+    ],
+    do_not_specialize_on_alignment=[
+        "width",
+        "score_stride",
+        "length_stride",
+        "table_stride",
+        "page_stride",
+        "table_width",
+        "num_pages",
+        "blocks",
+        "workers",
+    ],
+)
+def _clean_block_maxima_kernel(
+    Scores,
+    Lengths,
+    Table,
+    Cleaned,
+    Maxima,
+    Ends,
+    width,
+    score_stride,
+    length_stride,
+    table_stride,
+    page_stride,
+    table_width,
+    num_pages,
+    blocks,
+    workers,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    worker = tl.program_id(1)
+    length = tl.minimum(tl.maximum(tl.load(Lengths + row * length_stride), 0), width)
+    end = (length + 7) // 8
+    if worker == 0:
+        tl.store(Ends + row, end)
+    # Keep the launch shape fixed for graph replay, but visit only live tiles.
+    for tile in range(worker, tl.cdiv(length, TILE), workers):
+        block = tile * (TILE // 8) + tl.arange(0, TILE // 8)
+        column = block[:, None] * 8 + tl.arange(0, 8)[None, :]
+        live = column < length
+        page = tl.load(
+            Table + row * table_stride + (column // 64) * page_stride,
+            live & (column // 64 < table_width),
+            other=-1,
+        )
+        valid = live & (column // 64 < table_width) & (page >= 0) & (page < num_pages)
+        value = tl.load(
+            Scores + row * score_stride + column, valid, other=-float("inf")
+        )
+        tl.store(Cleaned + row * width + column, value, live)
+        # Preserve amax NaN propagation, even for the pinned newest block.
+        has_nan = tl.sum((value != value).to(tl.int32), axis=1) != 0
+        maximum = tl.max(value, axis=1)
+        maximum = tl.where(has_nan, float("nan"), maximum)
+        maximum = tl.where(
+            (block == end - 1) & (maximum > -float("inf")), float("inf"), maximum
+        )
+        tl.store(Maxima + row * blocks + block, maximum, block < end)
+
+
+def clean_block_maxima(
+    scores: torch.Tensor, visible: torch.Tensor, table: torch.Tensor, num_pages: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Clean paged FP32 scores and reduce their visible eight-token blocks.
+
+    ``table`` maps each row's logical 64-token pages to physical page IDs.
+    Invalid pages inside the visible prefix are masked to -inf. Return fixed-
+    shape cleaned scores, block maxima, and GPU-resident valid block counts.
+    Only the clamped visible score prefix and returned block prefix are written:
+    consumers must bound every read, including after CUDA Graph length changes.
+    """
+    if (
+        scores.ndim != 2
+        or scores.shape[1] == 0
+        or scores.stride(1) != 1
+        or scores.dtype != torch.float32
+        or visible.ndim != 1
+        or visible.numel() != scores.shape[0]
+        or table.ndim != 2
+        or table.shape[0] != scores.shape[0]
+    ):
+        raise ValueError("incompatible paged score geometry")
+    rows, width = scores.shape
+    blocks = triton.cdiv(width, 8)
+    # Enough independent tiles for long contexts; short rows exit on the GPU.
+    workers = min(triton.cdiv(width, 1024), 256)
+    cleaned = torch.empty((rows, width), device=scores.device, dtype=scores.dtype)
+    maxima = torch.empty((rows, blocks), device=scores.device, dtype=scores.dtype)
+    ends = torch.empty((rows,), device=scores.device, dtype=torch.int32)
+    if rows:
+        _clean_block_maxima_kernel[(rows, workers)](
+            scores,
+            visible,
+            table,
+            cleaned,
+            maxima,
+            ends,
+            width,
+            scores.stride(0),
+            visible.stride(0),
+            table.stride(0),
+            table.stride(1),
+            table.shape[1],
+            num_pages,
+            blocks,
+            workers,
+            1024,
+        )
+    return cleaned, maxima, ends

@@ -72,6 +72,8 @@ void chain_speculative_sampling_target_only(
     double threshold_single,
     double threshold_acc,
     bool deterministic,
+    bool use_draft_prob,
+    double reject_draft_prob_threshold,
     bool enable_pdl
 ) {
   CHECK_INPUT(candidates);
@@ -99,6 +101,12 @@ void chain_speculative_sampling_target_only(
   TVM_FFI_ICHECK_GE(1, threshold_single);
   TVM_FFI_ICHECK_GE(threshold_acc, 0);
   TVM_FFI_ICHECK_GE(1, threshold_acc);
+  // A real probability never exceeds 1, so the sentinel test
+  // (draft_prob > threshold) must stay false for every recorded row.
+  TVM_FFI_ICHECK_GE(reject_draft_prob_threshold, 1.0)
+      << "reject_draft_prob_threshold must be >= 1.0";
+  TVM_FFI_ICHECK(!use_draft_prob || draft_probs.has_value())
+      << "use_draft_prob requires the recorded draft_probs";
 
   float* draft_probs_ptr = nullptr;
   if (draft_probs.has_value()) {
@@ -123,6 +131,8 @@ void chain_speculative_sampling_target_only(
       static_cast<uint32_t>(batch_size),
       static_cast<uint32_t>(num_draft_tokens),
       static_cast<uint32_t>(vocab_size),
+      use_draft_prob,
+      static_cast<float>(reject_draft_prob_threshold),
       static_cast<float>(threshold_single),
       static_cast<float>(threshold_acc),
       deterministic,

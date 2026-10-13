@@ -45,7 +45,8 @@ from tokenspeed_kernel._triton import tl, triton
 __all__ = ["fill_ngram_history"]
 
 _SEED_BLOCK = 1024
-_REQUEST_CHUNK = 256
+# Wider chunks outgrow the default stack, and a first launch then grows local memory on every SM.
+_REQUEST_CHUNK = 32
 
 
 @triton.jit

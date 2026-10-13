@@ -247,7 +247,7 @@ def launch_gluon_linear_attnres_partials_gfx1250(
         blocks.stride(0),
         float(eps),
         projection_programs,
-        num_warps=_NUM_WARPS,
+        num_warps=_NUM_WARPS.value,
         num_stages=1,
         waves_per_eu=1,
     )

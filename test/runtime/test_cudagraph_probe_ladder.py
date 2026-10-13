@@ -48,7 +48,10 @@ from tokenspeed.runtime.execution.forward_step import ForwardStepRunner  # noqa:
 from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
     NULL_MEMORY_DELTA_OBSERVER,
 )
-from tokenspeed.runtime.execution.prefill_graph import PrefillGraph  # noqa: E402
+from tokenspeed.runtime.execution.prefill_graph import (  # noqa: E402
+    CapturedForward,
+    PrefillGraph,
+)
 from tokenspeed.runtime.layers.attention import registry  # noqa: E402
 
 WIDTH = cudagraph_memory.PROBE_ENTRIES_PER_LADDER
@@ -276,11 +279,16 @@ def test_releasing_drops_the_graphs_and_pools_but_keeps_the_tables(monkeypatch) 
     graph._encoders = {64: object()}
     graph._decoders = {8: object()}
     graph._pool = object()
+    graph._handoff_storage = {"slot": object()}
+    graph._encoder_handoff_storage = {"slot": object()}
+    graph._outputs = [object()]
 
     graph.release_graphs()
 
     assert (graph._captures, graph._encoders, graph._decoders) == ({}, {}, {})
     assert graph._pool is None
+    assert (graph._handoff_storage, graph._encoder_handoff_storage) == ({}, {})
+    assert graph._outputs is None
 
     runner = _decode_runner([1, 2])
     runner._metadata_snapshots = {("default", 1): object()}
@@ -300,22 +308,50 @@ def test_releasing_drops_the_graphs_and_pools_but_keeps_the_tables(monkeypatch) 
     assert runner._placeholder_tables
 
 
+@pytest.mark.parametrize("stage", ["bucket", "encoder", "decoder"])
+@pytest.mark.parametrize("explicit_stream", [False, True])
 def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     monkeypatch,
+    stage,
+    explicit_stream,
 ) -> None:
     order = []
+    entry_stream = object()
+    active_stream = entry_stream
+
+    def wait_stream(stream):
+        assert stream is entry_stream
+        order.append("wait")
+
+    capture_stream = SimpleNamespace(wait_stream=wait_stream)
+
+    @contextlib.contextmanager
+    def on_stream(stream):
+        nonlocal active_stream
+        previous = active_stream
+        active_stream = stream
+        try:
+            yield
+        finally:
+            active_stream = previous
 
     class _Recorder:
-        def __init__(self, name, pool=None, _stream=None):
-            self.name, self.pool = name, pool or "pool"
-            if name == "capture":
-                order.append("allocate pool")
+        def __init__(self, name, pool=None, stream=None):
+            self.name, self.pool = name, pool
+            self.stream = capture_stream if stream is None else stream
+            self.stream_context = on_stream(self.stream)
 
         def __enter__(self):
             order.append(f"{self.name} enter")
+            if self.name == "capture":
+                self.stream_context.__enter__()
+                order.append("allocate pool")
+                self.pool = "pool"
             return self
 
-        def __exit__(self, *_exc):
+        def __exit__(self, *exc):
+            if self.name == "capture":
+                self.stream_context.__exit__(*exc)
             order.append(f"{self.name} exit")
 
         def replay(self):
@@ -324,27 +360,62 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     monkeypatch.setattr(
         prefill_graph,
         "BreakableCapture",
-        lambda pool, stream: _Recorder("capture", pool),
+        lambda pool, stream, handoff_storage: _Recorder("capture", pool, stream),
     )
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_a, **_k: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: active_stream)
+    monkeypatch.setattr(torch.cuda, "stream", on_stream)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: order.append("synchronize"))
+
+    def forward(*_args):
+        assert active_stream is capture_stream
+        order.append("forward")
+        return torch.zeros(1), None
+
     graph = PrefillGraph.__new__(PrefillGraph)
     graph.num_warmup = 2
     graph._pool = None
-    graph._run_inner = lambda _bucket: order.append("forward") or (torch.zeros(1), None)
+    graph._handoff_storage = {}
+    graph._encoder_handoff_storage = {}
+    graph.capture_buckets, graph.decoder_buckets = [8], [8]
+    graph._narrowing = (
+        None if stage == "bucket" else SimpleNamespace(decoder_forward=forward)
+    )
+    graph._outputs = None
+    graph._ctx = object()
+    graph._run_inner = graph._run_encoder = forward
+    wrapper = SimpleNamespace(stream=capture_stream) if explicit_stream else None
+    observer = _Recorder("observe")
 
-    PrefillGraph._capture_bucket(graph, 8, None, _Recorder("observe"))
+    def rearm():
+        order.append("rearm")
 
+    if stage == "bucket":
+        graph._capture_bucket(8, wrapper, observer)
+    elif stage == "encoder":
+        graph._capture_encoder(8, wrapper, observer)
+    else:
+        graph._capture_decoder(object(), rearm, wrapper, observer)
+
+    before_forward = ["rearm"] if stage == "decoder" else []
     assert order == [
+        "wait",
+        *before_forward,
         "forward",
+        *before_forward,
         "forward",
-        "allocate pool",
+        "synchronize",
+        *before_forward,
         "observe enter",
         "capture enter",
+        "allocate pool",
         "forward",
         "capture exit",
         "observe exit",
+        *before_forward,
         "replay",
     ]
+    assert active_stream is entry_stream
+    assert graph._pool == "pool"
 
     # The same order at every other capture site.
     root = pathlib.Path(prefill_graph.__file__).parent
@@ -367,6 +438,95 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     }
 
 
+def test_every_capture_lands_its_output_in_one_shared_buffer() -> None:
+    """Outputs are leading rows of one buffer set sized for the widest graph."""
+    graph = PrefillGraph.__new__(PrefillGraph)
+    graph.capture_buckets, graph.decoder_buckets = [4, 8], []
+    graph._narrowing = None
+    graph._outputs = None
+
+    def forward(rows, aux):
+        return CapturedForward(
+            torch.randn(rows, 3), [torch.randn(rows, 5)] if aux else None
+        )
+
+    graph._reserve_outputs(prefill_graph._output_spec(forward(8, aux=True)))
+    landed = {}
+    for rows in (8, 4):
+        output = forward(rows, aux=True)
+        landed[rows] = graph._land_output(output)
+        torch.testing.assert_close(landed[rows].hidden_states, output.hidden_states)
+        torch.testing.assert_close(
+            landed[rows].aux_hidden_states[0], output.aux_hidden_states[0]
+        )
+    assert landed[8].hidden_states.data_ptr() == graph._outputs[0].data_ptr()
+    assert landed[4].hidden_states.data_ptr() == graph._outputs[0].data_ptr()
+    assert landed[4].aux_hidden_states[0].data_ptr() == graph._outputs[1].data_ptr()
+    assert [tuple(b.shape) for b in graph._outputs] == [(8, 3), (8, 5)]
+
+    for mismatch in (forward(4, aux=False), CapturedForward(torch.randn(4, 7), None)):
+        with pytest.raises(RuntimeError, match="differ across captures"):
+            graph._reserve_outputs(prefill_graph._output_spec(mismatch))
+    # No warmup ran, so there is nothing to size the outputs from.
+    with pytest.raises(ValueError, match="needs a warmup"):
+        graph._reserve_outputs(None)
+
+
+def test_narrowing_decoders_share_outputs_and_encoders_keep_their_handoffs(
+    monkeypatch,
+) -> None:
+    """Decoder outputs land in buffers sized by the decoder ladder.
+
+    Decoders take the shared handoff map; encoders take their own.
+    """
+    given = []
+
+    class _Capture:
+        def __init__(self, pool, stream, handoff_storage):
+            given.append(handoff_storage)
+            self.pool = pool or "pool"
+            self.stream = SimpleNamespace(wait_stream=lambda _stream: None)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            pass
+
+        def replay(self):
+            pass
+
+    monkeypatch.setattr(prefill_graph, "BreakableCapture", _Capture)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_a, **_k: None)
+    graph = PrefillGraph.__new__(PrefillGraph)
+    graph.num_warmup, graph._pool, graph._ctx = 1, None, None
+    graph.capture_buckets, graph.decoder_buckets = [64, 128], [8, 16]
+    graph._outputs = None
+    graph._handoff_storage, graph._encoder_handoff_storage = {}, {}
+    graph._narrowing = SimpleNamespace(
+        decoder_forward=lambda statics, _ctx: (statics * 2, [statics + 1])
+    )
+    graph._run_encoder = lambda _bucket: "state"
+
+    for rows in (16, 8):
+        statics = torch.randn(rows, 3)
+        decoder = PrefillGraph._capture_decoder(
+            graph, statics, lambda: None, None, contextlib.nullcontext()
+        )
+        hidden, taps = decoder.output
+        torch.testing.assert_close(hidden, statics * 2)
+        torch.testing.assert_close(taps[0], statics + 1)
+        assert hidden.data_ptr() == graph._outputs[0].data_ptr()
+        assert taps[0].data_ptr() == graph._outputs[1].data_ptr()
+    assert [tuple(b.shape) for b in graph._outputs] == [(16, 3), (16, 3)]
+
+    PrefillGraph._capture_encoder(graph, 128, None, contextlib.nullcontext())
+    assert [m is graph._handoff_storage for m in given] == [True, True, False]
+    assert given[2] is graph._encoder_handoff_storage
+
+
 def test_a_rebind_hands_back_views_of_the_rebuilt_pool(monkeypatch) -> None:
     import tokenspeed.runtime.engine.scheduler_utils as scheduler_utils
 
@@ -384,10 +544,11 @@ def test_a_rebind_hands_back_views_of_the_rebuilt_pool(monkeypatch) -> None:
     monkeypatch.setattr(
         cudagraph_memory,
         "reserve_and_rebind",
-        lambda *a, profiled_cache_bytes: seen.append(
+        lambda *a, profiled_cache_bytes, startup_resident_bytes: seen.append(
             (
                 a,
                 profiled_cache_bytes,
+                startup_resident_bytes,
                 args.attention_backend,
                 args.drafter_attention_backend,
             )
@@ -401,12 +562,18 @@ def test_a_rebind_hands_back_views_of_the_rebuilt_pool(monkeypatch) -> None:
     )
 
     attention, views = device._rebind_under_reserve(
-        "executor", "build", args, 3, probe, ("trtllm_mla", "flashinfer")
+        "executor",
+        "build",
+        args,
+        3,
+        probe,
+        ("trtllm_mla", "flashinfer"),
+        startup_resident_bytes=11,
     )
 
     assert attention is rebuilt
     # The rebuild resolves from the operator's choice, not the probe's write-back.
-    assert seen == [(("executor", "build", args, 3), 7, "trtllm_mla", "flashinfer")]
+    assert seen == [(("executor", "build", args, 3), 7, 11, "trtllm_mla", "flashinfer")]
     assert views == device.PoolViews(
         token_to_kv_pool="real",
         draft_token_to_kv_pool="draft",

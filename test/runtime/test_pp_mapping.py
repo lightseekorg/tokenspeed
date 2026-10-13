@@ -164,6 +164,85 @@ def test_pp_layer_partition_explicit_windows():
     assert pp_stage_windows(38, 4) == [(0, 10), (10, 20), (20, 29), (29, 38)]
 
 
+def test_pp_stage_cache_windows_scale_by_attention_instances():
+    """A paired layer (two attention instances) owns two cache layers per
+    block, so stage windows map to cache-ID windows by scaling both ends;
+    ownership then covers the 28-layer cache namespace exactly once."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.distributed.pp_stage import (
+        pp_stage_cache_windows,
+        pp_stage_windows,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        cache_field_placement,
+        pipeline_cache_ownership,
+    )
+
+    # Even split: 14 layers over PP2 -> cache layers [0, 14) and [14, 28).
+    even = pp_stage_cache_windows(
+        pp_stage_windows(14, 2),
+        cache_layers_per_execution_layer=2,
+        num_target_cache_layers=28,
+    )
+    assert even == [(0, 14), (14, 28)]
+    # Uneven --pp-layer-partition keeps whole blocks (both instances) together.
+    uneven = pp_stage_cache_windows(
+        pp_stage_windows(14, 2, (9, 5)),
+        cache_layers_per_execution_layer=2,
+        num_target_cache_layers=28,
+    )
+    assert uneven == [(0, 18), (18, 28)]
+    # One instance per block (K3, V4): the execution windows pass through.
+    assert pp_stage_cache_windows(
+        pp_stage_windows(7, 3),
+        cache_layers_per_execution_layer=1,
+        num_target_cache_layers=7,
+    ) == [(0, 3), (3, 5), (5, 7)]
+
+    # Three independent draft cache layers trail the target namespace and
+    # belong to the last stage alone; each stage's resident fields are the
+    # latents of its own blocks plus the owner-only index planes.
+    owners = pipeline_cache_ownership(28, 3, uneven)
+    assert [owner.resident_cache_window for owner in owners] == [(0, 18), (18, 31)]
+    assert [owner.owns_draft_cache for owner in owners] == [False, True]
+    fields = []
+    for layer in range(31):
+        fields.append(SimpleNamespace(field_id=f"layer.{layer}.latent_kv"))
+        if layer % 2 == 0 and layer < 28 or layer == 28:
+            fields.append(SimpleNamespace(field_id=f"layer.{layer}.index_k"))
+    resident, schedules = cache_field_placement(SimpleNamespace(fields=fields), owners)
+    assert resident[0][:3] == (
+        "layer.0.latent_kv",
+        "layer.0.index_k",
+        "layer.1.latent_kv",
+    )
+    assert "layer.17.latent_kv" in resident[0] and "layer.18.latent_kv" in resident[1]
+    assert "layer.28.index_k" in resident[1] and "layer.30.latent_kv" in resident[1]
+    # One producer step per cache layer; the draft layers complete together.
+    assert len(schedules[0]) == 18 and len(schedules[1]) == 11
+    assert schedules[1][-1] == (
+        "layer.28.latent_kv",
+        "layer.28.index_k",
+        "layer.29.latent_kv",
+        "layer.30.latent_kv",
+    )
+
+    # The mismatch the unscaled windows used to reach ownership with.
+    with pytest.raises(ValueError, match="do not cover the 28 target cache layers"):
+        pp_stage_cache_windows(
+            pp_stage_windows(14, 2),
+            cache_layers_per_execution_layer=1,
+            num_target_cache_layers=28,
+        )
+    with pytest.raises(ValueError, match=">= 1"):
+        pp_stage_cache_windows(
+            pp_stage_windows(14, 2),
+            cache_layers_per_execution_layer=0,
+            num_target_cache_layers=28,
+        )
+
+
 def test_pp_layer_partition_validation():
     from tokenspeed.runtime.distributed.pp_stage import pp_stage_windows
 

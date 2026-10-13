@@ -80,7 +80,7 @@ def test_mtp_fp8_block_scales_load_into_local_ep_expert(
 
     trtllm_backend = type("TrtllmBackend", (), {"value": "flashinfer_trtllm"})()
     monkeypatch.setattr(expert_module, "get_moe_backend", lambda: trtllm_backend)
-    monkeypatch.setattr(expert_module.tokenspeed_kernel, "moe_plan", fake_moe_plan)
+    monkeypatch.setattr(expert_module, "kernel_moe_plan", fake_moe_plan)
     quant_config = ModelOptMixedConfig(
         quantized_layers={
             "mtp.layers.0.mlp.experts": "FP8_BLOCK_SCALES",

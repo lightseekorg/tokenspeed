@@ -22,18 +22,22 @@
 
 from __future__ import annotations
 
-import torch
+# ``tokenspeed_kernel.ops.sampling.torch`` (the portable leaves) is imported
+# below for registration and would rebind the bare name ``torch`` in this
+# package namespace, hence the alias.
+import torch as _torch
+from tokenspeed_kernel.ops.sampling.logprob import vocab_parallel_logprobs
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["argmax"]
+__all__ = ["argmax", "vocab_parallel_logprobs"]
 
-_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-_SUPPORTED_OUT_DTYPES = (torch.int32, torch.int64)
+_SUPPORTED_DTYPES = (_torch.float16, _torch.bfloat16, _torch.float32)
+_SUPPORTED_OUT_DTYPES = (_torch.int32, _torch.int64)
 
 
-def _validate_argmax_out(logits: torch.Tensor, out: torch.Tensor) -> None:
+def _validate_argmax_out(logits: _torch.Tensor, out: _torch.Tensor) -> None:
     if out.shape != (logits.shape[0],):
         raise ValueError(
             f"out must have shape (M,)={(logits.shape[0],)}, got {tuple(out.shape)}"
@@ -45,13 +49,13 @@ def _validate_argmax_out(logits: torch.Tensor, out: torch.Tensor) -> None:
 
 
 def _argmax_torch_fallback(
-    logits: torch.Tensor,
+    logits: _torch.Tensor,
     *,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
+    out: _torch.Tensor | None = None,
+) -> _torch.Tensor:
     if out is not None:
         _validate_argmax_out(logits, out)
-    result = torch.argmax(logits, dim=-1)
+    result = _torch.argmax(logits, dim=-1)
     if out is not None:
         out.copy_(result)
         return out
@@ -59,12 +63,12 @@ def _argmax_torch_fallback(
 
 
 def argmax(
-    logits: torch.Tensor,
+    logits: _torch.Tensor,
     *,
-    out: torch.Tensor | None = None,
+    out: _torch.Tensor | None = None,
     solution: str | None = None,
     override: str | None = None,
-) -> torch.Tensor:
+) -> _torch.Tensor:
     """Return row-wise argmax indices over the last logits dimension.
 
     Args:
@@ -122,3 +126,4 @@ def argmax(
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401

@@ -81,3 +81,45 @@ def resolve_cuda_graph_support(*backends) -> CudaGraphSupport:
         resolved = resolved & declared
         stack.extend(backend.child_backends())
     return resolved
+
+
+@dataclass(frozen=True)
+class TreeSupport:
+    """One backend node's draft-tree capability (--speculative-eagle-topk > 1).
+
+    Each field is ``None`` when this node can take part, otherwise the reason
+    it cannot. A node answers for itself only; ``resolve_tree_support`` walks
+    ``child_backends()`` so a composite never has to forward the question.
+    """
+
+    verify_blocker: str | None
+    draft_blocker: str | None
+
+
+def resolve_tree_support(verify_root, draft_root) -> None:
+    """Refuse draft trees unless every node under both roots supports its part.
+
+    Args:
+        verify_root: The target's attention backend; every node must verify trees.
+        draft_root: The drafter's attention backend; every node must draft trees.
+
+    Raises:
+        NotImplementedError: Listing every blocking node and its reason.
+    """
+    blockers: list[str] = []
+    for root, part in ((verify_root, "verify"), (draft_root, "draft")):
+        stack = [root]
+        while stack:
+            backend = stack.pop()
+            support = backend.tree_support()
+            blocker = (
+                support.verify_blocker if part == "verify" else support.draft_blocker
+            )
+            if blocker is not None:
+                blockers.append(f"{part}: {blocker}")
+            stack.extend(backend.child_backends())
+    if blockers:
+        raise NotImplementedError(
+            "draft trees (--speculative-eagle-topk > 1) are not supported here: "
+            + "; ".join(blockers)
+        )

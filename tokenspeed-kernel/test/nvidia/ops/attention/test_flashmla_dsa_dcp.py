@@ -83,6 +83,7 @@ def test_flashmla_dsa_dcp_partials(phase, q_len, degree):
         page_size=64,
         return_lse=True,
         solution="flashmla",
+        slot_order="selection",
     )
     if packed:
         kwargs["q_len_per_req"] = q_len

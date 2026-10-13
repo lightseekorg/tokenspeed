@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import torch
+from tokenspeed_kernel.benchmark.profiler import ProfilePhase
 
 __all__ = [
     "GraphBenchmarkConfig",
@@ -38,6 +39,8 @@ __all__ = [
     "GraphTimer",
     "PreparedInvocation",
 ]
+
+InvocationProfiler = Callable[[ProfilePhase, int | None], AbstractContextManager[None]]
 
 GraphBenchmarkPhase = Literal[
     "configuration",
@@ -233,6 +236,7 @@ class GraphTimer:
         *,
         cold_cache: bool,
         measurement_blocks: int,
+        profile_invocation: InvocationProfiler | None = None,
     ) -> GraphMeasurement:
         """Capture and measure one prepared invocation.
 
@@ -268,14 +272,12 @@ class GraphTimer:
                     prepared,
                     cold_cache=cold_cache,
                     measurement_blocks=measurement_blocks,
+                    profile_invocation=profile_invocation,
                 )
                 warmup_time_ms = _elapsed_wall_ms(backend, warmup_started)
 
                 capture_started = backend.monotonic()
-                graph = self._capture(
-                    prepared,
-                    stream,
-                )
+                graph = self._capture(prepared, stream)
                 capture_time_ms = _elapsed_wall_ms(backend, capture_started)
 
                 first_replay_started = backend.monotonic()
@@ -295,6 +297,7 @@ class GraphTimer:
                     event_pairs,
                     cold_cache=cold_cache,
                     measurement_blocks=measurement_blocks,
+                    profile_invocation=profile_invocation,
                 )
                 measurement_time_ms = _elapsed_wall_ms(backend, measurement_started)
         except BaseException:
@@ -329,6 +332,7 @@ class GraphTimer:
         *,
         cold_cache: bool,
         measurement_blocks: int,
+        profile_invocation: InvocationProfiler | None,
     ) -> tuple[object, list[tuple[object, object]]]:
         backend = self._backend
         try:
@@ -340,11 +344,18 @@ class GraphTimer:
             ]
 
             with backend.use_stream(stream):
-                for _ in range(self.config.eager_warmup_iterations):
+                for index in range(self.config.eager_warmup_iterations):
                     _reset(prepared)
                     if cold_cache:
                         self._clear_cache()
-                    prepared.invoke()
+                    if (
+                        profile_invocation is None
+                        or index != self.config.eager_warmup_iterations - 1
+                    ):
+                        prepared.invoke()
+                    else:
+                        with profile_invocation("eager_metadata", index):
+                            prepared.invoke()
             backend.synchronize_stream(stream)
 
             # Event allocation can be lazy. Record every event before capture so
@@ -427,6 +438,7 @@ class GraphTimer:
         *,
         cold_cache: bool,
         measurement_blocks: int,
+        profile_invocation: InvocationProfiler | None,
     ) -> tuple[float, ...]:
         backend = self._backend
         try:
@@ -438,34 +450,47 @@ class GraphTimer:
                     backend.replay(graph)
             backend.synchronize_stream(stream)
 
-            if cold_cache:
-                return self._measure_cold_replays(
-                    prepared,
-                    graph,
-                    stream,
-                    event_pairs[0],
-                    measurement_blocks=measurement_blocks,
-                )
-
-            with backend.use_stream(stream):
-                for start, end in event_pairs:
-                    _reset(prepared)
-                    backend.record_event(start, stream)
-                    backend.replay(graph)
-                    backend.record_event(end, stream)
-            backend.synchronize_stream(stream)
-
-            samples: list[float] = []
-            for start, end in event_pairs:
-                elapsed_ms = backend.elapsed_time_ms(start, end)
-                sample_us = elapsed_ms * 1000.0
-                if not math.isfinite(sample_us) or sample_us <= 0.0:
-                    raise ValueError(
-                        "device event produced an invalid per-invocation sample "
-                        f"({sample_us!r} us)"
+            measurement_profile = (
+                profile_invocation("measurement", None)
+                if profile_invocation is not None
+                else contextlib.nullcontext()
+            )
+            with measurement_profile:
+                if cold_cache:
+                    return self._measure_cold_replays(
+                        prepared,
+                        graph,
+                        stream,
+                        event_pairs[0],
+                        measurement_blocks=measurement_blocks,
+                        profile_invocation=profile_invocation,
                     )
-                samples.append(sample_us)
-            return tuple(samples)
+
+                with backend.use_stream(stream):
+                    for index, (start, end) in enumerate(event_pairs):
+                        _reset(prepared)
+                        replay_profile = (
+                            profile_invocation("graph_replay", index)
+                            if profile_invocation is not None
+                            else contextlib.nullcontext()
+                        )
+                        with replay_profile:
+                            backend.record_event(start, stream)
+                            backend.replay(graph)
+                            backend.record_event(end, stream)
+                backend.synchronize_stream(stream)
+
+                samples: list[float] = []
+                for start, end in event_pairs:
+                    elapsed_ms = backend.elapsed_time_ms(start, end)
+                    sample_us = elapsed_ms * 1000.0
+                    if not math.isfinite(sample_us) or sample_us <= 0.0:
+                        raise ValueError(
+                            "device event produced an invalid per-invocation sample "
+                            f"({sample_us!r} us)"
+                        )
+                    samples.append(sample_us)
+                return tuple(samples)
         except Exception as error:
             raise GraphBenchmarkError(
                 "measurement",
@@ -481,17 +506,24 @@ class GraphTimer:
         event_pair: tuple[object, object],
         *,
         measurement_blocks: int,
+        profile_invocation: InvocationProfiler | None,
     ) -> tuple[float, ...]:
         backend = self._backend
         start, end = event_pair
         samples: list[float] = []
-        for _ in range(measurement_blocks):
+        for index in range(measurement_blocks):
             with backend.use_stream(stream):
                 _reset(prepared)
                 self._clear_cache()
-                backend.record_event(start, stream)
-                backend.replay(graph)
-                backend.record_event(end, stream)
+                replay_profile = (
+                    profile_invocation("graph_replay", index)
+                    if profile_invocation is not None
+                    else contextlib.nullcontext()
+                )
+                with replay_profile:
+                    backend.record_event(start, stream)
+                    backend.replay(graph)
+                    backend.record_event(end, stream)
             backend.synchronize_stream(stream)
 
             sample_us = backend.elapsed_time_ms(start, end) * 1000.0

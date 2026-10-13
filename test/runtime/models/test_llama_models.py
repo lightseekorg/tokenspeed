@@ -67,6 +67,7 @@ def _serve_server(port: int, extra_args=()) -> subprocess.Popen:
         "-m",
         "tokenspeed.cli",
         "serve",
+        "--disable-autotune",
         "--model",
         MODEL,
         "--host",

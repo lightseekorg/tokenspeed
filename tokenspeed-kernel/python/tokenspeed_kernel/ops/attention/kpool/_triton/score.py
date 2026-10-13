@@ -37,7 +37,9 @@ def _kpool_score_prefill_chunk_kernel(
     head_logits,
     pool_offset,
     cache_page_stride_bytes: tl.constexpr,
-    block_table_stride: tl.constexpr,
+    # Block-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    block_table_stride,
     head_logits_token_stride: tl.constexpr,
     head_logits_head_stride: tl.constexpr,
     chunk_pools: tl.constexpr,
@@ -160,8 +162,10 @@ def _kpool_score_dense_mma_kernel(
     logits,
     max_num_pools,
     cache_page_stride_bytes: tl.constexpr,
-    block_table_stride: tl.constexpr,
-    logits_stride: tl.constexpr,
+    # The table and score widths follow the batch's longest request; runtime
+    # so every batch shape shares one binary.
+    block_table_stride,
+    logits_stride,
     page_size: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -169,7 +173,9 @@ def _kpool_score_dense_mma_kernel(
     pool_size: tl.constexpr,
     softmax_scale: tl.constexpr,
     APPLY_RELU: tl.constexpr,
-    NUM_WORKERS: tl.constexpr,
+    # Derived from the batch's token and pool counts; runtime so every batch
+    # shape shares one binary.
+    NUM_WORKERS,
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,

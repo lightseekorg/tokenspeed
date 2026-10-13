@@ -25,9 +25,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import platform as host_platform
+import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
@@ -41,6 +43,8 @@ from tokenspeed_kernel.benchmark.harness import (
     KernelBenchmarkHarness,
     KernelBenchmarkResult,
 )
+from tokenspeed_kernel.benchmark.profiler import BenchmarkProfiler, NullProfiler
+from tokenspeed_kernel.benchmark.proton import ProtonProfiler
 from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
@@ -128,24 +132,38 @@ def _parse_environment(raw: object) -> dict[str, str]:
     }
 
 
-def _parse_policy(raw: object, location: str) -> dict[str, float]:
+def _parse_min_regression_absolute_us(raw: object) -> float:
+    minimum = _number(raw, "min_regression_absolute_us")
+    if minimum < 0.0:
+        raise SuiteConfigError("min_regression_absolute_us must be nonnegative")
+    return minimum
+
+
+def _parse_policy(
+    raw: object,
+    location: str,
+    min_regression_absolute_us: float,
+) -> dict[str, float]:
     policy = _object(raw, location)
+    if "max_relative_mad" in policy:
+        raise SuiteConfigError(
+            f"{location}.max_relative_mad was removed; the comparison checks "
+            "the spread between measurement rounds instead"
+        )
     parsed = {
         field: _number(policy[field], f"{location}.{field}")
         for field in (
             "max_regression_relative",
             "max_regression_absolute_us",
-            "max_relative_mad",
         )
     }
     if not 0.0 <= parsed["max_regression_relative"] < 1.0:
         raise SuiteConfigError(f"{location}.max_regression_relative must be in [0, 1)")
-    if parsed["max_regression_absolute_us"] < 0.0:
+    if parsed["max_regression_absolute_us"] < min_regression_absolute_us:
         raise SuiteConfigError(
-            f"{location}.max_regression_absolute_us must be nonnegative"
+            f"{location}.max_regression_absolute_us must be at least the suite's "
+            f"min_regression_absolute_us ({min_regression_absolute_us:g})"
         )
-    if not 0.0 < parsed["max_relative_mad"] < 1.0:
-        raise SuiteConfigError(f"{location}.max_relative_mad must be in (0, 1)")
     return parsed
 
 
@@ -182,6 +200,7 @@ def _parse_case(
     raw: object,
     index: int,
     suite_measurement_blocks: int,
+    min_regression_absolute_us: float,
 ) -> SuiteCase:
     location = f"cases[{index}]"
     case = _object(raw, location)
@@ -194,7 +213,9 @@ def _parse_case(
     definition, request = _parse_definition(
         case["definition"], f"{location}.definition"
     )
-    policy = _parse_policy(case["policy"], f"{location}.policy")
+    policy = _parse_policy(
+        case["policy"], f"{location}.policy", min_regression_absolute_us
+    )
     measurement_blocks = case.get("measurement_blocks", suite_measurement_blocks)
     if not isinstance(measurement_blocks, int) or measurement_blocks < 5:
         raise SuiteConfigError(f"{location}.measurement_blocks must be at least 5")
@@ -260,8 +281,16 @@ def _read_json(path: Path) -> object:
         raise SuiteConfigError(f"cannot read {path}: {error}") from error
 
 
-def load_suite(path: str | Path) -> BenchmarkSuite:
+def load_suite(
+    path: str | Path,
+    case_filters: Sequence[str] = (),
+) -> BenchmarkSuite:
     """Load the fields needed to execute a benchmark suite."""
+
+    try:
+        patterns = tuple(re.compile(expression) for expression in case_filters)
+    except re.error as error:
+        raise SuiteConfigError(f"invalid case filter: {error}") from error
 
     suite_path = Path(path)
     suite = _object(_read_json(suite_path), "suite")
@@ -274,6 +303,9 @@ def load_suite(path: str | Path) -> BenchmarkSuite:
         suite_id = _nonempty_string(suite["suite_id"], "suite_id")
         required_environment = _parse_environment(suite["environment"])
         timer, default_measurement_blocks = _parse_timer(suite["timer"])
+        min_regression_absolute_us = _parse_min_regression_absolute_us(
+            suite["min_regression_absolute_us"]
+        )
         root_cases = suite["cases"]
         if not isinstance(root_cases, list):
             raise SuiteConfigError("cases must be a JSON array")
@@ -316,7 +348,12 @@ def load_suite(path: str | Path) -> BenchmarkSuite:
             for expanded in _expand_case(case, index)
         ]
         cases = tuple(
-            _parse_case(case, index, default_measurement_blocks)
+            _parse_case(
+                case,
+                index,
+                default_measurement_blocks,
+                min_regression_absolute_us,
+            )
             for index, case in enumerate(expanded_cases)
         )
     except SuiteConfigError:
@@ -328,12 +365,22 @@ def load_suite(path: str | Path) -> BenchmarkSuite:
     if len(case_ids) != len(set(case_ids)):
         raise SuiteConfigError("duplicate case IDs are not allowed")
 
+    selected_cases = tuple(sorted(cases, key=lambda case: case.id))
+    if patterns:
+        selected_cases = tuple(
+            case
+            for case in selected_cases
+            if any(pattern.search(case.id) for pattern in patterns)
+        )
+        if not selected_cases:
+            raise SuiteConfigError("case filters matched no benchmark cases")
+
     return BenchmarkSuite(
         suite_id=suite_id,
         required_environment=required_environment,
         timer=timer,
         default_measurement_blocks=default_measurement_blocks,
-        cases=tuple(sorted(cases, key=lambda case: case.id)),
+        cases=selected_cases,
         schema_version=schema_version,
     )
 
@@ -455,6 +502,7 @@ def run_suite(
     *,
     harness_factory: Callable[[GraphBenchmarkConfig], KernelBenchmarkHarness],
     environment_provider: Callable[[], dict[str, Any]],
+    profiler: BenchmarkProfiler | None = None,
 ) -> dict[str, Any]:
     """Run a validated suite and return its coordinator-facing envelope."""
 
@@ -499,11 +547,17 @@ def run_suite(
         else:
             assert harness is not None
             try:
-                result_payload = _result_payload(
-                    harness.run(
-                        case.request,
-                        measurement_blocks=case.measurement_blocks,
+                run_options: dict[str, Any] = {
+                    "measurement_blocks": case.measurement_blocks
+                }
+                if profiler is not None:
+                    run_options["profile_invocation"] = (
+                        lambda phase, index, case_id=case.id: profiler.profile(
+                            case_id, phase, index
+                        )
                     )
+                result_payload = _result_payload(
+                    harness.run(case.request, **run_options)
                 )
             except Exception as error:  # noqa: BLE001 - benchmark failures are data
                 result_payload = _failure_payload(
@@ -544,6 +598,21 @@ def _write_output(payload: dict[str, Any], path: str | Path) -> None:
     output_path.write_text(serialized, encoding="utf-8")
 
 
+def _attach_profiles(
+    payload: dict[str, Any],
+    profiles: Mapping[str, dict[str, Any]],
+) -> None:
+    for case in payload["cases"]:
+        case["profile"] = profiles.get(case["id"])
+
+
+def _create_profiler(name: str | None) -> BenchmarkProfiler:
+    if name == "none" or (name is None and torch.version.hip is None):
+        return NullProfiler()
+    backend = "roctracer" if torch.version.hip is not None else None
+    return ProtonProfiler(backend=backend)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run a revision-local kernel benchmark suite for CI"
@@ -559,16 +628,33 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Result JSON path, or '-' for standard output",
     )
+    parser.add_argument(
+        "--case-filter",
+        action="append",
+        default=[],
+        metavar="REGEX",
+        help="Run cases whose expanded IDs match this regex (repeatable)",
+    )
+    parser.add_argument(
+        "--profiler",
+        choices=("none", "proton"),
+        default=os.environ.get("TOKENSPEED_KERNEL_BENCHMARK_PROFILER"),
+        help="Optional diagnostic profiler; defaults to Proton on AMD",
+    )
     args = parser.parse_args(argv)
 
     try:
-        suite = load_suite(args.suite)
-        payload = run_suite(
-            suite,
-            args.revision,
-            harness_factory=_create_harness,
-            environment_provider=_collect_environment,
-        )
+        suite = load_suite(args.suite, args.case_filter)
+        profiler = _create_profiler(args.profiler)
+        with profiler:
+            payload = run_suite(
+                suite,
+                args.revision,
+                harness_factory=_create_harness,
+                environment_provider=_collect_environment,
+                profiler=None if isinstance(profiler, NullProfiler) else profiler,
+            )
+        _attach_profiles(payload, profiler.profiles)
         _write_output(payload, args.output)
     except (OSError, SuiteConfigError) as error:
         parser.exit(2, f"error: {error}\n")

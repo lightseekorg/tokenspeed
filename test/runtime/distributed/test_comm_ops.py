@@ -11,7 +11,6 @@ import importlib.util
 import socket
 from functools import partial
 from types import SimpleNamespace
-from typing import List
 from unittest.mock import Mock
 
 import pytest
@@ -37,9 +36,10 @@ class TestAutoBackendTopology:
         backend = AutoBackend.__new__(AutoBackend)
         backend._nccl = Mock()
         backend._rsag = Mock()
-        backend._triton_ar = Mock()
+        backend._iris = Mock()
         backend._trtllm_ar = Mock()
         backend._trtllm_ar.has_trtllm_ar.return_value = False
+        backend._trtllm_ar.lamport_all_gather.return_value = None
         # A host-spread group's rsag routing keys on the fabric probe, so pin
         # both the probe and the local device count the tests assume.
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
@@ -145,7 +145,7 @@ class TestAutoBackendTopology:
             tensor, tuple(range(8)), op=None
         )
         backend._trtllm_ar.has_trtllm_ar.assert_called_once_with(tuple(range(8)))
-        backend._triton_ar.can_run.assert_not_called()
+        backend._iris.can_run.assert_not_called()
 
     def test_cross_node_all_reduce_uses_trtllm_when_armed(self, backend):
         """An armed mnnvl workspace serves cross-node groups directly."""
@@ -216,7 +216,7 @@ class TestAutoBackendTopology:
         backend._nccl.all_reduce.return_value = "nccl-result"
 
         assert backend.all_reduce(tensor, tuple(range(8))) == "nccl-result"
-        backend._triton_ar.can_run.assert_not_called()
+        backend._iris.can_run.assert_not_called()
 
 
 def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
@@ -284,6 +284,7 @@ def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
         gpu_id=0,
         dist_init_addr=None,
         nccl_port=1234,
+        emulate_rank_zero=False,
         distributed_timeout_seconds=10,
         mapping=mapping,
         hidden_size=0,
@@ -446,6 +447,90 @@ def _test_all_reduce(rank, world_size, device, group, ref_group):
     results = all_reduce(tuple(tensor.clone() for tensor in inputs), group)
     for result, reference in zip(results, expected):
         torch.testing.assert_close(result, reference)
+
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_cdna4 or importlib.util.find_spec("iris") is None:
+        return
+    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+    from tokenspeed.runtime.distributed.comm_ops import (
+        acquire_all_reduce_outputs,
+        prepare_all_reduce_buffers,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    previous_force = global_server_args_dict["force_deterministic_rsag"]
+    global_server_args_dict["force_deterministic_rsag"] = False
+    try:
+        backend = get_global_backend().iris
+        capacities = dict(
+            staged_max_numel=512 * 1024,
+            producer_direct_max_numel=1024 * 1024,
+            dtype=torch.bfloat16,
+            backend=None,
+        )
+        assert prepare_all_reduce_buffers(group, **capacities)
+        staged = torch.full((128,), rank + 1, dtype=torch.bfloat16, device=device)
+        torch.testing.assert_close(
+            all_reduce(staged, group),
+            torch.full_like(staged, world_size * (world_size + 1) // 2),
+            atol=0,
+            rtol=0,
+        )
+        states = []
+        for dtype in (torch.bfloat16, torch.float32):
+            shapes = (
+                ((384 * 1024,), (384 * 1024,))
+                if dtype == torch.bfloat16
+                else ((128,), (256,))
+            )
+            like = torch.empty(0, dtype=dtype, device=device)
+            outputs = acquire_all_reduce_outputs(shapes, like, group)
+            state = backend.state(group, dtype)
+            states.append(state)
+            assert state.owns_outputs(outputs)
+            pointer = state.producer.data.data_ptr()
+            for index, output in enumerate(outputs, start=1):
+                output.fill_(index * (rank + 1))
+            results = all_reduce(outputs, group)
+            for index, result in enumerate(results, start=1):
+                torch.testing.assert_close(
+                    result,
+                    torch.full_like(result, index * world_size * (world_size + 1) // 2),
+                    atol=0,
+                    rtol=0,
+                )
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                results = all_reduce(outputs, group)
+            if dtype == torch.bfloat16:
+                assert prepare_all_reduce_buffers(
+                    group,
+                    staged_max_numel=128,
+                    producer_direct_max_numel=256,
+                    dtype=dtype,
+                    backend=None,
+                )
+            for scale in (2, 3):
+                for index, output in enumerate(outputs, start=1):
+                    output.fill_(scale * index * (rank + 1))
+                graph.replay()
+                for index, result in enumerate(results, start=1):
+                    torch.testing.assert_close(
+                        result,
+                        torch.full_like(
+                            result, scale * index * world_size * (world_size + 1) // 2
+                        ),
+                        atol=0,
+                        rtol=0,
+                    )
+            assert backend.state(group, dtype) is state
+            assert state.producer.data.data_ptr() == pointer
+        assert states[0].producer.data.data_ptr() != states[1].producer.data.data_ptr()
+    finally:
+        global_server_args_dict["force_deterministic_rsag"] = previous_force
 
 
 def _test_all_gather(rank, world_size, device, group, ref_group):
@@ -746,6 +831,54 @@ def _test_backend_registry(rank, world_size, device, group, ref_group):
 # ---------------------------------------------------------------------------
 # FusionParams (no GPU needed)
 # ---------------------------------------------------------------------------
+
+
+class _RowGatherBackend:
+    """A fake backend whose all-gather is the low-latency solution's shape:
+    bf16 only, every rank's payload a whole number of 16-byte vectors."""
+
+    def __init__(self, world: int):
+        self.world = world
+        self.payloads: list[torch.Tensor] = []
+
+    def token_all_gather(self, tensor, group, scattered_num_tokens):
+        assert tensor.dtype == torch.bfloat16
+        assert tensor.numel() % 8 == 0, "payload is not 16-byte aligned"
+        self.payloads.append(tensor)
+        # Every rank holds the same bytes here; concatenate the counts' worth.
+        return torch.cat([tensor] * self.world)[: sum(scattered_num_tokens)]
+
+
+@pytest.mark.parametrize(
+    "dtype,width", [(torch.int64, 1), (torch.float32, 3), (torch.bfloat16, 5)]
+)
+def test_token_all_gather_rows_pads_narrow_rows_to_the_wire_alignment(dtype, width):
+    """A query shard gathers its token ids (one int64 per row) and fp32
+    scales; the row count is the shard's, so odd counts must still land
+    aligned, and the bytes come back as the caller's dtype, unpadded."""
+    from tokenspeed.runtime.distributed.comm_ops import token_all_gather_rows
+
+    local_rows = 5  # odd: 5 x 8 bytes is not a multiple of 16
+    rows = (torch.arange(local_rows * width) * 3).reshape(local_rows, width).to(dtype)
+    backend = _RowGatherBackend(world=2)
+    gathered = token_all_gather_rows(
+        rows, (0, 1), [local_rows, local_rows], backend=backend
+    )
+    assert gathered.dtype == dtype and gathered.shape == (2 * local_rows, width)
+    assert torch.equal(gathered[:local_rows], rows) and torch.equal(
+        gathered[local_rows:], rows
+    )
+    assert len(backend.payloads) == 1
+
+
+def test_token_all_gather_rows_leaves_aligned_bf16_rows_alone():
+    from tokenspeed.runtime.distributed.comm_ops import token_all_gather_rows
+
+    rows = torch.arange(3 * 8, dtype=torch.bfloat16).reshape(3, 8)  # 16-byte rows
+    backend = _RowGatherBackend(world=1)
+    gathered = token_all_gather_rows(rows, (0,), [3], backend=backend)
+    assert torch.equal(gathered, rows)
+    assert backend.payloads[0].data_ptr() == rows.data_ptr()
 
 
 class TestFusionParams:

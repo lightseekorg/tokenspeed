@@ -101,11 +101,6 @@ def _fp32_to_topk_key(x):
     return bits ^ gl.where(sign != 0, 0, 0x7FFFFFFF)
 
 
-@gluon.jit
-def _topk_add(a, b):
-    return a + b
-
-
 @gluon.jit(noinline=True)
 def _persistent_histogram_tail(
     row_logits,
@@ -478,7 +473,7 @@ def _dsa_persistent_radix_topk_kernel(
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
         group_counts = count_low + count_high
-        cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+        cumulative = gl.cumsum(group_counts, 0)
         before_group = cumulative - group_counts
         selected_group = (before_group < remaining) & (cumulative >= remaining)
         bucket_pairs = bucket_offsets.reshape([_PERSISTENT_NUM_BUCKETS // 2, 2])
@@ -652,7 +647,7 @@ def _dsa_persistent_radix_topk_kernel(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("block_table_cols",))
 def _dsa_trivial_topk_kernel(
     block_table,
     row_starts,
@@ -660,7 +655,7 @@ def _dsa_trivial_topk_kernel(
     out,
     lens_out,
     out_stride: gl.constexpr,
-    block_table_cols: gl.constexpr,
+    block_table_cols,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
@@ -1006,7 +1001,12 @@ def _emit_compact_final_topk(
     )
 
 
-@gluon.jit
+@gluon.jit(
+    do_not_specialize=(
+        "logits_stride",
+        "block_table_cols",
+    ),
+)
 def _dsa_oneblock_manual_radix_topk_kernel(
     logits,
     block_table,
@@ -1014,9 +1014,9 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     row_ends,
     out,
     lens_out,
-    logits_stride: gl.constexpr,
+    logits_stride,
     out_stride: gl.constexpr,
-    block_table_cols: gl.constexpr,
+    block_table_cols,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
@@ -1300,7 +1300,7 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         count_low = gl.convert_layout(count_low, group_layout)
         count_high = gl.convert_layout(count_high, group_layout)
         group_counts = count_low + count_high
-        group_cumulative = gl.associative_scan(group_counts, 0, _topk_add)
+        group_cumulative = gl.cumsum(group_counts, 0)
         group_greater = group_cumulative - group_counts
         selected_group = (group_greater < remaining) & (group_cumulative >= remaining)
         bucket_pairs = bucket_offsets.reshape([MAX_BUCKETS // 2, 2])

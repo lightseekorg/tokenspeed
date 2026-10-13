@@ -78,6 +78,7 @@
 //     fragile: it breaks if a non-owner is ever allowed to skip the B poll
 //     (e.g. an "output not needed here" fast path), or if an owner publishes
 //     B before all NRanks A slots have landed.
+//   * All-gather: slots carry each 16-bit value as 0x10000 | value, never the sentinel.
 
 #pragma once
 
@@ -697,6 +698,86 @@ cudaError_t mnnvl_allreduce_fusion_op(AllReduceFusionParams<T> const& params,
   }
 #undef MNNVL_DISPATCH_PATTERN
   return cudaErrorInvalidValue;
+}
+
+// One-shot all-gather of [num_tokens, width] 16-bit rows: one CTA per token, four values per thread.
+template <int NRanks>
+__global__ void __launch_bounds__(1024)
+    mnnvl_allgather_kernel_oneshot(uint16_t const* __restrict__ in, uint16_t* __restrict__ out,
+                                   int width, int rank, MnnvlCommArgs comm) {
+  int const token = blockIdx.x;
+  int const col = threadIdx.x * 4;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaGridDependencySynchronize();
+#endif
+  MnnvlLamportFlags flags(comm.buffer_flags);
+  uint32_t* stage_mcast = reinterpret_cast<uint32_t*>(flags.current_buf(comm.multicast_ptr));
+  uint32_t const* stage_local =
+      reinterpret_cast<uint32_t const*>(flags.current_buf(comm.buffer_ptr_local));
+  uint2 const v =
+      *reinterpret_cast<uint2 const*>(in + static_cast<size_t>(token) * width + col);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  cudaTriggerProgrammaticLaunchCompletion();
+#endif
+  *reinterpret_cast<uint4*>(stage_mcast +
+                            (static_cast<size_t>(token) * NRanks + rank) * width + col) =
+      make_uint4(0x10000u | (v.x & 0xffffu), 0x10000u | (v.x >> 16), 0x10000u | (v.y & 0xffffu),
+                 0x10000u | (v.y >> 16));
+  flags.cta_arrive();
+  flags.clear_dirty(comm.buffer_ptr_local);
+
+  uint4 words[NRanks];
+  bool done = false;
+  while (!done) {
+    done = true;
+#pragma unroll
+    for (int r = 0; r < NRanks; ++r) {
+      uint32_t const* src = stage_local + (static_cast<size_t>(token) * NRanks + r) * width + col;
+      asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                   : "=r"(words[r].x), "=r"(words[r].y), "=r"(words[r].z), "=r"(words[r].w)
+                   : "l"(src));
+      done &= words[r].x != 0x80000000u && words[r].y != 0x80000000u &&
+              words[r].z != 0x80000000u && words[r].w != 0x80000000u;
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < NRanks; ++r) {
+    *reinterpret_cast<uint2*>(out + (static_cast<size_t>(token) * NRanks + r) * width + col) =
+        make_uint2((words[r].x & 0xffffu) | (words[r].y << 16),
+                   (words[r].z & 0xffffu) | (words[r].w << 16));
+  }
+  flags.wait_and_update(
+      static_cast<uint32_t>(static_cast<size_t>(gridDim.x) * NRanks * width * sizeof(uint32_t)));
+}
+
+inline cudaError_t mnnvl_allgather_op(uint16_t const* in, uint16_t* out, int num_tokens, int width,
+                                      int nranks, int rank, MnnvlCommArgs const& comm,
+                                      bool launch_with_pdl, cudaStream_t stream) {
+  cudaLaunchConfig_t cfg;
+  cudaLaunchAttribute attrs[1];
+  cfg.gridDim = dim3(num_tokens, 1, 1);
+  cfg.blockDim = dim3(width / 4, 1, 1);
+  cfg.dynamicSmemBytes = 0;
+  cfg.stream = stream;
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = launch_with_pdl ? 1 : 0;
+  cfg.attrs = attrs;
+  cfg.numAttrs = 1;
+  auto launch = [&](auto kernel) {
+    return cudaLaunchKernelEx(&cfg, kernel, in, out, width, rank, comm);
+  };
+  switch (nranks) {
+    case 2:
+      return launch(mnnvl_allgather_kernel_oneshot<2>);
+    case 4:
+      return launch(mnnvl_allgather_kernel_oneshot<4>);
+    case 8:
+      return launch(mnnvl_allgather_kernel_oneshot<8>);
+    case 16:
+      return launch(mnnvl_allgather_kernel_oneshot<16>);
+    default:
+      return cudaErrorInvalidValue;
+  }
 }
 
 }  // namespace trtllm_mnnvl_allreduce_fusion

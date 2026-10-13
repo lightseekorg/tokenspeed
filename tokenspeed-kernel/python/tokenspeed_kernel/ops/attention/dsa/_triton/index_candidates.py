@@ -32,9 +32,11 @@ def _compact(
     Pages,
     Positions,
     Lengths,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-    STRIDE: tl.constexpr,
+    # Table and logits geometry follows the batch; runtime so every batch
+    # shape shares one binary.
+    ROWS,
+    COLS,
+    STRIDE,
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -61,9 +63,11 @@ def _mask_scores(
     Positions,
     Lengths,
     Causal,
-    WIDTH: tl.constexpr,
-    STRIDE: tl.constexpr,
-    COLS: tl.constexpr,
+    # Table and logits geometry follows the batch; runtime so every batch
+    # shape shares one binary.
+    WIDTH,
+    STRIDE,
+    COLS,
     PAGE: tl.constexpr,
     INITIAL: tl.constexpr,
     LOCAL: tl.constexpr,
@@ -153,8 +157,10 @@ def _gather_candidates(
     Logical,
     Scores,
     TOPK: tl.constexpr,
-    LOGIT_STRIDE: tl.constexpr,
-    COLS: tl.constexpr,
+    # Table and logits geometry follows the batch; runtime so every batch
+    # shape shares one binary.
+    LOGIT_STRIDE,
+    COLS,
     PAGE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):

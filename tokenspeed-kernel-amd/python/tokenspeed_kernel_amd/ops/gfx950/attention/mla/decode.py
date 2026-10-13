@@ -44,10 +44,16 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
-from tokenspeed_kernel_amd.ops.gfx950.attention._common import _INV_LN2
+from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
+    _INV_LN2,
+    _mfma_unscaled_fp8,
+)
 from tokenspeed_kernel_amd.ops.gfx950.attention.mla.reduce_project_value import (
     gluon_mla_reduce_project_value_gfx950,
 )
+
+# Scale before the FP8 cast to retain small probabilities; cancel at normalization.
+_FP8_PROBABILITY_SCALE = gl.constexpr(256.0)
 
 # ===-----------------------------------------------------------------------===#
 # Kernel Config
@@ -948,6 +954,8 @@ class AttentionProgram:
         p = gl.exp2((qk - n_e_max[:, None]) * _INV_LN2)
         e_sum = e_sum * re_scale + gl.sum(p, 1)
         e_max = n_e_max
+        if cfg.IS_FP8_Q:
+            p *= _FP8_PROBABILITY_SCALE
         p = p.to(dtype)
         p = gl.convert_layout(p, cfg.p_layout)
         acc *= re_scale[:, None]
@@ -985,6 +993,8 @@ class AttentionProgram:
         )
         acc *= self.kv_scale
         rcp = 1.0 / e_sum
+        if cfg.IS_FP8_Q:
+            rcp /= _FP8_PROBABILITY_SCALE
         stored_value = (acc * rcp[:, None]).to(out_dtype)
         if cfg.NHEAD < cfg.BLOCK_H:
             gl.amd.cdna4.buffer_store(
@@ -1131,11 +1141,17 @@ def _mla_decode_gluon(
         kv_scale,
     )
 
+    _mla_decode_program(program, Mid_lse, Final_lse)
+
+
+@gluon.jit
+def _mla_decode_program(program, Mid_lse, Final_lse):
     if program.split_kv_start >= program.split_kv_end:
         return
 
-    dtype = Q_nope.type.element_ty
-    kvtype = Kv_c_cache.type.element_ty
+    cfg = program.cfg
+    dtype = program.Q_nope.type.element_ty
+    kvtype = program.Kv_c_cache.type.element_ty
 
     if cfg.IS_FP8_Q:
         buf_q_nope = gl.allocate_shared_memory(
@@ -1513,6 +1529,703 @@ def _mla_softmax_reducev_kernel(
             Final_lse + cur_batch * stride_fl_b + cur_head * stride_fl_h,
             e_max + tl.log(e_sum),
         )
+
+
+@gluon.jit
+def _load_page(
+    Pages,
+    request,
+    start,
+    end,
+    stride_page,
+    PAGE: gl.constexpr,
+):
+    # Keep the page ID in a VGPR until the next copy needs a buffer descriptor.
+    # Moving it to an SGPR here would wait for this load and the preceding
+    # direct-to-LDS copy, since these loads complete in order.
+    return gl.load(Pages + request * stride_page + start // PAGE, start < end, 0)
+
+
+@gluon.jit
+def _make_kv_offsets(
+    STRIDE_KV: gl.constexpr,
+    N: gl.constexpr,
+    kv_load: gl.constexpr,
+    pe_load: gl.constexpr,
+    shared: gl.constexpr,
+    shared_pe: gl.constexpr,
+):
+    # Direct-to-LDS copies write 16 bytes per lane to linear LDS addresses.
+    # Precompute the source-column permutation that produces the swizzled
+    # tile through these linear writes, avoiding per-copy lane shuffles of
+    # offsets and masks.
+    gl.static_assert(shared.order[0] == 0 and shared_pe.order[0] == 0)
+    n = gl.arange(0, N, layout=gl.SliceLayout(0, kv_load))
+    d = gl.arange(0, 512, layout=gl.SliceLayout(1, kv_load))
+    phase = (n[None, :] // shared.per_phase) % shared.max_phase
+    column = ((d[:, None] // shared.vec) ^ phase) * shared.vec + d[:, None] % shared.vec
+    n_pe = gl.arange(0, N, layout=gl.SliceLayout(0, pe_load))
+    d_pe = gl.arange(0, 64, layout=gl.SliceLayout(1, pe_load))
+    phase_pe = (n_pe[None, :] // shared_pe.per_phase) % shared_pe.max_phase
+    column_pe = ((d_pe[:, None] // shared_pe.vec) ^ phase_pe) * shared_pe.vec + d_pe[
+        :, None
+    ] % shared_pe.vec
+    return n[None, :] * STRIDE_KV + column, n_pe[None, :] * STRIDE_KV + 512 + column_pe
+
+
+@gluon.jit
+def _issue_load_kv(
+    buf,
+    pebuf,
+    KV,
+    page,
+    start,
+    end,
+    offsets,
+    pe_offsets,
+    STRIDE_KV: gl.constexpr,
+    PAGE: gl.constexpr,
+    N: gl.constexpr,
+    kv_load: gl.constexpr,
+    pe_load: gl.constexpr,
+    linear: gl.constexpr,
+):
+    # Base each buffer at the tile's first token using 64-bit arithmetic.
+    # The 32-bit buffer-load offsets then stay below N * STRIDE_KV even for
+    # a KV pool larger than 2 GiB.
+    gl.static_assert(PAGE >= N and PAGE % N == 0)
+    # Buffer descriptors must be in SGPRs; the page ID is uniform.
+    page = gl.inline_asm(
+        "v_readfirstlane_b32 $0, $1", ("=s", "v"), [page], gl.int32, is_pure=True
+    )
+    base = KV + (page.to(gl.int64) * PAGE + start % PAGE) * STRIDE_KV
+    rows = end - start
+    n = gl.arange(0, N, layout=gl.SliceLayout(0, kv_load))
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        buf.reinterpret(buf.dtype, [512, N], linear),
+        base,
+        offsets,
+        mask=(n < rows)[None, :],
+    )
+    n_pe = gl.arange(0, N, layout=gl.SliceLayout(0, pe_load))
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(
+        pebuf.reinterpret(pebuf.dtype, [64, N], linear),
+        base,
+        pe_offsets,
+        mask=(n_pe < rows)[None, :],
+    )
+    gl.amd.cdna4.async_copy.commit_group()
+
+
+@gluon.constexpr_function
+def _transpose_operand_layout(layout):
+    return gl.DistributedLinearLayout(
+        [list(reversed(b)) for b in layout.reg_bases],
+        [list(reversed(b)) for b in layout.lane_bases],
+        [list(reversed(b)) for b in layout.warp_bases],
+        [list(reversed(b)) for b in layout.block_bases],
+        list(reversed(layout.shape)),
+    )
+
+
+@gluon.constexpr_function
+def _replicated_pair_layout(row_layout):
+    return gl.DistributedLinearLayout(
+        [[x[0], 0] for x in row_layout.reg_bases] + [[0, 1]],
+        [[x[0], 0] for x in row_layout.lane_bases],
+        [[x[0], 0] for x in row_layout.warp_bases],
+        [],
+        [row_layout.shape[0], 2],
+    )
+
+
+_KV_REUSE_MIN_HISTORY = gl.constexpr(4096)
+_QUERY_ROW_TILE = gl.constexpr(64)
+_QUERY_HEAD_TILE = gl.constexpr(16)
+_QUERY_VALUE_TILE = gl.constexpr(128)
+
+
+@gluon.constexpr_function
+def _supports_wide_query_block(heads, queries, page):
+    return page == 64 and _QUERY_ROW_TILE.value < queries * heads <= 128
+
+
+@gluon.constexpr_function
+def _single_query_split_bucket(heads, queries, split_bucket):
+    groups = triton.cdiv(queries * heads, _QUERY_ROW_TILE.value)
+    return triton.next_power_of_2(groups * split_bucket // queries)
+
+
+@gluon.jit
+def _use_wide_query_block(length, splits, H: gl.constexpr, QLEN: gl.constexpr):
+    tiles = gl.cdiv(gl.cdiv(length, 64), splits)
+    return tiles >= gl.cdiv(QLEN * H, 4) + 8
+
+
+@gluon.jit
+def _compute_pv(
+    buffer,
+    probability,
+    acc,
+    alpha,
+    chunk: gl.constexpr,
+    value_layout: gl.constexpr,
+    v_layout: gl.constexpr,
+):
+    value = gl.amd.cdna4.async_copy.load_shared_relaxed(
+        buffer.slice(chunk * _QUERY_VALUE_TILE, _QUERY_VALUE_TILE, 0), value_layout
+    )
+    value = gl.convert_layout(gl.permute(value, [1, 0]), v_layout, assert_trivial=True)
+    return _mfma_unscaled_fp8(probability, value, acc * alpha[:, None])
+
+
+@gluon.jit
+def _store_partial(Output, acc, reciprocal, valid, chunk: gl.constexpr):
+    columns = gl.arange(0, _QUERY_VALUE_TILE, layout=gl.SliceLayout(0, acc.type.layout))
+    gl.store(
+        Output + chunk * _QUERY_VALUE_TILE + columns[None, :],
+        acc * reciprocal[:, None],
+        valid[:, None],
+    )
+
+
+def _launch_metadata(grid, kernel, args):
+    return {"name": kernel.name}
+
+
+@gluon.jit
+def _decode_single_query(
+    Q,
+    KV,
+    Pages,
+    Partials,
+    LSE,
+    length,
+    query_group,
+    split,
+    STRIDE_Q_B: gl.constexpr,
+    STRIDE_Q_S: gl.constexpr,
+    STRIDE_Q_H: gl.constexpr,
+    STRIDE_KV: gl.constexpr,
+    stride_page,
+    H: gl.constexpr,
+    QLEN: gl.constexpr,
+    PAGE: gl.constexpr,
+    splits,
+    SPLIT_BUCKET: gl.constexpr,
+    WITHIN_2GB: gl.constexpr,
+    sm_scale,
+):
+    request = gl.program_id(0)
+    groups: gl.constexpr = gl.cdiv(QLEN * H, _QUERY_ROW_TILE)
+    work = query_group * splits + split
+    query = work % QLEN
+    short_split = work // QLEN
+    short_splits = groups * splits // QLEN
+    if short_split >= short_splits:
+        return
+    visible = gl.maximum(length - QLEN + query + 1, 0)
+    pages_per_split = gl.cdiv(gl.cdiv(visible, PAGE), short_splits)
+    first = short_split * pages_per_split * PAGE
+    end = gl.minimum(first + pages_per_split * PAGE, visible)
+    q_offset = request * STRIDE_Q_B + query * STRIDE_Q_S
+    row = (request * QLEN + query) * H
+    if first >= end:
+        head = gl.arange(0, 16, layout=gl.BlockedLayout([1], [64], [4], [0]))
+        gl.store(
+            LSE + (row + head) * SPLIT_BUCKET + short_split, -float("inf"), head < H
+        )
+        return
+    cfg = AttentionConfig(
+        BLOCK_H=16,
+        BLOCK_N=128,
+        NUM_KV_SPLITS=SPLIT_BUCKET,
+        PAGE_SIZE=PAGE,
+        HEAD_DIM_CKV=512,
+        HEAD_DIM_KPE=64,
+        KV_PE_OFFSET=512,
+        WITHIN_2GB=WITHIN_2GB,
+        NUM_XCDS=1,
+        NHEAD=H,
+        REGIME="bh16bn128",
+        IS_FP8_Q=True,
+        RETURN_LSE=False,
+        stride_q_nope_bs=0,
+        stride_q_nope_h=STRIDE_Q_H,
+        stride_q_pe_bs=0,
+        stride_q_pe_h=STRIDE_Q_H,
+        stride_kv_c_bs=STRIDE_KV,
+        stride_k_pe_bs=STRIDE_KV,
+        stride_req_to_tokens_bs=0,
+        stride_o_b=0,
+        stride_o_h=SPLIT_BUCKET * 512,
+        stride_o_s=512,
+        stride_mid_lse_b=0,
+        stride_mid_lse_h=SPLIT_BUCKET,
+        stride_mid_lse_s=1,
+        stride_final_lse_b=0,
+        stride_final_lse_h=0,
+    )
+    zero = gl.cast(0, gl.int32)
+    program = AttentionProgram(
+        cfg=cfg,
+        Q_nope=Q + q_offset,
+        Q_pe=Q + q_offset + cfg.HEAD_DIM_CKV,
+        Kv_c_cache=KV,
+        K_pe_cache=KV,
+        Req_to_tokens=Pages,
+        Out=Partials + row * SPLIT_BUCKET * cfg.HEAD_DIM_CKV,
+        kv_scale=gl.cast(1.0, gl.float32),
+        qk_scale=sm_scale,
+        cur_batch=zero,
+        cur_head_id=zero,
+        split_kv_id=short_split,
+        batch_page_start=request * stride_page,
+        split_kv_start=first,
+        split_kv_end=end,
+        num_iter=gl.cdiv(end - first, cfg.BLOCK_N),
+    )
+    _mla_decode_program(program, LSE + row * SPLIT_BUCKET, None)
+
+
+@gluon.jit(
+    launch_metadata=_launch_metadata,
+    do_not_specialize=["stride_page", "splits", "wide_splits", "reuse_min_history"],
+)
+def gluon_mla_decode_fp8_query_blocks_gfx950(
+    Q,
+    KV,
+    Pages,
+    Lengths,
+    Partials,
+    LSE,
+    STRIDE_Q_B: gl.constexpr,
+    STRIDE_Q_S: gl.constexpr,
+    STRIDE_Q_H: gl.constexpr,
+    STRIDE_KV: gl.constexpr,
+    stride_page,
+    H: gl.constexpr,
+    QLEN: gl.constexpr,
+    PAGE: gl.constexpr,
+    splits,
+    wide_splits,
+    reuse_min_history,
+    SPLIT_BUCKET: gl.constexpr,
+    WIDE_SPLIT_BUCKET: gl.constexpr,
+    WITHIN_2GB: gl.constexpr,
+    sm_scale,
+):
+    request = gl.program_id(0)
+    group = gl.program_id(1)
+    split = gl.program_id(2)
+    length = gl.load(Lengths + request)
+    if _supports_wide_query_block(H, QLEN, PAGE):
+        if _use_wide_query_block(length, wide_splits, H, QLEN):
+            if split < wide_splits:
+                _decode_query_block(
+                    Q,
+                    KV,
+                    Pages,
+                    Partials,
+                    LSE,
+                    length,
+                    0,
+                    split,
+                    STRIDE_Q_B,
+                    STRIDE_Q_S,
+                    STRIDE_Q_H,
+                    STRIDE_KV,
+                    stride_page,
+                    H,
+                    QLEN,
+                    PAGE,
+                    wide_splits,
+                    WIDE_SPLIT_BUCKET,
+                    sm_scale,
+                    128,
+                )
+            return
+        group = split % 2
+        split = split // 2
+        if split >= splits:
+            return
+        # Keep narrow rows contiguous within each request's reserved storage.
+        offset = request * QLEN * H * (WIDE_SPLIT_BUCKET - SPLIT_BUCKET)
+        Partials += offset * 512
+        LSE += offset
+    groups: gl.constexpr = gl.cdiv(QLEN * H, _QUERY_ROW_TILE)
+    if H <= _QUERY_HEAD_TILE and PAGE == 64 and groups * SPLIT_BUCKET >= QLEN:
+        if length < reuse_min_history and groups * splits >= QLEN:
+            _decode_single_query(
+                Q,
+                KV,
+                Pages,
+                Partials,
+                LSE,
+                length,
+                group,
+                split,
+                STRIDE_Q_B,
+                STRIDE_Q_S,
+                STRIDE_Q_H,
+                STRIDE_KV,
+                stride_page,
+                H,
+                QLEN,
+                PAGE,
+                splits,
+                SPLIT_BUCKET,
+                WITHIN_2GB,
+                sm_scale,
+            )
+            return
+    _decode_query_block(
+        Q,
+        KV,
+        Pages,
+        Partials,
+        LSE,
+        length,
+        group,
+        split,
+        STRIDE_Q_B,
+        STRIDE_Q_S,
+        STRIDE_Q_H,
+        STRIDE_KV,
+        stride_page,
+        H,
+        QLEN,
+        PAGE,
+        splits,
+        SPLIT_BUCKET,
+        sm_scale,
+        64,
+    )
+
+
+@gluon.jit
+def _decode_query_block(
+    Q,
+    KV,
+    Pages,
+    Partials,
+    LSE,
+    length,
+    group,
+    split,
+    STRIDE_Q_B: gl.constexpr,
+    STRIDE_Q_S: gl.constexpr,
+    STRIDE_Q_H: gl.constexpr,
+    STRIDE_KV: gl.constexpr,
+    stride_page,
+    H: gl.constexpr,
+    QLEN: gl.constexpr,
+    PAGE: gl.constexpr,
+    splits,
+    SPLIT_BUCKET: gl.constexpr,
+    sm_scale,
+    M: gl.constexpr,
+):
+    N: gl.constexpr = 64
+    request = gl.program_id(0)
+    pages_per_split = gl.cdiv(gl.cdiv(length, PAGE), splits)
+    first = split * pages_per_split * PAGE
+    end = gl.minimum((split + 1) * pages_per_split * PAGE, length)
+
+    mfma: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[32, 32, 64],
+        transposed=True,
+        warps_per_cta=[4, 1] if M == 128 else [2, 2],
+    )
+    a_layout: gl.constexpr = gl.DotOperandLayout(0, mfma, 16)
+    b_layout: gl.constexpr = gl.DotOperandLayout(1, mfma, 16)
+    p_layout: gl.constexpr = gl.DotOperandLayout(0, mfma, 16)
+    v_layout: gl.constexpr = gl.DotOperandLayout(1, mfma, 16)
+    # K and V share [latent, token] storage. Loading with v_layout's axes
+    # swapped lets V be viewed as [token, latent] without moving data.
+    value_linear: gl.constexpr = gl.to_linear_layout(v_layout, [N, _QUERY_VALUE_TILE])
+    value_layout: gl.constexpr = _transpose_operand_layout(value_linear)
+    load_layout: gl.constexpr = gl.BlockedLayout([1, 16], [4, 16], [4, 1], [1, 0])
+    m = gl.arange(0, M, layout=gl.SliceLayout(1, load_layout))
+    query = (group * M + m) // H
+    head = (group * M + m) % H
+    d = gl.arange(0, 512, layout=gl.SliceLayout(0, load_layout))
+    dpe = gl.arange(0, 64, layout=gl.SliceLayout(0, load_layout))
+    q_offset = request * STRIDE_Q_B + query * STRIDE_Q_S + head * STRIDE_Q_H
+    q_mask = (head < H) & (query < QLEN)
+    q = gl.load(Q + q_offset[:, None] + d[None, :], q_mask[:, None], 0.0)
+    qpe = gl.load(Q + q_offset[:, None] + 512 + dpe[None, :], q_mask[:, None], 0.0)
+    q = gl.convert_layout(q, a_layout)
+    qpe = gl.convert_layout(qpe, a_layout)
+
+    m_acc = gl.arange(0, M, layout=gl.SliceLayout(1, mfma))
+    query_acc = (group * M + m_acc) // H
+    head_acc = (group * M + m_acc) % H
+    visible = length - QLEN + query_acc + 1
+    maximum = gl.full([M], -float("inf"), gl.float32, gl.SliceLayout(1, mfma))
+    if M == 128:
+        denominator = gl.zeros([M], gl.float32, gl.SliceLayout(1, mfma))
+    else:
+        # Each 32-key half of a row belongs to a different wave. Keep two sums
+        # per row to avoid exchanging partial sums on every iteration. Both use
+        # the same maximum and alpha, so they can be added after the loop.
+        denominator = gl.sum(
+            gl.reshape(gl.zeros([M, N], gl.float32, mfma), [M, 2, N // 2]), 2
+        )
+        denominator_layout: gl.constexpr = denominator.type.layout
+    acc0 = gl.zeros([M, _QUERY_VALUE_TILE], gl.float32, mfma)
+    acc1 = gl.zeros([M, _QUERY_VALUE_TILE], gl.float32, mfma)
+    acc2 = gl.zeros([M, _QUERY_VALUE_TILE], gl.float32, mfma)
+    acc3 = gl.zeros([M, _QUERY_VALUE_TILE], gl.float32, mfma)
+    token = gl.arange(0, N, layout=gl.SliceLayout(0, mfma))
+
+    shared: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=16, per_phase=1, max_phase=8, order=[0, 1]
+    )
+    shared_pe: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=16, per_phase=1, max_phase=4, order=[0, 1]
+    )
+    kv_load: gl.constexpr = gl.BlockedLayout([16, 1], [32, 2], [1, 4], [0, 1])
+    pe_load: gl.constexpr = gl.BlockedLayout([16, 1], [4, 16], [1, 4], [0, 1])
+    buffers = gl.allocate_shared_memory(Q.type.element_ty, [2, 512, N], shared)
+    pe_buffers = gl.allocate_shared_memory(Q.type.element_ty, [2, 64, N], shared_pe)
+    if M == 64:
+        maximum_buffer = gl.allocate_shared_memory(
+            gl.float32, [M, 2], gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
+        )
+        maximum_layout: gl.constexpr = _replicated_pair_layout(
+            gl.to_linear_layout(gl.SliceLayout(1, mfma), [M])
+        )
+    # DMA writes in lane order; offsets already account for the LDS swizzle.
+    linear: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0, 1])
+    offsets, pe_offsets = _make_kv_offsets(
+        STRIDE_KV, N, kv_load, pe_load, shared, shared_pe
+    )
+    page = _load_page(Pages, request, first, end, stride_page, PAGE)
+    _issue_load_kv(
+        buffers.index(0),
+        pe_buffers.index(0),
+        KV,
+        page,
+        first,
+        end,
+        offsets,
+        pe_offsets,
+        STRIDE_KV,
+        PAGE,
+        N,
+        kv_load,
+        pe_load,
+        linear,
+    )
+    # Prefetch the next page ID while the current KV copy is in flight.
+    if M == 64:
+        page = _load_page(Pages, request, first + N, end, stride_page, PAGE)
+    current = 0
+    for start in range(first, end, N):
+        gl.amd.cdna4.async_copy.wait_group(0)
+        other = 1 - current
+        if start + N < end:
+            if M == 128:
+                page = _load_page(Pages, request, start + N, end, stride_page, PAGE)
+            _issue_load_kv(
+                buffers.index(other),
+                pe_buffers.index(other),
+                KV,
+                page,
+                start + N,
+                end,
+                offsets,
+                pe_offsets,
+                STRIDE_KV,
+                PAGE,
+                N,
+                kv_load,
+                pe_load,
+                linear,
+            )
+            if M == 64:
+                page = _load_page(Pages, request, start + 2 * N, end, stride_page, PAGE)
+        key = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            buffers.index(current), b_layout
+        )
+        key_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            pe_buffers.index(current), b_layout
+        )
+        logits = _mfma_unscaled_fp8(q, key, gl.zeros([M, N], gl.float32, mfma))
+        logits = _mfma_unscaled_fp8(qpe, key_pe, logits) * sm_scale
+        allowed = (start + token[None, :] < end) & (
+            start + token[None, :] < visible[:, None]
+        )
+        logits = gl.where(allowed, logits, -float("inf"))
+        if M == 128:
+            row_maximum = gl.max(logits, 1)
+        else:
+            local_maximum = gl.max(gl.reshape(logits, [M, 2, N // 2]), 2)
+            maximum_buffer.store(local_maximum)
+            row_maximum = gl.convert_layout(
+                gl.max(maximum_buffer.load(maximum_layout), 1), gl.SliceLayout(1, mfma)
+            )
+        next_max = gl.maximum(maximum, row_maximum)
+        safe_max = gl.where(next_max == -float("inf"), 0.0, next_max)
+        alpha = gl.exp2((maximum - safe_max) * _INV_LN2)
+        probability = gl.exp2((logits - safe_max[:, None]) * _INV_LN2)
+        if M == 128:
+            denominator = denominator * alpha + gl.sum(probability, 1)
+        else:
+            partial_probability = gl.reshape(probability, [M, 2, N // 2])
+            denominator = denominator * gl.convert_layout(
+                alpha, gl.SliceLayout(1, denominator_layout)
+            )[:, None] + gl.sum(partial_probability, 2)
+        maximum = next_max
+        probability = gl.convert_layout(
+            (probability * _FP8_PROBABILITY_SCALE).to(Q.type.element_ty), p_layout
+        )
+        acc0 = _compute_pv(
+            buffers.index(current), probability, acc0, alpha, 0, value_layout, v_layout
+        )
+        acc1 = _compute_pv(
+            buffers.index(current), probability, acc1, alpha, 1, value_layout, v_layout
+        )
+        acc2 = _compute_pv(
+            buffers.index(current), probability, acc2, alpha, 2, value_layout, v_layout
+        )
+        acc3 = _compute_pv(
+            buffers.index(current), probability, acc3, alpha, 3, value_layout, v_layout
+        )
+        current = other
+
+    row = (request * QLEN + query_acc) * H + head_acc
+    valid = (head_acc < H) & (query_acc < QLEN)
+    partial_row = row * SPLIT_BUCKET + split
+    if M == 64:
+        denominator = gl.convert_layout(gl.sum(denominator, 1), gl.SliceLayout(1, mfma))
+    reciprocal = gl.where(
+        denominator > 0, 1.0 / (denominator * _FP8_PROBABILITY_SCALE), 0.0
+    )
+    partial_out = Partials + partial_row[:, None] * 512
+    _store_partial(partial_out, acc0, reciprocal, valid, 0)
+    _store_partial(partial_out, acc1, reciprocal, valid, 1)
+    _store_partial(partial_out, acc2, reciprocal, valid, 2)
+    _store_partial(partial_out, acc3, reciprocal, valid, 3)
+    gl.store(LSE + partial_row, maximum + gl.log(denominator), valid)
+
+
+@gluon.jit(
+    launch_metadata=_launch_metadata,
+    do_not_specialize=["splits", "wide_splits", "reuse_min_history"],
+)
+def gluon_mla_decode_fp8_query_blocks_reduce_gfx950(
+    Partials,
+    LSE,
+    Lengths,
+    Output,
+    FinalLSE,
+    H: gl.constexpr,
+    QLEN: gl.constexpr,
+    PAGE: gl.constexpr,
+    splits,
+    wide_splits,
+    reuse_min_history,
+    SPLIT_BUCKET: gl.constexpr,
+    WIDE_SPLIT_BUCKET: gl.constexpr,
+    RETURN_LSE: gl.constexpr,
+):
+    row = gl.program_id(0)
+    column = gl.program_id(1)
+    length = gl.load(Lengths + row // (QLEN * H))
+    if _supports_wide_query_block(H, QLEN, PAGE):
+        if _use_wide_query_block(length, wide_splits, H, QLEN):
+            _reduce_splits(
+                Partials,
+                LSE,
+                Output,
+                FinalLSE,
+                row,
+                column,
+                splits=wide_splits,
+                SPLIT_STRIDE=WIDE_SPLIT_BUCKET,
+                REDUCE_SPLITS=WIDE_SPLIT_BUCKET,
+                VALUE_TILE=_QUERY_VALUE_TILE,
+                RETURN_LSE=RETURN_LSE,
+            )
+            return
+        request = row // (QLEN * H)
+        offset = request * QLEN * H * (WIDE_SPLIT_BUCKET - SPLIT_BUCKET)
+        Partials += offset * 512
+        LSE += offset
+    groups: gl.constexpr = gl.cdiv(QLEN * H, _QUERY_ROW_TILE)
+    if H <= _QUERY_HEAD_TILE and PAGE == 64 and groups * SPLIT_BUCKET >= QLEN:
+        if length < reuse_min_history and groups * splits >= QLEN:
+            if column == 0:
+                _reduce_splits(
+                    Partials,
+                    LSE,
+                    Output,
+                    FinalLSE,
+                    row,
+                    column,
+                    splits=groups * splits // QLEN,
+                    SPLIT_STRIDE=SPLIT_BUCKET,
+                    REDUCE_SPLITS=_single_query_split_bucket(H, QLEN, SPLIT_BUCKET),
+                    VALUE_TILE=512,
+                    RETURN_LSE=RETURN_LSE,
+                )
+            return
+    _reduce_splits(
+        Partials,
+        LSE,
+        Output,
+        FinalLSE,
+        row,
+        column,
+        splits=splits,
+        SPLIT_STRIDE=SPLIT_BUCKET,
+        REDUCE_SPLITS=SPLIT_BUCKET,
+        VALUE_TILE=_QUERY_VALUE_TILE,
+        RETURN_LSE=RETURN_LSE,
+    )
+
+
+@gluon.jit
+def _reduce_splits(
+    Partials,
+    LSE,
+    Output,
+    FinalLSE,
+    row,
+    column,
+    splits,
+    SPLIT_STRIDE: gl.constexpr,
+    REDUCE_SPLITS: gl.constexpr,
+    VALUE_TILE: gl.constexpr,
+    RETURN_LSE: gl.constexpr,
+):
+    if VALUE_TILE == 512 and REDUCE_SPLITS <= 16:
+        # Each thread merges its own columns without exchanging partials.
+        layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, 4], [1, 0])
+    else:
+        layout: gl.constexpr = gl.BlockedLayout([1, 4], [4, 16], [4, 1], [1, 0])
+    s = gl.arange(0, REDUCE_SPLITS, layout=gl.SliceLayout(1, layout))
+    d = column * VALUE_TILE + gl.arange(0, VALUE_TILE, layout=gl.SliceLayout(0, layout))
+    lse = gl.load(LSE + row * SPLIT_STRIDE + s, s < splits, -float("inf"))
+    valid = lse != -float("inf")
+    maximum = gl.max(lse, 0)
+    safe_max = gl.where(maximum == -float("inf"), 0.0, maximum)
+    weights = gl.exp2((lse - safe_max) * _INV_LN2)
+    denom = gl.sum(weights, 0)
+    values = gl.load(
+        Partials + (row * SPLIT_STRIDE + s[:, None]) * 512 + d[None, :],
+        valid[:, None],
+        0.0,
+    ).to(gl.float32)
+    result = gl.sum(values * weights[:, None], 0)
+    gl.store(Output + row * 512 + d, gl.where(denom > 0, result / denom, 0.0))
+
+    if RETURN_LSE:
+        if column == 0:
+            gl.store(FinalLSE + row, maximum + gl.log(denom))
 
 
 _WAVE_WORKGROUPS = 256
@@ -2184,3 +2897,204 @@ def launch_gluon_mla_decode_projected_value_gfx950(
         gate=gate,
         projected_out=out,
     )
+
+
+def launch_gluon_mla_decode_fp8_query_blocks_gfx950(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    softmax_scale: float,
+    *,
+    logit_cap: float,
+    return_lse: bool,
+    out: torch.Tensor | None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Decode causal FP8 query blocks with one page-table row per request.
+
+    Args:
+        q: E4M3 queries shaped ``[requests, queries, heads, 576]`` with a
+            contiguous last dimension. Supports 2 to 16 queries per request.
+        kv_cache: Contiguous E4M3 cache shaped ``[pages, page_size, 1, 576]``;
+            supported page sizes are 64, 128 and 256.
+        page_table: Int32 physical page indices shaped ``[requests, pages]``
+            with a contiguous last dimension.
+        cache_seqlens: Contiguous int32 final KV lengths shaped ``[requests]``.
+            Query ``j`` sees ``cache_seqlens[i] - queries + j + 1`` tokens.
+        max_seqlen_k: Host-side KV-length upper bound used to choose the split
+            count and scratch allocation. Actual attention limits come from
+            ``cache_seqlens``.
+        qk_nope_head_dim: Original non-RoPE query width. Unused because ``q``
+            has already been projected into the latent space.
+        kv_lora_rank: Latent width; must be 512.
+        qk_rope_head_dim: Positional width; must be 64.
+        softmax_scale: Scale applied to QK logits before softmax.
+        logit_cap: Soft cap on attention logits; only ``0.0`` is supported.
+        return_lse: Whether to also return natural-log log-sum-exp values.
+        out: Optional contiguous BF16 destination shaped
+            ``[requests, queries, heads, 512]`` on the input device.
+
+    Returns:
+        BF16 latent output shaped ``[requests, queries, heads, 512]``, or
+        ``(output, lse)`` when ``return_lse`` is true. LSE is FP32 shaped
+        ``[requests, queries, heads]``. Rows with no visible history have
+        zero output and negative-infinity LSE.
+    """
+    if q.ndim != 4 or q.shape[2] <= 0 or q.shape[3] != 576:
+        raise ValueError(
+            "query-block MLA requires q [requests,queries,heads,576], "
+            f"got {tuple(q.shape)}"
+        )
+    if not 2 <= q.shape[1] <= 16:
+        raise NotImplementedError(
+            f"query-block MLA supports 2..16 queries per request, got {q.shape[1]}"
+        )
+    if q.dtype != torch.float8_e4m3fn or kv_cache.dtype != q.dtype:
+        raise NotImplementedError(
+            "query-block MLA requires float8_e4m3fn q and KV, "
+            f"got {q.dtype} and {kv_cache.dtype}"
+        )
+    if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
+        raise NotImplementedError(
+            "query-block MLA requires latent/positional dimensions 512/64, "
+            f"got {kv_lora_rank}/{qk_rope_head_dim}"
+        )
+    if logit_cap != 0.0:
+        raise NotImplementedError(
+            f"query-block MLA requires logit_cap=0.0, got {logit_cap}"
+        )
+    if kv_cache.ndim != 4 or kv_cache.shape[2:] != (1, 576):
+        raise ValueError(
+            "query-block MLA requires KV [pages,page_size,1,576], "
+            f"got {tuple(kv_cache.shape)}"
+        )
+    if kv_cache.shape[1] not in (64, 128, 256):
+        raise NotImplementedError(
+            "query-block MLA supports page sizes 64, 128 and 256, "
+            f"got {kv_cache.shape[1]}"
+        )
+    if not kv_cache.is_contiguous() or q.stride(-1) != 1:
+        raise ValueError(
+            "query-block MLA requires contiguous KV and query head dimensions, "
+            f"got KV strides {kv_cache.stride()} and q strides {q.stride()}"
+        )
+    batch, width, heads, _ = q.shape
+    if (
+        page_table.ndim != 2
+        or page_table.shape[0] != batch
+        or page_table.stride(1) != 1
+    ):
+        raise ValueError(
+            "query-block MLA requires one unit-stride page-table row per request, "
+            f"got shape {tuple(page_table.shape)} and strides {page_table.stride()}"
+        )
+    if cache_seqlens.shape != (batch,) or not cache_seqlens.is_contiguous():
+        raise ValueError(
+            "query-block MLA requires one contiguous cache length per request, "
+            f"got shape {tuple(cache_seqlens.shape)} and strides {cache_seqlens.stride()}"
+        )
+    if page_table.dtype != torch.int32 or cache_seqlens.dtype != torch.int32:
+        raise ValueError(
+            "query-block MLA metadata must be int32, "
+            f"got {page_table.dtype} and {cache_seqlens.dtype}"
+        )
+    if not q.is_cuda or any(
+        tensor.device != q.device for tensor in (kv_cache, page_table, cache_seqlens)
+    ):
+        raise ValueError(
+            "query-block MLA inputs must share one GPU, "
+            f"got q={q.device}, KV={kv_cache.device}, "
+            f"page_table={page_table.device}, cache_seqlens={cache_seqlens.device}"
+        )
+    shape = (batch, width, heads, kv_lora_rank)
+    if out is None:
+        out = torch.empty(shape, device=q.device, dtype=torch.bfloat16)
+    elif (
+        out.shape != shape
+        or out.dtype != torch.bfloat16
+        or out.device != q.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"query-block MLA out must be contiguous BF16 {shape} on {q.device}, "
+            f"got shape {tuple(out.shape)}, dtype {out.dtype}, device {out.device} "
+            f"and strides {out.stride()}"
+        )
+    final_lse = (
+        torch.empty((batch, width, heads), device=q.device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
+    if not batch:
+        return (out, final_lse) if return_lse else out
+
+    page_size = kv_cache.shape[1]
+    reuse_min_history = (
+        (12288, 8193, 5377, 10241, 4609, 4096, 4096, 5121)[batch - 1]
+        if batch <= 8
+        else _KV_REUSE_MIN_HISTORY.value
+    )
+    query_groups = triton.cdiv(width * heads, _QUERY_ROW_TILE.value)
+    splits = _select_num_kv_splits_bh16bn128_fp8(
+        batch=batch * query_groups, max_seqlen_k=max_seqlen_k, block_n=64
+    )
+    wide_splits = splits
+    grid = (batch, query_groups, splits)
+    if _supports_wide_query_block(heads, width, page_size):
+        wide_splits = _select_num_kv_splits_bh16bn128_fp8(
+            batch=batch, max_seqlen_k=max_seqlen_k, block_n=64
+        )
+        grid = (batch, 1, max(query_groups * splits, wide_splits))
+    split_bucket = triton.next_power_of_2(splits)
+    wide_split_bucket = triton.next_power_of_2(wide_splits)
+    partial_shape = (batch * width * heads, wide_split_bucket, kv_lora_rank)
+    partials = torch.empty(partial_shape, device=q.device, dtype=torch.bfloat16)
+    lse = torch.empty(partial_shape[:-1], device=q.device, dtype=torch.float32)
+    gluon_mla_decode_fp8_query_blocks_gfx950[grid](
+        q,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        partials,
+        lse,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv_cache.stride(1),
+        page_table.stride(0),
+        heads,
+        width,
+        page_size,
+        splits,
+        wide_splits,
+        reuse_min_history,
+        split_bucket,
+        wide_split_bucket,
+        kv_cache.numel() * kv_cache.element_size() < 0x80000000,
+        softmax_scale,
+        num_warps=4,
+    )
+    gluon_mla_decode_fp8_query_blocks_reduce_gfx950[
+        (batch * width * heads, kv_lora_rank // _QUERY_VALUE_TILE.value)
+    ](
+        partials,
+        lse,
+        cache_seqlens,
+        out,
+        final_lse,
+        heads,
+        width,
+        page_size,
+        splits,
+        wide_splits,
+        reuse_min_history,
+        split_bucket,
+        wide_split_bucket,
+        return_lse,
+        num_warps=4,
+    )
+    return (out, final_lse) if return_lse else out

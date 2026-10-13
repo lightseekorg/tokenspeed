@@ -31,30 +31,97 @@ _LOAD_ELEMS = gl.constexpr(2)
 
 
 @gluon.jit
-def _load_candidate(
+def _attn_res_accumulate(
+    value,
+    scorer,
+    max_logit,
+    denominator,
+    mixed,
+    H: gl.constexpr,
+    SCORE_EPS: gl.constexpr,
+):
+    """Fold one candidate into a normalized online softmax mixture."""
+    square_sum = gl.sum(value * value, axis=0)
+    dot = gl.sum(value * scorer, axis=0)
+    score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
+    score_delta = score - max_logit
+    relative_scale = gl.exp2(-gl.abs(score_delta) * 1.4426950408889634)
+    candidate_is_max = score_delta > 0.0
+    old_scale = gl.where(candidate_is_max, relative_scale, 1.0)
+    candidate_scale = gl.where(candidate_is_max, 1.0, relative_scale)
+    denominator = denominator * old_scale + candidate_scale
+    candidate_weight = candidate_scale / denominator
+    mixed += candidate_weight * (value - mixed)
+    return gl.maximum(max_logit, score), denominator, mixed
+
+
+@gluon.jit
+def _attn_res_mix_gfx950(
     prefix,
     block_residual,
+    res_weight,
+    score_rms_weight,
+    output_rms_weight,
     token,
     hidden,
     hidden_mask,
     stride_block_t: gl.constexpr,
     stride_block_n: tl.int64,
-    candidate: gl.constexpr,
+    H: gl.constexpr,
     N: gl.constexpr,
+    SCORE_EPS: gl.constexpr,
+    OUTPUT_EPS: gl.constexpr,
 ):
-    if candidate == N - 1:
-        return prefix
-    # The stride fits int32, but candidate * stride can exceed it at large T.
-    ptr = block_residual + candidate * stride_block_n.to(gl.int64)
-    return cdna4.buffer_load(
-        ptr,
-        (token * stride_block_t + hidden).to(gl.int32),
-        mask=hidden_mask,
-        other=0.0,
+    """Mix candidates and normalize, retaining both existing BF16 boundaries."""
+    prefix = prefix.to(gl.float32)
+    if N == 1:
+        mixed = prefix
+    else:
+        scorer = cdna4.buffer_load(
+            res_weight, hidden.to(gl.int32), mask=hidden_mask, other=0.0
+        ).to(gl.float32)
+        scorer *= cdna4.buffer_load(
+            score_rms_weight, hidden.to(gl.int32), mask=hidden_mask, other=0.0
+        ).to(gl.float32)
+        # Consume the resident prefix first so it becomes the running mixture.
+        mixed = prefix
+        square_sum = gl.sum(prefix * prefix, axis=0)
+        dot = gl.sum(prefix * scorer, axis=0)
+        max_logit = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
+        denominator = 1.0
+        # A runtime loop keeps one block snapshot live at a time; unrolling
+        # lets the compiler hoist every snapshot load and halves occupancy.
+        for candidate in range(N - 1):
+            # The stride fits int32, but candidate * stride can exceed it at large T.
+            value = cdna4.buffer_load(
+                block_residual + candidate * stride_block_n.to(gl.int64),
+                (token * stride_block_t + hidden).to(gl.int32),
+                mask=hidden_mask,
+                other=0.0,
+            ).to(gl.float32)
+            max_logit, denominator, mixed = _attn_res_accumulate(
+                value, scorer, max_logit, denominator, mixed, H, SCORE_EPS
+            )
+    mixed = mixed.to(gl.bfloat16).to(gl.float32)
+    inverse_rms = gl.rsqrt(gl.sum(mixed * mixed, axis=0) / H + OUTPUT_EPS)
+    output_weight = cdna4.buffer_load(
+        output_rms_weight, hidden.to(gl.int32), mask=hidden_mask, other=0.0
     ).to(gl.float32)
+    return (mixed * inverse_rms * output_weight).to(gl.bfloat16)
 
 
-@gluon.jit
+def _attn_res_launch_metadata(grid, kernel, args):
+    tensors_per_element = (
+        args["N"]
+        + 2
+        + 2 * int(args["N"] > 1)
+        + 2 * int(args["HAS_DELTA"])
+        + int(args["WRITE_BLOCK"])
+    )
+    return {"name": kernel.name, "bytes": grid[0] * args["H"] * tensors_per_element * 2}
+
+
+@gluon.jit(launch_metadata=_attn_res_launch_metadata)
 def gluon_attn_res_fwd_gfx950(
     layer_residual,
     delta,
@@ -113,58 +180,24 @@ def gluon_attn_res_fwd_gfx950(
             mask=hidden_mask,
         )
 
-    if N == 1:
-        mixed = prefix
-    else:
-        scorer = cdna4.buffer_load(
-            res_weight,
-            hidden.to(gl.int32),
-            mask=hidden_mask,
-            other=0.0,
-        ).to(gl.float32)
-        scorer *= cdna4.buffer_load(
-            score_rms_weight,
-            hidden.to(gl.int32),
-            mask=hidden_mask,
-            other=0.0,
-        ).to(gl.float32)
-        max_logit = -float("inf")
-        denominator = 0.0
-        mixed = gl.zeros([_BLOCK_H], gl.float32, hidden_layout)
-        for candidate in gl.static_range(N):
-            value = _load_candidate(
-                prefix,
-                block_residual,
-                token,
-                hidden,
-                hidden_mask,
-                stride_block_t,
-                stride_block_n,
-                candidate,
-                N,
-            )
-            square_sum = gl.sum(value * value, axis=0)
-            dot = gl.sum(value * scorer, axis=0)
-            score = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
-            next_max = gl.maximum(max_logit, score)
-            old_scale = gl.exp(max_logit - next_max)
-            candidate_scale = gl.exp(score - next_max)
-            denominator = denominator * old_scale + candidate_scale
-            mixed = mixed * old_scale + candidate_scale * value
-            max_logit = next_max
-        mixed /= denominator
-
-    # Preserve the existing AttnRes BF16 boundary before output RMSNorm.
-    mixed = mixed.to(gl.bfloat16).to(gl.float32)
-    inverse_rms = gl.rsqrt(gl.sum(mixed * mixed, axis=0) / H + OUTPUT_EPS)
-    output_weight = cdna4.buffer_load(
+    mixed = _attn_res_mix_gfx950(
+        prefix,
+        block_residual,
+        res_weight,
+        score_rms_weight,
         output_rms_weight,
-        hidden.to(gl.int32),
-        mask=hidden_mask,
-        other=0.0,
-    ).to(gl.float32)
+        token,
+        hidden,
+        hidden_mask,
+        stride_block_t,
+        stride_block_n,
+        H,
+        N,
+        SCORE_EPS,
+        OUTPUT_EPS,
+    )
     cdna4.buffer_store(
-        (mixed * inverse_rms * output_weight).to(output.dtype.element_ty),
+        mixed.to(output.dtype.element_ty),
         output,
         (token * stride_output_t + hidden).to(gl.int32),
         mask=hidden_mask,

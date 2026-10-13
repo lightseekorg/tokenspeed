@@ -7,6 +7,7 @@ invariants in isolation -- segment splitting, the eager break handoff, shared
 mempool address stability -- without touching the model or the hot path.
 """
 
+import contextlib
 import os
 import sys
 import unittest
@@ -315,6 +316,158 @@ class TestBucketedCapture(unittest.TestCase):
             )
         # First sighting of each distinct bucket captured once; later n replay.
         self.assertEqual(set(self._captures), {4, 8, 16})
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestSharedHandoffStorage(unittest.TestCase):
+    """Captures of different widths share handoff storage through ``handoff_storage``.
+
+    Each layer has two breaks whose outputs have the same width, different row
+    counts, and are read together by the next segment, so merging them into one
+    buffer inside a capture would corrupt the result.
+    """
+
+    def setUp(self):
+        torch.manual_seed(3)
+        self.dev, self.dtype = "cuda", torch.float32
+        self.d = 16
+        self.w = torch.randn(self.d, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static = torch.zeros(8, self.d, device=self.dev, dtype=self.dtype)
+
+        class M:
+            @break_point
+            def whole(self, h):
+                return torch.relu(h)
+
+            @break_point
+            def half(self, h):
+                return h[: h.shape[0] // 2] * 2.0
+
+        self.m = M()
+
+    def _inner(self, n):
+        h = self.x_static[:n] @ self.w
+        a = self.m.whole(h)
+        b = self.m.half(h)
+        return a[: n // 2] + b
+
+    def _capture(self, n, storage, pool):
+        for _ in range(2):
+            self._inner(n)
+        torch.cuda.synchronize()
+        cap = BreakableCapture(pool=pool, handoff_storage=storage)
+        with cap:
+            out = self._inner(n)
+        return cap, out
+
+    def _check(self, captures, n):
+        cap, out = captures[n]
+        x = torch.randn(n, self.d, device=self.dev, dtype=self.dtype)
+        self.x_static.zero_()
+        self.x_static[:n].copy_(x)
+        cap.replay()
+        torch.cuda.synchronize()
+        h = x @ self.w
+        expected = torch.relu(h)[: n // 2] + h[: n // 2] * 2.0
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_captures_share_storage_and_replay_like_eager(self):
+        for order in ([8, 4], [4, 8]):
+            storage, pool, captures = {}, None, {}
+            for n in order:
+                captures[n] = self._capture(n, storage, pool)
+                pool = pool or captures[n][0].pool
+            # One slot per distinct handoff of a capture, not per capture.
+            self.assertEqual(len(storage), 2, order)
+            for n in (8, 4, 8, 4):
+                self._check(captures, n)
+            if order == [8, 4]:
+                wide, narrow = (
+                    {t.data_ptr() for t in captures[n][0]._handoff.values()}
+                    for n in (8, 4)
+                )
+                self.assertEqual(wide, narrow)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestPrefillGraphSharedOutputs(unittest.TestCase):
+    """PrefillGraph captures of two buckets share one output buffer and handoff map.
+
+    Replaying them alternately, including padded replays, must match eager over
+    the padded bucket exactly: a stale or aliased shared buffer would not.
+    """
+
+    def test_alternating_bucket_replays_match_eager(self):
+        from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+        torch.manual_seed(4)
+        dev, d = "cuda", 32
+        w1 = torch.randn(d, d, device=dev)
+        w2 = torch.randn(d, d, device=dev)
+        x_static = torch.zeros(16, d, device=dev)
+
+        class M:
+            @break_point
+            def attn(self, h):
+                return torch.tanh(h) * 3.0
+
+            @break_point
+            def half(self, h):
+                return h[: h.shape[0] // 2] + 1.0
+
+        m = M()
+
+        def inner(n):
+            h = x_static[:n] @ w1
+            a = m.attn(h)
+            b = m.half(h)
+            out = a.clone()
+            out[: n // 2] += b
+            return out, [a @ w2]
+
+        def eager(x):
+            h = x @ w1
+            a = torch.tanh(h) * 3.0
+            out = a.clone()
+            out[: x.shape[0] // 2] += h[: x.shape[0] // 2] + 1.0
+            return out, a @ w2
+
+        graph = PrefillGraph.__new__(PrefillGraph)
+        graph.num_warmup, graph._pool, graph._ctx = 2, None, None
+        graph.capture_buckets, graph.decoder_buckets = [8, 16], []
+        graph._narrowing, graph._outputs, graph._handoff_storage = None, None, {}
+        graph._run_inner = inner
+        with torch.inference_mode():
+            captures = {
+                bucket: PrefillGraph._capture_bucket(
+                    graph, bucket, None, contextlib.nullcontext()
+                )
+                for bucket in (16, 8)
+            }
+        for _cap, output in captures.values():
+            self.assertEqual(
+                output.hidden_states.data_ptr(), graph._outputs[0].data_ptr()
+            )
+            self.assertEqual(
+                output.aux_hidden_states[0].data_ptr(), graph._outputs[1].data_ptr()
+            )
+        self.assertEqual(len(graph._handoff_storage), 2)
+
+        # Serving replays under inference mode too; the breaks write inference tensors.
+        with torch.inference_mode():
+            for bucket, live in ((16, 16), (8, 8), (16, 16), (8, 5), (16, 12), (8, 8)):
+                x = torch.randn(live, d, device=dev)
+                x_static.zero_()
+                x_static[:live].copy_(x)
+                cap, output = captures[bucket]
+                cap.replay()
+                torch.cuda.synchronize()
+                hidden, aux = output.sliced(live)
+                padded = torch.zeros(bucket, d, device=dev)
+                padded[:live] = x
+                expected, tap = eager(padded)
+                torch.testing.assert_close(hidden, expected[:live], rtol=0, atol=0)
+                torch.testing.assert_close(aux[0], tap[:live], rtol=0, atol=0)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

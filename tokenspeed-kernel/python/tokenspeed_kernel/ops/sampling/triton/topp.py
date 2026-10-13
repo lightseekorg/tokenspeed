@@ -70,7 +70,7 @@ def _top_p_parallel_stage1_kernel(
     offset = tl.load(offsets_pool_ptr + pool_idx).to(tl.int64) + spec_pos
 
     vals = tl.load(
-        logits_ptr + row * logits_row_stride + cols,
+        logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
@@ -194,7 +194,7 @@ def _top_p_parallel_stage3_kernel(
         tl.load(temperature_pool_ptr + pool_idx).to(tl.float32), 1.0e-20
     )
     vals = tl.load(
-        logits_ptr + row * logits_row_stride + cols,
+        logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
@@ -304,7 +304,7 @@ def _top_p_parallel_repair_kernel(
             cols = start + token_offsets
             mask = cols < vocab_size
             vals = tl.load(
-                logits_ptr + row * logits_row_stride + cols,
+                logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
                 mask=mask,
                 other=float("-inf"),
             ).to(tl.float32)
@@ -329,7 +329,7 @@ def _top_p_parallel_repair_kernel(
             cols = start + token_offsets
             mask = cols < vocab_size
             vals = tl.load(
-                logits_ptr + row * logits_row_stride + cols,
+                logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
                 mask=mask,
                 other=float("-inf"),
             ).to(tl.float32)

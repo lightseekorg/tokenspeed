@@ -37,10 +37,10 @@ from tokenspeed_kernel._triton import tl, triton
 
 __all__ = ["advance_accepted_frontier"]
 
-_BLOCK = 1024
+_BLOCK = 128
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["batch_size", "num_extends", "max_num_tokens"])
 def _advance_accepted_frontier_kernel(
     req_pool_indices_ptr,
     input_lengths_ptr,
@@ -258,8 +258,7 @@ def advance_accepted_frontier(
         )
         return
 
-    block = min(_BLOCK, triton.next_power_of_2(batch_size))
-    _advance_accepted_frontier_kernel[(triton.cdiv(batch_size, block),)](
+    _advance_accepted_frontier_kernel[(triton.cdiv(batch_size, _BLOCK),)](
         req_pool_indices,
         input_lengths,
         accept_lengths,
@@ -272,7 +271,7 @@ def advance_accepted_frontier(
         num_extends,
         padding_index,
         max_num_tokens,
-        BLOCK=block,
+        BLOCK=_BLOCK,
         CONTEXT=context,
         CONTEXT_PAD=max(2, triton.next_power_of_2(context)),
         HAS_TAIL=has_tail,

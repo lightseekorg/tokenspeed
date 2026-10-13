@@ -21,8 +21,9 @@
 """CPU-only tests for the event loop's in-flight commit queue helpers.
 
 These exercise ``_dispatch_depends_on_pending_commit`` (the single registry
-of overlap-breaking dependencies) and ``_drain_in_flight`` with fakes, so no
-model, CUDA context, or transfer backend is created.
+of overlap-breaking dependencies), ``_drain_in_flight`` and the pipeline's
+commit-side token broadcast with fakes, so no model, CUDA context, or
+transfer backend is created.
 """
 
 from __future__ import annotations
@@ -130,6 +131,129 @@ def test_request_context_length_sums_prompt_and_output() -> None:
     loop = SimpleNamespace(output_processor=SimpleNamespace(rid_to_state={"r": state}))
 
     assert EventLoop._request_context_length(loop, "r") == 1024
+
+
+def _pp_loop(monkeypatch, *, is_last_pp_rank: bool, broadcast):
+    """A loop on a two-stage pipeline whose gloo broadcast is ``broadcast``."""
+    import tokenspeed.runtime.engine.event_loop as event_loop_module
+
+    monkeypatch.setattr(
+        event_loop_module,
+        "pg_manager",
+        SimpleNamespace(get_process_group=lambda backend, group: ("gloo", group)),
+    )
+    monkeypatch.setattr(event_loop_module.dist, "broadcast_object_list", broadcast)
+    mapping = SimpleNamespace(
+        has_pp=True, pp_group=(3, 7), is_last_pp_rank=is_last_pp_rank
+    )
+    return SimpleNamespace(server_args=SimpleNamespace(mapping=mapping))
+
+
+def test_pp_broadcast_adopts_the_last_stage_tokens_candidates_logprobs_and_flags(
+    monkeypatch,
+) -> None:
+    """A stage before the last commits the last stage's sampled tokens, the
+    drafter's candidate rows (next_input_ids) -- every rank's scheduler folds
+    them into the final chunk's result, which the remote decode carries --
+    both logprob vectors, which every rank's output processor records on its
+    request state, and the NaN guard's per-request flags, so every stage
+    aborts (or finishes) the same requests: only the last stage audits
+    logits and prompt logprobs, and the stage's own flags (zero here, the
+    guard found nothing in its placeholder outputs) would commit as healthy a
+    request the last stage aborts. The prompt-logprob plan the flat vector
+    follows is the stage's own (mirrored) one, so it stays in place."""
+    from_last_stage = (
+        ["sampled"],
+        ["lengths"],
+        ["candidates"],
+        ["output logprobs"],
+        ["prompt logprobs"],
+        ["nan flags"],
+    )
+
+    def broadcast(payload, src, group):
+        assert src == 7 and group == ("gloo", (3, 7))
+        assert payload == [None]
+        payload[0] = from_last_stage
+
+    loop = _pp_loop(monkeypatch, is_last_pp_rank=False, broadcast=broadcast)
+    results = SimpleNamespace(
+        output_tokens="placeholder",
+        output_lengths="placeholder",
+        next_input_ids=None,
+        output_logprobs=None,
+        input_token_logprobs=None,
+        output_nan_flags="this stage's clean flags",
+        input_logprob_plan="this stage's plan",
+    )
+
+    EventLoop._pp_broadcast_output_tokens(loop, forward_op=None, results=results)
+
+    assert results.output_tokens == ["sampled"]
+    assert results.output_lengths == ["lengths"]
+    assert results.next_input_ids == ["candidates"]
+    assert results.output_logprobs == ["output logprobs"]
+    assert results.input_token_logprobs == ["prompt logprobs"]
+    assert results.output_nan_flags == ["nan flags"]
+    assert results.input_logprob_plan == "this stage's plan"
+
+
+def test_pp_broadcast_sends_the_last_stage_results_unchanged(monkeypatch) -> None:
+    sent = []
+    loop = _pp_loop(
+        monkeypatch,
+        is_last_pp_rank=True,
+        broadcast=lambda payload, src, group: sent.append(payload[0]),
+    )
+    results = SimpleNamespace(
+        output_tokens="sampled",
+        output_lengths="lengths",
+        next_input_ids="candidates",
+        output_logprobs="output logprobs",
+        input_token_logprobs="prompt logprobs",
+        output_nan_flags="nan flags",
+    )
+
+    EventLoop._pp_broadcast_output_tokens(loop, forward_op=None, results=results)
+
+    assert sent == [
+        (
+            "sampled",
+            "lengths",
+            "candidates",
+            "output logprobs",
+            "prompt logprobs",
+            "nan flags",
+        )
+    ]
+    assert (results.output_tokens, results.next_input_ids) == ("sampled", "candidates")
+    assert results.input_token_logprobs == "prompt logprobs"
+    assert results.output_nan_flags == "nan flags"
+
+
+def test_pp_broadcast_precedes_commit_post_processing() -> None:
+    """The adopted tokens/candidates must be in place before the output
+    processor reads the result. Pinned on the statement order of
+    EventLoop._commit_forward_results."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(EventLoop._commit_forward_results))
+    calls = [
+        node.func.attr
+        for node in sorted(
+            (
+                n
+                for n in ast.walk(ast.parse(source))
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            ),
+            key=lambda n: (n.lineno, n.col_offset),
+        )
+    ]
+    assert calls.index("_pp_broadcast_output_tokens") < calls.index(
+        "post_process_forward_op"
+    )
 
 
 if __name__ == "__main__":

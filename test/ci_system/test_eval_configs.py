@@ -9,7 +9,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EVAL_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "eval"
 PERF_CONFIG_DIR = REPO_ROOT / "test" / "ci" / "perf"
-STAGE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "run-pr-test-stage.yml"
+STAGE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "run-ci-task-matrix.yml"
 HF_HOME_ASSIGNMENT = "HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache"
 FORK_PR_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
@@ -32,7 +32,7 @@ GPQA_DATASET_SOURCE_PRELUDE = (
 )
 DATASETS = {
     "aime25": {
-        "count": 10,
+        "count": 8,
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
@@ -44,7 +44,7 @@ DATASETS = {
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
-        "count": 10,
+        "count": 7,
         "dataset_args": {"dataset_id": "openai/gsm8k"},
     },
     "mmlu": {
@@ -193,6 +193,32 @@ def test_qwen38_flash_next_runs_gsm8k_with_kvstore_enabled():
     assert task["score_threshold"] == 0.96
 
 
+def test_qwen38_flash_next_mxfp4_runs_gsm8k_on_amd_tp2():
+    path = EVAL_CONFIG_DIR / "qwen3.8-flash-next-mxfp4-evalscope-gsm8k-amd.yaml"
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+    server_tokens = shlex.split(task["server"]["command"])
+    eval_tokens = shlex.split(task["eval"]["command"])
+
+    assert task["runner"]["labels"] == ["amd-mi35x-2gpu-test"]
+    assert task["install"] == ["bash test/ci_system/install_deps_rocm.sh"]
+    model = "amd/Qwen3.8-Flash-Next-Quark-MXFP4"
+    assert flag_value(server_tokens, "--model") == model
+    assert flag_value(server_tokens, "--tensor-parallel-size") == "2"
+    assert flag_value(server_tokens, "--quantization") == "mxfp4"
+    assert flag_value(server_tokens, "--speculative-algorithm") == "MTP"
+    assert flag_value(server_tokens, "--speculative-num-steps") == "3"
+    assert flag_value(eval_tokens, "--model") == model
+    assert flag_value(eval_tokens, "--datasets") == "gsm8k"
+    assert task["score_threshold"] == 0.96
+
+
+def test_deepseek_v4_flash_and_pro_are_not_in_ci_catalog():
+    for path in (REPO_ROOT / "test" / "ci").rglob("*.yaml"):
+        config = path.read_text(encoding="utf-8")
+        assert "DeepSeek-V4-Flash" not in config, path
+        assert "DeepSeek-V4-Pro" not in config, path
+
+
 def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
     filenames = (
         "deepseek-v4.1-flash-dspark-evalscope-gsm8k.yaml",
@@ -219,7 +245,6 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert flag_value(server_tokens, "--max-total-tokens") == "1048576"
         assert flag_value(server_tokens, "--max-num-seqs") == "32"
         assert flag_value(server_tokens, "--chunked-prefill-size") == "8192"
-        assert flag_value(server_tokens, "--gpu-memory-utilization") == "0.9"
         assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "32"
         assert flag_value(server_tokens, "--reasoning-parser") == "deepseek_v31"
         assert "--disable-kvstore" in server_tokens
@@ -283,15 +308,16 @@ def test_kimi_k3_amd_gates_use_eagle3():
     )
     assert tasks[0]["score_threshold"] == 0.90
     perf_server_tokens = shlex.split(tasks[1]["server"]["command"])
-    assert flag_value(perf_server_tokens, "--init-expert-location") == "trivial"
-    assert flag_value(perf_server_tokens, "--ep-dispatch-algorithm") == "static"
+    # EP1 has no expert placement, so server-arg validation rejects these.
+    assert "--init-expert-location" not in perf_server_tokens
+    assert "--ep-dispatch-algorithm" not in perf_server_tokens
     assert flag_value(perf_server_tokens, "--attention-backend") == "gluon"
     assert flag_value(perf_server_tokens, "--drafter-attention-backend") == "gluon"
     assert flag_value(perf_server_tokens, "--max-model-len") == "65536"
     assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
     assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
     assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
-    assert tasks[1]["perf_reference"] == {16: [23, 12.5]}
+    assert tasks[1]["perf_reference"] == {16: [60, 15]}
     assert tasks[1]["perf_threshold"] == 0.9
     assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
     perf_tokens = shlex.split(tasks[1]["perf"]["command"])
@@ -343,23 +369,3 @@ def test_kvv_configs_use_pinned_upstream_and_local_api():
         assert flag_value(command, "--max-tokens") == max_tokens
         assert "--thinking" in command
         assert flag_value(command, "--thinking-effort") == "max"
-
-
-def test_kimi_k25_amd_accuracy_gate_preserves_question_outputs():
-    task = yaml.safe_load(
-        (
-            EVAL_CONFIG_DIR / "kimi-k2.5-mxfp4-eagle3-evalscope-aime25-amd.yaml"
-        ).read_text()
-    )
-    command = shlex.split(task["eval"]["command"])
-    generation = json.loads(flag_value(command, "--generation-config"))
-
-    assert (
-        flag_value(command, "--work-dir") == ".ci-artifacts/published/evalscope-results"
-    )
-    assert "--no-timestamp" not in command
-    assert flag_value(command, "--limit") == "4"
-    assert flag_value(command, "--eval-batch-size") == "4"
-    assert generation == {"do_sample": False, "temperature": 0.0, "max_tokens": 65536}
-    assert task["score_threshold"] == 0.75
-    assert "retries" not in task

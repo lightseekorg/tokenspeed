@@ -50,7 +50,11 @@ import torch
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.layers.attention.backends.base import (
+    AttentionBackend,
+    reject_query_shard,
+)
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
@@ -209,6 +213,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     # staying at its breaks in both.
     cuda_graph_support = CudaGraphSupport(decode_graph=True, prefill_graph=True)
     supports_layer_sliding_window = True
+
+    skips_incomplete_prefill_outputs = True
 
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:
         super().__init__(config, spec)
@@ -544,8 +550,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
+        reject_query_shard(query_shard, "DeepseekV41AttentionBackend")
         del extend_with_prefix
         if forward_mode.is_decode():
             raise ValueError("V4.1 decode metadata must use refresh_decode_metadata")
@@ -671,20 +679,27 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         """Select the rows the CED decoder layers run on.
 
         The decoder attends the prompt's last window only, so a chunk that ends
-        its prompt keeps its last ``window`` rows and any other chunk keeps one
-        row (its logits are discarded, and one row per request keeps the
-        sampler's row contract). Decode rows are all kept. The scheduler never
-        leaves a final chunk shorter than the window, so a kept tail is the
+        its prompt keeps its last ``window`` rows. A batch without outputs
+        keeps no decoder rows. Otherwise an incomplete chunk retains its
+        original single compute row, preserving the numerical shape of the
+        other requests, but contributes no logits. Global KV is produced from
+        every input row before narrowing. Decode rows are all kept. The scheduler
+        never leaves a final chunk shorter than the window, so a kept tail is the
         prompt's last window unless the whole prompt is shorter.
         """
         n = self.forward_prefill_metadata.positions.numel()
         total = meta.positions.numel()
+        has_outputs = any(completes) or total > n
+        incomplete_rows = 1 if has_outputs else 0
         keeps = [
-            min(window, span.count) if done else min(1, span.count)
+            min(window if done else incomplete_rows, span.count)
             for span, done in zip(self._prefill_spans, completes, strict=True)
         ]
-        if all(keep == span.count for keep, span in zip(keeps, self._prefill_spans)):
-            # Identity: the decoder sees exactly the forward's query window.
+        if all(completes) and all(
+            keep == span.count and span.swa_prefix_begin == span.prefix
+            for keep, span in zip(keeps, self._prefill_spans)
+        ):
+            # Reuse metadata only when both rows and visible SWA history match.
             return V41DecoderView(
                 self.query_metadata(forward_mode),
                 self.forward_prefill_metadata,
@@ -696,7 +711,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         spans = []
         logits_rows = []
         view_offset = 0
-        for span, keep in zip(self._prefill_spans, keeps, strict=True):
+        for span, keep, done in zip(self._prefill_spans, keeps, completes, strict=True):
             begin = span.offset + span.count - keep
             rows.extend(range(begin, span.offset + span.count))
             if keep:
@@ -706,7 +721,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                         span.request, view_offset, first_position, keep, first_position
                     )
                 )
-                logits_rows.append(view_offset + keep - 1)
+                if done:
+                    logits_rows.append(view_offset + keep - 1)
             view_offset += keep
         k = view_offset
         rows.extend(range(n, total))

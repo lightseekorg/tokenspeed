@@ -30,8 +30,6 @@ import hashlib
 import json
 import os
 import re
-import threading
-from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
@@ -104,25 +102,22 @@ def storage_object_key(
     *,
     prefix: str,
     rank: int,
-    cp_rank: int,
 ) -> str:
     """Return the L3 object key for one packed Host CacheBlock.
 
     TokenSpeed's Host pool is one compact byte buffer (flat KV). One Mooncake
     object stores the packed bytes of a single CacheBlock, keyed by the
     scheduler content hash plus the group/offset/rank that uniquely identify
-    the shard. Attention TP and context-parallel ranks each own a different
-    physical KV slice; ``ENABLE_CP`` folds requested TP into CP and leaves
-    every worker at ``attn_tp_rank == 0``, so the CP rank must be in the key.
+    the shard. Attention TP ranks each own a different physical KV slice.
+    The trailing ``|c0`` is the retired context-parallel shard id, kept
+    literal so objects written before its removal stay addressable; drop it
+    with the next deliberate key-format bump.
     """
 
     if not content_hash:
         raise ValueError("content_hash must be non-empty")
     tagged = f"{prefix}_{content_hash}" if prefix else content_hash
-    return (
-        f"{tagged}|g{int(group_id)}|o{int(page_offset)}"
-        f"|r{int(rank)}|c{int(cp_rank)}"
-    )
+    return f"{tagged}|g{int(group_id)}|o{int(page_offset)}|r{int(rank)}|c0"
 
 
 def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
@@ -942,7 +937,6 @@ def storage_key_prefix(
     cache_signature: str,
     pipeline_rank: int,
     attn_tp_size: int,
-    cp_size: int,
     draft_model: str,
     draft_revision: str,
     draft_weight_version: str,
@@ -956,8 +950,8 @@ def storage_key_prefix(
     """Return a collision-resistant namespace for compatible L3 objects.
 
     Every component is required so a new caller cannot omit the checkpoint
-    identity, cache layout, pipeline stage, attention-TP width,
-    context-parallel width, draft pool, cache-quantization config (target
+    identity, cache layout, pipeline stage, attention-TP width, draft pool,
+    cache-quantization config (target
     and draft), runtime HF overrides, resolved target/draft attention backends,
     the KV-producer compat epoch,
     ``--skip-softmax-threshold``, or the resolved EAGLE3 capture layers
@@ -982,9 +976,10 @@ def storage_key_prefix(
     capture layers change which target hidden states the draft consumes
     and therefore the KV those layers produce. Empty strings and an empty
     override dict are valid and mean "unset" (no draft pool, no extra cache
-    scales, no HF overrides). ``cp_size`` belongs here rather than only in
-    the per-object ``c{cp_rank}`` shard id: zigzag CP assigns different token
-    blocks to the same rank under different widths. ``attn_tp_size``
+    scales, no HF overrides). The payload keeps a literal ``cp_size`` of 1,
+    the retired context-parallel width, so the namespace of every existing
+    deployment is unchanged until the next deliberate key-format bump.
+    ``attn_tp_size``
     belongs here rather than only in the per-object ``r{tp_rank}`` shard
     id: GQA with TP above the KV-head count keeps one local KV head per
     rank, so packed Host geometry is unchanged, while
@@ -1005,7 +1000,7 @@ def storage_key_prefix(
             "cache_signature": str(cache_signature),
             "pipeline_rank": int(pipeline_rank),
             "attn_tp_size": int(attn_tp_size),
-            "cp_size": int(cp_size),
+            "cp_size": 1,
             "draft_model": str(draft_model),
             "draft_revision": str(draft_revision),
             "draft_weight_version": str(draft_weight_version),
@@ -1040,125 +1035,6 @@ def copy_host_bytes(host_buffer: Any, offset: int, size: int) -> bytes:
     if callable(numpy):
         return bytes(numpy())
     return bytes(view)
-
-
-def l3_unread_key_capacity(
-    *, num_host_pages: int, cache_blocks_per_lcm_block: Sequence[int]
-) -> int:
-    """Return the unread-set bound in per-group CacheBlocks, not LCM parents.
-
-    Each Host LCM parent packs ``cache_blocks_per_lcm_block`` CacheBlocks
-    per group. Unread keys are those CacheBlocks, so a single multi-group
-    prefetch can insert more entries than ``num_host_pages``. Matching the
-    scheduler L3 shadow, capacity is ``num_host_pages`` times the sum of
-    each group's packing.
-    """
-
-    packed = 0
-    for count in cache_blocks_per_lcm_block:
-        if int(count) <= 0:
-            raise ValueError("cache_blocks_per_lcm_block must be positive")
-        packed += int(count)
-    if packed <= 0:
-        return max(int(num_host_pages), 1)
-    return max(int(num_host_pages) * packed, 1)
-
-
-def l3_pages_newly_published(
-    pages: Sequence[tuple], existed: Sequence[bool]
-) -> list[tuple]:
-    """Return pages that were absent before backup and may leave the unread set.
-
-    Mooncake puts are create-only. An object that ``batch_exists`` already
-    reports cannot be overwritten, so a failed ``batch_get_into`` of that
-    object must stay unread. Length mismatch returns no pages so a
-    truncated existence probe cannot clear the blacklist.
-    """
-
-    if len(existed) != len(pages):
-        return []
-    return [page for page, present in zip(pages, existed) if not present]
-
-
-class L3UnreadKeySet:
-    """Failed L3 gets that must not be re-admitted from ``batch_exists``.
-
-    A vanished or unreadable object can stay visible to ``batch_exists``.
-    Those keys stay unread until a Host backup creates a replacement
-    object (not a create-only skip of the existing one), a namespace
-    delete succeeds, or the set exceeds Host CacheBlock
-    capacity (oldest first) so a long-lived process cannot accumulate
-    every historical failure. Replica admission MIN-reduces local
-    readability so one rank cannot forget earlier than its peers.
-    """
-
-    def __init__(self, *, capacity: int) -> None:
-        if int(capacity) <= 0:
-            raise ValueError("L3 unread capacity must be positive")
-        self._capacity = int(capacity)
-        self._keys: OrderedDict[tuple[int, str, int], None] = OrderedDict()
-        self._lock = threading.Lock()
-
-    def mark(
-        self,
-        groups: Sequence[int],
-        hashes: Sequence[str],
-        offsets: Sequence[int],
-    ) -> None:
-        with self._lock:
-            for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
-                key = (int(group_id), str(content_hash), int(page_offset))
-                self._keys.pop(key, None)
-                self._keys[key] = None
-            while len(self._keys) > self._capacity:
-                self._keys.popitem(last=False)
-
-    def contains(self, group_id: int, content_hash: str, page_offset: int) -> bool:
-        with self._lock:
-            return (
-                int(group_id),
-                str(content_hash),
-                int(page_offset),
-            ) in self._keys
-
-    def forget(
-        self,
-        groups: Sequence[int],
-        hashes: Sequence[str],
-        offsets: Sequence[int],
-    ) -> None:
-        with self._lock:
-            for group_id, content_hash, page_offset in zip(groups, hashes, offsets):
-                self._keys.pop(
-                    (int(group_id), str(content_hash), int(page_offset)),
-                    None,
-                )
-
-    def unread_pages(self, pages: Sequence[tuple]) -> list[tuple]:
-        """Snapshot only backed-up pages whose failed GET needs revalidation."""
-
-        with self._lock:
-            if not self._keys:
-                return []
-            return [
-                page
-                for page in pages
-                if (int(page[0]), str(page[2]), int(page[3])) in self._keys
-            ]
-
-    def forget_pages(self, pages: Sequence[tuple]) -> None:
-        groups = []
-        hashes = []
-        offsets = []
-        for group_id, _host_block, content_hash, page_offset in pages:
-            groups.append(int(group_id))
-            hashes.append(str(content_hash))
-            offsets.append(int(page_offset))
-        self.forget(groups=groups, hashes=hashes, offsets=offsets)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._keys.clear()
 
 
 def write_host_bytes(host_buffer: Any, offset: int, payload: bytes) -> None:

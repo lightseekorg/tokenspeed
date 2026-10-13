@@ -33,6 +33,30 @@ _GUMBEL_BLOCK_SIZE = 1024
 _GUMBEL_COMPACT_BLOCK_SIZE = 2048
 
 
+def gumbel_scratch_shape(max_rows: int, vocab_size: int) -> tuple[int, int]:
+    """Shape of the ``local_ids`` / ``local_scores`` scratch for
+    ``gumbel_sample_from_pools``.
+
+    The two-stage kernel reduces each row's vocabulary in blocks of
+    ``_GUMBEL_BLOCK_SIZE`` tokens and keeps one (id, score) per block; callers
+    allocate the scratch once with this shape and pass row slices per step.
+
+    Args:
+        max_rows: Most logits rows a single call will sample.
+        vocab_size: Width of the logits rows.
+
+    Returns:
+        ``(max_rows, num_blocks)`` for an int32 ``local_ids`` and an fp32
+        ``local_scores`` tensor.
+    """
+    if max_rows < 0 or vocab_size <= 0:
+        raise ValueError(
+            f"gumbel_scratch_shape needs max_rows >= 0 and vocab_size > 0, got "
+            f"{max_rows=} {vocab_size=}"
+        )
+    return max_rows, triton.cdiv(vocab_size, _GUMBEL_BLOCK_SIZE)
+
+
 @triton.jit
 def _gumbel_sample_pool_stage1_kernel(
     logits_ptr,
@@ -57,7 +81,7 @@ def _gumbel_sample_pool_stage1_kernel(
     pool_idx = tl.load(req_pool_indices_ptr + req_row)
 
     logits = tl.load(
-        logits_ptr + row * logits_row_stride + token_offsets,
+        logits_ptr + row.to(tl.int64) * logits_row_stride + token_offsets,
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
@@ -142,7 +166,7 @@ def _gumbel_sample_compact_pool_kernel(
         cols = start + token_offsets
         mask = cols < vocab_size
         logits = tl.load(
-            logits_ptr + row * logits_row_stride + cols,
+            logits_ptr + row.to(tl.int64) * logits_row_stride + cols,
             mask=mask,
             other=float("-inf"),
         ).to(tl.float32)

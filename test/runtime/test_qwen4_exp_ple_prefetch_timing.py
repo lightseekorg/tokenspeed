@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -85,11 +84,6 @@ def test_qwen4_exp_prefetch_starts_at_preceding_layer(
         for layer_id in range(4)
     )
     model.hyper_connection_mixer = _RecordingMixer()
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_global_expert_distribution_recorder",
-        lambda: SimpleNamespace(with_current_layer=lambda _: nullcontext()),
-    )
     capture = _RecordingCapture() if capturing else None
     monkeypatch.setattr(
         qwen4_exp_module.BreakableCapture,

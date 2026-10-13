@@ -8,6 +8,7 @@ import torch
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -89,27 +90,28 @@ def test_logits_processor_dp_layout_threshold_and_modes():
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=16))
 
     assert (
         processor._resolve_logits_layout_plan(
             torch.empty(15 * 6, 3),
-            LogitsMetadata(forward_mode=ForwardMode.DECODE),
+            LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
         )
         is None
     )
 
     decode_plan = processor._resolve_logits_layout_plan(
         torch.empty(16 * 6, 3),
-        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+        LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
     )
     assert decode_plan is not None
 
     assert (
         processor._resolve_logits_layout_plan(
             torch.empty(32 * 6, 3),
-            LogitsMetadata(forward_mode=ForwardMode.EXTEND),
+            LogitsMetadata(forward_mode=ForwardMode.EXTEND, query_shard=None),
         )
         is None
     )
@@ -129,6 +131,7 @@ def test_forward_step_runner_uses_existing_route_for_padding():
         token_to_kv_pool=None,
         bs=30,
         num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 30, 1),
         input_num_tokens=30,
         forward_mode=ForwardMode.DECODE,
     )
@@ -171,6 +174,7 @@ def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
         token_to_kv_pool=None,
         bs=0,
         num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 0, 1),
         input_num_tokens=0,
         forward_mode=ForwardMode.DECODE,
         global_num_tokens=[0, 17],
@@ -193,6 +197,7 @@ def test_cuda_graph_route_respects_disable_padding_with_global_batch():
         token_to_kv_pool=None,
         bs=0,
         num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 0, 1),
         input_num_tokens=0,
         forward_mode=ForwardMode.DECODE,
         global_num_tokens=[0, 17],
@@ -216,6 +221,7 @@ def test_configure_dp_sampling_sets_state():
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        dp_lm_head_tp=False,
     )
 
     processor.configure_dp_logits_layout(_dp_runtime_config())
@@ -272,12 +278,13 @@ def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=5))
 
     plan = processor._resolve_logits_layout_plan(
         torch.empty(5 * 6, 3),
-        LogitsMetadata(forward_mode=forward_mode),
+        LogitsMetadata(forward_mode=forward_mode, query_shard=None),
     )
 
     assert plan is not None
@@ -318,6 +325,7 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
         tp_rank=1,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(
         _dp_runtime_config(tp_rank=1, skip_all_gather=True, device="cpu")
@@ -334,8 +342,9 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
     logits = processor._get_logits(
         hidden_states,
         lm_head,
-        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+        LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
         plan=plan,
+        require_full_vocab=False,
     )
 
     assert logits.shape == (12, 7)
@@ -350,6 +359,7 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
         tp_rank=2,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(
         _dp_runtime_config(tp_rank=2, skip_all_gather=True, device="cpu")
@@ -366,8 +376,9 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
     logits = processor._get_logits(
         hidden_states,
         lm_head,
-        LogitsMetadata(forward_mode=ForwardMode.DECODE),
+        LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
         plan=plan,
+        require_full_vocab=False,
     )
 
     assert logits.shape == (12, 7)

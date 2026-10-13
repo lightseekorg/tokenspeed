@@ -1,0 +1,162 @@
+name: Biweekly release
+
+on:
+  schedule:
+    - cron: '0 20 * * 0'
+      timezone: America/Los_Angeles
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Optional TokenSpeed stable version; otherwise increment the patch.'
+        type: string
+      resume_run_id:
+        description: 'Original completed run ID; resume only the release page and branch cleanup.'
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: weekly-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Select release or recovery
+        id: mode
+        env:
+          EVENT: ${{ github.event_name }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id || '' }}
+          VERSION: ${{ inputs.version || '' }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from datetime import date, datetime, timedelta
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          if os.environ['GITHUB_REPOSITORY'] != 'lightseekorg/tokenspeed' or os.environ['GITHUB_REF'] != 'refs/heads/main':
+              raise SystemExit('Releases must run from the source repository main branch.')
+          resume = os.environ['RESUME_RUN_ID']
+          if resume and (not re.fullmatch(r'[1-9][0-9]*', resume) or os.environ['VERSION']):
+              raise SystemExit('Recovery requires a run ID and no new version.')
+          mode = 'recovery' if resume else 'normal'
+          if os.environ['EVENT'] == 'schedule':
+              today = datetime.now(ZoneInfo('America/Los_Angeles')).date()
+              sunday = today - timedelta(days=(today.weekday() + 1) % 7)
+              if (sunday - date(2000, 1, 2)).days % 14:
+                  mode = 'skip'
+          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
+              print(f'mode={mode}', file=output)
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              print(f'Release mode: {mode}. Scheduled releases run every other Sunday at 20:00 America/Los_Angeles.', file=summary)
+          PY
+
+  plan:
+    needs: prepare
+    if: needs.prepare.outputs.mode == 'normal'
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: plan
+      previous: ''
+      version: ${{ inputs.version || '' }}
+    secrets: inherit
+
+  amd:
+    needs: plan
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: amd
+      previous: plan
+    secrets: inherit
+
+  kernel:
+    needs: amd
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: kernel
+      previous: amd
+    secrets: inherit
+
+  tokenspeed:
+    needs: kernel
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: tokenspeed
+      previous: kernel
+    secrets: inherit
+
+  index:
+    needs: tokenspeed
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: index
+      previous: tokenspeed
+    secrets: inherit
+
+  docker:
+    needs: index
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: docker
+      previous: index
+    secrets: inherit
+
+  release:
+    needs: docker
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: release
+      previous: docker
+    secrets: inherit
+
+  resume:
+    needs: prepare
+    if: needs.prepare.outputs.mode == 'recovery'
+    uses: ./.github/workflows/weekly-release-stage.yml
+    with:
+      stage: release
+      previous: ''
+      resume_run_id: ${{ inputs.resume_run_id }}
+    secrets: inherit
+
+  result:
+    if: always()
+    needs: [prepare, plan, amd, kernel, tokenspeed, index, docker, release, resume]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report release result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          results = json.loads(os.environ['RESULTS'])
+          mode = os.environ['MODE']
+          expected = {'normal': ['plan', 'amd', 'kernel', 'tokenspeed', 'index', 'docker', 'release'],
+                      'recovery': ['resume'], 'skip': []}
+          if mode not in expected:
+              raise SystemExit('Release mode selection failed.')
+          failed = [stage for stage in ['prepare', *expected[mode]] if results[stage]['result'] != 'success']
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as summary:
+              for stage, value in results.items():
+                  print(f"- {stage}: {value['result']}", file=summary)
+              if failed:
+                  print('\nManual intervention required. Inspect the first failed stage and its '
+                        'weekly-state artifact. Repair or rerun its recorded child workflow, '
+                        'then rerun failed jobs here. After a controller fix, start from main with '
+                        'resume_run_id to retry only release notes and cleanup once all publications succeeded.',
+                        file=summary)
+          if failed:
+              raise SystemExit('Release incomplete; manual intervention required.')
+          PY

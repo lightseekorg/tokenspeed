@@ -20,7 +20,7 @@ DECODE_DIST_INIT_ADDR=${DECODE_DIST_INIT_ADDR:-127.0.0.1:13580}
 LB_HOST=${LB_HOST:-0.0.0.0}
 LB_PORT=${LB_PORT:-18345}
 PROMETHEUS_PORT=${PROMETHEUS_PORT:-18422}
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
 MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-16}
@@ -207,7 +207,6 @@ COMMON_ARGS=(
   --world-size "$WORLD_SIZE"
   # Keep attention TP equal to this role's world size even with expert parallelism.
   --tensor-parallel-size "$WORLD_SIZE"
-  --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
   --trust-remote-code
   --moe-backend "$MOE_BACKEND"
   --dtype bfloat16
@@ -226,6 +225,9 @@ COMMON_ARGS=(
   --disaggregation-transfer-backend mooncake
   --disaggregation-layerwise-interval 0
 )
+if [[ -n "$GPU_MEMORY_UTILIZATION" ]]; then
+  COMMON_ARGS+=(--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION")
+fi
 
 if [[ "$MOE_BACKEND" == "mega_moe" ]]; then
   COMMON_ARGS+=(--enable-expert-parallel)

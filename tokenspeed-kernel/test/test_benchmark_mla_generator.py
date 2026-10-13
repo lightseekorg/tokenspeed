@@ -52,7 +52,9 @@ _DECODE_SHAPE = {
     "max_context_len": 65536,
     "q_dtype": _FP8,
     "kv_cache_dtype": _FP8,
+    "query_layout": "flattened",
 }
+_QUERY_AXIS_SHAPE = {**_DECODE_SHAPE, "query_layout": "query_axis"}
 _PREFILL_SHAPE = {
     "batch": 1,
     "query_tokens_per_sequence": 256,
@@ -60,6 +62,14 @@ _PREFILL_SHAPE = {
     "is_causal": False,
     "return_lse": True,
     "dtype": _FP8,
+}
+_EXTEND_SHAPE = {
+    "batch": 2,
+    "query_tokens_per_sequence": 64,
+    "prefix_tokens": 8192,
+    "max_context_len": 65536,
+    "q_dtype": "bfloat16",
+    "kv_cache_dtype": _FP8,
 }
 _NORMALIZE_SHAPE = {
     "tokens": 1,
@@ -143,6 +153,22 @@ def test_mla_generator_rejects_unimplemented_model_profile() -> None:
             {**_DECODE_SHAPE, "output_gate": 1},
             "output_gate must be a boolean",
         ),
+        (
+            "mla_decode_with_kvcache",
+            mla_generator.prepare_mla_decode,
+            {
+                key: value
+                for key, value in _DECODE_SHAPE.items()
+                if key != "query_layout"
+            },
+            "requires query_layout",
+        ),
+        (
+            "mla_decode_projected_value",
+            mla_generator.prepare_mla_decode_projected_value,
+            {**_QUERY_AXIS_SHAPE, "output_gate": True},
+            "single-query rows only",
+        ),
     ],
 )
 def test_mla_generator_rejects_invalid_shapes(
@@ -176,21 +202,28 @@ def test_mla_generator_builds_packed_qkv_gate_views(monkeypatch) -> None:
     assert gate.storage_offset() == 2112
 
 
-def test_mla_generator_builds_verify_page_table() -> None:
+@pytest.mark.parametrize("query_axis", [False, True])
+def test_mla_generator_builds_verify_page_table(query_axis: bool) -> None:
     page_table, cache_seqlens, pages = mla_generator._decode_page_table(
         2,
         4,
         130,
         256,
+        query_axis=query_axis,
         config=_config(),
         device="cpu",
     )
 
     assert pages == 6
-    assert page_table.shape == (8, 4)
-    assert page_table[:4].tolist() == [[0, 1, 2, 0]] * 4
-    assert page_table[4:].tolist() == [[3, 4, 5, 0]] * 4
-    assert cache_seqlens.tolist() == [127, 128, 129, 130] * 2
+    if query_axis:
+        # One row per request; the kernel derives each query's causal boundary.
+        assert page_table.tolist() == [[0, 1, 2, 0], [3, 4, 5, 0]]
+        assert cache_seqlens.tolist() == [130, 130]
+    else:
+        assert page_table.shape == (8, 4)
+        assert page_table[:4].tolist() == [[0, 1, 2, 0]] * 4
+        assert page_table[4:].tolist() == [[3, 4, 5, 0]] * 4
+        assert cache_seqlens.tolist() == [127, 128, 129, 130] * 2
 
 
 def _capture_generator_selection(
@@ -238,19 +271,23 @@ def _capture_operation_selection(
     return captured["signature"], captured["traits"]
 
 
-def _decode_operation_inputs(output_gate: bool) -> dict[str, object]:
+def _decode_operation_inputs(
+    output_gate: bool, *, query_axis: bool = False
+) -> dict[str, object]:
     config = _config()
     page_table, cache_seqlens, pages = mla_generator._decode_page_table(
         _DECODE_SHAPE["requests"],
         _DECODE_SHAPE["rows_per_request"],
         _DECODE_SHAPE["cache_length"],
         _DECODE_SHAPE["max_context_len"],
+        query_axis=query_axis,
         config=config,
         device="cpu",
     )
-    rows = page_table.shape[0]
+    rows = _DECODE_SHAPE["requests"] * _DECODE_SHAPE["rows_per_request"]
+    q_len = _DECODE_SHAPE["rows_per_request"] if query_axis else 1
     inputs: dict[str, object] = {
-        "q": torch.zeros((rows, 1, 12, 576), dtype=torch.float8_e4m3fn),
+        "q": torch.zeros((rows // q_len, q_len, 12, 576), dtype=torch.float8_e4m3fn),
         "kv_cache": torch.zeros((pages, 64, 1, 576), dtype=torch.float8_e4m3fn),
         "page_table": page_table,
         "cache_seqlens": cache_seqlens,
@@ -267,19 +304,28 @@ def _decode_operation_inputs(output_gate: bool) -> dict[str, object]:
     return inputs
 
 
-def test_mla_decode_selection_matches_operation_api(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("shape", "batch_size", "q_len"),
+    [(_DECODE_SHAPE, 8, 1), (_QUERY_AXIS_SHAPE, 2, 4)],
+)
+def test_mla_decode_selection_matches_operation_api(
+    monkeypatch, shape, batch_size, q_len
+) -> None:
+    query_axis = shape["query_layout"] == "query_axis"
     expected = _capture_operation_selection(
         monkeypatch,
-        lambda ops: ops.mla_decode_with_kvcache(**_decode_operation_inputs(False)),
+        lambda ops: ops.mla_decode_with_kvcache(
+            **_decode_operation_inputs(False, query_axis=query_axis)
+        ),
     )
     actual = _capture_generator_selection(
         monkeypatch,
         mla_generator.prepare_mla_decode,
-        _request("mla_decode_with_kvcache", _DECODE_SHAPE),
+        _request("mla_decode_with_kvcache", shape),
     )
 
     assert actual == expected
-    assert actual[1]["batch_size"] == 8
+    assert (actual[1]["batch_size"], actual[1]["q_len"]) == (batch_size, q_len)
 
 
 def test_mla_decode_projected_value_selection_matches_operation_api(
@@ -300,6 +346,35 @@ def test_mla_decode_projected_value_selection_matches_operation_api(
 
     assert actual == expected
     assert actual[1]["gate_kind"] == "sigmoid"
+
+
+def test_mla_extend_selection_matches_operation_api(monkeypatch) -> None:
+    batch, query_tokens = 2, 64
+    kv_tokens = 8192 + query_tokens
+    expected = _capture_operation_selection(
+        monkeypatch,
+        lambda ops: ops.mla_extend_with_kvcache(
+            q=torch.zeros((batch * query_tokens, 12, 576), dtype=torch.bfloat16),
+            kv_cache=torch.zeros((260, 64, 1, 576), dtype=torch.float8_e4m3fn),
+            page_table=torch.zeros((batch, 1024), dtype=torch.int32),
+            cache_seqlens=torch.full((batch,), kv_tokens, dtype=torch.int32),
+            cu_seqlens_q=torch.tensor([0, query_tokens, 2 * query_tokens]),
+            cu_seqlens_kv=torch.tensor([0, kv_tokens, 2 * kv_tokens]),
+            max_seqlen_q=query_tokens,
+            max_seqlen_k=65536,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            softmax_scale=192**-0.5,
+        ),
+    )
+    actual = _capture_generator_selection(
+        monkeypatch,
+        mla_generator.prepare_mla_extend,
+        _request("mla_extend_with_kvcache", _EXTEND_SHAPE),
+    )
+
+    assert actual == expected
 
 
 def test_mla_normalize_project_query_selection_matches_operation_api(

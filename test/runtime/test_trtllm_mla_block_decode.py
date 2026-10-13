@@ -36,6 +36,8 @@ def _backend(*, draft_block_decode: bool) -> TRTLLMMLABackend:
     backend.page_table_buf = None
     backend.seq_lens_buf = None
     backend._decode_views_by_bs = {}
+    backend.tree_verify = None
+    backend.tree_draft = None
     return backend
 
 
@@ -135,7 +137,6 @@ def test_block_decode_keeps_every_metadata_row_and_uses_uniform_lengths() -> Non
             out_cache_loc=torch.empty(0, dtype=torch.int32),
             token_to_kv_pool=pool,
             bs=2,
-            save_kv_cache=False,
         )
 
     assert output.shape == (8, 2)
@@ -183,7 +184,6 @@ def test_non_block_draft_keeps_causal_catch_up_offsets() -> None:
             out_cache_loc=torch.empty(0, dtype=torch.int32),
             token_to_kv_pool=pool,
             bs=1,
-            save_kv_cache=False,
         )
 
     assert captured["seq_lens"].tolist() == [11, 12, 13, 14]

@@ -1,6 +1,7 @@
 import ast
 import inspect
 import unittest
+from collections import deque
 from pathlib import Path
 from unittest import mock
 
@@ -29,14 +30,15 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         handler.clear_l1_cache_fn = mock.Mock(return_value=not clear_result)
         handler._replica_tp_size = 1
         handler._replica_tp_cpu_group = None
-        handler.attn_cp_size = 1
-        handler.attn_cp_cpu_group = None
         handler.pp_size = 1
         handler.pp_cpu_group = None
         handler.attn_dp_size = 1
         handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(1, dtype=torch.int32)
+        handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
+        handler._pending_weight_ops = deque()
+        handler._pending_internal_ops = deque()
+        handler._internal_op_completer = None
         handler._device = mock.Mock()
         handler._device.delete_l3_namespace.return_value = True
         return handler
@@ -91,7 +93,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertFalse(output.success)
 
-    def test_min_reduces_tp_then_cp_then_pp_before_clear(self):
+    def test_min_reduces_tp_then_pp_before_clear(self):
         groups_seen = []
 
         def fake_all_reduce(buf, *, op, group):
@@ -102,15 +104,13 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         handler = self._handler(can_clear=True, clear_result=True)
         handler._replica_tp_size = 2
         handler._replica_tp_cpu_group = "tp"
-        handler.attn_cp_size = 2
-        handler.attn_cp_cpu_group = "cp"
         handler.pp_size = 2
         handler.pp_cpu_group = "pp"
 
         with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
             handler.process_requests([FlushCacheReqInput()])
 
-        self.assertEqual(groups_seen, ["tp", "cp", "pp"])
+        self.assertEqual(groups_seen, ["tp", "pp"])
         handler.can_clear_cache_fn.assert_called_once_with()
         handler._device.delete_l3_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
@@ -137,7 +137,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertTrue(output.success)
 
-    def test_min_reduces_tp_then_cp_then_pp_then_dp_before_clear(self):
+    def test_min_reduces_tp_then_pp_then_dp_before_clear(self):
         groups_seen = []
 
         def fake_all_reduce(buf, *, op, group):
@@ -148,8 +148,6 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         handler = self._handler(can_clear=True, clear_result=True)
         handler._replica_tp_size = 2
         handler._replica_tp_cpu_group = "tp"
-        handler.attn_cp_size = 2
-        handler.attn_cp_cpu_group = "cp"
         handler.pp_size = 2
         handler.pp_cpu_group = "pp"
         handler.attn_dp_size = 2
@@ -158,7 +156,7 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
             handler.process_requests([FlushCacheReqInput()])
 
-        self.assertEqual(groups_seen, ["dp", "tp", "cp", "pp", "dp"])
+        self.assertEqual(groups_seen, ["dp", "tp", "pp", "dp"])
         handler.can_clear_cache_fn.assert_called_once_with()
         handler._device.delete_l3_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
@@ -275,14 +273,15 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler._device = mock.Mock()
         handler._replica_tp_size = 1
         handler._replica_tp_cpu_group = None
-        handler.attn_cp_size = 1
-        handler.attn_cp_cpu_group = None
         handler.pp_size = 1
         handler.pp_cpu_group = None
         handler.attn_dp_size = 1
         handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(1, dtype=torch.int32)
+        handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
+        handler._pending_weight_ops = deque()
+        handler._pending_internal_ops = deque()
+        handler._internal_op_completer = None
         handler.can_clear_cache_fn = mock.Mock(return_value=True)
         handler._device.delete_l3_namespace.return_value = True
         return handler
@@ -483,7 +482,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         self.assertFalse(output.success)
         self.assertIn("require weight_version", output.message)
 
-    def test_flush_min_reduces_tp_then_cp_then_pp(self):
+    def test_flush_min_reduces_tp_then_pp(self):
         groups_seen = []
 
         def fake_all_reduce(buf, *, op, group):
@@ -494,8 +493,6 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler = self._handler()
         handler._replica_tp_size = 2
         handler._replica_tp_cpu_group = "tp"
-        handler.attn_cp_size = 2
-        handler.attn_cp_cpu_group = "cp"
         handler.pp_size = 2
         handler.pp_cpu_group = "pp"
         handler.clear_cache_fn = mock.Mock(return_value=True)
@@ -511,7 +508,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
             handler.process_requests([req])
 
-        self.assertEqual(groups_seen, ["tp", "cp", "pp"])
+        self.assertEqual(groups_seen, ["tp", "pp"])
         handler.can_clear_cache_fn.assert_called_once_with()
         handler._device.delete_l3_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
@@ -522,7 +519,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         self.assertFalse(output.success)
         self.assertIn("cache flush failed", output.message)
 
-    def test_flush_min_reduces_tp_then_cp_then_pp_then_dp(self):
+    def test_flush_min_reduces_tp_then_pp_then_dp(self):
         groups_seen = []
 
         def fake_all_reduce(buf, *, op, group):
@@ -533,8 +530,6 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler = self._handler()
         handler._replica_tp_size = 2
         handler._replica_tp_cpu_group = "tp"
-        handler.attn_cp_size = 2
-        handler.attn_cp_cpu_group = "cp"
         handler.pp_size = 2
         handler.pp_cpu_group = "pp"
         handler.attn_dp_size = 2
@@ -552,7 +547,7 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
             handler.process_requests([req])
 
-        self.assertEqual(groups_seen, ["dp", "tp", "cp", "pp", "dp"])
+        self.assertEqual(groups_seen, ["dp", "tp", "pp", "dp"])
         handler.can_clear_cache_fn.assert_called_once_with()
         handler._device.delete_l3_namespace.assert_not_called()
         handler.clear_cache_fn.assert_not_called()
@@ -562,36 +557,6 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertFalse(output.success)
         self.assertIn("cache flush failed", output.message)
-
-    def test_enable_cp_flush_min_uses_cp_group_when_tp_is_one(self):
-        groups_seen = []
-
-        def fake_all_reduce(buf, *, op, group):
-            del buf, op
-            groups_seen.append(group)
-
-        handler = self._handler()
-        handler._replica_tp_size = 1
-        handler._replica_tp_cpu_group = "tp"
-        handler.attn_cp_size = 4
-        handler.attn_cp_cpu_group = "cp"
-        handler.clear_cache_fn = mock.Mock(return_value=True)
-        handler._device.update_weights.return_value = (True, "ok")
-        req = UpdateWeightsFromDistributedReqInput(
-            names=["w"],
-            dtype_names=["float16"],
-            shapes=[[1]],
-            flush_cache=True,
-            weight_version="v2",
-        )
-
-        with mock.patch.object(torch.distributed, "all_reduce", fake_all_reduce):
-            handler.process_requests([req])
-
-        self.assertEqual(groups_seen, ["cp", "cp"])
-        handler._device.update_weights.assert_called_once_with(req)
-        output = handler.send_func.send_pyobj.call_args.args[0]
-        self.assertTrue(output.success)
 
     def test_failed_flush_still_min_reduces_before_skipping_nccl(self):
         groups_seen = []

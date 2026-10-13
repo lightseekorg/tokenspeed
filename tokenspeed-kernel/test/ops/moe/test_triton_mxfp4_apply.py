@@ -1,28 +1,49 @@
 from __future__ import annotations
 
 import pytest
-import tokenspeed_kernel
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
+from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
 from tokenspeed_kernel.platform import current_platform
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("activation", ["silu", "situ"])
-def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
+# 192 is a multiple of 64 but not 128, like a 640-wide expert sharded by TP2.
+@pytest.mark.parametrize("intermediate_size", [128, 192])
+def test_triton_mxfp4_moe_matches_torch(
+    activation: str, intermediate_size: int
+) -> None:
     if not current_platform().is_amd:
         pytest.skip("Triton MXFP4 MoE is registered for AMD GPUs")
 
     generator = torch.Generator(device="cuda").manual_seed(0)
     x = torch.randn(4, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
     w13 = torch.randint(
-        0, 256, (4, 256, 64), device="cuda", dtype=torch.uint8, generator=generator
+        0,
+        256,
+        (4, 2 * intermediate_size, 64),
+        device="cuda",
+        dtype=torch.uint8,
+        generator=generator,
     )
-    w13_scale = torch.full((4, 256, 4), 120, device="cuda", dtype=torch.uint8)
+    w13_scale = torch.full(
+        (4, 2 * intermediate_size, 4), 120, device="cuda", dtype=torch.uint8
+    )
     w2 = torch.randint(
-        0, 256, (4, 128, 64), device="cuda", dtype=torch.uint8, generator=generator
+        0,
+        256,
+        (4, 128, intermediate_size // 2),
+        device="cuda",
+        dtype=torch.uint8,
+        generator=generator,
     )
-    w2_scale = torch.full((4, 128, 4), 120, device="cuda", dtype=torch.uint8)
+    w2_scale = torch.full(
+        (4, 128, intermediate_size // 32), 120, device="cuda", dtype=torch.uint8
+    )
     topk_ids = torch.tensor(
         [[0, 1], [1, 2], [2, 3], [3, 0]], device="cuda", dtype=torch.int32
     )
@@ -41,12 +62,12 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
     weights.w13_input_layout = "concatenated"
     weights.activation_situ_beta = 4.0
     weights.activation_situ_linear_beta = 25.0
-    plan = tokenspeed_kernel.moe_plan(
+    plan = kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
         activation=activation,
         routing_mode="precomputed_topk",
-        ispp=128,
+        ispp=intermediate_size,
         internal_activation_dtype="mxfp4",
         solution="triton",
         hidden=None,
@@ -54,9 +75,10 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        combine_order="rank",
     )
-    tokenspeed_kernel.moe_process_weights(plan, weights)
-    actual = tokenspeed_kernel.moe_apply(
+    kernel_moe_process_weights(plan, weights)
+    actual = kernel_moe_apply(
         plan,
         x,
         weights,
@@ -71,7 +93,7 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
         dtype=torch.float32,
     )
 
-    x_packed, x_scale = tokenspeed_kernel.quantize_mxfp4(
+    x_packed, x_scale = kernel_quantize_mxfp4(
         x, scale_layout="linear", solution="triton"
     )
     x_codes = torch.stack((x_packed & 0xF, x_packed >> 4), dim=-1).flatten(-2)
@@ -104,7 +126,7 @@ def test_triton_mxfp4_moe_matches_torch(activation: str) -> None:
             intermediate = (gate * up).to(torch.bfloat16)
         else:
             intermediate = (F.silu(gate) * up).to(torch.bfloat16)
-        intermediate_packed, intermediate_scale = tokenspeed_kernel.quantize_mxfp4(
+        intermediate_packed, intermediate_scale = kernel_quantize_mxfp4(
             intermediate, scale_layout="linear", solution="triton"
         )
         intermediate_codes = torch.stack(

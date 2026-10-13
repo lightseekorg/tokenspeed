@@ -22,109 +22,15 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import TensorDescriptor, libdevice, tl, triton
+from tokenspeed_kernel.ops.moe.triton._common import (
+    _combine,
+    _num_programs,
+    _prepare_routed_output,
+    _validate_launch,
+    _validate_topk,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-
-
-@triton.jit
-def _routing_kernel(
-    topk_ids_ptr,
-    expert_route_ids_ptr,
-    expert_counts_ptr,
-    num_routes,
-    BLOCK_ROUTES: tl.constexpr,
-):
-    expert_id = tl.program_id(0)
-    count = 0
-    num_blocks = tl.cdiv(num_routes, BLOCK_ROUTES)
-    for block_id in range(num_blocks):
-        route_ids = block_id * BLOCK_ROUTES + tl.arange(0, BLOCK_ROUTES)
-        route_mask = route_ids < num_routes
-        selected_experts = tl.load(topk_ids_ptr + route_ids, mask=route_mask, other=-1)
-        matches = route_mask & (selected_experts == expert_id)
-        local_rank = tl.cumsum(matches.to(tl.int32), axis=0) - 1
-        tl.store(
-            expert_route_ids_ptr + expert_id * num_routes + count + local_rank,
-            route_ids,
-            mask=matches,
-        )
-        count += tl.sum(matches.to(tl.int32), axis=0)
-    tl.store(expert_counts_ptr + expert_id, count)
-
-
-def _routing(
-    topk_ids: torch.Tensor, num_experts: int
-) -> tuple[torch.Tensor, torch.Tensor, str]:
-    topk_ids = topk_ids.to(torch.int32).contiguous()
-    num_routes = topk_ids.numel()
-    expert_route_ids = torch.empty(
-        (num_experts, num_routes), device=topk_ids.device, dtype=torch.int32
-    )
-    expert_counts = torch.empty(num_experts, device=topk_ids.device, dtype=torch.int32)
-    block_routes = 128 if num_routes <= 128 else 1024
-    _routing_kernel[(num_experts,)](
-        topk_ids,
-        expert_route_ids,
-        expert_counts,
-        num_routes,
-        BLOCK_ROUTES=block_routes,
-        num_warps=4,
-    )
-    return expert_route_ids, expert_counts
-
-
-@triton.jit
-def _combine_kernel(
-    route_output_ptr,
-    topk_weights_ptr,
-    output_ptr,
-    num_tokens,
-    hidden_size,
-    top_k: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    token_offsets = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    hidden_offsets = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    token_mask = token_offsets < num_tokens
-    hidden_mask = hidden_offsets < hidden_size
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for slot in range(top_k):
-        route_offsets = token_offsets * top_k + slot
-        values = tl.load(
-            route_output_ptr
-            + route_offsets[:, None] * hidden_size
-            + hidden_offsets[None, :],
-            mask=token_mask[:, None] & hidden_mask[None, :],
-            other=0.0,
-        )
-        weights = tl.load(topk_weights_ptr + route_offsets, mask=token_mask, other=0.0)
-        acc += values.to(tl.float32) * weights[:, None]
-    tl.store(
-        output_ptr + token_offsets[:, None] * hidden_size + hidden_offsets[None, :],
-        acc,
-        mask=token_mask[:, None] & hidden_mask[None, :],
-    )
-
-
-def _combine(
-    route_output: torch.Tensor,
-    topk_weights: torch.Tensor,
-    output: torch.Tensor,
-) -> None:
-    num_tokens, top_k = topk_weights.shape
-    hidden_size = output.shape[1]
-    _combine_kernel[(triton.cdiv(num_tokens, 4), triton.cdiv(hidden_size, 256))](
-        route_output,
-        topk_weights.contiguous(),
-        output,
-        num_tokens,
-        hidden_size,
-        top_k=top_k,
-        BLOCK_M=4,
-        BLOCK_N=256,
-        num_warps=4,
-    )
 
 
 def _validate(
@@ -135,17 +41,12 @@ def _validate(
     topk_ids: torch.Tensor | None,
     do_finalize: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not do_finalize:
-        raise ValueError("Triton MoE does not support deferred finalization")
-    if int(getattr(w, "ep_size", 1)) != 1:
-        raise ValueError("Triton MoE does not support expert parallelism")
+    _validate_launch(w, topk_weights, topk_ids, do_finalize)
     if any(
         getattr(w, name, None) is not None
         for name in ("w13_weight_bias", "w2_weight_bias")
     ):
         raise ValueError("Triton MoE does not support expert bias")
-    if topk_weights is None or topk_ids is None:
-        raise ValueError("Triton MoE requires precomputed topk weights and ids")
 
     activation = plan.get("activation") or getattr(w, "activation", "silu")
     if activation not in {"silu", "situ", "swiglu"}:
@@ -178,25 +79,15 @@ def _validate(
         raise TypeError("x, w13_weight, and w2_weight must have the same dtype")
     if not all(t.is_cuda and t.is_contiguous() for t in (x, w13, w2)):
         raise ValueError("x and weights must be contiguous GPU tensors")
-    if topk_ids.ndim != 2 or topk_weights.shape != topk_ids.shape:
-        raise ValueError("top-k tensors must have shape [num_tokens, top_k]")
-    if topk_ids.dtype not in (torch.int32, torch.int64):
-        raise TypeError("topk_ids must use torch.int32 or torch.int64")
-    if not topk_weights.is_floating_point():
-        raise TypeError("topk_weights must use a floating-point dtype")
-    if topk_ids.device != x.device or topk_weights.device != x.device:
-        raise ValueError("top-k tensors and x must be on the same device")
+    _validate_topk(x, topk_weights, topk_ids)
     if w13.device != x.device or w2.device != x.device:
         raise ValueError("x and weights must be on the same device")
 
-    num_tokens, hidden_size = x.shape
+    hidden_size = x.shape[1]
     num_experts, twice_intermediate_size, weight_hidden_size = w13.shape
     intermediate_size = twice_intermediate_size // 2
-    top_k = topk_ids.shape[1]
     if num_experts == 0:
         raise ValueError("unquantized MoE requires at least one expert")
-    if topk_ids.shape[0] != num_tokens or top_k == 0:
-        raise ValueError("top-k tensors must have shape [num_tokens, top_k > 0]")
     if twice_intermediate_size % 2 or weight_hidden_size != hidden_size:
         raise ValueError("w13_weight has an incompatible shape")
     if w2.shape != (num_experts, hidden_size, intermediate_size):
@@ -372,27 +263,21 @@ def _moe(
     if num_tokens == 0:
         return torch.empty_like(x)
 
-    expert_route_ids, expert_counts = _routing(topk_ids, num_experts)
+    expert_route_ids, expert_counts, route_output, output = _prepare_routed_output(
+        x, topk_ids, num_experts
+    )
     route_count = num_tokens * top_k
     intermediate = torch.empty(
         (route_count, intermediate_size), device=x.device, dtype=x.dtype
     )
-    # Invalid expert ids are absent from routing; zero their canonical rows.
-    route_output = torch.zeros(
-        (route_count, hidden_size), device=x.device, dtype=x.dtype
-    )
-    output = torch.empty_like(x)
     block_m = 16 if num_tokens <= 16 else 64
     stage1_block_n = 64 if intermediate_size % 64 == 0 else 32
     stage2_block_n = 128
     block_k = 64 if intermediate_size % 64 == 0 else 32
-    num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-    stage1_programs = min(
-        num_sms, route_count * triton.cdiv(intermediate_size, stage1_block_n)
+    stage1_programs = _num_programs(
+        x.device, route_count, intermediate_size, stage1_block_n
     )
-    stage2_programs = min(
-        num_sms, route_count * triton.cdiv(hidden_size, stage2_block_n)
-    )
+    stage2_programs = _num_programs(x.device, route_count, hidden_size, stage2_block_n)
     x_desc = TensorDescriptor.from_tensor(x, [1, block_k])
     w13_desc = TensorDescriptor.from_tensor(w13, [1, stage1_block_n, block_k])
     w2_desc = TensorDescriptor.from_tensor(w2, [1, stage2_block_n, block_k])

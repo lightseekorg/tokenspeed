@@ -142,6 +142,7 @@ class _KDA:
                 extend_replay_lens_cpu=torch.zeros_like(prefixes),
                 extend_prompt_lens_cpu=torch.tensor([prompt_tokens], dtype=torch.int32),
                 extend_with_prefix=begin > 0,
+                query_shard=None,
             )
         else:
             self.backend.refresh_decode_metadata(
@@ -256,6 +257,8 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
     config.prefix_granularity = _P
     config.num_device_pages = _USABLE + 1
     config.num_host_pages = 0
+    config.num_snapshot_pages = 1  # the null page alone: no pool
+    config.max_retracted_requests = 0
     config.max_scheduled_tokens = 8
     config.max_batch_size = 1
     config.decode_input_tokens = _WIDTH
@@ -353,7 +356,8 @@ def test_speculative_decode_recycles_working_state_and_preserves_prefill_checkpo
             inputs, begin=computed, end=computed + _WIDTH, prefill=False
         )
         actual.backend.commit_verified_state(
-            torch.tensor([accepted], dtype=torch.int32, device="cuda")
+            torch.tensor([accepted], dtype=torch.int32, device="cuda"),
+            accepted_path=None,
         )
         end = computed + accepted
         for layer in _LAYERS:

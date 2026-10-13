@@ -26,7 +26,10 @@ from typing import Any
 
 import torch
 
-from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.base_config import (
+    LinearMethodBase,
+    QuantizationConfig,
+)
 from tokenspeed.runtime.utils import log_info_on_rank0
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -80,6 +83,18 @@ class Fp8Config(QuantizationConfig):
                 )
         self.weight_block_size = weight_block_size
         self.scale_fmt = scale_fmt.lower() if scale_fmt is not None else None
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> LinearMethodBase:
+        """Select a linear method before its weights are created.
+
+        LinearBase applies ignored-layer rules before calling this hook.
+        Subclasses can override it to own weight creation, checkpoint loading
+        and execution together. Rely only on initialized LinearBase fields on
+        ``layer`` here; partition sizes arrive in ``create_weights``.
+        """
+        from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+
+        return Fp8LinearMethod(self)
 
     @classmethod
     def get_name(cls) -> str:

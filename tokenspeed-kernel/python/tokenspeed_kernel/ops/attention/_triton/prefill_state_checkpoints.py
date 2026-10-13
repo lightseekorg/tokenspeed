@@ -43,7 +43,10 @@ class PackedPrefillCheckpointInputs:
     beta_raw: torch.Tensor | None
 
 
-@triton.jit(do_not_specialize=["num_rows", "num_channels", "state_len"])
+@triton.jit(
+    do_not_specialize=["num_rows", "num_channels", "state_len"],
+    do_not_specialize_on_alignment=["sequence_starts"],
+)
 def _write_prefill_conv_checkpoints_kernel(
     raw_inputs,
     conv_states,
@@ -211,7 +214,10 @@ def write_prefill_conv_checkpoints(
     )
 
 
-@triton.jit(do_not_specialize=["num_tokens", "num_rows"])
+@triton.jit(
+    do_not_specialize=["num_tokens", "num_rows"],
+    do_not_specialize_on_alignment=["token_indices"],
+)
 def _pack_prefill_recurrent_inputs_kernel(
     token_indices,
     rows,
@@ -596,14 +602,16 @@ def pack_prefill_recurrent_checkpoint_inputs(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TOKENS"], do_not_specialize_on_alignment=["indices"])
 def _scatter_checkpoint_output_kernel(
     source,
     indices,
     output,
     STRIDES: tl.constexpr,
-    SHAPE: tl.constexpr,
-    TOKENS: tl.constexpr,
+    FEATURES: tl.constexpr,
+    # Token counts follow the batch; runtime so every batch shape shares one
+    # binary. The feature geometry is fixed per layer.
+    TOKENS,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -611,15 +619,18 @@ def _scatter_checkpoint_output_kernel(
     token, feature = offset // WIDTH, offset % WIDTH
     destination = tl.load(indices + token, token < TOKENS, other=-1)
     source_offset = token * STRIDES[0]
-    for dim in tl.static_range(len(SHAPE) - 1, 0, -1):
-        source_offset += (feature % SHAPE[dim]) * STRIDES[dim]
-        feature = feature // SHAPE[dim]
+    for dim in tl.static_range(len(FEATURES) - 1, -1, -1):
+        source_offset += (feature % FEATURES[dim]) * STRIDES[dim + 1]
+        feature = feature // FEATURES[dim]
     live = (token < TOKENS) & (destination >= 0)
     value = tl.load(source + source_offset, live, other=0)
     tl.store(output + destination * WIDTH + offset % WIDTH, value, live)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["BODY_TOKENS", "TAIL_TOKENS", "TOKENS"],
+    do_not_specialize_on_alignment=["sources"],
+)
 def _gather_checkpoint_output_kernel(
     body,
     tail,
@@ -628,9 +639,11 @@ def _gather_checkpoint_output_kernel(
     BODY_STRIDES: tl.constexpr,
     TAIL_STRIDES: tl.constexpr,
     FEATURES: tl.constexpr,
-    BODY_TOKENS: tl.constexpr,
-    TAIL_TOKENS: tl.constexpr,
-    TOKENS: tl.constexpr,
+    # Token counts follow the batch; runtime so every batch shape shares one
+    # binary. The feature geometry is fixed per layer.
+    BODY_TOKENS,
+    TAIL_TOKENS,
+    TOKENS,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -734,7 +747,7 @@ def merge_prefill_checkpoint_outputs(
             indices,
             output,
             STRIDES=source.stride()[token_dim:],
-            SHAPE=source.shape[token_dim:],
+            FEATURES=source.shape[token_dim + 1 :],
             TOKENS=indices.numel(),
             WIDTH=width,
             BLOCK=256,

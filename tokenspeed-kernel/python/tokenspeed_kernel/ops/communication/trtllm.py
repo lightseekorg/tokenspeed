@@ -24,20 +24,58 @@ from ctypes import c_void_p
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.gemm.fp8_utils import (
-    create_per_token_group_quant_fp8_output_scale,
-)
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import ErrorClass, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__name__)
 
 
+def _create_per_token_group_quant_fp8_output_scale(
+    x_shape,
+    device,
+    group_size: int,
+    column_major_scales: bool,
+    scale_tma_aligned: bool,
+    scale_ue8m0: bool,
+):
+    if scale_ue8m0:
+        if len(x_shape) != 2 or group_size != 128:
+            raise ValueError("packed E8M0 scales require 2-D 1x128 input groups")
+        rows, columns = x_shape
+        aligned_rows = (rows + 3) // 4 * 4
+        packed_columns = (columns // group_size + 3) // 4
+        base = torch.zeros(
+            (packed_columns, aligned_rows), device=device, dtype=torch.int32
+        )
+        return base.transpose(-1, -2)[:rows, :]
+    if column_major_scales:
+        if scale_tma_aligned:
+            aligned_rows = (x_shape[-2] + 3) // 4 * 4
+            return torch.empty(
+                x_shape[:-2] + (x_shape[-1] // group_size, aligned_rows),
+                device=device,
+                dtype=torch.float32,
+            ).permute(-1, -2)[: x_shape[-2], :]
+        return torch.empty(
+            (x_shape[-1] // group_size,) + x_shape[:-1],
+            device=device,
+            dtype=torch.float32,
+        ).permute(-1, -2)
+    return torch.empty(
+        x_shape[:-1] + (x_shape[-1] // group_size,),
+        device=device,
+        dtype=torch.float32,
+    )
+
+
 __all__ = [
     "TrtllmAllGatherState",
+    "TrtllmAllGatherQuantState",
     "TrtllmReduceScatterState",
     "trtllm_allgather",
+    "trtllm_allgather_fp8_quantize",
     "trtllm_reduce_scatter",
     "AllReduceFusionPattern",
     "allgather_dual_rmsnorm",
@@ -45,6 +83,7 @@ __all__ = [
     "reducescatter_residual_rmsnorm",
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
+    "trtllm_workspace_all_gather",
     "trtllm_workspace_allreduce",
     "group_spans_nodes",
     "armed_workspace_hidden_dim",
@@ -56,13 +95,16 @@ platform = current_platform()
 
 AllReduceFusionPattern = ErrorClass
 TrtllmAllGatherState = ErrorClass
+TrtllmAllGatherQuantState = ErrorClass
 TrtllmReduceScatterState = ErrorClass
 trtllm_allgather = error_fn
+trtllm_allgather_fp8_quantize = error_fn
 trtllm_reduce_scatter = error_fn
 # Two-shot token capacity of the mnnvl workspace; 0 where the path is absent.
 MNNVL_TWOSHOT_MAX_TOKEN = 0
 allgather_dual_rmsnorm = error_fn
 allreduce_residual_rmsnorm = error_fn
+trtllm_workspace_all_gather = error_fn
 trtllm_workspace_allreduce = error_fn
 armed_workspace_hidden_dim = error_fn
 ensure_workspace_initialized = error_fn
@@ -89,6 +131,7 @@ if current_platform().is_nvidia:
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
+        trtllm_mnnvl_allgather,
         trtllm_reducescatter_fusion,
     )
 
@@ -610,14 +653,10 @@ if current_platform().is_nvidia:
             partial_norm_out = norm_out[start : start + counts[rank]].contiguous()
 
         if block_quant_fp8:
-            from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
-
-            quant_out, scale_out = per_token_group_quant_fp8(
+            quant_out, scale_out = quantize_fp8(
                 norm_out,
+                granularity="token_group",
                 group_size=128,
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=False,
             )
             return quant_out, residual_out, scale_out, partial_norm_out
         return norm_out, residual_out, None, partial_norm_out
@@ -729,6 +768,30 @@ if current_platform().is_nvidia:
         )
         return allreduce_out.view(input_tensor.shape)
 
+    def trtllm_workspace_all_gather(
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor | None:
+        """All-gather of 16-bit rows along the last dim through the group's
+        mnnvl workspace: one lamport exchange, no barrier.
+
+        Args:
+            input_tensor: ``[T, W]`` rows of this rank.
+            group: process group whose armed workspace to use.
+
+        Returns:
+            ``[T, world * W]`` (rank-major columns, bit for bit), or None when
+            no mnnvl workspace serves the shape.
+        """
+        manager = _manager_for_group(group)
+        mnnvl = manager.mnnvl_workspace
+        if mnnvl is None or input_tensor.dim() != 2:
+            return None
+        gathered = trtllm_mnnvl_allgather(input_tensor, mnnvl, pdl_enabled())
+        if gathered is not None:
+            _mark_captured(manager, mnnvl)
+        return gathered
+
     def allreduce_residual_rmsnorm(
         input_tensor: torch.Tensor,
         residual: torch.Tensor,
@@ -796,7 +859,7 @@ if current_platform().is_nvidia:
                 device=input_tensor.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=128,
@@ -1128,7 +1191,7 @@ if current_platform().is_nvidia:
                 device=input_tensor.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=128,
@@ -1255,7 +1318,7 @@ if current_platform().is_nvidia:
                 device=qkv.device,
             )
             out_shape = (*quant_out.shape[:-1], quant_out.shape[-1])
-            scale_out = create_per_token_group_quant_fp8_output_scale(
+            scale_out = _create_per_token_group_quant_fp8_output_scale(
                 x_shape=out_shape,
                 device=quant_out.device,
                 group_size=block_size,
@@ -1431,9 +1494,88 @@ if current_platform().is_nvidia:
             )
             cudart.cudaFree(c_void_p(self.control_ptr))
 
+    class TrtllmAllGatherQuantState(TrtllmAllGatherState):
+        """Fused BF16 gather and 1x128 FP8 quantization scratch.
+
+        Construct collectively before capture. ``max_rows`` is the per-rank
+        capacity (1..128), ``hidden`` is a multiple of 128, and ``num_blocks``
+        bounds the launch grid to at most one CTA per SM. Outputs are borrowed
+        until the next quantized gather; calls sharing this state are serialized.
+        Every peer supplies equal positive physical rows, so empty logical
+        owners must participate with zero padding. Communication remains BF16;
+        fusion removes gathered-BF16 materialization and a separate quantizer,
+        but does not reduce link traffic. Ordinary ``gather`` remains available
+        as the numerical reference and fallback building block.
+        """
+
+        def __init__(self, group, max_rows, hidden, device, num_blocks):
+            from tokenspeed_kernel.thirdparty.flashinfer.allgather_quant import (
+                load_allgather_quant_module,
+            )
+
+            if (
+                not 0
+                < num_blocks
+                <= torch.cuda.get_device_properties(device).multi_processor_count
+            ):
+                raise ValueError("Fused gather requires a positive, SM-bounded grid")
+            self.module = load_allgather_quant_module()
+            self.num_blocks = num_blocks
+            super().__init__(group, max_rows, hidden, device, True)
+            padded_rows = (self.tp_size * max_rows + 3) // 4 * 4
+            self.fp8_out = torch.empty(
+                (padded_rows, hidden), dtype=torch.float8_e4m3fn, device=device
+            )
+            self.scales_out = torch.empty(
+                padded_rows * (hidden // 128), dtype=torch.float32, device=device
+            )
+
     @register_kernel(
         "communication",
-        "stateful_allgather",
+        "stateful_all_gather_fp8_quantize",
+        name="trtllm_allgather_fp8_quantize",
+        solution="trtllm",
+        signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
+    )
+    def trtllm_allgather_fp8_quantize(state, inputs):
+        """Gather BF16 rows and quantize ready 128-element groups in one kernel.
+
+        Args:
+            state: Prepared ``TrtllmAllGatherQuantState`` on the current GPU.
+            inputs: Contiguous BF16 ``[rows,H]``; every peer supplies equal rows.
+
+        Returns:
+            Borrowed FP8 values ``[round_up(TP*rows,4),H]`` and contiguous FP32
+            MN-major scales ``[H/128,round_up(TP*rows,4)]``. Padding is zero/one.
+            No RMSNorm or PDL is applied. A following GEMM uses normal stream
+            ordering; this API does not publish per-tile readiness to consumers.
+        """
+        if (
+            inputs.ndim != 2
+            or inputs.dtype != torch.bfloat16
+            or not inputs.is_contiguous()
+            or inputs.device != state.fp8_out.device
+            or inputs.shape[1] != state.hidden
+            or not 0 < inputs.shape[0] <= state.max_rows
+        ):
+            raise ValueError("Invalid fused AllGather quantization input")
+        rows = (state.tp_size * inputs.shape[0] + 3) // 4 * 4
+        values = state.fp8_out[:rows]
+        scales = state.scales_out[: rows * (state.hidden // 128)].view(-1, rows)
+        state.module.allgather_fp8_quantize(
+            inputs,
+            values,
+            scales,
+            state.workspace,
+            state.group.rank(),
+            state.tp_size,
+            state.num_blocks,
+        )
+        return values, scales
+
+    @register_kernel(
+        "communication",
+        "stateful_all_gather",
         name="trtllm_allgather",
         solution="trtllm",
         signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),

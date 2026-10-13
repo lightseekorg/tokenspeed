@@ -28,7 +28,6 @@ server:
     --moe-tp-size 8
     --max-model-len 80000
     --max-num-seqs 16
-    --gpu-memory-utilization 0.9
     --disable-cuda-graph-padding
     --trust-remote-code
     --attention-backend tokenspeed_mla

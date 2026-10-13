@@ -119,6 +119,7 @@ def _run(
         page_size=PAGE_SIZE,
         out=out,
         solution="flashinfer_trtllm",
+        slot_order="selection",
     )
 
 

@@ -21,12 +21,15 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
+from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
+
 from tokenspeed.runtime.configs.kimi_k3_config import (  # noqa: E402
     KimiK3Config,
     KimiK3VisionConfig,
     KimiLinearConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     FULL_ATTENTION,
     LINEAR_ATTENTION,
@@ -177,7 +180,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         """Construct one MoE block on a chosen plan; report what it wired."""
         from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
         from tokenspeed.runtime.models import kimi_k3
-        from tokenspeed.runtime.models.kimi_k3_comm import K3MoeTailCommState
 
         linear_calls: list[dict] = []
         multicast_calls: list[dict] = []
@@ -215,8 +217,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.components = kwargs
 
         config = KimiLinearConfig(
-            # Distinct widths: the MoE tail comm state is negotiated once per
-            # process, and another test already claimed 64/32.
             hidden_size=128,
             routed_expert_hidden_size=routed_hidden,
             moe_intermediate_size=64,
@@ -230,9 +230,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             world_size=8,
             pp_size=1,
             pp_rank=0,
-            attn=SimpleNamespace(
-                tp_size=8, cp_size=1, dp_size=1, dp_rank=0, dp_group=(0,)
-            ),
+            attn=SimpleNamespace(tp_size=8, dp_size=1, dp_rank=0, dp_group=(0,)),
             moe=SimpleNamespace(
                 tp_rank=0,
                 tp_size=1,
@@ -248,8 +246,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         with (
             _model_dtype(torch.bfloat16),
-            # Negotiated once per process; another test already claimed it.
-            mock.patch.object(K3MoeTailCommState, "_instance", None),
             mock.patch.object(kimi_k3, "ReplicatedLinear", FakeLinear),
             mock.patch.object(kimi_k3, "Kimi3LatentProjection", FakeLinear),
             mock.patch.object(kimi_k3, "MoELayer", FakeExperts),
@@ -257,9 +253,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
             mock.patch.object(kimi_k3, "LatentMoELayer", FakeLatentMoE),
             mock.patch.object(
                 kimi_k3.Kimi3MoEExecutionPlan, "build", return_value=plan
-            ),
-            mock.patch.object(
-                kimi_k3, "load_packaged_flashinfer_tuning_cache", lambda *a, **kw: None
             ),
             mock.patch.object(
                 kimi_k3.KimiK3LatentDownOp,
@@ -361,7 +354,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
         # Not get_process_group("nccl", ...): that spelling passes either way,
         # since the manager's device backend defaults to "nccl" in a test.
         get_pg.assert_called_with(mapping.moe.tp_ep_group)
-        self.assertFalse(layer.execution_plan.join_moe_reduce)
 
     def test_the_column_group_needs_a_divisible_latent(self):
         """The group would otherwise raise at construction and kill the boot.
@@ -481,6 +473,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 mapping=mapping,
                 layer_id=1,
                 model_scope="model.layers",
+                qkv_parallel=None,
+                output_parallel=None,
             )
 
         self.assertEqual(len(recorded), 1)
@@ -514,6 +508,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 mapping=staged,
                 layer_id=31,
                 model_scope="model.layers",
+                qkv_parallel=None,
+                output_parallel=None,
             )
         self.assertEqual(recorded[0]["moe_block_count"], 31)
         self.assertNotEqual(31, kimi_k3._k3_local_moe_blocks(config, mapping))
@@ -661,15 +657,17 @@ class KimiK3RegistrationTests(unittest.TestCase):
             token_to_kv_pool=None,
             bs=3,
             num_extends=1,
+            output_layout=ForwardOutputLayout(1, 1, 2, 1),
             input_num_tokens=4,
             forward_mode=ForwardMode.DECODE,
         )
         attention = DeepseekV3AttentionMLA.__new__(DeepseekV3AttentionMLA)
         torch.nn.Module.__init__(attention)
+        attention.has_head_tp = False
         attention.num_local_heads = 2
         attention.v_head_dim = 3
         attention.attn_mha = SimpleNamespace(group_id="full_attention")
-        attention.forward_normal_chunked = mock.Mock()
+        attention.forward_normal_chunked_kv_core = mock.Mock()
         attention.forward_absorb = mock.Mock()
 
         output_gate = torch.arange(24).reshape(4, 6)
@@ -678,6 +676,11 @@ class KimiK3RegistrationTests(unittest.TestCase):
             q=torch.empty(4, 2, 8),
             latent_cache=torch.empty(4, 1, 8),
             ctx=ctx,
+            expanded=MLAPrologueOutput(
+                query=torch.empty(4, 2, 8),
+                key=torch.empty(4, 2, 8),
+                value=torch.empty(4, 2, 3),
+            ),
             output_gate=output_gate,
         )
 
@@ -779,7 +782,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
             linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
-        layer = KimiLinearKDA(config, mapping, layer_id=0)
+        layer = KimiLinearKDA(
+            config, mapping, layer_id=0, qkv_parallel=None, output_parallel=None
+        )
 
         self.assertEqual(tuple(layer.qkvgb_proj.weight.shape), (288, 64))
         for value, shard_id in enumerate(("q", "k", "v", "g"), start=1):
@@ -810,7 +815,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
             for index in range(4)
         ]
-        mixed_qkv, gate, f_a, beta = layer._project_qkvfab(hidden_states)
+        mixed_qkv, gate, f_a, beta = layer._project_qkvfab(hidden_states, ctx=None)
         self.assertTrue(torch.equal(mixed_qkv, torch.cat(expected_qkvg[:3], dim=-1)))
         self.assertTrue(torch.equal(gate, expected_qkvg[3]))
         self.assertTrue(
@@ -849,7 +854,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
             linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
-        layer = KimiLinearKDA(config, mapping, layer_id=0)
+        layer = KimiLinearKDA(
+            config, mapping, layer_id=0, qkv_parallel=None, output_parallel=None
+        )
         rows, projection_width = 4, 64
         packed = torch.randn(rows, 288, dtype=torch.bfloat16)
         projection_outputs = (
@@ -888,6 +895,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                             hidden_states=torch.empty(rows, 64, dtype=torch.bfloat16),
                             ctx=ctx,
                             comm_manager=None,
+                            projection_out=None,
                         )
 
                 self.assertEqual(captured[0].is_contiguous(), expect_contiguous)
@@ -947,7 +955,6 @@ class KimiK3RegistrationTests(unittest.TestCase):
             world_size=8,
             attn=SimpleNamespace(
                 tp_size=8,
-                cp_size=1,
                 dp_size=1,
                 dp_rank=0,
                 dp_group=(0,),
@@ -1024,6 +1031,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             layer.topk.topk_config.output_format, TopKOutputFormat.STANDARD
         )
         self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
+        self.assertIsNone(layer.native_latent_moe.components["shared_reduce"])
         self._assert_latent_projection_sharding(linear_calls, mapping)
         self.assertEqual(len(multicast_calls), 1)
         wired = multicast_calls[0]
@@ -1145,7 +1153,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertIsNone(unsharded["routed_expert_up_proj"].get("shard_group"))
 
         self.assertIsNone(tp_layer.native_latent_moe)
-        self.assertEqual(tp_layer.comm.mapping.moe.tp_ep_group, ep_group)
+        self.assertIsNone(tp_layer.comm)
         routed_input = torch.zeros(1, config.routed_expert_hidden_size)
         torch.testing.assert_close(
             tp_layer._routed_experts(
@@ -1169,10 +1177,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         layer = SimpleNamespace(
             mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
+            execution_plan=SimpleNamespace(use_native=True),
             native_latent_moe=native_latent_moe,
             _use_fused_decode_pipeline=True,
             _forward_fused_decode_pipeline=fused_pipeline,
         )
+
+        layer._forward_amd = KimiLinearMoE._forward_amd.__get__(layer)
 
         output = KimiLinearMoE.forward(
             layer,
@@ -1180,6 +1191,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             prefix_sum,
             num_global_tokens=0,
             max_num_tokens_per_gpu=0,
+            prefix_is_sharded=False,
         )
 
         torch.testing.assert_close(output, prefix_sum)
@@ -1201,9 +1213,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 self.weight = torch.nn.Parameter(torch.arange(50.0).reshape(10, 5))
                 self.calls = 0
 
-            def forward(self, hidden, block_scale, output_dtype):
+            def forward(self, hidden, block_scale, output_dtype, *, ctx):
                 self.calls += 1
-                return torch.nn.functional.linear(hidden, self.weight)
+                value = hidden if block_scale is None else hidden * block_scale
+                output = torch.nn.functional.linear(value, self.weight.to(value.dtype))
+                if output_dtype is not None:
+                    output = output.to(output_dtype)
+                return output, None
 
         class IdentityComm:
             @staticmethod
@@ -1235,6 +1251,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         attention.qk_rope_head_dim = 1
         attention._qkv_a_width = 6
         attention._gate_width = 4
+        attention.qkv_parallel = None
         attention.fused_qkv_a_proj_with_mqa = FakeProjection()
         attention.fused_qk_layernorm = FakeFusedNorm()
         attention.q_a_layernorm = FakeQueryNorm()
@@ -1273,12 +1290,58 @@ class KimiK3RegistrationTests(unittest.TestCase):
         self.assertIsNone(decode_absorbed)
         self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
 
+        # The module paths must trim padding and preserve both canonical
+        # Q/KV/gate order and the FP8 checkpoint's gate/Q/KV order.
+        projection = attention.fused_qkv_a_proj_with_mqa
+        weight = torch.nn.functional.pad(projection.weight.detach(), (0, 0, 0, 2))
+        attention._fused_qkv_a_pad_rows = 2
+        for fp8 in (False, True):
+            with self.subTest(fp8=fp8):
+                attention._fused_qkv_a_fp8_layout = fp8
+                projection.weight = torch.nn.Parameter(
+                    weight.to(torch.float8_e4m3fn if fp8 else torch.float32),
+                    requires_grad=False,
+                )
+                output_dtype = torch.float32 if fp8 else torch.bfloat16
+                attention.q_b_proj.to(output_dtype)
+                attention.fused_qk_layernorm.to(output_dtype)
+                scale = None if fp8 else torch.full((prefill.shape[0], 1), 0.5)
+                with torch.no_grad():
+                    q, latent, gate, absorbed = attention._project_q_latent_gated(
+                        prefill, None, comm, scale
+                    )
+                expected = torch.nn.functional.linear(
+                    prefill if fp8 else prefill * scale, projection.weight.float()
+                )[:, :10]
+                if fp8:
+                    expected_gate, expected_q, expected_latent = expected.split(
+                        [4, 2, 4], dim=-1
+                    )
+                else:
+                    expected_q, expected_latent, expected_gate = expected.to(
+                        torch.bfloat16
+                    ).split([2, 4, 4], dim=-1)
+                expected_q = torch.nn.functional.rms_norm(
+                    expected_q, (2,), eps=attention.q_a_layernorm.variance_epsilon
+                )
+                expected_latent = expected_latent.clone()
+                expected_latent[:, :3] = torch.nn.functional.rms_norm(
+                    expected_latent[:, :3],
+                    (3,),
+                    eps=attention.q_a_layernorm.variance_epsilon,
+                )
+                torch.testing.assert_close(q, expected_q)
+                torch.testing.assert_close(latent, expected_latent)
+                torch.testing.assert_close(gate, expected_gate)
+                self.assertIsNone(absorbed)
+
     def test_ungated_mla_does_not_select_attnres_projection_fusion(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
 
         attention = KimiLinearMLAAttention.__new__(KimiLinearMLAAttention)
         torch.nn.Module.__init__(attention)
 
+        attention.qkv_parallel = None
         self.assertFalse(attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
 
     def test_config_registry_maps_model_type(self):

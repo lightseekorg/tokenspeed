@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from itertools import accumulate
 
 import torch
 import torch.nn.functional as F
@@ -34,7 +35,9 @@ from tokenspeed.runtime.layers.attention.mm_encoder_attention import (
     VIT_CUDNN_WORKSPACE_BYTES,
     VisionAttention,
 )
+from tokenspeed.runtime.multimodal.encoder_batching import pack_encoder_batches
 from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
+from tokenspeed.runtime.utils.env import envs
 
 
 @lru_cache(maxsize=16)
@@ -112,7 +115,11 @@ class DeepseekV41VisionBlock(nn.Module):
         vision = config.vision_config
         dim = vision.hidden_size
         self.norm1 = nn.RMSNorm(
-            dim, eps=1e-6, elementwise_affine=True, device=None, dtype=torch.float32
+            dim,
+            eps=1e-6,
+            elementwise_affine=True,
+            device=None,
+            dtype=torch.float32,
         )
         self.attn = VisionAttention(
             embed_dim=dim,
@@ -129,7 +136,11 @@ class DeepseekV41VisionBlock(nn.Module):
             mm_attention_backend=mm_attention_backend,
         )
         self.norm2 = nn.RMSNorm(
-            dim, eps=1e-6, elementwise_affine=True, device=None, dtype=torch.float32
+            dim,
+            eps=1e-6,
+            elementwise_affine=True,
+            device=None,
+            dtype=torch.float32,
         )
         self.mlp = DeepseekV41VisionMLP(config)
 
@@ -140,6 +151,7 @@ class DeepseekV41VisionBlock(nn.Module):
         sin: torch.Tensor,
         cu_seqlens: torch.Tensor,
         sequence_lengths: torch.Tensor | None,
+        max_seqlen: int,
     ) -> torch.Tensor:
         attn_output = self.attn(
             self.norm1(x),
@@ -147,7 +159,7 @@ class DeepseekV41VisionBlock(nn.Module):
             position_embeddings=(cos, sin),
             rotary_pos_emb_cos=None,
             rotary_pos_emb_sin=None,
-            max_seqlen=x.shape[0],
+            max_seqlen=max_seqlen,
             sequence_lengths=sequence_lengths,
         )
         x = x + attn_output.squeeze(0)
@@ -192,17 +204,39 @@ class DeepseekV41VisionTower(nn.Module):
         )
 
     def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        return self.forward_packed(patches, [(n_h, n_w)])
+
+    def forward_packed(
+        self, patches: torch.Tensor, grids: list[tuple[int, int]]
+    ) -> torch.Tensor:
+        """Encode concatenated patches with independent attention and RoPE per grid.
+
+        Grids describe each image in patch order. The returned tensor preserves
+        that order and has one hidden vector per input patch.
+        """
+        if not grids or any(h <= 0 or w <= 0 for h, w in grids):
+            raise ValueError("V4.1 requires nonempty, positive image grids")
+        if self.mm_attention_backend == "flashinfer_cudnn" and len(grids) != 1:
+            raise ValueError("V4.1 cuDNN image encoding requires singleton batches")
+        sizes = [h * w for h, w in grids]
+        if sum(sizes) != patches.shape[0]:
+            raise ValueError("V4.1 patch count does not match image grids")
         x = self.patch_embed(patches)
-        cos, sin = get_vision_cos_sin(
-            n_h, n_w, self.rope_dim, self.rope_theta, x.device
+        positions = [
+            get_vision_cos_sin(h, w, self.rope_dim, self.rope_theta, x.device)
+            for h, w in grids
+        ]
+        cos = torch.cat([position[0] for position in positions])
+        sin = torch.cat([position[1] for position in positions])
+        cu_seqlens = torch.tensor(
+            [0, *accumulate(sizes)], dtype=torch.int32, device=x.device
         )
-        cu_seqlens = torch.tensor([0, x.shape[0]], dtype=torch.int32, device=x.device)
         sequence_lengths = None
         if self.mm_attention_backend == "flashinfer_cudnn":
-            sequence_lengths = cu_seqlens[1:]
+            sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             cu_seqlens = (cu_seqlens * self.local_dim).repeat(3)
         for block in self.blocks:
-            x = block(x, cos, sin, cu_seqlens, sequence_lengths)
+            x = block(x, cos, sin, cu_seqlens, sequence_lengths, max(sizes))
         return self.norm(x)
 
 
@@ -235,6 +269,11 @@ class DeepseekV41Vision(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.max_batch_tokens = (
+            envs.TOKENSPEED_DEEPSEEK_V41_VISION_MAX_BATCH_TOKENS.get()
+        )
+        if self.max_batch_tokens <= 0:
+            raise ValueError("V4.1 vision max batch tokens must be positive")
         self.vision = DeepseekV41VisionTower(config, mapping, mm_attention_backend)
         self.aligner = DeepseekV41VisionAligner(config)
         hidden_size = config.text_config.hidden_size
@@ -243,9 +282,14 @@ class DeepseekV41Vision(nn.Module):
         self.image_newline = nn.Parameter(torch.empty(hidden_size))
 
     def embed_one(self, item: MultimodalDataItem) -> torch.Tensor:
+        return self.embed_media([item])
+
+    def _validate_item(self, item: MultimodalDataItem) -> tuple[int, int]:
         data = item.model_specific_data
         n_vit_h, n_vit_w = data["vit_grid"].reshape(-1).tolist()
         n_llm_h, n_llm_w = data["llm_grid"].reshape(-1).tolist()
+        if n_vit_h <= 0 or n_vit_w <= 0:
+            raise ValueError("V4.1 requires positive image grids")
         ratio = self.aligner.downsample_ratio
         if (n_llm_h, n_llm_w) != (
             (n_vit_h + ratio - 1) // ratio,
@@ -258,20 +302,65 @@ class DeepseekV41Vision(nn.Module):
             raise ValueError("V4.1 image types do not match llm_grid")
         if item.feature.shape[0] != n_vit_h * n_vit_w:
             raise ValueError("V4.1 patch count does not match vit_grid")
-        patches = item.feature.to(
-            device=self.image_start.device, dtype=self.image_start.dtype
+        return n_vit_h, n_vit_w
+
+    def _embed_batch(
+        self, items: list[MultimodalDataItem], grids: list[tuple[int, int]]
+    ) -> list[torch.Tensor]:
+        patches = torch.cat(
+            [
+                item.feature.to(
+                    device=self.image_start.device, dtype=self.image_start.dtype
+                )
+                for item in items
+            ]
         )
-        embeds = self.vision(patches, n_vit_h, n_vit_w)
-        embeds = self.aligner(embeds, n_vit_h, n_vit_w)
-        types = types.to(device=embeds.device, dtype=torch.int64)
-        block = torch.stack(
-            [self.image_start, self.image_start, self.image_newline, self.image_end]
-        )[types]
-        block[types == 1] = embeds
-        return block
+        features = self.vision.forward_packed(patches, grids)
+        outputs = []
+        for item, (h, w), feature in zip(
+            items, grids, features.split([h * w for h, w in grids]), strict=True
+        ):
+            # Padding and sentinel insertion are local to each image.
+            embeds = self.aligner(feature, h, w)
+            types = (
+                item.model_specific_data["types"]
+                .reshape(-1)
+                .to(device=embeds.device, dtype=torch.int64)
+            )
+            block = torch.stack(
+                [
+                    self.image_start,
+                    self.image_start,
+                    self.image_newline,
+                    self.image_end,
+                ]
+            )[types]
+            block[types == 1] = embeds
+            outputs.append(block)
+        return outputs
 
     def embed_media(self, items: list[MultimodalDataItem]) -> torch.Tensor:
-        return torch.cat([self.embed_one(item) for item in items], dim=0)
+        """Encode images in bounded batches, preserving item and token order."""
+        if not items:
+            raise ValueError("V4.1 requires at least one image")
+        grids = [self._validate_item(item) for item in items]
+        # Keep cuDNN on its validated singleton path.
+        groups = pack_encoder_batches(
+            [h * w for h, w in grids],
+            [1] * len(items),
+            max_tokens=self.max_batch_tokens,
+            max_items=(
+                1 if self.vision.mm_attention_backend == "flashinfer_cudnn" else None
+            ),
+            max_metadata_sequences=None,
+        )
+        outputs: dict[int, torch.Tensor] = {}
+        for indices in groups:
+            encoded = self._embed_batch(
+                [items[i] for i in indices], [grids[i] for i in indices]
+            )
+            outputs.update(zip(indices, encoded, strict=True))
+        return torch.cat([outputs[i] for i in range(len(items))], dim=0)
 
     def make_image_warmup_items(self) -> list[MultimodalDataItem]:
         vision = self.config.vision_config

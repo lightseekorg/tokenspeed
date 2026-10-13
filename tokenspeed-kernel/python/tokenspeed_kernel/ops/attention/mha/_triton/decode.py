@@ -53,7 +53,9 @@ def _fwd_kernel_stage1(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
     MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
@@ -277,7 +279,9 @@ def _fwd_grouped_kernel_stage1(
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
     MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,

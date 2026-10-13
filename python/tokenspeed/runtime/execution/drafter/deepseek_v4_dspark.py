@@ -32,6 +32,15 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.slot_state import (
+    PREPARED_MARKER_BYTES,
+    pack_slot_rows,
+    read_prepared_marker,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+    write_prepared_marker,
+)
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import (
     dspark_greedy_workspace,
     sample_dspark_block_greedy,
@@ -122,18 +131,23 @@ class DeepseekV4DSpark(BaseDrafter):
         )
         self.target_layer_ids = list(self.model.target_layer_ids)
         self.hidden_width = len(self.target_layer_ids) * int(self.model.hidden_size)
-        self.idle_forward_steps = 1
         self._prefill_graph: torch.cuda.CUDAGraph | None = None
         self._init_buffers()
+
+    def idle_forward_global_num_tokens(
+        self, global_num_tokens: list[int], global_bs: list[int]
+    ) -> list[list[int]]:
+        # Block drafter: one draft forward proposes the whole block.
+        del global_bs
+        return [global_num_tokens]
 
     @staticmethod
     def _validate_tp_only_mapping(mapping) -> None:
         dp_size = int(mapping.attn.dp_size)
-        cp_size = int(mapping.attn.cp_size)
-        if dp_size != 1 or cp_size != 1:
+        if dp_size != 1:
             raise ValueError(
                 "Week-0 DSPARK supports tensor parallelism only; "
-                f"got attention dp_size={dp_size}, cp_size={cp_size}."
+                f"got attention dp_size={dp_size}."
             )
 
     def _init_buffers(self) -> None:
@@ -193,6 +207,46 @@ class DeepseekV4DSpark(BaseDrafter):
         self.target_model = target_model
         self.lm_head = self.draft_model.lm_head
         self.tp_group = target_model.logits_processor.tp_group
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        # The request-persistent context windows and their lengths: the state
+        # ``dspark_prefix_replay_tokens`` exists to regenerate from a prefix.
+        if not 0 <= slot < self.first_padding_slot:
+            raise ValueError(
+                f"DSPARK slot {slot} is outside the persistent state domain "
+                f"[0, {self.first_padding_slot})"
+            )
+        return [self.kv_windows[slot], self.context_lengths[slot]]
+
+    def slot_state_bytes(self) -> int:
+        return PREPARED_MARKER_BYTES + slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # The windows are ``request_id``'s only once ``prepare_request_state``
+        # ran a forward for it in this slot; before that they are a previous
+        # occupant's and the image carries the marker alone.
+        prepared = self._request_by_pool_slot[slot] == request_id
+        write_prepared_marker(out, prepared)
+        if prepared:
+            pack_slot_rows(
+                self.slot_state_rows(slot), out[PREPARED_MARKER_BYTES:], stream
+            )
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        if read_prepared_marker(src):
+            unpack_slot_rows(
+                self.slot_state_rows(slot), src[PREPARED_MARKER_BYTES:], stream
+            )
+            # Imported windows belong to ``request_id``: ``prepare_request_state``
+            # must not reset them as a previous occupant's at the first forward.
+            self._request_by_pool_slot[slot] = request_id
+        else:
+            # Nobody's until the first forward prepares it for the request.
+            self._request_by_pool_slot[slot] = None
 
     def prepare_request_state(
         self,
@@ -478,6 +532,7 @@ class DeepseekV4DSpark(BaseDrafter):
             token_to_kv_pool=base_ctx.token_to_kv_pool,
             bs=num_decodes,
             num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, num_decodes, self.block_size),
             input_num_tokens=num_decodes * self.block_size,
             forward_mode=ForwardMode.DECODE,
             capture_hidden_mode=CaptureHiddenMode.NULL,

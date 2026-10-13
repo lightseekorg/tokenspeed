@@ -77,6 +77,122 @@ def test_mxfp8_mm_rejects_invalid_generator_parameters(
     assert raised.value.status is BenchmarkStatus.INVALID_CASE
 
 
+def _gemm_mm_request(parameters, *, registration=None) -> BenchmarkRequest:
+    return BenchmarkRequest(
+        family="gemm",
+        mode="mm",
+        parameters=parameters,
+        solution=None,
+        registration=registration,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+def _dense_mm_parameters(**updates):
+    parameters = {
+        "M": 2816,
+        "N": 3072,
+        "K": 512,
+        "quant": "none",
+        "dtype": "bfloat16",
+    }
+    parameters.update(updates)
+    return parameters
+
+
+def test_mm_requires_explicit_quant(mi350_platform):
+    parameters = _dense_mm_parameters()
+    del parameters["quant"]
+
+    with pytest.raises(BenchmarkCaseError, match="quant") as raised:
+        gemm_generator.prepare_mm(_gemm_mm_request(parameters), mi350_platform)
+
+    assert raised.value.status is BenchmarkStatus.INVALID_CASE
+
+
+def test_dense_mm_runs_through_harness_with_registered_reference(
+    mi350_platform,
+    fresh_registry,
+    monkeypatch,
+):
+    _ = fresh_registry
+    signature = format_signature(
+        a=dense_tensor_format(torch.bfloat16),
+        b=dense_tensor_format(torch.bfloat16),
+    )
+    candidate_spec = KernelSpec(
+        name="unit_candidate_mm",
+        family="gemm",
+        mode="mm",
+        solution="unit",
+        format_signatures=frozenset({signature}),
+        traits={
+            "mnk_problem_filter": frozenset({lambda m, n, k: m % 4 == 0}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+        },
+    )
+    reference_spec = KernelSpec(
+        name="unit_reference_mm",
+        family="gemm",
+        mode="mm",
+        solution="reference",
+        format_signatures=frozenset({signature}),
+    )
+    out_shapes: list[tuple[int, ...]] = []
+
+    def kernel(**kwargs):
+        out_shapes.append(tuple(kwargs["out"].shape))
+        kwargs["out"].copy_(kwargs["A"] @ kwargs["B"].T)
+        return kwargs["out"]
+
+    KernelRegistry.get().register(candidate_spec, kernel)
+    KernelRegistry.get().register(reference_spec, kernel)
+
+    class InputGenerator:
+        def generate(self, *, M, N, K):
+            return {
+                "A": torch.ones((M, K), dtype=torch.bfloat16),
+                "B": torch.ones((N, K), dtype=torch.bfloat16),
+                "A_scales": None,
+                "B_scales": None,
+                "out_dtype": torch.bfloat16,
+                "alpha": None,
+                "block_size": None,
+            }
+
+    monkeypatch.setattr(
+        gemm_generator,
+        "get_input_generator",
+        lambda *_args, **_kwargs: InputGenerator(),
+    )
+    monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
+    # The harness routes quant="none" through prepare_mm to the dense generator,
+    # whose traits must satisfy the candidate's problem filter.
+    result = KernelBenchmarkHarness(
+        FakeTimer(), platform_provider=lambda: mi350_platform
+    ).run(
+        _gemm_mm_request(
+            _dense_mm_parameters(
+                M=4,
+                N=3,
+                K=8,
+                validation={"runs": 1, "atol": 0.0, "rtol": 0.0},
+            ),
+            registration="unit_candidate_mm",
+        ),
+        measurement_blocks=3,
+    )
+
+    assert result.status is BenchmarkStatus.SUCCESS, result.to_dict()
+    assert result.registration_name == "unit_candidate_mm"
+    assert result.correctness is not None
+    assert result.correctness["passed"] is True
+    assert set(out_shapes) == {(4, 3)}
+
+
 @pytest.mark.parametrize(
     "parameters, match",
     [
@@ -482,3 +598,112 @@ def test_dense_bmm_gluon_registration_graph_replay(selection, selection_mode):
     assert result.correctness is not None
     assert result.correctness["passed"] is True
     assert result.correctness["runs"] == 3
+
+
+def _grouped_projection_request(**updates) -> BenchmarkRequest:
+    parameters = {
+        "groups": 2,
+        "M": 3,
+        "N": 8,
+        "K": 16,
+        "x_token_stride": 64,
+        "dtype": "bfloat16",
+    }
+    parameters.update(updates)
+    return BenchmarkRequest(
+        family="gemm",
+        mode="grouped_bf16_projection",
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+def _cpu_random_tensors(_seed, dtype, *shapes):
+    return [torch.zeros(shape, dtype=dtype) for shape in shapes]
+
+
+@pytest.mark.parametrize(
+    ("updates", "match"),
+    [
+        ({"extra": 1}, "Unknown"),
+        ({"groups": 0}, "groups"),
+        ({"x_token_stride": 31}, "x_token_stride"),
+        ({"dtype": "float16"}, "dtype"),
+    ],
+)
+def test_grouped_bf16_projection_rejects_invalid_parameters(updates, match):
+    with pytest.raises(BenchmarkCaseError, match=match):
+        gemm_generator.prepare_grouped_bf16_projection(
+            _grouped_projection_request(**updates), None
+        )
+
+
+@pytest.mark.parametrize("x_token_stride", [32, 128])
+def test_grouped_bf16_projection_selection_matches_operation_api(
+    monkeypatch, x_token_stride
+):
+    from tokenspeed_kernel.ops import gemm as gemm_ops
+
+    captured = {}
+
+    def capture_operation(_family, _mode, signature, *, traits, **_kwargs):
+        captured["operation"] = (signature, traits)
+        raise RuntimeError("selection captured")
+
+    def capture_generator(_request, _platform, signature, traits, _shape):
+        captured["generator"] = (signature, traits)
+        raise RuntimeError("selection captured")
+
+    monkeypatch.setattr(gemm_ops, "select_kernel", capture_operation)
+    monkeypatch.setattr(gemm_generator, "_random_tensors", _cpu_random_tensors)
+    monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(gemm_generator, "_select_registration", capture_generator)
+
+    rows = torch.zeros((3, x_token_stride), dtype=torch.bfloat16)
+    x = rows[:, :32].unflatten(1, (2, 16))
+    weight = torch.zeros((2, 8, 16), dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="selection captured"):
+        gemm_ops.grouped_bf16_projection(x, weight, None, None)
+    with pytest.raises(RuntimeError, match="selection captured"):
+        gemm_generator.prepare_grouped_bf16_projection(
+            _grouped_projection_request(x_token_stride=x_token_stride), None
+        )
+
+    assert captured["generator"] == captured["operation"]
+
+
+def test_grouped_bf16_projection_times_strided_view_without_out(
+    mi350_platform, monkeypatch
+):
+    spec = KernelSpec(
+        name="unit_grouped_projection",
+        family="gemm",
+        mode="grouped_bf16_projection",
+        solution="unit",
+        format_signatures=frozenset(),
+        traits={},
+    )
+    calls = []
+    monkeypatch.setattr(gemm_generator, "_random_tensors", _cpu_random_tensors)
+    monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
+    monkeypatch.setattr(
+        gemm_generator,
+        "_select_registration",
+        lambda *_args: (spec, lambda *args: calls.append(args)),
+    )
+
+    prepared = gemm_generator.prepare_grouped_bf16_projection(
+        _grouped_projection_request(), mi350_platform
+    )
+    prepared.invocation.invoke()
+
+    ((x, weight, out),) = calls
+    assert x.shape == (3, 2, 16)
+    assert x.stride() == (64, 16, 1)
+    assert weight.shape == (2, 8, 16)
+    assert weight.is_contiguous()
+    assert out is None
+    assert prepared.parameters["x_token_stride"] == 64

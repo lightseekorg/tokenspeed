@@ -40,6 +40,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 from tokenspeed_kernel.ops.embedding import apply_k_rope
 from torch import nn
 
@@ -54,6 +55,7 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.pp_stage import pp_layer_window
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -106,13 +108,15 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
+        *,
+        expanded: MLAPrologueOutput | None,
     ) -> torch.Tensor:
+        if expanded is not None:
+            raise RuntimeError("the DSpark draft attends decode rounds only")
         if q.size(0) == 0:
             return q.new_empty((0, self.num_local_heads * self.v_head_dim))
         if self.w_kc is None or self.w_vc is None:
-            # The absorbed decode kernel takes these as raw pointers, so a
-            # missing post_load_weights surfaces as a null-address GPU fault
-            # rather than anything that names the cause.
+            # The absorbed decode kernel takes raw pointers; a missing factor would fault opaquely.
             raise RuntimeError(
                 "K3 DSpark absorbed MLA factors are missing; "
                 "post_load_weights did not run after loading the draft."
@@ -124,17 +128,16 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
 
             decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
 
-        # The drafter publishes each block step's write window before this
-        # forward; the backend serves it as the DECODE window.
+        # The drafter publishes each block step's write window as the DECODE window.
         out_cache_loc = ctx.attn_backend.write_locations(
             self.attn_mqa, ForwardMode.DECODE
         )
-        Q, K = self.forward_absorb_qkv_proj(
+        Q = self.forward_absorb_qkv_proj(
             q, latent_cache, positions, decode_ctx, out_cache_loc
         )
         attn_output = q.new_empty((q.size(0), self.num_local_heads * self.v_head_dim))
         self.forward_absorb_attn_v_proj(
-            Q, K, decode_ctx, out_cache_loc, attn_output, record_kv_cache=False
+            Q, decode_ctx, attn_output, record_kv_cache=False
         )
         return attn_output
 
@@ -246,8 +249,10 @@ class K3DSparkDecoderLayer(nn.Module):
             layer_id=layer_id,
             is_moe=False,
             prev_is_moe=False,
+            dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(
@@ -511,6 +516,8 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         positions: torch.Tensor,
         cache_locs: torch.Tensor,
         token_to_kv_pool,
+        *,
+        attn_backend,
     ) -> None:
         """Project target-derived context into each draft layer's latent cache.
 
@@ -524,12 +531,18 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
             attn = layer.self_attn
             latent = attn.project_latent_kv(ctx_hidden)
             latent = attn.apply_latent_rope(positions, latent)
+            # Context injection writes the same sharded cache as attention:
+            # the backend's placement (None for a replicated group) decides
+            # which rows this rank stores and where.
+            local_locs, write_mask = resolve_cache_slots(
+                cache_locs, attn_backend.cache_placement(attn.attn_mqa)
+            )
             token_to_kv_pool.set_mla_kv_buffer(
                 attn.attn_mqa,
-                cache_locs,
+                local_locs,
                 latent[..., : attn.kv_lora_rank].contiguous(),
                 latent[..., attn.kv_lora_rank :].contiguous(),
-                write_mask=None,
+                write_mask=write_mask,
             )
 
     @torch.no_grad()

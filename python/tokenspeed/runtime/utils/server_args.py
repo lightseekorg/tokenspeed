@@ -23,15 +23,33 @@
 import argparse
 import dataclasses
 import json
+import math
 import os
 import random
 import socket
+from collections.abc import Sequence
 from typing import Literal
 
 from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.numerics import (
+    DSA_SLOT_ORDERS,
+    LAYER_BOUNDARY_NORMS,
+    LOGPROB_ORDERS,
+    MLA_LORA_SCALES,
+    MOE_COMBINE_ORDERS,
+    NUMERICS_ENVELOPES,
+    RL_BITWISE_SAMPLING_BACKENDS,
+    ROUTER_TOPKS,
+    SAMPLING_STREAMS,
+    YARN_RAMP_MASK_DEVICES,
+)
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.moe.dispatch_algorithm import (
+    EP_DISPATCH_ALGORITHMS,
+    STATIC_EP_DISPATCH_ALGORITHMS,
+)
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,
@@ -49,7 +67,19 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 
 logger = get_colorful_logger(__name__)
 
-ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
+# Sampling backends whose verify runs the draft-prob chain kernel
+# (--enable-speculative-sampling). greedy verifies by exact match and the
+# Triton backends by target-sampled exact match; the drafter's recorded
+# distribution never enters either.
+SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full"})
+
+# Usable range of --spec-reject-draft-prob-threshold. The sentinel rows are
+# written as threshold + 1.0 in fp32 and detected by ``draft_prob > threshold``:
+# below 1.0 a real probability would read as the sentinel, and from 2**24 on
+# fp32 (24 significand bits, ulp 2.0 there) can no longer resolve the + 1.0;
+# 2**20 leaves a wide margin, and nothing is gained from a larger sentinel.
+SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN = 1.0
+SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX = float(1 << 20)
 
 # Spec-decode overshoot spans the physical KV extent must absorb past the
 # logical context_len. The overlap scheduler steps a finished request at most
@@ -64,6 +94,31 @@ ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
 # whose output is already truncated by max_new_tokens; the garbage KV is
 # evicted with the request one step later.
 _SPEC_OVERSHOOT_SPANS = 3
+
+# Speculative algorithms a prefill server runs on the chunk pipeline
+# (--pipeline-parallel-size > 1). The drafter executes on the last stage, the
+# only stage that samples: an MTP (NextN) draft needs only that stage's final
+# hidden states, and DSPARK produces its draft context across stages. EAGLE3
+# is excluded because its aux taps come from several stages and nothing
+# carries them through the stage boundary. See
+# ServerArgs.resolve_disaggregation.
+PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
+
+
+def expert_placement_requested(server_args) -> bool:
+    """Whether serving needs an expert placement beyond the trivial identity.
+
+    Redundant experts, a non-trivial initial location, load recording and
+    online rebalancing all need the placement tables
+    (``moe/expert_location.py``); plain EP serving does not and keeps its
+    routing untouched.
+    """
+    return (
+        server_args.ep_num_redundant_experts > 0
+        or server_args.init_expert_location != "trivial"
+        or server_args.expert_distribution_recorder_mode is not None
+        or server_args.enable_eplb
+    )
 
 
 def str_to_bool(value: str | bool) -> bool:
@@ -90,6 +145,126 @@ def _nonempty_str(value: str) -> str:
     if not value.strip():
         raise argparse.ArgumentTypeError("value must be a non-empty string")
     return value
+
+
+def validate_kvp_disaggregation_role(
+    *, has_kvp: bool, disaggregation_mode: str
+) -> None:
+    """Reject KVP on the encode role, which has no KV cache to shard.
+
+    Aggregated engines and both PD roles may shard: a transfer edge copies
+    only the pages its prefill rank and its decode rank both own, so the
+    prefill and decode caches shard independently.
+    """
+    if has_kvp and disaggregation_mode not in ("null", "prefill", "decode"):
+        raise ValueError(
+            "--kv-parallel-size > 1 requires --disaggregation-mode "
+            f"null, prefill or decode (got {disaggregation_mode!r})"
+        )
+
+
+def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
+    """Refuse a launch value outside ``flag``'s closed set of ``choices``.
+
+    ServerArgs is the one place a closed-set flag is validated; consumers
+    read the resolved value and trust it.
+    """
+    if value not in choices:
+        raise ValueError(f"{flag} must be one of {list(choices)}, got {value!r}")
+
+
+# Attention backends whose sparse prefill can attend a query shard against the
+# gathered history of its requests (the query-context-parallel extend arm).
+QCP_ATTENTION_BACKENDS = frozenset({"dsa"})
+
+
+def validate_qcp(
+    *,
+    qcp_size: int,
+    attn_tp_size: int,
+    attn_dp_size: int,
+    dense_tp_size: int,
+    moe_tp_ep_size: int,
+    kvp_size: int,
+    disaggregation_mode: str,
+    disable_prefill_graph: bool,
+    enable_mixed_batch: bool,
+    attention_backend: str | None,
+    kv_cache_dtype: str,
+    kv_cache_quant_method: str,
+) -> None:
+    """Reject query-context-parallel layouts the first landing does not serve.
+
+    QCP shards an extend forward's rows over the attention TP group. It is a
+    prefill-role layout: the decode arm serves only the drafter's steps, the
+    eager extend break gathers the request history, and the sparse DSA
+    kernels attend the gathered buffer. ``qcp_size == 1`` is off and passes.
+    """
+    if qcp_size == 1:
+        return
+    if kv_cache_dtype not in ("auto", "bfloat16") or kv_cache_quant_method != "none":
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires a bf16 KV cache (got "
+            f"--kv-cache-dtype {kv_cache_dtype!r}, --kv-cache-quant-method "
+            f"{kv_cache_quant_method!r}): the sharded KV write gathers the rotated "
+            "latent and stores it with latent_store, which writes native rows only"
+        )
+    if qcp_size != attn_tp_size:
+        raise ValueError(
+            "--prefill-context-parallel-size must equal the attention TP size "
+            f"(got {qcp_size} with attn_tp_size={attn_tp_size}): the query shard "
+            "spans the whole attention TP group"
+        )
+    if attn_dp_size != 1:
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires attention DP 1 (got "
+            f"attn_dp_size={attn_dp_size}): the sampled-row table of a shard is "
+            "per DP group and the DP metadata gather does not carry it"
+        )
+    if dense_tp_size not in (1, attn_tp_size) or moe_tp_ep_size not in (
+        1,
+        attn_tp_size,
+    ):
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires --dense-tp-size and the "
+            f"MoE TP x EP group to be 1 or the attention TP width {attn_tp_size} "
+            f"(got dense {dense_tp_size}, MoE {moe_tp_ep_size}): attention returns "
+            "complete rows (head-replicated weights, or the head-TP tail), so the "
+            "drafter's replicated decode rows are never scattered and a narrower "
+            "dense or MoE group has no rows to gather"
+        )
+    if disaggregation_mode != "prefill":
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires --disaggregation-mode "
+            f"prefill (got {disaggregation_mode!r}): a sharded extend and "
+            "replicated decode rows cannot share one forward"
+        )
+    if not disable_prefill_graph:
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires --disable-prefill-graph: "
+            "the history gather runs in the eager attention break"
+        )
+    if enable_mixed_batch:
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 does not support "
+            "--enable-mixed-batch: a MIXED round would carry sharded extend rows "
+            "and replicated decode rows in one forward"
+        )
+    if (
+        attention_backend is not None
+        and attention_backend not in QCP_ATTENTION_BACKENDS
+    ):
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires a DSA-family attention "
+            f"backend ({sorted(QCP_ATTENTION_BACKENDS)}), got "
+            f"--attention-backend {attention_backend!r}"
+        )
+    if kvp_size not in (1, qcp_size):
+        raise ValueError(
+            "--kv-parallel-size must be 1 or equal to "
+            f"--prefill-context-parallel-size (got kvp={kvp_size}, qcp={qcp_size}): "
+            "the history gather splits by the page owners of the whole shard group"
+        )
 
 
 @dataclasses.dataclass
@@ -138,6 +313,8 @@ class ServerArgs:
     enable_mixed_batch: bool = False
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
+    # JSON on the CLI, normalized once to generic runtime options.
+    kv_offload_config: str | dict | None = None
     # special kv cache
     mamba_ssm_dtype: str = "float32"
 
@@ -157,12 +334,18 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
-    enable_log_requests: bool = False
+    enable_log_requests: bool = True
     log_requests_level: int = 0
     enable_log_request_stats: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
+    # Port for the engine's Prometheus /metrics HTTP endpoint, served from the
+    # engine's main process when --enable-metrics is on. None auto-allocates a
+    # free port (logged at startup).
+    metrics_port: int | None = None
+    # Bind host for the /metrics endpoint. None binds the engine's --host.
+    metrics_host: str | None = None
     app_key: str | None = None
 
     # Cache events
@@ -172,11 +355,30 @@ class ServerArgs:
     # pause/resume, and memory occupation). Set by the ``ts serve`` orchestrator;
     # None disables the in-engine app.
     rl_control_port: int | None = None
+    # Bind host for the in-engine RL control app. None binds the engine's
+    # --host. Bind a reachable address (and set --rl-control-api-key) when an
+    # external gateway drives this engine.
+    rl_control_host: str | None = None
+    # Bearer token the in-engine RL control app requires on every route. None
+    # leaves it open, which is what slime expects by default. Never exported in server info.
+    rl_control_api_key: str | None = dataclasses.field(default=None, repr=False)
     # Version identifier for the model weights. Stamped into every generation
     # response's meta_info so RL trainers know which policy version produced each
     # sample. Updated atomically after a successful weight push when the trainer
     # supplies a new version string.
     weight_version: str = "default"
+    # Model Updater SDK (``/update_weights_from_mooncake``). The config is an
+    # opaque JSON object handed to the SDK; the other three are required with
+    # it and must stay unset without it (validated in ``validate``).
+    model_update_config: str | None = None
+    # Import path of the SDK module exposing ``make_model_updater``,
+    # ``ModelUpdaterConfig``, ``EngineType``, ``MooncakeWeightStore``,
+    # ``FluentLlmEngineConfig`` and ``FluentLlmModelUpdateInitConfig``.
+    model_update_sdk_module: str | None = None
+    # ``EngineType`` member name the SDK resolves this engine as.
+    model_update_engine_type: str | None = None
+    # Whether an update also streams the speculative draft model's weights.
+    model_update_draft_weights: Literal["retain", "refresh"] | None = None
 
     # Data parallelism
     data_parallel_size: int | None = None
@@ -205,12 +407,13 @@ class ServerArgs:
         | None
     ) = None
     eplb_algorithm: str = "auto"
-    expert_distribution_recorder_mode: (
-        Literal["stat", "stat_approx", "per_pass", "per_token"] | None
-    ) = None
-    expert_distribution_recorder_buffer_size: int | None = None
-    enable_expert_distribution_metrics: bool = False
+    # 'stat': int64 route counters per physical expert, read by the
+    # EXPERT_LOAD profile activity and by --enable-eplb.
+    expert_distribution_recorder_mode: Literal["stat"] | None = None
+    # Online expert rebalancing; the two knobs below are required with it.
     enable_eplb: bool = False
+    eplb_rebalance_num_iterations: int | None = None
+    eplb_rebalance_layers_per_chunk: int | None = None
 
     # Dense GEMM selection is independent of routed-expert kernels.
     dense_gemm_backend: str = "auto"
@@ -233,6 +436,32 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    # The L3 prefetch that fills a waiting request's Host pages before its
+    # admission: the shortest L3 prefix worth one (prefix pages), the lane's
+    # deadline (base + per_page * pages seconds) and its batch. Explicit with
+    # an L3 store, unset without one (see validate_l3_prefetch_options).
+    kvstore_prefetch_min_pages: int | None = None
+    kvstore_prefetch_timeout_base_s: float | None = None
+    kvstore_prefetch_timeout_per_page_s: float | None = None
+    kvstore_prefetch_batch_pages: int | None = None
+
+    # Retraction snapshot pool (pinned Host, per rank) and its slot-state
+    # arena rows: a retracted request is suspended with its image and
+    # resumed by restore; a victim whose image does not fit is aborted
+    # instead. Sized like the KVStore: an explicit size in gigabytes wins
+    # (0 = not set), else a ratio of this rank's Device KV capacity (an
+    # explicit 0 disables the pool: every capacity block then aborts its
+    # victim), else derived at device build -- 0.1 of the Device KV without
+    # L2, the tails of ``retraction_snapshot_max_requests`` images with L2
+    # (cache/l2/sizing.py). The request cap derives from --max-num-seqs per
+    # attention-DP rank when 0 (resolve_retraction_snapshot_options).
+    retraction_snapshot_host_gb: float = 0.0
+    retraction_snapshot_ratio: float | None = None
+    retraction_snapshot_max_requests: int = 0
+    # Test knob: every |N| plans the scheduler retracts the oldest quiescent
+    # Decoding (N > 0) or Prefilling (N < 0) request without capacity
+    # pressure, to exercise the suspend/restore path. 0 (off) in serving.
+    debug_force_retraction_interval: int = 0
 
     # Multi-node distributed serving. ``None`` means "not given by the user",
     # which is what lets the launcher environment fill them in.
@@ -252,13 +481,23 @@ class ServerArgs:
     # (default) is exact dense attention; see --skip-softmax-threshold help.
     skip_softmax_threshold: float = 0.0
     sampling_backend: str | None = None
+    # Random stream of the non-greedy rows of the FlashInfer sampling backends:
+    # "batch" keys flashinfer's Philox stream by the batch row, so a request's
+    # draw depends on its co-batch; "per-request" keys it by (request seed,
+    # position) through the Gumbel-max pool kernels. See
+    # docs/design/numerics.md, sampling.deterministic.
+    sampling_stream: str = "batch"
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     attention_use_fp4_indexer_cache: bool | None = None
     use_trtllm_ragged_deepseek_prefill: bool | None = None
 
-    # DeepSeek V4
-    decode_context_parallel_size: int = 1
+    # KV parallelism: shard the full-history KV pages page-cyclically over a
+    # consecutive subgroup of attention TP (1 = off).
+    kv_parallel_size: int = 1
+    # Query context parallelism on the PD prefill role: shard every extend
+    # forward's rows over the attention TP group (1 = off).
+    prefill_context_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -289,12 +528,29 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
-    enable_replay_ssm: bool = False
+    # Standard (draft-prob) rejection sampling for the chain drafters: the
+    # drafter samples each step from its own distribution q and records it,
+    # verify accepts with coin * q(x) < p(x). Off: the target-only rule
+    # (accept with probability p(x) whatever the proposal). Both serve the
+    # target distribution; this one trades a sampled proposal for a higher
+    # acceptance rate under sampling temperatures.
+    enable_speculative_sampling: bool = False
+    # Recorded draft probabilities above this value mark a slot with no
+    # proposal (fresh admission, PD landing): always reject. Sentinel rows
+    # are written as threshold + 1, so it must lie within
+    # [SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN, SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX].
+    spec_reject_draft_prob_threshold: float = 2.0
+    enable_replay_ssm: bool = True
     eagle3_layers_to_capture: str | None = None
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
     # server started without the matching flag will receive empty logprobs.
     enable_output_logprobs: bool = False
+    # Sizing knob for prompt (input) logprobs: prompt rows pushed through the
+    # LM head per chunk, bounding the transient [rows, vocab] logits
+    # (chunk x vocab x (2 + 2 + 4) bytes: bf16 shard, bf16 gathered, fp32
+    # log-softmax).
+    input_logprob_chunk_tokens: int = 256
 
     # Runtime options
     disable_pdl: bool = False
@@ -312,10 +568,40 @@ class ServerArgs:
     batch_invariant_collectives: bool = False
     disable_sampling_tp_sync: bool = False
     # Numerics envelope: "auto" keeps every performance default; "rl-bitwise"
-    # asks for bitwise run-to-run and batch-composition invariance and folds
-    # the determinism switches below (resolve_numerics). Each folded switch
-    # can still be set individually; the umbrella only ever tightens.
+    # asks for bitwise run-to-run and batch-composition invariance and the
+    # trainer's operation order, and folds the determinism and trainer-order
+    # switches below (resolve_numerics). Each folded switch can still be set
+    # individually; the umbrella only ever tightens.
     numerics: str = "auto"
+    # Trainer-operation-order switches (docs/design/numerics.md,
+    # alignment.trainer). Each keeps the engine's own form by default and is
+    # folded to the trainer's form by --numerics rl-bitwise.
+    # Device that computes the deepseek_yarn RoPE inverse frequencies (the
+    # position frequencies, both divisions and the YaRN linear ramp mask).
+    yarn_ramp_mask_device: str = "cuda"
+    # Where LongCat-style MLA applies its sqrt(hidden / lora_rank) norm scales:
+    # folded into the q_a/kv_a layernorm weights at load, or multiplied at
+    # runtime after q_b_proj / kv_a_layernorm as the trainer does.
+    mla_lora_scale: str = "folded"
+    # The norm at each physical layer boundary (a layer's first norm, the
+    # final norm): the fused add+norm kernel, or a bf16 `hidden + residual`
+    # materialized first as the trainer does.
+    layer_boundary_norm: str = "fused"
+    # Correction-bias MoE routing: the fused CUDA kernel, or fp32 torch.softmax
+    # + torch.topk(probs + bias) in PyTorch tie order as the trainer does.
+    router_topk: str = "fused"
+    # Order of the selected-token log-softmax: torch.log_softmax, or
+    # Megatron's vocab-parallel cross-entropy over fixed 32768-wide vocab
+    # blocks. Changes the reported logprobs only, never the sampled tokens.
+    logprob_order: str = "torch"
+    # How a token's routed-expert contributions meet across the MoE TP-EP
+    # group: per-rank partials summed by the host (rank), or folded in fp32
+    # slot order inside the MoE leaf as the trainer does (slot).
+    moe_combine_order: str = "rank"
+    # The order the sparse attention cores reduce a token's selected KV slots
+    # in: as the top-k leaf emitted them (selection), or ascending (sorted,
+    # batch-invariant whenever the selected set is).
+    dsa_slot_order: str = "selection"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -330,7 +616,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
     weight_loader_prefetch_checkpoints: bool = True
-    weight_loader_prefetch_num_threads: int = 4
+    weight_loader_prefetch_num_threads: int = 8
     enable_memory_saver: bool = False
     disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
@@ -339,9 +625,17 @@ class ServerArgs:
     nprocs_per_node: int | None = None
     world_size: int | None = None
     attn_tp_size: int | None = None
+    # Decode-side layouts under attention DP: head-shard the MLA head
+    # projections / vocab-shard the LM head over contiguous DP ranks, and
+    # make the sharded o_proj / dense down_proj column-parallel on hidden so
+    # no cross-rank reduction remains outside MoE (TP batch invariance).
+    attn_head_tp_size: int | None = None
+    lm_head_tp_size: int | None = None
+    tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
     mapping: Mapping | None = None
+    emulate_rank_zero: bool = False
 
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
@@ -475,6 +769,17 @@ class ServerArgs:
                 else:
                     self.speculative_num_steps = num_speculative_tokens
 
+        if self.speculative_eagle_topk != 1:
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    f"--speculative-eagle-topk {self.speculative_eagle_topk} needs "
+                    "--speculative-algorithm"
+                )
+            if self.speculative_num_draft_tokens is None:
+                raise ValueError(
+                    "--speculative-eagle-topk > 1 drafts a tree; set its node budget "
+                    "with --speculative-num-draft-tokens"
+                )
         if self.speculative_num_draft_tokens is None:
             self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
@@ -487,20 +792,9 @@ class ServerArgs:
             # GPU memory is not known yet or no GPU is available.
             gpu_mem = None
 
-        # Set GPU memory utilization, which depends on the tensor parallelism size.
-        self._gpu_memory_utilization_defaulted = False
+        # Set GPU memory utilization.
         if self.gpu_memory_utilization is None:
-            if self.mapping.world_size >= 16:
-                self.gpu_memory_utilization = 0.79
-            elif self.mapping.world_size >= 8:
-                self.gpu_memory_utilization = 0.81
-            elif self.mapping.world_size >= 4:
-                self.gpu_memory_utilization = 0.95
-            elif self.mapping.world_size >= 2:
-                self.gpu_memory_utilization = 0.87
-            else:
-                self.gpu_memory_utilization = 0.88
-            self._gpu_memory_utilization_defaulted = True
+            self.gpu_memory_utilization = 0.95
 
         # Set the chunked prefill token budget.
         if self.chunked_prefill_size is None:
@@ -527,8 +821,25 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
-        if self.dense_gemm_backend not in {"auto", "trtllm_cutedsl"}:
-            raise ValueError("--dense-gemm-backend must be auto or trtllm_cutedsl")
+        _require_choice(
+            "--dense-gemm-backend", self.dense_gemm_backend, ("auto", "trtllm_cutedsl")
+        )
+        # The numerics switches (docs/design/numerics.md) are closed sets.
+        for flag, value, choices in (
+            ("--sampling-stream", self.sampling_stream, SAMPLING_STREAMS),
+            (
+                "--yarn-ramp-mask-device",
+                self.yarn_ramp_mask_device,
+                YARN_RAMP_MASK_DEVICES,
+            ),
+            ("--mla-lora-scale", self.mla_lora_scale, MLA_LORA_SCALES),
+            ("--layer-boundary-norm", self.layer_boundary_norm, LAYER_BOUNDARY_NORMS),
+            ("--router-topk", self.router_topk, ROUTER_TOPKS),
+            ("--logprob-order", self.logprob_order, LOGPROB_ORDERS),
+            ("--moe-combine-order", self.moe_combine_order, MOE_COMBINE_ORDERS),
+            ("--dsa-slot-order", self.dsa_slot_order, DSA_SLOT_ORDERS),
+        ):
+            _require_choice(flag, value, choices)
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -590,23 +901,16 @@ class ServerArgs:
         attn_tp_size = self.attn_tp_size
         attn_dp_size = self.data_parallel_size
 
-        # ``ENABLE_CP`` interprets attention TP size as CP size.
-        attn_cp_size = 1
-        if ENABLE_CP:
-            attn_cp_size, attn_tp_size = attn_tp_size, 1
-
         if world_size is None:
             world_size = pp_size
             if attn_tp_size is not None:
                 world_size *= attn_tp_size
-            if attn_cp_size is not None:
-                world_size *= attn_cp_size
             if attn_dp_size is not None:
                 world_size *= attn_dp_size
             logger.info(
                 f"Inferred world_size ({world_size!s}) from attn_tp_size ("
-                f"{attn_tp_size!s}) x attn_cp_size ({attn_cp_size!s}) x attn_dp_size ("
-                f"{attn_dp_size!s}) x pp_size ({pp_size!s})",
+                f"{attn_tp_size!s}) x attn_dp_size ({attn_dp_size!s}) x pp_size "
+                f"({pp_size!s})",
             )
         else:
             logger.info(f"Specified world_size ({world_size!s})")
@@ -620,19 +924,19 @@ class ServerArgs:
             )
         stage_world_size = world_size // pp_size
 
-        attn_tp_size, attn_cp_size, attn_dp_size = _resolve_parallelism_sizes(
-            stage_world_size, attn_tp_size, attn_cp_size, attn_dp_size
+        attn_tp_size, attn_dp_size = _resolve_parallelism_sizes(
+            stage_world_size, attn_tp_size, attn_dp_size
         )
 
         # Dense layers default to the attention replica's TP width
-        # (attn_tp_size x attn_cp_size == world_size // attn_dp_size). Without
-        # DP attention this is the full world, unchanged from before; with DP
-        # attention it keeps each dense all-reduce inside one replica (matching
-        # attn) instead of spanning the whole world, which would otherwise cross
+        # (attn_tp_size == world_size // attn_dp_size). Without DP attention
+        # this is the full world, unchanged from before; with DP attention it
+        # keeps each dense all-reduce inside one replica (matching attn)
+        # instead of spanning the whole world, which would otherwise cross
         # nodes and force attn_tp != dense_tp. Pass --dense-tp-size to override.
         dense_tp_size = self.dense_tp_size
         if self.dense_tp_size is None:
-            dense_tp_size = attn_tp_size * attn_cp_size
+            dense_tp_size = attn_tp_size
         dense_dp_size = None
 
         # --enable-expert-parallel auto-sets ep_size = the stage world (the
@@ -672,9 +976,11 @@ class ServerArgs:
         self.mapping = Mapping(
             world_size=world_size,
             attn_tp_size=attn_tp_size,
-            attn_cp_size=attn_cp_size,
             attn_dp_size=attn_dp_size,
-            attn_dcp_size=self.decode_context_parallel_size,
+            attn_kvp_size=self.kv_parallel_size,
+            attn_head_tp_size=self.attn_head_tp_size,
+            lm_head_tp_size=self.lm_head_tp_size,
+            attn_qcp_size=self.prefill_context_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -691,10 +997,27 @@ class ServerArgs:
         )
 
         # Impl constraints:
-        if self.mapping.attn.has_dcp and self.disaggregation_mode != "null":
-            raise ValueError("DCP cache transfer does not yet support PD")
+        validate_kvp_disaggregation_role(
+            has_kvp=self.mapping.attn.has_kvp,
+            disaggregation_mode=self.disaggregation_mode,
+        )
+        validate_qcp(
+            qcp_size=self.mapping.attn.qcp_size,
+            attn_tp_size=self.mapping.attn.tp_size,
+            attn_dp_size=self.mapping.attn.dp_size,
+            dense_tp_size=self.mapping.dense.tp_size,
+            moe_tp_ep_size=self.mapping.moe.tp_ep_size,
+            kvp_size=self.mapping.attn.kvp_size,
+            disaggregation_mode=self.disaggregation_mode,
+            disable_prefill_graph=bool(self.disable_prefill_graph),
+            enable_mixed_batch=self.enable_mixed_batch,
+            attention_backend=self.attention_backend,
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_quant_method=self.kv_cache_quant_method,
+        )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
+        self._validate_decode_tp_layouts()
 
         if self.mm_encoder_tp_mode == "data":
             if self.disaggregation_mode not in ("null", "prefill"):
@@ -704,18 +1027,278 @@ class ServerArgs:
                 )
             if self.mapping.nnodes != 1:
                 logger.warning("--mm-encoder-tp-mode data on nnodes>1 is experimental")
-            if self.mapping.has_attn_cp:
-                raise ValueError(
-                    "--mm-encoder-tp-mode data does not currently support "
-                    "attention context parallelism"
-                )
 
         logger.info(f"Parallelism configuration:\n{self.mapping!s}")
 
+    def _validate_decode_tp_layouts(self):
+        """Constraints of the TP layouts over ranks holding different rows:
+        the decode-side layouts under attention DP, and head TP over the
+        query shards of a prefill engine.
+
+        The structural rules (head TP needs attention TP 1 or a full-TP query
+        shard, is the query-shard group under QCP, tiles the stage world; LM
+        head TP under DP needs attention TP 1) live in ``Mapping``; the
+        prefill role's rules in ``validate_qcp``. This checks what only the
+        server knows: the engine role and the batch-invariance selection. The
+        weights' quantization is checked once the checkpoint's is resolved
+        (:meth:`validate_tp_batch_invariant_weights`).
+        """
+        attn = self.mapping.attn
+        if attn.head_tp_serves_decode_only:
+            # Head TP over attention-DP ranks serves absorbed decode rows
+            # only: an expanded prefill would need every head's K/V for the
+            # cached prefix, which the head-sharded kv_b_proj cannot produce.
+            # Over the query shards (attn.has_qcp) the extend rows run the
+            # absorbed sparse prefill through the exchange, and validate_qcp
+            # pinned the prefill role and the eager prefill already.
+            if self.disaggregation_mode != "decode":
+                raise ValueError(
+                    "--attn-head-tp-size > 1 serves decode rows only and "
+                    "requires --disaggregation-mode decode (or, on the prefill "
+                    "role, --prefill-context-parallel-size equal to it)"
+                )
+            # The prefill CUDA graph records extend forwards, and startup
+            # would capture (and tune on) extend-shaped dummies this layout
+            # cannot run; the decode engine's warmup is decode-shaped instead
+            # (ModelExecutor.autotune).
+            if not self.disable_prefill_graph:
+                logger.info(
+                    "--attn-head-tp-size > 1 serves decode rows only: disabling "
+                    "the prefill CUDA graph (--disable-prefill-graph)"
+                )
+                self.disable_prefill_graph = True
+        if attn.has_head_tp and self.mapping.nprocs_per_node % attn.head_tp_size:
+            logger.warning(
+                f"attention head TP group of {attn.head_tp_size} ranks spans "
+                f"nodes ({self.mapping.nprocs_per_node} ranks per node); the "
+                "per-layer head exchanges will cross the network"
+            )
+        if self.tp_batch_invariant not in ("none", "attn", "attn+dense"):
+            raise ValueError(
+                "--tp-batch-invariant must be one of none, attn, attn+dense; got "
+                f"{self.tp_batch_invariant!r}"
+            )
+        if self.tp_batch_invariant != "none" and not attn.has_head_tp:
+            raise ValueError(
+                f"--tp-batch-invariant {self.tp_batch_invariant} makes o_proj "
+                "column-parallel over the attention head TP group and needs "
+                "--attn-head-tp-size > 1"
+            )
+        if (
+            self.tp_batch_invariant == "attn+dense"
+            and self.mapping.dense.tp_size <= attn.tp_size
+        ):
+            # The batch-invariant dense tail replaces the token reduce-scatter
+            # of a dense group wider than attention TP (CommManager refuses
+            # it otherwise). Under query sharding the dense group is 1 or the
+            # attention TP width (validate_qcp), so the selection has no
+            # layout to apply to there.
+            raise ValueError(
+                "--tp-batch-invariant attn+dense makes the dense down_proj "
+                "column-parallel over the dense TP group and needs a dense TP "
+                f"group wider than attention TP (got --dense-tp-size "
+                f"{self.mapping.dense.tp_size} with attention TP {attn.tp_size})"
+                + (
+                    "; under --prefill-context-parallel-size the dense group is 1 "
+                    "or the attention TP width, so only --tp-batch-invariant attn "
+                    "applies"
+                    if attn.has_qcp
+                    else ""
+                )
+            )
+        if attn.has_dp and self.mapping.lm_head.has_tp and self.dp_sampling:
+            raise ValueError(
+                "--lm-head-tp-size > 1 under attention DP transposes the logits "
+                "back to each rank's own rows and cannot combine with --dp-sampling"
+            )
+
+    def validate_tp_batch_invariant_weights(
+        self,
+        resolved_quantization: str | None,
+        disable_quant_module: Sequence[str],
+    ) -> None:
+        """``--tp-batch-invariant`` needs an unquantized ``o_proj`` (and
+        ``down_proj`` for ``attn+dense``): the column-parallel GEMM's full-K
+        result is the point, and the quantized layouts do not offer it.
+
+        ``resolved_quantization`` is the checkpoint's method after
+        ``ModelConfig`` has merged ``--quantization`` with the checkpoint's own
+        declaration; a quantized checkpoint passes only when its
+        ``disable_quant_module`` keeps those modules in the loading dtype
+        (``self_attn`` for o_proj; ``dense_mlp`` or ``mlps`` for down_proj).
+        The layers check their own ``quant_config`` once built; this is the
+        early, whole-deployment form of that check.
+        """
+        if self.tp_batch_invariant == "none" or resolved_quantization is None:
+            return
+        excluded = set(disable_quant_module)
+        if "self_attn" not in excluded:
+            raise ValueError(
+                f"--tp-batch-invariant {self.tp_batch_invariant} needs an "
+                f"unquantized o_proj, but the {resolved_quantization} checkpoint "
+                "quantizes attention (disable_quant_module lacks 'self_attn')"
+            )
+        if self.tp_batch_invariant == "attn+dense" and not (
+            {"dense_mlp", "mlps"} & excluded
+        ):
+            raise ValueError(
+                "--tp-batch-invariant attn+dense needs an unquantized dense "
+                f"down_proj, but the {resolved_quantization} checkpoint quantizes "
+                "the dense MLPs (disable_quant_module lacks 'dense_mlp' / 'mlps')"
+            )
+
     def resolve_cache(self):
+        self.resolve_kv_offload()
         # Handle KVStore settings.
         self._handle_kvstore()
+        self.validate_l3_prefetch_options()
         self.validate_cache_options()
+        self.resolve_retraction_snapshot_options()
+
+    @property
+    def retracting_role(self) -> bool:
+        """Whether this engine can retract at all: the fused and decode roles."""
+        return self.disaggregation_mode not in ("prefill", "encode")
+
+    @property
+    def retraction_snapshot_pool_disabled(self) -> bool:
+        """Whether no image can ever be taken, so a capacity block aborts.
+
+        The one way to ask for that on a retracting role is
+        ``--retraction-snapshot-ratio 0`` without a size override; the roles
+        that never retract are resolved to the same knobs.
+        """
+        return (
+            self.retraction_snapshot_host_gb == 0
+            and self.retraction_snapshot_ratio == 0
+        )
+
+    def resolve_retraction_snapshot_options(self):
+        """Resolve the retraction snapshot pool's knobs the way the KVStore's are.
+
+        ``--retraction-snapshot-host-gb`` is the explicit size and wins when
+        set (0 = not set); ``--retraction-snapshot-ratio`` sizes the pool as
+        a fraction of this rank's Device KV capacity, an explicit 0 disabling
+        it; neither given means the device builder derives the size
+        (``cache/l2/sizing.py``). ``--retraction-snapshot-max-requests`` 0
+        derives to the rank's running requests (``--max-num-seqs`` over the
+        attention-DP ranks), the most that can ever need an image at once.
+        The prefill and encode roles never retract: their knobs are resolved
+        to no pool here with a log, as the KVStore's are off on the encode
+        role.
+        """
+        host_gb = self.retraction_snapshot_host_gb
+        ratio = self.retraction_snapshot_ratio
+        max_requests = self.retraction_snapshot_max_requests
+        if host_gb < 0 or max_requests < 0 or (ratio is not None and ratio < 0):
+            raise ValueError(
+                "--retraction-snapshot-host-gb, --retraction-snapshot-ratio and "
+                "--retraction-snapshot-max-requests must be non-negative"
+            )
+        if self.kv_offload_config is not None:
+            if host_gb > 0 or ratio not in (None, 0) or max_requests > 0:
+                raise ValueError(
+                    "KV offloading aborts requests under decode memory pressure; "
+                    "retraction snapshot pools are unsupported. Remove the "
+                    "--retraction-snapshot-host-gb, --retraction-snapshot-ratio "
+                    "and --retraction-snapshot-max-requests overrides "
+                    "(a ratio of 0 is allowed)."
+                )
+            if self.debug_force_retraction_interval != 0:
+                raise ValueError(
+                    "KV offloading has no recovery images; "
+                    "--debug-force-retraction-interval is unsupported."
+                )
+            # Reuse the scheduler's no-pool capacity abort path. Host history
+            # and fixed hot partitions follow the ordinary request ownership.
+            self.retraction_snapshot_host_gb = 0.0
+            self.retraction_snapshot_ratio = 0.0
+            self.retraction_snapshot_max_requests = 0
+            return
+        if not self.retracting_role:
+            forced = self.debug_force_retraction_interval != 0
+            if host_gb > 0 or ratio is not None or max_requests > 0 or forced:
+                logger.info(
+                    f"{self.disaggregation_mode!s} instance never retracts; ignoring "
+                    "the retraction snapshot pool arguments"
+                    + (" and --debug-force-retraction-interval" if forced else "")
+                )
+            self.retraction_snapshot_host_gb = 0.0
+            self.retraction_snapshot_ratio = 0.0
+            self.retraction_snapshot_max_requests = 0
+            # The scheduler refuses the knob on a pool-less engine.
+            self.debug_force_retraction_interval = 0
+            return
+        if self.retraction_snapshot_pool_disabled:
+            if max_requests > 0:
+                raise ValueError(
+                    "--retraction-snapshot-ratio 0 disables the retraction snapshot "
+                    "pool; --retraction-snapshot-max-requests has no rows to size"
+                )
+            if self.debug_force_retraction_interval != 0:
+                raise ValueError(
+                    "--debug-force-retraction-interval forces retractions, which the "
+                    "pool --retraction-snapshot-ratio 0 disabled"
+                )
+            return
+        if max_requests == 0:
+            # The cap is max_num_seqs per attention-DP rank: __post_init__
+            # resolves both before the cache.
+            if self.mapping is None or self.max_num_seqs is None:
+                raise ValueError(
+                    "resolve_parallelism() and resolve_memory_and_scheduling() must "
+                    "run before resolve_cache(): the derived "
+                    "--retraction-snapshot-max-requests is max_num_seqs per "
+                    "attention-DP rank"
+                )
+            dp_size = max(self.mapping.attn.dp_size, 1)
+            self.retraction_snapshot_max_requests = self.max_num_seqs // dp_size
+            if self.retraction_snapshot_max_requests == 0:
+                raise ValueError(
+                    "the retraction snapshot pool derives its request cap from "
+                    f"--max-num-seqs ({self.max_num_seqs}) per attention-DP rank "
+                    f"({dp_size}), which is 0 here; raise --max-num-seqs to at "
+                    "least the attention-DP size or pass "
+                    "--retraction-snapshot-max-requests"
+                )
+
+    def resolve_kv_offload(self):
+        """Validate deployment options without model-specific cache geometry."""
+        options = self.kv_offload_config
+        if options is None:
+            return
+        if isinstance(options, str):
+            try:
+                options = json.loads(options)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--kv-offload-config must be valid JSON") from exc
+        required = {"layers", "hot_tokens", "host_gb", "overlap"}
+        if not isinstance(options, dict) or set(options) != required:
+            raise ValueError(
+                f"--kv-offload-config requires a JSON object with exactly {sorted(required)}"
+            )
+        layers = options["layers"]
+        if (
+            not isinstance(layers, list)
+            or not layers
+            or any(type(layer) is not int or layer < 0 for layer in layers)
+            or len(set(layers)) != len(layers)
+        ):
+            raise ValueError("offload layers must be unique nonnegative integer IDs")
+        hot = options["hot_tokens"]
+        if type(hot) is not int or hot <= 0 or hot & (hot - 1):
+            raise ValueError("offload hot_tokens must be a positive power of two")
+        host = options["host_gb"]
+        if (
+            type(host) not in (int, float)
+            or not math.isfinite(host)
+            or host <= 0
+            or int(host * (1 << 30)) <= 0
+        ):
+            raise ValueError("offload host_gb must be a finite positive GiB budget")
+        if type(options["overlap"]) is not bool:
+            raise ValueError("offload overlap must be an explicit bool")
+        self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
         # Keep drafter backend consistent with the main model unless explicitly set.
@@ -759,12 +1342,132 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        # Only chain speculative decoding is supported.
         if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
+            self._validate_tree_speculation()
+        elif (
+            self.speculative_algorithm in ("EAGLE3", "MTP")
+            and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
+        ):
             raise ValueError(
-                "speculative_eagle_topk > 1 (tree spec) is not currently "
-                f"supported: {self.speculative_eagle_topk=}. Only chain spec "
-                "(topk=1) is wired end-to-end."
+                f"a draft chain verifies speculative_num_steps + 1 = "
+                f"{self.speculative_num_steps + 1} tokens, got "
+                f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}"
+            )
+
+        if self.enable_speculative_sampling:
+            self._validate_speculative_sampling()
+
+    def _validate_tree_speculation(self) -> None:
+        """Draft trees: EAGLE3/MTP with a node budget the draft can fill and a mask word can hold."""
+        topk = self.speculative_eagle_topk
+        steps = self.speculative_num_steps
+        nodes = self.speculative_num_draft_tokens
+        if self.speculative_algorithm not in ("EAGLE3", "MTP"):
+            raise ValueError(
+                f"speculative_eagle_topk={topk} (tree drafting) needs "
+                f"--speculative-algorithm EAGLE3 or MTP, got {self.speculative_algorithm}"
+            )
+        if not 1 <= topk <= 16 or not 1 <= steps <= 10:
+            raise ValueError(
+                f"tree drafting needs 1..16 children per node and 1..10 steps: {topk=}, {steps=}"
+            )
+        if (steps - 1) * topk > nodes:
+            raise ValueError(
+                f"tree drafting writes (steps - 1) * topk = {(steps - 1) * topk} lane slots per "
+                f"request into its {nodes}-slot draft window "
+                "(--speculative-num-draft-tokens); lower topk or steps"
+            )
+        candidates = topk + (steps - 1) * topk * topk
+        if not 2 <= nodes <= min(64, candidates + 1):
+            raise ValueError(
+                f"speculative_num_draft_tokens={nodes} must be in [2, {min(64, candidates + 1)}] "
+                f"for topk={topk} over {steps} steps (root + drafted nodes, at most 64)"
+            )
+        if self.grammar_backend != "none" or self.enable_mixed_batch:
+            raise ValueError(
+                "tree drafting does not support structured output or mixed batches yet: "
+                f"{self.grammar_backend=}, {self.enable_mixed_batch=}"
+            )
+        if self.disaggregation_mode != "null" or self.pipeline_parallel_size > 1:
+            raise ValueError(
+                "tree drafting does not carry the draft tree across prefill/decode "
+                f"disaggregation or pipeline stages yet: {self.disaggregation_mode=}, "
+                f"{self.pipeline_parallel_size=}"
+            )
+        if self.mapping.has_attn_dp:
+            raise ValueError(
+                "tree drafting does not support attention data parallelism yet: "
+                f"attention DP size {self.mapping.attn.dp_size}"
+            )
+
+    def _validate_speculative_sampling(self):
+        """Refuse ``--enable-speculative-sampling`` launches it cannot serve.
+
+        The accept test needs a proposal drawn from the recorded draft
+        distribution q, so the drafter must propose one token per step from
+        its own logits (the Eagle family and the multi-depth MTP drafter;
+        block drafters propose a whole block greedily), and the verifier must
+        be a backend that runs the draft-prob chain kernel: ``greedy`` verifies
+        by exact match and ``triton`` by a target-sampled exact match, so q
+        never enters either. The prefill role of a disaggregated deployment
+        never verifies a chain of its own and its drafted candidates ship to
+        the decode node without q, so there the flag would only allocate the
+        per-slot distribution buffer; it is refused. The sentinel threshold
+        is validated here once for every layer below: at least 1.0 so no
+        real probability reads as the sentinel, and at most 2**20 so the
+        fp32 sentinel ``threshold + 1.0`` stays distinguishable from it.
+        """
+        if self.disaggregation_mode == "prefill":
+            raise ValueError(
+                "--enable-speculative-sampling has no effect on the prefill role "
+                "of a disaggregated deployment: it never verifies a chain and its "
+                "candidates reach the decode node without their draft "
+                "distribution, so the flag would only cost the draft_probs "
+                "buffer. Pass it to the decode role only."
+            )
+        if self.speculative_algorithm is None:
+            raise ValueError(
+                "--enable-speculative-sampling needs speculative decoding: pass "
+                "--speculative-algorithm EAGLE3 or MTP"
+            )
+        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS:
+            raise ValueError(
+                "--enable-speculative-sampling needs a chain drafter that samples "
+                "one token per step from its own distribution; "
+                f"{self.speculative_algorithm} proposes a whole block greedily"
+            )
+        if self.speculative_eagle_topk != 1:
+            raise ValueError(
+                "--enable-speculative-sampling supports only the topk=1 chain: "
+                f"{self.speculative_eagle_topk=}"
+            )
+        if self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS:
+            if self.sampling_backend == "greedy":
+                why = "verifies by exact match, so the draft distribution never enters"
+            elif self.sampling_backend in ("triton", "triton_full"):
+                why = (
+                    "verifies by target-sampled exact match and has no draft-prob "
+                    "rejection kernel"
+                )
+            else:
+                why = "has no draft-prob rejection kernel"
+            raise ValueError(
+                "--enable-speculative-sampling needs a verifier with the draft-prob "
+                f"chain kernel ({sorted(SPECULATIVE_SAMPLING_BACKENDS)}); "
+                f"--sampling-backend {self.sampling_backend} {why}"
+            )
+        threshold = self.spec_reject_draft_prob_threshold
+        if not (
+            SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN
+            <= threshold
+            <= SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX
+        ):
+            raise ValueError(
+                "--spec-reject-draft-prob-threshold must be within "
+                f"[{SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN}, "
+                f"{SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX}]: at least 1.0 so no real "
+                "probability reads as the no-proposal sentinel, and small enough "
+                f"that the fp32 sentinel threshold + 1.0 stays above it; got {threshold}"
             )
 
     def resolve_communication(self):
@@ -772,6 +1475,7 @@ class ServerArgs:
         platform = current_platform()
         if (
             not self.enable_allreduce_fusion
+            and not self.emulate_rank_zero
             and (current_platform().is_hopper_plus or platform.is_amd)
             and self.mapping.nnodes == 1
             and self.mapping.has_attn_tp
@@ -794,23 +1498,60 @@ class ServerArgs:
 
         ``rl-bitwise`` is the RL rollout contract: within one deployment the
         same request produces bitwise-identical tokens and logprobs across
-        runs and regardless of batch composition. The umbrella only ever
-        tightens settings — a switch a user already set stays set — and each
-        derived switch remains individually available for auto mode.
+        runs and regardless of batch composition, and the forward follows the
+        training framework's operation order wherever the two engines differ
+        (``_resolve_rl_bitwise``). The umbrella only ever tightens: it sets
+        every switch it governs to its tight value and refuses explicit
+        choices it cannot tighten (a named MoE or sampling backend without the
+        guarantee). Each derived switch remains individually available for
+        auto mode. Whether the served model is verified under the envelope is
+        checked once its profile is known (``require_verified_numerics``).
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
-        if self.numerics == "auto":
-            return
-        if self.numerics != "rl-bitwise":
-            raise ValueError(
-                f"--numerics must be auto or rl-bitwise, got {self.numerics!r}"
-            )
-        # Collectives: rank-ordered NCCL instead of the symmetric-memory and
-        # trtllm fused paths, and the all-reduce becomes an all-gather with a
-        # fixed-rank-order fp32 fold: NCCL's ring chunks by message size, so
-        # a plain NCCL sum is run-stable but not batch-size-invariant.
-        self.force_deterministic_rsag = True
+        _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
+        if self.numerics != "auto":
+            self._resolve_rl_bitwise()
+        # Individual switches that veto a fusion resolve_communication may
+        # have auto-enabled, whatever the envelope. CommManager.should_fuse
+        # re-derives the veto from the switches, so the fused kernels stay off
+        # even where this flag is read before the fold.
+        if self.layer_boundary_norm == "unfused":
+            # The fused all-reduce+norm kernels add the residual inside the
+            # fusion; the unfused boundary norm needs the bf16 sum first.
+            self.enable_allreduce_fusion = False
+        if self.moe_combine_order == "slot":
+            # The MoE leaf returns complete rows; a fused all-reduce+norm at
+            # the next layer boundary would sum them tp_size times.
+            self.enable_allreduce_fusion = False
+            # The slot-order fold runs over the EP group inside the MoE leaf:
+            # a K-split (MoE TP) down projection would need a second,
+            # rank-ordered fold after it, and DeepEP's all-to-all owns that
+            # exchange itself (and hands the leaf a NCCL group, not the EP
+            # device group the fold runs on).
+            if self.mapping.moe.tp_size != 1:
+                raise ValueError(
+                    "--moe-combine-order slot needs MoE TP 1: a K-split down "
+                    "projection would need a second, rank-ordered fold after "
+                    f"the slot-order one (got --moe-tp-size {self.mapping.moe.tp_size})"
+                )
+            if self.all2all_backend == "deepep":
+                raise ValueError(
+                    "--moe-combine-order slot folds the routed outputs over the "
+                    "EP group inside the MoE leaf; --all2all-backend deepep "
+                    "performs that exchange itself and cannot be combined with it"
+                )
+
+    def _resolve_rl_bitwise(self):
+        """The rl-bitwise block: every envelope beyond auto runs it."""
+        # Collectives: one association order per reduction. NCCL's ring
+        # chunks by message size, so a plain NCCL sum is run-stable but not
+        # batch-size-invariant; batch_invariant_collectives routes the
+        # all-reduce to the NVLS in-switch reduction with a fixed issuer where
+        # multicast reaches (verified bitwise at startup) and every other
+        # reduction to the rank-ordered fp32 fold (comm_backend/auto.py).
+        # force_deterministic_rsag stays the user's "NCCL and the fold only"
+        # knob; the envelope does not set it.
         self.batch_invariant_collectives = True
         self.enable_allreduce_fusion = False
         self.comm_fusion_max_num_tokens = -1
@@ -819,11 +1560,81 @@ class ServerArgs:
         self.disable_autotune = True
         self.disable_tf32 = True
         self.disable_pdl = True
-        # MoE: the batch-invariant grouped leaves. Only the auto default is
-        # folded; an explicitly chosen backend stands (and must then honour
-        # the contract itself).
+        # MoE: the batch-invariant grouped leaves. An explicitly chosen
+        # backend cannot honour the contract, so it is refused rather than
+        # kept (a draft left unset inherits the target's).
         if self.moe_backend == "auto":
             self.moe_backend = "aok"
+        elif self.moe_backend != "aok":
+            raise ValueError(
+                f"--numerics {self.numerics} needs the batch-invariant MoE "
+                f"solution 'aok'; --moe-backend {self.moe_backend} makes no such "
+                "claim"
+            )
+        if self.draft_moe_backend == "auto":
+            self.draft_moe_backend = "aok"
+        elif self.draft_moe_backend not in (None, "aok"):
+            raise ValueError(
+                f"--numerics {self.numerics} needs the batch-invariant MoE "
+                f"solution 'aok'; --draft-moe-backend {self.draft_moe_backend} "
+                "makes no such claim"
+            )
+        # Sampling: greedy rows must break exact logit ties canonically, and
+        # sampled rows must draw from a stream the co-batch cannot move.
+        if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
+            raise ValueError(
+                f"--numerics {self.numerics} needs a sampling backend with "
+                "canonical greedy tie-breaking "
+                f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
+                f"{self.sampling_backend} resolves exact ties in reduction order"
+            )
+        self.sampling_stream = "per-request"
+        # Sparse attention: the tuned top-k kernels' tie order moves with the
+        # batch shape, so the cores reduce the selected slots sorted; the
+        # batch-invariant cores the envelope pins declare the trait.
+        self.dsa_slot_order = "sorted"
+        # Trainer alignment: the training framework's operation order wherever
+        # the two engines are known to differ. Each switch is documented in
+        # ``docs/design/numerics.md`` under "alignment.trainer".
+        # The trainer builds its RoPE inverse frequencies on the host; CPU and
+        # CUDA division round each of them differently at ulp level.
+        self.yarn_ramp_mask_device = "cpu"
+        # The trainer multiplies the LoRA norm scales as separate bf16 ops.
+        self.mla_lora_scale = "runtime"
+        # The trainer materializes each layer's bf16 output before the next
+        # layer's norm reads it.
+        self.layer_boundary_norm = "unfused"
+        # The trainer's router is softmax + topk(scores + bias) in torch.
+        self.router_topk = "torch"
+        # The trainer's logprobs come from its vocab-parallel cross-entropy.
+        self.logprob_order = "megatron"
+        # The trainer's grouped MLP applies the router weight inside the
+        # activation and folds a token's slots in fp32 slot order.
+        self.moe_combine_order = "slot"
+        # Layouts stay explicit: the envelope does not fold them in. A
+        # head-sharded o_proj that still sums its head partials across ranks
+        # is batch-invariant under the envelope, but its bits are not the
+        # full-K GEMM a replicated or column-parallel o_proj computes, and
+        # they equal a TP-W engine's all-reduced o_proj only when both sides
+        # sum in the same order: the exchanging forward's reduce-scatter
+        # always takes the ordered fold, while an all-reduce (the TP-W
+        # engine's, and the replicated-row decode steps of a query-sharding
+        # engine) takes the in-switch reduction where multicast reaches, whose
+        # order is a property of the GPU set (comm_backend/self_check.py).
+        # --force-deterministic-rsag on the all-reducing side pins it to the
+        # fold; docs/design/numerics.md, "Layout invariance of query context
+        # parallelism".
+        if self.mapping.attn.has_head_tp and self.tp_batch_invariant == "none":
+            logger.warning(
+                "--numerics rl-bitwise with --attn-head-tp-size > 1 but without "
+                "--tp-batch-invariant attn: the o_proj head partials are summed "
+                "across ranks (the ordered fold for the reduce-scatter, the "
+                "in-switch all-reduce where it applies), which is batch-invariant "
+                "but differs from the full-K o_proj of a TP1 or --tp-batch-invariant "
+                "engine, and equals a TP-W engine's o_proj only when both sides "
+                "sum in the same order (--force-deterministic-rsag on the "
+                "all-reducing side)"
+            )
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -857,24 +1668,37 @@ class ServerArgs:
                     "supported yet"
                 )
             if self.speculative_algorithm is not None:
-                if (
-                    self.speculative_algorithm != "DSPARK"
-                    or self.disaggregation_mode != "prefill"
-                ):
+                # Pipeline speculation is a prefill-server feature: only the
+                # last stage samples, so it alone runs the drafter and owns
+                # the draft cache; the candidates ride the remote decode to
+                # the peer. A decode role (or the PP debug mode) has no
+                # token feedback on the chunk pipeline to draft against.
+                if self.disaggregation_mode != "prefill":
                     raise ValueError(
                         "--pipeline-parallel-size > 1 supports speculation only "
-                        "as DSPARK context production on a prefill server"
+                        "on a prefill server (--disaggregation-mode prefill)"
                     )
-                # Current CachePD / draft layout limits rather than PP limits:
-                # CachePD has no CP partition contract, and the draft reduces
-                # its attention-TP embedding partials over the dense TP group.
+                # DSPARK produces its draft context across stages (each stage
+                # projects the target taps it owns); an MTP (NextN) draft
+                # needs only the last stage's captured hidden states.
+                if self.speculative_algorithm not in PIPELINE_SPEC_ALGORITHMS:
+                    raise ValueError(
+                        f"--speculative-algorithm {self.speculative_algorithm} "
+                        "is not supported with --pipeline-parallel-size > 1; "
+                        f"pipeline speculation supports {PIPELINE_SPEC_ALGORITHMS}"
+                    )
+                # A draft layout limit rather than a PP limit: the DSPARK
+                # draft reduces its attention-TP embedding partials over the
+                # dense TP group. MTP drafts embed with an ordinary reduced
+                # vocab-parallel lookup, so only DSPARK carries the rule.
+                # Both TP groups are stride-1 over the stage, so equal widths
+                # mean equal groups (the mapping has no rank yet here).
                 if (
-                    self.mapping.attn.cp_size != 1
-                    or self.mapping.dense.tp_group != self.mapping.attn.tp_group
+                    self.speculative_algorithm == "DSPARK"
+                    and self.mapping.dense.tp_size != self.mapping.attn.tp_size
                 ):
                     raise ValueError(
-                        "Pipeline DSPARK requires attention CP=1 and matching "
-                        "dense/attention TP groups"
+                        "Pipeline DSPARK requires matching dense/attention TP groups"
                     )
             if (
                 self.pp_layer_partition is not None
@@ -937,13 +1761,64 @@ class ServerArgs:
                 "unset --disable-kvstore"
             )
 
+    def validate_l3_prefetch_options(self):
+        """The L3 prefetch knobs: all four with an L3 store, none without.
+
+        An L3 hit is fetched into Host pages before the request is admitted,
+        on the Host cache executor's prefetch lane; these size that fetch.
+        None of them has a silent default: the threshold trades a short hit's
+        recompute against a round of admission latency, the deadline bounds
+        how long a request may wait on the store, and the batch is the
+        store's request granularity.
+        """
+        knobs = {
+            "--kvstore-prefetch-min-pages": self.kvstore_prefetch_min_pages,
+            "--kvstore-prefetch-timeout-base-s": self.kvstore_prefetch_timeout_base_s,
+            "--kvstore-prefetch-timeout-per-page-s": (
+                self.kvstore_prefetch_timeout_per_page_s
+            ),
+            "--kvstore-prefetch-batch-pages": self.kvstore_prefetch_batch_pages,
+        }
+        given = [name for name, value in knobs.items() if value is not None]
+        if self.kvstore_storage_backend is None:
+            if given:
+                raise ValueError(
+                    f"{', '.join(given)} belong to the L3 prefetch and need "
+                    "--kvstore-storage-backend"
+                )
+            return
+        missing = [name for name, value in knobs.items() if value is None]
+        if missing:
+            raise ValueError(
+                f"--kvstore-storage-backend needs the L3 prefetch knobs: {', '.join(missing)}"
+            )
+        if self.kvstore_prefetch_min_pages < 1:
+            raise ValueError("--kvstore-prefetch-min-pages must be at least 1 page")
+        if self.kvstore_prefetch_timeout_base_s <= 0:
+            raise ValueError("--kvstore-prefetch-timeout-base-s must be positive")
+        if self.kvstore_prefetch_timeout_per_page_s < 0:
+            raise ValueError("--kvstore-prefetch-timeout-per-page-s must be >= 0")
+        if self.kvstore_prefetch_batch_pages < 1:
+            raise ValueError("--kvstore-prefetch-batch-pages must be at least 1 page")
+
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
-        if self.decode_context_parallel_size > 1 and self.enable_kvstore:
+        # Both Host tiers -- the L2 KVStore and the retraction snapshot pool --
+        # are legal under KV-page sharding (--kv-parallel-size):
+        # the scheduler allocates every Host block in its Device block's
+        # residue class and the executor translates ownership on both ends of
+        # every row (cache/transfer/ownership.py), so each rank copies the
+        # blocks it owns. L3 is not: its keys name content and position, but
+        # which rank owns a block is decided at allocation, so a rank cannot
+        # answer an existence probe for blocks it did not own when the object
+        # was written (docs/design/cache-concepts.md, the retraction image).
+        if self.kv_parallel_size > 1 and (self.kvstore_storage_backend is not None):
             raise ValueError(
-                "DCP cache transfer does not yet support KVStore; "
-                "use --disable-kvstore."
+                "--kvstore-storage-backend (L3) is not supported under "
+                "--kv-parallel-size > 1: a page-cyclic sharded group "
+                "has no owner-stable L3 key. The Host KVStore itself and the "
+                "retraction snapshot pool are supported."
             )
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
@@ -958,14 +1833,264 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+    def validate_model_update_options(self):
+        """Require the Model Updater SDK flags together, or none of them.
+
+        The config alone cannot select the SDK module, the engine type, or
+        the draft policy, so those three are mandatory with it and
+        meaningless without it.
+        """
+        companions = {
+            "--model-update-sdk-module": self.model_update_sdk_module,
+            "--model-update-engine-type": self.model_update_engine_type,
+            "--model-update-draft-weights": self.model_update_draft_weights,
+        }
+        if self.model_update_config is None:
+            given = [flag for flag, value in companions.items() if value is not None]
+            if given:
+                raise ValueError(f"{', '.join(given)} require --model-update-config")
+            return
+        missing = [flag for flag, value in companions.items() if value is None]
+        if missing:
+            raise ValueError(f"--model-update-config requires {', '.join(missing)}")
+        try:
+            parsed = json.loads(self.model_update_config)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--model-update-config must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("--model-update-config must be a JSON object")
+        if self.model_update_draft_weights not in ("retain", "refresh"):
+            raise ValueError(
+                "--model-update-draft-weights must be 'retain' or 'refresh'"
+            )
+
+    def validate_petit_moe_options(self):
+        """Validate shared backend, model, and scheduling options for Petit.
+
+        MoELayer owns hardware, MoE topology, and expert compatibility checks.
+        """
+        active_moe_backends = [("target", self.moe_backend)]
+        if self.speculative_algorithm is not None:
+            active_moe_backends.append(
+                ("draft", self.draft_moe_backend or self.moe_backend)
+            )
+        gluon_petit_roles = [
+            role for role, backend in active_moe_backends if backend == "gluon_petit"
+        ]
+        if self.all2all_backend == "gluon_petit":
+            mismatched_roles = [
+                f"{role}={backend}"
+                for role, backend in active_moe_backends
+                if backend != "gluon_petit"
+            ]
+            if mismatched_roles:
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires every active MoE backend to "
+                    "match --all2all-backend gluon_petit; incompatible "
+                    + ", ".join(mismatched_roles)
+                )
+        elif gluon_petit_roles:
+            raise ValueError(
+                "Gluon Petit MegaMoE requires --all2all-backend gluon_petit "
+                f"for the active {', '.join(gluon_petit_roles)} MoE backend"
+            )
+
+        if gluon_petit_roles:
+            if self.dtype != "bfloat16":
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires --dtype bfloat16; "
+                    f"configured dtype={self.dtype}"
+                )
+            if self.mapping.attn.tp_size != 1 or self.mapping.dense.tp_size != 1:
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires attention TP1 and dense TP1"
+                )
+            decode_tokens_per_request = (
+                self.speculative_num_draft_tokens
+                if self.speculative_algorithm is not None
+                else 1
+            )
+            decode_tokens_per_rank = (
+                self.max_num_seqs // self.mapping.attn.dp_size
+            ) * decode_tokens_per_request
+            if decode_tokens_per_rank > 1024:
+                raise ValueError(
+                    "Gluon Petit MegaMoE supports at most 1024 decode tokens "
+                    "per rank; reduce --max-num-seqs or the speculative draft "
+                    f"token count (configured {decode_tokens_per_rank} tokens "
+                    "per rank)"
+                )
+            if (
+                self.chunked_prefill_size <= 0
+                or self.chunked_prefill_size > 1024
+                or self.max_prefill_tokens > 1024
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE supports at most 1024 prefill tokens "
+                    "per rank; set --chunked-prefill-size to a positive value "
+                    "no greater than 1024 and --max-prefill-tokens no greater "
+                    "than 1024"
+                )
+
+    def validate_rank_emulation(self):
+        """Reject layouts ``--emulate-rank-zero`` cannot stand in for.
+
+        The emulated rank replaces collectives through the comm backend and
+        one-member process groups. Paths that exchange per-rank state outside
+        them, or that keep their own peer communicators, need real peers.
+        """
+        if not self.emulate_rank_zero:
+            return
+        if not current_platform().is_amd:
+            raise ValueError("--emulate-rank-zero is supported on AMD GPUs only")
+        if self.mapping.world_size == 1:
+            raise ValueError(
+                "--emulate-rank-zero needs a parallel layout of more than one rank"
+            )
+        unsupported = []
+        if self.mapping.nnodes != 1:
+            unsupported.append(f"--nnodes {self.mapping.nnodes}")
+        if self.mapping.has_pp:
+            unsupported.append("pipeline parallelism")
+        if self.mapping.attn.has_qcp:
+            unsupported.append("query context parallelism")
+        if self.mapping.has_attn_dp:
+            unsupported.append("attention data parallelism")
+        if self.mapping.moe.tp_ep_size != self.mapping.attn.tp_size:
+            unsupported.append("an MoE TP x EP size other than the attention TP size")
+        if self.mm_encoder_tp_mode == "data":
+            unsupported.append("--mm-encoder-tp-mode data")
+        if self.disaggregation_mode != "null":
+            unsupported.append(f"--disaggregation-mode {self.disaggregation_mode}")
+        if self.all2all_backend != "none":
+            unsupported.append(f"--all2all-backend {self.all2all_backend}")
+        if self.enable_allreduce_fusion:
+            unsupported.append("--enable-allreduce-fusion")
+        if self.enable_eplb:
+            unsupported.append("--enable-eplb")
+        if unsupported:
+            raise ValueError(
+                f"--emulate-rank-zero does not support {', '.join(unsupported)}"
+            )
+
+    def validate_expert_placement_options(self):
+        """Check the expert placement flags (redundant experts, recorded load).
+
+        A placement needs an explicit dispatch algorithm, and under rl-bitwise
+        a deterministic one: the replicated-input EP path relies on every rank
+        choosing the same replica for a route. Online rebalancing
+        (``--enable-eplb``) spells out every choice it depends on -- the load
+        counters, a static dispatch algorithm, the snapshot interval and the
+        layers switched per round -- rather than auto-setting any of them.
+        """
+        if self.enable_eplb:
+            if self.expert_distribution_recorder_mode != "stat":
+                raise ValueError(
+                    "--enable-eplb rebalances from the routing load counters; "
+                    "pass --expert-distribution-recorder-mode stat explicitly."
+                )
+            if self.ep_dispatch_algorithm not in STATIC_EP_DISPATCH_ALGORITHMS:
+                raise ValueError(
+                    "--enable-eplb needs a static replica choice "
+                    "(--ep-dispatch-algorithm static or static_with_zero_expert); "
+                    f"got {self.ep_dispatch_algorithm!r}."
+                )
+            if (
+                self.eplb_rebalance_num_iterations is None
+                or self.eplb_rebalance_num_iterations <= 0
+            ):
+                raise ValueError(
+                    "--enable-eplb requires --eplb-rebalance-num-iterations N > 0: "
+                    "the forwards between two load snapshots."
+                )
+            if (
+                self.eplb_rebalance_layers_per_chunk is None
+                or self.eplb_rebalance_layers_per_chunk < 1
+            ):
+                raise ValueError(
+                    "--enable-eplb requires --eplb-rebalance-layers-per-chunk L >= 1: "
+                    "the MoE layers whose experts move in one scheduling round "
+                    "(at most the model's MoE layer count)."
+                )
+            if self.mapping.moe.ep_size <= 1:
+                raise ValueError(
+                    "--enable-eplb balances expert load across expert-parallel "
+                    f"ranks, but the MoE layers run with ep_size="
+                    f"{self.mapping.moe.ep_size}; enable expert parallelism."
+                )
+            if self.numerics != "auto" and self.moe_combine_order != "slot":
+                # Under a bitwise envelope the rank-order MoE combine makes the
+                # output depend on the placement, which a rebalance changes;
+                # the slot-order combine is placement-independent. The
+                # envelope folds it in resolve_numerics, so this only guards
+                # that fold.
+                raise ValueError(
+                    f"--enable-eplb under --numerics {self.numerics} requires "
+                    "--moe-combine-order slot (a placement-independent MoE "
+                    f"combine); got {self.moe_combine_order!r}."
+                )
+        elif (
+            self.eplb_rebalance_num_iterations is not None
+            or self.eplb_rebalance_layers_per_chunk is not None
+        ):
+            raise ValueError(
+                "--eplb-rebalance-num-iterations and "
+                "--eplb-rebalance-layers-per-chunk have no effect without "
+                "--enable-eplb."
+            )
+        if self.expert_distribution_recorder_mode not in (None, "stat"):
+            raise ValueError(
+                "--expert-distribution-recorder-mode supports only 'stat' (per "
+                "physical expert route counters dumped by the EXPERT_LOAD profile "
+                f"activity), got {self.expert_distribution_recorder_mode!r}."
+            )
+        if self.ep_num_redundant_experts < 0:
+            raise ValueError("--ep-num-redundant-experts must be non-negative")
+        if self.ep_num_redundant_experts > 0 and self.mapping.moe.ep_size <= 1:
+            raise ValueError(
+                f"--ep-num-redundant-experts {self.ep_num_redundant_experts} "
+                "replicates experts across expert-parallel ranks, but the MoE "
+                f"layers run with ep_size={self.mapping.moe.ep_size}; enable "
+                "expert parallelism (--ep-size > 1) or drop the redundant experts."
+            )
+        if expert_placement_requested(self):
+            if self.ep_dispatch_algorithm is None:
+                raise ValueError(
+                    "--ep-dispatch-algorithm is required with "
+                    "--ep-num-redundant-experts, a non-trivial "
+                    "--init-expert-location or --expert-distribution-recorder-mode: "
+                    "static_with_zero_expert for models with zero experts, "
+                    "static otherwise."
+                )
+            if (
+                self.numerics == "rl-bitwise"
+                and self.ep_dispatch_algorithm not in STATIC_EP_DISPATCH_ALGORITHMS
+            ):
+                raise ValueError(
+                    "--numerics rl-bitwise needs a deterministic expert placement; "
+                    f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} picks "
+                    "replicas at random. Use static or static_with_zero_expert."
+                )
+        elif self.ep_dispatch_algorithm is not None:
+            raise ValueError(
+                f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} has no effect "
+                "without an expert placement (--ep-num-redundant-experts, "
+                "--init-expert-location or --expert-distribution-recorder-mode)."
+            )
+
     def validate(self):
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
+        if self.input_logprob_chunk_tokens <= 0:
+            raise ValueError("--input-logprob-chunk-tokens must be positive")
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
             if not self.disable_pdl:
                 raise ValueError("NPU execution requires --disable-pdl")
+
+        self.validate_petit_moe_options()
+        self.validate_rank_emulation()
 
         if (
             self.max_num_seqs is not None
@@ -975,8 +2100,7 @@ class ServerArgs:
                 f"max_num_seqs must be >= attn_dp_size: {self.max_num_seqs=} < {self.mapping.attn.dp_size=}"
             )
 
-        if self.mapping.has_attn_cp and self.max_num_seqs > 1:
-            raise ValueError("CP attention is enabled but max_num_seqs > 1")
+        self.validate_model_update_options()
 
         if self.mapping.has_attn_dp:
             if self.chunked_prefill_size > self.max_prefill_tokens:
@@ -987,19 +2111,7 @@ class ServerArgs:
         if self.deepseek_v4_prefill_chunk_size <= 0:
             raise ValueError("deepseek_v4_prefill_chunk_size must be positive")
 
-        if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
-            self.expert_distribution_recorder_mode = "stat"
-            logger.info(
-                "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
-            )
-
-        if (self.enable_eplb or (self.init_expert_location is not None)) and (
-            self.ep_dispatch_algorithm is None
-        ):
-            self.ep_dispatch_algorithm = "static"
-            logger.info(
-                "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
-            )
+        self.validate_expert_placement_options()
 
         from tokenspeed.runtime.utils.env import envs
 
@@ -1153,9 +2265,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.kv_cache_dtype,
             choices=["auto", "bfloat16", "fp8", "fp8_e4m3", "mxfp8"],
-            help='Data type for kv cache storage. "auto" will use model data type. '
-            '"bfloat16" explicitly selects BF16 storage. "fp8" is an alias for '
-            '"fp8_e4m3" (per-tensor scales). "mxfp8" stores '
+            help='Data type for kv cache storage. "auto" and "bfloat16" store BF16 '
+            'rows (fp16 activations convert on write). "fp8" is an alias for '
+            '"fp8_e4m3" (unit scale). "mxfp8" stores '
             "block-scaled fp8-e4m3 (one UE8M0 scale per 32 head_dim elements) and "
             "requires --block-size 128 with an MHA attention backend.",
         )
@@ -1184,9 +2296,8 @@ class ServerArgs:
             type=nullable_str,
             default=None,
             help="Path to the JSON file containing the KV cache "
-            "scaling factors. This should generally be supplied, when "
-            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-            "default to 1.0, which may cause accuracy issues. ",
+            "scaling factors. FP8 KV cache runs unscaled, so under FP8 every "
+            "factor in the file must be 1.0.",
         )
         parser.add_argument(
             "--max-model-len",
@@ -1265,6 +2376,14 @@ class ServerArgs:
 
         # KVStore
         parser.add_argument(
+            "--kv-offload-config",
+            type=str,
+            default=ServerArgs.kv_offload_config,
+            help='Sparse KV offload JSON object with explicit "layers", "hot_tokens", '
+            '"host_gb" (GiB), and "overlap". Model-specific options remain in '
+            "--hf-overrides; unsupported cache recipes reject this configuration.",
+        )
+        parser.add_argument(
             "--disable-kvstore",
             action="store_true",
             help="Disable KVStore",
@@ -1305,6 +2424,98 @@ class ServerArgs:
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
+        )
+        parser.add_argument(
+            "--kvstore-prefetch-min-pages",
+            type=int,
+            default=ServerArgs.kvstore_prefetch_min_pages,
+            help="L3 prefetch threshold, in prefix pages: a waiting request whose "
+            "L3-only prefix is at least this long has it fetched into Host pages "
+            "before admission (the request waits, holding no Device page); a "
+            "shorter one is simply computed. Required with "
+            "--kvstore-storage-backend, refused without it.",
+        )
+        parser.add_argument(
+            "--kvstore-prefetch-timeout-base-s",
+            type=float,
+            default=ServerArgs.kvstore_prefetch_timeout_base_s,
+            help="L3 prefetch deadline, base term in seconds: a prefetch stops "
+            "starting batches base + per-page * pages seconds after it began on "
+            "the prefetch lane and lands the prefix it has. The deadline is "
+            "checked between batches only -- a batch_get_into already issued "
+            "runs to completion (the store API has no timeout), so one batch may "
+            "overrun it and a hung store holds the lane and every later "
+            "prefetch. Positive; required with --kvstore-storage-backend.",
+        )
+        parser.add_argument(
+            "--kvstore-prefetch-timeout-per-page-s",
+            type=float,
+            default=ServerArgs.kvstore_prefetch_timeout_per_page_s,
+            help="L3 prefetch deadline, per-page term in seconds (0 for a fixed "
+            "deadline). Required with --kvstore-storage-backend.",
+        )
+        parser.add_argument(
+            "--kvstore-prefetch-batch-pages",
+            type=int,
+            default=ServerArgs.kvstore_prefetch_batch_pages,
+            help="Prefix pages per L3 get of a prefetch; the fetch stops at the "
+            "first batch with a missing page. Required with "
+            "--kvstore-storage-backend.",
+        )
+        # Retraction snapshot pool
+        parser.add_argument(
+            "--retraction-snapshot-host-gb",
+            type=float,
+            default=ServerArgs.retraction_snapshot_host_gb,
+            help="Per-rank pinned Host pool, in gigabytes, that images a retracted "
+            "request's unaligned tail pages, its groups Host L2 never holds, and "
+            "its slot state (the hash-complete blocks go to Host L2 and stay "
+            "pinned there until the request is restored; with --disable-kvstore "
+            "the pool must hold whole images). A retracted request is suspended "
+            "with its image and resumes exactly where it stopped once the image "
+            "is copied back; nothing is recomputed. A victim whose image does not "
+            "fit the Host (L2 pins, the pool or its rows) is aborted instead of "
+            "imaged and the client told why, so the pool bounds how much can be "
+            "suspended at once, never how long an admission waits. The explicit "
+            "size, overriding --retraction-snapshot-ratio when set; 0 (the "
+            "default) means not set. The prefill and encode roles never retract "
+            "and ignore it.",
+        )
+        parser.add_argument(
+            "--retraction-snapshot-ratio",
+            type=float,
+            default=ServerArgs.retraction_snapshot_ratio,
+            help="Size of the retraction snapshot pool as a fraction of this rank's "
+            "Device KV capacity (the base --kvstore-ratio uses). An explicit 0 "
+            "disables the pool: no image can be taken and every capacity block "
+            "aborts its victim -- the only way to get abort-only behaviour. "
+            "Unset (the default) derives the size: 0.1 of the Device KV without "
+            "the KVStore (whole images; an on-by-default pool must stay cheap to "
+            "pin -- pass 1 to make every resident suspendable), else the tails "
+            "of --retraction-snapshot-max-requests images (one page per group "
+            "that publishes to Host L2, a request's worst case for a group that "
+            "never does), the slot-state arena coming on top.",
+        )
+        parser.add_argument(
+            "--retraction-snapshot-max-requests",
+            type=int,
+            default=ServerArgs.retraction_snapshot_max_requests,
+            help="Slot-state image rows of the retraction snapshot pool, i.e. the "
+            "most requests suspended at once. 0 (the default) derives to this "
+            "rank's running requests, --max-num-seqs / attention-DP size, which "
+            "covers every resident; a victim that finds no free row is aborted "
+            "rather than imaged. Refused with --retraction-snapshot-ratio 0.",
+        )
+        parser.add_argument(
+            "--debug-force-retraction-interval",
+            type=int,
+            default=ServerArgs.debug_force_retraction_interval,
+            help="TEST ONLY. Every |N| scheduler plans retract the oldest quiescent "
+            "decoding request (N > 0) or the one prefilling request between its "
+            "chunks (N < 0) without capacity pressure, so the suspend/restore "
+            "path runs on every request of a test run. Refused with "
+            "--retraction-snapshot-ratio 0. 0 (the default) is off; never set it "
+            "in serving.",
         )
         # Mamba Cache
         parser.add_argument(
@@ -1381,7 +2592,7 @@ class ServerArgs:
             "--enable-log-requests",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_log_requests,
-            help="Log metadata, inputs, outputs of all requests. The verbosity is decided by --log-requests-level",
+            help="Log metadata, inputs, outputs of all requests (default on; --no-enable-log-requests to disable). The verbosity is decided by --log-requests-level",
         )
         parser.add_argument(
             "--log-requests-level",
@@ -1413,6 +2624,21 @@ class ServerArgs:
             choices=["prometheus"],
             default=["prometheus"],
             help="Select metrics reporter(can be specified multiple times)",
+        )
+        parser.add_argument(
+            "--metrics-port",
+            type=int,
+            default=ServerArgs.metrics_port,
+            help="Port for the engine's Prometheus /metrics HTTP endpoint, served "
+            "by the engine's main process when --enable-metrics is on. Defaults "
+            "to an automatically allocated free port (logged at startup); 0 "
+            "also auto-allocates.",
+        )
+        parser.add_argument(
+            "--metrics-host",
+            type=str,
+            default=ServerArgs.metrics_host,
+            help="Bind host for the /metrics endpoint. Defaults to --host.",
         )
 
         parser.add_argument(
@@ -1496,47 +2722,70 @@ class ServerArgs:
             "--init-expert-location",
             type=str,
             default=ServerArgs.init_expert_location,
-            help="Initial location of EP experts.",
+            help="Expert placement: 'trivial'; inline JSON (starts with '{'); "
+            "a directory of per-rank *.expert-load.pt records; a .pt/.json "
+            "file; otherwise a glob over record files. A 'logical_count' "
+            "[layers, experts] load record derives the placement with the EPLB "
+            "algorithm, a 'physical_to_logical_map' [layers, slots] pins it "
+            "exactly. The EXPERT_LOAD profile activity writes load records.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
             type=int,
             default=ServerArgs.ep_num_redundant_experts,
-            help="Allocate this number of redundant experts in expert parallel.",
+            help="Add this many physical expert slots per MoE layer for replicas "
+            "of hot experts; the total must divide over the EP size.",
         )
         parser.add_argument(
             "--ep-dispatch-algorithm",
             type=str,
             default=ServerArgs.ep_dispatch_algorithm,
-            help="The algorithm to choose ranks for redundant experts in expert parallel.",
+            choices=list(EP_DISPATCH_ALGORITHMS),
+            help="How routing picks among an expert's replicas; required with an "
+            "expert placement. static_with_zero_expert for models with zero "
+            "experts (LongCat), static otherwise; dynamic* draw at random.",
         )
         parser.add_argument(
             "--eplb-algorithm",
             type=str,
             default=ServerArgs.eplb_algorithm,
-            help="Chosen EPLB algorithm",
+            help="EPLB algorithm deriving the placement from a load record: "
+            "auto, deepseek or deepseek_hierarchical.",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",
             type=str,
             default=ServerArgs.expert_distribution_recorder_mode,
-            help="Mode of expert distribution recorder.",
-        )
-        parser.add_argument(
-            "--expert-distribution-recorder-buffer-size",
-            type=int,
-            default=ServerArgs.expert_distribution_recorder_buffer_size,
-            help="Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
-        )
-        parser.add_argument(
-            "--enable-expert-distribution-metrics",
-            action="store_true",
-            help="Enable logging metrics for expert balancedness",
+            choices=["stat"],
+            help="'stat' counts the routes to every physical expert so the "
+            "EXPERT_LOAD profile activity can dump a load record and "
+            "--enable-eplb can rebalance from it.",
         )
         parser.add_argument(
             "--enable-eplb",
             action="store_true",
-            help="Enable EPLB algorithm",
+            help="Online expert rebalancing: every --eplb-rebalance-num-iterations "
+            "forwards the routing load since the previous snapshot is balanced "
+            "with the EPLB algorithm and the expert weights move between slots, "
+            "--eplb-rebalance-layers-per-chunk layers per scheduling round. "
+            "Requires --expert-distribution-recorder-mode stat and a static "
+            "--ep-dispatch-algorithm, both explicit; POST /rebalance_experts "
+            "triggers one rebalance manually.",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-num-iterations",
+            type=int,
+            default=ServerArgs.eplb_rebalance_num_iterations,
+            help="Forwards between two expert load snapshots under --enable-eplb "
+            "(required with it).",
+        )
+        parser.add_argument(
+            "--eplb-rebalance-layers-per-chunk",
+            type=int,
+            default=ServerArgs.eplb_rebalance_layers_per_chunk,
+            help="MoE layers whose experts move in one scheduling round under "
+            "--enable-eplb (required with it; at most the MoE layer count). "
+            "Fewer layers per chunk bound the per-round stall.",
         )
         parser.add_argument(
             "--dense-gemm-backend",
@@ -1553,9 +2802,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.moe_backend,
             help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
-            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, aok "
-            "(the batch-invariant leaves; --numerics rl-bitwise folds auto to "
-            "it)",
+            "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, "
+            "gluon_petit, aok (the batch-invariant leaves; --numerics rl-bitwise "
+            "folds auto to it)",
         )
         parser.add_argument(
             "--moe-mxfp4-fp8-activation",
@@ -1580,9 +2829,10 @@ class ServerArgs:
             metavar="ALL2ALL_BACKEND",
             type=str,
             default=ServerArgs.all2all_backend,
-            choices=["none", "agrs", "deepep", "flashinfer"],
+            choices=["none", "agrs", "deepep", "flashinfer", "gluon_petit"],
             help="MoE communication backend. agrs and flashinfer explicitly select "
-            "the Kimi-K3 attention-DP transport; none preserves existing behavior.",
+            "the Kimi-K3 attention-DP transport; gluon_petit selects the fused "
+            "Petit MegaMoE transport; none preserves existing behavior.",
         )
         parser.add_argument(
             "--deepep-mode",
@@ -1713,6 +2963,20 @@ class ServerArgs:
             "Finite top_k values must be < 128 or -1.",
         )
         parser.add_argument(
+            "--sampling-stream",
+            type=str,
+            choices=list(SAMPLING_STREAMS),
+            default=ServerArgs.sampling_stream,
+            help="Random stream of the non-greedy rows of the flashinfer and "
+            "flashinfer_full sampling backends. 'batch': flashinfer's "
+            "top_k_top_p / min_p sampling kernels, whose Philox stream is keyed "
+            "by the batch row, so a request's draw depends on its co-batch. "
+            "'per-request': the Gumbel-max pool kernels keyed by the request's "
+            "seed and position, so a request samples the same tokens alone and "
+            "inside any batch (finite top_k is capped at 128). Folded to "
+            "per-request by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
             "--dp-sampling",
             action="store_true",
             default=ServerArgs.dp_sampling,
@@ -1814,7 +3078,11 @@ class ServerArgs:
             type=str,
             choices=["xgrammar", "none"],
             default=ServerArgs.grammar_backend,
-            help="Grammar backend. 'none' disables grammar-guided decoding entirely ",
+            help=(
+                "Grammar backend. 'none' disables grammar-guided decoding "
+                "entirely; requests with json_schema, regex, ebnf or "
+                "structural_tag are then rejected as invalid requests."
+            ),
         )
         parser.add_argument(
             "--reasoning-parser",
@@ -1900,8 +3168,8 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-eagle-topk",
             type=int,
-            help="The number of tokens sampled from the draft model in each speculative step.",
-            choices=[1],
+            help="Children each draft node expands to per step; above 1 the draft is a tree "
+            "(EAGLE3, or EAGLE-style MTP), and --speculative-num-draft-tokens is its node budget.",
             default=ServerArgs.speculative_eagle_topk,
         )
         parser.add_argument(
@@ -1911,16 +3179,53 @@ class ServerArgs:
             default=ServerArgs.speculative_num_draft_tokens,
         )
         parser.add_argument(
-            "--enable-replay-ssm",
+            "--enable-speculative-sampling",
             action="store_true",
+            default=ServerArgs.enable_speculative_sampling,
+            help="Standard rejection sampling for chain speculative decoding: the "
+            "drafter samples each step from its own distribution q (per-request "
+            "temperature; greedy rows stay argmax) and verify accepts with "
+            "coin * q(x) < p(x) instead of the target-only rule. Needs EAGLE3 "
+            "or MTP with --speculative-eagle-topk 1 and the flashinfer or "
+            "flashinfer_full sampling backend; refused on the prefill role of "
+            "a disaggregated deployment. Costs a per-request fp32 draft "
+            "distribution buffer; see docs/configuration/server.md.",
+        )
+        parser.add_argument(
+            "--spec-reject-draft-prob-threshold",
+            type=float,
+            default=ServerArgs.spec_reject_draft_prob_threshold,
+            help="With --enable-speculative-sampling, recorded draft probabilities "
+            "above this value mark a request with no proposal yet (fresh "
+            "admission, PD landing) and always reject. Must lie within "
+            "[1.0, 2**20].",
+        )
+        parser.add_argument(
+            "--disable-replay-ssm",
+            dest="enable_replay_ssm",
+            action="store_false",
             default=ServerArgs.enable_replay_ssm,
-            help="Enable ReplaySSM for supported Qwen GDN target verification.",
+            help="Stage every verify position's recurrent state instead of "
+            "replaying the accepted tokens (ReplaySSM, on by default for "
+            "supported Qwen GDN and Nemotron-H Mamba2 targets).",
+        )
+        parser.add_argument(
+            "--enable-replay-ssm",
+            dest="enable_replay_ssm",
+            action="store_true",
+            help="Deprecated: ReplaySSM is on by default.",
         )
         parser.add_argument(
             "--enable-output-logprobs",
             action="store_true",
             default=ServerArgs.enable_output_logprobs,
             help="Enable per-token sampled-token logprobs. OFF by default; enabling extends the captured CUDA-graph footprint. Requests asking for logprobs on a server without this flag receive empty logprobs.",
+        )
+        parser.add_argument(
+            "--input-logprob-chunk-tokens",
+            type=int,
+            default=ServerArgs.input_logprob_chunk_tokens,
+            help="Prompt rows pushed through the LM head per chunk when a request asks for prompt (input) logprobs (SGLang logprob_start_len). A sizing knob only: the transient per-chunk cost is about chunk x vocab x 8 bytes (bf16 logits shard, bf16 TP-gathered logits, fp32 log-softmax) and the value never changes a result.",
         )
         parser.add_argument(
             "--eagle3-layers-to-capture",
@@ -1962,9 +3267,9 @@ class ServerArgs:
             "--disable-autotune",
             "--disable-flashinfer-autotune",
             action="store_true",
-            help="Skip the startup kernel-tuning pass; tunable kernels use each "
-            "library's heuristic tactics instead. Speeds up startup for "
-            "debugging at the cost of serving performance.",
+            help="Skip profiling missing kernel tactics during startup. A matching "
+            "persistent FlashInfer cache is still loaded; uncovered shapes use "
+            "the library's heuristic fallback.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",
@@ -2087,8 +3392,8 @@ class ServerArgs:
             help=(
                 "Disable prefetching safetensors checkpoint shards into the OS "
                 "page cache. Prefetch is enabled by default: shards are read "
-                "sequentially a bounded window ahead of weight loading "
-                "(min(80 GiB, 25%% of available host memory)), so weight copies "
+                "in parallel ranges a bounded window ahead of weight loading "
+                "(min(40 GiB, 25%% of available host memory)), so weight copies "
                 "hit the cache at streaming bandwidth instead of demand-faulting "
                 "cold pages from shared filesystems."
             ),
@@ -2097,7 +3402,7 @@ class ServerArgs:
             "--weight-loader-prefetch-num-threads",
             type=int,
             default=ServerArgs.weight_loader_prefetch_num_threads,
-            help="Number of background threads per rank for checkpoint prefetching.",
+            help="Maximum concurrent checkpoint range readers per rank.",
         )
         parser.add_argument(
             "--enable-memory-saver",
@@ -2107,7 +3412,8 @@ class ServerArgs:
         parser.add_argument(
             "--disable-cudagraph-memory-reserve",
             action="store_true",
-            help="Do not reserve the projected CUDA-graph pool memory in the KV cache budget.",
+            help="Do not reserve the projected CUDA-graph pool memory, nor what startup "
+            "keeps resident on CUDA, in the KV cache budget.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -2131,18 +3437,77 @@ class ServerArgs:
             help="Specify tp size for attn part",
         )
         parser.add_argument(
-            "--decode-context-parallel-size",
+            "--kv-parallel-size",
             type=int,
-            default=ServerArgs.decode_context_parallel_size,
-            help="Shard DeepSeek V4 compressed KV over a subgroup of attention TP.",
+            default=ServerArgs.kv_parallel_size,
+            help="KV parallelism (KVP): shard full-history KV pages (MLA/DSA "
+            "latent, DeepSeek V4 compressed KV) cyclically over a consecutive "
+            "subgroup of attention TP, each rank storing one shard of every "
+            "request's pages; decode attends the owned pages and merges the "
+            "partials (DCP). Allowed on aggregated engines and the PD prefill "
+            "role, with the Host KVStore and the retraction snapshot pool; the "
+            "decode role and L3 storage (--kvstore-storage-backend) are not "
+            "supported yet.",
+        )
+        parser.add_argument(
+            "--attn-head-tp-size",
+            type=int,
+            default=ServerArgs.attn_head_tp_size,
+            help="Shard the MLA head projections (q_b_proj, kv_b_proj, o_proj) "
+            "by heads over this many contiguous ranks that hold different rows; "
+            "the attention exchanges heads for tokens around core attention. "
+            "Either attention-DP ranks of a decode engine (requires attention "
+            "TP 1, attention DP and --disaggregation-mode decode; every rank "
+            "keeps its own KV cache), or the query shards of a prefill engine "
+            "(must equal --prefill-context-parallel-size; the extend rows run "
+            "the absorbed sparse prefill through the exchange). Defaults to the "
+            "ranks holding the same rows: the attention TP size, or 1 "
+            "(head-replicated) under --prefill-context-parallel-size.",
+        )
+        parser.add_argument(
+            "--lm-head-tp-size",
+            type=int,
+            default=ServerArgs.lm_head_tp_size,
+            help="Vocab-shard the LM head over this many contiguous ranks. "
+            "Under attention DP (which needs attention TP 1) the default 1 "
+            "keeps the head replicated; a wider group gathers the ranks' rows "
+            "before the logits GEMM and transposes the vocab shards back. "
+            "Without attention DP it must equal the attention TP size.",
+        )
+        parser.add_argument(
+            "--tp-batch-invariant",
+            type=str,
+            choices=["none", "attn", "attn+dense"],
+            default=ServerArgs.tp_batch_invariant,
+            help="Replace the reduce-scatter after a head-sharded o_proj "
+            "(attn) and after a TP dense down_proj (attn+dense) with "
+            "column-parallel GEMMs on hidden fed by an all-gather of the "
+            "reduction dimension and followed by an all-to-all back to each "
+            "rank's own rows. Every collective is then a permutation, so the "
+            "bits match a TP1 full-K GEMM. attn needs --attn-head-tp-size > 1; "
+            "attn+dense also needs --dense-tp-size > 1; both need unquantized "
+            "o_proj / down_proj weights.",
+        )
+        parser.add_argument(
+            "--prefill-context-parallel-size",
+            type=int,
+            default=ServerArgs.prefill_context_parallel_size,
+            help="Shard every extend forward's query rows over the attention TP "
+            "group on the PD prefill role (query context parallelism): rank r "
+            "computes a contiguous slice of the chunk's rows against the gathered "
+            "KV history of its requests. Must equal --attn-tp-size and requires "
+            "--disaggregation-mode prefill, --disable-prefill-graph, a DSA-family "
+            "attention backend and --kv-parallel-size 1 or equal. "
+            "The attention weights are head-replicated unless --attn-head-tp-size "
+            "equals it, which shards them over the shard group.",
         )
         parser.add_argument(
             "--dense-tp-size",
             type=int,
             default=ServerArgs.dense_tp_size,
             help="Specify tp size for dense part. Defaults to the attention "
-            "replica width (attn_tp_size x attn_cp_size): the full world without "
-            "DP attention, one replica with it.",
+            "TP width: the full world without DP attention, one replica with "
+            "it.",
         )
         parser.add_argument(
             "--moe-tp-size",
@@ -2163,28 +3528,145 @@ class ServerArgs:
             help="Total number of processes across all nodes.",
         )
         parser.add_argument(
+            "--emulate-rank-zero",
+            action="store_true",
+            help="Run only global rank 0 of the configured parallel layout, "
+            "on one GPU. Collectives become local stand-ins that keep the "
+            "real shapes but not the values, so kernels, weight shards and "
+            "cache sizing match rank 0 of the full deployment while outputs "
+            "are meaningless. AMD GPUs only; requires one node and no "
+            "pipeline, context or attention data parallelism.",
+        )
+        parser.add_argument(
             "--force-deterministic-rsag",
             action="store_true",
-            help="Use NCCL collectives instead of Triton symmetric-memory "
-            "all-reduce/gather/scatter.",
+            help="NCCL and the rank-ordered fold only: no symmetric-memory "
+            "path -- neither the Triton multicast all-gather/reduce-scatter "
+            "and in-switch all-reduce, nor the trtllm and Triton all-reduce "
+            "tiers, nor the distributed argmax. With --batch-invariant-collectives every "
+            "reduction takes the fold; without it, NCCL. Not folded in by "
+            "--numerics rl-bitwise, which keeps the multicast paths and "
+            "verifies the in-switch reduction at startup.",
         )
         parser.add_argument(
             "--batch-invariant-collectives",
             action="store_true",
-            help="Run every all-reduce as an all-gather plus a fixed-rank-order "
-            "fp32 fold. NCCL sums are run-stable but chunk by message size, so "
-            "they are not batch-size-invariant; the fold is. Costs world_size "
-            "times the all-reduce traffic. Folded in by --numerics rl-bitwise.",
+            help="One association order per reduction, independent of the "
+            "batch. A 2-D bf16 all-reduce on a multicast-reachable group runs "
+            "as the NVLS in-switch reduction issued by one fixed rank, "
+            "verified bitwise at startup; every other reduction (other "
+            "payloads, unreachable groups, the reduce-scatters) runs as NCCL "
+            "data movement plus a fixed-rank-order fp32 fold, which for an "
+            "all-reduce costs world_size times the traffic. NCCL sums are "
+            "run-stable but chunk by message size, so they are not "
+            "batch-size-invariant. Folded in by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--numerics",
             type=str,
-            choices=["auto", "rl-bitwise"],
+            choices=list(NUMERICS_ENVELOPES),
             default=ServerArgs.numerics,
             help="Numerics envelope. rl-bitwise folds the determinism "
-            "switches (deterministic collectives, no autotune/TF32/PDL, no "
-            "fused all-reduce) so outputs and logprobs are bitwise identical "
-            "across runs and batch compositions within one deployment.",
+            "switches (batch-invariant collectives, no autotune/TF32/PDL, no "
+            "fused all-reduce, the batch-invariant MoE leaves, per-request "
+            "sampling) so outputs and logprobs are bitwise identical across "
+            "runs and batch compositions within one deployment, and the "
+            "trainer-operation-order switches (docs/design/numerics.md, "
+            "alignment.trainer) so a teacher-forced pass reproduces the RL "
+            "trainer's logprobs; a model serves it only once its profile "
+            "declares it verified.",
+        )
+        parser.add_argument(
+            "--yarn-ramp-mask-device",
+            type=str,
+            choices=list(YARN_RAMP_MASK_DEVICES),
+            default=ServerArgs.yarn_ramp_mask_device,
+            help="Device that computes the deepseek_yarn RoPE inverse "
+            "frequencies (the position frequencies, both divisions and the "
+            "YaRN linear ramp mask) before the table is moved to the model "
+            "device once. The trainer builds it on the host, and CPU and CUDA "
+            "division round differently at ulp level. Folded to cpu by "
+            "--numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--mla-lora-scale",
+            type=str,
+            choices=list(MLA_LORA_SCALES),
+            default=ServerArgs.mla_lora_scale,
+            help="Where LongCat-style MLA applies its sqrt(hidden / lora_rank) "
+            "norm scales. 'folded': into the q_a_layernorm / kv_a_layernorm "
+            "weights after loading. 'runtime': as separate bf16 multiplies "
+            "after q_b_proj and after kv_a_layernorm, as the trainer does; the "
+            "norm weights are never rewritten and the DSA indexer reads the "
+            "unscaled q_lora. Folded to runtime by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--layer-boundary-norm",
+            type=str,
+            choices=list(LAYER_BOUNDARY_NORMS),
+            default=ServerArgs.layer_boundary_norm,
+            help="The norm at each physical layer boundary (a layer's first "
+            "norm and the final norm). 'fused': the fused add+norm kernel, "
+            "whose residual sum stays fp32 into the norm. 'unfused': "
+            "hidden + residual is materialized in bf16 first, then a "
+            "standalone RMSNorm, as the trainer does; all-reduce+norm fusion "
+            "is vetoed with it. Folded to unfused by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--router-topk",
+            type=str,
+            choices=list(ROUTER_TOPKS),
+            default=ServerArgs.router_topk,
+            help="Correction-bias MoE routing (LongCat). 'fused': the fused "
+            "CUDA softmax+bias+top-k kernel. 'torch': fp32 torch.softmax, "
+            "torch.topk(probs + bias, sorted=True) in PyTorch tie order, "
+            "weights = unbiased probs x routed_scaling_factor, zero experts "
+            "become id -1 and keep their weight, as the trainer does. Folded "
+            "to torch by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--logprob-order",
+            type=str,
+            choices=list(LOGPROB_ORDERS),
+            default=ServerArgs.logprob_order,
+            help="Order of the selected-token log-softmax behind every "
+            "returned logprob. 'torch': torch.log_softmax. 'megatron': the "
+            "trainer's vocab-parallel cross-entropy order (row max, shift, "
+            "sum(exp) over fixed 32768-wide vocab blocks folded in block "
+            "order, logp = -(log(sum_exp) - target)); requests asking for "
+            "temperature- or top-p-normalised logprobs are refused. Changes "
+            "logprobs only, never the sampled tokens. Folded to megatron by "
+            "--numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--moe-combine-order",
+            type=str,
+            choices=list(MOE_COMBINE_ORDERS),
+            default=ServerArgs.moe_combine_order,
+            help="How a token's routed-expert contributions meet across the "
+            "MoE TP-EP group. 'rank': the MoE kernel returns this rank's "
+            "partial and the host sums the partials (all-reduce or "
+            "reduce-scatter), adding the identity zero-expert residual once "
+            "around it. 'slot': the MoE kernel folds the token's top-k slots "
+            "in fp32 slot order across the EP group itself, zero-expert "
+            "residual included, as the trainer's grouped MLP does, and the "
+            "host reduces nothing; needs MoE TP 1 and a kernel declaring the "
+            "combine_order trait with slot (the batch-invariant 'aok' leaf), "
+            "and vetoes all-reduce+norm fusion. Folded to slot by --numerics "
+            "rl-bitwise.",
+        )
+        parser.add_argument(
+            "--dsa-slot-order",
+            type=str,
+            choices=list(DSA_SLOT_ORDERS),
+            default=ServerArgs.dsa_slot_order,
+            help="The order the sparse (DSA) attention cores reduce a token's "
+            "selected KV slots in. 'selection': as the top-k leaf emitted "
+            "them (every core). 'sorted': ascending slot order, so the "
+            "reduction is batch-invariant whenever the selected set is; "
+            "served only by cores declaring the slot_order trait (the "
+            "batch-invariant 'aok' leaves). Folded to sorted by --numerics "
+            "rl-bitwise.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",
@@ -2299,10 +3781,56 @@ class ServerArgs:
             "by the `ts serve` orchestrator.",
         )
         parser.add_argument(
+            "--rl-control-host",
+            type=str,
+            default=ServerArgs.rl_control_host,
+            help="Bind host for the in-engine RL control-plane HTTP app. Defaults to "
+            "--host. Bind a reachable address when an external gateway drives the "
+            "engine, and set --rl-control-api-key.",
+        )
+        parser.add_argument(
+            "--rl-control-api-key",
+            type=str,
+            default=ServerArgs.rl_control_api_key,
+            help="Bearer token required on every RL control-plane route. Unset "
+            "leaves the app open, which is what slime expects by default.",
+        )
+        parser.add_argument(
             "--weight-version",
             type=str,
             default=ServerArgs.weight_version,
             help="Initial model-weight version stamped into generation metadata.",
+        )
+        parser.add_argument(
+            "--model-update-config",
+            type=str,
+            default=ServerArgs.model_update_config,
+            help="JSON object handed to the Model Updater SDK for "
+            "/update_weights_from_mooncake. Requires --model-update-sdk-module, "
+            "--model-update-engine-type and --model-update-draft-weights.",
+        )
+        parser.add_argument(
+            "--model-update-sdk-module",
+            type=str,
+            default=ServerArgs.model_update_sdk_module,
+            help="Import path of the Model Updater SDK module (imported lazily "
+            "on the first /update_weights_from_mooncake).",
+        )
+        parser.add_argument(
+            "--model-update-engine-type",
+            type=str,
+            default=ServerArgs.model_update_engine_type,
+            help="Model Updater SDK EngineType member name for this engine "
+            "(resolved as EngineType[value.upper()]).",
+        )
+        parser.add_argument(
+            "--model-update-draft-weights",
+            type=str,
+            choices=["retain", "refresh"],
+            default=ServerArgs.model_update_draft_weights,
+            help="Whether /update_weights_from_mooncake also streams the "
+            "speculative draft model's weights: 'retain' updates the target "
+            "only, 'refresh' updates target and draft.",
         )
 
     @classmethod

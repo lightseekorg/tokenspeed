@@ -1160,7 +1160,7 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
 
 @pytest.mark.parametrize(
     ("batch", "active"),
-    [(1, 1), (2, 2), (4, 2), (8, 8), (16, 16), (32, 32)],
+    [(1, 1), (2, 2), (4, 2), (8, 8), (16, 16), (32, 32), (64, 60)],
 )
 def test_kda_fused_paged_decode_matches_reference(batch: int, active: int) -> None:
     """The K3 megafusion preserves state paging and its fused norm epilogue."""

@@ -728,8 +728,10 @@ def _topk_forward(
     stride_ym,  # topk values/indices
     USE_PROVIDED_INDX: tl.constexpr,
     PeerBits,
-    stride_rm: tl.constexpr,
-    stride_rn: tl.constexpr,  # bitmatrix
+    # The bitmatrix rows follow the token count; runtime so every batch shape
+    # shares one binary.
+    stride_rm,
+    stride_rn,  # bitmatrix
     n_rows,
     n_expts_tot,  # shape
     dst_offs_m,

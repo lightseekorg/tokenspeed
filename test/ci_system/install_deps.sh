@@ -92,9 +92,9 @@ apt_install_with_retry() {
 }
 
 ensure_flashinfer_jit_cache() {
-    # GB200 and B200 runner images preinstall flashinfer-jit-cache; it must
+    # Blackwell runner images preinstall flashinfer-jit-cache; it must
     # match the flashinfer-python pin exactly or flashinfer refuses to import.
-    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != b200* && "${CI_RUNNER_LABEL:-}" != slurm-gb200-* ]]; then
+    if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != gb300* && "${CI_RUNNER_LABEL:-}" != b200* && "${CI_RUNNER_LABEL:-}" != b300* && "${CI_RUNNER_LABEL:-}" != slurm-gb200-* && "${CI_RUNNER_LABEL:-}" != slurm-gb300-* && "${CI_RUNNER_LABEL:-}" != slurm-b300-* ]]; then
         return 0
     fi
 
@@ -161,9 +161,9 @@ python3 -m pip install --upgrade --ignore-installed --break-system-packages \
     pip setuptools wheel
 
 # ============================================================
-# Step 3: Sync FlashInfer JIT cache on GB200/B200
+# Step 3: Sync FlashInfer JIT cache on Blackwell runners
 # ============================================================
-echo "=== Step 3: Sync FlashInfer JIT cache on GB200/B200 ==="
+echo "=== Step 3: Sync FlashInfer JIT cache on Blackwell runners ==="
 ensure_flashinfer_jit_cache
 
 # ============================================================
@@ -262,6 +262,7 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
     case "${FLASHINFER_VERSION}" in
         0.6.18) FLASHINFER_CUBIN_SHA256="2dd65c0fcfc6bc44c67f148530de5372979c2e3d260e47935730f94156d4d873" ;;
         0.7.0) FLASHINFER_CUBIN_SHA256="f1821e11ad4ea9666a09c2b04cc16b1e34f601296dc7a7b689649281c0358a9c" ;;
+        0.7.1rc2) FLASHINFER_CUBIN_SHA256="7c8e7dc24ca8d97c00bc0709fc6b0882676c8a7fd65bf2dbc8021b88f4ec3c0f" ;;
         *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
     esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,
@@ -349,7 +350,9 @@ expected_cuda = f"{sys.argv[3][:-1]}.{sys.argv[3][-1]}"
 print(f"Torch CUDA runtime: {torch.version.cuda}", flush=True)
 if torch.version.cuda != expected_cuda:
     raise SystemExit(f"Expected Torch CUDA {expected_cuda}, got {torch.version.cuda}")
-if os.environ.get("CI_RUNNER_LABEL", "").startswith(("gb200", "b200", "slurm-gb200-")):
+if os.environ.get("CI_RUNNER_LABEL", "").startswith(
+    ("gb200", "gb300", "b200", "b300", "slurm-gb200-", "slurm-gb300-", "slurm-b300-")
+):
     url, expected, installed = install_url_if_needed(Path(sys.argv[1]), sys.argv[3])
     print(f"Installed flashinfer-jit-cache=={installed}", flush=True)
     if url is not None:

@@ -18,10 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
+import sys
 from dataclasses import replace
 
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPLayout,
@@ -169,3 +176,179 @@ def test_refresh_rejects_layout_topology_and_page_geometry_changes():
     ]:
         with pytest.raises(ValueError, match=message):
             refresh_dcp_page_table_metadata(previous=metadata, **(kwargs | changes))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("degree", [1, 2, 4, 8])
+@pytest.mark.parametrize("block_size", [64, 128])
+def test_query_visibility_reserve_pages_advance_and_reanchor(
+    device, degree, block_size
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    # Ownership follows physical virtual IDs, not logical page positions.
+    blocks = [[5, 2, 8, 1], [2, 5, 1, 8], [0, 0, 0, 0]]
+    subpages = block_size // 64
+    table = torch.tensor(
+        [[b * subpages + s for b in row for s in range(subpages)] for row in blocks],
+        dtype=torch.int32,
+        device=device,
+    )
+    visible = torch.tensor([[62, 63, 64, 65]] * 2 + [[0] * 4], device=device).int()
+    lengths = visible[:, -1].contiguous()
+    for rank in range(degree):
+        common = dict(virtual_block_count=10, degree=degree, rank=rank)
+        layout = CompactDCPLayout(lengths, 64, block_size, visible)
+        metadata = refresh_dcp_page_table_metadata(
+            page_table=table, layout=layout, previous=None, **common
+        )
+        buffers = (
+            metadata.local_page_table,
+            metadata.page_prefix,
+            metadata.local_visible_lens,
+            metadata.local_seq_lens,
+        )
+        pointers = [t.data_ptr() for t in buffers]
+        compact_before = metadata.local_page_table.clone()
+
+        def check(endpoints):
+            expected = []
+            for row, row_blocks in enumerate(blocks):
+                # Enumerate visible global tokens independently of prefix arithmetic.
+                owned = [
+                    (b > 0 and (b - 1) % degree == rank)
+                    for b in row_blocks
+                    for _ in range(block_size)
+                ]
+                expected.append([sum(owned[:end]) for end in endpoints[row]])
+                pages = [
+                    ((b - 1) // degree + 1) * subpages + s
+                    for b in row_blocks
+                    if b > 0 and (b - 1) % degree == rank
+                    for s in range(subpages)
+                ]
+                assert metadata.local_page_table[row].tolist() == pages + [0] * (
+                    table.shape[1] - len(pages)
+                )
+            assert metadata.local_visible_lens.tolist() == expected
+            assert metadata.local_seq_lens.tolist() == [row[-1] for row in expected]
+            assert [t.data_ptr() for t in buffers] == pointers
+
+        metadata.refresh_visible_lengths(visible)
+        if device == "cuda":
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                metadata.refresh_visible_lengths(visible)
+        # Advance across kernel and ownership pages; rollback; noncausal draft;
+        # exact full-table endpoint; idle; then restore a live sequence.
+        for endpoints in (
+            [62, 63, 64, 65],
+            [126, 127, 128, 129],
+            [190, 191, 192, 193],
+            [61, 62, 63, 64],
+            [129] * 4,
+            list(range(4 * block_size - 3, 4 * block_size + 1)),
+            [0] * 4,
+            [62, 63, 64, 65],
+        ):
+            expected_endpoints = [endpoints, endpoints, [0] * 4]
+            visible.copy_(torch.tensor(expected_endpoints, device=device))
+            metadata.local_visible_lens.fill_(-1)
+            metadata.local_seq_lens.fill_(-1)
+            if device == "cuda":
+                graph.replay()
+            else:
+                metadata.refresh_visible_lengths(visible)
+            check(expected_endpoints)
+            torch.testing.assert_close(metadata.local_page_table, compact_before)
+
+        # A row view must update the parent's buffers, including the query bounds.
+        subset = metadata.slice_requests(1, 2)
+        visible[1].zero_()
+        subset.refresh_visible_lengths(visible[1:2])
+        assert metadata.local_visible_lens[1].tolist() == [0] * 4
+        assert metadata.local_seq_lens[1].item() == 0
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("queries", [1, 3])
+def test_query_visibility_full_refresh_reuses_storage(device, queries):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    table = torch.tensor([[5, 2, 8, 1]], dtype=torch.int32, device=device)
+    visible = torch.tensor(
+        [list(range(66 - queries, 66))], dtype=torch.int32, device=device
+    )
+    lengths = torch.tensor([65], dtype=torch.int32, device=device)
+    layout = CompactDCPLayout(lengths, 64, 64, visible)
+    common = dict(
+        page_table=table, layout=layout, virtual_block_count=10, degree=2, rank=0
+    )
+    metadata = refresh_dcp_page_table_metadata(previous=None, **common)
+
+    def refresh():
+        updated = refresh_dcp_page_table_metadata(previous=metadata, **common)
+        assert updated.page_prefix.data_ptr() == metadata.page_prefix.data_ptr()
+        assert (
+            updated.local_visible_lens.data_ptr()
+            == metadata.local_visible_lens.data_ptr()
+        )
+
+    refresh()
+    if device == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            refresh()
+    table.copy_(torch.tensor([[2, 5, 1, 8]], device=device))
+    if device == "cuda":
+        graph.replay()
+    else:
+        refresh()
+    assert metadata.local_page_table.tolist() == [[3, 1, 0, 0]]
+    assert metadata.page_prefix.tolist() == [[0, 0, 1, 2, 2]]
+    assert metadata.local_visible_lens.tolist() == [[0] * (queries - 1) + [1]]
+    assert metadata.local_seq_lens.tolist() == [1]
+    with pytest.raises(ValueError, match="visibility buffers changed"):
+        refresh_dcp_page_table_metadata(
+            previous=metadata,
+            **(common | {"layout": replace(layout, visible_lens=None)}),
+        )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("block_size", [64, 128])
+def test_verify_query_lengths_cross_ownership_boundaries(device, block_size):
+    """A verify window's per-query endpoints, fed through the layout's
+    ``visible_lens``, map to the owned-token counts a brute-force scan of the
+    cyclic placement gives, across kernel-page and ownership-block edges."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    blocks = torch.tensor([[2, 5, 8], [0, 0, 0]], dtype=torch.int32, device=device)
+    subpages = block_size // 64
+    pages = (
+        blocks[..., None] * subpages + torch.arange(subpages, device=device)
+    ).reshape(2, -1)
+    offsets = torch.arange(-5, 1, dtype=torch.int32, device=device)
+    for length in (1, block_size - 1, block_size + 2, 2 * block_size + 1):
+        lens = torch.tensor([length, 0], dtype=torch.int32, device=device)
+        causal = (lens[:, None] + offsets).clamp_min(0)
+        noncausal = lens[:, None].expand(-1, 6).contiguous()
+        for rank in range(4):
+            expected = [
+                sum(
+                    (int(blocks[0, t // block_size]) - 1) % 4 == rank
+                    for t in range(max(0, length - 5 + i))
+                )
+                for i in range(6)
+            ]
+            for visible, rows in ((causal, expected), (noncausal, [expected[-1]] * 6)):
+                metadata = refresh_dcp_page_table_metadata(
+                    page_table=pages,
+                    virtual_block_count=10,
+                    degree=4,
+                    rank=rank,
+                    layout=CompactDCPLayout(lens, 64, block_size, visible),
+                    previous=None,
+                )
+                assert metadata.local_visible_lens.tolist() == [rows, [0] * 6]
+                assert metadata.local_seq_lens.tolist() == [expected[-1], 0]

@@ -32,7 +32,7 @@ server:
     --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla
     --speculative-num-steps 1
     --drafter-attention-backend tokenspeed_mla
-    --engine-startup-timeout 2400
+    --engine-startup-timeout 3600
     --host 127.0.0.1
     --port 8000
   ready:

@@ -73,12 +73,20 @@ class Reg(enum.IntEnum):
     USER1 = 9
     USER2 = 10
     USER3 = 11
+    USER4 = 12
+    USER5 = 13
+    USER6 = 14
+    USER7 = 15
     # Pointer slots: per-step tensor base addresses (data_ptr) go here.
     PTR0 = 16
     PTR1 = 17
     PTR2 = 18
     PTR3 = 19
     PTR4 = 20
+    PTR5 = 21
+    PTR6 = 22
+    PTR7 = 23
+    PTR8 = 24
 
 
 def _ref(v: "int | Reg") -> int:

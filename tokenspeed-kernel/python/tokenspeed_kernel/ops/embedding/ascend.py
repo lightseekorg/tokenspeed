@@ -44,8 +44,6 @@ if current_platform().is_npu:
             "partial_rotary": frozenset({True, False}),
             "is_neox": frozenset({True, False}),
             "has_fused_kv": frozenset({False}),
-            "has_fused_mla_kv": frozenset({False}),
-            "fused_mla_full_query": frozenset({False}),
             "has_q_out": frozenset({True, False}),
             "has_k_out": frozenset({True, False}),
         },
@@ -59,16 +57,12 @@ if current_platform().is_npu:
         cos_sin_cache: torch.Tensor,
         is_neox: bool = True,
         fused_set_kv_buffer_arg: Any = None,
-        fused_mla_set_kv_buffer_arg: Any = None,
         q_rope_out: torch.Tensor | None = None,
         k_rope_out: torch.Tensor | None = None,
         enable_pdl: bool = False,
     ) -> None:
         del enable_pdl
-        if (
-            fused_set_kv_buffer_arg is not None
-            or fused_mla_set_kv_buffer_arg is not None
-        ):
+        if fused_set_kv_buffer_arg is not None:
             raise ValueError("Ascend RoPE does not support fused KV writes")
         _apply_rope(
             positions=positions,

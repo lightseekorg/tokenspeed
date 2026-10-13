@@ -49,16 +49,30 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.slot_state import (
+    pack_slot_rows,
+    slot_state_image_bytes,
+    unpack_slot_rows,
+)
 from tokenspeed.runtime.layers.attention.backends.support import (  # noqa: F401
     CudaGraphSupport,
+    TreeSupport,
     resolve_cuda_graph_support,
 )
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
+        TreeDraftInputs,
+        TreeVerifyInputs,
+    )
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        HistoryGatherWorkspace,
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -99,6 +113,11 @@ class SparseTopKShare:
 class CachePoolBinding:
     """A node's bound cache pool."""
 
+    #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
+    #: none by default; a node that keeps some names them.
+    token_derived_slot_state: tuple[str, ...] = ()
+    constant_slot_state: tuple[str, ...] = ()
+
     def _init_pool_binding(self) -> None:
         self.cache_pool: CachePool | None = None
 
@@ -129,6 +148,105 @@ class CachePoolBinding:
         """Return logical-slot ownership, or None for local/replicated storage."""
         return None
 
+    # ------------------------------------------------------------------
+    # Slot-state image (SlotStateExporter)
+    # ------------------------------------------------------------------
+
+    def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
+        """This node's own per-slot rows a retraction snapshot images.
+
+        Backend-private state keyed by ``req_pool_index`` -- a recurrent
+        ring, a partial index pool not yet in a page -- is the exception
+        (``AGENTS.md``); a backend that keeps some lists it here, in a fixed
+        order, so a restore carries it with the pages. Paged state is in
+        cache groups and never listed. A node lists its own rows only; the
+        tree is flattened by :meth:`slot_state_exporters`. A leaf's default
+        is empty.
+        """
+        del slot
+        return []
+
+    def slot_state_exporters(self) -> tuple[CachePoolBinding, ...]:
+        """This node and every node below it, each imaging its own rows.
+
+        The model executor lists these in the blob, so a composite's rows and
+        its children's are separate segments laid out once by the Host cache
+        executor rather than re-measured at every export.
+        """
+        exporters = [self]
+        for child in self.child_backends():
+            exporters.extend(child.slot_state_exporters())
+        return tuple(exporters)
+
+    def slot_state_bytes(self) -> int:
+        return slot_state_image_bytes(self.slot_state_rows(0))
+
+    def export_slot_state(
+        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        # Backend rows are rewritten by every forward and prepared at a PD
+        # landing, never keyed by request: always valid, nothing to mark.
+        del request_id
+        pack_slot_rows(self.slot_state_rows(slot), out, stream)
+
+    def import_slot_state(
+        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+    ) -> None:
+        del request_id
+        unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+
+    def prepare_cache_batch(
+        self, request_slots: torch.Tensor, *, num_extends: int, stream: torch.Stream
+    ) -> None:
+        """Begin KV offloading access for this target batch's request slots.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Clear last-step read/write mappings, mask null/padded requests, and
+        order residency work on stream. This does not allocate history.
+        num_extends identifies prefill rows, which offloaded arenas reject.
+        """
+        for child in self.child_backends():
+            child.prepare_cache_batch(
+                request_slots, num_extends=num_extends, stream=stream
+            )
+
+    def writeback_accepted_kv(self, accept_lengths: torch.Tensor) -> None:
+        """Persist accepted KV from offloading compute buffers to Host history.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Join writeback to the execution stream before publishing completion.
+        accept_lengths counts accepted target-input rows, not output tokens.
+        """
+        for child in self.child_backends():
+            child.writeback_accepted_kv(accept_lengths)
+
+    def invalidate_cache_residency(
+        self, request_slots: torch.Tensor, *, stream: torch.Stream
+    ) -> None:
+        """Fence KV offloading work and invalidate reused request-slot tags.
+
+        Broadcast to child backends; leaves without offloading do nothing.
+        Reset hot-cache tags, seed state, and LRU on stream. This does not
+        erase authoritative history or release scheduler-owned cache blocks.
+        """
+        for child in self.child_backends():
+            child.invalidate_cache_residency(request_slots, stream=stream)
+
+    def prefetch_sparse_kv(
+        self,
+        layer: PagedAttention,
+        selection: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Overlap sparse KV offloading loads for this producer's consumers.
+
+        layer identifies the selection producer. Its recipe declares which
+        offloaded consumer fields share selection. Load those fields on the
+        prefetch stream when overlap is enabled; otherwise do nothing.
+        Each consumer must still call prepare_sparse_kv_access to join its
+        ready event and publish compute slots before projection/attention.
+        """
+
 
 class AttentionBackend(CachePoolBinding, ABC):
     """The runner-facing contract; see the module docstring.
@@ -140,6 +258,11 @@ class AttentionBackend(CachePoolBinding, ABC):
     # validation: every published family must have a consumer); composites
     # union their children's.
     cache_consumer_families: frozenset[str] = frozenset({"history"})
+    # Only backends whose model skips incomplete-prefill outputs opt in.
+    skips_incomplete_prefill_outputs: bool = False
+    # MLA sharded history reads/writes and global attention-partial merging,
+    # independent of whether the model also has linear-attention layers.
+    supports_mla_dcp: bool = False
     supports_mla_projected_value_decode: bool = False
     # Bound by register_step_counter (PD layerwise transfer); None otherwise.
     step_counter: StepCounter | None = None
@@ -181,6 +304,40 @@ class AttentionBackend(CachePoolBinding, ABC):
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
+
+    def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        """Allocate graph-stable target verify buffers and return their bytes.
+
+        ``max_bs`` is the serving batch capacity; ``draft_token_num`` is the
+        verify width. Composites delegate to their verify consumers. Backends
+        without verify buffers return zero.
+        """
+        return 0
+
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        """Allocate the query-context-parallel history gather workspace and
+        return its bytes (the recipe reserved them from the cache budget;
+        the registry checks the two agree). Only a tree with the GPU DSA
+        sharded extend arm has one."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no sharded extend arm; query context "
+            "parallelism needs GPU DSA attention"
+        )
+
+    def history_gather_workspace(self) -> HistoryGatherWorkspace | None:
+        """The allocated history gather workspace of this tree, or ``None``
+        before :meth:`preallocate_history_gather_workspace` ran (or on a tree
+        without the sharded extend arm)."""
+        return None
+
+    def adopt_history_gather_workspace(self, workspace: HistoryGatherWorkspace) -> None:
+        """Share another tree's history gather workspace: the draft tree
+        gathers into the target's buffers, which are idle while the draft
+        runs. A leaf without the sharded extend arm ignores it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} has no sharded extend arm to share a history "
+            "gather workspace with"
+        )
 
     @property
     def prefill_metadata_is_capture_ready(self) -> bool:
@@ -249,6 +406,7 @@ class AttentionBackend(CachePoolBinding, ABC):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
         """Build metadata for an extend / mixed (or idle warmup) forward.
@@ -277,6 +435,11 @@ class AttentionBackend(CachePoolBinding, ABC):
                 prompt from an intermediate one.
             extend_with_prefix: Whether any extend row continues a cached or
                 chunked prefix (some ``extend_prefix_lens`` entry is non-zero).
+            query_shard: The rows of the extend span this rank computes under
+                query context parallelism, or ``None`` when every rank computes
+                every row. The lengths above describe the whole span on every
+                rank; a node that cannot attend a query shard calls
+                :func:`reject_query_shard`.
             **kwargs: Model-side extras (positions, capture mode, ...) a
                 node may ignore.
         """
@@ -381,9 +544,9 @@ class AttentionBackend(CachePoolBinding, ABC):
         same object whichever level of the tree they hold."""
         return self._sparse_topk
 
-    def support_kv_cache_prewrite(
-        self, forward_mode: ForwardMode | None = None
-    ) -> bool:
+    def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
+        """Whether a narrowed draft step in a round of ``forward_mode`` can
+        attend its live rows as a DECODE dispatch (Eagle3's first step)."""
         return False
 
     # ------------------------------------------------------------------
@@ -417,15 +580,92 @@ class AttentionBackend(CachePoolBinding, ABC):
             f"{type(self).__name__} owns no draft write locations"
         )
 
+    def tree_support(self) -> TreeSupport:
+        """This node's own draft-tree capability; ``resolve_tree_support`` asks
+        every node before any bind. Nodes without a tree path keep this."""
+        name = type(self).__name__
+        return TreeSupport(
+            verify_blocker=f"{name} has no draft-tree verify path",
+            draft_blocker=f"{name} has no draft-tree lane path",
+        )
+
+    def bind_tree_verify(self, inputs: TreeVerifyInputs) -> None:
+        """Arm draft-tree verify (--speculative-eagle-topk > 1) on every node,
+        after ``resolve_tree_support``; leaves that verify trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_verify(inputs)
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        """Arm draft-tree lanes on every node of the drafter's backend, after
+        ``resolve_tree_support``; leaves that draft trees keep ``inputs``."""
+        for backend in self.child_backends():
+            backend.bind_tree_draft(inputs)
+
+    def compact_verify_window(self, path: torch.Tensor) -> None:
+        """After a draft-tree verify, move each request's accepted path to the
+        front of its verify window in the cache this node owns; nodes that own
+        none forward to their children.
+
+        Args:
+            path: ``[bs, N]`` int32 accepted window row at each depth, root
+                first, ``-1`` past the path.
+        """
+        for backend in self.child_backends():
+            backend.compact_verify_window(path)
+
     def write_locations(
         self, layer: PagedAttention, forward_mode: ForwardMode
     ) -> torch.Tensor:
-        """This layer's KV write slots for the requests the forward covers —
-        the one accessor for writers outside the backend (fused RoPE
-        prewrite, model-side MLA cache writes)."""
+        """Return this layer's authoritative history write slots.
+
+        Index-K uses these before selection, independently of KV offloading.
+        Offloaded latent KV writers use the compute slots returned by
+        prepare_sparse_kv_access instead. This query does not copy KV.
+        """
         raise NotImplementedError(
             f"{type(self).__name__} owns no paged write locations"
         )
+
+    def forward_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode
+    ) -> torch.Tensor:
+        """Slots for the K/V rows a forward in ``forward_mode`` carries: the
+        attention prologue's write target."""
+        raise NotImplementedError(
+            f"{type(self).__name__} owns no paged write locations"
+        )
+
+    def padded_write_locations(
+        self, layer: PagedAttention, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        """:meth:`forward_write_locations` widened to the ``rows`` a graph-padded
+        forward carries, the extra rows landing in the dummy slot 0, so the
+        prologue can be captured; a backend without a padded span serves exact
+        counts only."""
+        locations = self.forward_write_locations(layer, forward_mode)
+        if locations.numel() != rows:
+            raise ValueError(f"{locations.numel()} write slots for {rows} rows")
+        return locations
+
+    def prepare_sparse_kv_access(
+        self,
+        layer: PagedAttention,
+        selection: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        forward_mode: ForwardMode,
+    ) -> torch.Tensor:
+        """Prepare sparse KV offloading and return this layer's compute writes.
+
+        selection contains history row IDs, including masks and duplicates;
+        positions contains token positions. Decode loads history or joins
+        prefetch, then publishes hot reads/writes. Extend reserves projection
+        staging; sparse-prefill iteration later flushes and gathers history.
+        Use the returned slots for KV projection before attention. Layers
+        without offloading return ordinary history writes without copying KV.
+        Wrappers route by layer and preserve the returned tensor.
+        """
+        return self.write_locations(layer, forward_mode)
 
     # ------------------------------------------------------------------
     # PD / speculative side state
@@ -443,34 +683,40 @@ class AttentionBackend(CachePoolBinding, ABC):
         self.step_counter = step_counter
 
     def commit_speculative_state_after_verify(
-        self, accepted_lengths: torch.Tensor, *, num_extends: int
+        self,
+        accepted_lengths: torch.Tensor,
+        *,
+        num_extends: int,
+        accepted_path: torch.Tensor | None,
     ) -> None:
         """Commit live acceptance after drafted decode/mixed execution or replay.
 
         ``num_extends == 0`` identifies pure decode; otherwise extend requests
-        lead the mixed batch. Stateless backends inherit this no-op.
+        lead the mixed batch. ``accepted_path`` is the ``[bs, N]`` accepted
+        draft-tree path (root first, ``-1`` past it), ``None`` for a chain.
+        Stateless backends inherit this no-op.
         """
 
     @contextmanager
     def record_pd_cache_step(
         self,
         forward_mode: ForwardMode,
-        save_kv_cache: bool,
+        writes_in_call: bool,
         record_kv_cache: bool | None,
     ):
-        """Anchor the PD layerwise cache-step record to the wrapped KV write:
-        before the attention call when the KV was pre-written
-        (``save_kv_cache=False``), after it otherwise. No-op without a step
+        """Anchor the PD layerwise cache-step record to the layer's last cache
+        write: after the wrapped call when it writes a cache field
+        (``writes_in_call``), before it otherwise. No-op without a step
         counter."""
         if record_kv_cache is None:
             record_cache = not forward_mode.is_decode() and not forward_mode.is_idle()
         else:
             record_cache = record_kv_cache
         record_cache = record_cache and self.step_counter is not None
-        if record_cache and not save_kv_cache:
+        if record_cache and not writes_in_call:
             self.step_counter.record_cache()
         yield
-        if record_cache and save_kv_cache:
+        if record_cache and writes_in_call:
             self.step_counter.record_cache()
 
     # ------------------------------------------------------------------
@@ -549,6 +795,26 @@ class AttentionBackend(CachePoolBinding, ABC):
         **kwargs,
     ):
         raise NotImplementedError()
+
+
+def reject_query_shard(query_shard: QueryShardPlan | None, node: str) -> None:
+    """Fail loud when a forward shards its query rows over a node that attends
+    every row.
+
+    Under query context parallelism the model feeds a node its shard of the
+    extend rows while the metadata describes the whole span; only a backend
+    whose extend arm gathers each request's history for its local rows may
+    accept the shard.
+
+    Args:
+        query_shard: The forward's shard plan, or ``None`` when not sharded.
+        node: Backend name for the diagnostic.
+    """
+    if query_shard is not None and query_shard.size > 1:
+        raise RuntimeError(
+            f"{node} cannot attend a query shard; query context parallelism "
+            "needs the gathered-history DSA extend arm"
+        )
 
 
 def reject_bounded_replay(extend_replay_lens_cpu: torch.Tensor, node: str) -> None:

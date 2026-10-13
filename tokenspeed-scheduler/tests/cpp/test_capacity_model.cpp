@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "integration_test_helper.h"
 #include "scheduler/capacity_model.h"
 #include "scheduler/scheduler.h"
 #include "scheduler/types.h"
@@ -81,8 +82,8 @@ SchedulerConfig SizingConfig(Role role, std::int32_t prefix_granularity, std::in
     cfg.disable_l2_cache = true;
     for (CacheGroupConfig& group : groups) {
         if (role != Role::kFused) {
-            group.transfer_policy =
-                group.IsSnapshotStateGroup() ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+            group.transfer_policy = group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot
+                                                                          : CacheTransferPolicy::FullSuffix;
         }
         cfg.cache_groups.push_back(std::move(group));
     }
@@ -96,6 +97,7 @@ SchedulerConfig SizedConfig(SchedulerConfig cfg, std::int32_t usable_lcm_blocks)
     for (CacheGroupConfig& group : cfg.cache_groups) {
         group.total_pages = 1 + usable_lcm_blocks * group.cache_blocks_per_lcm_block;
     }
+    SetTestSnapshotPool(cfg);
     return cfg;
 }
 
@@ -130,6 +132,7 @@ TEST(CapacityModelTest, L3SizingDoesNotRequireHostPagesBeforeAllocation) {
     SchedulerConfig sizing = SizingConfig(Role::kFused, 4, 8, 1, 0, false, {Full("full", 4, 1)});
     sizing.disable_l2_cache = false;
     sizing.enable_l3_storage = true;
+    sizing.l3_prefetch_min_pages = 1;
     const CapacityModel model{sizing};
     SchedulerConfig sized = SizedConfig(sizing, 8);
     EXPECT_THROW(sized.Validate(), std::invalid_argument);
@@ -195,8 +198,8 @@ TEST(CapacityModelTest, ConcurrentDemandByRetention) {
     SchedulerConfig prefill = cfg;
     prefill.role = Role::kP;
     for (CacheGroupConfig& group : prefill.cache_groups) {
-        group.transfer_policy =
-            group.IsSnapshotStateGroup() ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+        group.transfer_policy = group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot
+                                                                      : CacheTransferPolicy::FullSuffix;
     }
     const std::vector<std::int64_t> prefill_pages = CapacityModel{prefill}.ConcurrentGroupPages(65536, 4096);
     EXPECT_EQ(prefill_pages[0], 1024 + 16 * 1);

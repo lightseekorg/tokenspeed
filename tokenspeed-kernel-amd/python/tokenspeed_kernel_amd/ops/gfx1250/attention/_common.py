@@ -45,6 +45,10 @@ class InputStrides:
     stride_d: gl.constexpr
 
     @gluon.jit
+    def base_offset(self, token, head):
+        return token.to(gl.int64) * self.stride_t + head.to(gl.int64) * self.stride_h
+
+    @gluon.jit
     def offsets(self, token, head, dim):
         return (token * self.stride_t + head * self.stride_h + dim * self.stride_d).to(
             gl.int32

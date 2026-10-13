@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import hadamard_transform
+from tokenspeed_kernel.ops.transform import hadamard_transform
 
 torch.manual_seed(42)
 

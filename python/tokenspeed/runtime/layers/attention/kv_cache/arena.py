@@ -18,21 +18,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The one cache allocation every compute view is a window onto."""
+"""The cache owner for ordinary allocations and mixed host/device planes."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 
+import numpy as np
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
+from tokenspeed_kernel.ops.kvcache import zero_byte_ranges
+from tokenspeed_kernel.ops.kvcache.triton import zero_page_fields
 
+from tokenspeed.runtime.layers.attention.kv_cache.offload import SparseKVOffload
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
+    CacheStoragePlan,
+    plan_cache_storage,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -62,16 +69,36 @@ class CacheArena:
         cache_group_specs: tuple[CacheGroupSpec, ...],
         token_capacity: int | None = None,
         enable_memory_saver: bool = False,
+        storage_plan: CacheStoragePlan | None = None,
     ):
         if not cache_group_specs:
             raise ValueError(
                 "cache arena requires at least one cache group spec to publish"
             )
         self.plan = plan
-        # Materialize immutable byte geometry at setup, not on first hand-out.
-        for group in plan.groups:
-            plan.block_byte_segments(group.group_id, [])
         self.device = device
+        # Materialize immutable byte geometry at setup, not on first hand-out.
+        # zero_blocks ships only page ids per call; each group's field table
+        # (page-0 offset, page stride, payload bytes) lives on the device.
+        # The kernel trusts these ranges, so their bound is checked once here.
+        # A group may have no fields on this rank: pipeline parallelism keeps
+        # every group but drops the fields of layers another stage owns.
+        self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
+        for group in plan.groups:
+            page_count, fields = plan.page_field_layout(group.group_id)
+            for base, stride, size in fields:
+                if base + (page_count - 1) * stride + size > plan.arena_bytes:
+                    raise ValueError(
+                        f"cache group {group.group_id!r} field geometry reaches "
+                        f"past the {plan.arena_bytes}-byte arena"
+                    )
+            self._zero_field_tables[group.group_id] = (
+                page_count,
+                torch.tensor(fields, dtype=torch.int64, device=device).reshape(
+                    len(fields), 3
+                ),
+                max((size for _, _, size in fields), default=0),
+            )
         self._cache_group_specs_by_id = {
             spec.group_id: spec for spec in cache_group_specs
         }
@@ -83,17 +110,48 @@ class CacheArena:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
+        self.storage_plan = storage_plan or plan_cache_storage(
+            plan,
+            cache_group_specs,
+            offload=None,
+        )
+        expected_storage = plan_cache_storage(
+            plan,
+            cache_group_specs,
+            offload=self.storage_plan.offload,
+        )
+        if self.storage_plan != expected_storage:
+            raise ValueError("cache physical binding does not match its memory plan")
+        if enable_memory_saver and not self.storage_plan.monolithic:
+            raise ValueError("mixed host/device cache does not support sleep/wake")
+        self.offload_config = self.storage_plan.offload
+        self.offload: SparseKVOffload | None = None
+        self.regions: dict[str, torch.Tensor] = {}
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
-            self.buffer = torch.zeros(
-                plan.arena_bytes,
-                dtype=torch.uint8,
-                device=device,
-            )
-
-        # The plan names every field and its dtype
+            for region in self.storage_plan.regions:
+                host = region.placement == "host"
+                self.regions[region.region_id] = torch.zeros(
+                    region.size_bytes,
+                    dtype=torch.uint8,
+                    device="cpu" if host else device,
+                    pin_memory=host,
+                )
+        self._field_bindings = {b.field_id: b for b in self.storage_plan.fields}
         self._fields: dict[str, torch.Tensor] = {
             field.field_id: self._bind(field) for field in plan.fields
         }
+        if self.offload_config is not None:
+            self.offload = SparseKVOffload(
+                self, self.offload_config, workspaces=self.storage_plan.workspaces
+            )
+        expected_device = (
+            self.storage_plan.device_history_bytes
+            + self.storage_plan.persistent_workspace_bytes
+        )
+        if self.allocated_device_bytes != expected_device:
+            raise RuntimeError(
+                "cache allocation differs from its physical workspace plan"
+            )
         plan_groups = {group.group_id: group for group in plan.groups}
         # The contract joins the recipe's logical specs with the plan's
         # physical facts for the same groups. The plan owns page counts and
@@ -121,10 +179,19 @@ class CacheArena:
             },
         )
         logger.info(
-            f"Allocated cache arena: {plan.arena_bytes:d} bytes, prefix_granularity="
+            f"Allocated cache arena: device_bytes={self.allocated_device_bytes:d}, "
+            f"host_bytes={self.allocated_host_bytes:d}, logical_plan_bytes={plan.arena_bytes:d}, prefix_granularity="
             f"{plan.prefix_granularity:d}, num_lcm_blocks={plan.num_lcm_blocks:d}, "
             f"device {device!s}",
         )
+        if self.offload_config is not None:
+            logger.info(
+                f"Sparse KV hot pool: rows={self.offload_config.device_rows}, "
+                f"buffer_rows={self.offload_config.buffer_tokens}, "
+                f"request_slots={self.offload_config.request_slots}, "
+                f"persistent_bytes={self.storage_plan.persistent_workspace_bytes}, "
+                f"temporary_budget_bytes={self.storage_plan.temporary_workspace_bytes}"
+            )
 
     @property
     def cache_group_specs(self) -> tuple[CacheGroupSpec, ...]:
@@ -177,28 +244,40 @@ class CacheArena:
         for extent in reversed(field.shape):
             element_strides.append(stride)
             stride *= extent
-        pages = self.buffer.view(dtype).as_strided(
+        binding = self._field_bindings[field.field_id]
+        buffer = self.regions[binding.region_id]
+        offset = binding.offset_bytes
+        pages = buffer.view(dtype).as_strided(
             (group.page_count, *field.shape),
             (
                 field.page_stride_bytes // field.element_size,
                 *reversed(element_strides),
             ),
-            self.field_block_byte_offset(field.field_id, 0) // field.element_size,
+            offset // field.element_size,
         )
         spec = self._cache_group_specs_by_id[field.group_id]
-        if field.shape[0] != self.plan.prefix_granularity or spec.family == "state":
+        # Keep ordinary fields' addressing contract. History groups can also
+        # contain page-indexed compressor state whose shape starts with rows.
+        token_rows = self.plan.prefix_granularity
+        if (
+            self.offload_config is not None
+            and field.field_id in self.offload_config.field_ids
+        ):
+            token_rows = spec.rows_per_page
+        if spec.family == "state" or field.shape[0] != token_rows:
             return pages
         return pages.view(-1, *field.shape[1:])
 
     def field(self, field_id: str) -> torch.Tensor:
         """Return one planned field's view into the arena.
 
-        The view is shaped the way the field is addressed. A field whose
-        planned shape leads with the identity grain stores one entry per
-        token, so its page axis is folded away and consumers index entries
-        directly; every other field (recurrent state, block-scaled scale
-        planes, V4's byte-shaped planes) is addressed per page and keeps its
-        planned shape. The plan decides which, so no compute view restates
+        The view is shaped the way the field is addressed. A history field whose
+        planned shape leads with the prefix grain stores an entry per token,
+        so its page axis is folded away and consumers index entries directly.
+        Offloaded fields use their group's physical row grain for this fold.
+        Other fields (recurrent state, compressor state, block-scaled scale
+        planes, V4's byte-shaped planes) retain page-indexed views.
+        The plan decides which, so no compute view restates
         its kernel's geometry, and the dtype likewise comes from the plan.
 
         Args:
@@ -215,6 +294,46 @@ class CacheArena:
         except KeyError:
             raise ValueError(f"cache field {field_id!r} is not planned") from None
 
+    def field_address(self, field_id: str) -> int:
+        """Address of physical block zero, including host placement."""
+        return self._fields[field_id].data_ptr()
+
+    @property
+    def buffer(self) -> torch.Tensor:
+        """Compatibility view for consumers requiring a single device slab."""
+        if not self.storage_plan.monolithic:
+            raise ValueError("this cache uses physical regions, not a device slab")
+        return self.regions["arena"]
+
+    def registration_regions(self) -> tuple[tuple[int, int], ...]:
+        return tuple((b.data_ptr(), b.nbytes) for b in self.regions.values())
+
+    @property
+    def allocated_device_bytes(self) -> int:
+        history = sum(
+            self.regions[r.region_id].nbytes
+            for r in self.storage_plan.regions
+            if r.placement == "device"
+        )
+        return history + (
+            0
+            if self.offload is None
+            else sum(state.device_nbytes for state in self.offload.fields.values())
+        )
+
+    @property
+    def allocated_host_bytes(self) -> int:
+        return sum(
+            self.regions[r.region_id].nbytes
+            for r in self.storage_plan.regions
+            if r.placement == "host"
+        )
+
+    def compute_field(self, field_id: str) -> torch.Tensor:
+        if self.offload is not None and field_id in self.offload.fields:
+            return self.offload.fields[field_id].device
+        return self.field(field_id)
+
     def field_ids(self) -> frozenset[str]:
         """Every field the plan names, all of them materialized."""
         return frozenset(self._fields)
@@ -222,30 +341,80 @@ class CacheArena:
     def field_block_byte_offset(self, field_id: str, block_id: int) -> int:
         return self.plan.field_page_byte_offset(field_id, block_id)
 
-    def zero_blocks(self, block_ids_by_group: dict[str, list[int]]) -> None:
+    def zero_blocks(self, block_ids_by_group: Mapping[str, np.ndarray]) -> None:
         """Clear local physical blocks after validating every group's IDs.
 
+        Host work stays O(pages) with no per-page Python object: the ids are
+        validated as one array, staged through one pinned copy, and each
+        group's page x field expansion runs in the kernel. A long prompt's
+        admission hands out thousands of pages, so per-range Python here
+        would stall the forward thread.
+
         Args:
-            block_ids_by_group: Local block IDs, each in [0, group.page_count).
+            block_ids_by_group: Local block IDs per group as 1-D integer
+                arrays, each in [0, group.page_count).
 
         Raises:
             IndexError: A block ID is outside its group's physical range.
+            TypeError: A group's IDs are not a 1-D integer array.
         """
-        for group_id, block_ids in block_ids_by_group.items():
-            page_count = self.plan.group(group_id).page_count
-            for block in block_ids:
-                if not 0 <= block < page_count:
-                    raise IndexError(
-                        f"local block ID {block} outside [0, {page_count}) "
-                        f"for group {group_id!r}"
-                    )
-        segments = [
-            segment
-            for group_id, block_ids in block_ids_by_group.items()
-            for segment in self.block_byte_segments(group_id, block_ids)
-        ]
-        if segments:
-            zero_byte_ranges(self.buffer, segments)
+        spans: list[tuple[str, int, int]] = []
+        arrays: list[np.ndarray] = []
+        total = 0
+        for group_id, ids in block_ids_by_group.items():
+            page_count, fields, _ = self._zero_field_tables[group_id]
+            if (
+                not isinstance(ids, np.ndarray)
+                or ids.ndim != 1
+                or ids.dtype.kind not in "iu"
+            ):
+                raise TypeError(
+                    f"block IDs for group {group_id!r} must be a 1-D integer array"
+                )
+            if ids.size == 0:
+                continue
+            low, high = int(ids.min()), int(ids.max())
+            if low < 0 or high >= page_count:
+                raise IndexError(
+                    f"local block ID {low if low < 0 else high} outside "
+                    f"[0, {page_count}) for group {group_id!r}"
+                )
+            if fields.shape[0] == 0:
+                # Validated, but this rank holds none of the group's bytes.
+                continue
+            spans.append((group_id, total, ids.size))
+            arrays.append(ids)
+            # Each group's span starts 16-byte aligned, as the kernel requires
+            # of the pointer it receives.
+            total += -(-ids.size // 4) * 4
+        if total == 0:
+            return
+        if not self.storage_plan.monolithic:
+            # Mixed regions use physical bindings; Host clears run on the
+            # execution stream through the CuTeDSL kernel boundary.
+            segments = [
+                segment
+                for group_id, block_ids in block_ids_by_group.items()
+                for segment in self.block_byte_segments(group_id, block_ids.tolist())
+            ]
+            for region_id, ranges in self.storage_plan.split_ranges(segments).items():
+                zero_byte_ranges(self.regions[region_id], ranges, device=self.device)
+            return
+        # The caching host allocator tracks the pinned block's pending copy,
+        # so the next call cannot overwrite it early.
+        staging = torch.empty(total, dtype=torch.int32, pin_memory=True)
+        host = staging.numpy()
+        for (_, start, count), ids in zip(spans, arrays, strict=True):
+            host[start : start + count] = ids
+        pages = staging.to(self.buffer.device, non_blocking=True)
+        for group_id, start, count in spans:
+            _, fields, max_field_bytes = self._zero_field_tables[group_id]
+            zero_page_fields(
+                self.buffer,
+                pages[start : start + count],
+                fields,
+                max_field_bytes=max_field_bytes,
+            )
 
     def block_byte_segments(
         self, group_id: str, block_ids: list[int]
@@ -276,4 +445,8 @@ class CacheArena:
         Exactly one owner, so callers may fan this out over every compute
         view without double-clearing or needing a "views skip" rule.
         """
-        self.buffer.zero_()
+        if self.offload is not None:
+            self.offload.synchronize()
+            self.offload.clear()
+        for buffer in self.regions.values():
+            zero_byte_ranges(buffer, [(0, buffer.nbytes)], device=self.device)

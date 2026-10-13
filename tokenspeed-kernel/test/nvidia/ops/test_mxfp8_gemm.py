@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import mm
+from tokenspeed_kernel.ops.gemm import _online_quantize_mxfp8, mm
+from tokenspeed_kernel.ops.gemm.flashinfer import swizzle_mxfp8_scale
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -17,22 +18,29 @@ pytestmark = pytest.mark.skipif(
 )
 @pytest.mark.parametrize("m,k", [(1, 128), (5, 384), (7, 640)])
 def test_packed_ue8m0_quant_pdl_matches_reference(device: str, m: int, k: int) -> None:
-    from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
 
     torch.manual_seed(0)
     x = torch.randn((m, k), device=device, dtype=torch.bfloat16)
-    outputs = []
-    for enable_pdl in (False, True):
-        outputs.append(
-            per_token_group_quant_fp8(
-                x,
-                128,
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                enable_pdl=enable_pdl,
-            )
+
+    def quantize_packed_ue8m0(enable_pdl: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        q, scales = quantize_fp8(
+            x,
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="ue8m0",
+            enable_pdl=enable_pdl,
         )
+        # Repack the canonical [m, k // 128] UE8M0 exponents into the
+        # four-exponents-per-word layout, zero-filling tail bytes.
+        if scales.dtype != torch.uint8:
+            scales = (torch.log2(scales) + 127).to(torch.uint8)
+        packs = (k // 128 + 3) // 4
+        padded = torch.zeros((m, packs * 4), dtype=torch.uint8, device=device)
+        padded[:, : k // 128] = scales
+        return q, padded.view(torch.int32)
+
+    outputs = [quantize_packed_ue8m0(enable_pdl) for enable_pdl in (False, True)]
 
     q, packed_scales = outputs[0]
     torch.cuda.synchronize()
@@ -61,7 +69,8 @@ def test_packed_ue8m0_quant_pdl_matches_reference(device: str, m: int, k: int) -
     assert torch.equal(actual_bytes, expected_bytes)
 
 
-def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str) -> None:
+@pytest.mark.parametrize("override", [None, "triton_mm_fp8_blockscale"])
+def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str, override: str | None) -> None:
     torch.manual_seed(0)
     m, n, k = 19, 128, 128
     a = torch.randn(m, k, device=device, dtype=torch.bfloat16) * 0.2
@@ -77,12 +86,18 @@ def test_triton_mxfp8_1x32_raw_ue8m0_weight(device: str) -> None:
         out_dtype=torch.bfloat16,
         quant="mxfp8",
         block_size=[1, 32],
-        override="triton_mm_fp8_blockscale",
+        override=override,
     )
 
     scales = torch.exp2(b_scales.float() - 127.0).repeat_interleave(32, dim=1)
-    ref = a.float() @ (b.float() * scales).t()
-    torch.testing.assert_close(out.float(), ref, atol=0.08, rtol=0.12)
+    # Compare against the operands mm() actually quantizes; UE8M0 scales are
+    # stored as biased exponent bytes.
+    q_a, a_scales = _online_quantize_mxfp8(a, [1, 32], "ue8m0", enable_pdl=False)
+    activation_scales = torch.exp2(a_scales.float() - 127.0).repeat_interleave(
+        32, dim=1
+    )
+    ref = (q_a.float() * activation_scales) @ (b.float() * scales).t()
+    torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=5e-3)
 
 
 def _has_flashinfer_mxfp8() -> bool:
@@ -104,6 +119,10 @@ def _quantize_mxfp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
     q, s = mxfp8_quantize(x, is_sf_swizzled_layout=False)
     return q, s.view(x.shape[0], x.shape[1] // 32)
+
+
+def _dequantize_mxfp8(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    return q.float() * torch.exp2(s.float() - 127.0).repeat_interleave(32, dim=1)
 
 
 @requires_flashinfer_mxfp8
@@ -140,7 +159,7 @@ def test_flashinfer_mxfp8_matches_triton_on_identical_operands(
 
 @requires_flashinfer_mxfp8
 def test_flashinfer_mxfp8_selected_with_online_quant(device: str) -> None:
-    from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
+    from flashinfer import autotune
     from tokenspeed_kernel.selection import select_kernel
     from tokenspeed_kernel.signature import (
         ScaleFormat,
@@ -163,7 +182,7 @@ def test_flashinfer_mxfp8_selected_with_online_quant(device: str) -> None:
             "mxfp8",
             fp8,
             scale=ScaleFormat(
-                storage_dtype=torch.float32, granularity="block", block_shape=(1, 32)
+                storage_dtype=torch.uint8, granularity="block", block_shape=(1, 32)
             ),
         ),
         b=tensor_format(
@@ -182,18 +201,21 @@ def test_flashinfer_mxfp8_selected_with_online_quant(device: str) -> None:
 
     # Production layout: bf16 activations (online ue8m0 quant inside mm),
     # weight scales pre-swizzled at load time.
-    out = mm(
-        a,
-        b_q,
-        B_scales=swizzle_mxfp8_scale(b_s, n, k),
-        out_dtype=torch.bfloat16,
-        quant="mxfp8",
-        block_size=[1, 32],
-    )
-    scales = torch.exp2(b_s.float() - 127.0).repeat_interleave(32, dim=1)
-    ref = a.float() @ (b_q.float() * scales).t()
-    rel = (torch.norm(out.float() - ref) / torch.norm(ref)).item()
-    assert rel < 5e-2, f"rel_l2={rel}"
+    # Exercise candidate selection: rc2 admitted invalid narrow persistent tiles.
+    with autotune(tuning_buckets=[m]):
+        out = mm(
+            a,
+            b_q,
+            B_scales=swizzle_mxfp8_scale(b_s, n, k),
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=[1, 32],
+        )
+    # mm() quantizes the activation online with the same FlashInfer quantizer;
+    # dequantizing that result keeps quantization noise out of the comparison.
+    a_q, a_s = _quantize_mxfp8(a)
+    ref = _dequantize_mxfp8(a_q, a_s) @ _dequantize_mxfp8(b_q, b_s).t()
+    torch.testing.assert_close(out.float(), ref, atol=1e-3, rtol=1e-2)
 
 
 @requires_flashinfer_mxfp8
@@ -235,7 +257,6 @@ def test_flashinfer_mxfp8_square_weight_orientation(device: str) -> None:
 @requires_flashinfer_mxfp8
 def test_swizzle_mxfp8_scale_matches_flashinfer_layout(device: str) -> None:
     from flashinfer import mxfp8_quantize
-    from tokenspeed_kernel.ops.gemm.fp8_utils import swizzle_mxfp8_scale
 
     torch.manual_seed(0)
     for m, k in [(4, 512), (19, 2048), (300, 6144)]:

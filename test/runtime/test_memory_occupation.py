@@ -20,12 +20,27 @@
 
 """CPU-only tests for GPU memory release coordination."""
 
-from tokenspeed.runtime.engine.io_struct import (
+import os
+import sys
+
+import pytest
+
+# CI registration (AST-parsed, runtime no-op).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
+from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    ResumeMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqOutput,
 )
-from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
-from tokenspeed.runtime.engine.pause import PauseController, PauseState
+from tokenspeed.runtime.engine.memory_occupation import (  # noqa: E402
+    MemoryOccupationController,
+)
+from tokenspeed.runtime.engine.pause import PauseController, PauseState  # noqa: E402
 
 
 class _Sender:
@@ -55,7 +70,8 @@ class _MemoryAdapter:
         self.paused_tags.append(tag)
 
 
-def test_kv_release_waits_until_cache_can_be_cleared():
+@pytest.mark.parametrize("resume_tags", [None, []])
+def test_kv_release_waits_until_cache_can_be_cleared(resume_tags):
     sender = _Sender()
     pause = PauseController(sender)
     adapter = _MemoryAdapter()
@@ -67,6 +83,8 @@ def test_kv_release_waits_until_cache_can_be_cleared():
         enabled=True,
         reset_caches_fn=lambda: next(clear_results),
         kv_repair_fn=lambda: None,
+        weights_release_refusal_fn=lambda: None,
+        weights_busy_fn=lambda: False,
     )
 
     controller.handle_release(ReleaseMemoryOccupationReqInput(tags=["kv_cache"]))
@@ -75,6 +93,14 @@ def test_kv_release_waits_until_cache_can_be_cleared():
     assert pause.is_drain_pending
     assert adapter.paused_tags == []
     assert sender.items == []
+
+    # An empty memory resume cannot release another operation's drain slot.
+    controller.handle_resume(ResumeMemoryOccupationReqInput(tags=resume_tags))
+    assert pause.is_drain_pending and pause.admit_blocked
+    assert adapter.paused_tags == []
+    assert isinstance(sender.items[0], ResumeMemoryOccupationReqOutput)
+    assert sender.items[0].success
+    sender.items.clear()
 
     pause.maybe_finish_drain(_Scheduler())
 

@@ -43,7 +43,6 @@ def _tp1_mapping() -> Mapping:
         rank=0,
         world_size=1,
         attn_tp_size=1,
-        attn_cp_size=1,
         attn_dp_size=1,
         dense_tp_size=1,
         dense_dp_size=1,

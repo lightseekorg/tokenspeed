@@ -37,10 +37,12 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     CudaGraphSupport,
     reject_bounded_replay,
+    reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
@@ -80,9 +82,9 @@ class Qwen4ExpPLEBackend(AttentionBackend):
     """Bind PLE cache fields and own their metadata and verify workspace."""
 
     cache_consumer_families = frozenset({"state"})
-    # Prefill graph buckets pad tokens; PLE's request-shaped updates must stay
-    # eager so padding cannot advance n-gram or short-convolution state.
-    cuda_graph_support = CudaGraphSupport(prefill_graph=False)
+    # The PLE layer's break runs request-shaped state updates eagerly, using
+    # live query lengths to exclude padded rows from state writes.
+    cuda_graph_support = CudaGraphSupport(prefill_graph=True)
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         super().__init__(config, spec)
@@ -222,8 +224,10 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
+        query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
+        reject_query_shard(query_shard, "Qwen4ExpPLEBackend")
         reject_bounded_replay(extend_replay_lens_cpu, "Qwen4ExpPLEBackend")
         del (
             req_pool_indices,

@@ -1,0 +1,190 @@
+name: Build and Release tokenspeed-kernel-amd nightly
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      version_date:
+        description: "UTC nightly version date, formatted as YYYYMMDD."
+        required: false
+        type: string
+      publish_github:
+        description: "Publish nightly distributions and the pip index from main."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Resolve nightly version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      version_date: ${{ steps.metadata.outputs.version_date }}
+      tag_name: ${{ steps.metadata.outputs.tag_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve nightly version
+        id: metadata
+        env:
+          PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
+          VERSION_DATE: ${{ inputs.version_date }}
+        run: |
+          if [ "$PUBLISH_GITHUB" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Nightly publication requires main." >&2
+            exit 1
+          fi
+          version_date="${VERSION_DATE:-$(date -u +%Y%m%d)}"
+          version=$(python .github/scripts/prepare-kernel-amd-nightly.py \
+            --target version . "$version_date")
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "version_date=${version_date}" >> "$GITHUB_OUTPUT"
+          echo "tag_name=tokenspeed-kernel-amd-nightly-v${version}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build AMD nightly distributions
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build distributions
+        run: |
+          version=$(python .github/scripts/prepare-kernel-amd-nightly.py \
+            --target amd . '${{ needs.metadata.outputs.version_date }}')
+          test "$version" = '${{ needs.metadata.outputs.version }}'
+          python -m pip install --upgrade build twine "setuptools<82" wheel
+          python -m build tokenspeed-kernel-amd --sdist --wheel --no-isolation --outdir dist
+          python -m twine check dist/*
+          python - <<'PY'
+          import glob
+          import zipfile
+          from email.parser import BytesParser
+
+          wheels = glob.glob('dist/*.whl')
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected one AMD wheel, found {wheels}")
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              metadata_path = next(name for name in wheel.namelist() if name.endswith('.dist-info/METADATA'))
+              metadata = BytesParser().parsebytes(wheel.read(metadata_path))
+          if metadata['Name'] != 'tokenspeed-kernel-amd' or metadata['Version'] != '${{ needs.metadata.outputs.version }}':
+              raise SystemExit(f"Unexpected AMD wheel metadata: {metadata['Name']} {metadata['Version']}")
+          PY
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenspeed-kernel-amd-dist
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish AMD nightly release and pip index
+    if: (github.event_name == 'schedule' || inputs.publish_github) && github.repository == 'lightseekorg/tokenspeed'
+    concurrency:
+      group: wheelhouse-publication
+      cancel-in-progress: false
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: tokenspeed-kernel-amd-dist
+          path: dist/tokenspeed-kernel-amd-dist
+
+      - name: Create or complete GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          test "$(gh api user --jq .login)" = lightseek-bot
+          for repository in lightseekorg/whl lightseekorg/tokenspeed; do
+            test "$(gh repo view "$repository" --json visibility --jq .visibility)" = PUBLIC
+          done
+          title="tokenspeed-kernel-amd ${VERSION}"
+          notes="${title} built from lightseekorg/tokenspeed@${SOURCE_SHA}"
+          assets=(dist/tokenspeed-kernel-amd-dist/*.whl dist/tokenspeed-kernel-amd-dist/*.tar.gz)
+          if gh release view "$TAG_NAME" --repo lightseekorg/whl >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" --repo lightseekorg/whl --prerelease
+            existing_assets=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json assets --jq '.assets[].name')
+            for asset in "${assets[@]}"; do
+              if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
+                existing_notes=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json body --jq .body)
+                if [ "$existing_notes" != "$notes" ]; then
+                  echo "Cannot complete a nightly release from a different source commit." >&2
+                  exit 1
+                fi
+                gh release upload "$TAG_NAME" "$asset" --repo lightseekorg/whl
+              fi
+            done
+          else
+            gh release create "$TAG_NAME" "${assets[@]}" --repo lightseekorg/whl \
+              --title "$title" --notes "$notes" --prerelease
+          fi
+          gh api "repos/lightseekorg/whl/releases/tags/${TAG_NAME}" > nightly-release.json
+
+      - name: Checkout wheel index
+        uses: actions/checkout@v4
+        with:
+          repository: lightseekorg/whl
+          ref: gh-pages
+          path: wheelhouse
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+
+      - name: Publish AMD nightly pip index
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+        run: |
+          python .github/scripts/update-nightly-index.py \
+            --package tokenspeed-kernel-amd --variant rocm72 wheelhouse nightly-release.json dist
+          cd wheelhouse
+          git config user.name lightseek-bot
+          git config user.email 243258330+lightseek-bot@users.noreply.github.com
+          git add nightly/index.html nightly/rocm7.2/index.html nightly/rocm7.2/tokenspeed-kernel-amd/index.html
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git diff --cached
+          if [ -f .pre-commit-config.yaml ]; then
+            pre-commit run --all-files
+          fi
+          git commit -s -m "Publish tokenspeed-kernel-amd nightly index"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:gh-pages; then
+              gh api repos/lightseekorg/whl/contents/nightly/rocm7.2/tokenspeed-kernel-amd/index.html --jq .content | base64 --decode
+              gh api repos/lightseekorg/whl/contents/nightly/rocm7.2/index.html --jq .content | base64 --decode
+              exit 0
+            fi
+            git fetch origin gh-pages
+            git rebase origin/gh-pages
+          done
+          echo "Could not publish the AMD nightly index after three attempts." >&2
+          exit 1

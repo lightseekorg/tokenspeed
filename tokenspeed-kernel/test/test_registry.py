@@ -508,3 +508,43 @@ class TestUnregister:
     def test_unregister_nonexistent_is_noop(self):
         reg = KernelRegistry.get()
         reg._unregister("does_not_exist")
+
+
+def test_vendor_min_arch_versions_apply_per_vendor(
+    h100_platform, b200_platform, mi350_platform
+) -> None:
+    from dataclasses import replace
+
+    capability = CapabilityRequirement(
+        vendors=frozenset({"nvidia", "amd"}),
+        vendor_min_arch_versions={
+            "nvidia": ArchVersion(10, 0),
+            "amd": ArchVersion(9, 5),
+        },
+    )
+
+    assert not capability.satisfied_by(h100_platform)
+    assert capability.satisfied_by(b200_platform)
+    assert capability.satisfied_by(mi350_platform)
+    gfx942 = replace(mi350_platform, arch_version=ArchVersion(9, 4))
+    assert not capability.satisfied_by(gfx942)
+
+
+def test_vendor_min_arch_versions_reject_ambiguous_requirements() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"amd"}),
+            vendor_min_arch_versions={"amd": ArchVersion(9, 5)},
+        )
+    with pytest.raises(ValueError, match="every vendor in vendors"):
+        CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            vendor_min_arch_versions={"amd": ArchVersion(9, 5)},
+        )
+    # A vendor without a floor would silently accept every arch of it.
+    with pytest.raises(ValueError, match="every vendor in vendors"):
+        CapabilityRequirement(
+            vendors=frozenset({"nvidia", "amd"}),
+            vendor_min_arch_versions={"nvidia": ArchVersion(10, 0)},
+        )

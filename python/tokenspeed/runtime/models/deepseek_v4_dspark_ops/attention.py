@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import fp8_quantize_dequantize
 from tokenspeed_kernel.ops.layernorm import grouped_rmsnorm as kernel_grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm import rmsnorm as kernel_rmsnorm
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 
 def dspark_fp8_quant_dequant(
@@ -34,13 +34,14 @@ def dspark_fp8_quant_dequant(
             f"got width={x.shape[-1]}, block_size={block_size}."
         )
     if x.is_cuda:
-        return fp8_quantize_dequantize(
+        output, _ = quantize_fp8(
             x,
+            granularity="token_group",
             group_size=block_size,
             scale_encoding="ue8m0",
-            override=None,
-            solution=None,
+            dequantize=True,
         )
+        return output
     original_dtype = x.dtype
     blocks = x.float().unflatten(-1, (-1, block_size))
     absmax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)

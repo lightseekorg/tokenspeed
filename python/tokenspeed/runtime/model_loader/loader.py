@@ -43,6 +43,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
@@ -55,10 +56,12 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     filter_safetensors_files_by_weight_names,
     get_quant_config,
+    initialize_dummy_integer_weights,
     initialize_dummy_weights,
     instanttensor_weights_iterator,
     np_cache_weights_iterator,
     pt_weights_iterator,
+    require_unit_kv_scales,
     safetensors_filtered_weights_iterator,
     safetensors_weights_iterator,
 )
@@ -109,6 +112,8 @@ def device_loading_context(
                     p.data = p.data.to(original_device)
         # New parameters or parameters already on target device are untouched
 
+
+from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
 
@@ -325,6 +330,7 @@ class DefaultModelLoader(BaseModelLoader):
         source: "Source",
         weight_name_filter: Callable[[str], bool] | None,
         checkpoint_load_group: tuple[int, ...] | None,
+        mapping: Mapping,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format.
 
@@ -338,6 +344,19 @@ class DefaultModelLoader(BaseModelLoader):
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
+        hf_weights_files.sort()
+        # Filtered models can consume different shard lists on different ranks.
+        # Keep their independent prefetch rather than assign reads to absent peers.
+        local_rank, local_world_size = 0, 1
+        if use_safetensors and weight_name_filter is None:
+            node_start = mapping.node_rank * mapping.nprocs_per_node
+            local_ranks = tuple(
+                rank
+                for rank in range(node_start, node_start + mapping.nprocs_per_node)
+                if checkpoint_load_group is None or rank in checkpoint_load_group
+            )
+            local_rank = local_ranks.index(mapping.rank)
+            local_world_size = len(local_ranks)
         if use_safetensors and weight_name_filter is not None:
             index_file = (
                 "consolidated.safetensors.index.json"
@@ -384,18 +403,23 @@ class DefaultModelLoader(BaseModelLoader):
                 lambda name: weight_name_filter(source.prefix + name),
                 prefetch=self.load_config.weight_loader_prefetch_checkpoints,
                 prefetch_num_threads=self.load_config.weight_loader_prefetch_num_threads,
+                local_rank=local_rank,
+                local_world_size=local_world_size,
             )
         elif use_safetensors:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
                 prefetch=self.load_config.weight_loader_prefetch_checkpoints,
                 prefetch_num_threads=self.load_config.weight_loader_prefetch_num_threads,
+                local_rank=local_rank,
+                local_world_size=local_world_size,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        # Apply the prefix.
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        return require_unit_kv_scales(
+            (source.prefix + name, tensor) for (name, tensor) in weights_iterator
+        )
 
     def _get_all_weights(
         self,
@@ -414,7 +438,11 @@ class DefaultModelLoader(BaseModelLoader):
                 getattr(model, "fall_back_to_pt_during_load", False),
             )
             bind_checkpoint_dir(hf_folder)
+        # A model that reads a stage-specific checkpoint subset names its own
+        # group; otherwise the caller says which ranks load this model at all.
         checkpoint_load_group = getattr(model, "checkpoint_load_group", None)
+        if checkpoint_load_group is None:
+            checkpoint_load_group = self.load_config.checkpoint_load_group
 
         primary_weights = DefaultModelLoader.Source(
             model_config.model_path,
@@ -423,7 +451,10 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
         yield from self._get_weights_iterator(
-            primary_weights, weight_name_filter, checkpoint_load_group
+            primary_weights,
+            weight_name_filter,
+            checkpoint_load_group,
+            model_config.mapping,
         )
 
         secondary_weights = cast(
@@ -431,7 +462,7 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._get_weights_iterator(
-                source, weight_name_filter, checkpoint_load_group
+                source, weight_name_filter, checkpoint_load_group, model_config.mapping
             )
 
     def download_model(self, model_config: ModelConfig) -> None:
@@ -447,33 +478,39 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> nn.Module:
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
-            with target_device:
-                model = _initialize_model(
-                    model_config,
-                    self.load_config,
-                )
+            with startup_phase("weights.allocate"):
+                with target_device:
+                    model = _initialize_model(
+                        model_config,
+                        self.load_config,
+                    )
 
-            model.load_weights(self._get_all_weights(model_config, model))
+            with startup_phase("weights.read_copy"):
+                model.load_weights(self._get_all_weights(model_config, model))
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    # When quant methods need to process weights after loading
-                    # (for repacking, quantizing, etc), they expect parameters
-                    # to be on the global target device. This scope is for the
-                    # case where cpu offloading is used, where we will move the
-                    # parameters onto device for processing and back off after.
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
+            with startup_phase("weights.postprocess"):
+                for _, module in model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        # When quant methods need to process weights after loading
+                        # (for repacking, quantizing, etc), they expect parameters
+                        # to be on the global target device. This scope is for the
+                        # case where cpu offloading is used, where we will move the
+                        # parameters onto device for processing and back off after.
+                        with device_loading_context(module, target_device):
+                            quant_method.process_weights_after_loading(module)
 
-                process_method = getattr(module, "process_weights_after_loading", None)
-                if process_method is not None:
-                    with device_loading_context(module, target_device):
-                        module.process_weights_after_loading(module)
+                    process_method = getattr(
+                        module, "process_weights_after_loading", None
+                    )
+                    if process_method is not None:
+                        with device_loading_context(module, target_device):
+                            module.process_weights_after_loading(module)
 
-            post_quant_warmup = getattr(model, "post_quant_warmup", None)
-            if callable(post_quant_warmup):
-                post_quant_warmup()
+            with startup_phase("weights.post_quant_warmup"):
+                post_quant_warmup = getattr(model, "post_quant_warmup", None)
+                if callable(post_quant_warmup):
+                    post_quant_warmup()
 
         return model.eval()
 
@@ -524,6 +561,14 @@ class DummyModelLoader(BaseModelLoader):
                     model_config,
                     self.load_config,
                 )
+            # Post-processing can read integer weights, such as index tables,
+            # so they need valid values before it runs.
+            initialize_dummy_integer_weights(model)
+            # An EAGLE3 draft cannot share a vocab-sharded target embedding,
+            # and its own dummy embedding is as valid as a loaded one.
+            mark_initialized = getattr(model, "mark_embedding_initialized", None)
+            if callable(mark_initialized):
+                mark_initialized()
             if getattr(model, "post_load_weights", None):
                 model.post_load_weights()
 
@@ -549,8 +594,9 @@ class ShardedStateLoader(BaseModelLoader):
     """
     Model loader that directly loads each worker's model state dict, which
     enables a fast load path for large tensor-parallel models where each worker
-    only needs to read its own shard rather than the entire checkpoint. See
-    `examples/save_sharded_state.py` for creating a sharded checkpoint.
+    only needs to read its own shard rather than the entire checkpoint.
+    Checkpoints contain post-processed state and require the same model,
+    parallel mapping, quantization and runtime weight layout when reloaded.
     """
 
     DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"

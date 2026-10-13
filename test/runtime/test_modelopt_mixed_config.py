@@ -5,10 +5,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import tokenspeed_kernel
 import torch
 from torch import nn
 
+import tokenspeed.runtime.layers.dense.nvfp4 as nvfp4_module
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
@@ -89,8 +89,8 @@ def test_from_config_rejects_unknown_algo():
 
 def test_w4a16_routing_rejects_unavailable_backend(monkeypatch):
     monkeypatch.setattr(
-        tokenspeed_kernel,
-        "has_flashinfer_cute_dsl_nvfp4_a16",
+        nvfp4_module,
+        "kernel_has_flashinfer_cute_dsl_nvfp4_a16",
         lambda: False,
     )
     config = _renamed_config(
@@ -114,8 +114,8 @@ def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
     from tokenspeed.runtime.layers.linear import ReplicatedLinear
 
     monkeypatch.setattr(
-        tokenspeed_kernel,
-        "has_flashinfer_cute_dsl_nvfp4_a16",
+        nvfp4_module,
+        "kernel_has_flashinfer_cute_dsl_nvfp4_a16",
         lambda: True,
     )
     quant_config = ModelOptMixedConfig(quantized_layers={"lm_head": "W4A16_NVFP4"})
@@ -141,8 +141,8 @@ def test_attention_dp_lm_head_uses_mixed_quantization(monkeypatch):
 
 def test_qwen35_w4a16_and_static_fp8_routing(monkeypatch):
     monkeypatch.setattr(
-        tokenspeed_kernel,
-        "has_flashinfer_cute_dsl_nvfp4_a16",
+        nvfp4_module,
+        "kernel_has_flashinfer_cute_dsl_nvfp4_a16",
         lambda: True,
     )
 

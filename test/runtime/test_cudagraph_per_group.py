@@ -44,7 +44,11 @@ def _odd_specs():
 
 def _stacks(device, max_bs=6):
     return GroupTableStacks(
-        _odd_specs(), max_bs=max_bs, max_tokens_per_req=2, device=device
+        _odd_specs(),
+        max_bs=max_bs,
+        max_tokens_per_req=2,
+        max_extend_tokens=0,
+        device=device,
     )
 
 

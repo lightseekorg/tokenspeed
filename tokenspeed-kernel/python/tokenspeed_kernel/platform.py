@@ -20,13 +20,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import logging
 import math
 import os
 import site
 import sys
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -209,7 +211,7 @@ class PlatformInfo:
 
     @property
     def is_cdna4_plus(self) -> bool:
-        return self.is_amd and self.arch_version >= ArchVersion(9, 5)
+        return self.is_cdna4 or self.is_cdna5_plus
 
     @property
     def is_cdna5_plus(self) -> bool:
@@ -237,6 +239,28 @@ class PlatformInfo:
             return _hip_host_get_device_pointer(ptr)
         return ptr
 
+    @contextlib.contextmanager
+    def restore_stack_limit(self) -> Iterator[None]:
+        """Restore, when the block exits normally, the stack limit its kernels raised.
+
+        CUDA raises the current context's limit to fit each kernel at launch and
+        keeps local memory reserved for it on every SM until the limit is set
+        lower again. A no-op on other vendors.
+        """
+        if not self.is_nvidia:
+            yield
+            return
+        from cuda.bindings import driver
+
+        stack = driver.CUlimit.CU_LIMIT_STACK_SIZE
+        error, limit = driver.cuCtxGetLimit(stack)
+        if error != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuCtxGetLimit failed with {error!s}")
+        yield
+        (error,) = driver.cuCtxSetLimit(stack, limit)
+        if error != driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"cuCtxSetLimit failed with {error!s}")
+
     @property
     def generation_name(self) -> str:
         """Human-readable generation name."""
@@ -253,6 +277,7 @@ class PlatformInfo:
         if self.is_amd:
             names = {
                 (9, 5): "CDNA4",  # MI350
+                (12, 0): "RDNA4",
                 (12, 5): "CDNA5",
             }
             return names.get(arch_version, f"GFX{arch_version[0]}.{arch_version[1]}")
@@ -267,14 +292,40 @@ class CapabilityRequirement:
     max_arch_version: ArchVersion | None = None
     required_features: frozenset[str] = frozenset()
     vendors: frozenset[str] | None = None  # None = any vendor
+    # Per-vendor minimum arch for kernels that serve several vendors, whose
+    # arch numbering differs (e.g. NVIDIA sm100 vs AMD gfx950). Use instead
+    # of min_arch_version, with one floor for every vendor in ``vendors``.
+    vendor_min_arch_versions: Mapping[str, ArchVersion] = field(
+        default_factory=dict, hash=False
+    )
+
+    def __post_init__(self) -> None:
+        if not self.vendor_min_arch_versions:
+            return
+        if self.min_arch_version is not None:
+            raise ValueError(
+                "set min_arch_version or vendor_min_arch_versions, not both"
+            )
+        if self.vendors is None or set(self.vendor_min_arch_versions) != self.vendors:
+            raise ValueError(
+                "vendor_min_arch_versions must give a floor for every vendor in "
+                "vendors, and only for those"
+            )
+
+    def min_arch_version_for(self, vendor: str) -> ArchVersion | None:
+        """The minimum arch version required on ``vendor``, if any."""
+        if self.vendor_min_arch_versions:
+            return self.vendor_min_arch_versions.get(vendor)
+        return self.min_arch_version
 
     def satisfied_by(self, platform: PlatformInfo) -> bool:
         """Check if platform satisfies these requirements."""
         if self.vendors and platform.vendor not in self.vendors:
             return False
 
-        if self.min_arch_version:
-            if not platform.arch_version >= self.min_arch_version:
+        min_arch_version = self.min_arch_version_for(platform.vendor)
+        if min_arch_version:
+            if not platform.arch_version >= min_arch_version:
                 return False
 
         if self.max_arch_version:
@@ -469,6 +520,7 @@ def _detect_rocm_platform() -> PlatformInfo:
     # Map supported AMD architectures.
     arch_map = {
         "gfx950": ArchVersion(9, 5),  # MI350
+        "gfx1201": ArchVersion(12, 0),  # RDNA4
         "gfx1250": ArchVersion(12, 5),
     }
     try:
@@ -502,6 +554,8 @@ def _detect_rocm_platform() -> PlatformInfo:
 
 def _get_rocm_sm_features(arch: str) -> frozenset[str]:
     """Determine ROCm SM features from architecture."""
+    # gfx1201 uses portable kernels. Do not advertise CDNA matrix/async-copy
+    # capabilities until the corresponding implementations support RDNA4.
     features: set[str] = set()
 
     if arch in ("gfx950", "gfx1250"):

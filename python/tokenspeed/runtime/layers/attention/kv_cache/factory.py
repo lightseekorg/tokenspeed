@@ -28,6 +28,7 @@ def create_cache_arena(
         cache_group_specs=spec.cache_group_specs,
         token_capacity=spec.token_capacity,
         enable_memory_saver=enable_memory_saver,
+        storage_plan=spec.storage_plan,
     )
 
 
@@ -56,6 +57,7 @@ def _mha_pool_class(family: str, *, mxfp8: bool) -> type[CachePool]:
         "inkling": (HybridInklingTokenToKVPool, HybridInklingTokenToKVPoolMXFP8),
         "qwen_gdn": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
         "qwen4_exp": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
+        "mamba2": (HybridMHATokenToKVPool, HybridMHATokenToKVPoolMXFP8),
     }
     plain, scaled = by_family[family]
     return scaled if mxfp8 else plain
@@ -308,6 +310,7 @@ _POOL_FACTORIES: dict[str, Callable[..., CachePool]] = {
     "inkling": _mha_shaped_pool,
     "qwen_gdn": _mha_shaped_pool,
     "qwen4_exp": _mha_shaped_pool,
+    "mamba2": _mha_shaped_pool,
     "mla": _mla_pool,
     "kimi_k3": _hybrid_kda_pool,
     "dsa": _dsa_pool,

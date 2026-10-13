@@ -1,4 +1,4 @@
-"""Dense FP8 (128,128) preparation and dispatch for selectable backends."""
+"""Dense FP8 (128,128) dispatch for selectable backends."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def _method() -> Fp8LinearMethod:
 
 @pytest.mark.parametrize("m", [1, 3, 4, 5])
 @pytest.mark.parametrize("backend", ["auto", "trtllm_cutedsl"])
-def test_process_weights_prepares_and_uses_native_scales(
+def test_process_weights_preserves_canonical_scales(
     m: int, backend: str, monkeypatch
 ) -> None:
     monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", backend)
@@ -55,13 +55,6 @@ def test_process_weights_prepares_and_uses_native_scales(
 
     method.process_weights_after_loading(layer)
 
-    plan = method.prepared_linear_plan(layer)
-    assert plan is not None
-    expected_override = {
-        "auto": "flashinfer_mm_fp8_blockscale",
-        "trtllm_cutedsl": "trtllm_cutedsl_mm_fp8_blockscale",
-    }
-    assert plan.override == expected_override[backend]
     assert torch.equal(layer.weight_scale_inv, canonical_scales)
 
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
@@ -71,3 +64,30 @@ def test_process_weights_prepares_and_uses_native_scales(
     ).repeat_interleave(128, dim=1)
     reference = x.float() @ dequant.t()
     torch.testing.assert_close(prepared.float(), reference, atol=2e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize("m", [1, 65, 129])
+def test_cutedsl_warmup_covers_capture_tiles(m: int, monkeypatch) -> None:
+    from tokenspeed_kernel.thirdparty import trtllm_blockwise
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "trtllm_cutedsl")
+    layer = _make_layer(256, 512)
+    method = _method()
+    method.process_weights_after_loading(layer)
+    warmup = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
+    method.apply(layer, warmup)
+    torch.cuda.synchronize()
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("CuTe-DSL compiled after eager warmup")
+
+    monkeypatch.setattr(trtllm_blockwise, "_compile", unexpected_compile)
+    x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = method.apply(layer, x)
+    x.normal_()
+    graph.replay()
+    expected = method.apply(layer, x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)

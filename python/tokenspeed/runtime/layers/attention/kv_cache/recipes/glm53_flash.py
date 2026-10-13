@@ -40,6 +40,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_replay_supported,
+    kda_verify_workspace_bytes,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
@@ -174,6 +178,15 @@ def declare_glm53_flash_groups(
         raise TypeError("GLM-5.3-Flash draft layers require a draft attention config")
 
     target_dsa = _require_dsa_config(attn_config, "target")
+    if target_dsa.index_k_format != "fp8_scaled":
+        # The pooled index-K rows below are planned as FP8 keys plus one
+        # scale, the plane the KPool indexer leaves read; a config naming
+        # another plane must not get a budget that disagrees with its rows.
+        raise ValueError(
+            "GLM-5.3-Flash plans its pooled index-K rows as FP8 keys with "
+            "scales (index_k_format='fp8_scaled'); got "
+            f"{target_dsa.index_k_format!r}"
+        )
     target_linear = _require_linear_config(attn_config)
     target_layer_types = _target_layer_types(attn_config, num_target_layers)
     group_ids = (
@@ -341,10 +354,28 @@ class Glm53FlashRecipe(CacheRecipe):
     def verify_scratch_in_pool(self) -> bool:
         return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
 
+    @cached_property
+    def replay_kda(self) -> bool:
+        """Cache the replay capability for this recipe's fixed configuration."""
+        return kda_replay_supported(self.attn_config)
+
     @override
     def workspace_bytes(self) -> int:
-        """Bounded raw KPool tails kept once per request and DSA layer."""
-        return self.pool_options().workspace_bytes
+        """Shared KPool tails plus the target's KDA verification staging."""
+        tail_bytes = self.pool_options().workspace_bytes
+        width = self.attn_config.speculative_num_draft_tokens
+        if (
+            self.server_args.speculative_algorithm is None
+            or self.server_args.disaggregation_mode == "prefill"
+            or width <= 1
+        ):
+            return tail_bytes
+        return tail_bytes + kda_verify_workspace_bytes(
+            self.attn_config,
+            self.groups(),
+            draft_token_num=width,
+            replay_kda=self.replay_kda,
+        )
 
     @override
     def pool_options(self) -> Glm53FlashPoolOptions:

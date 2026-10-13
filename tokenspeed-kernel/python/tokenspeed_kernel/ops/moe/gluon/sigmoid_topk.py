@@ -80,6 +80,7 @@ if current_platform().is_amd:
         signatures=format_signatures("router_logits", "dense", {torch.float32}),
         priority=Priority.SPECIALIZED,
         traits={
+            # Keep the Gluon path available for explicit selection below 513.
             "tokens": range(2, 1 << 31),
             "experts": frozenset({896}),
             "topk": frozenset({16}),

@@ -40,7 +40,7 @@ _MAX_AMD_GLUON_TOKENS = 65536
 _MAX_N = 12
 
 
-def _select_attn_res_kernel(
+def select_attn_res_fwd_kernel(
     layer_residual,
     block_residual,
     res_weight,
@@ -53,6 +53,15 @@ def _select_attn_res_kernel(
     num_valid_blocks,
     block_write_idx,
 ):
+    """Select the kernel :func:`attn_res_fwd` runs for these inputs.
+
+    Arguments match :func:`attn_res_fwd`, with ``output_eps`` the resolved
+    output RMSNorm epsilon.
+
+    Returns:
+        ``(kernel, valid_blocks)``: the selected kernel and the number of
+        snapshots it mixes.
+    """
     tokens, hidden_size = layer_residual.shape
     valid_blocks = (
         block_residual.shape[0] if num_valid_blocks is None else int(num_valid_blocks)
@@ -174,7 +183,7 @@ def attn_res_fwd(
     output_eps = (
         eps if out_norm_weight is None or out_norm_eps is None else out_norm_eps
     )
-    kernel, valid_blocks = _select_attn_res_kernel(
+    kernel, valid_blocks = select_attn_res_fwd_kernel(
         layer_residual,
         block_residual,
         res_weight,
@@ -235,7 +244,7 @@ def attn_res_fwd_available(
         eps if out_norm_weight is None or out_norm_eps is None else out_norm_eps
     )
     try:
-        kernel, _ = _select_attn_res_kernel(
+        kernel, _ = select_attn_res_fwd_kernel(
             layer_residual,
             block_residual,
             res_weight,
@@ -280,8 +289,46 @@ def _same_tensor_contract(
         )
 
 
-def gated_residual_mix(
-    normalized: _torch.Tensor,
+def pad_gated_residual_projection_weight(
+    projection_weight: _torch.Tensor,
+    *,
+    projection_rows: int,
+) -> _torch.Tensor:
+    """Prepare the down/inject weight once during model loading.
+
+    Args:
+        projection_weight: Down/inject weight shaped
+            ``[stored_rows, hc_count * hidden_size]``, with or without padding.
+        projection_rows: Number of logical down/inject rows before padding.
+
+    Returns:
+        BF16/FP16 storage aligned to a 16-byte GEMM output width, with newly
+        appended rows zeroed. Other dtypes use the original logical extent.
+        Weights already at the desired extent are returned unchanged. Pass
+        the same ``projection_rows`` to :func:`gated_residual_mix`.
+    """
+    if (
+        projection_weight.ndim != 2
+        or not 0 < projection_rows <= projection_weight.shape[0]
+    ):
+        raise ValueError(
+            "projection_rows must fit the two-dimensional projection weight"
+        )
+    alignment = 8 if projection_weight.dtype in (_torch.bfloat16, _torch.float16) else 1
+    padded_rows = (projection_rows + alignment - 1) // alignment * alignment
+    if padded_rows == projection_weight.shape[0]:
+        return projection_weight
+    if padded_rows == projection_rows:
+        return projection_weight[:projection_rows]
+    with _torch.no_grad():
+        return _torch.nn.functional.pad(
+            projection_weight[:projection_rows],
+            (0, 0, 0, padded_rows - projection_rows),
+        )
+
+
+def select_gated_residual_mix_kernel(
+    flat: _torch.Tensor,
     projection_weight: _torch.Tensor,
     up_weight: _torch.Tensor,
     hc_count: int,
@@ -289,80 +336,28 @@ def gated_residual_mix(
     lowrank: int,
     *,
     weights_independent: bool,
-    projection_scale: float = 1.0,
-    override: str | None = None,
-    solution: str | None = None,
-) -> tuple[_torch.Tensor, _torch.Tensor | None]:
-    """Mix normalized hyperconnection branches and optionally form inject logits.
-
-    The first projection is stored as one matrix. Its leading ``lowrank`` rows
-    are the mix-down weight and, when present, its final ``hc_count`` rows are
-    the block-injection weight. This preserves a single read of the wide input.
+    override: str | None,
+    solution: str | None,
+):
+    """Select the ``gated_residual_mix`` kernel for validated 2-D inputs.
 
     Args:
-        normalized: Normalized GPU residual streams shaped
-            ``[..., hc_count * hidden_size]``.
-        projection_weight: Fused down/inject weight shaped either
-            ``[lowrank, hc_count * hidden_size]`` or
-            ``[lowrank + hc_count, hc_count * hidden_size]``.
-        up_weight: Mix-up weight shaped
-            ``[hc_count * hidden_size, lowrank]``.
+        flat: Normalized residual streams shaped ``[rows, hc_count * hidden_size]``.
+        projection_weight: Fused down/inject weight (see ``gated_residual_mix``).
+        up_weight: Mix-up weight shaped ``[hc_count * hidden_size, lowrank]``.
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
-        weights_independent: Whether both weights are already ready and remain
-            unchanged within forward, permitting weight TMA before the activation
-            producer completes. Pass False when a preceding PDL kernel may write
-            either weight.
-        projection_scale: Scale applied to down and inject projection results.
-            It is ``1`` when an exact power-of-two scale was folded into the
-            checkpoint weight and ``1 / hc_count`` otherwise.
+        weights_independent: Whether both weights stay unchanged within forward.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
     Returns:
-        A pair containing the mixed tensor shaped ``[..., hidden_size]`` and
-        optional inject logits shaped ``[..., hc_count]``.
+        The selected kernel and the selection traits.
     """
-    if hc_count <= 1 or hidden_size <= 0 or lowrank <= 0:
-        raise ValueError("hc_count must exceed one and all dimensions must be positive")
-    if not math.isfinite(projection_scale) or projection_scale <= 0:
-        raise ValueError("projection_scale must be finite and positive")
-
-    wide = hc_count * hidden_size
-    flat = _flatten_rows(normalized, wide, "normalized")
-    if projection_weight.ndim != 2 or projection_weight.shape[1] != wide:
-        raise ValueError(
-            "projection_weight must have shape "
-            f"[{lowrank} or {lowrank + hc_count}, {wide}], got "
-            f"{tuple(projection_weight.shape)}"
-        )
-    projection_rows = int(projection_weight.shape[0])
-    if projection_rows not in (lowrank, lowrank + hc_count):
-        raise ValueError(
-            f"projection_weight has {projection_rows} rows; expected {lowrank} "
-            f"or {lowrank + hc_count}"
-        )
-    if up_weight.shape != (wide, lowrank):
-        raise ValueError(
-            f"up_weight must have shape {(wide, lowrank)}, got {tuple(up_weight.shape)}"
-        )
-    _same_tensor_contract(flat, projection_weight, "projection_weight")
-    _same_tensor_contract(flat, up_weight, "up_weight")
-    if not flat.is_cuda:
-        raise ValueError("gated_residual_mix requires GPU tensors")
+    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
 
     rows = int(flat.shape[0])
-    has_inject = projection_rows != lowrank
-    leading_shape = normalized.shape[:-1]
-    if rows == 0:
-        mixed = normalized.new_empty((*leading_shape, hidden_size))
-        inject = (
-            normalized.new_empty((*leading_shape, hc_count)) if has_inject else None
-        )
-        return mixed, inject
-
-    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
 
     traits = {
         "weights_independent": weights_independent,
@@ -395,6 +390,114 @@ def gated_residual_mix(
         override=override,
         solution=solution,
     )
+    return kernel, traits
+
+
+def gated_residual_mix(
+    normalized: _torch.Tensor,
+    projection_weight: _torch.Tensor,
+    up_weight: _torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    *,
+    projection_rows: int,
+    weights_independent: bool,
+    projection_scale: float = 1.0,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[_torch.Tensor, _torch.Tensor | None]:
+    """Mix normalized hyperconnection branches and optionally form inject logits.
+
+    The first projection is stored as one matrix. Its leading ``lowrank`` rows
+    are the mix-down weight and, when present, its next ``hc_count`` rows are
+    the block-injection weight. This preserves a single read of the wide input.
+    Loading may append padding rows; forward never copies or pads weights.
+
+    Args:
+        normalized: Normalized GPU residual streams shaped
+            ``[..., hc_count * hidden_size]``.
+        projection_weight: Fused down/inject weight shaped
+            ``[stored_rows, hc_count * hidden_size]``. ``stored_rows`` is
+            ``projection_rows`` or, for BF16/FP16, rounded up to eight rows
+            by :func:`pad_gated_residual_projection_weight` during loading.
+        up_weight: Mix-up weight shaped
+            ``[hc_count * hidden_size, lowrank]``.
+        hc_count: Number of residual branches.
+        hidden_size: Width of one branch.
+        lowrank: Rank of the mix gate bottleneck.
+        projection_rows: Logical weight rows, either ``lowrank`` without
+            injection or ``lowrank + hc_count`` with injection. Storage
+            padding does not contribute inject logits.
+        weights_independent: Whether both weights are already ready and remain
+            unchanged within forward, permitting weight TMA before the activation
+            producer completes. Pass False when a preceding PDL kernel may write
+            either weight.
+        projection_scale: Scale applied to down and inject projection results.
+            It is ``1`` when an exact power-of-two scale was folded into the
+            checkpoint weight and ``1 / hc_count`` otherwise.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        A pair containing the mixed tensor shaped ``[..., hidden_size]`` and
+        optional inject logits shaped ``[..., hc_count]``.
+    """
+    if hc_count <= 1 or hidden_size <= 0 or lowrank <= 0:
+        raise ValueError("hc_count must exceed one and all dimensions must be positive")
+    if not math.isfinite(projection_scale) or projection_scale <= 0:
+        raise ValueError("projection_scale must be finite and positive")
+
+    wide = hc_count * hidden_size
+    flat = _flatten_rows(normalized, wide, "normalized")
+    if projection_weight.ndim != 2 or projection_weight.shape[1] != wide:
+        raise ValueError(
+            "projection_weight must have shape "
+            f"[{lowrank} or {lowrank + hc_count}, {wide}], got "
+            f"{tuple(projection_weight.shape)}"
+        )
+    if projection_rows not in (lowrank, lowrank + hc_count):
+        raise ValueError(
+            f"projection_rows is {projection_rows}; expected {lowrank} "
+            f"or {lowrank + hc_count}"
+        )
+    alignment = 8 if projection_weight.dtype in (_torch.bfloat16, _torch.float16) else 1
+    padded_rows = (projection_rows + alignment - 1) // alignment * alignment
+    if projection_weight.shape[0] not in (projection_rows, padded_rows):
+        raise ValueError(
+            f"projection_weight has {projection_weight.shape[0]} stored rows; "
+            f"expected {projection_rows} or {padded_rows}"
+        )
+    if up_weight.shape != (wide, lowrank):
+        raise ValueError(
+            f"up_weight must have shape {(wide, lowrank)}, got {tuple(up_weight.shape)}"
+        )
+    _same_tensor_contract(flat, projection_weight, "projection_weight")
+    _same_tensor_contract(flat, up_weight, "up_weight")
+    if not flat.is_cuda:
+        raise ValueError("gated_residual_mix requires GPU tensors")
+
+    rows = int(flat.shape[0])
+    has_inject = projection_rows != lowrank
+    leading_shape = normalized.shape[:-1]
+    if rows == 0:
+        mixed = normalized.new_empty((*leading_shape, hidden_size))
+        inject = (
+            normalized.new_empty((*leading_shape, hc_count)) if has_inject else None
+        )
+        return mixed, inject
+
+    kernel, traits = select_gated_residual_mix_kernel(
+        flat,
+        projection_weight,
+        up_weight,
+        hc_count,
+        hidden_size,
+        lowrank,
+        weights_independent=weights_independent,
+        override=override,
+        solution=solution,
+    )
     ShapeCapture.get().record(
         "residual", "hyperconnection_mix", kernel.name, flat.dtype, traits
     )
@@ -412,6 +515,7 @@ def gated_residual_mix(
             hc_count,
             hidden_size,
             lowrank,
+            projection_rows,
             projection_scale,
             weights_independent,
         )
@@ -547,15 +651,62 @@ def mhc_mixes(
         raise ValueError(
             "mhc_mixes requires contiguous colocated tensors and positive iterations"
         )
+    traits = {
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
+        "hidden_size": int(residual.shape[-1]),
+    }
     kernel = select_kernel(
         "residual",
         "mhc_mixes",
         format_signature(residual=dense_tensor_format(residual.dtype)),
-        traits=None,
+        traits=traits,
         override=None,
         solution=None,
     )
     return kernel(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters)
+
+
+def mhc_apply_pre(
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    *,
+    norm_weight: _torch.Tensor | None,
+    norm_eps: float | None,
+) -> _torch.Tensor:
+    """Collapse residual streams with given pre coefficients into a layer input.
+
+    Args:
+        residual: Contiguous BF16 residual streams ``[..., hc_mult, H]``.
+        pre: Contiguous FP32 pre coefficients ``[..., hc_mult]``, e.g. the
+            previous sublayer's ``mhc_mixes`` output.
+        norm_weight: Optional RMSNorm weight ``[H]`` applied to the BF16-rounded
+            stream sum. ``None`` returns the plain collapse.
+        norm_eps: RMSNorm epsilon; must be given exactly when ``norm_weight`` is.
+
+    Returns:
+        BF16 layer input ``[..., H]``.
+    """
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
+    if pre.shape != residual.shape[:-1]:
+        raise ValueError("mhc_apply_pre requires pre shaped like residual[..., :, 0]")
+    traits = {
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
+        "fused_norm": norm_weight is not None,
+        "hc_mult": int(residual.shape[-2]),
+    }
+    kernel = select_kernel(
+        "residual",
+        "mhc_apply_pre",
+        format_signature(
+            residual=dense_tensor_format(residual.dtype),
+            pre=dense_tensor_format(pre.dtype),
+        ),
+        traits=traits,
+        override=None,
+        solution=None,
+    )
+    return kernel(residual, pre, norm_weight=norm_weight, norm_eps=norm_eps)
 
 
 def mhc_pre(
@@ -603,6 +754,7 @@ def mhc_pre(
     num_tokens = int(residual.numel() // (hc_mult * hidden_size))
     traits = {
         "num_tokens": num_tokens,
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
         "hc_mult": hc_mult,
         "hidden_size": hidden_size,
         "sinkhorn_iters": int(sinkhorn_iters),
@@ -671,6 +823,7 @@ def mhc_post(
     num_tokens = int(residual.numel() // (hc_mult * hidden_size))
     traits = {
         "num_tokens": num_tokens,
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
         "hc_mult": hc_mult,
         "hidden_size": hidden_size,
     }
@@ -771,10 +924,12 @@ __all__ = [
     "attn_res_fwd_available",
     "gated_residual_combine",
     "gated_residual_mix",
+    "mhc_apply_pre",
     "mhc_fused_hc",
     "mhc_mixes",
     "mhc_post",
     "mhc_pre",
+    "pad_gated_residual_projection_weight",
 ]
 
 

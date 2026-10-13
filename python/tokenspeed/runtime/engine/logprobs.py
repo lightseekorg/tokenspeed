@@ -44,6 +44,39 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.engine.io_struct import BatchStrOut
 
 
+def resolve_logprob_start_len(logprob_start_len: int | None, input_len: int) -> int:
+    """Resolve an SGLang ``logprob_start_len`` against a prompt of ``input_len``.
+
+    SGLang semantics: ``-1`` (or omitted) means "the last prompt token only",
+    so the response's ``input_token_logprobs`` is the single ``(None,
+    last_token)`` entry and no prompt position needs logits. Any start at or
+    past the prompt end is a client error.
+
+    Args:
+        logprob_start_len: The request's value; ``None`` and ``-1`` select the
+            default.
+        input_len: The (padded) prompt length the start is relative to.
+
+    Returns:
+        The start position in ``[0, input_len)``.
+
+    Raises:
+        ValueError: ``logprob_start_len`` is below ``-1`` or ``>= input_len``.
+    """
+    if logprob_start_len is None or logprob_start_len == -1:
+        return max(input_len - 1, 0)
+    if logprob_start_len < -1:
+        raise ValueError(
+            f"logprob_start_len must be -1 or >= 0, got {logprob_start_len}."
+        )
+    if logprob_start_len >= input_len:
+        raise ValueError(
+            f"logprob_start_len ({logprob_start_len}) must be smaller than the "
+            f"prompt length ({input_len})."
+        )
+    return logprob_start_len
+
+
 @dataclass
 class Logprob:
     """Per-output-token logprob entry (vLLM-style).

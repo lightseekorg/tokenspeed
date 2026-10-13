@@ -1,19 +1,46 @@
-name: Release PyPI
+name: Build and Release TokenSpeed
 on:
+  schedule:
+    - cron: "0 3 * * *"
   push:
     branches:
       - main
     paths:
       - "python/tokenspeed/version.py"
   workflow_dispatch:
+    inputs:
+      nightly:
+        description: "Build a dated nightly with the same-date tokenspeed-kernel dependency."
+        type: boolean
+        default: false
+      replace_nightly:
+        description: "Replace existing nightly assets and refresh their pip index hashes (main only)."
+        type: boolean
+        default: false
+      publish_github:
+        description: "Publish nightly distributions and the pip index from main."
+        type: boolean
+        default: true
+      version_date:
+        description: "Nightly version date override, formatted as YYYYMMDD."
+        type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     if: github.repository == 'lightseekorg/tokenspeed'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      nightly: ${{ steps.metadata.outputs.nightly }}
+      version: ${{ steps.metadata.outputs.version }}
+      kernel_version: ${{ steps.metadata.outputs.kernel_version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,6 +49,55 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Prepare nightly metadata
+        id: metadata
+        env:
+          NIGHTLY: ${{ github.event_name == 'schedule' || inputs.nightly }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
+          PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
+          VERSION_DATE: ${{ inputs.version_date }}
+        run: |
+          if [ "$REPLACE_NIGHTLY" = "true" ] && { [ "$NIGHTLY" != "true" ] || [ "$PUBLISH_GITHUB" != "true" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; }; then
+            echo "Replacing nightly assets requires nightly publication from main." >&2
+            exit 1
+          fi
+          echo "nightly=${NIGHTLY}" >> "$GITHUB_OUTPUT"
+          if [ "$NIGHTLY" != "true" ]; then
+            exit 0
+          fi
+          if [ "$PUBLISH_GITHUB" = "true" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Nightly publication requires main." >&2
+            exit 1
+          fi
+          python -m pip install --upgrade "setuptools<82" wheel packaging
+          version_date="${VERSION_DATE:-$(date -u +%Y%m%d)}"
+          kernel_version=$(
+            cd tokenspeed-kernel/python
+            TOKENSPEED_KERNEL_BACKEND=cuda \
+            TOKENSPEED_KERNEL_NIGHTLY=true \
+            TOKENSPEED_KERNEL_VERSION_DATE="$version_date" \
+              python setup.py --version
+          )
+          version=$(python .github/scripts/prepare-tokenspeed-nightly.py \
+            . "$version_date" "$kernel_version")
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
+          echo "TokenSpeed ${version} requires tokenspeed-kernel==${kernel_version}"
+
+          # The one-hour schedule offset is not a publication-order guarantee.
+          for attempt in $(seq 1 60); do
+            if python -m pip download --no-deps --only-binary=:all: \
+              --index-url https://lightseek.org/whl/nightly \
+              --dest kernel-ready "tokenspeed-kernel==${kernel_version}"; then
+              exit 0
+            fi
+            if [ "$attempt" = 60 ]; then
+              echo "The same-date kernel nightly is not published; refusing to release TokenSpeed." >&2
+              exit 1
+            fi
+            sleep 60
+          done
 
       - name: Build distributions
         run: |
@@ -39,7 +115,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.repository == 'lightseekorg/tokenspeed'
+    if: github.repository == 'lightseekorg/tokenspeed' && needs.build.outputs.nightly != 'true'
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
@@ -56,3 +132,196 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+
+  publish-nightly:
+    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: wheelhouse-publication
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: tokenspeed-dist
+          path: dist/tokenspeed-dist
+
+      - name: Publish nightly distributions
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
+        run: |
+          test "$(gh api user --jq .login)" = lightseek-bot
+          for repository in lightseekorg/whl lightseekorg/tokenspeed; do
+            test "$(gh repo view "$repository" --json visibility --jq .visibility)" = PUBLIC
+          done
+          tag="tokenspeed-nightly-v${VERSION}"
+          title="tokenspeed ${VERSION}"
+          notes="${title} built from lightseekorg/tokenspeed@${GITHUB_SHA}"
+          assets=(dist/tokenspeed-dist/*.whl dist/tokenspeed-dist/*.tar.gz)
+          if gh release view "$tag" --repo lightseekorg/whl >/dev/null 2>&1; then
+            if [ "$REPLACE_NIGHTLY" = "true" ]; then
+              gh release upload "$tag" "${assets[@]}" --repo lightseekorg/whl --clobber
+              printf '%s\n\n%s\n' "$notes" \
+                "Replacement build; reinstall with --no-cache-dir --force-reinstall if already installed." > release-notes.txt
+              gh release edit "$tag" --repo lightseekorg/whl --notes-file release-notes.txt
+            else
+              existing_assets=$(gh release view "$tag" --repo lightseekorg/whl --json assets --jq '.assets[].name')
+              for asset in "${assets[@]}"; do
+                if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
+                  existing_notes=$(gh release view "$tag" --repo lightseekorg/whl --json body --jq .body)
+                  if [ "$existing_notes" != "$notes" ]; then
+                    echo "Cannot complete a nightly release from a different source commit." >&2
+                    exit 1
+                  fi
+                  gh release upload "$tag" "$asset" --repo lightseekorg/whl
+                fi
+              done
+            fi
+          else
+            gh release create "$tag" "${assets[@]}" --repo lightseekorg/whl \
+              --title "$title" --notes "$notes" --prerelease
+          fi
+          gh api "repos/lightseekorg/whl/releases/tags/${tag}" > nightly-release.json
+
+      - name: Checkout wheel index
+        uses: actions/checkout@v4
+        with:
+          repository: lightseekorg/whl
+          ref: gh-pages
+          path: wheelhouse
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+
+      - name: Publish nightly pip index
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
+        run: |
+          replace_args=()
+          if [ "$REPLACE_NIGHTLY" = "true" ]; then
+            replace_args+=(--replace)
+          fi
+          python .github/scripts/update-nightly-index.py "${replace_args[@]}" \
+            --package tokenspeed --variant cu130 wheelhouse nightly-release.json dist
+          cd wheelhouse
+          git config user.name lightseek-bot
+          git config user.email 243258330+lightseek-bot@users.noreply.github.com
+          git add nightly/index.html nightly/tokenspeed/index.html
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git diff --cached
+          if [ -f .pre-commit-config.yaml ]; then
+            pre-commit run --all-files
+          fi
+          git commit -s -m "Publish tokenspeed nightly index"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:gh-pages; then
+              gh api repos/lightseekorg/whl/contents/nightly/tokenspeed/index.html --jq .content | base64 --decode
+              gh api repos/lightseekorg/whl/contents/nightly/index.html --jq .content | base64 --decode
+              exit 0
+            fi
+            git fetch origin gh-pages
+            git rebase origin/gh-pages
+          done
+          echo "Could not publish the nightly index after three attempts." >&2
+          exit 1
+
+  check-nightly-rocm:
+    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    needs: [build, publish-nightly]
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Wait for same-date ROCm kernel nightly
+        env:
+          KERNEL_VERSION: ${{ needs.build.outputs.kernel_version }}
+        run: |
+          # CUDA's successful publication does not guarantee ROCm is ready.
+          for attempt in $(seq 1 60); do
+            if python -m pip download --no-deps --only-binary=:all: \
+              --index-url https://lightseek.org/whl/nightly/rocm7.2 \
+              --dest kernel-ready "tokenspeed-kernel==${KERNEL_VERSION}"; then
+              exit 0
+            fi
+            if [ "$attempt" = 60 ]; then
+              echo "The same-date ROCm kernel nightly is not published; refusing to index TokenSpeed for ROCm." >&2
+              exit 1
+            fi
+            sleep 60
+          done
+
+  publish-nightly-rocm:
+    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    needs: [build, check-nightly-rocm]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: wheelhouse-publication
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download TokenSpeed distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: tokenspeed-dist
+          path: dist/tokenspeed-dist
+
+      - name: Checkout wheel index
+        uses: actions/checkout@v4
+        with:
+          repository: lightseekorg/whl
+          ref: gh-pages
+          path: wheelhouse
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+
+      - name: Publish ROCm TokenSpeed nightly index
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          VERSION: ${{ needs.build.outputs.version }}
+          REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
+        run: |
+          test "$(gh api user --jq .login)" = lightseek-bot
+          gh api "repos/lightseekorg/whl/releases/tags/tokenspeed-nightly-v${VERSION}" > nightly-release.json
+          replace_args=()
+          if [ "$REPLACE_NIGHTLY" = "true" ]; then
+            replace_args+=(--replace)
+          fi
+          python .github/scripts/update-nightly-index.py "${replace_args[@]}" \
+            --package tokenspeed --variant rocm72 wheelhouse nightly-release.json dist
+          cd wheelhouse
+          git config user.name lightseek-bot
+          git config user.email 243258330+lightseek-bot@users.noreply.github.com
+          git add nightly/index.html nightly/rocm7.2/index.html nightly/rocm7.2/tokenspeed/index.html
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git diff --cached
+          if [ -f .pre-commit-config.yaml ]; then
+            pre-commit run --all-files
+          fi
+          git commit -s -m "Publish tokenspeed ROCm nightly index"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:gh-pages; then
+              gh api repos/lightseekorg/whl/contents/nightly/rocm7.2/tokenspeed/index.html --jq .content | base64 --decode
+              gh api repos/lightseekorg/whl/contents/nightly/rocm7.2/index.html --jq .content | base64 --decode
+              exit 0
+            fi
+            git fetch origin gh-pages
+            git rebase origin/gh-pages
+          done
+          echo "Could not publish the ROCm TokenSpeed nightly index after three attempts." >&2
+          exit 1

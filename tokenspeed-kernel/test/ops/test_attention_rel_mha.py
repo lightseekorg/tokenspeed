@@ -45,6 +45,7 @@ from rel_mha_reference import (
     build_paged,
     cu_seqlens,
     ref_rel_attn,
+    ref_rel_logits,
     require_fa4,
 )
 from tokenspeed_kernel.ops.attention.mha import (
@@ -319,3 +320,76 @@ def test_mha_ops_interface_has_no_rel_args(device: str, require) -> None:
     )
     assert out.shape == q_decode.shape
     assert not torch.isnan(out).any()
+
+
+@pytest.mark.parametrize("head_dim", [128, 96], ids=["d128", "d96"])
+@pytest.mark.parametrize("window_left", [-1, 31], ids=["full", "swa32"])
+def test_triton_rel_mha_prefill_lse(
+    device: str, require, head_dim: int, window_left: int
+) -> None:
+    """Triton prefill output and LSE, including a non-power-of-two head dim."""
+    require("attention", "rel_mha_prefill", "triton", DTYPE, "q")
+    q_lens, rel_extent, scale = [150, 64, 1], 48, 1.0 / head_dim
+    total = sum(q_lens)
+    q = torch.randn(total, NUM_Q_HEADS, head_dim, device=device, dtype=DTYPE) * 0.5
+    k = torch.randn(total, NUM_KV_HEADS, head_dim, device=device, dtype=DTYPE) * 0.5
+    v = torch.randn(total, NUM_KV_HEADS, head_dim, device=device, dtype=DTYPE) * 0.5
+    rel_logits = torch.randn(total, NUM_Q_HEADS, rel_extent, device=device, dtype=DTYPE)
+    cu = cu_seqlens(q_lens, device)
+    out, lse = rel_mha_prefill(
+        q=q,
+        k=k,
+        v=v,
+        rel_logits=rel_logits,
+        cu_seqlens=cu,
+        cu_seqlens_cpu=cu.tolist(),
+        max_seqlen=max(q_lens),
+        window_left=window_left,
+        return_lse=True,
+        softmax_scale=scale,
+        solution="triton",
+    )
+    for s, e in zip(cu.tolist()[:-1], cu.tolist()[1:]):
+        args = (q[s:e], k[s:e], rel_logits[s:e], rel_extent, window_left, scale)
+        ref_lse = ref_rel_logits(*args).logsumexp(-1).transpose(0, 1)
+        torch.testing.assert_close(lse[s:e], ref_lse, atol=1e-4, rtol=1e-4)
+        ref = ref_rel_attn(q[s:e], k[s:e], v[s:e], *args[2:])
+        torch.testing.assert_close(out[s:e], ref, atol=TOL, rtol=0)
+
+
+def test_triton_rel_mha_extend_lse_ignores_page_padding(device: str, require) -> None:
+    """Multi-block windowed extend; NaN in page padding must not reach the output."""
+    require("attention", "rel_mha_extend_with_kvcache", "triton", DTYPE, "q")
+    q_lens, kv_lens, rel_extent, window_left = [150, 7], [430, 7], 64, 100
+    scale = 1.0 / HEAD_DIM
+    k_cache, v_cache, page_table, ks, vs = build_paged(kv_lens, device, PAGE)
+    for i, length in enumerate(kv_lens):
+        last_page, used = page_table[i, (length - 1) // PAGE], (length - 1) % PAGE + 1
+        k_cache[last_page, used:] = float("nan")
+        v_cache[last_page, used:] = float("nan")
+    total = sum(q_lens)
+    q = torch.randn(total, NUM_Q_HEADS, HEAD_DIM, device=device, dtype=DTYPE) * 0.5
+    rel_logits = torch.randn(total, NUM_Q_HEADS, rel_extent, device=device, dtype=DTYPE)
+    cu = cu_seqlens(q_lens, device)
+    out, lse = rel_mha_extend_with_kvcache(
+        q=q,
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu_seqlens(kv_lens, device),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=torch.tensor(kv_lens, device=device, dtype=torch.int32),
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(kv_lens),
+        rel_logits=rel_logits,
+        window_left=window_left,
+        return_lse=True,
+        softmax_scale=scale,
+        solution="triton",
+    )
+    for i, (s, e) in enumerate(zip(cu.tolist()[:-1], cu.tolist()[1:])):
+        args = (rel_logits[s:e], rel_extent, window_left, scale)
+        ref_lse = ref_rel_logits(q[s:e], ks[i], *args).logsumexp(-1).transpose(0, 1)
+        torch.testing.assert_close(lse[s:e], ref_lse, atol=1e-4, rtol=1e-4)
+        ref = ref_rel_attn(q[s:e], ks[i], vs[i], *args)
+        torch.testing.assert_close(out[s:e], ref, atol=TOL, rtol=0)

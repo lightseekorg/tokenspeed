@@ -156,6 +156,8 @@ class TestInklingMTPLoadWeights(unittest.TestCase):
         from tokenspeed.runtime.models.inkling import InklingDenseMLP
 
         self.assertEqual(len(self.model.model.layers), NUM_DEPTHS)
+        # The multi-depth drafter's depth-count contract attribute.
+        self.assertEqual(self.model.num_mtp_layers, NUM_DEPTHS)
         for layer in self.model.model.layers:
             block = layer.transformer_block
             self.assertFalse(block.is_moe)

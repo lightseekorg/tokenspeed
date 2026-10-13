@@ -29,23 +29,26 @@ from torch import nn
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.hf_transformers_utils import model_loader_architectures
 
 logger = get_colorful_logger(__name__)
 
 
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype) -> Generator[None]:
-    """Sets the default torch dtype to the given dtype."""
+    """Temporarily set the default dtype, restoring it even if loading fails."""
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
-    yield
-    torch.set_default_dtype(old_dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(old_dtype)
 
 
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
     from tokenspeed.runtime.models.registry import ModelRegistry
 
-    architectures = getattr(model_config.hf_config, "architectures", [])
+    architectures = model_loader_architectures(model_config.hf_config)
     # Mixtral only supports the quantization backends listed here in the
     # current model registry and loader stack.
     mixtral_supported = ["fp8", "compressed-tensors"]
@@ -57,4 +60,15 @@ def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], 
     ):
         architectures = ["QuantMixtralForCausalLM"]
 
-    return ModelRegistry.resolve_model_cls(architectures)
+    model_cls, architecture = ModelRegistry.resolve_model_cls(architectures)
+    profiled = model_config.model_profile_architecture
+    if profiled is not None and architecture != profiled:
+        # An earlier architecture in the list resolved to another class, so
+        # the plugin profile that configured attention and cache geometry
+        # describes a model that is not the one being built.
+        raise ValueError(
+            f"the model loader resolves architecture {architecture!r}, but the "
+            f"plugin profile was taken from {profiled!r}; list the plugin "
+            "architecture first in config.architectures"
+        )
+    return model_cls, architecture

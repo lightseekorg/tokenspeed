@@ -43,12 +43,6 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
-from tokenspeed.runtime.layers.utils import (
-    CP_METADATA,
-    ENABLE_CP,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-)
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -58,6 +52,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3DecoderLayer,
     DeepseekV3DraftAttentionMLA,
     DeepseekV3ForCausalLM,
+    _prepare_mla_kv_b_proj_weights,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,57 +70,15 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
     def attention_cls(self) -> type[nn.Module]:
         return DeepseekV3DraftAttentionMLA
 
-    def _maybe_narrow_residual(
+    def narrow_residual(
         self,
         residual: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
         """Narrow residual to the draft attention's [bs, H] live rows."""
-        if ctx.draft_narrowing is None or ctx.forward_mode.is_idle():
+        if ctx.draft_narrowing is None:
             return residual
         return residual.index_select(0, ctx.gather_ids)
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        residual: torch.Tensor | None,
-    ) -> torch.Tensor:
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
-
-        if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
-            )
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                ctx=ctx,
-                comm_manager=self.comm_manager,
-            )
-            residual = self._maybe_narrow_residual(residual, ctx)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        else:
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        return hidden_states, residual
 
 
 class DeepseekModelNextN(nn.Module):
@@ -196,15 +149,6 @@ class DeepseekModelNextN(nn.Module):
         hidden_states = self.eh_proj(fused)
 
         residual = None
-        if CP_METADATA:
-            hidden_states = cp_split_and_rebuild_data(
-                hidden_states,
-                CP_METADATA.value.split_list,
-                CP_METADATA.value.zigzag_index,
-            )
-            positions = cp_split_and_rebuild_data(
-                positions, CP_METADATA.value.split_list, CP_METADATA.value.zigzag_index
-            )
         hidden_states, residual = self.decoder(
             positions,
             hidden_states,
@@ -213,18 +157,8 @@ class DeepseekModelNextN(nn.Module):
         )
 
         if not ctx.forward_mode.is_idle():
-            if not ENABLE_CP:
-                hidden_states, _ = self.decoder.comm_manager.final_norm(
-                    hidden_states, residual, ctx, self.shared_head.norm
-                )
-            else:
-                hidden_states, _ = self.shared_head.norm(hidden_states, residual)
-        if CP_METADATA:
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                CP_METADATA.value,
-                self.mapping.attn.tp_rank,
-                self.mapping.attn.tp_group,
+            hidden_states, _ = self.decoder.comm_manager.final_norm(
+                hidden_states, residual, ctx, self.shared_head.norm
             )
         return hidden_states, None
 
@@ -240,6 +174,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.mapping = mapping
+        # ``q_a_proj`` / ``kv_a_proj_with_mqa`` checkpoint tensors waiting for
+        # their partner before the fused projection is written. Kept on the
+        # instance because a live update streams the checkpoint in chunks and
+        # the pair may straddle a ``load_weights`` call.
+        self._pending_a_proj: dict[str, torch.Tensor] = {}
 
         # FP4 quantization is not used for the NextN draft model.
         # The NVIDIA FP4 checkpoint stores NextN MoE weights in BF16,
@@ -257,7 +196,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             config, mapping=self.mapping, quant_config=quant_config
         )
 
-        if self.mapping.attn.has_dp:
+        # The draft shares the target's LM-head layout (mapping.lm_head):
+        # replicated under attention DP unless --lm-head-tp-size shards it.
+        if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
@@ -268,17 +209,18 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
+                tp_rank=self.mapping.lm_head.tp_rank,
+                tp_size=self.mapping.lm_head.tp_size,
+                tp_group=self.mapping.lm_head.tp_group,
             )
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
 
     @torch.no_grad()
@@ -338,7 +280,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        cached_a_proj = self._pending_a_proj
 
         nextn_spec_weight_names = [
             "shared_head.norm",
@@ -483,6 +425,31 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     weight_loader(param, loaded_weight)
         self.post_load_weights()
 
+    def begin_weight_update(self) -> None:
+        super().begin_weight_update()
+        self._pending_a_proj.clear()
+
+    def abort_weight_update(self) -> None:
+        super().abort_weight_update()
+        self._pending_a_proj.clear()
+
+    def end_weight_update(self) -> None:
+        """Close the session; a half-arrived ``q_a``/``kv_a`` pair fails it.
+
+        Raises:
+            RuntimeError: One side of a ``q_a_proj`` / ``kv_a_proj_with_mqa``
+                pair was streamed without the other, so the fused projection
+                still holds the previous weights.
+        """
+        if self._pending_a_proj:
+            unpaired = sorted(self._pending_a_proj)
+            self.abort_weight_update()
+            raise RuntimeError(
+                f"{type(self).__name__}: the update streamed {unpaired} without "
+                "the partner tensor the fused q/kv a-projection needs"
+            )
+        super().end_weight_update()
+
     def post_load_weights(self):
         self_attn = self.model.decoder.self_attn
         if (
@@ -504,11 +471,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         else:
             w = self_attn.kv_b_proj.weight
 
-        w_kc, w_vc = w.unflatten(
-            0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-        ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-        self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-        self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+        self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(w, self_attn)
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

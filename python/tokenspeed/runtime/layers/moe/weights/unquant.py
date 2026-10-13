@@ -36,13 +36,14 @@ def create_dense_weight_pair(
     with_bias: bool = False,
 ) -> int:
     ispp = spec.intermediate_size // spec.tp_size
+    w13_rows = 2 * ispp if spec.gated else ispp
     # Zeroed rather than empty: a padded intermediate size leaves the tail rows
     # of w13 and columns of w2 unwritten by the loader, and only zeros there
     # contribute nothing to the MoE output.
     w13_weight = torch.nn.Parameter(
         torch.zeros(
             spec.num_local_experts,
-            2 * ispp,
+            w13_rows,
             spec.hidden_size,
             dtype=params_dtype,
         ),
@@ -66,7 +67,7 @@ def create_dense_weight_pair(
 
     if with_bias:
         w13_weight_bias = torch.nn.Parameter(
-            torch.zeros(spec.num_local_experts, 2 * ispp, dtype=params_dtype),
+            torch.zeros(spec.num_local_experts, w13_rows, dtype=params_dtype),
             requires_grad=False,
         )
         w2_weight_bias = torch.nn.Parameter(

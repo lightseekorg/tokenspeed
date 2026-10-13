@@ -100,9 +100,9 @@ class MLAStaticTileSchedulerParams:
         cluster_shape_mnk: cute.Shape,
         split_kv: cutlass.Int32,
         *,
-        problem_shape_b_fdd: cute.FastDivmodDivisor = None,
-        problem_shape_s_fdd: cute.FastDivmodDivisor = None,
-        split_kv_fdd: cute.FastDivmodDivisor = None,
+        problem_shape_b_fdd: cute.FastDivmodDivisorV2 = None,
+        problem_shape_s_fdd: cute.FastDivmodDivisorV2 = None,
+        split_kv_fdd: cute.FastDivmodDivisorV2 = None,
         loc=None,
         ip=None,
     ):
@@ -127,15 +127,15 @@ class MLAStaticTileSchedulerParams:
         self.split_kv = split_kv
         self.split_kv_fdd = split_kv_fdd
         if cutlass.const_expr(problem_shape_b_fdd is None):
-            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor(
+            self.problem_shape_b_fdd = cute.fast_divmod_create_divisor_v2(
                 problem_shape_b, loc=loc, ip=ip
             )
         if cutlass.const_expr(problem_shape_s_fdd is None):
-            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor(
+            self.problem_shape_s_fdd = cute.fast_divmod_create_divisor_v2(
                 problem_shape_s, loc=loc, ip=ip
             )
         if cutlass.const_expr(split_kv_fdd is None):
-            self.split_kv_fdd = cute.fast_divmod_create_divisor(
+            self.split_kv_fdd = cute.fast_divmod_create_divisor_v2(
                 split_kv, loc=loc, ip=ip
             )
         self.loc = loc
@@ -159,12 +159,12 @@ class MLAStaticTileSchedulerParams:
         )
         split_kv = cutlass.new_from_mlir_values(self.split_kv, (values[2],))
         problem_shape_b_fdd = cutlass.new_from_mlir_values(
-            self.problem_shape_b_fdd, (values[3],)
+            self.problem_shape_b_fdd, values[3:5]
         )
         problem_shape_s_fdd = cutlass.new_from_mlir_values(
-            self.problem_shape_s_fdd, (values[4],)
+            self.problem_shape_s_fdd, values[5:7]
         )
-        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, (values[5],))
+        split_kv_fdd = cutlass.new_from_mlir_values(self.split_kv_fdd, values[7:9])
         return MLAStaticTileSchedulerParams(
             self.is_persistent,
             problem_shape_b,
@@ -335,13 +335,13 @@ class MLAStaticTileScheduler:
         return values
 
     def __new_from_mlir_values__(self, values):
-        assert len(values) == 13
-        new_params = cutlass.new_from_mlir_values(self.params, values[0:6])
+        assert len(values) == 16
+        new_params = cutlass.new_from_mlir_values(self.params, values[0:9])
         new_current_work_linear_idx = cutlass.new_from_mlir_values(
-            self.current_work_linear_idx, [values[6]]
+            self.current_work_linear_idx, [values[9]]
         )
-        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[7:10])
-        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[10:])
+        new_blk_coord = cutlass.new_from_mlir_values(self.blk_coord, values[10:13])
+        new_grid_shape = cutlass.new_from_mlir_values(self.grid_shape, values[13:])
         return MLAStaticTileScheduler(
             new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
         )

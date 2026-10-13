@@ -186,6 +186,56 @@ def test_measure_captures_one_invocation_and_reports_statistics() -> None:
     assert backend.log[-1] == "cleanup:0"
 
 
+@pytest.mark.parametrize("cold_cache", [False, True])
+def test_profiler_uses_final_eager_warmup_and_measured_replays(
+    cold_cache: bool,
+) -> None:
+    backend = _FakeBackend([1.0, 2.0])
+
+    @contextmanager
+    def profile(phase, index):
+        backend.log.append(f"profile_enter:{phase}:{index}")
+        yield
+        backend.log.append(f"profile_exit:{phase}:{index}")
+
+    def invoke():
+        backend.log.append("invoke")
+
+    GraphTimer(
+        GraphBenchmarkConfig(
+            eager_warmup_iterations=2,
+            replay_warmup_iterations=1,
+        ),
+        backend=backend,
+    ).measure(
+        PreparedInvocation(invoke),
+        cold_cache=cold_cache,
+        measurement_blocks=2,
+        profile_invocation=profile,
+    )
+
+    assert [item for item in backend.log if item.startswith("profile_")] == [
+        "profile_enter:eager_metadata:1",
+        "profile_exit:eager_metadata:1",
+        "profile_enter:measurement:None",
+        "profile_enter:graph_replay:0",
+        "profile_exit:graph_replay:0",
+        "profile_enter:graph_replay:1",
+        "profile_exit:graph_replay:1",
+        "profile_exit:measurement:None",
+    ]
+    for index in range(2):
+        enter = backend.log.index(f"profile_enter:graph_replay:{index}")
+        exit = backend.log.index(f"profile_exit:graph_replay:{index}")
+        assert backend.log[enter + 1].startswith("record:")
+        assert backend.log[enter + 2] == "replay:0"
+        assert backend.log[enter + 3].startswith("record:")
+        assert exit == enter + 4
+
+    measurement_sync = max(_positions(backend.log, "sync:benchmark"))
+    assert measurement_sync < backend.log.index("profile_exit:measurement:None")
+
+
 def test_events_are_primed_before_capture_and_reused_for_measurement() -> None:
     backend = _FakeBackend([1.0, 1.0])
     config = GraphBenchmarkConfig(

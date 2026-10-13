@@ -39,9 +39,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _global_scale_passthrough,
     _maybe_extract_swiglu_args,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._layouts import (
-    _moe_partial_reduce,
-)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.launch import (
     _dense_grid_dims,
     _launch_kernel,
@@ -53,6 +50,9 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
     _prefill_launch_tuning,
     _ragged_slice_size,
     _resolve_prefill_slice_modes,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
+    gluon_mxfp4_moe_stage2_reduce_kernel,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
     MXFP4_BLOCK,
@@ -513,18 +513,20 @@ def gluon_mxfp_combine(
             )
             R_BLOCK_N = 256
             r_grid = (n_tokens_eff * ((y_n + R_BLOCK_N - 1) // R_BLOCK_N),)
-            _moe_partial_reduce[r_grid](
+            gluon_mxfp4_moe_stage2_reduce_kernel[r_grid](
                 y,
                 y_reduced,
                 n_tokens_eff,
                 y_n,
-                y.stride(0),
                 n_act_eff * y.stride(0),
+                y.stride(0),
                 y.stride(1),
                 y_reduced.stride(0),
                 y_reduced.stride(1),
-                SPLIT_K=n_act_eff,
+                BLOCK_M=1,
+                TOP_K=n_act_eff,
                 BLOCK_N=R_BLOCK_N,
+                MASK_INVALID_ROUTES=False,
                 num_warps=1,
             )
             y = y_reduced

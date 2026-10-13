@@ -53,9 +53,13 @@ def _mla_decode_kernel(
     stride_lse_b,
     stride_lse_q,
     stride_lse_h,
-    page_table_stride_b: tl.constexpr,
+    # Page-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    page_table_stride_b,
     PAGE_SIZE: tl.constexpr,
-    MAX_SEQLEN_K: tl.constexpr,
+    # Unused by this kernel; the per-batch longest context must not key its
+    # compilation.
+    MAX_SEQLEN_K,
     logit_cap: tl.constexpr,
     KV_LORA_RANK: tl.constexpr,
     QK_ROPE_HEAD_DIM: tl.constexpr,

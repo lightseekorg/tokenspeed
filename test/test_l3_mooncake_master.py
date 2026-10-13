@@ -273,11 +273,10 @@ class MooncakeMasterLiveTest(unittest.TestCase):
             json.dumps(self._extra_config()),
             host_buffer=host.host_buffer,
             tp_size=1,
-            cp_size=1,
             pp_size=1,
         )
         self.assertIsInstance(backend, MooncakeKvStore)
-        l3 = L3HostStore(backend, host, key_prefix="live", rank=0, cp_rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="live", rank=0)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         self.assertEqual(l3.exists(pages), [True])

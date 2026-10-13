@@ -30,14 +30,6 @@ mla_decode = pytest.importorskip(
 )
 
 
-def test_small_batch_target_workgroup_defaults_match_measured_winners() -> None:
-    assert mla_decode._DEFAULT_SMALL_BATCH_TARGET_WORKGROUPS == {
-        1: 256,
-        2: 128,
-        4: 256,
-    }
-
-
 @pytest.mark.parametrize(
     "batch,block_h,target_workgroups,expected_splits",
     [

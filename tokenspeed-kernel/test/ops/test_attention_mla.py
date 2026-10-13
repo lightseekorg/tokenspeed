@@ -439,19 +439,24 @@ def test_mla_decode_with_kvcache(
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
-def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_captures(
+@pytest.mark.parametrize(
+    "window_left,kv_lora_rank,qk_rope_head_dim,qk_nope_head_dim",
+    [(129, 8, 4, 4), (-1, 512, 64, 128)],
+    ids=["windowed", "full-attention"],
+)
+def test_mla_decode_noncausal_block_matches_reference_and_captures(
     device: str,
+    window_left: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    qk_nope_head_dim: int,
 ) -> None:
     torch.manual_seed(91)
     block_size = 8
     context_len = 177
     cache_len = context_len + block_size
-    window_left = 129
     page_size = 64
     num_heads = 2
-    kv_lora_rank = 8
-    qk_rope_head_dim = 4
-    qk_nope_head_dim = 4
     qk_head_dim = kv_lora_rank + qk_rope_head_dim
     max_pages = math.ceil(cache_len / page_size)
 
@@ -498,9 +503,10 @@ def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_capture
     dense_kv = kv_cache.reshape(-1, qk_head_dim)[:cache_len].float()
     expected = []
     for block_position in range(block_size):
-        start = max(
-            0,
-            context_len - window_left + block_position,
+        start = (
+            max(0, context_len - window_left + block_position)
+            if window_left >= 0
+            else 0
         )
         visible = dense_kv[start:cache_len]
         scores = torch.einsum("hd,kd->hk", q[block_position, 0].float(), visible)
@@ -977,20 +983,28 @@ def test_mla_decode_with_kvcache_projected_value_matches_split(
 
 
 @pytest.mark.parametrize("use_gate", [False, True])
+@pytest.mark.parametrize(
+    "q_len,window_left,block_size",
+    [(1, -1, 1), (1, -1, 2), (1, 3, 2), (2, -1, 2), (2, 3, 2)],
+    ids=["plain", "flat-block", "flat-window", "query-block", "query-window"],
+)
 def test_mla_decode_with_kvcache_composes_projected_value_fallback(
     monkeypatch: pytest.MonkeyPatch,
     use_gate: bool,
+    q_len: int,
+    window_left: int,
+    block_size: int,
 ) -> None:
     import tokenspeed_kernel.ops.attention.mla as attention_ops
     from tokenspeed_kernel.selection import NoKernelFoundError
 
-    latent = torch.arange(24, dtype=torch.float32).reshape(2, 1, 3, 4) / 16
-    q = torch.empty(2, 1, 3, 6)
+    latent = torch.arange(24 * q_len, dtype=torch.float32).reshape(2, q_len, 3, 4) / 16
+    q = torch.empty(2, q_len, 3, 6)
     kv_cache = torch.empty(1, 8, 1, 6)
     page_table = torch.zeros(2, 1, dtype=torch.int32)
     cache_seqlens = torch.ones(2, dtype=torch.int32)
     weight = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2) / 32
-    raw_gate = torch.linspace(-1, 1, 12).reshape(2, 6)
+    raw_gate = torch.linspace(-1, 1, 12 * q_len).reshape(2 * q_len, 6)
     gate = raw_gate if use_gate else None
     output = torch.empty_like(raw_gate)
 
@@ -1001,6 +1015,12 @@ def test_mla_decode_with_kvcache_composes_projected_value_fallback(
             assert kwargs["traits"]["logit_cap"] is True
             raise NoKernelFoundError
         assert args[1] == "mla_decode_with_kvcache"
+        # Unwindowed flattened rows carry block-end cache lengths, so the
+        # projected-value fallback selects ordinary single-query decode.
+        expected_block_size = block_size if window_left >= 0 or q_len > 1 else 1
+        assert kwargs["traits"]["noncausal_block_size"] == expected_block_size
+        assert kwargs["traits"]["sliding_window"] == (window_left >= 0)
+        assert kwargs["traits"]["q_len"] == q_len
         split_decode.name = "split_decode"
         return split_decode
 
@@ -1008,6 +1028,11 @@ def test_mla_decode_with_kvcache_composes_projected_value_fallback(
         assert kwargs["kv_lora_rank"] == 4
         assert kwargs["qk_rope_head_dim"] == 2
         assert kwargs["logit_cap"] == 2.5
+        assert kwargs["softmax_scale"] == 0.75
+        assert kwargs["out"] is None
+        if window_left >= 0 or q_len > 1:
+            assert kwargs["window_left"] == window_left
+            assert kwargs["noncausal_block_size"] == block_size
         return latent
 
     monkeypatch.setattr(attention_ops, "select_kernel", select_decode_kernel)
@@ -1021,14 +1046,16 @@ def test_mla_decode_with_kvcache_composes_projected_value_fallback(
         qk_nope_head_dim=2,
         kv_lora_rank=4,
         qk_rope_head_dim=2,
-        softmax_scale=1.0,
+        softmax_scale=0.75,
+        window_left=window_left,
+        noncausal_block_size=block_size,
         value_weight=weight,
         gate=gate,
         out=output,
         logit_cap=2.5,
     )
     expected = torch.bmm(
-        latent.reshape(2, 3, 4).transpose(0, 1).contiguous(),
+        latent.reshape(2 * q_len, 3, 4).transpose(0, 1).contiguous(),
         weight,
     )
     expected = expected.transpose(0, 1).reshape_as(output)
@@ -1060,10 +1087,10 @@ def test_mla_decode_with_kvcache_rejects_invalid_projected_out() -> None:
             out=out,
         )
 
-    with pytest.raises(ValueError, match="contiguous and colocated"):
+    with pytest.raises(ValueError, match="be contiguous"):
         call(torch.empty(2, 12)[:, ::2])
-    with pytest.raises(ValueError, match="contiguous and colocated"):
-        call(torch.empty(2, 6, device="meta"))
+    with pytest.raises(ValueError, match="match value_weight dtype"):
+        call(torch.empty(2, 6, dtype=torch.float64))
 
     with pytest.raises(ValueError, match="gate requires value_weight"):
         mla_decode_with_kvcache(
@@ -1385,7 +1412,7 @@ def _windowed_decode(q, kv_cache, page_table, cache_seqlens, cache_len, window, 
 
 
 @pytest.mark.skipif(
-    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+    not platform.is_blackwell_plus,
     reason="the query-axis block MLA decode is a Blackwell CuteDSL kernel",
 )
 @pytest.mark.parametrize("window", [129, -1], ids=["windowed", "full-attention"])
@@ -1415,6 +1442,7 @@ def test_mla_block_decode_agrees_across_both_block_layouts(
         kv_lora_rank=_QUERY_BLOCK_DIMS["kv_lora_rank"],
         qk_rope_head_dim=_QUERY_BLOCK_DIMS["qk_rope_head_dim"],
         sliding_window=window >= 0,
+        noncausal_block_size=block,
     )
 
     q = torch.randn(block, heads, qk_head_dim, device=device, dtype=torch.bfloat16) / 8
@@ -1462,6 +1490,7 @@ def test_query_block_support_declines_what_the_fast_kernel_never_declared() -> N
         num_q_heads=8,
         q_len=8,
         sliding_window=True,
+        noncausal_block_size=8,
         **{k: v for k, v in _QUERY_BLOCK_DIMS.items() if k != "qk_nope_head_dim"},
     )
     assert not supports_mla_decode_query_blocks(**{**probe, "page_size": 128})
@@ -1469,3 +1498,27 @@ def test_query_block_support_declines_what_the_fast_kernel_never_declared() -> N
     assert not supports_mla_decode_query_blocks(**{**probe, "solution": "triton"})
     # A block of one is ordinary decode or target verify, never a proposal.
     assert not supports_mla_decode_query_blocks(**{**probe, "q_len": 1})
+
+
+def test_query_block_support_distinguishes_causal_fp8_from_other_masks() -> None:
+    if not current_platform().is_cdna4:
+        pytest.skip("causal FP8 query blocks target CDNA4")
+    probe = dict(
+        q_dtype=torch.float8_e4m3fn,
+        kv_dtype=torch.float8_e4m3fn,
+        page_size=64,
+        num_q_heads=12,
+        q_len=4,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        sliding_window=False,
+        noncausal_block_size=1,
+        solution="gluon",
+    )
+    assert supports_mla_decode_query_blocks(**probe)
+    # Ordinary decode, non-causal draft blocks, windows and BF16 queries keep
+    # their existing kernels and flattened rows.
+    assert not supports_mla_decode_query_blocks(**{**probe, "q_len": 1})
+    assert not supports_mla_decode_query_blocks(**{**probe, "noncausal_block_size": 4})
+    assert not supports_mla_decode_query_blocks(**{**probe, "sliding_window": True})
+    assert not supports_mla_decode_query_blocks(**{**probe, "q_dtype": torch.bfloat16})

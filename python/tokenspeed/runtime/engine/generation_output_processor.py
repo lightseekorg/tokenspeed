@@ -74,14 +74,25 @@ class RequestState:
         sampling_params: SamplingParams,
         stream: bool,
         tokenizer,
+        *,
+        computes_prompt_logprobs: bool,
         eos_token_ids: list[int] = None,
         return_logprob: bool = False,
+        logprob_start_len: int = -1,
         top_logprobs_num: int = 0,
         token_ids_logprob: list[int] | None = None,
         multimodal_inputs=None,
         prompt_input_ids_unpadded: list[int] | None = None,
         created_time: float = 0.0,
     ) -> None:
+        """Per-request output state.
+
+        Args:
+            computes_prompt_logprobs: Whether this engine runs the prompt rows
+                (False on the PD decode role, whose prefill node returns the
+                prompt logprobs). Selects what ``return_logprob`` accumulates,
+                so it is always stated.
+        """
         # --- Extracted from recv_req (immutable) ---
         self.prompt_input_ids: list[int] = prompt_input_ids
         self.prompt_input_ids_unpadded: list[int] = (
@@ -110,6 +121,13 @@ class RequestState:
         # request stats (host-side); tracker attached only with --enable-log-request-stats
         self.created_time: float = created_time
         self.stats: RequestStatsTracker = NOOP_STATS
+        # Queue-time metric (tokenspeed:request_queue_time_seconds): wall time
+        # the request entered the scheduler's waiting queue, stamped when its
+        # spec is submitted, and the once-per-request observation flag. A
+        # retracted request re-enters the C++ queue without a new stamp, so
+        # preemption never records a second sample.
+        self.scheduler_enqueue_time: float = 0.0
+        self.queue_time_recorded: bool = False
         # Sampled-token logprobs, accumulated per generated token.
         # None when return_logprob is False.
         self.output_token_logprobs_val: list[float] | None = (
@@ -118,6 +136,37 @@ class RequestState:
         self.output_token_logprobs_idx: list[int] | None = (
             [] if return_logprob else None
         )
+        # Prompt (input) logprobs, SGLang dialect: ``input_token_logprobs``
+        # is ``[(None, ids[start]), (lp, ids[start+1]), ...]`` over positions
+        # ``[logprob_start_len, input_length)``. The start is resolved here
+        # (-1 -> last prompt token, the default that needs no logits; the
+        # ingress rejected out-of-range values). ``input_token_logprobs`` is
+        # the position-indexed accumulator for the prompt positions that need
+        # logits, ``[start, input_length - 1)``, filled across prefill chunks;
+        # ``_val``/``_idx`` are the finalized lists, None until the prompt's
+        # final chunk commits. A decode-role request never finalizes -- the
+        # prefill node returns them -- so it ships [] like a request that did
+        # not ask.
+        last_position = max(len(self.prompt_input_ids) - 1, 0)
+        self.logprob_start_len: int = (
+            last_position
+            if logprob_start_len < 0
+            else min(logprob_start_len, last_position)
+        )
+        self.returns_input_logprobs: bool = return_logprob and computes_prompt_logprobs
+        self.input_token_logprobs: list[float | None] | None = (
+            [None] * (last_position - self.logprob_start_len)
+            if self.wants_input_logprobs
+            else None
+        )
+        self.input_token_logprobs_val: list[float | None] | None = None
+        self.input_token_logprobs_idx: list[int] | None = None
+        self.input_logprob_sent: bool = False
+        # The NaN guard flagged this request on a prefill chunk that owed no
+        # token yet (a NaN prompt logprob, or NaN logits of the chunk's last
+        # row). The abort is issued when the prompt completes, like a flag on
+        # the final chunk.
+        self.numerical_error_detected: bool = False
 
         # --- Streaming bookkeeping (internal) ---
         self._surr_offset: int | None = None
@@ -144,17 +193,24 @@ class RequestState:
         self.grammar_key: tuple[str, str] | None = None
         self.grammar_queued_ts: float = 0.0
 
-    def set_finish_with_abort(self, message: str, notify_client: bool = False) -> None:
+    def set_finish_with_abort(
+        self,
+        message: str,
+        notify_client: bool = False,
+        status_code: int | None = None,
+    ) -> None:
         """Mark this request as aborted with ``message``; finished_reason is
         materialized immediately so callers don't need a check_finished() pass.
 
         ``notify_client`` streams a terminating finish to the client (used for
         pause-initiated aborts, where the client did not tear down its state).
+        ``status_code`` is the HTTP status the frontend reports; None leaves
+        the abort an internal error.
         """
         self.to_abort = True
         self.to_abort_message = message
         self.abort_notify_client = notify_client
-        self.finished_reason = FINISH_ABORT(message=message)
+        self.finished_reason = FINISH_ABORT(message=message, status_code=status_code)
 
     @classmethod
     def from_recv_req(
@@ -162,19 +218,33 @@ class RequestState:
         recv_req: TokenizedGenerateReqInput,
         tokenizer,
         eos_token_ids: list[int],
+        *,
+        computes_prompt_logprobs: bool,
     ) -> RequestState:
+        """Build the state for an admitted request.
+
+        Args:
+            recv_req: The tokenized request.
+            tokenizer: Tokenizer for stop-string handling.
+            eos_token_ids: EOS ids that end generation.
+            computes_prompt_logprobs: Whether this engine runs the prompt rows
+                (False on the PD decode role, whose prefill node returns the
+                prompt logprobs).
+        """
         return cls(
             prompt_input_ids=recv_req.input_ids,
             sampling_params=recv_req.sampling_params,
             stream=recv_req.stream,
             tokenizer=tokenizer,
+            computes_prompt_logprobs=computes_prompt_logprobs,
             eos_token_ids=eos_token_ids,
-            return_logprob=getattr(recv_req, "return_logprob", False),
-            top_logprobs_num=getattr(recv_req, "top_logprobs_num", 0),
-            token_ids_logprob=getattr(recv_req, "token_ids_logprob", None),
-            multimodal_inputs=getattr(recv_req, "multimodal_inputs", None),
-            prompt_input_ids_unpadded=getattr(recv_req, "input_ids_unpadded", None),
-            created_time=getattr(recv_req, "created_time", 0.0),
+            return_logprob=recv_req.return_logprob,
+            logprob_start_len=recv_req.logprob_start_len,
+            top_logprobs_num=recv_req.top_logprobs_num,
+            token_ids_logprob=recv_req.token_ids_logprob,
+            multimodal_inputs=recv_req.multimodal_inputs,
+            prompt_input_ids_unpadded=recv_req.input_ids_unpadded,
+            created_time=recv_req.created_time,
         )
 
     @property
@@ -193,26 +263,67 @@ class RequestState:
     def prefill_finished(self):
         return self.computed_length >= self.input_length
 
+    @property
+    def wants_input_logprobs(self) -> bool:
+        """Whether any prompt position needs logits for its logprob.
+
+        The default start (the last prompt token) yields the single
+        ``(None, last_token)`` entry and no GPU work.
+        """
+        return (
+            self.returns_input_logprobs
+            and self.logprob_start_len < self.input_length - 1
+        )
+
+    def record_input_token_logprobs(self, start: int, logprobs: list[float]) -> None:
+        """Store one chunk's prompt logprobs for positions ``[start, start+n)``."""
+        if self.input_token_logprobs is None:
+            raise RuntimeError("prompt logprobs recorded for a request that wants none")
+        offset = start - self.logprob_start_len
+        if offset < 0 or offset + len(logprobs) > len(self.input_token_logprobs):
+            raise RuntimeError(
+                f"prompt logprob rows [{start}, {start + len(logprobs)}) fall outside "
+                f"[{self.logprob_start_len}, {self.input_length - 1})"
+            )
+        self.input_token_logprobs[offset : offset + len(logprobs)] = logprobs
+
+    def finalize_input_token_logprobs(self) -> None:
+        """Assemble the SGLang lists once the prompt's final chunk committed.
+
+        Idempotent: a second call keeps the lists already built. Element 0 is
+        ``(None, ids[start])``; element
+        ``k`` is the logprob of ``ids[start + k]`` given its prefix. The ids are
+        the tokenizer-valid prompt (multimodal pad hashes are not tokens).
+        """
+        if not self.returns_input_logprobs or self.input_token_logprobs_val is not None:
+            return
+        logprobs: list[float | None] = (
+            list(self.input_token_logprobs)
+            if self.input_token_logprobs is not None
+            else []
+        )
+        if any(lp is None for lp in logprobs):
+            # Every scored position was recomputed by a chunk that commits its
+            # rows before the prompt completes (the admission probe is capped
+            # at the start), so a gap is a planning bug, not a runtime state.
+            raise RuntimeError(
+                "prompt logprobs incomplete: "
+                f"{sum(lp is None for lp in logprobs)} of {len(logprobs)} positions "
+                "have no value"
+            )
+        self.input_token_logprobs_val = [None] + logprobs
+        self.input_token_logprobs_idx = list(
+            self.prompt_input_ids_unpadded[self.logprob_start_len :]
+        )
+        if len(self.input_token_logprobs_val) != len(self.input_token_logprobs_idx):
+            raise RuntimeError(
+                f"prompt logprobs have {len(self.input_token_logprobs_val)} values "
+                f"for {len(self.input_token_logprobs_idx)} tokens"
+            )
+        self.input_token_logprobs = None
+
     def add_computed_length(self, incr: int):
         self.computed_length += incr
-
-    def maybe_extend_multimodal_mrope_positions(self) -> None:
-        mm = self.multimodal_inputs
-        if mm is None or mm.mrope_positions is None:
-            return
-
-        target_len = self.input_length + self.output_length
-        current_len = mm.mrope_positions.shape[-1]
-        if current_len >= target_len:
-            return
-
-        from tokenspeed.runtime.multimodal.mrope import (
-            extend_mrope_positions_for_retracted_request,
-        )
-
-        mm.mrope_positions = extend_mrope_positions_for_retracted_request(
-            mm.mrope_positions, target_len - current_len
-        )
 
     def has_pending_multimodal_features(self) -> bool:
         mm = self.multimodal_inputs
@@ -530,7 +641,6 @@ class OutputProcesser:
         the hostfunc (e.g., last live request finished).
         """
         grammars = completion.grammars or []
-        stride = completion.tokens_per_req
         bs = completion.bs
         advance_mask = completion.advance_mask or [True] * bs
         output_tokens = model_execution_results.output_tokens
@@ -545,8 +655,9 @@ class OutputProcesser:
             ):
                 continue
             n_accepted = int(accept_lengths[i].item())
+            offset = completion.output_layout.token_offset(i)
             for j in range(n_accepted):
-                tok = int(output_tokens[i * stride + j].item())
+                tok = int(output_tokens[offset + j].item())
                 try:
                     grammar.accept_token(tok)
                 except Exception:
@@ -684,10 +795,12 @@ class OutputProcesser:
         )
         output_lengths_list = model_execution_results.output_lengths.tolist()
         output_tokens_list = model_execution_results.output_tokens.tolist()
-        # Per-slot total prefill length as the OP sees it (C++ Request::PrefillSize()).
-        # After a retract the victim's generated tokens are rebased into the
-        # prefill window (RebasePrefill), so this can exceed the original prompt
-        # length that RequestState.prefill_finished compares against.
+        self._record_input_token_logprobs(forward_op, model_execution_results)
+        # Per-slot total prefill length as the OP sees it (C++
+        # Request::PrefillSize()): the prompt length. A capacity retraction
+        # restores the request's image and re-prefills nothing, and an L3 hit
+        # is prefetched before admission, so no path extends the window past
+        # the prompt.
         prefill_lengths = forward_op.prefill_lengths
         pt = 0
         for i, rid in enumerate(forward_op.request_ids):
@@ -711,9 +824,8 @@ class OutputProcesser:
             request_state: RequestState = self.rid_to_state[rid]
             # scheduled_time is stamped pre-forward in the event loop (queue end)
 
-            # Mid-chunk extend slot by the op's own prefill_lengths (rebased after
-            # retract; C++ owes no token and the sampled one is garbage).
-            # Fresh requests: prefill_length == prompt length, same as the gate below.
+            # Mid-chunk extend slot by the op's own prefill_lengths: C++ owes
+            # no token and the sampled one is garbage.
             if (
                 not is_decode_slot
                 and forward_op.extend_prefix_lens[i] + forward_op.input_lengths[i]
@@ -721,8 +833,12 @@ class OutputProcesser:
             ):
                 # It owes no token, but the chunk's KV has landed -- report
                 # that much, so the scheduler stops counting a forward
-                # against these pages and may retract the request if the
-                # next round needs them.
+                # against these pages and may retract the request (imaging
+                # the landed chunk) if the next round needs them. A NaN flag
+                # on this chunk (its prompt logprobs, or its last row's
+                # logits) terminates the request when the prompt completes.
+                if nan_flags_list is not None and nan_flags_list[i]:
+                    request_state.numerical_error_detected = True
                 request_changes.append(make_extend_result_event(rid))
                 continue
 
@@ -730,11 +846,15 @@ class OutputProcesser:
             if not request_state.prefill_finished:
                 continue
 
+            if not is_decode_slot:
+                request_state.finalize_input_token_logprobs()
             request_state.stats.mark_prefill_done(stats_now)
             if i >= num_extends:
                 request_state.stats.record_decode_step(step_dt, prefilling_others)
 
-            nan_detected = nan_flags_list is not None and nan_flags_list[i]
+            nan_detected = (
+                nan_flags_list is not None and nan_flags_list[i]
+            ) or request_state.numerical_error_detected
             if nan_detected and not request_state.finished:
                 request_state.finished_reason = FINISH_ABORT(
                     message=(
@@ -910,8 +1030,42 @@ class OutputProcesser:
         self.stream_output(stream_out_rids, stream_out_states)
         return request_changes
 
+    def _record_input_token_logprobs(
+        self, forward_op, model_execution_results: ModelExecutionResult
+    ) -> None:
+        """Place this forward's prompt logprobs into their requests.
+
+        The flat result follows the plan's extend-slot order; each slot's
+        rows start at the prompt position the plan recorded, so a chunk lands
+        at its own positions whatever earlier chunks delivered.
+        """
+        plan = model_execution_results.input_logprob_plan
+        logprobs = model_execution_results.input_token_logprobs
+        if plan is None or logprobs is None:
+            return
+        values = logprobs.tolist()
+        if len(values) != plan.num_rows:
+            raise RuntimeError(
+                f"prompt logprob result has {len(values)} rows for a plan of "
+                f"{plan.num_rows}"
+            )
+        cursor = 0
+        for i, count in enumerate(plan.counts):
+            if count == 0:
+                continue
+            state = self.rid_to_state.get(forward_op.request_ids[i])
+            if state is not None and state.input_token_logprobs is not None:
+                state.record_input_token_logprobs(
+                    plan.position_starts[i], values[cursor : cursor + count]
+                )
+            cursor += count
+
     def on_remote_prefill_done(
-        self, req_id: str, bootstrap_token: int, cached_tokens: int
+        self,
+        req_id: str,
+        bootstrap_token: int,
+        cached_tokens: int,
+        bootstrap_logprob: float | None,
     ) -> None:
         """Record the bootstrap token on a decode-node request (RemotePrefillDoneEvent).
 
@@ -928,6 +1082,10 @@ class OutputProcesser:
         bootstrap_token == -1 means the prefill side did not (or could not) supply a
         token (e.g. it was generated on a rank whose ZMQ message arrived after the
         success barrier had already been satisfied).
+
+        ``bootstrap_logprob`` is the prefill node's logprob of that token, so a
+        request returning logprobs sees one entry per generated token; None when
+        the prefill node sent none (logprobs off, or an older sender).
         """
         if req_id not in self.rid_to_state:
             return
@@ -951,9 +1109,71 @@ class OutputProcesser:
                 state.grammar = None
             return
         state.output_ids.append(bootstrap_token)
+        if state.output_token_logprobs_val is not None:
+            if bootstrap_logprob is not None:
+                state.output_token_logprobs_val.append(bootstrap_logprob)
+                state.output_token_logprobs_idx.append(bootstrap_token)
+            else:
+                # Compat with a prefill peer that sends no logprob (older
+                # version, or launched without --enable-output-logprobs):
+                # the response's output logprobs are one entry short, which
+                # the client cannot tell from the data. Say so here.
+                logger.warning(
+                    f"[on_remote_prefill_done] rid={req_id!s} returns logprobs but "
+                    "the prefill peer sent no bootstrap logprob; its first output "
+                    "token has none (is the prefill node started with "
+                    "--enable-output-logprobs and at the same version?)",
+                )
         if state.grammar is not None:
             state.grammar.accept_token(bootstrap_token)
         state.check_finished()
+
+    def finish_scheduler_aborted_requests(self, aborts) -> None:
+        """Finish the requests the scheduler aborted while building a plan.
+
+        The last resort of a capacity retraction whose victim could not be
+        imaged (``ExecutionPlan.aborts``, ``docs/configuration/server.md``,
+        "Retraction snapshot pool"): the scheduler released the request's
+        pages and slot in that very round and emits nothing further for it,
+        so this is the request's whole finish -- the client gets an
+        ``ABORT_CODE.CapacityAbort`` finish carrying the scheduler's detail
+        (the shortfall and the knobs to raise), which a caller that can
+        resubmit retries on. Returns no scheduler event: the request is
+        already ``Finished`` there. A victim is quiescent when chosen, so no
+        in-flight forward names it. A client abort may cross the same round:
+        its state is already finished with the client's reason (and the
+        tokenizer manager has torn down, unless a pause-initiated abort left
+        a passive client waiting for its terminating finish), so it is
+        released here without a capacity finish, count or stream; an id
+        already gone is skipped.
+
+        Args:
+            aborts: The plan's ``SchedulerAbort`` entries (``request_id``,
+                ``reason``, ``detail``).
+        """
+        for abort in aborts:
+            rid = str(abort.request_id)
+            state = self.rid_to_state.get(rid)
+            if state is None:
+                continue
+            detail = str(abort.detail)
+            if not state.finished:
+                state.finished_reason = FINISH_ABORT(
+                    message=f"Request aborted by the scheduler: {detail}",
+                    err_type=ABORT_CODE.CapacityAbort,
+                )
+                self.metrics.record_capacity_abort()
+                if self.attn_tp_rank == 0:
+                    logger.warning(
+                        f"Req {rid!s} aborted by the scheduler ({abort.reason!s}): "
+                        f"{detail}"
+                    )
+                self.stream_output([rid], [state])
+            elif state.abort_notify_client:
+                self.stream_output([rid], [state])
+            self._log_request_stats(rid, state, time.time())
+            self._release_multimodal_features(state)
+            self.rid_to_state.pop(rid)
 
     def finish_remote_prefill_only_request(self, req_id: str) -> list:
         """Finish after remote prefill when no decode step is needed.
@@ -1036,6 +1256,8 @@ class OutputProcesser:
         output_extra_infos: list[dict] = []
         output_token_logprobs_val: list[list[float]] = []
         output_token_logprobs_idx: list[list[int]] = []
+        input_token_logprobs_val: list[list[float | None]] = []
+        input_token_logprobs_idx: list[list[int]] = []
 
         for i, rs in enumerate(output_states):
             # For finished requests, always output (unless already output)
@@ -1115,6 +1337,17 @@ class OutputProcesser:
                 output_token_logprobs_val.append([])
                 output_token_logprobs_idx.append([])
 
+            # Prompt logprobs ship once, on the first frame after the prompt's
+            # final chunk committed; later frames (and a decode-role request,
+            # which never finalizes) carry [] and the frontend keeps the lists.
+            if rs.input_token_logprobs_val is not None and not rs.input_logprob_sent:
+                rs.input_logprob_sent = True
+                input_token_logprobs_val.append(rs.input_token_logprobs_val)
+                input_token_logprobs_idx.append(rs.input_token_logprobs_idx)
+            else:
+                input_token_logprobs_val.append([])
+                input_token_logprobs_idx.append([])
+
         # Don't send empty batch to detokenizer
         if len(rids_to_send) == 0:
             return
@@ -1134,8 +1367,8 @@ class OutputProcesser:
             completion_tokens=completion_tokens,
             cached_tokens=cached_tokens,
             spec_verify_ct=spec_verify_ct,
-            input_token_logprobs_val=[],
-            input_token_logprobs_idx=[],
+            input_token_logprobs_val=input_token_logprobs_val,
+            input_token_logprobs_idx=input_token_logprobs_idx,
             output_token_logprobs_val=output_token_logprobs_val,
             output_token_logprobs_idx=output_token_logprobs_idx,
             input_top_logprobs_val=[],

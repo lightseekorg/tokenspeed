@@ -75,6 +75,7 @@ def _ok(result) -> bool:
 
 def make_engine(Engine, model, *, enable_prefix_caching):
     return Engine(
+        disable_autotune=True,
         model=model,
         enable_memory_saver=True,
         enable_prefix_caching=enable_prefix_caching,
@@ -224,6 +225,7 @@ def main() -> None:
         print("[H] (#4 draft pool) SKIPPED — set TOKENSPEED_DRAFT_MODEL to run")
     else:
         engine3 = Engine(
+            disable_autotune=True,
             model=model,
             enable_memory_saver=True,
             enable_prefix_caching=False,

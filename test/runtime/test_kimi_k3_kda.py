@@ -119,6 +119,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         scan_boundaries,
         A_log=torch.empty(2),
         dt_bias=torch.empty(2, 3),
+        D=None,
         a=None,
         b=None,
         g_raw=torch.empty_like(query),
@@ -565,6 +566,7 @@ class _KDAHarness:
             extend_replay_lens_cpu=torch.zeros_like(prefix_cpu),
             extend_prompt_lens_cpu=prefix_cpu + new_cpu,
             extend_with_prefix=bool(prefix_cpu.any()),
+            query_shard=None,
         )
 
     def decode_metadata(self, tables, seq_lens):

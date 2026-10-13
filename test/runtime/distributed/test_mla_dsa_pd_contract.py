@@ -75,7 +75,13 @@ def _attn_config(family: str, pd_enabled: bool):
         kv_cache_dim=576,
     )
     if family == "dsa":
-        spec = DSAConfig(index_topk=1, index_head_dim=128, index_n_heads=1, **common)
+        spec = DSAConfig(
+            index_topk=1,
+            index_head_dim=128,
+            index_n_heads=1,
+            index_k_format="fp8_scaled",
+            **common,
+        )
     else:
         spec = MLAConfig(**common)
     return AttnConfig(

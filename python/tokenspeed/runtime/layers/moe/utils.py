@@ -49,6 +49,7 @@ class All2AllBackend(Enum):
     AGRS = "agrs"
     DEEPEP = "deepep"
     FLASHINFER = "flashinfer"
+    GLUON_PETIT = "gluon_petit"
 
     @classmethod
     def _missing_(cls, value):
@@ -65,6 +66,9 @@ class All2AllBackend(Enum):
     def is_deepep(self):
         return self == All2AllBackend.DEEPEP
 
+    def is_gluon_petit(self):
+        return self == All2AllBackend.GLUON_PETIT
+
 
 class MoeBackend(Enum):
 
@@ -75,6 +79,7 @@ class MoeBackend(Enum):
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    GLUON_PETIT = "gluon_petit"
 
     DEEP_GEMM = "deep_gemm"
     DEEP_GEMM_MEGA_MOE = "deep_gemm_mega_moe"
@@ -104,6 +109,9 @@ class MoeBackend(Enum):
 
     def is_flashinfer_cutedsl(self):
         return self == MoeBackend.FLASHINFER_CUTEDSL
+
+    def is_gluon_petit(self):
+        return self == MoeBackend.GLUON_PETIT
 
     def is_deep_gemm(self):
         return self == MoeBackend.DEEP_GEMM

@@ -22,19 +22,27 @@
 
 Wraps NCCL and optional low-latency GPU backends. CUDA IPC and symmetric-memory
 backends are only selected for node-local groups; groups spanning nodes fall
-back to NCCL.
+back to NCCL. ``AutoBackend.route`` is the one place that decides which
+implementation serves a collective; every public method asks it first.
 """
+
+import enum
 
 import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import (
     CommBackend,
+    CommWork,
     Group,
 )
+from tokenspeed.runtime.distributed.comm_backend.iris import (
+    IrisBackend,
+)
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
-    TritonAllReduceBackend,
+from tokenspeed.runtime.distributed.comm_backend.projection import (
+    ProjectionBackend,
+    ProjectionWorkspace,
 )
 from tokenspeed.runtime.distributed.comm_backend.triton_rsag import TritonRSAGBackend
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
@@ -57,18 +65,61 @@ def ordered_fold_sum(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     return out
 
 
+class Collective(enum.Enum):
+    """The collectives ``AutoBackend.route`` decides for."""
+
+    ALL_REDUCE = "all_reduce"
+    REDUCE_SCATTER = "reduce_scatter"
+    TOKEN_REDUCE_SCATTER = "token_reduce_scatter"
+    ALL_GATHER = "all_gather"
+    TOKEN_ALL_GATHER = "token_all_gather"
+
+    @property
+    def is_reduction(self) -> bool:
+        return self in (
+            Collective.ALL_REDUCE,
+            Collective.REDUCE_SCATTER,
+            Collective.TOKEN_REDUCE_SCATTER,
+        )
+
+
+class Route(enum.Enum):
+    """Which implementation serves a collective."""
+
+    # The vendor collective (NCCL / RCCL).
+    NCCL = "nccl"
+    # NCCL data movement plus the rank-ordered fp32 fold: batch-invariant,
+    # at world_size x the traffic for an all-reduce.
+    ORDERED_FOLD = "ordered_fold"
+    # Symmetric-memory multicast: the NVLS in-switch reduction for an
+    # all-reduce (one fixed issuer), multicast stores for the gathers.
+    MULTIMEM = "multimem"
+    # The all-reduce's performance tiers (trtllm / Iris / NCCL), outside
+    # any numerics contract.
+    TIERED = "tiered"
+
+
 class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
     def __init__(self):
         self._nccl = NcclBackend()
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
-        self._triton_ar = TritonAllReduceBackend(fallback=self._nccl)
+        self._iris = IrisBackend(fallback=self._nccl)
         self._rsag = TritonRSAGBackend(fallback=self._nccl)
+        # Projection fallbacks retain Auto's ordinary routing and numerics.
+        self._projection = ProjectionBackend(fallback=self)
+        # Groups the startup self-check moved off the in-switch reduction
+        # (``pin_ordered_fold``); set once, world-uniformly, before serving.
+        self._fold_pinned_groups: set[Group] = set()
 
     @property
     def nccl(self) -> NcclBackend:
         return self._nccl
+
+    @property
+    def iris(self) -> IrisBackend:
+        return self._iris
 
     @property
     def trtllm_ar(self) -> TrtllmAllReduceBackend:
@@ -76,6 +127,11 @@ class AutoBackend(CommBackend):
 
     def configure(self, use_pynccl: bool = False) -> None:
         self._nccl.configure(use_pynccl=use_pynccl)
+
+    def for_named_groups(self, name: str) -> CommBackend:
+        # NCCL alone: the low-latency backends hold per-group state prepared
+        # for the shared groups.
+        return self._nccl.for_named_groups(name)
 
     @staticmethod
     def _force_deterministic_rsag() -> bool:
@@ -103,6 +159,71 @@ class AutoBackend(CommBackend):
         gathered = self._nccl.all_gather(tensor, group, dim=0)
         parts = gathered.view((world_size, *tensor.shape))
         return ordered_fold_sum(parts, tensor)
+
+    def _multimem_all_reduce(
+        self, tensor: torch.Tensor, group: Group, op
+    ) -> torch.Tensor:
+        """The NVLS in-switch sum through the group's fixed issuer, in place.
+
+        The batch-invariant replacement for the fold where the fold is dear:
+        an all-reduce's fold moves world_size x the payload to every rank,
+        the in-switch reduction moves it twice through one port. Rows are a
+        collective's shape, identical on every rank, so an empty payload
+        returns without a kernel on every rank alike.
+        """
+        if op is not None and op != torch.distributed.ReduceOp.SUM:
+            raise ValueError("batch-invariant collectives fold SUM reductions only")
+        if len(group) == 1 or tensor.numel() == 0:
+            return tensor
+        return self._rsag.multimem_all_reduce(tensor, group)
+
+    def _ordered_fold_reduce_scatter(
+        self, tensor: torch.Tensor, group: Group
+    ) -> torch.Tensor:
+        """Exchange each rank's chunks, then fold them in fixed rank order.
+
+        ``tensor`` holds ``len(group)`` equal chunks along dim 0, chunk ``i``
+        destined for the group's ``i``-th rank. The all-to-all moves the same
+        bytes a reduce-scatter does; each rank then folds the chunks it
+        received from ranks 0..n-1 in fp32, so its output does not depend on
+        the payload size the way a ring reduce-scatter's association does.
+        """
+        world_size = len(group)
+        if world_size == 1:
+            return tensor
+        if tensor.shape[0] % world_size:
+            raise ValueError(
+                f"reduce-scatter input rows ({tensor.shape[0]}) must split evenly "
+                f"across {world_size} ranks"
+            )
+        received = torch.empty_like(tensor)
+        self._nccl.all_to_all_single(received, tensor.contiguous(), group)
+        parts = received.view(
+            (world_size, tensor.shape[0] // world_size, *tensor.shape[1:])
+        )
+        return ordered_fold_sum(parts, torch.empty_like(parts[0]))
+
+    def _ordered_fold_token_reduce_scatter(
+        self, tensor: torch.Tensor, group: Group, scattered_num_tokens: list[int]
+    ) -> torch.Tensor:
+        """Token reduce-scatter through the ordered fold (uneven token split).
+
+        Pads every rank's token slice to the largest one, as the NCCL path
+        does, so the exchange splits evenly; the padding rows are dropped.
+        """
+        max_tokens = max(scattered_num_tokens)
+        padded = tensor.new_zeros(
+            (len(scattered_num_tokens) * max_tokens, tensor.shape[-1])
+        )
+        offset = 0
+        for rank_index, count in enumerate(scattered_num_tokens):
+            padded[rank_index * max_tokens : rank_index * max_tokens + count].copy_(
+                tensor[offset : offset + count]
+            )
+            offset += count
+        folded = self._ordered_fold_reduce_scatter(padded, group)
+        rank_index = group.index(torch.distributed.get_rank())
+        return folded[: scattered_num_tokens[rank_index]].contiguous()
 
     @staticmethod
     def _group_spans_nodes(group: Group) -> bool:
@@ -137,6 +258,65 @@ class AutoBackend(CommBackend):
             return True
         return group_has_fabric(group)
 
+    def pin_ordered_fold(self, group: Group) -> None:
+        """Keep ``group``'s batch-invariant reductions on the ordered fold.
+
+        The startup self-check calls this, on every rank alike, for a group
+        whose in-switch reduction it could not verify as one function across
+        the deployment (``comm_backend/self_check.py``); ``route`` honours it
+        before choosing the switch.
+        """
+        self._fold_pinned_groups.add(group)
+
+    def route(
+        self, collective: Collective, tensor: torch.Tensor, group: Group
+    ) -> Route:
+        """The one routing decision for every collective this backend serves.
+
+        In precedence order:
+
+        1. ``--force-deterministic-rsag``: no symmetric-memory path. A
+           reduction takes the ordered fold under
+           ``--batch-invariant-collectives`` and NCCL otherwise; a gather
+           takes NCCL.
+        2. ``--batch-invariant-collectives``: one association order per
+           reduction, independent of the batch. A 2-D bf16 all-reduce on a
+           multicast-reachable group the self-check did not pin to the fold
+           takes the NVLS in-switch reduction with a fixed issuer
+           (``TritonRSAGBackend.multimem_all_reduce``; the startup self-check
+           verifies it bitwise); every other reduction -- other payloads,
+           unreachable or pinned groups, and the reduce-scatters, whose fold
+           already moves each byte once -- takes the ordered fold. The
+           verdict depends only on static properties of the call site (group,
+           dtype, rank, width) and the startup pins, never on the row count,
+           so a site's route cannot move with the batch.
+        3. Otherwise the performance defaults: gathers and the token
+           reduce-scatter take the multicast kernels where multicast reaches
+           (the RSAG backend itself falls back to NCCL past its capacity),
+           the plain reduce-scatter NCCL, the all-reduce its tiered dispatch.
+
+        Gathers are pure data movement, so the envelope leaves them to the
+        performance default.
+        """
+        if self._force_deterministic_rsag():
+            if collective.is_reduction and self._batch_invariant_collectives():
+                return Route.ORDERED_FOLD
+            return Route.NCCL
+        if collective.is_reduction and self._batch_invariant_collectives():
+            if (
+                collective is Collective.ALL_REDUCE
+                and group not in self._fold_pinned_groups
+                and self._rsag.serves_multimem_all_reduce(tensor)
+                and self._multicast_reachable(group)
+            ):
+                return Route.MULTIMEM
+            return Route.ORDERED_FOLD
+        if collective is Collective.ALL_REDUCE:
+            return Route.TIERED
+        if collective is Collective.REDUCE_SCATTER:
+            return Route.NCCL
+        return Route.MULTIMEM if self._multicast_reachable(group) else Route.NCCL
+
     # ---- Token-aware ops ----
 
     def token_all_gather(
@@ -145,9 +325,9 @@ class AutoBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        if self._force_deterministic_rsag() or not self._multicast_reachable(group):
-            return self._nccl.token_all_gather(tensor, group, scattered_num_tokens)
-        return self._rsag.token_all_gather(tensor, group, scattered_num_tokens)
+        if self.route(Collective.TOKEN_ALL_GATHER, tensor, group) is Route.MULTIMEM:
+            return self._rsag.token_all_gather(tensor, group, scattered_num_tokens)
+        return self._nccl.token_all_gather(tensor, group, scattered_num_tokens)
 
     def token_reduce_scatter(
         self,
@@ -155,9 +335,14 @@ class AutoBackend(CommBackend):
         group: Group,
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
-        if self._force_deterministic_rsag() or not self._multicast_reachable(group):
-            return self._nccl.token_reduce_scatter(tensor, group, scattered_num_tokens)
-        return self._rsag.token_reduce_scatter(tensor, group, scattered_num_tokens)
+        route = self.route(Collective.TOKEN_REDUCE_SCATTER, tensor, group)
+        if route is Route.ORDERED_FOLD:
+            return self._ordered_fold_token_reduce_scatter(
+                tensor, group, scattered_num_tokens
+            )
+        if route is Route.MULTIMEM:
+            return self._rsag.token_reduce_scatter(tensor, group, scattered_num_tokens)
+        return self._nccl.token_reduce_scatter(tensor, group, scattered_num_tokens)
 
     # ---- Public CommBackend interface ----
 
@@ -168,11 +353,11 @@ class AutoBackend(CommBackend):
         op=None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         if self._batch_invariant_collectives():
+            # Each tensor takes its own route (fold or multimem); grouping is
+            # a NCCL optimization the contract has no use for.
             if isinstance(tensor, torch.Tensor):
-                return self._ordered_fold_all_reduce(tensor, group, op)
-            return tuple(
-                self._ordered_fold_all_reduce(value, group, op) for value in tensor
-            )
+                return self._all_reduce_one(tensor, group, op)
+            return tuple(self._all_reduce_one(value, group, op) for value in tensor)
         if not isinstance(tensor, torch.Tensor):
             tensors = tensor
             if len(tensors) == 0:
@@ -183,9 +368,9 @@ class AutoBackend(CommBackend):
             if (
                 not use_nccl
                 and current_platform().is_amd
-                and self._triton_ar.can_reduce_outputs(tensors, group, op=op)
+                and self._iris.can_reduce_outputs(tensors, group, op=op)
             ):
-                return self._triton_ar.all_reduce(tensors, group, op=op)
+                return self._iris.all_reduce(tensors, group, op=op)
             # Collections past the one-shot window are headed for NCCL;
             # grouping avoids the copy required to concatenate them first.
             use_nccl = use_nccl or all(
@@ -195,22 +380,29 @@ class AutoBackend(CommBackend):
             use_nccl = use_nccl or (
                 current_platform().is_amd
                 and sum(value.numel() * value.element_size() for value in tensors)
-                > self._triton_ar.producer_direct_max_bytes
+                > self._iris.producer_direct_max_bytes
             )
             if use_nccl and len(tensors) == 2:
                 return self._nccl.all_reduce_two(*tensors, group, op=op)
             return super().all_reduce(tensors, group, op=op)
+        return self._all_reduce_one(tensor, group, op)
 
-        # AR backend dispatch -- first match wins. This is Tier 1 (which
-        # backend); the trtllm backend then runs Tier 2 (mnnvl vs IPC, by
-        # payload bytes) inside _ar_fusion_workspace.
-        #   1. force_deterministic_rsag ............ NCCL
-        #   2. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
-        #   3. group spans nodes ................... NCCL
-        #   4. triton_ar can run ................... triton_ar
-        #   5. otherwise ........................... NCCL
-        if self._force_deterministic_rsag():
+    def _all_reduce_one(self, tensor: torch.Tensor, group: Group, op) -> torch.Tensor:
+        """All-reduce a single tensor along the route ``route`` picked for it."""
+        route = self.route(Collective.ALL_REDUCE, tensor, group)
+        if route is Route.ORDERED_FOLD:
+            return self._ordered_fold_all_reduce(tensor, group, op)
+        if route is Route.MULTIMEM:
+            return self._multimem_all_reduce(tensor, group, op)
+        if route is Route.NCCL:
             return self._nccl.all_reduce(tensor, group, op=op)
+        # Tiered dispatch -- first match wins. This is Tier 1 (which backend);
+        # the trtllm backend then runs Tier 2 (mnnvl vs IPC, by payload bytes)
+        # inside _ar_fusion_workspace.
+        #   1. trtllm_ar armed for this group ...... trtllm_ar   (mnnvl / IPC fusion)
+        #   2. group spans nodes ................... NCCL
+        #   3. Iris can run ........................ Iris
+        #   4. otherwise ........................... NCCL
         spans_nodes = self._group_spans_nodes(group)
         # trtllm_ar carries an mnnvl workspace that spans nodes; it is only
         # armed for a group when that succeeded, so has_trtllm_ar() is itself
@@ -221,12 +413,24 @@ class AutoBackend(CommBackend):
             return self._trtllm_ar.all_reduce(tensor, group, op=op)
         if spans_nodes:
             return self._nccl.all_reduce(tensor, group, op=op)
-        if self._triton_ar.can_run(tensor, group, op=op):
-            return self._triton_ar.all_reduce(tensor, group, op=op)
+        if self._iris.can_run(tensor, group, op=op):
+            return self._iris.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)
 
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         return self._trtllm_ar.ensure_group_lane(group, hidden_dim)
+
+    def can_prepare_all_reduce_buffers(self, group: Group, dtype: torch.dtype) -> bool:
+        """Whether this group's performance route permits Iris preparation."""
+        return not (
+            not current_platform().is_amd
+            or len(group) <= 1
+            or dtype != torch.bfloat16
+            or self._force_deterministic_rsag()
+            or self._batch_invariant_collectives()
+            or self._group_spans_nodes(group)
+            or self._trtllm_ar.has_trtllm_ar(group)
+        )
 
     def prepare_all_reduce_buffers(
         self,
@@ -234,25 +438,14 @@ class AutoBackend(CommBackend):
         *,
         staged_max_numel: int,
         producer_direct_max_numel: int,
-        attnres_max_numel: int,
-        attnres_max_rows: int,
-        enable_lamport: bool,
         dtype: torch.dtype,
     ) -> bool:
-        if (
-            not current_platform().is_amd
-            or self._force_deterministic_rsag()
-            or self._group_spans_nodes(group)
-            or self._trtllm_ar.has_trtllm_ar(group)
-        ):
+        if not self.can_prepare_all_reduce_buffers(group, dtype):
             return False
-        return self._triton_ar.prepare_all_reduce_buffers(
+        return self._iris.prepare_all_reduce_buffers(
             group,
             staged_max_numel=staged_max_numel,
             producer_direct_max_numel=producer_direct_max_numel,
-            attnres_max_numel=attnres_max_numel,
-            attnres_max_rows=attnres_max_rows,
-            enable_lamport=enable_lamport,
             dtype=dtype,
         )
 
@@ -271,15 +464,14 @@ class AutoBackend(CommBackend):
         """
         if (
             self._force_deterministic_rsag()
+            or self._batch_invariant_collectives()
             or self._group_spans_nodes(group)
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
             return False
         if current_platform().is_amd:
-            return self._triton_ar.can_acquire_outputs(shapes, like, group, op=op)
-        return self._triton_ar.can_acquire_all_reduce_outputs(
-            shapes, like, group, op=op
-        )
+            return self._iris.can_acquire_outputs(shapes, like, group, op=op)
+        return self._iris.can_acquire_all_reduce_outputs(shapes, like, group, op=op)
 
     def acquire_all_reduce_outputs(
         self,
@@ -289,20 +481,23 @@ class AutoBackend(CommBackend):
         op=None,
     ) -> tuple[torch.Tensor, ...]:
         """Acquire ordinary or producer-direct all-reduce outputs."""
+        # The fold and the in-switch reduction read ordinary tensors; the
+        # producer-direct staging below only serves the Iris all-reduce.
         if (
             self._force_deterministic_rsag()
+            or self._batch_invariant_collectives()
             or self._group_spans_nodes(group)
             or self._trtllm_ar.has_trtllm_ar(group)
         ):
             return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
-        if current_platform().is_amd and not self._triton_ar.can_acquire_outputs(
+        if current_platform().is_amd and not self._iris.can_acquire_outputs(
             shapes,
             like,
             group,
             op=op,
         ):
             return super().acquire_all_reduce_outputs(shapes, like, group, op=op)
-        return self._triton_ar.acquire_all_reduce_outputs(
+        return self._iris.acquire_all_reduce_outputs(
             shapes,
             like,
             group,
@@ -312,11 +507,16 @@ class AutoBackend(CommBackend):
     def all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int = 0
     ) -> torch.Tensor:
-        if self._force_deterministic_rsag() or not self._multicast_reachable(group):
-            return self._nccl.all_gather(tensor, group, dim)
-        if tensor.dim() == 2 and dim in (-1, tensor.dim() - 1):
+        if (
+            self.route(Collective.ALL_GATHER, tensor, group) is Route.MULTIMEM
+            and tensor.dim() == 2
+            and dim in (-1, tensor.dim() - 1)
+        ):
+            # Small rows ride the all-reduce workspace's barrier-free exchange.
+            gathered = self._trtllm_ar.lamport_all_gather(tensor, group)
+            if gathered is not None:
+                return gathered
             return self._rsag.all_gather(tensor, group, dim)
-
         return self._nccl.all_gather(tensor, group, dim)
 
     def all_gather_single(
@@ -324,13 +524,85 @@ class AutoBackend(CommBackend):
     ) -> None:
         return self._nccl.all_gather_single(output, input, group)
 
+    def all_gather_single_async(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> CommWork:
+        return self._nccl.all_gather_single_async(output, input, group)
+
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
+        if self.route(Collective.REDUCE_SCATTER, tensor, group) is Route.ORDERED_FOLD:
+            return self._ordered_fold_reduce_scatter(tensor, group)
         return self._nccl.reduce_scatter(tensor, group)
 
     def all_to_all_single(
-        self, output: torch.Tensor, input: torch.Tensor, group: Group
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
-        return self._nccl.all_to_all_single(output, input, group)
+        # Pure data movement: no reduction, so nothing to fold for the
+        # batch-invariant envelope and no symmetric-memory path to veto.
+        return self._nccl.all_to_all_single(
+            output,
+            input,
+            group,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+        )
+
+    def prepare_projection(self, spec, scratch_pool=None):
+        """Prepare optional Lamport paths without changing ordinary routing.
+
+        Projection collectives have an explicit pre-capture lifetime. Their
+        large-message and unsupported-topology paths return to this backend;
+        batch-invariant reductions retain the rank-ordered fold at every size.
+        """
+        use_lamport = (
+            current_platform().is_nvidia
+            and spec.device.type == "cuda"
+            and spec.dtype == torch.bfloat16
+            and not self._force_deterministic_rsag()
+        )
+        return self._projection.prepare(
+            spec,
+            use_lamport,
+            use_lamport and not self._batch_invariant_collectives(),
+            scratch_pool,
+        )
+
+    def projection_all_gather(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        quantize: bool,
+        workspace: ProjectionWorkspace,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._projection.all_gather(tensor, rows, quantize, workspace)
+
+    def projection_all_to_all(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        inverse: bool,
+        quantize: bool,
+        out: torch.Tensor | None,
+        workspace: ProjectionWorkspace,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._projection.all_to_all(
+            tensor, rows, inverse, quantize, out, workspace
+        )
+
+    def acquire_projection_output(
+        self, rows: int, workspace: ProjectionWorkspace
+    ) -> torch.Tensor:
+        return self._projection.acquire_output(rows, workspace)
+
+    def projection_reduce_scatter(
+        self, tensor: torch.Tensor, rows: int, workspace: ProjectionWorkspace
+    ) -> torch.Tensor:
+        return self._projection.reduce_scatter(tensor, rows, workspace)
 
     def send(self, tensor: torch.Tensor, dst: int, group: Group) -> None:
         return self._nccl.send(tensor, dst, group)

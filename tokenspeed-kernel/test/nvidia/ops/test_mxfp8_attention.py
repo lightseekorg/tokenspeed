@@ -62,7 +62,7 @@ def _require_blockscaled_fa4():
 
 def _quantize(x: torch.Tensor):
     """[T, H, D] bf16 -> (fp8 [T, H, D], e8m0 [T, H, SF_DIM])."""
-    from tokenspeed_kernel import quantize_mxfp8
+    from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 
     t, h, d = x.shape
     q, sf = quantize_mxfp8(x.reshape(t * h, d))

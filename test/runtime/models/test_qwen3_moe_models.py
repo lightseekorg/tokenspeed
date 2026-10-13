@@ -8,6 +8,7 @@ from tokenspeed.runtime.configs.qwen3_moe_config import Qwen3MoeConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY, get_config
 
@@ -203,6 +204,7 @@ class TestQwen3MoeConfig(unittest.TestCase):
             token_to_kv_pool=None,
             bs=0,
             num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, 0, 1),
             input_num_tokens=0,
             forward_mode=ForwardMode.IDLE,
         )

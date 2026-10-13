@@ -94,17 +94,18 @@ def _prep_tape_kernel(descs_ptr, regs_ptr, BLOCK: tl.constexpr):
         state_out = idx  # second output rides the idx slot
         seq_ptr = tl.cast(scalar, tl.pointer_type(tl.int32))
         page_size = stride
-        o = offs
-        mask = o < n
-        after = tl.load(seq_ptr + o, mask=mask, other=1).to(tl.int64)
-        before = after - 1
-        in_slot = tl.maximum((before - 1) // page_size, 0)
-        out_slot = tl.minimum(tl.maximum((after - 1) // page_size, 0), m - 1)
-        s_in = tl.load(rows + o * m + in_slot, mask=mask, other=0)
-        s_in = tl.where(before > 0, s_in, 0)
-        s_out = tl.load(rows + o * m + out_slot, mask=mask, other=0)
-        tl.store(dst + o, s_in, mask=mask)
-        tl.store(state_out + o, s_out, mask=mask)
+        for base in range(0, n, BLOCK):
+            o = base + offs
+            mask = o < n
+            after = tl.load(seq_ptr + o, mask=mask, other=1).to(tl.int64)
+            before = after - 1
+            in_slot = tl.maximum((before - 1) // page_size, 0)
+            out_slot = tl.minimum(tl.maximum((after - 1) // page_size, 0), m - 1)
+            s_in = tl.load(rows + o * m + in_slot, mask=mask, other=0)
+            s_in = tl.where(before > 0, s_in, 0)
+            s_out = tl.load(rows + o * m + out_slot, mask=mask, other=0)
+            tl.store(dst + o, s_in, mask=mask)
+            tl.store(state_out + o, s_out, mask=mask)
 
 
 def run_tape(descs, regs) -> None:

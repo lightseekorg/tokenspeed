@@ -18,9 +18,14 @@ The fused dispatch policy (`fused/moe.py`) is the top of the funnel: it calls
 `M >= 9`, staged MFMA decode), so the kernel dependency arrow points from
 `fused/` to the staged files, never back.
 
-For the staged package's second GEMM, TP uses direct atomic accumulation through
-64 tokens and scratch-plus-FP32-reduce at larger sizes; EP uses atomic
-accumulation because each rank owns only a sparse subset of the routed experts.
+For the staged package's second GEMM, TP uses direct BF16 atomic accumulation
+through 2048 tokens with E2M1 activations (64 with E4M3), and scratch-plus-FP32
+reduction at larger sizes. E2M1 atomics use adjacent column pairs per lane and
+column-first workgroup order. They remove the partials buffer and separate
+reduction, but retain an output-clear launch on every invocation, including
+graph replay. BF16 atomic summation is order-dependent and rounds after each
+route, unlike FP32 reduction. EP uses atomic accumulation because each rank
+owns only a sparse subset of the routed experts.
 
 ## Staged package files
 

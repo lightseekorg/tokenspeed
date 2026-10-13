@@ -22,7 +22,8 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.metadata import fill_ngram_history
+from tokenspeed_kernel.ops.metadata import fill_ngram_history, ngram_history
+from utils import compiled_kernels
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -187,6 +188,44 @@ def test_fused_history_matches_eager_chain(batch, context, capacity):
     assert torch.equal(needs, ref_needs)
     assert torch.equal(prev, ref_prev)
     assert torch.equal(mask, ref_mask)
+
+
+@pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
+@pytest.mark.parametrize("lengths_dtype", (torch.int32, torch.int64))
+def test_no_request_chunk_outgrows_the_default_stack(ids_dtype, lengths_dtype):
+    """Local memory past the default stack is reserved on every SM at first launch."""
+    chunk = ngram_history._REQUEST_CHUNK
+    # One batch per request-chunk bucket, then batches past the widest chunk.
+    for batch in [1 << i for i in range(chunk.bit_length())] + [chunk + 1, 3000]:
+        # Scalars that are and are not multiples of 16 compile apart; serving's vocab is.
+        for vocab, capacity in ((100, 7 * batch), (128, 112 * batch)):
+            for context in (1, 3, 4):
+                args = list(
+                    _batch(
+                        batch,
+                        context,
+                        pool=batch + 8,
+                        capacity=capacity,
+                        vocab=vocab,
+                        seed=batch,
+                    )
+                )
+                args[4] = args[4].to(lengths_dtype)
+                args[5] = args[5].to(ids_dtype)
+                fill_ngram_history(*args)
+    torch.cuda.synchronize()
+    compiled = compiled_kernels(ngram_history._ngram_history_kernel) + compiled_kernels(
+        ngram_history._ngram_seed_kernel
+    )
+    # CUDA keeps a 1 KiB stack per thread; HIP allocates scratch for any private segment.
+    limit = 0 if torch.version.hip else 1024
+    # n_spills is the per-thread local size in 4-byte words.
+    over_limit = [
+        (kernel.src.constants, 4 * kernel.n_spills)
+        for kernel in compiled
+        if 4 * kernel.n_spills > limit
+    ]
+    assert compiled and not over_limit, over_limit
 
 
 def test_fused_history_rejects_misshapen_inputs():

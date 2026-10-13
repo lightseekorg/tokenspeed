@@ -25,7 +25,6 @@ server:
     --moe-tp-size 4
     --max-model-len 80000
     --max-num-seqs 16
-    --gpu-memory-utilization 0.95
     --disable-cuda-graph-padding
     --trust-remote-code
     --attention-backend tokenspeed_mla
@@ -36,7 +35,7 @@ server:
     --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla
     --speculative-num-steps 3
     --drafter-attention-backend tokenspeed_mla
-    --engine-startup-timeout 2400
+    --engine-startup-timeout 3600
     --host 127.0.0.1
     --port 8000
   ready:

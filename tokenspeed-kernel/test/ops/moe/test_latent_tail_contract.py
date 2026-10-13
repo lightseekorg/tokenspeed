@@ -24,86 +24,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.latent_tail import (
-    KimiK3LatentTailOp,
-    _allocator_identity,
-    _tail_pool_slot,
-)
-
-
-def test_initialize_constructs_a_fresh_op(monkeypatch: pytest.MonkeyPatch) -> None:
-    constructed = []
-
-    def fake_init(self, *args, **kwargs) -> None:
-        constructed.append((self, args, kwargs))
-
-    monkeypatch.setattr(KimiK3LatentTailOp, "__init__", fake_init)
-    monkeypatch.setattr(
-        "tokenspeed_kernel.ops.moe.latent_tail.dist.get_world_size", lambda group: 8
-    )
-    kwargs = {
-        "group": SimpleNamespace(group_name="test-group"),
-        "hidden_size": 7168,
-        "latent_size": 3584,
-        "rms_eps": 1e-6,
-        "device": torch.device("cuda", 0),
-        "layer_index": 1,
-        "model_scope": "model.layers",
-    }
-
-    first = KimiK3LatentTailOp.initialize(**kwargs)
-    second = KimiK3LatentTailOp.initialize(**kwargs)
-
-    assert first is not second
-    assert len(constructed) == 2
-
-
-def test_slot_binding_is_rank_identical_for_same_layer() -> None:
-    rank_zero_slot = _tail_pool_slot(31, 2)
-    rank_one_slot = _tail_pool_slot(31, 2)
-
-    assert rank_zero_slot == rank_one_slot
-
-
-def test_adjacent_layers_use_different_slots_at_depth_two() -> None:
-    assert _tail_pool_slot(31, 2) != _tail_pool_slot(32, 2)
-
-
-def test_k3_first_moe_layer_starts_at_logical_layer_one() -> None:
-    assert _tail_pool_slot(1, 2) == 1
-    assert _tail_pool_slot(2, 2) == 0
-    assert _tail_pool_slot(3, 2) == _tail_pool_slot(1, 2)
-
-
-@pytest.mark.parametrize("depth", [1, 2, 3, 17])
-def test_slot_binding_has_exact_depth_reuse_spacing(depth: int) -> None:
-    slots = [_tail_pool_slot(layer, depth) for layer in range(depth * 2)]
-
-    assert slots[:depth] == slots[depth:]
-    assert len(set(slots[:depth])) == depth
-
-
-def test_base_and_draft_layer_namespaces_use_different_slot_bundles() -> None:
-    base_scope = "model.layers"
-    draft_scope = "model.decoder"
-    layer_index = 0
-
-    assert _tail_pool_slot(layer_index, 2) == _tail_pool_slot(layer_index, 2)
-    assert (base_scope, _tail_pool_slot(layer_index, 2)) != (
-        draft_scope,
-        _tail_pool_slot(layer_index, 2),
-    )
-
-
-def test_slot_binding_rejects_invalid_depth() -> None:
-    with pytest.raises(ValueError, match="greater than zero"):
-        _tail_pool_slot(0, 0)
-
-
-def test_allocator_identity_handles_builtin_bound_methods() -> None:
-    owner: list[object] = []
-
-    assert _allocator_identity(owner.append) is owner
 
 
 def test_lamport_copy_releases_successors_before_rearming() -> None:
@@ -120,6 +40,24 @@ def test_lamport_copy_releases_successors_before_rearming() -> None:
     release = source.index("griddepcontrol_launch_dependents()")
     cleanup = source.index("store_lamport_sentinel_128(source")
     assert release < cleanup
+
+
+def test_shared_rs_does_not_run_routed_collective():
+    from unittest.mock import Mock
+
+    from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
+
+    shared = torch.ones(2, 4)
+    shard = torch.ones(64, 2)
+    op = object.__new__(KimiK3LatentTailOp)
+    op._unused_gamma = torch.ones(2)
+    op._collective = Mock(latent_output=torch.empty(64, 2), return_value=(None, shard))
+    op._gather_complete = Mock()
+    assert op.reduce_scatter_shared(shared) is shard
+    assert op._collective.call_args.kwargs == {
+        "include_reduce_scatter": True,
+        "include_routed": False,
+    }
 
 
 def _parameters_with_defaults(args: ast.arguments) -> list:
@@ -176,8 +114,6 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
     # sanitize -0, so it needs the pattern that takes two coincidences to spell.
     tail = (package / "ops/moe/latent_tail.py").read_text()
     assert "sentinel=NEG_ZERO_F32_BITS" in tail
-    # Naming it is not enough: the text check passes while the import is absent,
-    # which is a NameError at the first tail construction and not at import.
     tail_imports = {
         alias.asname or alias.name
         for node in ast.walk(ast.parse(tail))

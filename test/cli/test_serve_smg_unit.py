@@ -47,6 +47,8 @@ from tokenspeed.cli.serve_smg import (
     INKLING_TOOL_CALL_PARSER,
     KIMI_K3_REASONING_PARSER,
     KIMI_K3_TOOL_CALL_PARSER,
+    _add_metrics_port,
+    _add_rl_control_port,
     _args_with_default_model_parsers,
     _free_port_avoiding_ephemeral_range,
     _gateway_args_with_default_log_level,
@@ -883,6 +885,96 @@ async def test_run_smg_allocates_prometheus_port_at_gateway_spawn():
 
 
 @pytest.mark.asyncio
+async def test_run_smg_wires_metrics_port_into_engine_spawn(capsys):
+    """With --enable-metrics the engine gets a pinned --metrics-port before
+    spawn_engine, and the scrape URL is printed once serving is ready."""
+    engine = _make_proc(returncode=0)
+    gateway = _make_proc(returncode=0)
+
+    startup_done = asyncio.Event()
+
+    async def wait_then_zero():
+        await startup_done.wait()
+        return 0
+
+    engine.wait = AsyncMock(side_effect=wait_then_zero)
+    gateway.wait = AsyncMock(side_effect=wait_then_zero)
+
+    async def probe_then_schedule_release(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, startup_done.set)
+
+    opts = OrchestratorOpts(engine_startup_timeout=10, gateway_startup_timeout=10)
+    spawn_engine_mock = AsyncMock(return_value=engine)
+    with patch("tokenspeed.cli.serve_smg.spawn_engine", spawn_engine_mock), patch(
+        "tokenspeed.cli.serve_smg.spawn_gateway", AsyncMock(return_value=gateway)
+    ), patch("tokenspeed.cli.serve_smg.wait_grpc_serving", AsyncMock()), patch(
+        "tokenspeed.cli.serve_smg.wait_http_ready",
+        side_effect=probe_then_schedule_release,
+    ), patch(
+        "tokenspeed.cli.serve_smg.terminate_then_kill", AsyncMock()
+    ):
+        rc = await run_smg(
+            engine_args=["--model", "/tmp/x", "--enable-metrics"],
+            gateway_args=["--model", "/tmp/x"],
+            opts=opts,
+            user_host="127.0.0.1",
+            user_port=8000,
+        )
+
+    assert rc == 0
+    spawned_args = spawn_engine_mock.await_args.args[0]
+    idx = spawned_args.index("--metrics-port")
+    port = int(spawned_args[idx + 1])
+    assert 1 <= port <= 65535
+    out = capsys.readouterr().out
+    assert f"engine metrics available at http://127.0.0.1:{port}/metrics" in out
+
+
+@pytest.mark.asyncio
+async def test_run_smg_without_metrics_leaves_engine_args_untouched(capsys):
+    """No --enable-metrics: no --metrics-port injection, no metrics output."""
+    engine = _make_proc(returncode=0)
+    gateway = _make_proc(returncode=0)
+
+    startup_done = asyncio.Event()
+
+    async def wait_then_zero():
+        await startup_done.wait()
+        return 0
+
+    engine.wait = AsyncMock(side_effect=wait_then_zero)
+    gateway.wait = AsyncMock(side_effect=wait_then_zero)
+
+    async def probe_then_schedule_release(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, startup_done.set)
+
+    opts = OrchestratorOpts(engine_startup_timeout=10, gateway_startup_timeout=10)
+    spawn_engine_mock = AsyncMock(return_value=engine)
+    with patch("tokenspeed.cli.serve_smg.spawn_engine", spawn_engine_mock), patch(
+        "tokenspeed.cli.serve_smg.spawn_gateway", AsyncMock(return_value=gateway)
+    ), patch("tokenspeed.cli.serve_smg.wait_grpc_serving", AsyncMock()), patch(
+        "tokenspeed.cli.serve_smg.wait_http_ready",
+        side_effect=probe_then_schedule_release,
+    ), patch(
+        "tokenspeed.cli.serve_smg.terminate_then_kill", AsyncMock()
+    ):
+        rc = await run_smg(
+            engine_args=["--model", "/tmp/x"],
+            gateway_args=["--model", "/tmp/x"],
+            opts=opts,
+            user_host="127.0.0.1",
+            user_port=8000,
+        )
+
+    assert rc == 0
+    spawned_args = spawn_engine_mock.await_args.args[0]
+    assert "--metrics-port" not in spawned_args
+    assert "engine metrics" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
 async def test_signal_handlers_installed_before_spawning_engine():
     """Signal handlers must be live before any subprocess."""
     call_order: list[str] = []
@@ -1140,3 +1232,65 @@ def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):
         "--tool-call-parser",
         DEEPSEEK_V4_TOOL_CALL_PARSER,
     ]
+
+
+def test_add_rl_control_port_allocates_when_absent(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40123
+    )
+    args, url = _add_rl_control_port(["--model", "/tmp/x"])
+    assert args == ["--model", "/tmp/x", "--rl-control-port", "40123"]
+    assert url == "http://127.0.0.1:40123"
+
+
+def test_add_rl_control_port_keeps_a_pinned_port():
+    args, url = _add_rl_control_port(["--model", "/tmp/x", "--rl-control-port", "5005"])
+    assert args == ["--model", "/tmp/x", "--rl-control-port", "5005"]
+    assert url == "http://127.0.0.1:5005"
+
+
+def test_add_metrics_port_noop_without_enable_metrics():
+    args, url = _add_metrics_port(["--model", "/tmp/x"])
+    assert args == ["--model", "/tmp/x"]
+    assert url is None
+
+
+def test_add_metrics_port_allocates_when_absent(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40124
+    )
+    args, url = _add_metrics_port(["--model", "/tmp/x", "--enable-metrics"])
+    assert args == ["--model", "/tmp/x", "--enable-metrics", "--metrics-port", "40124"]
+    assert url == "http://127.0.0.1:40124/metrics"
+
+
+def test_add_metrics_port_keeps_a_pinned_port():
+    args, url = _add_metrics_port(
+        ["--model", "/tmp/x", "--enable-metrics", "--metrics-port", "5006"]
+    )
+    assert args == ["--model", "/tmp/x", "--enable-metrics", "--metrics-port", "5006"]
+    assert url == "http://127.0.0.1:5006/metrics"
+
+
+def test_add_metrics_port_treats_zero_as_auto(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40124
+    )
+    args, url = _add_metrics_port(["--enable-metrics", "--metrics-port", "0"])
+    assert args == ["--enable-metrics", "--metrics-port", "40124"]
+    assert url == "http://127.0.0.1:40124/metrics"
+
+
+def test_add_metrics_port_url_follows_metrics_host(monkeypatch):
+    monkeypatch.setattr(
+        "tokenspeed.cli.serve_smg._free_port_avoiding_ephemeral_range", lambda: 40124
+    )
+    args, url = _add_metrics_port(["--enable-metrics", "--metrics-host", "0.0.0.0"])
+    assert args == [
+        "--enable-metrics",
+        "--metrics-host",
+        "0.0.0.0",
+        "--metrics-port",
+        "40124",
+    ]
+    assert url == "http://0.0.0.0:40124/metrics"

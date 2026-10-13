@@ -21,22 +21,19 @@
 from __future__ import annotations
 
 import inspect
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
-from tokenspeed_kernel import (
-    gated_residual_combine,
+from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
-    gated_residual_mix,
     grouped_gemma_rmsnorm,
 )
+from tokenspeed_kernel.ops.residual import gated_residual_combine, gated_residual_mix
 
 import tokenspeed.runtime.distributed.comm_manager as comm_manager_module
 import tokenspeed.runtime.layers.hyperconnection as hyperconnection_module
-import tokenspeed.runtime.models.qwen4_exp as qwen4_exp_module
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.hyperconnection import (
@@ -49,7 +46,7 @@ from tokenspeed.runtime.models.qwen4_exp_nextn import Qwen4ExpDraftAttentionDeco
 
 def test_runtime_uses_tokenspeed_kernel_boundary() -> None:
     source = inspect.getsource(hyperconnection_module)
-    assert "from tokenspeed_kernel import" in source
+    assert "from tokenspeed_kernel.ops.residual import" in source
     assert "import triton" not in source
     assert "@triton.jit" not in source
 
@@ -60,7 +57,14 @@ def test_kernel_boundary_is_gpu_only() -> None:
     up = torch.empty(8, 2)
     with pytest.raises(ValueError, match="requires GPU tensors"):
         gated_residual_mix(
-            normalized, projection, up, 2, 4, 2, weights_independent=False
+            normalized,
+            projection,
+            up,
+            2,
+            4,
+            2,
+            projection_rows=4,
+            weights_independent=False,
         )
     with pytest.raises(ValueError, match="requires GPU tensors"):
         gated_residual_combine(torch.empty(1, 4), normalized, torch.empty(1, 2), 2, 4)
@@ -100,6 +104,132 @@ def test_up_weight_loader_rejects_shape_change() -> None:
 
     with pytest.raises(ValueError, match="shape mismatch"):
         param.weight_loader(param, torch.empty(8, 4))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    ("use_combine", "inject_first"), [(False, False), (True, False), (True, True)]
+)
+def test_projection_loader_pads_storage_once(dtype, use_combine, inject_first) -> None:
+    mixer = GatedResidualSimple(
+        HyperConnectionConfig(hc_count=4, hidden_size=8, hc_lowrank=5),
+        use_mix=True,
+        use_combine=use_combine,
+    ).to(dtype=dtype)
+    param = mixer.mix_inject_proj.weight
+    logical_rows = 5 + (4 if use_combine else 0)
+    expected_rows = (
+        (logical_rows + 7) // 8 * 8 if dtype is not torch.float32 else logical_rows
+    )
+    shards = {"mix": torch.randn(5, 32, dtype=dtype)}
+    if use_combine:
+        shards["inject"] = torch.randn(4, 32, dtype=dtype)
+    order = list(reversed(shards)) if inject_first else list(shards)
+    storage = None
+    for name in order:
+        param.weight_loader(param, shards[name], name)
+        assert param.shape == (expected_rows, 32)
+        if storage is None:
+            storage = param.data_ptr()
+        assert param.data_ptr() == storage
+    mixer.process_weights_after_loading(mixer)
+    assert param.data_ptr() == storage
+    torch.testing.assert_close(param[:5], shards["mix"] / 4, rtol=0, atol=0)
+    if use_combine:
+        torch.testing.assert_close(
+            param[5:logical_rows], shards["inject"] / 4, rtol=0, atol=0
+        )
+        normalized = torch.randn(3, 32, dtype=dtype)
+        torch.testing.assert_close(
+            mixer._inject_logits(normalized),
+            torch.nn.functional.linear(normalized, param[5:logical_rows]),
+            rtol=0,
+            atol=0,
+        )
+    assert torch.count_nonzero(param[logical_rows:]) == 0
+    # Reloading a shard keeps captured CUDA graph pointers valid.
+    replacement = -shards["mix"]
+    param.weight_loader(param, replacement, "mix")
+    assert param.data_ptr() == storage
+    torch.testing.assert_close(param[:5], replacement / 4, rtol=0, atol=0)
+
+
+def test_projection_postprocess_preserves_fp32_logical_width() -> None:
+    mixer = GatedResidualSimple(
+        HyperConnectionConfig(hc_count=4, hidden_size=8, hc_lowrank=5)
+    ).to(dtype=torch.bfloat16)
+    mixer.process_weights_after_loading(mixer)
+    assert mixer.mix_inject_proj.weight.shape == (16, 32)
+    mixer.float()
+    original = mixer.mix_inject_proj.weight[:9].detach().clone()
+    mixer.process_weights_after_loading(mixer)
+    assert mixer.mix_inject_proj.weight.shape == (9, 32)
+    torch.testing.assert_close(mixer.mix_inject_proj.weight, original, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("rows", [17, 257])
+@torch.inference_mode()
+def test_loaded_projection_padding_survives_graph_weight_reload(dtype, rows) -> None:
+    with torch.device("cuda"):
+        mixer = GatedResidualSimple(
+            HyperConnectionConfig(
+                hc_count=4, hidden_size=2560, hc_lowrank=320, params_dtype=dtype
+            )
+        ).to(dtype=dtype)
+    generator = torch.Generator(device="cuda").manual_seed(59 + rows)
+    projection = (
+        torch.randn(324, 10240, dtype=dtype, device="cuda", generator=generator) * 0.01
+    )
+    up = torch.randn(10240, 320, dtype=dtype, device="cuda", generator=generator) * 0.01
+    param = mixer.mix_inject_proj.weight
+    param.weight_loader(param, projection[:320], "mix")
+    param.weight_loader(param, projection[320:], "inject")
+    mixer.input_mix_weight_up.weight.weight_loader(mixer.input_mix_weight_up.weight, up)
+    storage = param.data_ptr()
+    assert param.shape == (328, 10240)
+    value = torch.randn(rows, 10240, dtype=dtype, device="cuda", generator=generator)
+
+    def invoke():
+        mixed, residuals = mixer.mix(value, normalized=value)
+        return mixed, residuals[2]
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with mock.patch.object(
+        hyperconnection_module,
+        "pad_gated_residual_projection_weight",
+        side_effect=AssertionError("forward must use the loaded weight directly"),
+    ):
+        with torch.cuda.stream(stream):
+            invoke()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = invoke()
+    for factor in (1.0, -0.5):
+        param.weight_loader(param, projection[:320] * factor, "mix")
+        param.weight_loader(param, projection[320:] * factor, "inject")
+        assert param.data_ptr() == storage
+        value.normal_(generator=generator)
+        graph.replay()
+        torch.cuda.synchronize()
+        x = value.cpu().double()
+        projected = x @ param[:324].cpu().double().T
+        gate = torch.nn.functional.silu(projected[:, :320]) @ up.cpu().double().T
+        expected = (
+            (gate.sigmoid() * x).reshape(rows, 4, 2560).mean(1),
+            projected[:, 320:],
+        )
+        tolerance = 0.01 if dtype is torch.bfloat16 else 0.002
+        torch.testing.assert_close(
+            tuple(output.cpu().double() for output in outputs),
+            expected,
+            rtol=tolerance,
+            atol=tolerance,
+        )
+    graph.reset()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -314,7 +444,13 @@ def test_residual_fusion_gather_boundaries_match_communication(
 ) -> None:
     mapping = SimpleNamespace(
         has_attn_tp=attn_tp > 1,
-        attn=SimpleNamespace(tp_size=attn_tp, tp_group=list(range(attn_tp))),
+        attn=SimpleNamespace(
+            tp_size=attn_tp,
+            tp_rank=0,
+            tp_group=list(range(attn_tp)),
+            has_qcp=False,
+            qcp_size=1,
+        ),
         dense=SimpleNamespace(tp_size=other_tp),
         moe=SimpleNamespace(tp_ep_size=other_tp),
     )
@@ -325,6 +461,8 @@ def test_residual_fusion_gather_boundaries_match_communication(
         prev_is_moe=is_moe,
         input_layernorm=None,
         post_attn_layernorm=None,
+        dense_batch_invariant=False,
+        query_sharded=False,
     )
     x = torch.arange(12).reshape(3, 4)
     gather = mock.Mock(side_effect=lambda value, **kwargs: value.repeat(2, 1))
@@ -336,16 +474,17 @@ def test_residual_fusion_gather_boundaries_match_communication(
     expected_pre = layer_id > 0 and expected_final
     assert manager.needs_pre_attn_all_gather() == expected_pre
     assert manager.needs_final_all_gather() == expected_final
+    ctx = SimpleNamespace(query_shard=None)
     for operation, expected in (
         (manager.pre_attn_comm, expected_pre),
         (manager.gather_residual, expected_pre),
     ):
         gather.reset_mock()
-        result = operation(x, None)
+        result = operation(x, ctx)
         assert gather.call_count == int(expected)
         assert (result is x) == (not expected)
     gather.reset_mock()
-    result, residual = manager.post_final_norm_comm(x, x, None)
+    result, residual = manager.post_final_norm_comm(x, x, ctx)
     assert gather.call_count == int(expected_final)
     assert residual is x and (result is x) == (not expected_final)
 
@@ -459,13 +598,8 @@ def _tail_fusion_model(
     ],
 )
 def test_mlp_tail_fusion_preserves_intervening_operations(
-    monkeypatch, dtype: torch.dtype, boundary: str
+    dtype: torch.dtype, boundary: str
 ) -> None:
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_global_expert_distribution_recorder",
-        lambda: SimpleNamespace(with_current_layer=lambda index: nullcontext()),
-    )
     torch.manual_seed(103)
     model = _tail_fusion_model(dtype, boundary, 3)
     ids = torch.arange(4, device="cuda")
@@ -518,13 +652,8 @@ def test_mlp_tail_fusion_preserves_intervening_operations(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize(("rows", "layer_count"), [(0, 1), (1, 3), (4, 1)])
 def test_mlp_tail_fusion_graph_replay_keeps_current_residual(
-    monkeypatch, rows: int, layer_count: int
+    rows: int, layer_count: int
 ) -> None:
-    monkeypatch.setattr(
-        qwen4_exp_module,
-        "get_global_expert_distribution_recorder",
-        lambda: SimpleNamespace(with_current_layer=lambda index: nullcontext()),
-    )
     torch.manual_seed(109)
     model = _tail_fusion_model(torch.bfloat16, "none", layer_count)
     ids = torch.arange(rows, device="cuda")

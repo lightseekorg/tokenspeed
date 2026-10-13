@@ -77,12 +77,47 @@ def chain_speculative_sampling_target_only(
     threshold_acc: float = 1.0,
     deterministic: bool = True,
     enable_pdl: bool | None = None,
+    *,
+    use_draft_prob: bool,
+    reject_draft_prob_threshold: float,
 ) -> None:
-    """Target-only chain speculative sampling.
+    """Chain speculative verification with one of two accept rules.
 
-    When ``draft_probs`` is ``None``, the kernel treats draft probabilities as
-    all zeros and avoids the corresponding GMEM traffic.
+    Args:
+        predicts: ``[bs * N]`` int32 output tokens, written for the accepted
+            prefix and the slot after it.
+        accept_index: ``[bs, N]`` int32 output positions, ``-1`` where unused.
+        accept_token_num: ``[bs]`` int32 accepted draft counts (bonus token
+            excluded).
+        candidates: ``[bs, N]`` int32 chains; column 0 is the verified token,
+            columns ``1..N-1`` the drafts.
+        uniform_samples: ``[bs, N]`` fp32 accept coins.
+        uniform_samples_for_final_sampling: ``[bs]`` fp32 residual coins.
+        target_probs: ``[bs, N, V]`` fp32 target distributions.
+        draft_probs: ``[bs, N, V]`` fp32 draft distributions. Under
+            ``use_draft_prob`` row ``i`` is the distribution candidate
+            ``i + 1`` was sampled from (required); otherwise it is an optional
+            residual subtrahend and ``None`` means all zeros (no GMEM traffic).
+        threshold_single: Target-only rule: accept outright at or above this
+            target probability.
+        threshold_acc: Target-only rule: accept with probability
+            ``target_prob / threshold_acc``.
+        deterministic: Fixed-order block scan for the residual draw.
+        enable_pdl: Programmatic dependent launch; ``None`` takes the platform
+            default.
+        use_draft_prob: Standard rejection sampling (``coin * q(x) < p(x)``,
+            residual ``norm(relu(p - q))``) instead of the target-only rule.
+        reject_draft_prob_threshold: ``draft_probs`` entries above this are
+            the "no recorded proposal" sentinel: the candidate is rejected and
+            the row samples the full target. The binding rejects values below
+            1.0 (a real probability would read as the sentinel); the serving
+            layer validates the full usable range once at server-args time.
     """
+    if use_draft_prob and draft_probs is None:
+        raise ValueError(
+            "chain_speculative_sampling_target_only: use_draft_prob requires the "
+            "recorded draft_probs"
+        )
     enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _load_sampling_chain_module().chain_speculative_sampling_target_only(
         predicts,
@@ -96,5 +131,7 @@ def chain_speculative_sampling_target_only(
         float(threshold_single),
         float(threshold_acc),
         bool(deterministic),
+        bool(use_draft_prob),
+        float(reject_draft_prob_threshold),
         enable_pdl,
     )

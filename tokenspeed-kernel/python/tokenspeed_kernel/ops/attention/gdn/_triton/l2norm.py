@@ -59,13 +59,17 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["T"],
+    do_not_specialize_on_alignment=["T"],
+)
 def l2norm_fwd_kernel(
     x,
     y,
     eps,
-    NB: tl.constexpr,
-    T: tl.constexpr,
+    # The row count follows the batch; runtime so every batch shape shares one
+    # binary (block pointer shapes accept runtime values).
+    T,
     D: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
@@ -104,7 +108,6 @@ def l2norm_fwd(
         raise RuntimeError("This layer doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -113,7 +116,6 @@ def l2norm_fwd(
             x,
             y,
             eps,
-            NB=NB,
             T=T,
             D=D,
             BD=BD,
@@ -140,7 +142,6 @@ def l2norm_fwd(
 
 
 class L2NormFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(ctx, x, eps=1e-6, output_dtype=None):

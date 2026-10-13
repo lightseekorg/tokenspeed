@@ -28,7 +28,11 @@ via custom ops.
 import torch
 import torch.distributed
 
-from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
+from tokenspeed.runtime.distributed.comm_backend.base import (
+    CommBackend,
+    CommWork,
+    Group,
+)
 
 
 class NcclBackend(CommBackend):
@@ -39,12 +43,20 @@ class NcclBackend(CommBackend):
     on first use.
     """
 
-    def __init__(self):
+    def __init__(self, *, group_name: str | None = None):
         self._resources = {}  # group_tuple → {pynccl_comm, device_group, world_size}
         self._use_pynccl = False
+        # The process groups the collectives run on: the shared ones (None)
+        # or a named copy (``ProcessGroupManager.init_process_group``).
+        self._group_name = group_name
 
     def configure(self, use_pynccl: bool = False) -> None:
         self._use_pynccl = use_pynccl
+
+    def for_named_groups(self, name: str) -> "NcclBackend":
+        # torch.distributed only: PyNccl builds its communicator at a group's
+        # first collective, which on a named group may fall inside a forward.
+        return NcclBackend(group_name=name)
 
     def _get_or_create_resources(self, group: Group):
         if group in self._resources:
@@ -54,7 +66,9 @@ class NcclBackend(CommBackend):
             process_group_manager as pg_manager,
         )
 
-        device_group = pg_manager.get_process_group("nccl", group)
+        device_group = pg_manager.get_process_group(
+            "nccl", group, name=self._group_name
+        )
         world_size = len(group)
 
         pynccl_comm = None
@@ -64,7 +78,9 @@ class NcclBackend(CommBackend):
                     PyNcclCommunicator,
                 )
 
-                gloo_group = pg_manager.get_process_group("gloo", group)
+                gloo_group = pg_manager.get_process_group(
+                    "gloo", group, name=self._group_name
+                )
                 pynccl_comm = PyNcclCommunicator(
                     group=gloo_group,
                     device=torch.device(f"cuda:{torch.cuda.current_device()}"),
@@ -168,12 +184,27 @@ class NcclBackend(CommBackend):
         if pynccl is not None and not pynccl.disabled:
             pynccl.all_gather(output, input)
         else:
-            torch.distributed.all_gather_single(
+            torch.distributed.all_gather_into_tensor(
                 output, input, group=res["device_group"]
             )
 
-    def all_to_all_single(
+    def all_gather_single_async(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
+    ) -> CommWork:
+        res = self._get_or_create_resources(group)
+        # PyNccl has no asynchronous form; torch.distributed runs the
+        # collective on the process group's own stream.
+        return torch.distributed.all_gather_into_tensor(
+            output, input, group=res["device_group"], async_op=True
+        )
+
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: Group,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
     ) -> None:
         res = self._get_or_create_resources(group)
         ws = res["world_size"]
@@ -181,7 +212,13 @@ class NcclBackend(CommBackend):
             output.copy_(input)
             return
         # PyNccl has no all_to_all wrapper
-        torch.distributed.all_to_all_single(output, input, group=res["device_group"])
+        torch.distributed.all_to_all_single(
+            output,
+            input,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=res["device_group"],
+        )
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         res = self._get_or_create_resources(group)
@@ -198,7 +235,7 @@ class NcclBackend(CommBackend):
         if pynccl is not None and not pynccl.disabled:
             pynccl.reduce_scatter(output_tensor, tensor)
         else:
-            torch.distributed.reduce_scatter_single(
+            torch.distributed.reduce_scatter_tensor(
                 output_tensor, tensor, group=res["device_group"]
             )
         return output_tensor
@@ -292,7 +329,7 @@ class NcclBackend(CommBackend):
             max_tokens, hidden, dtype=tensor.dtype, device=tensor.device
         )
         res = self._get_or_create_resources(group)
-        torch.distributed.reduce_scatter_single(
+        torch.distributed.reduce_scatter_tensor(
             output, padded_input.contiguous(), group=res["device_group"]
         )
         rank = group.index(torch.distributed.get_rank())

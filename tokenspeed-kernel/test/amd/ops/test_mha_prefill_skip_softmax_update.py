@@ -34,17 +34,15 @@ Checks (bf16, causal, fixed seed):
       batch
   [2] ELISION FIRES     past that range the output does move, so [1] is not
       vacuously true of a kernel that skips nothing
-  [3] NO REGRESSION     with skipping off, the result matches dense SDPA
 
-How far the elided output may drift is covered by
-``test_mha_prefill_skip_softmax.py``.
+How far the elided output may drift, and that it matches dense SDPA with
+skipping off, is covered by ``test_mha_prefill_skip_softmax.py``.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -60,7 +58,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mha.prefill import (  # noqa: E4
 _SEQLEN = 4096
 _HEAD_DIM = 128
 _DTYPE = torch.bfloat16
-_NO_REGRESSION_TOL = 5e-3
 # Baseline for [1]: too small for any row to vote, but still the
 # ENABLE_SKIP_SOFTMAX=True build, so any difference is the skipping itself.
 _TINY_THRESHOLD = 1e-9
@@ -78,24 +75,6 @@ def _qkv(n_heads: int, n_kv_heads: int, total_tokens: int, seed: int = 0):
     k = torch.randn((total_tokens, n_kv_heads, _HEAD_DIM), device="cuda", dtype=_DTYPE)
     v = torch.randn((total_tokens, n_kv_heads, _HEAD_DIM), device="cuda", dtype=_DTYPE)
     return q, k, v
-
-
-def _dense_ref(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Per-sequence causal dense reference in fp32. [S,H,D] layout, one sequence."""
-    n_heads, n_kv_heads = q.shape[1], k.shape[1]
-    qt, kt, vt = (x.transpose(0, 1).float().unsqueeze(0) for x in (q, k, v))
-    if n_kv_heads != n_heads:
-        repeat = n_heads // n_kv_heads
-        kt = kt.repeat_interleave(repeat, dim=1)
-        vt = vt.repeat_interleave(repeat, dim=1)
-    out = F.scaled_dot_product_attention(qt, kt, vt, is_causal=True)
-    return out.squeeze(0).transpose(0, 1).to(q.dtype)
-
-
-def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
-    return (
-        (a.float() - b.float()).abs().mean() / b.float().abs().mean().clamp_min(1e-6)
-    ).item()
 
 
 def _run(q, k, v, seqlens: list[int], threshold: float, **kwargs):
@@ -182,12 +161,3 @@ def test_elision_actually_fires(threshold: float) -> None:
     inert = _run(q, k, v, [_SEQLEN], _TINY_THRESHOLD)
     assert torch.isfinite(elided).all()
     assert not torch.equal(elided, inert)
-
-
-@pytest.mark.parametrize("threshold", [0.0, _TINY_THRESHOLD])
-def test_inert_without_skipping(threshold: float) -> None:
-    """[3] With nothing to vote or elide, the result still matches dense."""
-    q, k, v = _qkv(8, 2, _SEQLEN)
-    out = _run(q, k, v, [_SEQLEN], threshold)
-    assert torch.isfinite(out).all()
-    assert _rel_err(out, _dense_ref(q, k, v)) < _NO_REGRESSION_TOL

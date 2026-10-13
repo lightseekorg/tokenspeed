@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string>
 #include <vector>
@@ -31,6 +32,14 @@ struct RequestSpec {
     std::string request_id;
     std::vector<std::int32_t> tokens;
     std::int32_t max_new_tokens{0};
+    // Upper bound on the prompt prefix the first admission's probe may claim
+    // from the prefix cache, in tokens. A request that returns prompt logprobs
+    // from position `s` sets this to `s`, so every position at or after `s` is
+    // recomputed and produces logits (a cached position has no logits). The
+    // default places no bound beyond the ordinary replay tail. A readmission
+    // after retraction relaxes it to the positions whose forward results had
+    // landed before the retraction: their logits already exist.
+    std::int32_t max_cached_prefix_tokens{std::numeric_limits<std::int32_t>::max()};
 };
 
 // One prefill chunk's model inputs. The input covers `extend_len` tokens

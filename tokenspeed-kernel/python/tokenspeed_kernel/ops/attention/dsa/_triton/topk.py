@@ -26,7 +26,7 @@ from tokenspeed_kernel.platform import current_platform
 
 _is_nvidia = current_platform().is_nvidia
 
-_RADIX_TOPK_MIN_COLS = 65536
+_RADIX_TOPK_MIN_COLS = 32768
 _RADIX_TOPK_BLOCK_N = 4096
 
 
@@ -35,7 +35,9 @@ def _mark_forced_initial_local_logits_kernel(
     logits_ptr,
     logits_row_stride,
     causal_lens_ptr,
-    num_cols: tl.constexpr,
+    # Candidate width follows the batch; runtime so every batch shape shares
+    # one binary.
+    num_cols,
     initial_tokens: tl.constexpr,
     local_tokens: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -112,7 +114,9 @@ def _local_topk_to_global_slots_kernel(
     block_table_ptr,
     block_table_base_offsets_ptr,
     block_table_stride,
-    block_table_cols: tl.constexpr,
+    # Block-table width follows the batch; runtime so every batch shape
+    # shares one binary.
+    block_table_cols,
     block_size: tl.constexpr,
     topk: tl.constexpr,
     has_seq_lens: tl.constexpr,
@@ -498,50 +502,68 @@ def _dsa_decode_logits_fp8_kernel(
     block_idx = offsets // page_size
     block_offset = offsets - block_idx * page_size
     valid = valid & (offsets < max_seq_len)
-    page = tl.load(
-        block_table + req * block_table_stride + block_idx,
-        mask=valid,
-        other=0,
-    ).to(tl.int64)
+    if page_size % BLOCK_N == 0:
+        # An aligned tile fits within one page, so its ownership is uniform.
+        start = block_id * BLOCK_N
+        page = tl.load(
+            block_table + req * block_table_stride + start // page_size,
+            mask=(start < seq_len) & (start < max_seq_len),
+            other=-1,
+        ).to(tl.int64)
+        has_valid = page >= 0
+    else:
+        page = tl.load(
+            block_table + req * block_table_stride + block_idx,
+            mask=valid,
+            other=-1,
+        ).to(tl.int64)
+        has_valid = tl.max((valid & (page >= 0)).to(tl.int32), axis=0) > 0
     valid = valid & (page >= 0)
-    fp8_base = page * page_stride_bytes + block_offset * head_dim
-    scale_base = (
-        page * (page_stride_bytes // 4)
-        + (page_size * head_dim) // 4
-        + block_offset * num_groups
-    )
-    scores = tl.zeros((BLOCK_N,), tl.float32)
-
-    dim_offsets = tl.arange(0, BLOCK_D)
-    for head in tl.static_range(0, num_heads):
-        head_weight = tl.load(weights + token * num_heads + head).to(tl.float32)
-        head_score = tl.zeros((BLOCK_N,), tl.float32)
-        for dim_start in tl.static_range(0, head_dim, BLOCK_D):
-            dims = dim_start + dim_offsets
-            q_vals = tl.load(
-                q + (token * num_heads + head) * head_dim + dims,
-                mask=dims < head_dim,
-                other=0.0,
-            ).to(tl.float32)
-            k_vals = tl.load(
-                index_k_fp8 + fp8_base[:, None] + dims[None, :],
-                mask=valid[:, None] & (dims[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            k_scale = tl.load(
-                index_k_scale + scale_base + dim_start // 128,
-                mask=valid,
-                other=0.0,
-            ).to(tl.float32)
-            head_score += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
-        scores += (
-            tl.maximum(head_score, 0.0, propagate_nan=tl.PropagateNan.ALL) * head_weight
+    # Foreign pages and capacity beyond the causal length can leave a whole
+    # tile empty. Skip Q/K scoring, but still overwrite its logits for Top-K.
+    scores = tl.full((BLOCK_N,), -float("inf"), tl.float32)
+    if has_valid:
+        fp8_base = page * page_stride_bytes + block_offset * head_dim
+        scale_base = (
+            page * (page_stride_bytes // 4)
+            + (page_size * head_dim) // 4
+            + block_offset * num_groups
         )
+        scores = tl.zeros((BLOCK_N,), tl.float32)
 
-    scores *= softmax_scale
-    forced = (offsets < INITIAL_TOKENS) | (offsets >= seq_len - LOCAL_TOKENS)
-    scores = tl.where(forced, float("inf"), scores)
-    scores = tl.where(valid & (scores == scores), scores, -float("inf"))
+        dim_offsets = tl.arange(0, BLOCK_D)
+        for head in tl.static_range(0, num_heads):
+            head_weight = tl.load(weights + token * num_heads + head).to(tl.float32)
+            head_score = tl.zeros((BLOCK_N,), tl.float32)
+            for dim_start in tl.static_range(0, head_dim, BLOCK_D):
+                dims = dim_start + dim_offsets
+                q_vals = tl.load(
+                    q + (token * num_heads + head) * head_dim + dims,
+                    mask=dims < head_dim,
+                    other=0.0,
+                ).to(tl.float32)
+                k_vals = tl.load(
+                    index_k_fp8 + fp8_base[:, None] + dims[None, :],
+                    mask=valid[:, None] & (dims[None, :] < head_dim),
+                    other=0.0,
+                ).to(tl.float32)
+                k_scale = tl.load(
+                    index_k_scale + scale_base + dim_start // 128,
+                    mask=valid,
+                    other=0.0,
+                ).to(tl.float32)
+                head_score += tl.sum(
+                    k_vals * k_scale[:, None] * q_vals[None, :], axis=1
+                )
+            scores += (
+                tl.maximum(head_score, 0.0, propagate_nan=tl.PropagateNan.ALL)
+                * head_weight
+            )
+
+        scores *= softmax_scale
+        forced = (offsets < INITIAL_TOKENS) | (offsets >= seq_len - LOCAL_TOKENS)
+        scores = tl.where(forced, float("inf"), scores)
+        scores = tl.where(valid & (scores == scores), scores, -float("inf"))
     tl.store(
         logits + token * logits_stride + offsets,
         scores,
@@ -1026,10 +1048,11 @@ def _topk_with_padding(
     if rows == 0 or cols == 0:
         return torch.full((rows, topk), -1, dtype=torch.int32, device=logits.device)
     logits = logits.contiguous()
-    if cols >= _RADIX_TOPK_MIN_COLS:
+    n_cols_padded = _next_power_of_2(max(cols, topk))
+    # Unrolled sort cost follows the padded width, including speculative KV padding.
+    if n_cols_padded >= _RADIX_TOPK_MIN_COLS:
         return _radix_topk(logits, topk)
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
-    n_cols_padded = _next_power_of_2(max(cols, topk))
     block_n = min(n_cols_padded, 2048)
     block_n = max(block_n, topk)
     if n_cols_padded % block_n != 0:
@@ -1346,8 +1369,6 @@ def _triton_dsa_prefill_topk_fp8_impl(
     softmax_scale: float,
     index_k_cache: torch.Tensor | None = None,
     page_size: int | None = None,
-    index_k_fp8: torch.Tensor | None = None,
-    index_k_scale: torch.Tensor | None = None,
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,

@@ -714,6 +714,73 @@ def test_slurm_runner_override_keeps_task_env_and_uses_gb300_hardware(
     assert captured["env"]["LOGICAL_RUNNER_ENV"] == "preserved"
 
 
+@pytest.mark.parametrize(
+    ("task_type", "inherited", "task_env", "expected"),
+    [
+        ("eval", None, {}, "error"),
+        ("perf", None, {}, "error"),
+        ("server_smoke", None, {}, "error"),
+        ("eval", None, {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("eval", "off", {}, "error"),
+        ("perf", "off", {"TOKENSPEED_JIT_COMPILE_CHECK": "warn"}, "warn"),
+        ("ut", None, {}, None),
+        ("ut", "warn", {}, "warn"),
+    ],
+)
+def test_b200v2_tasks_set_cache_and_jit_check_defaults(
+    monkeypatch, tmp_path, task_type, inherited, task_env, expected
+):
+    cache_env = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
+    monkeypatch.delenv(cache_env, raising=False)
+    monkeypatch.delenv("CI_CACHE_ROOT", raising=False)
+    monkeypatch.delenv("RUNNER_NAME", raising=False)
+    cache_root = tmp_path / "persistent cache"
+    monkeypatch.setenv("FLASHINFER_CACHE_DIR", str(cache_root / "flashinfer"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "ephemeral-home" / ".cache"))
+    if inherited is None:
+        monkeypatch.delenv("TOKENSPEED_JIT_COMPILE_CHECK", raising=False)
+    else:
+        monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", inherited)
+    task = {
+        "name": "jit-check",
+        "type": task_type,
+        "runner": {"labels": ["b200v2-1gpu"]},
+        "env": task_env,
+        "ut": {"commands": ["run test"]},
+    }
+    captured = {}
+
+    class FakeProcessGroupManager:
+        def run(self, command, *, cwd, env, dry_run):
+            return {"returncode": 0, "output": ""}
+
+        def terminate_all(self, *, dry_run):
+            return None
+
+    def capture_setup(runner, env, cwd, dry_run, reuse_state, setup_mode):
+        captured.update(env=env.copy())
+        return env, FakeProcessGroupManager()
+
+    monkeypatch.setattr(pipeline, "normalize_task", lambda path, root: task)
+    monkeypatch.setattr(pipeline, "setup_runner", capture_setup)
+    monkeypatch.setattr(pipeline, "get_stage_commands", lambda task: [])
+
+    pipeline.execute_task(
+        config="task.yaml",
+        runner="b200v2-1gpu",
+        runner_override=None,
+        work_dir=str(tmp_path),
+        dry_run=False,
+        print_plan=False,
+        result_json=None,
+        setup_mode="ci",
+    )
+    assert captured["env"].get("TOKENSPEED_JIT_COMPILE_CHECK") == expected
+    assert captured["env"][cache_env] == str(
+        cache_root / "tokenspeed" / "flashinfer-autotune"
+    )
+
+
 def test_runner_specific_env_uses_original_label_after_b200_override(monkeypatch):
     monkeypatch.setenv("TOKENSPEED_B200_RUNNER_LABEL", "b200v2")
     task = {
@@ -1111,6 +1178,42 @@ def test_scan_filters_task_yaml_only_changes(
     assert [entry["name"] for entry in matrix["include"]] == expected
 
 
+@pytest.mark.parametrize(
+    ("changed", "expected"),
+    [
+        ("tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n", ["bench"]),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "test/ci/ut.yaml\n",
+            ["bench", "ut"],
+        ),
+        (
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "tokenspeed-kernel/python/tokenspeed_kernel/benchmark/harness.py\n",
+            ["bench", "ut"],
+        ),
+    ],
+)
+def test_scan_runs_only_kernel_benchmarks_for_suite_only_changes(
+    changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    _write_task_yaml(root, "ut.yaml", _default_body("ut", ["amd-mi350-1gpu"]))
+    bench = _default_body("bench", ["amd-mi350-1gpu-bench"])
+    bench = bench.replace("type: ut", "type: perf").replace(
+        "workflow_stage: unit-test", "workflow_stage: kernel-benchmark"
+    )
+    _write_task_yaml(root, "bench.yaml", bench + "perf:\n  command: true\n")
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text(changed)
+    argv = ["scan", "--repo-root", str(tmp_path), "--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
+
+
 def test_validate_task_accepts_known_priorities(tmp_path):
     for priority in ("low", "normal", "high"):
         body = _default_body("ut-a", ["b300-1gpu"], extra=f"priority: {priority}\n")
@@ -1300,6 +1403,22 @@ def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     ]
     assert all(e["priority"] == "normal" for e in matrix["include"])
     assert all(e["optional"] is False for e in matrix["include"])
+
+
+def test_build_matrix_post_submit_also_selects_per_commit_tasks(tmp_path):
+    _write_task_yaml(tmp_path, "a.yaml", _default_body("pr", ["b200-1gpu"]))
+    _write_task_yaml(
+        tmp_path,
+        "b.yaml",
+        _default_body("push", ["b200-1gpu"]).replace("per-commit", "post-submit"),
+    )
+
+    def names(trigger):
+        matrix = build_matrix(tmp_path, tmp_path, trigger=trigger)
+        return [entry["name"] for entry in matrix["include"]]
+
+    assert names("per-commit") == ["pr"]
+    assert names("post-submit") == ["pr", "push"]
 
 
 def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):

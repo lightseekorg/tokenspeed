@@ -26,11 +26,14 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
 
+_RELU2_FP8_MAX = tl.constexpr(448.0)
+
 __all__ = [
     "add3",
     "fused_gate_sigmoid_mul_add",
     "fused_swiglu_fp8_ue8m0",
     "fused_swiglu_fp8_ue8m0_masked_packed",
+    "relu2",
     "sigmoid_mul",
     "silu_and_mul",
     "situ_and_mul",
@@ -154,6 +157,7 @@ def _sigmoid_mul_kernel(
     x_ptr,
     gate_ptr,
     n_elements,
+    bias_ptr,
     hidden_dim: tl.constexpr,
     head_dim: tl.constexpr,
     gate_row_stride: tl.constexpr,
@@ -179,12 +183,19 @@ def _sigmoid_mul_kernel(
 
     x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
     g = tl.load(gate_addrs, mask=mask).to(tl.float32)
-    out = x * tl.sigmoid(g)
+    if bias_ptr is not None:
+        # The eager FP32 sigmoid: libdevice exp and an IEEE-rounded division.
+        z = g + tl.load(bias_ptr + head, mask=mask, other=0.0).to(tl.float32)
+        out = x * tl.div_rn(1.0, 1.0 + libdevice.exp(-z))
+    else:
+        out = x * tl.sigmoid(g)
     tl.store(x_ptr + offsets, out, mask=mask)
 
 
-def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """In-place ``x *= sigmoid(gate)``.
+def sigmoid_mul(
+    x: torch.Tensor, gate: torch.Tensor, head_bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    """In-place ``x *= sigmoid(gate)``, or ``x *= sigmoid(gate + head_bias)``.
 
     ``x`` must be contiguous 2D ``[num_tokens, hidden_dim]`` and is mutated.
     ``gate`` may be either
@@ -196,6 +207,14 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
 
     The strided form lets callers skip the ``.reshape(-1)`` copy after the
     chunk; both layouts share the same kernel via the explicit gate strides.
+
+    ``head_bias`` is an optional contiguous 1D BF16, FP16 or FP32 tensor with
+    one value per gate head, added to the gate before the sigmoid. A 3D gate
+    must have ``head_bias.numel()`` heads; a 2D gate is split into that many
+    equal heads. With it, the kernel computes
+    ``x * (1 / (1 + exp(-(gate + bias))))`` in FP32 with libdevice ``exp`` and
+    an IEEE-rounded division, rounding once on the store. Without it the
+    kernel is unchanged and uses ``tl.sigmoid``.
 
     """
     if x.ndim != 2:
@@ -228,6 +247,30 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     else:
         raise ValueError(f"gate must be 2D or 3D, got {gate.ndim}D")
 
+    if head_bias is not None:
+        if head_bias.ndim != 1 or not head_bias.is_contiguous():
+            raise ValueError(
+                f"head_bias must be contiguous 1D, got shape {tuple(head_bias.shape)} "
+                f"stride {head_bias.stride()}"
+            )
+        if head_bias.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise ValueError(
+                f"head_bias must be bf16, fp16 or fp32, got {head_bias.dtype}"
+            )
+        bias_heads = head_bias.numel()
+        if gate.ndim == 3:
+            if bias_heads != gate.shape[1]:
+                raise ValueError(
+                    f"num_heads mismatch: gate={gate.shape[1]} head_bias={bias_heads}"
+                )
+        elif bias_heads == 0 or hidden_dim % bias_heads != 0:
+            raise ValueError(
+                f"hidden_dim mismatch: x={hidden_dim} is not a multiple of "
+                f"head_bias={bias_heads}"
+            )
+        else:
+            head_dim = gate_head_stride = hidden_dim // bias_heads
+
     n = x.numel()
     if n == 0:
         return x
@@ -240,6 +283,7 @@ def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         x,
         gate,
         n,
+        head_bias,
         hidden_dim=hidden_dim,
         head_dim=head_dim,
         gate_row_stride=gate_row_stride,
@@ -1477,5 +1521,76 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
         num_warps=8,
         ENABLE_PDL=enable_pdl,
         **pdl_kwargs,
+    )
+    return out
+
+
+@triton.jit
+def _relu2_kernel(
+    x_ptr,
+    out_ptr,
+    fp8_scale_ptr,
+    stride_x,
+    stride_out,
+    n_cols,
+    BLOCK: tl.constexpr,
+    HAS_FP8: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    if HAS_FP8:
+        inv_scale = 1.0 / tl.load(fp8_scale_ptr).to(tl.float32)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    y = tl.maximum(x, 0.0)
+    y = y * y
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    if HAS_FP8:
+        # Quantize the activation-dtype square, as the consumer would.
+        y = y.to(x_ptr.dtype.element_ty).to(tl.float32)
+        y = tl.clamp(y * inv_scale, -_RELU2_FP8_MAX, _RELU2_FP8_MAX)
+    tl.store(
+        out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask
+    )
+
+
+def relu2(
+    x: torch.Tensor, out: torch.Tensor, *, fp8_scale: torch.Tensor | None
+) -> torch.Tensor:
+    """Squared ReLU, ``relu(x) ** 2`` in FP32, optionally quantized to static FP8.
+
+    Args:
+        x: ``[M, N]`` input, rows may be strided but columns dense.
+        out: ``[M, N]`` output; FP8 exactly when ``fp8_scale`` is given.
+        fp8_scale: One-element FP32 dequant scale of the consuming linear.
+
+    Returns:
+        ``out``.
+    """
+    if x.dim() != 2 or out.shape != x.shape or x.stride(1) != 1 or out.stride(1) != 1:
+        raise ValueError("relu2 operands must be [M, N] with dense columns")
+    if (fp8_scale is not None) != (out.dtype == torch.float8_e4m3fn):
+        raise ValueError("relu2 writes FP8 exactly when fp8_scale is given")
+    rows, cols = x.shape
+    if rows == 0:
+        return out
+    block = 1024
+    enable_pdl = pdl_enabled()
+    _relu2_kernel[(rows, triton.cdiv(cols, block))](
+        x,
+        out,
+        x if fp8_scale is None else fp8_scale,
+        x.stride(0),
+        out.stride(0),
+        cols,
+        BLOCK=block,
+        HAS_FP8=fp8_scale is not None,
+        ENABLE_PDL=enable_pdl,
+        num_warps=4,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out

@@ -24,10 +24,10 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Iterable
-from dataclasses import replace
 from typing import Any
 
 import torch
+from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -35,12 +35,14 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
+from tokenspeed.runtime.layers.quantization.utils import (
+    should_exclude_quant_module,
+    should_ignore_quant_layer,
+)
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
@@ -53,8 +55,21 @@ from tokenspeed.runtime.utils import add_prefix
 def _resolve_mtp_quant_config(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
-    if quant_config is not None and should_exclude_quant_module(
-        "mtp.layers.0", quant_config.exclude_modules
+    if quant_config is None:
+        return None
+    if should_exclude_quant_module("mtp.layers.0", quant_config.exclude_modules):
+        return None
+    # AMD Quark expands an ``mtp.*`` exclusion into the MTP layer's linear
+    # module names only; its fused routed experts (and ``fc_embedding``) are
+    # left out of the list but stay BF16 as well.
+    if all(
+        should_ignore_quant_layer(f"mtp.layers.0.{module}", quant_config.ignored_layers)
+        for module in (
+            "self_attn.qkv_proj",
+            "self_attn.o_proj",
+            "mlp.shared_expert.gate_up_proj",
+            "mlp.shared_expert.down_proj",
+        )
     ):
         return None
     return quant_config
@@ -90,6 +105,7 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
 
     def _attn(
         self,
+        positions: torch.Tensor,
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
@@ -100,40 +116,25 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
     ) -> torch.Tensor:
         if ctx.draft_narrowing is None:
             return super()._attn(
-                q,
-                k,
-                v,
-                gate,
-                ctx,
-                topk_indices=topk_indices,
+                positions, q, k, v, gate, ctx, topk_indices=topk_indices
             )
-        from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-
-        # The live rows attend over the accepted prefix, not the verify window.
-        ctx.draft_narrowing.publish_accepted_prefix()
-        q = q.index_select(0, ctx.gather_ids)
-        if gate is not None:
-            gate = gate.index_select(0, ctx.gather_ids)
+        rows = ctx.gather_ids
         if topk_indices is None:
-            decode_ctx = replace(ctx, forward_mode=ForwardMode.DECODE)
-            output = self.attn(
-                q,
-                k,
-                v,
-                decode_ctx,
-                record_kv_cache=not ctx.forward_mode.is_decode_or_idle(),
-            )
+            output = self.attn.attend_live_rows(q, k, v, positions, ctx)
         else:
-            topk_indices = topk_indices.index_select(0, ctx.gather_ids)
+            # Sparse QSA attends the live rows in the round's own mode.
+            ctx.draft_narrowing.publish_accepted_prefix()
+            q = self.attn.prologue(q, k, v, positions, ctx).q
             output = self.attn(
-                q,
-                k,
-                v,
-                ctx,
-                topk_indices=topk_indices,
+                q.index_select(0, rows),
+                k=None,
+                v=None,
+                positions=None,
+                ctx=ctx,
+                topk_indices=topk_indices.index_select(0, rows),
             )
         if gate is not None:
-            sigmoid_mul(output, gate)
+            sigmoid_mul(output, gate.index_select(0, rows))
         return output
 
     def forward(self, *args, **kwargs):
@@ -225,6 +226,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            dp_lm_head_tp=False,
         )
 
     def get_hot_token_id(self):

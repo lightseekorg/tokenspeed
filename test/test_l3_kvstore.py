@@ -35,14 +35,11 @@ from unittest import mock
 from tokenspeed.runtime.cache.l3.backend import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     L3_RUNTIME_COMPAT,
-    L3UnreadKeySet,
     MemoryKvStore,
     _ext_def_file_from_yaml_text,
     cache_layout_signature,
     l3_cache_quantization_id,
     l3_checkpoint_id,
-    l3_pages_newly_published,
-    l3_unread_key_capacity,
     resolve_l3_weight_version,
     share_l3_checkpoint_ids,
     storage_key_prefix,
@@ -86,18 +83,20 @@ class FakeHostTest(unittest.TestCase):
 
 
 class StorageKeyTest(unittest.TestCase):
-    def test_object_key_includes_group_offset_and_ranks(self):
+    def test_object_key_includes_group_offset_and_rank(self):
+        # The trailing ``|c0`` is the retired context-parallel shard id, kept
+        # literal so objects written before its removal stay addressable.
         self.assertEqual(
-            storage_object_key("abc", 1, 2, prefix="model", rank=3, cp_rank=4),
-            "model_abc|g1|o2|r3|c4",
+            storage_object_key("abc", 1, 2, prefix="model", rank=3),
+            "model_abc|g1|o2|r3|c0",
         )
         self.assertEqual(
-            storage_object_key("abc", 0, 0, prefix="", rank=0, cp_rank=0),
+            storage_object_key("abc", 0, 0, prefix="", rank=0),
             "abc|g0|o0|r0|c0",
         )
         self.assertNotEqual(
-            storage_object_key("abc", 0, 0, prefix="", rank=0, cp_rank=0),
-            storage_object_key("abc", 0, 0, prefix="", rank=0, cp_rank=1),
+            storage_object_key("abc", 0, 0, prefix="", rank=0),
+            storage_object_key("abc", 0, 0, prefix="", rank=1),
         )
 
     def test_attention_build_exports_resolved_backend_names(self):
@@ -212,7 +211,6 @@ class StorageKeyTest(unittest.TestCase):
             cache_signature="layout",
             pipeline_rank=0,
             attn_tp_size=1,
-            cp_size=1,
             draft_model="org/draft",
             draft_revision="draft-checkpoint",
             cache_quantization="",
@@ -242,7 +240,6 @@ class StorageKeyTest(unittest.TestCase):
                 "cache_signature": "layout",
                 "pipeline_rank": 0,
                 "attn_tp_size": 1,
-                "cp_size": 1,
                 "draft_model": "",
                 "draft_revision": "",
                 "draft_weight_version": "",
@@ -266,8 +263,6 @@ class StorageKeyTest(unittest.TestCase):
         self.assertNotEqual(base, prefix(pipeline_rank=1))
         self.assertNotEqual(base, prefix(attn_tp_size=8))
         self.assertNotEqual(prefix(attn_tp_size=8), prefix(attn_tp_size=16))
-        self.assertNotEqual(base, prefix(cp_size=2))
-        self.assertNotEqual(prefix(cp_size=2), prefix(cp_size=4))
         self.assertNotEqual(base, prefix(draft_model="org/draft"))
         self.assertNotEqual(base, prefix(cache_quantization='{"quantization":"fp8"}'))
         self.assertNotEqual(base, prefix(model_overrides={"rope_theta": 10000.0}))
@@ -1611,70 +1606,6 @@ class StorageKeyTest(unittest.TestCase):
         self.assertEqual(fp16, cache_layout_signature(shifted, cache_dtype="float16"))
 
 
-class L3UnreadKeySetTest(unittest.TestCase):
-    def test_forget_after_mark_allows_reuse(self):
-        unread = L3UnreadKeySet(capacity=4)
-        unread.mark([0], ["h4"], [0])
-        self.assertTrue(unread.contains(0, "h4", 0))
-        unread.forget([0], ["h4"], [0])
-        self.assertFalse(unread.contains(0, "h4", 0))
-
-    def test_forget_pages_matches_backup_tuples(self):
-        unread = L3UnreadKeySet(capacity=4)
-        unread.mark([1], ["h5"], [2])
-        unread.forget_pages([(1, 99, "h5", 2)])
-        self.assertFalse(unread.contains(1, "h5", 2))
-
-    def test_newly_published_pages_exclude_objects_that_already_existed(self):
-        missing = (0, 1, "h-new", 0)
-        present = (0, 2, "h-old", 0)
-        self.assertEqual(
-            l3_pages_newly_published([missing, present], [False, True]),
-            [missing],
-        )
-        self.assertEqual(l3_pages_newly_published([present], [True]), [])
-        self.assertEqual(l3_pages_newly_published([missing], [False, True]), [])
-
-    def test_capacity_counts_packed_cache_blocks_not_lcm_parents(self):
-        self.assertEqual(
-            l3_unread_key_capacity(num_host_pages=2, cache_blocks_per_lcm_block=(4, 1)),
-            10,
-        )
-        unread = L3UnreadKeySet(
-            capacity=l3_unread_key_capacity(
-                num_host_pages=1, cache_blocks_per_lcm_block=(4, 1)
-            )
-        )
-        unread.mark(
-            [0, 0, 0, 0, 1],
-            ["h0", "h1", "h2", "h3", "h4"],
-            [0, 1, 2, 3, 0],
-        )
-        self.assertTrue(unread.contains(0, "h0", 0))
-        self.assertTrue(unread.contains(1, "h4", 0))
-
-    def test_capacity_evicts_oldest_failure(self):
-        unread = L3UnreadKeySet(capacity=2)
-        unread.mark([0, 0, 0], ["h1", "h2", "h3"], [0, 0, 0])
-        self.assertFalse(unread.contains(0, "h1", 0))
-        self.assertTrue(unread.contains(0, "h2", 0))
-        self.assertTrue(unread.contains(0, "h3", 0))
-
-    def test_clear_forgets_every_key(self):
-        unread = L3UnreadKeySet(capacity=2)
-        unread.mark([0], ["h4"], [0])
-        unread.clear()
-        self.assertFalse(unread.contains(0, "h4", 0))
-
-    def test_capacity_must_be_positive(self):
-        with self.assertRaisesRegex(ValueError, "capacity must be positive"):
-            L3UnreadKeySet(capacity=0)
-
-    def test_unread_capacity_rejects_non_positive_packing(self):
-        with self.assertRaisesRegex(ValueError, "cache_blocks_per_lcm_block"):
-            l3_unread_key_capacity(num_host_pages=2, cache_blocks_per_lcm_block=(4, 0))
-
-
 class MemoryKvStoreTest(unittest.TestCase):
     def test_round_trips_host_bytes(self):
         store = MemoryKvStore()
@@ -1698,7 +1629,7 @@ class L3HostStoreTest(unittest.TestCase):
     def test_backups_and_prefetches_packed_pages(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         self.assertEqual(l3.exists(pages), [True])
@@ -1719,7 +1650,7 @@ class L3HostStoreTest(unittest.TestCase):
     def test_present_keys_requires_exists_mask(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
         signature = inspect.signature(l3.present_keys)
         self.assertIs(signature.parameters["exists"].default, inspect.Parameter.empty)
         with self.assertRaises(TypeError):
@@ -1729,14 +1660,14 @@ class L3HostStoreTest(unittest.TestCase):
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         old_key = l3.object_key("h0", 0, 0)
         l3.rotate_namespace()
         self.assertEqual(old_key, l3.object_key("h0", 0, 0))
         self.assertEqual(l3.exists(pages), [False])
-        restarted = L3HostStore(backend, host, key_prefix="m", rank=1, cp_rank=0)
+        restarted = L3HostStore(backend, host, key_prefix="m", rank=1)
         self.assertEqual(restarted.object_key("h0", 0, 0), old_key)
         self.assertEqual(restarted.exists(pages), [False])
 
@@ -1744,7 +1675,7 @@ class L3HostStoreTest(unittest.TestCase):
         backend = mock.Mock()
         backend.remove_by_prefix.return_value = False
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1, cp_rank=0
+            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1756,7 +1687,7 @@ class L3HostStoreTest(unittest.TestCase):
         backend = mock.Mock()
         backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
         l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1, cp_rank=0
+            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
         )
         old_key = l3.object_key("h0", 0, 0)
 
@@ -1767,7 +1698,7 @@ class L3HostStoreTest(unittest.TestCase):
     def test_set_key_prefix_republishes_under_the_new_namespace(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0, cp_rank=0)
+        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0)
         pages = [(0, 1, "h0", 0)]
         self.assertEqual(l3.backup(pages), [True])
         old_key = l3.object_key("h0", 0, 0)
@@ -1783,25 +1714,25 @@ class L3HostStoreTest(unittest.TestCase):
 class FactoryTest(unittest.TestCase):
     def test_memory_and_unknown_backend(self):
         backend = create_kvstore_storage_backend(
-            "memory", None, host_buffer=object(), tp_size=1, cp_size=1, pp_size=1
+            "memory", None, host_buffer=object(), tp_size=1, pp_size=1
         )
         self.assertIsInstance(backend, MemoryKvStore)
         self.assertIsNone(
             create_kvstore_storage_backend(
-                None, None, host_buffer=object(), tp_size=1, cp_size=1, pp_size=1
+                None, None, host_buffer=object(), tp_size=1, pp_size=1
             )
         )
         with self.assertRaisesRegex(ValueError, "unsupported"):
             create_kvstore_storage_backend(
-                "nfs", None, host_buffer=object(), tp_size=1, cp_size=1, pp_size=1
+                "nfs", None, host_buffer=object(), tp_size=1, pp_size=1
             )
 
-    def test_cp_size_has_no_default(self):
-        param = inspect.signature(create_kvstore_storage_backend).parameters["cp_size"]
+    def test_pp_size_has_no_default(self):
+        param = inspect.signature(create_kvstore_storage_backend).parameters["pp_size"]
         self.assertIs(param.default, inspect.Parameter.empty)
         with self.assertRaises(TypeError):
             create_kvstore_storage_backend(
-                "memory", None, host_buffer=object(), tp_size=1, pp_size=1
+                "memory", None, host_buffer=object(), tp_size=1
             )
 
 
@@ -1881,12 +1812,12 @@ class MooncakeKvStoreTest(unittest.TestCase):
     def test_extra_config_has_no_default(self):
         param = inspect.signature(MooncakeKvStore.__init__).parameters["extra_config"]
         self.assertIs(param.default, inspect.Parameter.empty)
-        cp_param = inspect.signature(MooncakeKvStore.__init__).parameters["cp_size"]
-        self.assertIs(cp_param.default, inspect.Parameter.empty)
+        pp_param = inspect.signature(MooncakeKvStore.__init__).parameters["pp_size"]
+        self.assertIs(pp_param.default, inspect.Parameter.empty)
         with self.assertRaises(TypeError):
-            MooncakeKvStore(host_buffer=object(), tp_size=1, cp_size=1, pp_size=1)
+            MooncakeKvStore(host_buffer=object(), tp_size=1, pp_size=1)
         with self.assertRaises(TypeError):
-            MooncakeKvStore(None, host_buffer=object(), tp_size=1, pp_size=1)
+            MooncakeKvStore(None, host_buffer=object(), tp_size=1)
 
     def test_non_default_tenant_is_never_silently_dropped(self):
         class _Store:
@@ -1914,7 +1845,6 @@ class MooncakeKvStoreTest(unittest.TestCase):
                     },
                     host_buffer=host,
                     tp_size=1,
-                    cp_size=1,
                     pp_size=1,
                 )
 
@@ -2023,7 +1953,7 @@ class MooncakeKvStoreTest(unittest.TestCase):
         adapter.store.remove_by_regex.return_value = -1
         self.assertFalse(adapter.remove_by_prefix("model_"))
 
-    def test_segment_is_divided_across_tp_cp_and_pp_ranks(self):
+    def test_segment_is_divided_across_tp_and_pp_ranks(self):
         captured = {}
 
         class _Store:
@@ -2052,8 +1982,7 @@ class MooncakeKvStoreTest(unittest.TestCase):
             MooncakeKvStore(
                 extra,
                 host_buffer=host,
-                tp_size=2,
-                cp_size=2,
+                tp_size=4,
                 pp_size=2,
             )
         self.assertEqual(captured["segment"], 1 * 1024**3)
@@ -2063,8 +1992,7 @@ class MooncakeKvStoreTest(unittest.TestCase):
             MooncakeKvStore(
                 extra,
                 host_buffer=host,
-                tp_size=1,
-                cp_size=4,
+                tp_size=4,
                 pp_size=1,
             )
         self.assertEqual(captured["segment"], 2 * 1024**3)

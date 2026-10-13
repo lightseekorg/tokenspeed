@@ -65,6 +65,8 @@ from tokenspeed.runtime.configs import (
     Qwen4ExpTextConfig,
 )
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
+from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
+from tokenspeed.runtime.configs.nemotron_omni_config import NemotronHOmniConfig
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
@@ -91,6 +93,8 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
     Glm53FlashConfig.model_type: Glm53FlashConfig,
+    NemotronHConfig.model_type: NemotronHConfig,
+    NemotronHOmniConfig.model_type: NemotronHOmniConfig,
     "glm5_next": Glm53FlashConfig,
 }
 
@@ -157,6 +161,15 @@ def resolve_architecture(config: PretrainedConfig) -> str:
     if archs:
         return archs[0]
     return type(config).__name__
+
+
+def model_loader_architectures(config: PretrainedConfig) -> list[str]:
+    """The architecture names the model loader resolves, in its order.
+
+    Plugin profile resolution walks the same list, so a profile always
+    describes the class that is actually built.
+    """
+    return list(getattr(config, "architectures", None) or [])
 
 
 def get_hf_text_config(config: PretrainedConfig):
@@ -496,6 +509,8 @@ def get_config(
         "Qwen3ASRForConditionalGeneration",
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronHOmniConfig",
     ]:
         if config is text_config:
             return config

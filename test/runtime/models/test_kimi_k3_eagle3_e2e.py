@@ -61,6 +61,7 @@ class TestKimiK3Eagle3E2E(unittest.TestCase):
                     "-m",
                     "tokenspeed.cli",
                     "serve",
+                    "--disable-autotune",
                     "--model",
                     MODEL,
                     "--served-model-name",

@@ -20,9 +20,11 @@
 
 """Place virtual cache blocks, token slots and kernel pages on local ranks.
 
-One cyclic block-placement rule serves both position-preserving slot mapping
-and compact page tables with local token counts. These operations transform
-addresses only; KV payload reads/writes belong to their cache-layout kernels.
+Under KV parallelism (KVP) a sharded cache group deals its virtual blocks
+page-cyclically to the ranks of the KVP group; one cyclic block-placement rule
+serves both position-preserving slot mapping and compact page tables with
+local token counts. These operations transform addresses only; KV payload
+reads/writes belong to their cache-layout kernels.
 """
 
 from __future__ import annotations
@@ -80,8 +82,10 @@ def virtual_slots_to_local(
         rows_per_page: Unchanged physical rows per owned cache block. Use 1
             to translate a block table instead of row slots.
         virtual_block_count: Scheduler capacity including null block 0.
-        degree: Number of owners, or 1 for a replicated group.
-        rank: Owner index in [0, degree); replicated groups use 0.
+        degree: Number of owners (the KVP group width), or 1 for a
+            replicated group.
+        rank: Owner index in [0, degree) (the KVP rank); replicated groups
+            use 0.
         out: Optional contiguous output tensor with the same shape/dtype.
         owner_mask: Optional contiguous boolean output of the same shape.
 
@@ -139,15 +143,130 @@ def virtual_slots_to_local(
     return out, owner_mask
 
 
+@triton.jit(do_not_specialize=["COUNT", "SEND_ROWS"])
+def _split_slots_by_owner(
+    Slots,
+    GatheredIndex,
+    Fetch,
+    # The row count follows the forward's history and the send width its
+    # largest owner; runtime so every history shares one binary.
+    COUNT,
+    SEND_ROWS,
+    ROWS: tl.constexpr,
+    DEGREE: tl.constexpr,
+    OWNERS: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # One program walks the rows in order, carrying each owner's running row
+    # count across blocks.
+    owners = tl.arange(0, OWNERS)
+    carry = tl.zeros((OWNERS,), dtype=tl.int32)
+    for start in range(0, COUNT, BLOCK):
+        offsets = start + tl.arange(0, BLOCK)
+        active = offsets < COUNT
+        slot = tl.load(Slots + offsets, mask=active, other=ROWS).to(tl.int64)
+        previous = slot // ROWS - 1
+        owner = (previous % DEGREE).to(tl.int32)
+        hit = (owner[:, None] == owners[None, :]) & active[:, None]
+        hits = hit.to(tl.int32)
+        running = tl.cumsum(hits, axis=0) + carry[None, :]
+        within = tl.sum(tl.where(hit, running, 0), axis=1) - 1
+        tl.store(GatheredIndex + offsets, owner * SEND_ROWS + within, mask=active)
+        local = (previous // DEGREE + 1) * ROWS + slot % ROWS
+        tl.store(
+            Fetch + within,
+            local.to(Fetch.dtype.element_ty),
+            mask=active & (owner == RANK),
+        )
+        carry += tl.sum(hits, axis=0)
+
+
+def split_slots_by_owner(
+    slots: torch.Tensor,
+    *,
+    block_granularity: int,
+    degree: int,
+    rank: int,
+    send_rows: int,
+    gathered_index: torch.Tensor,
+    fetch: torch.Tensor,
+) -> None:
+    """Lay rows out for an all-gather over their cyclic page owners.
+
+    Row ``i`` belongs to owner ``(slots[i] // block_granularity - 1) % degree``,
+    the rule of ``virtual_slots_to_local``, and every owner keeps its rows in
+    order. With every owner sending ``send_rows`` rows, the rank-major
+    all-gather output holds row ``i`` at ``owner * send_rows`` plus the count
+    of that owner's rows before ``i``.
+
+    Args:
+        slots: Int32 or int64 virtual slots [rows], contiguous. Every row must
+            have an owner: ``slots >= block_granularity``.
+        block_granularity: Tokens per scheduler ownership block.
+        degree: Number of owners.
+        rank: The owner whose rows ``fetch`` receives.
+        send_rows: Rows every owner contributes; at least any owner's count.
+        gathered_index: Int32 output [rows]: each row's all-gather output row.
+        fetch: Output [>= rank's row count] in the slots' dtype: the physical
+            slots of ``rank``'s rows, in order. Entries past that count keep
+            their contents.
+
+    Returns:
+        None; both outputs are written in place.
+    """
+    if block_granularity <= 0 or degree <= 0 or not 0 <= rank < degree:
+        raise ValueError("invalid owner split geometry")
+    if (
+        slots.dim() != 1
+        or not slots.is_contiguous()
+        or gathered_index.shape != slots.shape
+        or gathered_index.dtype != torch.int32
+        or fetch.dim() != 1
+        or fetch.dtype != slots.dtype
+    ):
+        raise ValueError("owner split buffers disagree with the slots")
+    if slots.numel() == 0:
+        return
+    if slots.is_cuda:
+        _split_slots_by_owner[(1,)](
+            slots,
+            gathered_index,
+            fetch,
+            slots.numel(),
+            send_rows,
+            ROWS=block_granularity,
+            DEGREE=degree,
+            OWNERS=triton.next_power_of_2(degree),
+            RANK=rank,
+            BLOCK=1024,
+        )
+    else:
+        previous = slots.to(torch.int64) // block_granularity - 1
+        owner = previous % degree
+        seen = torch.cumsum(
+            torch.arange(degree).unsqueeze(1) == owner.unsqueeze(0), dim=1
+        )
+        within = seen.gather(0, owner.unsqueeze(0)).squeeze(0) - 1
+        gathered_index.copy_(owner * send_rows + within)
+        mine = owner == rank
+        local = (previous // degree + 1) * block_granularity
+        local += slots.to(torch.int64) % block_granularity
+        fetch[within[mine]] = local[mine].to(fetch.dtype)
+
+
 @triton.jit
 def _compact_owned_pages(
     Table,
     Lens,
     Out,
     LocalLens,
-    TSTRIDE: tl.constexpr,
-    OSTRIDE: tl.constexpr,
-    COLS: tl.constexpr,
+    PagePrefix,
+    # Table geometry follows the batch; runtime so every batch shape shares
+    # one binary. BLOCK buckets COLS for the column range.
+    TSTRIDE,
+    OSTRIDE,
+    COLS,
     PAGE: tl.constexpr,
     SUBPAGES: tl.constexpr,
     VIRTUAL_COUNT: tl.constexpr,
@@ -162,8 +281,13 @@ def _compact_owned_pages(
     block = page // SUBPAGES
     local_block, owner = virtual_block_to_local(block, DEGREE, RANK)
     owner &= block < VIRTUAL_COUNT
-    valid = (col < COLS) & (col * PAGE < length) & owner
+    valid = (col < COLS) & owner
+    if PagePrefix is None:
+        valid &= col * PAGE < length
     dest = tl.cumsum(valid.to(tl.int32)) - 1
+    if PagePrefix is not None:
+        tl.store(PagePrefix + row * (COLS + 1), 0)
+        tl.store(PagePrefix + row * (COLS + 1) + col + 1, dest + 1, col < COLS)
     local = local_block * SUBPAGES + page % SUBPAGES
     tl.store(Out + row * OSTRIDE + dest, local, valid)
     rows = tl.minimum(PAGE, tl.maximum(length - col * PAGE, 0))
@@ -171,7 +295,7 @@ def _compact_owned_pages(
     tl.store(LocalLens + row, count)
 
 
-def compact_dcp_pages(
+def compact_kvp_pages(
     table: torch.Tensor,
     lengths: torch.Tensor,
     *,
@@ -182,13 +306,15 @@ def compact_dcp_pages(
     rank: int,
     out: torch.Tensor,
     local_lengths: torch.Tensor,
+    page_prefix: torch.Tensor | None = None,
 ) -> None:
     """Pack owned kernel pages in token order into persistent output buffers.
 
     ``table`` holds virtual kernel pages, not scheduler blocks. ``lengths``
     are global causal endpoints. Outputs are local physical pages and the
     number of valid local tokens, including a possibly partial last page.
-    Zero-length shards retain a zero page table for safe kernel padding.
+    Without page_prefix, zero-length shards retain a zero page table. With
+    page_prefix, local_lengths still excludes reserve pages from attention.
 
     Args:
         table: Int32 virtual kernel pages [batch, max_pages].
@@ -196,10 +322,14 @@ def compact_dcp_pages(
         page_size: Tokens per kernel page.
         block_granularity: Tokens per scheduler ownership block.
         virtual_block_count: Exclusive upper bound of scheduler block IDs.
-        degree: Number of context owners.
-        rank: Owner index within the context group.
+        degree: Number of page owners (the KVP group width).
+        rank: Owner index within the KVP group.
         out: Preallocated physical page table, with the same shape as table.
         local_lengths: Preallocated local token counts, shaped like lengths.
+        page_prefix: Optional int32 output [batch, max_pages + 1], contiguous.
+            When supplied, retain all allocated owned pages, including draft
+            reserve pages beyond lengths, and record exclusive owned-page counts.
+            Omitting it packs only pages intersecting the current lengths.
 
     Returns:
         None; both output buffers are refreshed in place.
@@ -211,13 +341,13 @@ def compact_dcp_pages(
         or virtual_block_count <= 1
         or not 0 <= rank < degree
     ):
-        raise ValueError("invalid DCP page geometry")
+        raise ValueError("invalid KVP page geometry")
     if (
         table.ndim != 2
         or out.shape != table.shape
         or local_lengths.shape != lengths.shape
     ):
-        raise ValueError("DCP page buffers disagree")
+        raise ValueError("KVP page buffers disagree")
     out.zero_()
     if table.is_cuda:
         _compact_owned_pages[(table.shape[0],)](
@@ -225,6 +355,7 @@ def compact_dcp_pages(
             lengths,
             out,
             local_lengths,
+            page_prefix,
             table.stride(0),
             out.stride(0),
             table.shape[1],
@@ -234,20 +365,109 @@ def compact_dcp_pages(
             degree,
             rank,
             triton.next_power_of_2(table.shape[1]),
+            # The prefix output increases live scan state. More threads limit
+            # register spills on long rows, while short rows favor four warps.
+            num_warps=8 if page_prefix is not None and table.shape[1] > 2048 else 4,
         )
     else:
         subpages = block_granularity // page_size
         for row in range(table.shape[0]):
             count = 0
             tokens = 0
+            if page_prefix is not None:
+                page_prefix[row, 0] = 0
             for col, page in enumerate(table[row].tolist()):
                 block = page // subpages
-                if col * page_size >= int(lengths[row]):
+                if page_prefix is None and col * page_size >= int(lengths[row]):
                     break
                 if 0 < block < virtual_block_count and (block - 1) % degree == rank:
                     out[row, count] = (
                         (block - 1) // degree + 1
                     ) * subpages + page % subpages
                     count += 1
-                    tokens += min(page_size, int(lengths[row]) - col * page_size)
+                    tokens += min(
+                        page_size, max(int(lengths[row]) - col * page_size, 0)
+                    )
+                if page_prefix is not None:
+                    page_prefix[row, col + 1] = count
             local_lengths[row] = tokens
+
+
+@triton.jit(do_not_specialize=["PSTRIDE", "VSTRIDE", "OSTRIDE", "COLS", "QUERIES"])
+def _local_visible_lengths(
+    Prefix,
+    Visible,
+    Out,
+    LocalLens,
+    PSTRIDE,
+    VSTRIDE,
+    OSTRIDE,
+    COLS,
+    QUERIES,
+    PAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    q = tl.arange(0, BLOCK)
+    length = tl.load(Visible + row * VSTRIDE + q, q < QUERIES, 0)
+    page = length // PAGE
+    before = tl.load(Prefix + row * PSTRIDE + page, q < QUERIES, 0)
+    # At the exact table endpoint only the sentinel prefix is needed.
+    after = tl.load(
+        Prefix + row * PSTRIDE + page + 1,
+        (q < QUERIES) & (page < COLS),
+        0,
+    )
+    local = before * PAGE + tl.where(after > before, length % PAGE, 0)
+    tl.store(Out + row * OSTRIDE + q, local, q < QUERIES)
+    if LocalLens is not None:
+        tl.store(tl.broadcast_to(LocalLens + row, (BLOCK,)), local, q == QUERIES - 1)
+
+
+def kvp_local_visible_lengths(
+    page_prefix: torch.Tensor,
+    visible_lengths: torch.Tensor,
+    *,
+    page_size: int,
+    out: torch.Tensor,
+    local_lengths: torch.Tensor | None = None,
+) -> None:
+    """Translate global query endpoints through an owned-page prefix table.
+
+    Args:
+        page_prefix: Exclusive owned-page counts [batch, max_pages + 1] from
+            compact_kvp_pages. Includes allocated reserve pages.
+        visible_lengths: Int32 global exclusive endpoints [batch, queries],
+            each in [0, max_pages * page_size]. The last dimension is contiguous.
+            Causal verify supplies one endpoint per query; noncausal draft may
+            repeat the same endpoint. Reanchoring may decrease endpoints.
+        page_size: Tokens per kernel page.
+        out: Persistent int32 output with the same shape as visible_lengths
+            and a contiguous last dimension. Receives local token counts.
+        local_lengths: Optional contiguous [batch] output for the final query's
+            local endpoint. When supplied, query endpoints must be nondecreasing.
+
+    Returns:
+        None; out is refreshed without scanning or rebuilding page tables.
+    """
+    if visible_lengths.is_cuda:
+        _local_visible_lengths[(visible_lengths.shape[0],)](
+            page_prefix,
+            visible_lengths,
+            out,
+            local_lengths,
+            page_prefix.stride(0),
+            visible_lengths.stride(0),
+            out.stride(0),
+            page_prefix.shape[1] - 1,
+            visible_lengths.shape[1],
+            page_size,
+            triton.next_power_of_2(visible_lengths.shape[1]),
+        )
+    else:
+        page = visible_lengths.long() // page_size
+        before = page_prefix.gather(1, page)
+        after = page_prefix.gather(1, (page + 1).clamp_max(page_prefix.shape[1] - 1))
+        out.copy_(before * page_size + (after > before) * (visible_lengths % page_size))
+        if local_lengths is not None:
+            local_lengths.copy_(out[:, -1])

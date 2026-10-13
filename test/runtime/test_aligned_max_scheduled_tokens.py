@@ -1,8 +1,8 @@
 """aligned_max_scheduled_tokens (engine/scheduler_utils, applied in
 engine/event_loop before make_config).
 
-Recurrent-state cache groups (family=State; the C++ ``IsSnapshotStateGroup``
-criterion) register their snapshot only when a
+Recurrent-state cache groups (family=State; the C++ ``AttnKind::kMambaState``
+kind) register their snapshot only when a
 prefill chunk ends page-aligned (RegistersAlignedFinalPageOnly). The helper
 floors the scheduler's max_scheduled_tokens to the LCM of those groups' page
 grains so state pages can register and prefix-cache reuse stays live; the

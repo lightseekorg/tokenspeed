@@ -57,7 +57,9 @@ def resolve_group_slot(
     return tl.where(valid, page * ROWS + logical % ROWS, -1)
 
 
-@triton.jit(do_not_specialize=["N"])
+# Table geometry follows the batch (rows) and the longest request (columns);
+# left specialized, Triton recompiles when either hits 1 or a multiple of 16.
+@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
 def _group_slots_kernel(
     P,
     R,

@@ -78,20 +78,20 @@ def _reference_apply_attn_res(prefix_sum, block_residual, proj, norm):
 
 class AttnResTests(unittest.TestCase):
     def test_batched_iris_reduce_consumes_attnres_combine(self):
-        import tokenspeed_kernel.ops.communication.triton as triton_comm
 
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
 
         group = object()
-        state = SimpleNamespace(
-            attn_ar_fusion_ok=False,
-            cute_ar=None,
-            mapping=SimpleNamespace(
-                nprocs_per_node=8,
-                attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
-            ),
+        comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+        comm.iris_state = SimpleNamespace(
+            attnres_supported=mock.Mock(), attnres_combine=mock.Mock()
         )
-        comm = kimi_k3_comm.K3AttnComm(state)
+        comm.attn_ar_fusion_ok = False
+        comm.cute_ar = None
+        comm.mapping = SimpleNamespace(
+            nprocs_per_node=8,
+            attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
+        )
         partial = torch.randn(4, _HIDDEN, dtype=torch.bfloat16)
         prefix = torch.randn_like(partial)
         scratch = (object(), object(), object())
@@ -104,13 +104,13 @@ class AttnResTests(unittest.TestCase):
         with (
             mock.patch.object(kimi_k3_comm, "_get_process_group", return_value=group),
             mock.patch.object(
-                triton_comm,
-                "allreduce_residual_attnres_combine_supported",
+                comm.iris_state,
+                "attnres_supported",
                 return_value=True,
             ) as supported,
             mock.patch.object(
-                triton_comm,
-                "allreduce_residual_attnres_combine",
+                comm.iris_state,
+                "attnres_combine",
                 return_value=(expected_h, expected_residual),
             ) as fused,
         ):
@@ -118,6 +118,7 @@ class AttnResTests(unittest.TestCase):
                 partial,
                 prefix,
                 combine,
+                producer_direct=False,
                 mlp_wp=mlp_wp,
             )
 
@@ -130,20 +131,20 @@ class AttnResTests(unittest.TestCase):
         fused.assert_called_once()
 
     def test_fused_attention_window_defers_attnres_combine(self):
-        import tokenspeed_kernel.ops.communication.triton as triton_comm
 
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
 
         group = object()
-        state = SimpleNamespace(
-            attn_ar_fusion_ok=False,
-            cute_ar=None,
-            mapping=SimpleNamespace(
-                nprocs_per_node=8,
-                attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
-            ),
+        comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+        comm.iris_state = SimpleNamespace(
+            attnres_supported=mock.Mock(), attnres_combine=mock.Mock()
         )
-        comm = kimi_k3_comm.K3AttnComm(state)
+        comm.attn_ar_fusion_ok = False
+        comm.cute_ar = None
+        comm.mapping = SimpleNamespace(
+            nprocs_per_node=8,
+            attn=SimpleNamespace(tp_rank=0, tp_group=tuple(range(8))),
+        )
         partial = torch.randn(17, _HIDDEN, dtype=torch.bfloat16)
         prefix = torch.randn_like(partial)
         reduced = torch.randn_like(partial)
@@ -158,8 +159,8 @@ class AttnResTests(unittest.TestCase):
         with (
             mock.patch.object(kimi_k3_comm, "_get_process_group", return_value=group),
             mock.patch.object(
-                triton_comm,
-                "allreduce_residual_attnres_combine_supported",
+                comm.iris_state,
+                "attnres_supported",
                 side_effect=lambda partial, *_args, **_kwargs: partial.shape[0] <= 16,
             ) as supported,
             mock.patch.object(
@@ -172,16 +173,16 @@ class AttnResTests(unittest.TestCase):
                 partial,
                 prefix,
                 combine,
+                producer_direct=False,
                 mlp_wp=torch.randn(_HIDDEN, dtype=torch.bfloat16),
             )
 
         torch.testing.assert_close(residual, prefix + reduced)
         self.assertIsNone(hidden)
         supported.assert_called_once()
-        fallback_reduce.assert_called_once_with(partial, state.mapping.attn.tp_group)
+        fallback_reduce.assert_called_once_with(partial, comm.mapping.attn.tp_group)
 
     def test_fused_attention_reduce_window(self):
-        import tokenspeed_kernel.ops.communication.triton as triton_comm
 
         import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
 
@@ -193,13 +194,14 @@ class AttnResTests(unittest.TestCase):
             _EPS,
         )
 
+        state = SimpleNamespace(attnres_supported=mock.Mock())
         with (
             mock.patch.object(
                 kimi_k3_comm, "_get_process_group", return_value=object()
             ),
             mock.patch.object(
-                triton_comm,
-                "allreduce_residual_attnres_combine_supported",
+                state,
+                "attnres_supported",
                 side_effect=lambda partial, *_args, **_kwargs: partial.shape[0] <= 16,
             ) as supported,
         ):
@@ -213,16 +215,15 @@ class AttnResTests(unittest.TestCase):
                         _HIDDEN,
                         dtype=torch.bfloat16,
                     )
-                    state = SimpleNamespace(
-                        mapping=SimpleNamespace(
-                            nprocs_per_node=8,
-                            attn=SimpleNamespace(
-                                tp_rank=0,
-                                tp_group=tuple(range(8)),
-                            ),
-                        )
+                    comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+                    comm.iris_state = state
+                    comm.mapping = SimpleNamespace(
+                        nprocs_per_node=8,
+                        attn=SimpleNamespace(
+                            tp_rank=0,
+                            tp_group=tuple(range(8)),
+                        ),
                     )
-                    comm = kimi_k3_comm.K3AttnComm(state)
                     self.assertEqual(
                         comm.fused_attnres_reduce_available(
                             partial,
@@ -353,12 +354,22 @@ class AttnResTests(unittest.TestCase):
         torch.testing.assert_close(actual, expected)
 
     def test_fused_model_graph_matches_vllm_operation_order(self):
-        for is_block_write_layer in (False, True):
-            with self.subTest(is_block_write_layer=is_block_write_layer):
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.models import kimi_k3_comm
+
+        for is_block_write_layer, forward_mode in (
+            (False, ForwardMode.EXTEND),
+            (True, ForwardMode.EXTEND),
+            (False, ForwardMode.DECODE),
+            (True, ForwardMode.DECODE),
+        ):
+            with self.subTest(
+                is_block_write_layer=is_block_write_layer, forward_mode=forward_mode
+            ):
                 events = []
-                hidden_states = torch.ones(2, 4, dtype=torch.bfloat16)
+                hidden_states = torch.ones(4096, 4, dtype=torch.bfloat16)
                 original_prefix = hidden_states.clone()
-                block_residual = torch.zeros(3, 2, 4, dtype=torch.bfloat16)
+                block_residual = torch.zeros(3, 4096, 4, dtype=torch.bfloat16)
                 reduced = torch.full_like(hidden_states, 3)
 
                 def apply_attn_res(
@@ -383,6 +394,8 @@ class AttnResTests(unittest.TestCase):
                     return torch.full_like(prefix, len(events))
 
                 class SelfAttention:
+                    o_proj = None
+
                     def __call__(self, **kwargs):
                         events.append(("attention", kwargs["hidden_states"]))
                         return torch.full_like(hidden_states, 2)
@@ -413,17 +426,23 @@ class AttnResTests(unittest.TestCase):
                     mlp=mlp,
                     _prepare_next_fallback_attnres_partial=mock.Mock(),
                 )
+                layer.k3_comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+                layer.k3_comm.iris_state = None
+                layer.k3_comm.mapping = layer.mapping
 
                 with (
                     mock.patch.object(kimi_k3, "_apply_attn_res", apply_attn_res),
-                    mock.patch.object(kimi_k3, "all_reduce", reduce_attention),
+                    mock.patch.object(
+                        layer.k3_comm, "acquire_projection_output", return_value=None
+                    ),
+                    mock.patch.object(kimi_k3_comm, "all_reduce", reduce_attention),
                 ):
                     result, actual_blocks = (
                         kimi_k3.KimiLinearDecoderLayer._forward_fused_attnres_graph(
                             layer,
                             positions=torch.empty(0),
                             hidden_states=hidden_states,
-                            ctx=object(),
+                            ctx=SimpleNamespace(forward_mode=forward_mode),
                             block_residual=block_residual,
                         )
                     )
@@ -449,6 +468,83 @@ class AttnResTests(unittest.TestCase):
                     self.assertIs(post[1], hidden_states)
                     self.assertIs(post[2], reduced)
                     torch.testing.assert_close(result, original_prefix + reduced + 5)
+
+    def test_mixer_passes_an_explicit_residual_shard_to_moe(self):
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        for writes_block, mode in (
+            (False, ForwardMode.DECODE),
+            (True, ForwardMode.MIXED),
+        ):
+            with self.subTest(writes_block=writes_block, mode=mode):
+                hidden = torch.empty((4096, 7168), dtype=torch.bfloat16, device="meta")
+                history = torch.empty(
+                    (5, 4096, 7168), dtype=torch.bfloat16, device="meta"
+                )
+                partial = torch.empty_like(hidden)
+                shard = torch.empty((512, 7168), dtype=torch.bfloat16, device="meta")
+                normalized, output = torch.empty_like(hidden), torch.empty_like(hidden)
+                weight = torch.empty((7168,), dtype=torch.bfloat16, device="meta")
+                norm = SimpleNamespace(weight=weight, variance_epsilon=1e-6)
+                moe = mock.Mock(spec=kimi_k3.KimiLinearMoE, return_value=output)
+                moe.native_latent_moe = None
+                comm = SimpleNamespace(
+                    acquire_projection_output=mock.Mock(return_value=partial),
+                    mix_for_moe=mock.Mock(return_value=(shard, normalized)),
+                    reduce_for_attnres=mock.Mock(
+                        side_effect=AssertionError("mixed twice")
+                    ),
+                )
+                layer = SimpleNamespace(
+                    is_block_write_layer=writes_block,
+                    block_write_idx=4,
+                    prev_valid_blocks=4,
+                    self_attention_res_proj=object(),
+                    self_attention_res_norm=norm,
+                    input_layernorm=norm,
+                    self_attn=mock.Mock(return_value=partial),
+                    mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
+                    mlp_res_proj=SimpleNamespace(weight=weight),
+                    mlp_res_norm=norm,
+                    post_attention_layernorm=norm,
+                    is_moe_layer=True,
+                    block_sparse_moe=moe,
+                    k3_comm=comm,
+                    comm_manager=SimpleNamespace(get_num_tokens=lambda _: (4096, 4096)),
+                    _prepare_next_fallback_attnres_partial=mock.Mock(),
+                )
+                ctx = SimpleNamespace(forward_mode=mode)
+                with mock.patch.object(
+                    kimi_k3, "_apply_attn_res", return_value=hidden
+                ) as pre_mix:
+                    actual, actual_history = (
+                        kimi_k3.KimiLinearDecoderLayer._forward_fused_attnres_graph(
+                            layer, torch.empty(0), hidden, ctx, history
+                        )
+                    )
+                self.assertIs(actual, output)
+                self.assertIs(actual_history, history)
+                self.assertEqual(pre_mix.call_count, 1)
+                self.assertIs(
+                    comm.mix_for_moe.call_args.args[1],
+                    None if writes_block else hidden,
+                )
+                self.assertEqual(
+                    comm.mix_for_moe.call_args.kwargs["num_valid_blocks"],
+                    4 + int(writes_block),
+                )
+                self.assertEqual(moe.call_count, 1)
+                self.assertIs(moe.call_args.args[0], normalized)
+                self.assertIs(moe.call_args.args[1], shard)
+                self.assertEqual(
+                    moe.call_args.kwargs,
+                    dict(
+                        num_global_tokens=4096,
+                        max_num_tokens_per_gpu=4096,
+                        ctx=ctx,
+                        prefix_is_sharded=True,
+                    ),
+                )
 
     def test_fused_model_graph_preserves_single_token_collective_path(self):
         weight = torch.empty(_HIDDEN, dtype=torch.bfloat16)
@@ -597,7 +693,8 @@ class AttnResTests(unittest.TestCase):
             self_attn=attention,
             comm_manager=object(),
             k3_comm=SimpleNamespace(
-                state=SimpleNamespace(attn_ar_fusion_ok=False),
+                attn_ar_fusion_ok=False,
+                acquire_projection_output=mock.Mock(return_value=None),
                 fused_attnres_reduce_available=mock.Mock(return_value=True),
             ),
             attn_fork=fork,
@@ -969,13 +1066,17 @@ class KimiKDAMergedProjTests(unittest.TestCase):
                 head_dim=head_dim,
                 tp_rank=rank,
                 tp_size=tp,
+                fp8_channel_quant=False,
             )
             for sid, w in ws.items():
                 m.weight.weight_loader(m.weight, w, sid)
             x = torch.randn(3, hidden, dtype=torch.bfloat16)
-            mixed_qkv, gate, f_a_out, beta = m(x)
             pl = proj // tp
             hl = num_heads // tp
+            packed, _ = m(x, ctx=None)
+            mixed_qkv, gate, f_a_out, beta = packed[:, : m.used_rows].split(
+                [3 * pl, pl, head_dim, hl], dim=-1
+            )
 
             def ref(w, rows, rk=rank):
                 return x @ w[rk * rows : (rk + 1) * rows].t()
@@ -1001,10 +1102,17 @@ class KimiKDAMergedProjTests(unittest.TestCase):
 
     def test_decode_single_row_slice_is_zero_copy(self):
         m = kimi_k3.KimiKDAMergedProj(
-            hidden_size=8, proj=8, num_heads=2, head_dim=4, tp_rank=0, tp_size=1
+            hidden_size=8,
+            proj=8,
+            num_heads=2,
+            head_dim=4,
+            tp_rank=0,
+            tp_size=1,
+            fp8_channel_quant=False,
         )
         torch.nn.init.normal_(m.weight)
-        mixed, gate, _, _ = m(torch.randn(1, 8, dtype=torch.bfloat16))
+        packed, _ = m(torch.randn(1, 8, dtype=torch.bfloat16), ctx=None)
+        mixed, gate = packed[:, :24], packed[:, 24:32]
         # [1, 3p] slice of a [1, total] row is already contiguous: no copy.
         self.assertTrue(mixed.is_contiguous())
         self.assertEqual(

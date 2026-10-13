@@ -107,3 +107,61 @@ def test_rows_bit_parity_with_flashinfer(r):
     data, sf = quantize_mxfp8_rows(x)
     assert torch.equal(ref_data.view(torch.uint8), data.view(torch.uint8))
     assert torch.equal(ref_sf.view(torch.uint8).reshape(r, 4), sf.view(torch.uint8))
+
+
+def test_rejects_pages_that_are_not_a_multiple_of_128_tokens():
+    """The scale slab is laid out per 128-token page; a 64-token page aliases scales."""
+    rows = torch.zeros(4, 2, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.zeros(128, 2, 128, device="cuda", dtype=torch.float8_e4m3fn)
+    scales = torch.zeros(1, 2, 1, 32, 4, 4, device="cuda", dtype=torch.uint8)
+    with pytest.raises(AssertionError):
+        quantize_store_kv_mxfp8(
+            rows, rows, cache, cache, scales, scales, torch.arange(4, device="cuda"), 64
+        )
+
+
+@pytest.mark.parametrize(
+    "rows_shape,cache_shape",
+    [
+        ((4, 2, 64), (128, 2, 64)),
+        ((4, 4, 128), (128, 2, 128)),
+        ((4, 1, 256), (128, 2, 128)),
+        ((4, 128), (128, 2, 64)),
+        ((4, 512), (128, 2, 128)),
+        ((4, 128), (128, 128)),
+    ],
+)
+def test_rejects_rows_the_scale_layout_cannot_hold(rows_shape, cache_shape):
+    """The scale-plane strides assume 128-wide heads, as many as the cache has."""
+    rows = torch.zeros(rows_shape, device="cuda", dtype=torch.bfloat16)
+    cache = torch.zeros(cache_shape, device="cuda", dtype=torch.float8_e4m3fn)
+    scales = torch.zeros(1, 4, 1, 32, 4, 4, device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="128-wide heads"):
+        quantize_store_kv_mxfp8(
+            rows, rows, cache, cache, scales, scales, torch.arange(4, device="cuda")
+        )
+
+
+@pytest.mark.parametrize(
+    "v_shape,v_cache_shape,v_cache_dtype",
+    [
+        ((4, 2, 128), (128, 1, 128), torch.float8_e4m3fn),
+        ((4, 2, 128), (128, 2, 128), torch.uint8),
+        ((4, 1, 128), (128, 2, 128), torch.float8_e4m3fn),
+        ((4, 2, 128), (2, 2, 128), torch.float8_e4m3fn),
+        ((2, 2, 128), (128, 2, 128), torch.float8_e4m3fn),
+    ],
+)
+def test_rejects_value_rows_or_cache_unlike_the_keys(
+    v_shape, v_cache_shape, v_cache_dtype
+):
+    """The kernel writes V with K's geometry."""
+    k = torch.zeros(4, 2, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros(v_shape, device="cuda", dtype=torch.bfloat16)
+    k_cache = torch.zeros(128, 2, 128, device="cuda", dtype=torch.float8_e4m3fn)
+    v_cache = torch.zeros(v_cache_shape, device="cuda", dtype=v_cache_dtype)
+    scales = torch.zeros(1, 2, 1, 32, 4, 4, device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="value rows and cache"):
+        quantize_store_kv_mxfp8(
+            k, v, k_cache, v_cache, scales, scales, torch.arange(4, device="cuda")
+        )

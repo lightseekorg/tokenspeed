@@ -72,6 +72,9 @@ class _Draft:
         self.lm_head = _Embed(64)
         self._embed_loaded_from_checkpoint = embed_loaded
 
+    mark_embedding_initialized = (
+        dsv3.Eagle3DeepseekV2ForCausalLM.mark_embedding_initialized
+    )
     set_embed_and_head = dsv3.Eagle3DeepseekV2ForCausalLM.set_embed_and_head
 
 
@@ -92,6 +95,13 @@ class EmbedSharingTest(unittest.TestCase):
         shard = torch.nn.Parameter(torch.ones(8, 8))
         with self.assertRaises(ValueError):
             draft.set_embed_and_head(shard, None)
+
+    def test_dummy_initialized_draft_keeps_its_embedding(self):
+        draft = _Draft(embed_loaded=False)
+        draft.mark_embedding_initialized()
+        own = draft.model.embed_tokens.weight
+        draft.set_embed_and_head(torch.nn.Parameter(torch.ones(8, 8)), None)
+        self.assertIs(draft.model.embed_tokens.weight, own)
 
     def test_matching_shapes_share(self):
         draft = _Draft(embed_loaded=True)

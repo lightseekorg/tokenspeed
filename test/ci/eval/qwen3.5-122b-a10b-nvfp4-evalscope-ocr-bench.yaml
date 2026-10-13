@@ -22,7 +22,6 @@ server:
     --max-num-seqs 16
     --chunked-prefill-size 8192
     --max-prefill-tokens 8192
-    --gpu-memory-utilization 0.9
     --trust-remote-code
     --attention-backend trtllm
     --moe-backend flashinfer_trtllm
@@ -31,6 +30,7 @@ server:
     --kv-cache-dtype fp8_e4m3
     --load-format auto
     --speculative-algorithm MTP
+    --disable-replay-ssm
     --speculative-draft-model-path nvidia/Qwen3.5-122B-A10B-NVFP4
     --speculative-num-steps 3
     --speculative-eagle-topk 1

@@ -53,7 +53,6 @@ from tokenspeed.runtime.models.base import (
     BaseTransformerModel,
 )
 from tokenspeed.runtime.models.utils import (
-    create_fused_set_kv_buffer_arg,
     validate_attention_partition,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -191,6 +190,8 @@ class LlamaAttention(nn.Module):
             self.head_dim**-0.5,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            rotary_emb=self.rotary_emb,
+            qk_norm=None,
         )
 
     def forward(
@@ -220,67 +221,8 @@ class LlamaAttention(nn.Module):
         v: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """RoPE + attention (pre-o_proj), with optional fused KV pre-write.
-
-        When the backend supports KV pre-write *and* ``create_fused_set_kv_buffer_arg``
-        accepts the layer's scales, fused rope writes KV directly into the cache
-        so the attention call can run with ``save_kv_cache=False`` (saves one
-        kernel launch). Otherwise we fall back to plain RoPE + ``self.attn(q, k, v)``
-        so the backend writes KV the normal way — without this fallback, layers
-        with non-trivial k/v scales silently lose their KV writes. Subclasses
-        (e.g. Eagle3 draft head) override this hook to insert spec-decode
-        behaviour around the same scaffolding.
-        """
-        if ctx.attn_backend.support_kv_cache_prewrite(ctx.forward_mode):
-            fused_kv_arg = self._build_fused_kv_arg(v, ctx)
-            if fused_kv_arg is not None:
-                q_rope = self._fused_rope_kv_write(positions, q, k, fused_kv_arg)
-                return self.attn(
-                    q_rope,
-                    None,
-                    None,
-                    save_kv_cache=False,
-                    ctx=ctx,
-                )
-        q, k = self.rotary_emb(positions, q, k)
-        return self.attn(q, k, v, ctx=ctx)
-
-    def _build_fused_kv_arg(
-        self,
-        v: torch.Tensor,
-        ctx: ForwardContext,
-    ):
-        """Try to build the fused RoPE+KV-write descriptor; returns ``None`` if
-        the helper rejects the layer (e.g. non-trivial k/v scales)."""
-        n = v.shape[0]
-        return create_fused_set_kv_buffer_arg(
-            value=v.view(n, self.num_kv_heads, self.head_dim),
-            layer=self.attn,
-            # Prewrite at this layer's group locations, fetched from the
-            # backend (the one owner of KV write slots).
-            out_cache_loc=ctx.attn_backend.write_locations(self.attn, ctx.forward_mode),
-            token_to_kv_pool=ctx.token_to_kv_pool,
-        )
-
-    def _fused_rope_kv_write(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        fused_kv_arg,
-    ) -> torch.Tensor:
-        """Fused RoPE that writes KV into cache (via ``fused_kv_arg``) and
-        returns the rope'd Q."""
-        n = q.shape[0]
-        q_rope = torch.empty((n, self.q_size), dtype=q.dtype, device=q.device)
-        self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=fused_kv_arg,
-            output_q_rope=q_rope,
-        )
-        return q_rope
+        """Attention before ``o_proj``; the Eagle3 draft head overrides it."""
+        return self.attn(q, k, v, positions, ctx)
 
 
 class LlamaDecoderLayer(BaseDecoderLayer):

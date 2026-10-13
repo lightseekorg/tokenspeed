@@ -54,7 +54,9 @@ def balanced_packing(
         rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
         return pack_index, rank_in_pack
 
-    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    # Stable: equal loads tie in index order, so every rank (and every run)
+    # packs the same way from the same counts.
+    indices = weight.double().sort(dim=-1, descending=True, stable=True).indices.cpu()
     pack_index = torch.full_like(weight, fill_value=-1, dtype=torch.int64, device="cpu")
     rank_in_pack = torch.full_like(pack_index, fill_value=-1)
     for i in range(num_layers):
@@ -230,7 +232,9 @@ def rebalance_experts(
     """
 
     num_layers, num_logical_experts = weight.shape
-    weight = weight.float().cpu()
+    # Double, not float: a long online window (billions of routes per expert)
+    # passes 2^24, where float32 rounds counts and breaks determinism.
+    weight = weight.double().cpu()
     if enable_hierarchical:
         # use hierarchical load-balance policy
         phy2log, phyrank, logcnt = rebalance_experts_hierarchical(

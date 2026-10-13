@@ -29,7 +29,7 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.gdn._triton.index import prepare_chunk_indices
 from tokenspeed_kernel.ops.attention.gdn._triton.op import safe_exp
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 
 @triton.heuristics(
@@ -162,7 +162,8 @@ def chunk_scaled_dot_kkt_fwd(
         K=K,
         BT=BT,
         BK=64,
-        num_warps=8,
+        # gfx950: four waves are faster than eight.
+        num_warps=4 if current_platform().is_cdna4 else 8,
         num_stages=3,
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),

@@ -28,6 +28,7 @@ server:
     --kv-cache-dtype fp8_e4m3
     --comm-fusion-max-num-tokens 4096
     --speculative-algorithm MTP
+    --disable-replay-ssm
     --speculative-num-steps 3
     --host 127.0.0.1
     --port 8000

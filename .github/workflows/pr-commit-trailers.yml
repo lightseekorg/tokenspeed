@@ -1,0 +1,50 @@
+name: PR Commit Trailers
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-commit-trailers-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  commit-trailers:
+    name: Commit trailers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check commit co-authors
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          commits="$RUNNER_TEMP/pr-commits.txt"
+          message="$RUNNER_TEMP/pr-commit-message.txt"
+          forbidden='^[[:space:]]*Co-authored-by:.*(Codex|Claude[[:space:]]+Code|noreply@anthropic\.com)'
+          git rev-list "refs/remotes/origin/$BASE_REF..$HEAD_SHA" > "$commits"
+
+          failed=false
+          while IFS= read -r commit; do
+            git log -1 --format=%B "$commit" > "$message"
+            if grep -qiE "$forbidden" "$message"; then
+              echo "::error::Commit $commit has a forbidden Codex or Claude Code Co-authored-by trailer."
+              failed=true
+            fi
+          done < "$commits"
+
+          if [[ "$failed" == true ]]; then
+            echo "::error::Amend the listed commits to remove these Co-authored-by trailers, then push the updated branch."
+            exit 1
+          fi
+          echo "Commit trailers comply with the attribution policy."

@@ -45,8 +45,12 @@ class ParallelGroup(Enum):
     """The parallel group a communication belongs to."""
 
     ATTN_TP = auto()
+    # Head-sharded attention projections over attention-DP ranks.
+    ATTN_HEAD_TP = auto()
     DENSE_TP = auto()
     MOE_TP_EP = auto()
+    # Vocab-sharded LM head over attention-DP ranks.
+    LM_HEAD_TP = auto()
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,10 +84,14 @@ Partial = Placement.partial
 def group_tp_size(mapping: Mapping, group: ParallelGroup) -> int:
     if group == ParallelGroup.ATTN_TP:
         return mapping.attn.tp_size
+    elif group == ParallelGroup.ATTN_HEAD_TP:
+        return mapping.attn.head_tp_size
     elif group == ParallelGroup.DENSE_TP:
         return mapping.dense.tp_size
     elif group == ParallelGroup.MOE_TP_EP:
         return mapping.moe.tp_ep_size
+    elif group == ParallelGroup.LM_HEAD_TP:
+        return mapping.lm_head.tp_size
     else:
         raise ValueError(f"Unknown group: {group}")
 
@@ -91,10 +99,14 @@ def group_tp_size(mapping: Mapping, group: ParallelGroup) -> int:
 def group_has_parallel(mapping: Mapping, group: ParallelGroup) -> bool:
     if group == ParallelGroup.ATTN_TP:
         return mapping.has_attn_tp
+    elif group == ParallelGroup.ATTN_HEAD_TP:
+        return mapping.attn.has_head_tp
     elif group == ParallelGroup.DENSE_TP:
         return mapping.dense.has_tp
     elif group == ParallelGroup.MOE_TP_EP:
         return mapping.moe.has_tp_ep
+    elif group == ParallelGroup.LM_HEAD_TP:
+        return mapping.lm_head.has_tp
     else:
         raise ValueError(f"Unknown group: {group}")
 

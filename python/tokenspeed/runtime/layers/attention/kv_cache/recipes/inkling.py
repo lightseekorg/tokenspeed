@@ -324,7 +324,7 @@ def _conv_ring_bytes(*, text_config, attn_config, num_layers: int, spec_tokens: 
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 
     rows = int(attn_config.max_bs) + 2
-    # Must match _wrap_inkling_backend's ring sizing: (W-1) taps + K chunk rows.
+    # Match InklingAttnBackend.from_config: (W-1) taps + K chunk rows.
     spec_tokens = max(1, int(spec_tokens))
     ring_rows = int(text_config.sconv_kernel_size) - 1 + spec_tokens
     conv_dim = inkling_conv_total_dim(

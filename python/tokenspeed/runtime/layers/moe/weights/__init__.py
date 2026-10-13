@@ -39,6 +39,11 @@ def create_layer_weights(
     with_bias: bool = False,
     solution: str | None = None,
 ) -> None:
+    if not spec.gated and quant_kind not in ("nvfp4", "unquant"):
+        raise NotImplementedError(
+            f"{spec.activation} experts are supported with NVFP4 or unquantized "
+            f"weights only, got {quant_kind}"
+        )
     if quant_kind == "unquant":
         create_dense_weight_pair(
             spec,

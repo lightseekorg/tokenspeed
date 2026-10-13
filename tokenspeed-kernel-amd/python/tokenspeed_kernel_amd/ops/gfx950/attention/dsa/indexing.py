@@ -51,11 +51,13 @@ def gluon_dsa_decode_topk_fp8_gfx950(
     seq_lens,
     block_table,
     logits,
-    block_table_stride: gl.constexpr,
-    logits_stride: gl.constexpr,
+    # The table width and max_seq_len (the logits width) follow the batch;
+    # runtime so every batch shape shares one binary.
+    block_table_stride,
+    logits_stride,
     page_size: gl.constexpr,
     page_stride_bytes: gl.constexpr,
-    max_seq_len: gl.constexpr,
+    max_seq_len,
     num_heads: gl.constexpr,
     head_dim: gl.constexpr,
     num_groups: gl.constexpr,
@@ -147,8 +149,10 @@ def gluon_dsa_prefill_topk_fp8_gfx950(
     row_starts,
     row_ends,
     logits,
-    logits_stride: gl.constexpr,
-    seq_len_sum: gl.constexpr,
+    # seq_len_sum (the logits width) follows the batch; runtime so every batch
+    # shape shares one binary.
+    logits_stride,
+    seq_len_sum,
     page_size: gl.constexpr,
     page_stride_bytes: gl.constexpr,
     num_heads: gl.constexpr,

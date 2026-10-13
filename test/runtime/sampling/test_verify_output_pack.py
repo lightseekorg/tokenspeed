@@ -37,6 +37,9 @@ MAX_BS, MAX_N = 4, 6
 def _backend(device: str) -> GreedySamplingBackend:
     return GreedySamplingBackend(
         SamplingBackendConfig(
+            enable_speculative_sampling=False,
+            sampling_stream="batch",
+            logprob_order="torch",
             max_bs=MAX_BS,
             max_draft_tokens_per_req=MAX_N,
             max_req_pool_size=8,
@@ -114,6 +117,7 @@ def test_verify_lands_all_three_outputs_in_the_pack(monkeypatch) -> None:
         SimpleNamespace(next_token_logits=logits),
         SimpleNamespace(vocab_mask=None, req_pool_indices=None),
         candidates,
+        tree=None,
     )
     _, _, index = _pack_regions(backend)
     assert predict.data_ptr() == backend._output_pack_buf.data_ptr()

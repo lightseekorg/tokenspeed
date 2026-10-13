@@ -139,8 +139,8 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     # the cache recipes; empty -> single full-history group. A layer's
     # compute mask lives on its PagedAttention (sliding_window_size).
     cache_layer_types: tuple[str, ...] = ()
-    # Retention window; families narrow the type (per-layer tuple on MHA,
-    # DeepSeek V4's int on MLA, None on MSA).
+    # Retention window for per-layer cache recipes. Families that declare
+    # whole groups, such as DeepSeek V4, put their windows on those groups.
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
 
     @classmethod
@@ -197,10 +197,18 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
-    # One topology for target and continuation/MTP views; DCP does not add ranks.
-    dcp_size: int = 1
-    dcp_rank: int = 0
-    dcp_group: tuple[int, ...] = (0,)
+    # KV parallelism (page-cyclic KV page sharding over a consecutive subgroup
+    # of attention TP): one topology for target and continuation/MTP views;
+    # KVP does not add ranks. Decode attends the owned pages and merges the
+    # partials by LSE (DCP).
+    kvp_size: int = 1
+    kvp_rank: int = 0
+    kvp_group: tuple[int, ...] = (0,)
+    # Query context parallelism: the extend rows this rank computes are a
+    # contiguous shard of the chunk; the group is the attention TP group.
+    qcp_size: int = 1
+    qcp_rank: int = 0
+    qcp_group: tuple[int, ...] = (0,)
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
@@ -212,26 +220,44 @@ class AttnConfig:
                 "AttnConfig requires exactly one softmax-family component, got "
                 f"{[type(c).__name__ for c in self.components] or 'none'}"
             )
-        if self.dcp_size > 1:
+        if self.qcp_size > 1:
+            softmax = softmax_components[0]
+            # The gathered-history extend arm exists on the GPU DSA leaf only;
+            # every other leaf rejects a query shard at its metadata build.
+            if not (softmax.is_dsa and softmax.backend_name in (None, "dsa")):
+                raise ValueError(
+                    "query context parallelism requires GPU DSA attention; "
+                    f"got {softmax.backend_name!r}"
+                )
+            if torch.device(self.device).type != "cuda":
+                raise ValueError("GPU DSA query context parallelism requires CUDA")
+            # The sharded KV write gathers the rotated latent and stores it
+            # with latent_store, which writes native (bf16) rows only.
+            if (
+                self.kv_cache_dtype is not torch.bfloat16
+                or self.kv_cache_mxfp8
+                or self.kv_cache_quant_method != "none"
+            ):
+                raise ValueError(
+                    "query context parallelism requires a bf16 KV cache; got "
+                    f"{self.kv_cache_dtype} (mxfp8={self.kv_cache_mxfp8}, quant "
+                    f"method {self.kv_cache_quant_method!r})"
+                )
+        if self.kvp_size > 1:
             softmax = softmax_components[0]
             if softmax.backend_name == "flashmla":
                 if torch.device(self.device).type != "cuda":
-                    raise ValueError("FlashMLA DCP requires CUDA")
-                if (
-                    self.speculative_num_steps > 0
-                    or self.speculative_num_draft_tokens > 1
-                    or self.is_draft
-                ):
-                    raise ValueError("FlashMLA DCP does not yet support speculation")
+                    raise ValueError("FlashMLA DCP decode requires CUDA")
+            elif softmax.backend_name == "tokenspeed_mla":
+                pass
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
                 if torch.device(self.device).type != "cuda":
-                    raise ValueError("GPU DSA DCP requires CUDA")
-                if (
-                    self.speculative_num_steps > 0
-                    or self.speculative_num_draft_tokens > 1
-                    or self.is_draft
-                ):
-                    raise ValueError("GPU DSA DCP does not yet support speculation")
+                    raise ValueError("GPU DSA DCP decode requires CUDA")
+                if self.draft_block_decode:
+                    raise ValueError(
+                        "GPU DSA DCP decode does not yet support non-causal "
+                        "block drafts"
+                    )
             elif softmax.backend_name == "hybrid_linear_attn":
                 # The registry resolves the user's full-attention leaf after
                 # composing the hybrid components, and validates it before
@@ -239,13 +265,14 @@ class AttnConfig:
                 pass
             elif softmax.backend_name != "deepseek_v4":
                 raise ValueError(
-                    "DCP currently requires DeepSeek V4, GPU DSA or FlashMLA attention"
+                    "--kv-parallel-size > 1 (DCP decode) currently requires "
+                    "DeepSeek V4, GPU DSA, FlashMLA or CuTe MLA attention"
                 )
             else:
                 platform = current_platform()
                 if not dsv4_decode_supports_partials(platform):
                     raise ValueError(
-                        "DCP requires a DeepSeek V4 decode kernel that returns a "
+                        "DCP decode requires a DeepSeek V4 decode kernel that returns a "
                         f"no-sink LSE; none is registered for {platform.device_name}"
                     )
 
@@ -296,9 +323,12 @@ def model_wide_kwargs(
     )
     attn_mapping = server_args.mapping.attn
     kwargs.update(
-        dcp_size=attn_mapping.dcp_size,
-        dcp_rank=attn_mapping.dcp_rank,
-        dcp_group=attn_mapping.dcp_group,
+        kvp_size=attn_mapping.kvp_size,
+        kvp_rank=attn_mapping.kvp_rank,
+        kvp_group=attn_mapping.kvp_group,
+        qcp_size=attn_mapping.qcp_size,
+        qcp_rank=attn_mapping.qcp_rank,
+        qcp_group=attn_mapping.qcp_group,
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(

@@ -32,6 +32,7 @@ server:
     --kv-cache-dtype fp8
     --kvstore-ratio 0.5
     --speculative-algorithm MTP
+    --disable-replay-ssm
     --speculative-num-steps 3
     --host 127.0.0.1
     --port 8000

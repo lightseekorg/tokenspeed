@@ -38,21 +38,18 @@ HEAD_DIM = 128
 PAGE = 128
 
 
-def ref_rel_attn(
+def ref_rel_logits(
     q: torch.Tensor,
     k: torch.Tensor,
-    v: torch.Tensor,
     rel_logits: torch.Tensor | None,
     rel_extent: int,
     window_left: int,
     scale: float,
 ) -> torch.Tensor:
-    """Per-sequence torch reference. q [Sq,H,D], k/v [Sk,KV,D], rel_logits [Sq,H,E]."""
+    """Masked fp32 logits [H, Sq, Sk]. q [Sq,H,D], k [Sk,KV,D], rel_logits [Sq,H,E]."""
     Sq, H, _ = q.shape
     Sk, KV, _ = k.shape
-    rep = H // KV
-    k = k.repeat_interleave(rep, dim=1)
-    v = v.repeat_interleave(rep, dim=1)
+    k = k.repeat_interleave(H // KV, dim=1)
     logits = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * scale
     q_pos = torch.arange(Sq, device=q.device) + (Sk - Sq)
     kv_pos = torch.arange(Sk, device=q.device)
@@ -66,7 +63,21 @@ def ref_rel_attn(
     mask = dist < 0  # causal
     if window_left >= 0:
         mask |= dist > window_left
-    logits.masked_fill_(mask.unsqueeze(0), float("-inf"))
+    return logits.masked_fill_(mask.unsqueeze(0), float("-inf"))
+
+
+def ref_rel_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    rel_logits: torch.Tensor | None,
+    rel_extent: int,
+    window_left: int,
+    scale: float,
+) -> torch.Tensor:
+    """Per-sequence torch reference. q [Sq,H,D], k/v [Sk,KV,D], rel_logits [Sq,H,E]."""
+    logits = ref_rel_logits(q, k, rel_logits, rel_extent, window_left, scale)
+    v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
     return torch.einsum("hqk,khd->qhd", logits.softmax(-1), v.float()).to(q.dtype)
 
 

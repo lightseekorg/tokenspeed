@@ -18,8 +18,9 @@ class CuteSkinnyGemm:
     """Shape-dynamic low-latency GEMM for small token counts.
 
     Computes ``C[M, N] = A[M, K] @ B[N, K].T + residual`` with BF16 or FP16
-    inputs, FP32 accumulators, and an output matching the input dtype. The
-    residual term is optional and is added before the output conversion.
+    inputs and FP32 accumulators. FP8 inputs take a per-tensor dequant scale
+    for each operand and write ``output_type``. The residual term is optional
+    and is added before the output conversion.
     ``has_residual2`` is a local extension over the vLLM original: a second
     optional addend folded into the same epilogue, for fused
     ``a + x @ W.T + c`` projections. N and
@@ -32,6 +33,8 @@ class CuteSkinnyGemm:
         self,
         *,
         element_type,
+        output_type,
+        has_scale: bool,
         num_rows: int,
         block_size: int,
         outputs_per_block: int,
@@ -50,6 +53,8 @@ class CuteSkinnyGemm:
         ):
             raise ValueError("static K must contain at least two complete tiles")
         self.element_type = element_type
+        self.output_type = output_type
+        self.has_scale = has_scale
         self.num_rows = num_rows
         self.block_size = block_size
         self.outputs_per_block = outputs_per_block
@@ -69,6 +74,8 @@ class CuteSkinnyGemm:
         gResidual: cute.Tensor,
         gResidual2: cute.Tensor,
         gC: cute.Tensor,
+        gScaleA: cute.Tensor,
+        gScaleB: cute.Tensor,
         stream: CUstream,
     ) -> None:
         n = cute.size(gB, mode=[0])
@@ -97,6 +104,8 @@ class CuteSkinnyGemm:
             gResidual,
             gResidual2,
             gC,
+            gScaleA,
+            gScaleB,
             k,
             copy_a,
             copy_b,
@@ -118,6 +127,8 @@ class CuteSkinnyGemm:
         gResidual: cute.Tensor,
         gResidual2: cute.Tensor,
         gC: cute.Tensor,
+        gScaleA: cute.Tensor,
+        gScaleB: cute.Tensor,
         k_extent: cutlass.Int32,
         copy_a: cute.CopyAtom,
         copy_b: cute.CopyAtom,
@@ -220,12 +231,21 @@ class CuteSkinnyGemm:
                         b_regs[ni, None],
                     )
 
-                for vi in cutlass.range_constexpr(vector_width):
-                    for mi in cutlass.range_constexpr(num_rows):
-                        for ni in cutlass.range_constexpr(outputs_per_block):
-                            acc[mi, ni] = acc[mi, ni] + a_regs[mi, vi].to(
-                                cutlass.Float32
-                            ) * b_regs[ni, vi].to(cutlass.Float32)
+                if const_expr(self.element_type.width == 8):
+                    # FP8 converts whole vectors; per-element conversion is far slower.
+                    a_f32 = a_regs.load().to(cutlass.Float32)
+                    b_f32 = b_regs.load().to(cutlass.Float32)
+                    for vi in cutlass.range_constexpr(vector_width):
+                        for mi in cutlass.range_constexpr(num_rows):
+                            for ni in cutlass.range_constexpr(outputs_per_block):
+                                acc[mi, ni] += a_f32[mi, vi] * b_f32[ni, vi]
+                else:
+                    for vi in cutlass.range_constexpr(vector_width):
+                        for mi in cutlass.range_constexpr(num_rows):
+                            for ni in cutlass.range_constexpr(outputs_per_block):
+                                acc[mi, ni] = acc[mi, ni] + a_regs[mi, vi].to(
+                                    cutlass.Float32
+                                ) * b_regs[ni, vi].to(cutlass.Float32)
 
         for mi in cutlass.range_constexpr(num_rows):
             for ni in cutlass.range_constexpr(outputs_per_block):
@@ -244,6 +264,9 @@ class CuteSkinnyGemm:
 
         cute.arch.sync_threads()
         if tidx == 0:
+            scale = cutlass.Float32(1.0)
+            if const_expr(self.has_scale):
+                scale = gScaleA[0] * gScaleB[0]
             for mi in cutlass.range_constexpr(num_rows):
                 for ni in cutlass.range_constexpr(outputs_per_block):
                     n_idx = n_base + ni
@@ -256,11 +279,13 @@ class CuteSkinnyGemm:
                             reduction_profile=0,
                         )
                     )
+                    if const_expr(self.has_scale):
+                        total = total * scale
                     if const_expr(self.has_residual):
                         total += gResidual[mi, n_idx].to(cutlass.Float32)
                     if const_expr(self.has_residual2):
                         total += gResidual2[mi, n_idx].to(cutlass.Float32)
-                    gC[mi, n_idx] = cutlass.Float32(total).to(self.element_type)
+                    gC[mi, n_idx] = cutlass.Float32(total).to(self.output_type)
 
         if const_expr(self.use_pdl):
             cute.arch.griddepcontrol_launch_dependents()
