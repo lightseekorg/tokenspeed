@@ -565,6 +565,46 @@ them in a fixed order and adds the sink once; each of its workgroups owns one
 token, 16 heads and a 64-dim slice, so the merge of a small batch still spreads
 over many CUs.
 
+### gfx950 QSA sparse attention
+
+`gluon_qsa_sparse_attention_gfx950` serves `qsa_sparse_attention`: each query
+row attends to its own list of physical KV-cache slots (Qwen3.8 QSA selects
+2051 per row).
+
+#### Contract
+
+- BF16 queries `(tokens, q_heads, head_dim)`; BF16 or FP8 E4M3 caches
+  `(slots, kv_heads, head_dim)` of any size with contiguous head dims;
+  `head_dim` and `value_head_dim` in {128, 256}; any GQA group (blocks of 16
+  query heads).
+- Int32 `selected_slots (tokens, width)`, any column order: slots `<= 0` are
+  ignored (slot 0 may hold NaN), rows without a valid slot return zeros.
+  Scalar FP8 `k_scale` / `v_scale`.
+- Grid and split count depend only on tensor shapes; the token count is never
+  a compile key.
+
+#### Algorithm
+
+A one-wave workgroup owns one row, up to 16 query heads of one KV head (the
+MFMA M dimension) and a share of the row's slots. It first compacts the row's
+valid slots to the front of an LDS list (prefix sum and scatter), so invalid
+columns, such as the unselected middle of a short context, cost neither
+gathers nor MFMAs. Each 16-slot tile is gathered straight into registers, K in
+the 16x16x32 MFMA B-operand layout and V through one LDS store and
+`ds_read_b64_tr_b16` transposed reads for the 16x16x16 PV MFMA; the next tile's
+gathers are issued before the current one is consumed. Gathers use 64-bit
+pointers, since serving caches exceed the 2 GiB reach of buffer loads; lanes
+past the valid slots read slot 1, so no gather is predicated. Q is kept in LDS and
+re-read per tile: the arch-VGPR budget goes to gathers in flight, and a
+register-resident Q forced the allocator to reuse gather destinations behind
+`vmcnt(0)` waits.
+
+Gathering is L2-bandwidth bound (prefill rows of one request re-read the same
+slots). Batches with fewer than about 1024 (row, head-block) workgroups split
+the compacted tiles over up to 32 workgroups that store FP32 partials and
+base-2 LSE; `gluon_qsa_sparse_attention_merge_gfx950` merges all splits of a
+(row, head) in one pass.
+
 ### gfx1250 MLA decode
 
 `gluon_mla_decode_gfx1250` computes absorbed MLA decode over a paged cache,
