@@ -338,11 +338,11 @@ class EngineMetrics:
         self.request_queue_time_seconds = Histogram(
             name="tokenspeed:request_queue_time_seconds",
             documentation=(
-                "Wall time from entering the scheduler's waiting queue to "
-                "first dispatch into a forward batch, observed once per "
-                "request. The enqueue point is the request's arrival at this "
-                "scheduler process; tokenizer-manager and IPC wait are "
-                "excluded."
+                "Wall time from submission to the scheduler's waiting queue "
+                "to first dispatch into a forward batch, observed once per "
+                "request. Grammar-compile, pause-hold, and EPD embedding "
+                "waits precede submission and are excluded, as are "
+                "tokenizer-manager and IPC wait."
             ),
             labelnames=labelnames,
             buckets=[
