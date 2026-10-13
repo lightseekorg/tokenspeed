@@ -148,6 +148,43 @@ def test_mix_workspace_is_not_first_created_under_capture(monkeypatch):
     assert hyperconnection._workspaces == {}
 
 
+@pytest.mark.parametrize("tail", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+def test_mix_supports_rank_tails_that_fill_an_mfma_step(tail):
+    lowrank = 256 + tail
+    supported = tail >= 32
+    assert (
+        hyperconnection.supports_gluon_hyperconnection_mix_gfx950(
+            16, HC_COUNT, HIDDEN_SIZE, lowrank
+        )
+        is supported
+    )
+    wide = HC_COUNT * HIDDEN_SIZE
+    normalized = torch.randn(16, wide, device="cuda", dtype=torch.bfloat16)
+    projection = torch.randn(lowrank, wide, device="cuda", dtype=torch.bfloat16)
+    up = torch.randn(wide, lowrank, device="cuda", dtype=torch.bfloat16)
+    if not supported:
+        # Smaller tails cannot form an MFMA K step: reject, never miscompute.
+        with pytest.raises(ValueError, match="at least 32"):
+            hyperconnection.launch_gluon_hyperconnection_mix_gfx950(
+                normalized, projection, up, HC_COUNT, HIDDEN_SIZE, lowrank, 1.0
+            )
+        return
+    mixed, _ = hyperconnection.launch_gluon_hyperconnection_mix_gfx950(
+        normalized, projection * 0.02, up * 0.02, HC_COUNT, HIDDEN_SIZE, lowrank, 1.0
+    )
+    expected, _ = gated_residual_mix(
+        normalized,
+        projection * 0.02,
+        up * 0.02,
+        HC_COUNT,
+        HIDDEN_SIZE,
+        lowrank,
+        weights_independent=True,
+        override="triton_hyperconnection_mix",
+    )
+    torch.testing.assert_close(mixed, expected, rtol=1e-2, atol=1e-2)
+
+
 def test_mix_row_count_does_not_recompile():
     inputs = _inputs(256, LOWRANK + HC_COUNT, torch.bfloat16, seed=11)
 

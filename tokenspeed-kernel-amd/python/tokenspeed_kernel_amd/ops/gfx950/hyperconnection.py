@@ -283,12 +283,13 @@ def gluon_hyperconnection_mix_up_gfx950(
     dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=8)
 
     # The rank is covered by a power-of-two head and tail so that every load
-    # is issued before the first MFMA (one memory round trip).
+    # is issued before the first MFMA (one memory round trip). A tail must
+    # fill at least one 32-deep MFMA K step.
     R_HEAD: gl.constexpr = BLOCK_R
     R_TAIL: gl.constexpr = R - BLOCK_R
     gl.static_assert(
-        R_TAIL >= 0 and (R_TAIL & (R_TAIL - 1)) == 0,
-        "rank must split into two power-of-two tiles",
+        R_TAIL == 0 or (R_TAIL >= 32 and (R_TAIL & (R_TAIL - 1)) == 0),
+        "rank must be the head tile plus a power-of-two tail of at least 32",
     )
     offs_bc = gl.arange(0, BLOCK_N, gl.SliceLayout(0, dot_b))
     b_rows = (offs_bc // BLOCK_H) * H + h_tile * BLOCK_H + offs_bc % BLOCK_H
@@ -420,13 +421,15 @@ def supports_gluon_hyperconnection_mix_gfx950(
 ) -> bool:
     """Whether the two-launch mix supports (and was tuned for) this shape."""
     wide = hc_count * hidden_size
+    # The up kernel splits the rank into a 256 head and a power-of-two tail
+    # that fills at least one 32-deep MFMA K step.
     tail = lowrank - 256
     return (
         1 <= rows <= MAX_ROWS
         and hc_count == 4
         and hidden_size % 16 == 0
         and wide % 10240 == 0
-        and tail > 0
+        and tail >= 32
         and tail & (tail - 1) == 0
     )
 
@@ -476,7 +479,7 @@ def launch_gluon_hyperconnection_mix_gfx950(
         raise ValueError(
             "GFX950 hyper-connection mix requires contiguous FP16/BF16 tensors, "
             f"1..{MAX_ROWS} rows, four branches, a wide dimension divisible by "
-            "10240 and a rank of 256 plus a power of two"
+            "10240 and a rank of 256 plus a power of two of at least 32"
         )
     device = normalized.device
     dtype = normalized.dtype

@@ -1184,8 +1184,9 @@ Triton epilogues.
 
 - Contiguous FP16/BF16 `normalized [rows, 4 * H]`, fused down/inject weight
   `[R (+ 4), 4 * H]` and up weight `[4 * H, R]`; `4 * H` divisible by 10240
-  and `R` equal to 256 plus a power of two. Returns the mixed `[rows, H]` and
-  the inject logits `[rows, 4]` (or `None`) in the input dtype.
+  and `R` equal to 256 plus a power of two of at least 32. Returns the mixed
+  `[rows, H]` and the inject logits `[rows, 4]` (or `None`) in the input
+  dtype.
 - Numerics follow the GEMM-plus-epilogue path: both projections accumulate in
   FP32 and are rounded to the input dtype before the scale/SiLU and the
   sigmoid gate, so only the accumulation order differs (at most one ulp).
