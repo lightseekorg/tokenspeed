@@ -747,3 +747,80 @@ def test_lamport_all_gather_refuses_by_shape_and_copies_odd_layouts():
         refused = torch.zeros(shape, dtype=dtype, device=dev)
         assert trtllm_mnnvl_allgather(refused, mnnvl, launch_with_pdl=True) is None
     dist.barrier()
+
+
+def test_lamport_all_gather_advances_the_rotation_and_clears_behind():
+    """Each gather takes the next buffer, records its widened extent and
+    returns the buffer the previous call dirtied to the sentinel, whatever the
+    widths on either side."""
+    from tokenspeed_kernel.thirdparty.cuda.trtllm import trtllm_mnnvl_allgather
+
+    ws = _skip_unless_mnnvl()
+    rank, world, dev, mnnvl = ws["rank"], ws["world"], ws["dev"], ws["mnnvl"]
+    handle = mnnvl._refs[1]
+    local = handle.get_buffer(rank, (handle.buffer_size // 4,), torch.int32)
+    words_per_buffer = mnnvl.buffer_size_bytes // 4
+    for token_num, width in ((4, 4096), (1, 640), (16, 1280), (2, 4096)):
+        torch.cuda.synchronize()
+        dist.barrier()
+        before = mnnvl.buffer_flags.tolist()
+        x = torch.randn(token_num, width, device=dev).bfloat16()
+        assert trtllm_mnnvl_allgather(x, mnnvl, launch_with_pdl=False) is not None
+        torch.cuda.synchronize()
+        dist.barrier()
+        after = mnnvl.buffer_flags.tolist()
+        extent = token_num * world * width * 4
+        assert after[:5] == [(before[0] + 1) % 3, before[0], before[2], 1, extent]
+        if before[3] == 1:
+            start = before[1] * words_per_buffer
+            behind = local[start : start + before[4] // 4]
+            assert torch.all(behind == -(2**31))
+
+
+def test_workspace_all_gather_freezes_the_workspace_only_when_served():
+    """Capturing a served gather through the backend-facing entry point
+    freezes the workspace against growth; capturing a refused one does not."""
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        ensure_workspace_initialized,
+        trtllm_workspace_all_gather,
+    )
+
+    rank, dev = _setup()
+    try:
+        armed = ensure_workspace_initialized(
+            rank=rank, group=dist.group.WORLD, max_token_num=2048, hidden_dim=H
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"trtllm fusion workspace unavailable: {exc}")
+    manager = comm._manager_for_group(dist.group.WORLD)
+    if not armed or manager.mnnvl_workspace is None:
+        pytest.skip("no mnnvl workspace on this fabric")
+    world = dist.get_world_size()
+    consumed_before = manager.graph_consumed
+    manager.graph_consumed = False
+    torch.manual_seed(8_000 + rank)
+    x = torch.randn(4, 640, device=dev).bfloat16()
+    refused = torch.randn(4, 640, device=dev)
+    want = torch.empty(world, 4, 640, dtype=torch.bfloat16, device=dev)
+    dist.all_gather_into_tensor(want, x)
+    try:
+        trtllm_workspace_all_gather(x, dist.group.WORLD)
+        torch.cuda.synchronize()
+        assert not manager.graph_consumed
+        # The refused capture holds one ordinary kernel so the graph is not empty.
+        with torch.cuda.graph(torch.cuda.CUDAGraph()):
+            refused.mul_(2)
+            assert trtllm_workspace_all_gather(refused, dist.group.WORLD) is None
+        assert not manager.graph_consumed
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got = trtllm_workspace_all_gather(x, dist.group.WORLD)
+        assert got is not None and manager.graph_consumed
+        dist.barrier()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(got, want.permute(1, 0, 2).reshape(4, world * 640))
+    finally:
+        manager.graph_consumed = consumed_before
+    dist.barrier()
