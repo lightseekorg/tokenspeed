@@ -131,6 +131,30 @@ def select_rows_torch(logits, candidates, live_widths, topk, row_out, row_lens):
     row_lens.copy_((values_topk > -torch.inf).sum(dim=1).to(row_lens.dtype))
 
 
+def select_blocks_torch(logits, visible, candidate_topk, block_out, block_lens):
+    """Write each row's top ``candidate_topk`` eight-row blocks, position-sorted.
+
+    A block scores the max of its 8 logits; the block holding row
+    ``visible[q] - 1`` is forced in when it has a finite score. Row q of
+    ``block_out`` gets the block ids ascending, then -1; ``block_lens`` the
+    count. Equal-score boundary ties may pick any equivalent subset.
+    """
+    queries, width = logits.shape
+    n_blocks = width // 8
+    block_scores = logits[:, : n_blocks * 8].reshape(queries, n_blocks, 8).amax(-1)
+    latest = (visible.to(torch.int64) - 1) // 8
+    live = (visible > 0) & (latest < n_blocks)
+    latest = latest.clamp(0, n_blocks - 1)
+    rows = torch.arange(queries, device=logits.device)
+    current = block_scores[rows, latest]
+    block_scores[rows, latest] = torch.where(
+        live & (current > -torch.inf),
+        torch.full_like(current, float("inf")),
+        current,
+    )
+    _select_sorted(block_scores, int(candidate_topk), block_out, block_lens)
+
+
 def run_dsv41_csa2_index_topk(
     index_q,
     weights,
@@ -147,11 +171,13 @@ def run_dsv41_csa2_index_topk(
     out,
     launch_logits,
     select_rows,
+    select_blocks,
 ):
     """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch.
 
     ``launch_logits`` scores a query tile into -inf-initialized FP32 logits;
-    ``select_rows`` has the ``select_rows_torch`` contract.
+    ``select_rows`` has the ``select_rows_torch`` contract and
+    ``select_blocks`` the ``select_blocks_torch`` contract.
     """
     out = _index_topk_outputs(
         index_q,
@@ -253,24 +279,9 @@ def run_dsv41_csa2_index_topk(
                 row_lens[output_begin:output_end],
             )
             if make_blocks:
-                n_blocks = width // 8
-                block_scores = (
-                    logits[:, : n_blocks * 8]
-                    .reshape(tile_queries, n_blocks, 8)
-                    .amax(-1)
-                )
-                latest = (tile_visible.to(torch.int64) - 1) // 8
-                live = (tile_visible > 0) & (latest < n_blocks)
-                latest = latest.clamp(0, n_blocks - 1)
-                rows = torch.arange(tile_queries, device=q.device)
-                current = block_scores[rows, latest]
-                block_scores[rows, latest] = torch.where(
-                    live & (current > -torch.inf),
-                    torch.full_like(current, float("inf")),
-                    current,
-                )
-                _select_sorted(
-                    block_scores,
+                select_blocks(
+                    logits,
+                    tile_visible,
                     int(candidate_topk),
                     block_out[output_begin:output_end],
                     block_lens[output_begin:output_end],
@@ -316,6 +327,16 @@ def launch_gfx1250_logits(
         candidates,
         logits,
         score_chunk_size,
+    )
+
+
+def select_blocks_gfx950(logits, visible, candidate_topk, block_out, block_lens):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
+        launch_dsv41_index_block_select_gfx950,
+    )
+
+    launch_dsv41_index_block_select_gfx950(
+        logits, visible, candidate_topk, block_out, block_lens
     )
 
 

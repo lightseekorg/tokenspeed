@@ -462,8 +462,9 @@ preparation, validation and tiling, and runs two steps per query tile: a
 scorer writes one row of FP32 logits per query, one per candidate column, and
 a selector turns each row into that query's sorted list of logical KV row ids.
 gfx950 runs both steps in Gluon (`gluon_dsv41_index_topk_gfx950`, then
-`gluon_dsv41_index_topk_select_gfx950`); gfx1250 has a Gluon scorer and the
-portable torch selector.
+`gluon_dsv41_index_topk_select_gfx950`) and selects candidate blocks with a
+Triton radix select (`dsv41_index_block_select_gfx950`); gfx1250 has a Gluon
+scorer and the portable torch selectors.
 
 #### Contract
 
