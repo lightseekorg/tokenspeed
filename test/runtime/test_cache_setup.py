@@ -351,9 +351,8 @@ class _SyntheticHybridRecipe(CacheRecipe):
             (
                 CacheGroupSpec(
                     group_id=self._extra_state_group,
-                    retention="full_history",
+                    attn_kind="state",
                     sliding_window_tokens=None,
-                    family="state",
                     replayable=False,
                 ),
                 (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),
@@ -1017,9 +1016,8 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
 def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     """No new contract: the one spec publishes draft-only
     groups as ordinary groups; pool publication and the scheduler config
-    conversion carry them with their natural retention — the C++ side
-    instantiates its existing SwaManager for them, no draft concept
-    anywhere."""
+    conversion carry them with their own kind -- the C++ side treats them as
+    any sliding-window group, no draft concept anywhere."""
     from test.runtime.cache_pool_test_utils import MinimalCacheView
 
     import torch

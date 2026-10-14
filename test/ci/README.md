@@ -154,10 +154,10 @@ workflows map that to GitHub Actions `continue-on-error`.
 # whole task can fail without blocking the workflow
 optional: true
 
-# only the MI35x 1-GPU entry is non-blocking; other entries of the same
+# only the MI355 1-GPU entry is non-blocking; other entries of the same
 # task still block on failure
 optional:
-  amd-mi35x-1gpu-test: true
+  amd-mi355-1gpu: true
 ```
 
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
@@ -334,7 +334,7 @@ smoke test. For a meaningful manual comparison, use `K8s Dispatch`: selecting a
 pull request uses its target and head revisions, while selecting a commit
 compares it with the latest `main`. Both revisions always execute serially in one task allocation.
 
-The task requests the ci-infra-managed `amd-mi350-1gpu-bench` runner pool and
+The task requests the ci-infra-managed `amd-mi355-1gpu` runner pool and
 exposes logical device 0. Each allocation must provide one `gfx950` GPU,
 working ROCm device permissions, Git, Bash, Python virtual-environment support,
 sufficient temporary storage, and access to the configured package indexes. The normal AMD

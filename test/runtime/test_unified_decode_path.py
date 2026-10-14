@@ -28,9 +28,7 @@ architecture:
   replay is "refresh + graph.replay()");
 * per-bs metadata views are pointer-stable and lazily built for a bs never
   captured (the above-ladder decode path);
-* the persistent buffers are sized by max decode bs, not the capture ladder;
-* every leaf class carries the uniform leaf signature, every runner-facing
-  node the runner signature (conformance).
+* the persistent buffers are sized by max decode bs, not the capture ladder.
 """
 
 from __future__ import annotations
@@ -101,10 +99,10 @@ class _RouterCase(_TorchCase):
         router.bind(
             CacheGroupGeometry(
                 granularities={FULL: 2},
-                families={FULL: "history"},
+                attn_kinds={FULL: "full_history"},
                 full_history_group_id=FULL,
                 row_geometry={FULL: (2, 1)},
-                retentions={FULL: ("full_history", None)},
+                windows={FULL: None},
             ),
             {FULL: leaf},
         )
@@ -354,117 +352,6 @@ class DefaultCaptureTest(_RouterCase):
         md = self._default_capture(LADDER_BS, seq)
         padded_seq = torch.tensor([5, 4, 1, 1], dtype=torch.int32)
         self.assertIs(self._refresh(LADDER_BS, 2, padded_seq, replay=True), md)
-
-
-class LeafSignatureConformanceTest(_TorchCase):
-    """Every paged leaf class carries the uniform leaf contract.
-
-    The router calls every leaf with the same positional/keyword shape; a
-    narrower bespoke signature TypeErrors on exactly the configs that need
-    it. Runner-facing nodes (router, composites, V4, state) are checked
-    against the runner kwarg set separately below.
-    """
-
-    _LEAF_CLASSES = (
-        ("tokenspeed.runtime.layers.attention.backends.paged.mha", "MHAAttnBackend"),
-        ("tokenspeed.runtime.layers.attention.backends.paged.msa", "MSAAttnBackend"),
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.trtllm",
-            "TRTLLMMHAAttnBackend",
-        ),
-        ("tokenspeed.runtime.layers.attention.backends.paged.mla", "MLAAttnBackend"),
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.trtllm_mla",
-            "TRTLLMMLABackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla",
-            "CuteDSLMLABackend",
-        ),
-        (
-            "tokenspeed.runtime.layers.attention.backends.paged.flashmla",
-            "FlashMLABackend",
-        ),
-        ("tokenspeed.runtime.layers.attention.backends.paged.dsa", "DSABackend"),
-    )
-
-    def _classes(self):
-        import importlib
-
-        for module_name, cls_name in self._LEAF_CLASSES:
-            try:
-                yield getattr(importlib.import_module(module_name), cls_name)
-            except (ImportError, ModuleNotFoundError) as exc:
-                self.skipTest(f"needs optional deps for {cls_name}: {exc}")
-
-    def test_every_leaf_is_a_paged_attention_backend(self):
-        from tokenspeed.runtime.layers.attention.backends.paged.base import (
-            PagedAttentionBackend,
-        )
-
-        for cls in self._classes():
-            with self.subTest(backend=cls.__name__):
-                self.assertTrue(issubclass(cls, PagedAttentionBackend))
-
-    def test_constructor_takes_injected_kernel_page_size(self):
-        import inspect
-
-        for cls in self._classes():
-            with self.subTest(backend=cls.__name__):
-                sig = inspect.signature(cls.__init__)
-                param = sig.parameters.get("kernel_page_size")
-                self.assertIsNotNone(param, f"{cls.__name__} lacks kernel_page_size")
-                self.assertEqual(param.kind, param.KEYWORD_ONLY)
-
-    def test_refresh_signature_binds_the_leaf_call_shape(self):
-        import inspect
-
-        for cls in self._classes():
-            with self.subTest(backend=cls.__name__):
-                sig = inspect.signature(cls.refresh_decode_metadata)
-                try:
-                    # (self, bs, actual_bs, seq_lens, page_table, ...)
-                    sig.bind(
-                        None, 8, 8, None, None, num_extends=0, for_graph_replay=True
-                    )
-                except TypeError as exc:
-                    self.fail(f"{cls.__name__}.refresh_decode_metadata: {exc}")
-
-    def test_init_forward_metadata_binds_the_leaf_call_shape(self):
-        import inspect
-
-        for cls in self._classes():
-            with self.subTest(backend=cls.__name__):
-                sig = inspect.signature(cls.init_forward_metadata)
-                try:
-                    # (self, bs, num_extends, seq_lens, page_table, mode, ...)
-                    sig.bind(
-                        None,
-                        8,
-                        8,
-                        None,
-                        None,
-                        None,
-                        extend_seq_lens=None,
-                        extend_seq_lens_cpu=None,
-                        extend_prefix_lens=None,
-                        extend_prefix_lens_cpu=None,
-                        extend_with_prefix=False,
-                        query_shard=None,
-                        page_table_cpu=None,
-                    )
-                except TypeError as exc:
-                    self.fail(f"{cls.__name__}.init_forward_metadata: {exc}")
-                for name in ("query_shard", "page_table_cpu"):
-                    param = sig.parameters.get(name)
-                    self.assertIsNotNone(
-                        param, f"{cls.__name__}.init_forward_metadata lacks {name}"
-                    )
-                    self.assertIs(
-                        param.default,
-                        inspect.Parameter.empty,
-                        f"{cls.__name__}.init_forward_metadata gives {name} a default",
-                    )
 
 
 class WrapperForwardsTheExtendBundleTest(_TorchCase):

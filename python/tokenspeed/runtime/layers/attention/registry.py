@@ -607,7 +607,7 @@ def create_paged_router(
     """Build the CacheGroupRouter for one side's paged attention.
 
     The router builds one ``PagedAttentionBackend`` leaf per paged
-    (history-family) cache group of the pool view bound later via
+    (history) cache group of the pool view bound later via
     ``set_cache_pool``; each leaf's kernel page size resolves from the
     config override, the leaf class default, or the group's own block
     granularity (``PagedAttentionBackend.resolve_kernel_page_size``).
@@ -1174,21 +1174,18 @@ def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
 def _validate_hybrid_kvp_cache(spec: CachePoolSpec, *, kvp_size: int) -> None:
     """Validate declared storage, independent of recipe name or inheritance."""
     groups = spec.cache_group_specs
-    if not any(
-        group.family == "history" and group.retention == "full_history"
-        for group in groups
-    ):
+    if not any(group.attn_kind == "full_history" for group in groups):
         raise ValueError("Hybrid MLA KVP requires a full-history cache group")
     for group in groups:
-        if group.family == "history" and group.retention != "full_history":
+        if group.attn_kind == "sliding_window":
             raise ValueError(
                 f"Hybrid MLA KVP cache group {group.group_id!r} "
-                "must use full-history retention"
+                "must be a full-history group"
             )
-        expected = kvp_size if group.family == "history" else 1
+        expected = kvp_size if group.attn_kind != "state" else 1
         if group.shard_count != expected:
             raise ValueError(
-                f"Hybrid MLA KVP cache group {group.group_id!r} ({group.family}) "
+                f"Hybrid MLA KVP cache group {group.group_id!r} ({group.attn_kind}) "
                 f"requires shard_count={expected}, got {group.shard_count}"
             )
 

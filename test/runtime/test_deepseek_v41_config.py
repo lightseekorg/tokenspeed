@@ -444,7 +444,7 @@ def test_config_selects_flash_recipe_and_checks_geometry(runtime_config, overlap
         None,
         2,
     ]
-    assert all(group.family == "history" for group, _ in groups)
+    assert all(group.attn_kind != "state" for group, _ in groups)
     assert all(field.page_stride_bytes % 256 == 0 for field in layout.fields)
     with pytest.raises(ValueError, match="-byte plane"):
         recipe.check_layout(replace(layout, lcm_block_bytes=rows.lcm_block_bytes + 256))

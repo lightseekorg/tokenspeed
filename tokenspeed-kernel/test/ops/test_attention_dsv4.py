@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.attention.dsv4.cuda import (
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     _dsv4_fused_csa_indexer_mxfp4_cache_kernel,
     _dsv4_fused_sparse_compress_cache_kernel,
+    _dsv4_gather_launch_config,
     _dsv4_use_serial_four_block_indexer_q,
     dsv4_compact_compressed_slot_mapping,
     dsv4_compressed_slot_mapping,
@@ -518,6 +519,28 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
                     parameter = parameters[name]
                     self.assertFalse(parameter.is_constexpr)
                     self.assertTrue(parameter.do_not_specialize)
+
+    def test_sparse_prefill_gather_launch_config(self):
+        cases = (
+            (1, 0, (128, 4)),
+            (1, 512, (128, 4)),
+            (1, 513, (512, 1)),
+            (1, 3072, (512, 1)),
+            (1, 3073, (1024, 1)),
+            (1, 6144, (1024, 1)),
+            (1, 6145, (2048, 1)),
+            (3, 6145, (1024, 1)),
+            (4, 12288, (1024, 1)),
+            (4, 12289, (2048, 1)),
+            (8, 2048, (512, 1)),
+            (8, 8192, (2048, 1)),
+        )
+        for num_reqs, max_rows, expected in cases:
+            with self.subTest(num_reqs=num_reqs, max_rows=max_rows):
+                self.assertEqual(
+                    _dsv4_gather_launch_config(num_reqs, max_rows),
+                    expected,
+                )
 
     def test_slot_mapping_guard_masks_invalid_graph_tokens(self):
         slots = torch.tensor([0, 1, -1, 3], dtype=torch.int64)

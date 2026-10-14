@@ -22,6 +22,9 @@ from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_topk_prefill,
     indexer_topk_prefill,
 )
+from tokenspeed_kernel.ops.attention.dsv4.triton import (
+    dsv4_compute_global_topk_indices_and_lens,
+)
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import (
@@ -863,7 +866,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeBackend:
             draft_block_decode = False
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def refresh_decode_metadata(self, *args, **kwargs):
                 captured["args"] = args
@@ -946,7 +949,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeBackend:
             draft_block_decode = False
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
                 self.key = key
@@ -1002,7 +1005,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeBackend:
             draft_block_decode = False
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
                 self.key = key
@@ -1024,11 +1027,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
         )
         wrapper.token_to_kv_pool = _fake_pool(
-            SimpleNamespace(group_id="v4.swa_kv", family="history"),
-            SimpleNamespace(group_id="v4.state", family="state"),
+            SimpleNamespace(group_id="v4.swa_kv", attn_kind="full_history"),
+            SimpleNamespace(group_id="v4.state", attn_kind="state"),
         )
         wrapper.draft_token_to_kv_pool = _fake_pool(
-            SimpleNamespace(group_id="v4.swa_kv", family="history"),
+            SimpleNamespace(group_id="v4.swa_kv", attn_kind="full_history"),
         )
 
         wrapper._init_forward_metadata(
@@ -1054,7 +1057,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeBackend:
             draft_block_decode = False
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
                 self.key = key
@@ -2212,8 +2215,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         pool, _ = _make_planned_deepseek_v4_pool(layout, config)
 
-        self.assertEqual(
-            {spec.family for spec in pool.arena.cache_group_specs}, {"history"}
+        self.assertTrue(
+            all(spec.attn_kind != "state" for spec in pool.arena.cache_group_specs)
         )
         with self.assertRaisesRegex(ValueError, "more than one history"):
             derive_history_groups_by_layer(
@@ -2394,6 +2397,23 @@ class TestDeepseekV4Config(unittest.TestCase):
                     torch.full_like(out[row, selected:], -1),
                 )
             )
+
+    def test_deepseek_v4_global_topk_cpu_masks_invalid_req_before_indexing(self):
+        indices, lens = dsv4_compute_global_topk_indices_and_lens(
+            topk_indices=torch.tensor([[0, 4], [0, 1]], dtype=torch.int32),
+            token_to_req_indices=torch.tensor([0, 99], dtype=torch.int32),
+            block_table=torch.tensor([[10]], dtype=torch.int32),
+            block_size=4,
+            is_valid_token=torch.tensor([True, False]),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                indices,
+                torch.tensor([[40, -1], [-1, -1]], dtype=torch.int32),
+            )
+        )
+        self.assertTrue(torch.equal(lens, torch.tensor([2, 0], dtype=torch.int32)))
 
     def test_hidden_compression_reference_preserves_expected_shapes(self):
         torch.manual_seed(0)

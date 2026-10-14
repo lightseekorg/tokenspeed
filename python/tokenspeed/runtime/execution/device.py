@@ -172,7 +172,7 @@ class DeviceSpecs:
             rows (the PD decode role, whose prefill node returns them) or its
             LM head scores every prompt row on this rank (no row narrowing,
             no pipeline split). The ingress refuses such requests otherwise.
-        cache_state_group_ids: Group ids of the state-family cache groups,
+        cache_state_group_ids: Group ids of the state cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
         num_host_pages: The L2 host tier's page count (incl. the null page),
@@ -1634,7 +1634,7 @@ def build_device_side(
         cache_state_group_ids=tuple(
             str(spec.group_id)
             for spec in views.token_to_kv_pool.arena.cache_group_specs
-            if spec.family == "state"
+            if spec.attn_kind == "state"
         ),
         num_host_pages=(
             host_cache_executor.num_host_pages if host_cache_executor is not None else 0

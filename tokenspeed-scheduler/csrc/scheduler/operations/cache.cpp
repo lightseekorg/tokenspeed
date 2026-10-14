@@ -28,10 +28,10 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
     std::vector<CacheGroupSpec> specs;
     specs.reserve(config.cache_groups.size());
     for (const CacheGroupConfig& group : config.cache_groups) {
-        const AttnKind kind = group.Kind();
+        const AttnKind kind = group.attn_kind;
         const bool is_swa = kind == AttnKind::kSlidingWindow;
         specs.push_back(CacheGroupSpec{
-            .kind = kind,
+            .attn_kind = kind,
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .replayable = group.replayable,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,

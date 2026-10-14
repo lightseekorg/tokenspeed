@@ -76,7 +76,7 @@ def _make_backend(width: int, is_draft: bool, device: str):
                     group_specs=(
                         SimpleNamespace(
                             group_id=QWEN4_EXP_PLE_CACHE_GROUP,
-                            family="state",
+                            attn_kind="state",
                         ),
                     )
                 ),
@@ -287,8 +287,8 @@ def test_mamba_only_claims_its_recurrent_groups():
                 runtime_contract=SimpleNamespace(
                     prefix_granularity=16,
                     group_specs=(
-                        SimpleNamespace(group_id="ple", family="state"),
-                        SimpleNamespace(group_id="gdn", family="state"),
+                        SimpleNamespace(group_id="ple", attn_kind="state"),
+                        SimpleNamespace(group_id="gdn", attn_kind="state"),
                     ),
                 )
             ),

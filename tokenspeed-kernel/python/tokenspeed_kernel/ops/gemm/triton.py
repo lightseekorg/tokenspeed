@@ -28,6 +28,8 @@ from typing import List, Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.activation.triton import silu_and_mul
+from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
@@ -1242,6 +1244,65 @@ def triton_mm_mxfp4(
         num_warps=4,
     )
     return C
+
+
+# ---- Dense MXFP4 linears with dynamic MXFP4 activations ------------------
+
+# Weight stored in checkpoint order: packed E2M1 [N, K/2] plus UE8M0 [N, K/32].
+MXFP4_LINEAR_LINEAR_LAYOUT = "linear"
+MXFP4_LINEAR_SIGNATURE = format_signature(
+    x=dense_tensor_format(torch.bfloat16),
+    weight=tensor_format("mxfp4", torch.uint8, scale=_MXFP4_SCALE),
+)
+MXFP4_LINEAR_SIGNATURES = frozenset({MXFP4_LINEAR_SIGNATURE})
+
+
+@register_kernel(
+    "gemm",
+    "mxfp4_linear",
+    name="triton_mxfp4_linear",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=MXFP4_LINEAR_SIGNATURES,
+    traits={"weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT})},
+    priority=Priority.PORTABLE,
+)
+def triton_mxfp4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """``mxfp4(x) @ W.T``: quantize ``x`` to MXFP4, then the MXFP4 GEMM."""
+    x_fp4, x_scale = mxfp4_quantize(x)
+    return triton_mm_mxfp4(x_fp4, weight, x_scale, weight_scale, x.dtype, out=out)
+
+
+@register_kernel(
+    "gemm",
+    "mxfp4_swiglu_linear",
+    name="triton_mxfp4_swiglu_linear",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
+    signatures=MXFP4_LINEAR_SIGNATURES,
+    traits={"weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT})},
+    priority=Priority.PORTABLE,
+)
+def triton_mxfp4_swiglu_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """``silu(gate) * up`` of ``mxfp4(x) @ W.T`` with stacked [gate; up] rows."""
+    gate_up = triton_mxfp4_linear(x, weight, weight_scale, out=None)
+    if out is None:
+        out = torch.empty(
+            (x.shape[0], weight.shape[0] // 2), dtype=x.dtype, device=x.device
+        )
+    return silu_and_mul(gate_up, out)
 
 
 # ---- Triton scaled FP8 ----------------------------------------------------
