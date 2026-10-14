@@ -266,8 +266,9 @@ def test_launch_arguments(arch, monkeypatch, m, a_layout, b_layout, n, k):
 
 
 def test_tiles_follow_the_rule_unless_measured(monkeypatch):
-    """The rule fitted to the GB200 sweep (1-16 | 32 | 64 rows), and a
-    measured ``_SMALL_M_TILES`` entry taking precedence for its shape."""
+    """The rule fitted to the GB200 sweep (1-16 | 32 | 64 rows), a measured
+    ``_SMALL_M_TILES`` entry taking precedence for its shape, and an entry
+    whose BLOCK_K does not divide K refused."""
     config = triton_fp8_channel._small_m_config
     # Llama-3.1-8B shards at 8-way tensor parallelism: Q/K/V (768, 4096),
     # output (4096, 512), gate/up (3584, 4096), down (4096, 1792).
@@ -279,7 +280,7 @@ def test_tiles_follow_the_rule_unless_measured(monkeypatch):
     assert config(1, 4096, 1792) == (16, 64, 256, 4, 4)
     # Qwen3-30B-A3B shards (same parallelism) at the rule's edges: K = 2,048
     # takes K tiles of 512, N = 2,048 keeps 16 weight rows per program.
-    assert config(1, 640, 2048) == (16, 16, 512, 4, 4)
+    assert config(1, 768, 2048) == (16, 16, 512, 4, 4)
     assert config(1, 2048, 512) == (16, 16, 256, 4, 4)
     assert config(40, 4096, 384) == (64, 64, 128, 8, 3)
     monkeypatch.setitem(
@@ -287,6 +288,13 @@ def test_tiles_follow_the_rule_unless_measured(monkeypatch):
     )
     assert config(1, 768, 4096) == (16, 16, 256, 4, 3)
     assert config(32, 768, 4096) == (32, 16, 512, 4, 3)
+    # The kernel loads whole K tiles, so an entry whose BLOCK_K does not
+    # divide K is refused instead of reading past the rows.
+    monkeypatch.setitem(
+        triton_fp8_channel._SMALL_M_TILES, (4096, 1792, 16), (64, 512, 4, 4)
+    )
+    with pytest.raises(ValueError, match="does not divide K 1792"):
+        config(1, 4096, 1792)
 
 
 @pytest.mark.parametrize(

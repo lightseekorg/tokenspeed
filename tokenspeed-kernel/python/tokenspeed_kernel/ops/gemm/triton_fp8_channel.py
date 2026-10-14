@@ -126,7 +126,8 @@ def _fp8_channel_small_m_kernel(
 # tiles that take precedence over the rule of ``_small_m_config`` for their
 # shape. Empty by default; a sweep of a model's weight shapes on its GPU
 # (each BLOCK_M bucket averaged over its row counts, 1-16 | 32 | 64) can
-# fill it.
+# fill it. BLOCK_K must divide K: the kernel's K loop reads whole tiles,
+# masked along M and N only.
 _SMALL_M_TILES: dict[tuple[int, int, int], tuple[int, int, int, int]] = {}
 
 
@@ -136,7 +137,8 @@ def _small_m_config(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
 
     BLOCK_M is ``m`` rounded up to a power of two (at least 16, the smallest
     MMA side Triton takes): three compiled variants cover 1 to 64 rows. The
-    shapes of ``_SMALL_M_TILES`` take their entry; any other shape takes the
+    shapes of ``_SMALL_M_TILES`` take their entry, whose ``BLOCK_K`` must
+    divide ``k`` (a ``ValueError`` otherwise); any other shape takes the
     rule fitted to a GB200 sweep: 16 weight rows per program for narrow weights (at most
     2,048 rows, so the launch still spreads over the SMs) and 64 above, K
     tiles of 512 where K is long, and 64 x 256 tiles on eight warps for the
@@ -145,7 +147,13 @@ def _small_m_config(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
     block_m = max(16, triton.next_power_of_2(m))
     tile = _SMALL_M_TILES.get((n, k, block_m))
     if tile is not None:
-        return (block_m, *tile)
+        block_n, block_k, num_warps, num_stages = tile
+        if k % block_k:
+            raise ValueError(
+                f"_SMALL_M_TILES[{(n, k, block_m)}] has BLOCK_K {block_k}, which "
+                f"does not divide K {k}: the kernel's K loop reads whole tiles"
+            )
+        return block_m, block_n, block_k, num_warps, num_stages
     block_k = 256 if k % 256 == 0 else _K_ALIGN
     if block_m == 64:
         return block_m, 64, block_k, 8, 3
