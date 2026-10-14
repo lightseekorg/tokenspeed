@@ -490,10 +490,10 @@ validates the parser names, so use the values accepted by the bundled
 
 When neither parser is named and the model family has no parser defaults,
 `ts serve` passes `--reasoning-parser passthrough` to the gateway, unless the
-model's `tokenizer_config.json` declares a `response_template`, no other
-`--tokenizer` is given, and the installed gateway supports response templates:
-the gateway then takes both parsers from that template. Naming either parser,
-for example `--reasoning-parser passthrough`, turns the template off.
+model's `tokenizer_config.json` declares a `response_template` and no other
+`--tokenizer` is given: the bundled `tokenspeed-smg` gateway then takes both
+parsers from that template. Naming either parser, for example
+`--reasoning-parser passthrough`, turns the template off.
 
 ## Speculative decoding
 

@@ -187,19 +187,17 @@ def _gateway_args_with_default_reasoning_parser(
     Without a configured name, smg guesses a reasoning parser from the model
     id; ``passthrough`` returns the text as generated instead. A ``tokenizer``
     whose ``tokenizer_config.json`` declares a ``response_template`` gets no
-    default while neither parser is named, if the installed gateway selects
-    parsers from response templates: it then takes both parsers from the
-    template, and any configured name, this default included, turns
-    the template off. An explicit ``--reasoning-parser passthrough`` still
-    does. With an older gateway, which would guess from the model id, the
-    default stays.
+    default while neither parser is named: the gateway then takes both parsers
+    from the template, and any configured parser name, this default included,
+    turns the template off. This relies on the ``tokenspeed-smg`` pin in
+    ``python/pyproject.toml`` providing a gateway that takes its parsers from
+    a response template, as the parser names set in
+    ``_args_with_default_model_parsers`` rely on it to know those names.
     """
     if "--reasoning-parser" in gateway_args:
         return gateway_args
-    if (
-        "--tool-call-parser" not in gateway_args
-        and _declares_response_template(tokenizer)
-        and _smg_selects_response_template_parsers()
+    if "--tool-call-parser" not in gateway_args and _declares_response_template(
+        tokenizer
     ):
         sys.stdout.write(
             f"ts serve: {tokenizer} declares a response_template; the gateway "
@@ -434,57 +432,6 @@ def _declares_response_template(tokenizer: str | None) -> bool:
         return False
     config = _load_model_config(tokenizer_dir, "tokenizer_config.json")
     return isinstance(config.get("response_template"), dict)
-
-
-# The check looks for this crate as a direct dependency of the gateway crate
-# (``smg``) in the wheel's SBOM. smg#2719 adds the crate; the smg change that
-# makes the gateway take its parsers from a response template is still to come.
-_SMG_RESPONSE_TEMPLATE_CRATE = "smg-response-template"
-# Distributions that install the ``smg`` package: the bundled build, smg's own.
-_SMG_DISTRIBUTIONS = ("tokenspeed-smg", "smg")
-
-
-def _smg_selects_response_template_parsers() -> bool:
-    """Whether the installed gateway takes its parsers from a response template.
-
-    maturin writes the crate graph of the ``smg`` wheel into a CycloneDX SBOM
-    under ``.dist-info/sboms/``; this looks there for the gateway crate's
-    dependency on the response-template crate, so it reads package metadata
-    only: no network and no gateway start. Every installed distribution of
-    ``smg`` must show it; no distribution, no SBOM, or an unreadable one
-    counts as no.
-    """
-    from importlib import metadata
-
-    found = False
-    for name in _SMG_DISTRIBUTIONS:
-        try:
-            dist = metadata.distribution(name)
-        except metadata.PackageNotFoundError:
-            continue
-        if not _sbom_gateway_depends_on(dist, _SMG_RESPONSE_TEMPLATE_CRATE):
-            return False
-        found = True
-    return found
-
-
-def _sbom_gateway_depends_on(dist, crate: str) -> bool:
-    """Whether an SBOM of ``dist`` has the ``smg`` crate depend on ``crate``."""
-    for file in dist.files or ():
-        if file.parent.name != "sboms" or file.suffix != ".json":
-            continue
-        try:
-            sbom = json.loads(file.read_text())
-            names = {c["bom-ref"]: c["name"] for c in sbom["components"]}
-            if any(
-                names.get(dep["ref"]) == "smg"
-                and any(names.get(ref) == crate for ref in dep.get("dependsOn", ()))
-                for dep in sbom["dependencies"]
-            ):
-                return True
-        except Exception:  # noqa: BLE001 - an unreadable SBOM counts as no
-            continue
-    return False
 
 
 def _is_deepseek_v41_model(model_id: str | None) -> bool:
