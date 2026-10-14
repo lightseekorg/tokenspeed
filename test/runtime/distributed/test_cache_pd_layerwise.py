@@ -38,11 +38,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from runtime.cache_pd_test_utils import block_manifest as make_block_manifest
-from runtime.cache_pd_test_utils import group as make_group  # noqa: E402
-from runtime.cache_pd_test_utils import layout as make_layout
-from runtime.cache_pd_test_utils import producer_schedule as make_producer_schedule
-from runtime.cache_pd_test_utils import segment as make_segment
+from test.runtime.cache_pd_test_utils import block_manifest as make_block_manifest
+from test.runtime.cache_pd_test_utils import group as make_group  # noqa: E402
+from test.runtime.cache_pd_test_utils import layout as make_layout
+from test.runtime.cache_pd_test_utils import producer_schedule as make_producer_schedule
+from test.runtime.cache_pd_test_utils import segment as make_segment
 
 from tokenspeed.runtime.pd.base.status import TransferPoll  # noqa: E402
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
