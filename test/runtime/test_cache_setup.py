@@ -909,54 +909,6 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         )
 
 
-def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import tokenspeed.runtime.layers.attention.registry as registry
-
-    monkeypatch.setattr(
-        registry,
-        "is_deepseek_v4",
-        lambda config: getattr(config, "is_deepseek_v4", False),
-    )
-    server_args = SimpleNamespace(
-        kv_offload_config=None,
-        attention_backend=None,
-        drafter_attention_backend=None,
-        disaggregation_mode="prefill",
-    )
-    target = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("LlamaForCausalLM",),
-            is_deepseek_v4=False,
-        ),
-        model_profile=None,
-    )
-    draft = SimpleNamespace(
-        hf_config=SimpleNamespace(
-            architectures=("DeepseekV4ForCausalLMNextN",),
-            is_deepseek_v4=True,
-        ),
-        model_profile=None,
-    )
-
-    with pytest.raises(NotImplementedError, match="target-only"):
-        registry.create_attn_components(
-            server_args,
-            target,
-            gpu_id=0,
-            rank=0,
-            gpu_memory=0,
-            draft_model_config=draft,
-            graph_reserve_bytes=0,
-            post_profile_bytes=0,
-            probe_batch_rows=None,
-            profiled_cache_bytes=None,
-            reuse_target_backend=None,
-            reuse_draft_backend=None,
-        )
-
-
 def test_hybrid_draft_layers_share_plan_with_disjoint_views() -> None:
     setup = _hybrid_setup_with_narrow_draft()
 
@@ -1312,7 +1264,6 @@ def _fake_around_the_budget(monkeypatch, free):
     )
     monkeypatch.setattr(common.torch, "get_device_module", lambda device: gpu)
     side = SimpleNamespace(
-        is_deepseek_v4=False,
         is_hybrid_linear=False,
         is_dspark=False,
         requested_backend=None,

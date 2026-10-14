@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
 # SPDX-License-Identifier: MIT AND Apache-2.0
 
-"""Tensor-parallel DSpark Markov and confidence heads.
+"""Tensor-parallel DSpark Markov head and greedy block sampler.
 
 The Markov head keeps the checkpoint's BF16 dtypes: its bigram table is
 replicated on every rank so a lookup is a plain gather, and its rank-``R``
@@ -40,31 +40,6 @@ class DSparkVanillaMarkov(nn.Module):
             raise ValueError("DSpark Markov table and projection ranks differ")
         self.embedding = embedding
         self.projection = projection
-
-
-class DSparkConfidenceHead(nn.Module):
-    """Per-position acceptance-confidence predictor.
-
-    Week-0 keeps a fixed proposal width, but loads this checkpoint component so
-    malformed DSpark heads fail during startup and future dynamic truncation can
-    be added without changing the weight contract.
-    """
-
-    def __init__(self, projection: nn.Module) -> None:
-        super().__init__()
-        self.projection = projection
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        previous_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        features = torch.cat(
-            [hidden_states, previous_embeddings.to(hidden_states.dtype)],
-            dim=-1,
-        )
-        logits, _ = self.projection(features.float())
-        return logits.squeeze(-1)
 
 
 def dspark_greedy_workspace(

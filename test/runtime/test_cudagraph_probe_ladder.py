@@ -423,7 +423,6 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     for path in (
         root / "prefill_graph.py",
         root / "forward_step.py",
-        root / "drafter/deepseek_v4_dspark.py",
     ):
         for node in ast.walk(ast.parse(path.read_text())):
             if isinstance(node, ast.With):
@@ -434,7 +433,6 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     assert found == {
         "prefill_graph.py": 3,
         "forward_step.py": 1,
-        "deepseek_v4_dspark.py": 1,
     }
 
 

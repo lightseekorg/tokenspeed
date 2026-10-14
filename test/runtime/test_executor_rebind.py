@@ -255,7 +255,6 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
 
 def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeypatch):
     from tokenspeed.runtime.execution.drafter import _dflash_fused_kv
-    from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import DeepseekV4DSpark
     from tokenspeed.runtime.execution.drafter.dflash import DFlash
     from tokenspeed.runtime.execution.dspark_context import DSparkContextProducer
 
@@ -273,11 +272,6 @@ def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeyp
     assert dflash.token_to_kv_pool == "real"
     assert _dflash_fused_kv._cached_kv_ptrs == {}
     assert rebuilt == ["fused_kv", "incremental_proj"]
-
-    dspark = DeepseekV4DSpark.__new__(DeepseekV4DSpark)
-    dspark._prefill_graph = object()
-    dspark.release_prefill_graph()
-    assert dspark._prefill_graph is None
 
     # Only the last pipeline stage owns the draft context cache.
     producer = DSparkContextProducer.__new__(DSparkContextProducer)

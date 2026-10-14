@@ -38,8 +38,6 @@ from dataclasses import dataclass
 from typing import ClassVar, TypeVar
 
 import torch
-from tokenspeed_kernel.ops.attention.dsv4 import dsv4_decode_supports_partials
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
@@ -140,7 +138,7 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     # compute mask lives on its PagedAttention (sliding_window_size).
     cache_layer_types: tuple[str, ...] = ()
     # Sliding window for per-layer cache recipes. Recipes that declare whole
-    # groups, such as DeepSeek V4, put their windows on those groups.
+    # groups, such as DeepSeek V4.1, put their windows on those groups.
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
 
     @classmethod
@@ -264,18 +262,11 @@ class AttnConfig:
                 # composing the hybrid components, and validates it before
                 # cache allocation. The composite name is not a capability.
                 pass
-            elif softmax.backend_name != "deepseek_v4":
+            else:
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "
-                    "DeepSeek V4, DSA, FlashMLA or CuTe MLA attention"
+                    "DSA, FlashMLA or CuTe MLA attention"
                 )
-            else:
-                platform = current_platform()
-                if not dsv4_decode_supports_partials(platform):
-                    raise ValueError(
-                        "DCP decode requires a DeepSeek V4 decode kernel that returns a "
-                        f"no-sink LSE; none is registered for {platform.device_name}"
-                    )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
         """The first component that is a ``cls``, or None.
