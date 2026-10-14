@@ -44,9 +44,12 @@ from tokenspeed_kernel_amd._triton import gluon
 @gluon.jit
 def _n16_weight_offset(n, k_packed, packed_k):
     """Byte offset of packed K byte ``k_packed`` of row ``n``."""
+    # Whole chunks first, then the half-chunk tail of a row group. Keep this
+    # form: with a runtime ``packed_k`` the single ``n // 16 * packed_k * 16``
+    # product made the SiTU warp decode about 10% slower.
     return (
-        n // 16 * (packed_k * 16)
-        + k_packed // 64 * 1024
+        (n // 16 * (packed_k // 64) + k_packed // 64) * 1024
+        + n // 16 * (packed_k % 64 * 16)
         + (k_packed // 16 % 4) * 256
         + n % 16 * 16
         + k_packed % 16
