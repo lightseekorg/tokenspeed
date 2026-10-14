@@ -28,7 +28,6 @@ from __future__ import annotations
 import math
 import os
 import sys
-import unittest
 
 import pytest
 
@@ -116,7 +115,7 @@ def _pages(specs, **kw):
     return dict(zip((spec.group_id for spec in specs), pages))
 
 
-class MultiWindowPageCountsTest(unittest.TestCase):
+class TestMultiWindowPageCountsTest:
     """full + W=128 + W=4 on page 64: three different budgets from one call.
 
     Per live request a sliding group retains ceil((W - 1 + decode + page - 1)
@@ -139,29 +138,29 @@ class MultiWindowPageCountsTest(unittest.TestCase):
         )
         # full: ceil(4096/64) dense + one unaligned tail page per request
         # + one tail-handover page per request
-        self.assertEqual(pages["full_attention"], 64 + 4 + 4)
+        assert (pages["full_attention"]) == (64 + 4 + 4)
         # W=128: ceil((127 + 1 + 63)/64) = 3 per request; lookback
         # ceil((127 + 63)/64) = 3 and ceil(512/64) = 8 rows for the chunk in
         # flight; handover 1 per request
-        self.assertEqual(pages["sliding_attention_128"], 4 * 3 + 3 + 8 + 4)
+        assert (pages["sliding_attention_128"]) == (4 * 3 + 3 + 8 + 4)
         # W=4: ceil((3 + 1 + 63)/64) = 2 per request -- a sub-page window can
         # still straddle two pages while its partial tail is live; lookback
         # ceil((3 + 63)/64) = 2; handover min(1, lookback) = 1 per request
-        self.assertEqual(pages["sliding_attention_4"], 4 * 2 + 2 + 8 + 4)
-        self.assertGreater(pages["sliding_attention_128"], pages["sliding_attention_4"])
+        assert (pages["sliding_attention_4"]) == (4 * 2 + 2 + 8 + 4)
+        assert (pages["sliding_attention_128"]) > (pages["sliding_attention_4"])
 
     def test_window_one_holds_only_the_token_being_written(self):
         pages = _pages([_spec("s", "sliding_window", window=1)])
         # No resident history and no lookback: one page per request for the
         # decode token, plus the chunk in flight.
-        self.assertEqual(pages["s"], 4 * 1 + 0 + 8)
+        assert (pages["s"]) == (4 * 1 + 0 + 8)
 
     def test_resident_window_clamped_by_context_len(self):
         wide = _pages([_spec("s", "sliding_window", window=128)], max_context_len=32)
         # min(127, 32) = 32 -> ceil((32 + 1 + 63)/64) = 2 pages per request
         # instead of 3; the resumable-boundary lookback still follows the
         # window (3 pages); handover 1 per request.
-        self.assertEqual(wide["s"], 4 * 2 + 3 + 8 + 4)
+        assert (wide["s"]) == (4 * 2 + 3 + 8 + 4)
 
     def test_scheduled_tokens_capped_by_total(self):
         pages = _pages(
@@ -169,14 +168,14 @@ class MultiWindowPageCountsTest(unittest.TestCase):
             max_scheduled_tokens=10_000,
             max_total_tokens=4096,
         )
-        self.assertEqual(pages["s"], 4 * 3 + 3 + math.ceil(4096 / PAGE) + 4)
+        assert (pages["s"]) == (4 * 3 + 3 + math.ceil(4096 / PAGE) + 4)
 
     def test_sliding_without_window_raises(self):
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             _pages([_spec("s", "sliding_window", window=None)])
 
 
-class SuffixedGroupIdFlowTest(unittest.TestCase):
+class TestSuffixedGroupIdFlowTest:
     """Spec grouping and budget computation agree on the suffixed group ids --
     the groups the C++ scheduler sizes and later reads."""
 
@@ -196,18 +195,16 @@ class SuffixedGroupIdFlowTest(unittest.TestCase):
             prefix_granularity=PAGE,
             sliding_window_tokens=windows,
         )
-        self.assertEqual(
-            [s.group_id for s in specs],
-            ["full_attention", "sliding_attention_128", "sliding_attention_4"],
+        assert ([s.group_id for s in specs]) == (
+            ["full_attention", "sliding_attention_128", "sliding_attention_4"]
         )
         pages = _pages(specs)
-        self.assertEqual(
-            set(pages),
-            {"full_attention", "sliding_attention_128", "sliding_attention_4"},
+        assert (set(pages)) == (
+            {"full_attention", "sliding_attention_128", "sliding_attention_4"}
         )
-        self.assertGreater(pages["full_attention"], pages["sliding_attention_128"])
-        self.assertGreater(pages["sliding_attention_128"], pages["sliding_attention_4"])
+        assert (pages["full_attention"]) > (pages["sliding_attention_128"])
+        assert (pages["sliding_attention_128"]) > (pages["sliding_attention_4"])
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

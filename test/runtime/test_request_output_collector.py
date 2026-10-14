@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 
 # CI registration (AST-parsed, runtime no-op).
@@ -62,19 +61,19 @@ def _ids(output_ids: list[int]) -> dict:
     return {"text": "", "output_ids": output_ids, "meta_info": {"id": "r"}}
 
 
-class TestCollectorStreamMerge(unittest.TestCase):
+class TestCollectorStreamMerge:
     def test_repeated_token_is_kept(self):
         # Two decode steps that both sampled token 6.
         merged = _merge([_ids([6]), _ids([6])], cumulative=False)
-        self.assertEqual(merged["output_ids"], [6, 6])
+        assert (merged["output_ids"]) == ([6, 6])
 
     def test_repeated_run_is_kept(self):
         steps = [_ids([2]), _ids([2]), _ids([2]), _ids([2]), _ids([8]), _ids([5])]
         merged = _merge(steps, cumulative=False)
-        self.assertEqual(merged["output_ids"], [2, 2, 2, 2, 8, 5])
+        assert (merged["output_ids"]) == ([2, 2, 2, 2, 8, 5])
         # Speculative decoding: several ids per step.
         merged = _merge([_ids([4, 4]), _ids([4, 4, 1])], cumulative=False)
-        self.assertEqual(merged["output_ids"], [4, 4, 4, 4, 1])
+        assert (merged["output_ids"]) == ([4, 4, 4, 4, 1])
 
     def test_repeated_logprob_entries_are_kept(self):
         # Streamed logprob lists hold only their own frame's positions too.
@@ -91,12 +90,12 @@ class TestCollectorStreamMerge(unittest.TestCase):
             for _ in range(2)
         ]
         meta = _merge(outputs, cumulative=False)["meta_info"]
-        self.assertEqual(meta["output_token_logprobs"], [(0.0, 6, None)] * 2)
-        self.assertEqual(meta["logprobs"], [{6: Logprob(logprob=0.0)}] * 2)
+        assert (meta["output_token_logprobs"]) == ([(0.0, 6, None)] * 2)
+        assert (meta["logprobs"]) == ([{6: Logprob(logprob=0.0)}] * 2)
 
     def test_cumulative_ids_are_replaced(self):
         merged = _merge([_ids([7]), _ids([7, 7]), _ids([7, 7, 6])], cumulative=True)
-        self.assertEqual(merged["output_ids"], [7, 7, 6])
+        assert (merged["output_ids"]) == ([7, 7, 6])
 
 
 class _DigitTokenizer:
@@ -181,20 +180,20 @@ def _logprob_ids(output: dict) -> list[int]:
     return [entry[1] for entry in output["meta_info"]["output_token_logprobs"]]
 
 
-class TestOutputProcessorStreamMerge(unittest.TestCase):
+class TestOutputProcessorStreamMerge:
     def test_inline_detokenizer_keeps_repeated_token(self):
         out = _stream([([6], [0.0]), ([6], [0.0])], inline=True)
-        self.assertEqual(out["text"], "66")
-        self.assertEqual(out["output_ids"], [6, 6])
-        self.assertEqual(_logprob_ids(out), [6, 6])
+        assert (out["text"]) == ("66")
+        assert (out["output_ids"]) == ([6, 6])
+        assert (_logprob_ids(out)) == ([6, 6])
 
     def test_raw_token_cumulative_ids_are_not_duplicated(self):
         # Without --stream-output a raw-token frame carries every id so far,
         # while its logprobs still cover only that frame.
         out = _stream([([7], [0.0]), ([7], [0.0]), ([6], [-0.5])], inline=False)
-        self.assertEqual(out["output_ids"], [7, 7, 6])
-        self.assertEqual(_logprob_ids(out), [7, 7, 6])
+        assert (out["output_ids"]) == ([7, 7, 6])
+        assert (_logprob_ids(out)) == ([7, 7, 6])
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

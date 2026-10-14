@@ -28,7 +28,9 @@ the linear-attention mapping. No user-facing parameter exists yet: the
 forward/state implementation.
 """
 
-import unittest
+import sys
+
+import pytest
 
 from tokenspeed.runtime.distributed.mapping import (
     LinearAttnLayerMapping,
@@ -36,52 +38,52 @@ from tokenspeed.runtime.distributed.mapping import (
 )
 
 
-class TestLinearAttnMappingDefaults(unittest.TestCase):
+class TestLinearAttnMappingDefaults:
     def test_defaults_follow_attn_tp_tp8(self):
         m = Mapping(rank=0, world_size=8, attn_tp_size=8)
-        self.assertEqual(m.linear_attn.tp_size, m.attn.tp_size)
-        self.assertEqual(m.linear_attn.tp_group, m.attn.tp_group)
-        self.assertEqual(m.linear_attn.dp_size, 1)
+        assert (m.linear_attn.tp_size) == (m.attn.tp_size)
+        assert (m.linear_attn.tp_group) == (m.attn.tp_group)
+        assert (m.linear_attn.dp_size) == (1)
 
     def test_defaults_follow_attn_tp_dp8(self):
         # attention-DP8: attn tp=1, so linear-attn defaults to tp=1 per rank.
         m = Mapping(rank=3, world_size=8, attn_tp_size=1, attn_dp_size=8)
-        self.assertEqual(m.linear_attn.tp_size, 1)
-        self.assertEqual(m.linear_attn.dp_size, 8)
-        self.assertEqual(m.linear_attn.tp_rank, 0)
+        assert (m.linear_attn.tp_size) == (1)
+        assert (m.linear_attn.dp_size) == (8)
+        assert (m.linear_attn.tp_rank) == (0)
 
     def test_hybrid_shape_linear_attn_tp_spans_dp_ranks(self):
         # The target hybrid: MLA-DP8 with KDA-TP8 over the same ranks.
         m = Mapping(
             rank=3, world_size=8, attn_tp_size=1, attn_dp_size=8, linear_attn_tp_size=8
         )
-        self.assertEqual(m.linear_attn.tp_size, 8)
-        self.assertEqual(m.linear_attn.tp_rank, 3)
-        self.assertEqual(m.linear_attn.tp_group, tuple(range(8)))
-        self.assertEqual(m.linear_attn.dp_size, 1)
+        assert (m.linear_attn.tp_size) == (8)
+        assert (m.linear_attn.tp_rank) == (3)
+        assert (m.linear_attn.tp_group) == (tuple(range(8)))
+        assert (m.linear_attn.dp_size) == (1)
         # MLA stays data-parallel.
-        self.assertEqual(m.attn.dp_size, 8)
+        assert (m.attn.dp_size) == (8)
 
     def test_rank_propagates_to_linear_attn(self):
         m = Mapping(world_size=8, attn_tp_size=1, attn_dp_size=8, linear_attn_tp_size=8)
         m.rank = 5
-        self.assertEqual(m.linear_attn.tp_rank, 5)
+        assert (m.linear_attn.tp_rank) == (5)
 
     def test_pp_stage_world(self):
         # KDA mapping resolves inside one pipeline stage.
         m = Mapping(rank=0, world_size=16, attn_tp_size=8, pp_size=2)
-        self.assertEqual(m.linear_attn.tp_size, 8)
-        self.assertEqual(m.linear_attn.dp_size, 1)
+        assert (m.linear_attn.tp_size) == (8)
+        assert (m.linear_attn.dp_size) == (1)
 
     def test_standalone_linear_attn_mapping_complement(self):
         km = LinearAttnLayerMapping(rank=6, world_size=8, tp_size=4)
-        self.assertEqual((km.tp_size, km.dp_size), (4, 2))
-        self.assertEqual(km.tp_rank, 2)
-        self.assertEqual(km.tp_group, (4, 5, 6, 7))
-        self.assertEqual(km.dp_rank, 1)
+        assert ((km.tp_size, km.dp_size)) == ((4, 2))
+        assert (km.tp_rank) == (2)
+        assert (km.tp_group) == ((4, 5, 6, 7))
+        assert (km.dp_rank) == (1)
 
 
-class TestNoUserFacingParameterYet(unittest.TestCase):
+class TestNoUserFacingParameterYet:
     def test_server_args_has_no_linear_attn_field(self):
         # Phase 0 is internal plumbing only; the CLI flag ships with the
         # hybrid implementation.
@@ -90,11 +92,11 @@ class TestNoUserFacingParameterYet(unittest.TestCase):
         from tokenspeed.runtime.utils.server_args import ServerArgs
 
         names = {f.name for f in dataclasses.fields(ServerArgs)}
-        self.assertNotIn("linear_attn_tp_size", names)
-        self.assertNotIn("kda_tp_size", names)
+        assert ("linear_attn_tp_size") not in (names)
+        assert ("kda_tp_size") not in (names)
 
 
-class TestLinearAttnConfig(unittest.TestCase):
+class TestLinearAttnConfig:
     """LinearAttnConfig.generate: presence detection + unified geometry."""
 
     @staticmethod
@@ -121,13 +123,13 @@ class TestLinearAttnConfig(unittest.TestCase):
         spec = LinearAttnConfig.generate(
             self._server_args(tp_size=8), self._model(text_config)
         )
-        self.assertIsNotNone(spec)
-        self.assertEqual((spec.num_k_heads, spec.num_v_heads), (96, 96))
-        self.assertEqual((spec.head_k_dim, spec.head_v_dim), (128, 128))
-        self.assertEqual(spec.conv_kernel_size, 4)
-        self.assertEqual(spec.layer_ids, tuple(text_config.linear_layer_ids))
-        self.assertEqual(len(spec.layer_ids), 69)
-        self.assertEqual(spec.tp_size, 8)
+        assert (spec) is not None
+        assert ((spec.num_k_heads, spec.num_v_heads)) == ((96, 96))
+        assert ((spec.head_k_dim, spec.head_v_dim)) == ((128, 128))
+        assert (spec.conv_kernel_size) == (4)
+        assert (spec.layer_ids) == (tuple(text_config.linear_layer_ids))
+        assert (len(spec.layer_ids)) == (69)
+        assert (spec.tp_size) == (8)
 
     def test_qwen35_gdn_geometry(self):
         from tokenspeed.runtime.configs.qwen3_5_text_base_config import (
@@ -142,19 +144,18 @@ class TestLinearAttnConfig(unittest.TestCase):
         # for it — covered by test_non_hybrid_model_gets_none).
         text_config = Qwen3_5BaseTextConfig(full_attention_interval=4)
         spec = LinearAttnConfig.generate(self._server_args(), self._model(text_config))
-        self.assertIsNotNone(spec)
-        self.assertEqual((spec.num_k_heads, spec.num_v_heads), (16, 32))
-        self.assertEqual((spec.head_k_dim, spec.head_v_dim), (128, 128))
-        self.assertEqual(spec.layer_ids, tuple(text_config.linear_layer_ids))
+        assert (spec) is not None
+        assert ((spec.num_k_heads, spec.num_v_heads)) == ((16, 32))
+        assert ((spec.head_k_dim, spec.head_v_dim)) == ((128, 128))
+        assert (spec.layer_ids) == (tuple(text_config.linear_layer_ids))
         # Every 4th layer is full attention, so index 3 is not a linear layer.
-        self.assertIn(0, spec.layer_ids)
-        self.assertNotIn(3, spec.layer_ids)
+        assert (0) in (spec.layer_ids)
+        assert (3) not in (spec.layer_ids)
         # Asymmetric-head state shapes: conv covers q/k (key geometry) + v.
-        self.assertEqual(
-            spec.conv_state_shape,
-            (2 * 16 * 128 + 32 * 128, spec.conv_kernel_size - 1),
+        assert (spec.conv_state_shape) == (
+            (2 * 16 * 128 + 32 * 128, spec.conv_kernel_size - 1)
         )
-        self.assertEqual(spec.temporal_state_shape, (32, 128, 128))
+        assert (spec.temporal_state_shape) == ((32, 128, 128))
 
     def test_glm53_flash_kda_geometry(self):
         from tokenspeed.runtime.configs.glm53_flash_config import (
@@ -169,10 +170,10 @@ class TestLinearAttnConfig(unittest.TestCase):
             self._server_args(tp_size=4), self._model(text_config)
         )
 
-        self.assertIsNotNone(spec)
-        self.assertEqual(spec.layer_ids, (0, 1, 2))
-        self.assertEqual(spec.conv_state_shape, (3 * 64 * 128 // 4, 3))
-        self.assertEqual(spec.temporal_state_shape, (64 // 4, 128, 128))
+        assert (spec) is not None
+        assert (spec.layer_ids) == ((0, 1, 2))
+        assert (spec.conv_state_shape) == ((3 * 64 * 128 // 4, 3))
+        assert (spec.temporal_state_shape) == ((64 // 4, 128, 128))
 
     def test_non_hybrid_model_gets_none(self):
         from types import SimpleNamespace
@@ -182,9 +183,9 @@ class TestLinearAttnConfig(unittest.TestCase):
         )
 
         plain = SimpleNamespace()  # no linear_layer_ids at all
-        self.assertIsNone(
+        assert (
             LinearAttnConfig.generate(self._server_args(), self._model(plain))
-        )
+        ) is None
 
     def test_indivisible_heads_raise(self):
         from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
@@ -192,7 +193,7 @@ class TestLinearAttnConfig(unittest.TestCase):
             LinearAttnConfig,
         )
 
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             LinearAttnConfig.generate(
                 self._server_args(tp_size=5), self._model(KimiLinearConfig())
             )
@@ -205,19 +206,15 @@ class TestLinearAttnConfig(unittest.TestCase):
         )
         from tokenspeed.runtime.layers.attention.registry import _LINEAR_ATTN_CLS
 
-        self.assertIs(
-            _LINEAR_ATTN_CLS["KimiK3ForConditionalGeneration"], LinearAttnConfig
+        assert (_LINEAR_ATTN_CLS["KimiK3ForConditionalGeneration"]) is (
+            LinearAttnConfig
         )
-        self.assertIs(_LINEAR_ATTN_CLS["Qwen3_5MoeForCausalLM"], LinearAttnConfig)
-        self.assertIs(
-            _LINEAR_ATTN_CLS["Glm53FlashForConditionalGeneration"],
-            LinearAttnConfig,
+        assert (_LINEAR_ATTN_CLS["Qwen3_5MoeForCausalLM"]) is (LinearAttnConfig)
+        assert (_LINEAR_ATTN_CLS["Glm53FlashForConditionalGeneration"]) is (
+            LinearAttnConfig
         )
-        self.assertNotIn(
-            "Glm53FlashForConditionalGenerationNextN",
-            _LINEAR_ATTN_CLS,
-        )
+        assert ("Glm53FlashForConditionalGenerationNextN") not in (_LINEAR_ATTN_CLS)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

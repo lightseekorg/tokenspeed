@@ -5,8 +5,9 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
-import unittest
 from types import SimpleNamespace
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -71,7 +72,7 @@ class HybridBackend:
     cache_consumer_families = frozenset({"history", "state"})
 
 
-class ValidateSchedulerConfigTest(unittest.TestCase):
+class TestValidateSchedulerConfigTest:
     def test_covered_families_pass(self):
         _pcs.validate_scheduler_config(
             attn_backend=HistoryBackend(),
@@ -85,7 +86,7 @@ class ValidateSchedulerConfigTest(unittest.TestCase):
     def test_missing_family_rejected(self):
         # A hybrid pool's state group has no consumer in a history-only
         # backend; its tables would go unread.
-        with self.assertRaisesRegex(RuntimeError, r"missing \['state'\]"):
+        with pytest.raises((RuntimeError), match=(r"missing \['state'\]")):
             _pcs.validate_scheduler_config(
                 attn_backend=HistoryBackend(),
                 kv_pool=FakePool(FakeContract("history", "state")),
@@ -95,7 +96,7 @@ class ValidateSchedulerConfigTest(unittest.TestCase):
         class UndeclaredBackend:
             pass
 
-        with self.assertRaisesRegex(RuntimeError, "consumer families"):
+        with pytest.raises((RuntimeError), match=("consumer families")):
             _pcs.validate_scheduler_config(
                 attn_backend=UndeclaredBackend(),
                 kv_pool=FakePool(FakeContract("history")),
@@ -103,4 +104,4 @@ class ValidateSchedulerConfigTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

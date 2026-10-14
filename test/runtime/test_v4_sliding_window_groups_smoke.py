@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import math
-import unittest
+import sys
 from types import SimpleNamespace
+
+import pytest
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -118,8 +120,10 @@ class _CapacityProbe(CacheRecipe):
 _PAGE_SHAPES = ((4, 1), (4, 2), (16, 4), (2, 128))
 
 
-class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
-    def test_overlap_page_budget_is_parameterized_by_verify_width_and_depth(self):
+class TestV4SlidingWindowGroupsSmoke:
+    def test_overlap_page_budget_is_parameterized_by_verify_width_and_depth(
+        self, subtests
+    ):
         max_live_requests = 3
         for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
             raw_per_page = rows_per_page * entry_stride_tokens
@@ -161,7 +165,9 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     decode_input_tokens=verify_width,
                     overlap_schedule_depth=1,
                 )
-                with self.subTest(raw_per_page=raw_per_page, verify_width=verify_width):
+                with subtests.test(
+                    raw_per_page=raw_per_page, verify_width=verify_width
+                ):
                     # One overlapped step protects one more verify window per
                     # live request: never fewer pages, never more than the
                     # window's own page span. A dense history has one tail page
@@ -169,19 +175,23 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     # past what that slack absorbs.
                     for group_id in ("full", "sliding"):
                         delta = overlapped[group_id] - baseline[group_id]
-                        self.assertGreaterEqual(delta, 0, group_id)
-                        self.assertLessEqual(
-                            delta,
-                            max_live_requests * math.ceil(verify_width / raw_per_page),
-                            group_id,
+                        _pytest_a_12 = delta
+                        _pytest_b_13 = 0
+                        _pytest_msg_14 = group_id
+                        assert _pytest_a_12 >= _pytest_b_13, _pytest_msg_14
+                        _pytest_a_15 = delta
+                        _pytest_b_16 = max_live_requests * math.ceil(
+                            verify_width / raw_per_page
                         )
-                    self.assertEqual(
-                        overlapped["full"] - baseline["full"],
-                        max_live_requests
-                        * math.ceil((verify_width - 1) / raw_per_page),
+                        _pytest_msg_17 = group_id
+                        assert _pytest_a_15 <= _pytest_b_16, _pytest_msg_17
+                    assert (overlapped["full"] - baseline["full"]) == (
+                        max_live_requests * math.ceil((verify_width - 1) / raw_per_page)
                     )
 
-    def test_capture_table_width_is_parameterized_by_verify_width_and_depth(self):
+    def test_capture_table_width_is_parameterized_by_verify_width_and_depth(
+        self, subtests
+    ):
         for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
             raw_per_page = rows_per_page * entry_stride_tokens
             full = CacheGroupSpec(
@@ -204,7 +214,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             context_len = 5 * raw_per_page + 1
             for verify_width in (1, 2, 4, 8):
                 for overlap_depth in (0, 1):
-                    with self.subTest(
+                    with subtests.test(
                         raw_per_page=raw_per_page,
                         verify_width=verify_width,
                         overlap_depth=overlap_depth,
@@ -215,12 +225,11 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                             max_tokens_per_req=verify_width,
                             overlap_schedule_depth=overlap_depth,
                         )
-                        self.assertEqual(
-                            full_pages,
+                        assert (full_pages) == (
                             math.ceil(
                                 (context_len + (overlap_depth + 1) * verify_width)
                                 / raw_per_page
-                            ),
+                            )
                         )
 
                         sliding_pages = compute_max_logical_pages_for_capture(
@@ -229,16 +238,17 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                             max_tokens_per_req=verify_width,
                             overlap_schedule_depth=overlap_depth,
                         )
-                        self.assertEqual(
-                            sliding_pages,
+                        assert (sliding_pages) == (
                             math.ceil(
                                 (window + (overlap_depth + 1) * verify_width)
                                 / raw_per_page
                             )
-                            + 1,
+                            + 1
                         )
 
-    def test_sliding_capture_width_covers_conservative_reservation_bound(self):
+    def test_sliding_capture_width_covers_conservative_reservation_bound(
+        self, subtests
+    ):
         for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
             raw_per_page = rows_per_page * entry_stride_tokens
             # Cover a window that is a multiple of raw_per_page and one that is
@@ -259,7 +269,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                             reservation_end = (
                                 context_len + (overlap_depth + 1) * verify_width
                             )
-                            with self.subTest(
+                            with subtests.test(
                                 raw_per_page=raw_per_page,
                                 window=window,
                                 context_len=context_len,
@@ -278,9 +288,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                                 conservative_pages = math.ceil(
                                     reservation_end / raw_per_page
                                 ) - math.floor(retained_begin / raw_per_page)
-                                self.assertGreaterEqual(
-                                    capture_pages, conservative_pages
-                                )
+                                assert (capture_pages) >= (conservative_pages)
 
     def test_state_capture_width_is_the_two_slots_whatever_the_context(self):
         state = CacheGroupSpec(
@@ -293,21 +301,20 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         for context_len in (0, 1, 4096, 1 << 20):
             for verify_width in (1, 8):
                 for overlap_depth in (0, 1):
-                    self.assertEqual(
+                    assert (
                         compute_max_logical_pages_for_capture(
                             state,
                             max_context_len=context_len,
                             max_tokens_per_req=verify_width,
                             overlap_schedule_depth=overlap_depth,
-                        ),
-                        STATE_TABLE_SLOTS,
-                    )
-        with self.assertRaises(ValueError):
+                        )
+                    ) == (STATE_TABLE_SLOTS)
+        with pytest.raises((ValueError)):
             compute_max_logical_pages_for_capture(
                 state, max_context_len=8, max_tokens_per_req=0
             )
 
-    def test_overlap_sizing_rejects_invalid_runtime_parameters(self):
+    def test_overlap_sizing_rejects_invalid_runtime_parameters(self, subtests):
         spec = CacheGroupSpec(
             group_id="full",
             retention="full_history",
@@ -336,8 +343,8 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             ({"max_total_tokens": -1}, "max_total_tokens"),
         ):
             with (
-                self.subTest(function="page_counts", overrides=overrides),
-                self.assertRaisesRegex(ValueError, message),
+                subtests.test(function="page_counts", overrides=overrides),
+                pytest.raises((ValueError), match=(message)),
             ):
                 compute_cache_group_pages([spec], **{**count_args, **overrides})
 
@@ -347,8 +354,8 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             ({"overlap_schedule_depth": 2}, "overlap_schedule_depth"),
         ):
             with (
-                self.subTest(function="capture_width", overrides=overrides),
-                self.assertRaisesRegex(ValueError, message),
+                subtests.test(function="capture_width", overrides=overrides),
+                pytest.raises((ValueError), match=(message)),
             ):
                 compute_max_logical_pages_for_capture(
                     spec,
@@ -361,8 +368,8 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
 
         # Non-positive row geometry is rejected at spec construction now.
         with (
-            self.subTest(group="bad-rows"),
-            self.assertRaisesRegex(ValueError, "rows_per_page"),
+            subtests.test(group="bad-rows"),
+            pytest.raises((ValueError), match=("rows_per_page")),
         ):
             CacheGroupSpec("bad-rows", "full_history", 0, 1, None, replayable=False)
 
@@ -382,15 +389,15 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         )
         for invalid_spec, message in invalid_specs:
             with (
-                self.subTest(group=invalid_spec.group_id),
-                self.assertRaisesRegex(ValueError, message),
+                subtests.test(group=invalid_spec.group_id),
+                pytest.raises((ValueError), match=(message)),
             ):
                 compute_max_logical_pages_for_capture(
                     invalid_spec,
                     max_context_len=8,
                 )
 
-    def test_overlap_schedule_enablement_truth_table(self):
+    def test_overlap_schedule_enablement_truth_table(self, subtests):
         from tokenspeed.runtime.engine.scheduler_utils import (
             should_use_overlap_schedule,
         )
@@ -403,14 +410,13 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             (False, "decode", True),
         )
         for disabled, mode, expected in cases:
-            with self.subTest(disabled=disabled, mode=mode):
-                self.assertEqual(
+            with subtests.test(disabled=disabled, mode=mode):
+                assert (
                     should_use_overlap_schedule(
                         disable_overlap_schedule=disabled,
                         disaggregation_mode=mode,
-                    ),
-                    expected,
-                )
+                    )
+                ) == (expected)
 
     def test_sliding_window_scheduled_tokens_are_global_and_capped(self):
         specs = [
@@ -446,9 +452,8 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         lookback_pages = math.ceil((7 + 3) / 4)
         handover_pages = 10 * min(math.ceil((4 - 1) / 4), lookback_pages)
         scheduled_pages = math.ceil(20 / 4)
-        self.assertEqual(
-            pages["sliding"],
-            resident_pages + handover_pages + lookback_pages + scheduled_pages,
+        assert (pages["sliding"]) == (
+            resident_pages + handover_pages + lookback_pages + scheduled_pages
         )
 
     def test_page_counts_positive_finite_and_under_total_times_live(self):
@@ -469,10 +474,21 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         bound = inputs["max_total_tokens"] * inputs["max_live_requests"]
         for spec in specs:
             n = pages[spec.group_id]
-            self.assertIsInstance(n, int, spec.group_id)
-            self.assertGreater(n, 0, spec.group_id)
-            self.assertTrue(math.isfinite(n), spec.group_id)
-            self.assertLess(n, bound, spec.group_id)
+            _pytest_obj_1 = n
+            _pytest_cls_2 = int
+            _pytest_msg_3 = spec.group_id
+            assert isinstance(_pytest_obj_1, _pytest_cls_2), _pytest_msg_3
+            _pytest_a_4 = n
+            _pytest_b_5 = 0
+            _pytest_msg_6 = spec.group_id
+            assert _pytest_a_4 > _pytest_b_5, _pytest_msg_6
+            _pytest_expr_7 = math.isfinite(n)
+            _pytest_msg_8 = spec.group_id
+            assert _pytest_expr_7, _pytest_msg_8
+            _pytest_a_9 = n
+            _pytest_b_10 = bound
+            _pytest_msg_11 = spec.group_id
+            assert _pytest_a_9 < _pytest_b_10, _pytest_msg_11
 
     def test_lcm_specs_own_row_geometry_and_declare_no_packing(self):
         specs = build_v4_cache_specs(
@@ -481,13 +497,11 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         )
 
         # Packing is the memory plan's answer, so a spec cannot declare it.
-        self.assertFalse(
-            any(hasattr(spec, "cache_blocks_per_lcm_block") for spec in specs)
-        )
+        assert not (any(hasattr(spec, "cache_blocks_per_lcm_block") for spec in specs))
         rows = {spec.group_id: spec.rows_per_page for spec in specs}
-        self.assertEqual(rows["v4.swa_kv"], 64)
-        self.assertEqual(rows["v4.c4a.compressor_state"], 4)
-        self.assertEqual(rows["v4.c128a.compressor_state"], 8)
+        assert (rows["v4.swa_kv"]) == (64)
+        assert (rows["v4.c4a.compressor_state"]) == (4)
+        assert (rows["v4.c128a.compressor_state"]) == (8)
 
     def test_every_v4_group_is_token_history(self):
         # V4 stores rows of tokens everywhere -- the SWA window and the
@@ -498,15 +512,13 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             SimpleNamespace(sliding_window=128),
             layer_ratio=(1, 4, 128),
         )
-        self.assertEqual({spec.family for spec in specs}, {"history"})
-        self.assertTrue(all(spec.family == "history" for spec in specs))
+        assert ({spec.family for spec in specs}) == ({"history"})
+        assert all(spec.family == "history" for spec in specs)
         retentions = {spec.group_id: spec.retention for spec in specs}
-        self.assertEqual(retentions["v4.swa_kv"], "sliding_window")
-        self.assertEqual(retentions["v4.c4a.compressor_state"], "sliding_window")
-        self.assertEqual(
-            retentions["v4.c4a.indexer_compressor_state"], "sliding_window"
-        )
-        self.assertEqual(retentions["v4.c4a.compressed_kv"], "full_history")
+        assert (retentions["v4.swa_kv"]) == ("sliding_window")
+        assert (retentions["v4.c4a.compressor_state"]) == ("sliding_window")
+        assert (retentions["v4.c4a.indexer_compressor_state"]) == ("sliding_window")
+        assert (retentions["v4.c4a.compressed_kv"]) == ("full_history")
 
     def test_v4_groups_cross_the_bridge_into_a_live_scheduler(self):
         # The whole V4 set arrives at the C++ scheduler as History groups,
@@ -520,7 +532,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 pool_to_cache_groups,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs torch + the tokenspeed_scheduler ext: {exc}")
+            pytest.skip(f"needs torch + the tokenspeed_scheduler ext: {exc}")
 
         prefix_granularity = 256
         num_device_pages = 8
@@ -548,7 +560,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         pool = SimpleNamespace(arena=SimpleNamespace(runtime_contract=contract))
         groups = pool_to_cache_groups(pool)
 
-        self.assertEqual({g.family for g in groups}, {CacheGroupFamily.History})
+        assert ({g.family for g in groups}) == ({CacheGroupFamily.History})
         config = make_config(
             num_device_pages=num_device_pages,
             max_scheduled_tokens=1024,
@@ -574,9 +586,9 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             layer_ratio=(4, 128),
         )
         windows = {spec.group_id: spec.sliding_window_tokens for spec in specs}
-        self.assertEqual(windows["v4.c4a.compressor_state"], 8)
-        self.assertEqual(windows["v4.c4a.indexer_compressor_state"], 8)
-        self.assertEqual(windows["v4.c128a.compressor_state"], 128)
+        assert (windows["v4.c4a.compressor_state"]) == (8)
+        assert (windows["v4.c4a.indexer_compressor_state"]) == (8)
+        assert (windows["v4.c128a.compressor_state"]) == (128)
 
     def test_lcm_capacity_is_the_inverse_of_parent_demand(self):
         from tokenspeed_scheduler import SchedulerConfig
@@ -613,9 +625,9 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             layout, num_lcm_blocks, upper_bound=4096
         )
 
-        self.assertLessEqual(probe.parents_needed(layout, capacity), num_lcm_blocks)
-        self.assertGreater(probe.parents_needed(layout, capacity + 1), num_lcm_blocks)
+        assert (probe.parents_needed(layout, capacity)) <= (num_lcm_blocks)
+        assert (probe.parents_needed(layout, capacity + 1)) > (num_lcm_blocks)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

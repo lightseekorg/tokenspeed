@@ -4,8 +4,10 @@ import sys
 import tempfile
 import threading
 import time
-import unittest
+from collections import Counter
 from unittest import mock
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -41,7 +43,7 @@ def _fake_available_memory(available):
     )
 
 
-class TestWeightLoaderPrefetch(unittest.TestCase):
+class TestWeightLoaderPrefetch:
     def _parse_server_args(self, cli):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -53,20 +55,20 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
         server_args = self._parse_server_args(
             ["--weight-loader-prefetch-num-threads", "2"]
         )
-        self.assertTrue(server_args.weight_loader_prefetch_checkpoints)
-        self.assertEqual(server_args.weight_loader_prefetch_num_threads, 2)
+        assert server_args.weight_loader_prefetch_checkpoints
+        assert (server_args.weight_loader_prefetch_num_threads) == (2)
 
     def test_disable_flag_turns_prefetch_off(self):
         server_args = self._parse_server_args(
             ["--disable-weight-loader-prefetch-checkpoints"]
         )
-        self.assertFalse(server_args.weight_loader_prefetch_checkpoints)
+        assert not (server_args.weight_loader_prefetch_checkpoints)
 
     def test_load_config_defaults_enable_prefetch(self):
         load_config = LoadConfig()
 
-        self.assertTrue(load_config.weight_loader_prefetch_checkpoints)
-        self.assertEqual(load_config.weight_loader_prefetch_num_threads, 8)
+        assert load_config.weight_loader_prefetch_checkpoints
+        assert (load_config.weight_loader_prefetch_num_threads) == (8)
 
     def _make_files(self, tmpdir, count, size):
         files = []
@@ -84,13 +86,13 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                 prefetcher = CheckpointPrefetcher(
                     files, local_rank=0, local_world_size=1
                 )
-            self.assertEqual(prefetcher._window_bytes, 25 * 1024**3)
+            assert (prefetcher._window_bytes) == (25 * 1024**3)
             with _fake_available_memory(1000 * 1024**3):
                 prefetcher = CheckpointPrefetcher(
                     files, local_rank=0, local_world_size=1
                 )
-            self.assertEqual(
-                prefetcher._window_bytes, CheckpointPrefetcher._WINDOW_MAX_BYTES
+            assert (prefetcher._window_bytes) == (
+                CheckpointPrefetcher._WINDOW_MAX_BYTES
             )
 
     def test_window_bounds_read_ahead_and_advances_on_consumption(self):
@@ -115,20 +117,20 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                 )
                 prefetcher.start()
 
-                self.assertTrue(_wait_until(lambda: len(read_order) == 2))
+                assert _wait_until(lambda: len(read_order) == 2)
                 prefetcher.wait_file(0)
                 prefetcher.wait_file(1)
                 # Third shard would exceed the window until we consume one.
                 time.sleep(0.05)
-                self.assertEqual(read_order, files[:2])
+                assert (read_order) == (files[:2])
 
                 prefetcher.advance(0)
-                self.assertTrue(_wait_until(lambda: len(read_order) == 3))
-                self.assertEqual(read_order, files[:3])
+                assert _wait_until(lambda: len(read_order) == 3)
+                assert (read_order) == (files[:3])
 
                 prefetcher.advance(1)
                 prefetcher.advance(2)
-                self.assertTrue(_wait_until(lambda: read_order == files))
+                assert _wait_until(lambda: read_order == files)
                 prefetcher.wait_file(3)
 
     def test_oversized_shard_still_prefetched_alone(self):
@@ -152,7 +154,7 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                 prefetcher.wait_file(0)
                 prefetcher.advance(0)
                 prefetcher.wait_file(1)
-                self.assertEqual(read_order, files)
+                assert (read_order) == (files)
 
     def test_parallel_ranges_cover_shard_and_wait_for_every_range(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -164,7 +166,7 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
 
             def read_range(file_path, start, end):
                 if start == 0:
-                    self.assertTrue(release.wait(_POLL_TIMEOUT_S))
+                    assert release.wait(_POLL_TIMEOUT_S)
                 count = original(file_path, start, end)
                 ranges.append((start, end))
                 if end == 261:
@@ -183,17 +185,17 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                 )
                 prefetcher.start()
                 try:
-                    self.assertTrue(last_finished.wait(_POLL_TIMEOUT_S))
-                    self.assertFalse(prefetcher._ready[0].is_set())
+                    assert last_finished.wait(_POLL_TIMEOUT_S)
+                    assert not (prefetcher._ready[0].is_set())
                 finally:
                     release.set()
                     prefetcher.close()
-                self.assertTrue(prefetcher._ready[0].is_set())
+                assert prefetcher._ready[0].is_set()
             ranges.sort()
-            self.assertEqual(ranges[0][0], 0)
-            self.assertEqual(ranges[-1][1], 261)
+            assert (ranges[0][0]) == (0)
+            assert (ranges[-1][1]) == (261)
             for previous, following in zip(ranges, ranges[1:]):
-                self.assertEqual(previous[1], following[0])
+                assert (previous[1]) == (following[0])
 
     def test_local_readers_share_reads_without_expanding_the_window(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -219,15 +221,13 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                     for reader in readers:
                         reader.wait_file(0)
                         reader.wait_file(1)
-                    self.assertCountEqual(reads, files[:2])
-                    self.assertTrue(
-                        all(reader._inflight_bytes == 200 for reader in readers)
-                    )
+                    assert Counter(reads) == Counter(files[:2])
+                    assert all(reader._inflight_bytes == 200 for reader in readers)
                     for idx in range(len(files)):
                         for reader in readers:
                             reader.wait_file(idx)
                             reader.advance(idx)
-                    self.assertCountEqual(reads, files)
+                    assert Counter(reads) == Counter(files)
                 finally:
                     for reader in readers:
                         reader.close()
@@ -260,8 +260,8 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                             Mapping(rank=rank, world_size=8, nprocs_per_node=4),
                         )
                     )
-                self.assertCountEqual(
-                    [call.args[0] for call in read.call_args_list], files
+                assert Counter(call.args[0] for call in read.call_args_list) == Counter(
+                    files
                 )
 
             # Different per-rank filters must not leave shards assigned to
@@ -292,11 +292,11 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                             Mapping(rank=rank, world_size=2),
                         )
                     )
-                self.assertCountEqual(
-                    [call.args[0] for call in read.call_args_list], files
+                assert Counter(call.args[0] for call in read.call_args_list) == Counter(
+                    files
                 )
 
-    def test_iterator_close_stops_workers_waiting_for_window(self):
+    def test_iterator_close_stops_workers_waiting_for_window(self, subtests):
         with tempfile.TemporaryDirectory() as tmpdir:
             files = [
                 os.path.join(tmpdir, f"weights-{idx}.safetensors") for idx in range(2)
@@ -307,7 +307,7 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                 )
             for filtered in [False, True]:
                 with (
-                    self.subTest(filtered=filtered),
+                    subtests.test(filtered=filtered),
                     _fake_available_memory(os.path.getsize(files[0]) * 4),
                 ):
                     prefetcher = CheckpointPrefetcher(
@@ -334,10 +334,8 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
                             next(iterator)
                         finally:
                             iterator.close()
-                    self.assertEqual(prefetcher._files_read, 1)
-                    self.assertTrue(
-                        all(not thread.is_alive() for thread in prefetcher._threads)
-                    )
+                    assert (prefetcher._files_read) == (1)
+                    assert all(not thread.is_alive() for thread in prefetcher._threads)
 
     def test_read_failure_unblocks_consumer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -358,4 +356,4 @@ class TestWeightLoaderPrefetch(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

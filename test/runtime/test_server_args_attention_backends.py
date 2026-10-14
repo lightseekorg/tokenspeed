@@ -9,6 +9,8 @@ registry after plugin discovery, so they accept exactly the same names.
 import os
 import sys
 
+import pytest
+
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -17,7 +19,6 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import argparse
 import pickle
-import unittest
 from types import SimpleNamespace
 from unittest import mock
 
@@ -30,7 +31,7 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
 
 
-class TestAttentionBackendChoices(unittest.TestCase):
+class TestAttentionBackendChoices:
     def _build_parser(self) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -46,33 +47,33 @@ class TestAttentionBackendChoices(unittest.TestCase):
         args = self._build_parser().parse_args(
             ["--model", "x", "--attention-backend", "trtllm_mla"]
         )
-        self.assertEqual(args.attention_backend, "trtllm_mla")
+        assert (args.attention_backend) == ("trtllm_mla")
 
     def test_attention_backend_accepts_mla(self):
         args = self._build_parser().parse_args(
             ["--model", "x", "--attention-backend", "mla"]
         )
-        self.assertEqual(args.attention_backend, "mla")
+        assert (args.attention_backend) == ("mla")
 
     def test_attention_backend_accepts_gluon(self):
         args = self._build_parser().parse_args(
             ["--model", "x", "--attention-backend", "gluon"]
         )
-        self.assertEqual(args.attention_backend, "gluon")
+        assert (args.attention_backend) == ("gluon")
 
     def test_attention_backend_accepts_mha_kernel_solutions(self):
         for backend in ("fa3", "fa4", "triton", "flashinfer"):
             args = self._build_parser().parse_args(
                 ["--model", "x", "--attention-backend", backend]
             )
-            self.assertEqual(args.attention_backend, backend)
+            assert (args.attention_backend) == (backend)
 
     def test_attention_backend_uses_generic_mha_for_ascend(self):
         import tokenspeed.runtime.layers.attention.backends  # noqa: F401
 
         registry.validate_attention_backend_name("mha", flag="--attention-backend")
         for name in ("ascend_mha", "npu"):
-            with self.assertRaisesRegex(ValueError, "Unknown --attention-backend"):
+            with pytest.raises((ValueError), match=("Unknown --attention-backend")):
                 registry.validate_attention_backend_name(
                     name, flag="--attention-backend"
                 )
@@ -82,20 +83,20 @@ class TestAttentionBackendChoices(unittest.TestCase):
         args = self._build_parser().parse_args(
             ["--model", "x", "--drafter-attention-backend", "trtllm_mla"]
         )
-        self.assertEqual(args.drafter_attention_backend, "trtllm_mla")
+        assert (args.drafter_attention_backend) == ("trtllm_mla")
 
     def test_drafter_attention_backend_accepts_gluon(self):
         args = self._build_parser().parse_args(
             ["--model", "x", "--drafter-attention-backend", "gluon"]
         )
-        self.assertEqual(args.drafter_attention_backend, "gluon")
+        assert (args.drafter_attention_backend) == ("gluon")
 
     def test_flags_defer_backend_names_to_the_registry(self):
         parser = self._build_parser()
         # Plugins register backends after argument parsing, so neither flag
         # may carry a closed argparse choice list.
-        self.assertIsNone(self._action(parser, "attention_backend").choices)
-        self.assertIsNone(self._action(parser, "drafter_attention_backend").choices)
+        assert (self._action(parser, "attention_backend").choices) is None
+        assert (self._action(parser, "drafter_attention_backend").choices) is None
 
     def test_invalid_backend_rejected_on_both_flags(self):
         import tokenspeed.runtime.layers.attention.backends  # noqa: F401
@@ -106,14 +107,14 @@ class TestAttentionBackendChoices(unittest.TestCase):
                 registry.HYBRID_LINEAR_ATTN_BACKEND, flag=flag
             )
             registry.validate_attention_backend_name(None, flag=flag)
-            with self.assertRaisesRegex(ValueError, f"Unknown {flag} 'bogus'"):
+            with pytest.raises((ValueError), match=(f"Unknown {flag} 'bogus'")):
                 registry.validate_attention_backend_name("bogus", flag=flag)
 
     def test_inline_detokenizer_is_forced_on(self):
         args = prepare_server_args(["--model", "x"])
-        self.assertTrue(args.enable_inline_detokenizer)
+        assert args.enable_inline_detokenizer
 
-    def test_kda_prefill_graph_uses_shared_args_not_worker_environment(self):
+    def test_kda_prefill_graph_uses_shared_args_not_worker_environment(self, subtests):
         spec = MHAConfig(
             num_attention_heads=4, num_kv_heads=4, head_dim=128, attn_tp_size=1
         )
@@ -143,15 +144,15 @@ class TestAttentionBackendChoices(unittest.TestCase):
             if disabled:
                 argv.append("--disable-kda-prefill-graph")
             shared_args = prepare_server_args(argv)
-            self.assertIs(shared_args.disable_kda_prefill_graph, disabled)
-            self.assertFalse(shared_args.disable_prefill_graph)
-            self.assertFalse(shared_args.enforce_eager)
+            assert (shared_args.disable_kda_prefill_graph) is (disabled)
+            assert not (shared_args.disable_prefill_graph)
+            assert not (shared_args.enforce_eager)
             # Simulate workers receiving the same serialized server arguments
             # despite conflicting legacy environment settings. Keep the real
             # KDA constructor so reintroducing a local env read fails this test.
             for worker_env in ("0", "1"):
                 with (
-                    self.subTest(disabled=disabled, worker_env=worker_env),
+                    subtests.test(disabled=disabled, worker_env=worker_env),
                     mock.patch.dict(
                         os.environ, {"TOKENSPEED_KDA_PREFILL_GRAPH": worker_env}
                     ),
@@ -173,23 +174,21 @@ class TestAttentionBackendChoices(unittest.TestCase):
                         full_attn_backend_name="mla",
                         linear_attention="kda",
                     )
-                    self.assertIs(
-                        backend.linear_attn_backend._prefill_graph_enabled, not disabled
+                    assert (backend.linear_attn_backend._prefill_graph_enabled) is (
+                        not disabled
                     )
-                    self.assertEqual(
-                        backend.linear_attn_backend.kda_backend, "cutedsl_kda"
-                    )
+                    assert (backend.linear_attn_backend.kda_backend) == ("cutedsl_kda")
 
     def test_model_path_alias_sets_model(self):
         args = self._build_parser().parse_args(["--model-path", "x"])
-        self.assertEqual(args.model, "x")
+        assert (args.model) == ("x")
 
     def test_prepare_server_args_accepts_model_path_alias(self):
         args = prepare_server_args(["--model-path", "x"])
-        self.assertEqual(args.model, "x")
+        assert (args.model) == ("x")
 
     def test_defaults_to_mha_for_mha(self):
-        self.assertEqual(registry._get_default_backend_name(AttentionArch.MHA), "mha")
+        assert (registry._get_default_backend_name(AttentionArch.MHA)) == ("mha")
 
     def test_mha_kernel_solution_backends_use_mha_backend(self):
         from tokenspeed.runtime.layers.attention.backends.paged.mha import (
@@ -197,9 +196,8 @@ class TestAttentionBackendChoices(unittest.TestCase):
         )
 
         for backend in ("mha", "fa3", "fa4", "triton", "flashinfer"):
-            self.assertIs(
-                registry._get_backend_cls(backend, AttentionArch.MHA),
-                MHAAttnBackend,
+            assert (registry._get_backend_cls(backend, AttentionArch.MHA)) is (
+                MHAAttnBackend
             )
 
     def test_mla_backend_registered_for_mla(self):
@@ -207,19 +205,15 @@ class TestAttentionBackendChoices(unittest.TestCase):
             MLAAttnBackend,
         )
 
-        self.assertIs(
-            registry._get_backend_cls("mla", AttentionArch.MLA),
-            MLAAttnBackend,
-        )
+        assert (registry._get_backend_cls("mla", AttentionArch.MLA)) is (MLAAttnBackend)
 
     def test_gluon_backend_registered_for_mla(self):
         from tokenspeed.runtime.layers.attention.backends.paged.mla import (
             MLAAttnBackend,
         )
 
-        self.assertIs(
-            registry._get_backend_cls("gluon", AttentionArch.MLA),
-            MLAAttnBackend,
+        assert (registry._get_backend_cls("gluon", AttentionArch.MLA)) is (
+            MLAAttnBackend
         )
 
     def test_gluon_mla_backend_forces_gluon_kernel_solution(self):
@@ -258,12 +252,11 @@ class TestAttentionBackendChoices(unittest.TestCase):
             components=(spec,),
         )
 
-        self.assertEqual(
-            MLAAttnBackend(config, spec, kernel_page_size=64).kernel_solution,
-            "gluon",
+        assert (MLAAttnBackend(config, spec, kernel_page_size=64).kernel_solution) == (
+            "gluon"
         )
 
-    def test_dsa_routes_dense_attention_by_platform(self):
+    def test_dsa_routes_dense_attention_by_platform(self, subtests):
         import dataclasses
 
         from tokenspeed.runtime.layers.attention.backends.paged import (
@@ -288,14 +281,13 @@ class TestAttentionBackendChoices(unittest.TestCase):
             (SimpleNamespace(is_nvidia=False, is_amd=True), "MLAAttnBackend"),
         ):
             with (
-                self.subTest(name=cls_name),
+                subtests.test(name=cls_name),
                 mock.patch.object(
                     dsa_backend, cls_name, return_value=dense_backend
                 ) as create,
             ):
-                self.assertIs(
-                    dsa_backend._make_dense_leaf(config, spec, platform, 64),
-                    dense_backend,
+                assert (dsa_backend._make_dense_leaf(config, spec, platform, 64)) is (
+                    dense_backend
                 )
                 create.assert_called_once_with(
                     config,
@@ -324,20 +316,20 @@ class TestAttentionBackendChoices(unittest.TestCase):
         with mock.patch.object(registry, "_get_backend_cls", return_value=ProbeBackend):
             registry._create_attn_backend_with_name("child", AttentionArch.MHA, config)
 
-        self.assertEqual(routed["source_name"], "parent")
-        self.assertEqual(routed["spec"].backend_name, "child")
-        self.assertIsNot(routed["spec"], source)
+        assert (routed["source_name"]) == ("parent")
+        assert (routed["spec"].backend_name) == ("child")
+        assert (routed["spec"]) is not (source)
 
     def test_defaults_to_mla_for_mla(self):
-        self.assertEqual(registry._get_default_backend_name(AttentionArch.MLA), "mla")
+        assert (registry._get_default_backend_name(AttentionArch.MLA)) == ("mla")
 
     def test_lcm_kernel_page_size_is_validated_without_rewriting_it(self):
         config = SimpleNamespace(kernel_page_size=64)
 
         registry._validate_lcm_page_size(config, prefix_granularity=128)
 
-        self.assertEqual(config.kernel_page_size, 64)
-        with self.assertRaisesRegex(ValueError, "positive multiple"):
+        assert (config.kernel_page_size) == (64)
+        with pytest.raises((ValueError), match=("positive multiple")):
             registry._validate_lcm_page_size(
                 SimpleNamespace(kernel_page_size=96),
                 prefix_granularity=128,
@@ -388,13 +380,13 @@ class TestAttentionBackendChoices(unittest.TestCase):
 
         config = MHAConfig.generate(server_args, model_config)
 
-        self.assertEqual(config.speculative_num_steps, 3)
-        self.assertEqual(config.speculative_num_draft_tokens, 4)
-        self.assertEqual(config.context_len, 4108)
+        assert (config.speculative_num_steps) == (3)
+        assert (config.speculative_num_draft_tokens) == (4)
+        assert (config.context_len) == (4108)
 
 
-class TestKdaBackendPolicy(unittest.TestCase):
-    def test_prefill_backend_selection(self):
+class TestKdaBackendPolicy:
+    def test_prefill_backend_selection(self, subtests):
         cases = (
             # AMD keeps kernel-registry selection, including explicit NVIDIA policies.
             (True, False, False, "auto", "auto"),
@@ -410,7 +402,7 @@ class TestKdaBackendPolicy(unittest.TestCase):
         )
         for is_amd, is_hopper_plus, cute_supported, requested, expected in cases:
             with (
-                self.subTest(is_amd=is_amd, requested=requested, expected=expected),
+                subtests.test(is_amd=is_amd, requested=requested, expected=expected),
                 mock.patch.object(
                     kda,
                     "current_platform",
@@ -423,7 +415,7 @@ class TestKdaBackendPolicy(unittest.TestCase):
                     return_value=cute_supported,
                 ) as supports_cute,
             ):
-                self.assertEqual(kda.resolve_kda_backend(requested), expected)
+                assert (kda.resolve_kda_backend(requested)) == (expected)
                 if is_amd:
                     supports_cute.assert_not_called()
 
@@ -438,12 +430,12 @@ class TestKdaBackendPolicy(unittest.TestCase):
                 "tokenspeed_kernel.ops.attention.kda.cute_dsl.cutedsl_kda_supported",
                 return_value=False,
             ),
-            self.assertRaisesRegex(ValueError, "requires an NVIDIA sm_100 or sm_103"),
+            pytest.raises((ValueError), match=("requires an NVIDIA sm_100 or sm_103")),
         ):
             kda.resolve_kda_backend("cutedsl_kda")
 
 
-class TestPagedRouterNameResolution(unittest.TestCase):
+class TestPagedRouterNameResolution:
     """Names reaching create_paged_router select the LEAF; wrapper names
     must not leak into leaf constructors that interpret backend_name
     themselves (MHA/MLA kernel-solution maps)."""
@@ -479,12 +471,10 @@ class TestPagedRouterNameResolution(unittest.TestCase):
         config = self._config()
         router = registry.create_paged_router(config, AttentionArch.MHA)
         leaf = router._leaf_factory("full_attention", 64)
-        self.assertEqual(type(leaf).__name__, "MHAAttnBackend")
+        assert (type(leaf).__name__) == ("MHAAttnBackend")
         # And the leaf's own spec resolved a kernel solution (backend_name
         # was cleared, not passed through as the sentinel).
-        self.assertNotEqual(
-            getattr(leaf, "kernel_solution", "unset"), "hybrid_linear_attn"
-        )
+        assert (getattr(leaf, "kernel_solution", "unset")) != ("hybrid_linear_attn")
 
     def test_leaf_factory_does_not_mutate_the_shared_spec(self):
         config = self._config()
@@ -494,10 +484,10 @@ class TestPagedRouterNameResolution(unittest.TestCase):
         )
         router._leaf_factory("full_attention", 64)
         # Lazy leaf construction must not leave a mutated shared component.
-        self.assertEqual(spec.backend_name, "hybrid_linear_attn")
+        assert (spec.backend_name) == ("hybrid_linear_attn")
 
 
-class TestDecodeHostL2(unittest.TestCase):
+class TestDecodeHostL2:
     def test_decode_enables_host_l2_without_prefix_matching(self):
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "decode"
@@ -510,22 +500,22 @@ class TestDecodeHostL2(unittest.TestCase):
         args._handle_kvstore()
         args.validate_cache_options()
 
-        self.assertTrue(args.enable_kvstore)
+        assert args.enable_kvstore
 
 
-class TestDisaggregationGraphFlags(unittest.TestCase):
+class TestDisaggregationGraphFlags:
     """The prefill role is a role with no decode step, not an eager role."""
 
     def test_prefill_role_keeps_the_ordinary_graph_flags(self):
         args = prepare_server_args(["--model", "x", "--disaggregation-mode", "prefill"])
-        self.assertFalse(args.enforce_eager)
-        self.assertFalse(args.disable_prefill_graph)
+        assert not (args.enforce_eager)
+        assert not (args.disable_prefill_graph)
 
     def test_prefill_role_honours_explicit_eager(self):
         args = prepare_server_args(
             ["--model", "x", "--disaggregation-mode", "prefill", "--enforce-eager"]
         )
-        self.assertTrue(args.enforce_eager)
+        assert args.enforce_eager
 
     def test_pipeline_parallelism_forces_eager(self):
         args = prepare_server_args(
@@ -538,14 +528,14 @@ class TestDisaggregationGraphFlags(unittest.TestCase):
                 "2",
             ]
         )
-        self.assertTrue(args.enforce_eager)
+        assert args.enforce_eager
 
     def test_pipeline_debug_without_pd_forces_eager(self):
         with mock.patch.dict(os.environ, {"TS_PP_DEBUG_ALLOW_NON_PREFILL": "1"}):
             args = prepare_server_args(
                 ["--model", "x", "--pipeline-parallel-size", "2"]
             )
-        self.assertTrue(args.enforce_eager)
+        assert args.enforce_eager
 
     @staticmethod
     def _pipeline_prefill_args(algorithm: str, *extra: str) -> list[str]:
@@ -561,17 +551,17 @@ class TestDisaggregationGraphFlags(unittest.TestCase):
             *extra,
         ]
 
-    def test_pipeline_prefill_accepts_last_stage_drafters(self):
+    def test_pipeline_prefill_accepts_last_stage_drafters(self, subtests):
         # The drafter runs on the last stage, the only stage that samples;
         # DSPARK additionally produces context across stages.
         for algorithm in ("MTP", "DSPARK"):
-            with self.subTest(algorithm=algorithm):
+            with subtests.test(algorithm=algorithm):
                 args = prepare_server_args(self._pipeline_prefill_args(algorithm))
-                self.assertEqual(args.speculative_algorithm, algorithm)
-                self.assertTrue(args.enforce_eager)
+                assert (args.speculative_algorithm) == (algorithm)
+                assert args.enforce_eager
 
     def test_pipeline_speculation_requires_the_prefill_role(self):
-        with self.assertRaisesRegex(ValueError, "disaggregation-mode prefill"):
+        with pytest.raises((ValueError), match=("disaggregation-mode prefill")):
             prepare_server_args(
                 [
                     "--model",
@@ -588,7 +578,7 @@ class TestDisaggregationGraphFlags(unittest.TestCase):
         # feedback to draft against either.
         with (
             mock.patch.dict(os.environ, {"TS_PP_DEBUG_ALLOW_NON_PREFILL": "1"}),
-            self.assertRaisesRegex(ValueError, "only on a prefill server"),
+            pytest.raises((ValueError), match=("only on a prefill server")),
         ):
             prepare_server_args(
                 [
@@ -601,13 +591,13 @@ class TestDisaggregationGraphFlags(unittest.TestCase):
                 ]
             )
 
-    def test_pipeline_rejects_drafts_that_read_taps_from_several_stages(self):
+    def test_pipeline_rejects_drafts_that_read_taps_from_several_stages(self, subtests):
         # DFLASH has no cross-stage context production; EAGLE3's aux taps
         # are not carried through the stage boundary.
         for algorithm in ("DFLASH", "EAGLE3"):
             with (
-                self.subTest(algorithm=algorithm),
-                self.assertRaisesRegex(ValueError, f"{algorithm} is not supported"),
+                subtests.test(algorithm=algorithm),
+                pytest.raises((ValueError), match=(f"{algorithm} is not supported")),
             ):
                 prepare_server_args(self._pipeline_prefill_args(algorithm))
 
@@ -623,14 +613,14 @@ class TestDisaggregationGraphFlags(unittest.TestCase):
             "--dense-tp-size",
             "1",
         )
-        with self.assertRaisesRegex(ValueError, "matching dense/attention TP"):
+        with pytest.raises((ValueError), match=("matching dense/attention TP")):
             prepare_server_args(self._pipeline_prefill_args("DSPARK", *narrow_dense))
         args = prepare_server_args(self._pipeline_prefill_args("MTP", *narrow_dense))
-        self.assertEqual(args.mapping.dense.tp_size, 1)
-        self.assertEqual(args.mapping.attn.tp_size, 2)
+        assert (args.mapping.dense.tp_size) == (1)
+        assert (args.mapping.attn.tp_size) == (2)
 
 
-class TestL3StorageBackend(unittest.TestCase):
+class TestL3StorageBackend:
     def test_cli_accepts_mooncake_and_memory(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
@@ -639,8 +629,8 @@ class TestL3StorageBackend(unittest.TestCase):
             if candidate.dest == "kvstore_storage_backend":
                 action = candidate
                 break
-        self.assertIsNotNone(action)
-        self.assertEqual(set(action.choices), {"mooncake", "memory"})
+        assert (action) is not None
+        assert (set(action.choices)) == ({"mooncake", "memory"})
 
     def test_memory_backend_keeps_host_io(self):
         args = object.__new__(ServerArgs)
@@ -653,8 +643,8 @@ class TestL3StorageBackend(unittest.TestCase):
 
         args._handle_kvstore()
 
-        self.assertTrue(args.enable_kvstore)
-        self.assertEqual(args.kvstore_io_backend, "direct")
+        assert args.enable_kvstore
+        assert (args.kvstore_io_backend) == ("direct")
 
     def test_l3_requires_host_l2(self):
         args = object.__new__(ServerArgs)
@@ -665,7 +655,7 @@ class TestL3StorageBackend(unittest.TestCase):
         args.kvstore_storage_backend = "mooncake"
         args.kvstore_io_backend = "direct"
 
-        with self.assertRaisesRegex(ValueError, "requires Host L2"):
+        with pytest.raises((ValueError), match=("requires Host L2")):
             args._handle_kvstore()
 
     def test_mooncake_backend_keeps_host_io(self):
@@ -679,9 +669,9 @@ class TestL3StorageBackend(unittest.TestCase):
 
         args._handle_kvstore()
 
-        self.assertTrue(args.enable_kvstore)
-        self.assertEqual(args.kvstore_io_backend, "direct")
+        assert args.enable_kvstore
+        assert (args.kvstore_io_backend) == ("direct")
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
