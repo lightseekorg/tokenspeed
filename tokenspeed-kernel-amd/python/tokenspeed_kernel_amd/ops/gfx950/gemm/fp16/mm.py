@@ -1678,12 +1678,12 @@ def launch_gluon_mm_a16w16_medium_gfx950(
 
 
 # Cold-cache sweeps on gfx950 at Kimi K3 TP8 and Qwen3.8-Flash-Next TP2 decode
-# shapes (Qwen3.8 checked as HIP-graph replays, as served), keyed by (N, K) and then by M bucket: a call uses the
-# config of the smallest bucket covering its M, so M stays a runtime argument
-# within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M, WARPS_N,
-# NUM_BUFFERS, SPLIT_K, NUM_XCDS); NUM_BUFFERS above three holds every K tile of
-# a program. Only buckets that beat torch.mm by at least 4% are listed; the
-# rest keep the torch path.
+# shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
+# uses the config of the smallest bucket covering its M, so M stays a runtime
+# argument within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M,
+# WARPS_N, NUM_BUFFERS, SPLIT_K, NUM_XCDS); NUM_BUFFERS above three holds every
+# K tile of a program. Only buckets that beat torch.mm by at least 4% are
+# listed; the rest keep the torch path.
 DECODE_M_BUCKETS = (4, 8, 16, 32, 64)
 _DECODE_CONFIGS: dict[
     tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
