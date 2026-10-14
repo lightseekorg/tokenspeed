@@ -86,8 +86,6 @@ __all__ = [
     "grouped_bf16_projection",
     # MV: small-M dense projection
     "mv",
-    "mv_weight_split",
-    "use_mv",
     # Linear AttnRes partials
     "linear_attnres_partials",
     "linear_attnres_partials_available",
@@ -463,6 +461,8 @@ def mm(
                 has_out=out is not None,
             ):
                 return flashinfer_bf16_gemm(A, B, out)
+        if bias is None and _use_mv(A, B):
+            return mv(A, B, out)
 
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
@@ -1292,17 +1292,7 @@ def _select_mv(
     return torch_decode_gemv
 
 
-def use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether a dense projection should use the specialized decode entry.
-
-    Args:
-        x: Activation tensor shaped ``[M, K]``.
-        weight: Projection weight shaped ``[N, K]``.
-
-    Returns:
-        True for eligible small-M FI inputs or a registered CDNA4/CDNA5
-        kernel; False when the caller should retain its ordinary GEMM path.
-    """
+def _use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     if (
         flashinfer_joint_bf16_supported(x, weight, None)
         and x.shape[0] <= BF16_GEMM_MAX_M
@@ -2098,7 +2088,7 @@ def kimi3_latent_projection(
             weight,
             out=out,
         )
-    if routed and use_mv(hidden_states, weight):
+    if routed and _use_mv(hidden_states, weight):
         return mv(hidden_states, weight, out)
     if out is None:
         return torch.nn.functional.linear(hidden_states, weight)
@@ -2174,7 +2164,7 @@ def kimi3_mla_qkv_gate_projection(
             else (
                 "gluon_largem_gfx1250"
                 if gfx1250_largem
-                else ("fused" if m <= 32 or use_mv(hidden_states, weight) else "split")
+                else ("fused" if m <= 32 or _use_mv(hidden_states, weight) else "split")
             )
         )
 
@@ -2671,7 +2661,7 @@ def kimi3_shared_situ_projection(
             hidden_states, gate_up_weight, out, beta, linear_beta
         )
 
-    if routed and use_mv(hidden_states, gate_up_weight):
+    if routed and _use_mv(hidden_states, gate_up_weight):
         gate_up = mv(hidden_states, gate_up_weight)
     else:
         gate_up = None
@@ -2804,7 +2794,7 @@ def kimi3_shared_down_projection(
             solution = "gluon_largem_gfx1250"
         else:
             solution = "torch"
-    if routed and use_mv(hidden_states, weight):
+    if routed and _use_mv(hidden_states, weight):
         return mv(hidden_states, weight, out)
     if solution == "triton_gemv":
         if not specialized:
@@ -2969,7 +2959,7 @@ def kimi3_qkvfab_projection(
             and supports_gluon_mm_a16w16_prefill_gfx950(m, output_width, input_width)
         ):
             solution = "gluon_largem"
-        elif specialized or use_mv(hidden_states, weight):
+        elif specialized or _use_mv(hidden_states, weight):
             # Let the registry pick per (M, N, K); unlisted shapes hit torch.mm.
             solution = "mv"
         else:

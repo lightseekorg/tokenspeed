@@ -944,6 +944,7 @@ def test_mm_joint_dispatch_respects_overrides_and_contract(
         _KERNELS_WITH_PDL=set(),
         ShapeCapture=SimpleNamespace(get=lambda: SimpleNamespace(record=record)),
         kernel_scope=scope,
+        _use_mv=lambda *args: False,
     )
     api = _functions(
         KERNEL / "ops/gemm/__init__.py",
@@ -1141,7 +1142,7 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
     api = _functions(
         KERNEL / "ops/gemm/__init__.py",
         None,
-        ("use_mv",),
+        ("_use_mv",),
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
@@ -1151,7 +1152,7 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
             torch_decode_gemv=fallback,
         ),
     )
-    assert api.use_mv(tensor((m, k)), tensor((7168, k))) is expected
+    assert api._use_mv(tensor((m, k)), tensor((7168, k))) is expected
     if fi and m <= 32:
         select.assert_not_called()
 
@@ -1360,7 +1361,6 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
     if kind == "environment":
         monkeypatch.setenv("TOKENSPEED_KERNEL_OVERRIDE_GEMM_MM", "forced")
     mm = Mock(return_value=object())
-    shortcut = Mock(side_effect=AssertionError("override must precede shortcuts"))
     api = _functions(
         RUNTIME / "layers/dense/unquant.py",
         "UnquantizedLinearMethod",
@@ -1368,7 +1368,6 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
         dict(
             kernel_mm=mm,
             resolve_kernel_override=resolve_kernel_override,
-            use_mv=shortcut,
         ),
     )
     x, weight = object(), object()
@@ -1380,7 +1379,6 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
     if numerics == "rl-bitwise":
         expected["override"] = "aok"
     mm.assert_called_once_with(x, weight, **expected)
-    shortcut.assert_not_called()
 
 
 @pytest.mark.parametrize("serving", [False, True])
@@ -1390,7 +1388,7 @@ def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(serving):
     api = _functions(
         KERNEL / "ops/gemm/__init__.py",
         None,
-        ("use_mv", "mv"),
+        ("_use_mv", "mv"),
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
@@ -1404,7 +1402,7 @@ def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(serving):
     )
     x = torch.ones(1, 128, dtype=torch.bfloat16)
     w = torch.ones(32, 128, dtype=torch.bfloat16)
-    assert api.use_mv(x, w) is not serving
+    assert api._use_mv(x, w) is not serving
     used, idle = (fallback, joint) if serving else (joint, fallback)
     assert api.mv(x, w) is used.return_value
     used.assert_called_once_with(x, w, None)
@@ -1446,6 +1444,7 @@ def test_mm_runs_the_joint_bf16_gemm_only_before_serving(serving):
                 get=lambda: SimpleNamespace(record=lambda *args: None)
             ),
             kernel_scope=lambda *args, **kwargs: nullcontext(),
+            _use_mv=lambda *args: False,
         ),
     )
     x = torch.randn(3, 4, dtype=torch.bfloat16)

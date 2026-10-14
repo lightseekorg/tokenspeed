@@ -21,7 +21,6 @@
 
 import torch
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
-from tokenspeed_kernel.ops.gemm import mv, use_mv
 from tokenspeed_kernel.selection import resolve_kernel_override
 from torch.nn.parameter import Parameter
 
@@ -81,8 +80,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if resolve_kernel_override("gemm", "mm", None) is not None:
             return kernel_mm(x, layer.weight, bias=bias)
 
-        if bias is None and use_mv(x, layer.weight):
-            return mv(x, layer.weight)
         if bias is None:
             from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250
 

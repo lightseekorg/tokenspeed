@@ -25,9 +25,10 @@ from dataclasses import astuple
 import pytest
 import torch
 from tokenspeed_kernel import compile_monitor
+from tokenspeed_kernel.ops.gemm import _use_mv
 from tokenspeed_kernel.ops.gemm import flashinfer as fi
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
-from tokenspeed_kernel.ops.gemm import mv, use_mv
+from tokenspeed_kernel.ops.gemm import mv
 from tokenspeed_kernel.ops.gemm._triton.gemv import _rowcta_gemv_kernel
 from utils import assert_no_triton_compile
 
@@ -76,7 +77,7 @@ def test_serving_routes_new_row_counts_away_from_per_m_compiles(warp_splitk):
     with assert_no_triton_compile(_rowcta_gemv_kernel):
         for m in (1, 5, 17, 23):
             rows = x[:m]
-            assert not use_mv(rows, weight)
+            assert not _use_mv(rows, weight)
             expected = (rows.float() @ weight.float().T).to(torch.bfloat16)
             for got in (mv(rows, weight), kernel_mm(rows, weight)):
                 torch.testing.assert_close(got, expected, rtol=2e-2, atol=2e-2)
