@@ -785,6 +785,7 @@ def test_only_dedicated_tasks_declare_gb300():
         "kimi-k3-nvfp4-dp16-four-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
         "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+        "qwen3.8-flash-next-nvfp4-tp4ep4-evalscope-agentic.yaml",
     ]
 
 

@@ -1,5 +1,6 @@
 import json
 import re
+import runpy
 import subprocess
 import textwrap
 from contextlib import nullcontext
@@ -893,25 +894,73 @@ attn_tp4_moe_tp4,16,30.0,24000.0,82.5,3.1
 """
 
 
-def test_extract_perf_summary_rows_parses_csv_block():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_extract_perf_summary_rows_parses_csv_block(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     assert rows is not None
     assert len(rows) == 5
     assert rows[0]["Conc."] == "1"
     assert rows[-1]["Latency (tps/user)"] == "30.0"
-    assert rows[-1]["Throughput (tps/gpu)"] == "24000.0"
+    assert rows[-1][throughput_metric] == "24000.0"
 
 
 def test_extract_perf_summary_rows_returns_none_when_missing():
     assert extract_perf_summary_rows("nothing relevant here") is None
 
 
+@pytest.mark.parametrize(
+    "invalid_values",
+    [{}, {"Output Throughput (tok/s)": "nan"}, {"Failed Requests": 1}],
+)
+def test_qwen_output_throughput_is_reported_per_minute_per_gpu(
+    tmp_path, invalid_values
+):
+    run_dir = tmp_path / "attn_tp4_moe_ep4" / "parallel_1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "benchmark_summary.json").write_text(
+        json.dumps(
+            {
+                "Concurrency": 1,
+                "TPOT (ms)": 10.0,
+                "Total Throughput (tok/s)": 4000.0,
+                "Output Throughput (tok/s)": 120.0,
+                "KV Cache Hit Rate (%)": 0.0,
+                "Failed Requests": 0,
+                **invalid_values,
+            }
+        ),
+        encoding="utf-8",
+    )
+    collector = runpy.run_path(
+        str(
+            Path(__file__).resolve().parents[1]
+            / "agentic_benchmark/Qwen3.8-Flash-Next/tokenspeed/collect_outputs.py"
+        )
+    )
+
+    if invalid_values:
+        with pytest.raises(ValueError):
+            collector["collect"](tmp_path, expected_concurrencies=[1])
+        return
+
+    rows = collector["collect"](tmp_path, expected_concurrencies=[1])
+
+    assert rows[0]["Output Throughput (tok/min/gpu)"] == 1800.0
+
+
 def _command_results_with(rows):
     return [{"perf_summary_rows": rows}]
 
 
-def test_check_perf_reference_passes_when_actual_meets_floor():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_check_perf_reference_passes_when_actual_meets_floor(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     task = {
         "perf_threshold": 0.9,
         "perf_reference": {16: [33.0, 26000.0]},
@@ -920,18 +969,28 @@ def test_check_perf_reference_passes_when_actual_meets_floor():
     assert result is not None
     assert result["passed"] is True
     assert result["failures"] == []
+    assert result["checks"][0][throughput_metric]["actual"] == 24000.0
+    for formatter in (
+        format_perf_reference_table,
+        format_perf_reference_markdown_table,
+    ):
+        assert "24000.00" in "\n".join(formatter(result["checks"]))
 
 
-def test_check_perf_reference_fails_when_metric_below_floor():
-    rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
+@pytest.mark.parametrize(
+    "throughput_metric", ["Throughput (tps/gpu)", "Output Throughput (tok/min/gpu)"]
+)
+def test_check_perf_reference_fails_when_metric_below_floor(throughput_metric):
+    output = PERF_CSV_FIXTURE.replace("Throughput (tps/gpu)", throughput_metric)
+    rows = extract_perf_summary_rows(output)
     task = {
         "perf_threshold": 0.9,
-        "perf_reference": {16: [40.0, 26000.0]},
+        "perf_reference": {16: [33.0, 30000.0]},
     }
     result = check_perf_reference(task, _command_results_with(rows), ["perf"])
     assert result is not None
     assert result["passed"] is False
-    assert any("Latency (tps/user)" in f for f in result["failures"])
+    assert any(throughput_metric in failure for failure in result["failures"])
 
 
 def test_check_perf_reference_reports_missing_row():
@@ -962,7 +1021,7 @@ def test_check_perf_reference_raises_when_no_rows_found():
 def test_check_perf_reference_raises_on_malformed_pair():
     rows = extract_perf_summary_rows(PERF_CSV_FIXTURE)
     task = {"perf_reference": {16: [40.0]}}
-    with pytest.raises(ValueError, match=r"\[tps_user, tps_gpu\]"):
+    with pytest.raises(ValueError, match=r"\[tps_user, throughput_per_gpu\]"):
         check_perf_reference(task, _command_results_with(rows), ["perf"])
 
 

@@ -85,9 +85,6 @@ def _head_layout(**overrides) -> SimpleNamespace:
 
 
 def test_get_drafter_impl_routing():
-    from tokenspeed.runtime.models.deepseek_v4_dspark import (
-        DeepseekV4ForCausalLMDSpark,
-    )
     from tokenspeed.runtime.models.deepseek_v41_dspark import (
         DeepseekV41ForCausalLMDSpark,
     )
@@ -105,10 +102,6 @@ def test_get_drafter_impl_routing():
     )
     assert get_drafter_impl("DFLASH", mock.MagicMock()) is DFlash
     assert get_drafter_impl("DSPARK", mock.MagicMock()) is DSpark
-    assert (
-        get_drafter_impl("DSPARK", mock.MagicMock(spec=DeepseekV4ForCausalLMDSpark))
-        is DeepseekV4DSpark
-    )
     assert (
         get_drafter_impl("DSPARK", mock.MagicMock(spec=DeepseekV41ForCausalLMDSpark))
         is DeepseekV41DSpark
@@ -1119,19 +1112,13 @@ def test_ordinary_block_models_declare_capture_setup(family):
     target.set_dflash_layers_to_capture.assert_called_once_with([2, 7])
 
 
-@pytest.mark.parametrize("family", ["v4", "v41"])
-def test_deepseek_block_models_configure_capture_through_common_setup(
-    monkeypatch, family
-):
-    from tokenspeed.runtime.models.deepseek_v4_dspark import DeepseekV4ForCausalLMDSpark
+def test_deepseek_block_models_configure_capture_through_common_setup(monkeypatch):
     from tokenspeed.runtime.models.deepseek_v41_dspark import (
         DeepseekV41ForCausalLMDSpark,
     )
     from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 
-    model_class = (
-        DeepseekV4ForCausalLMDSpark if family == "v4" else DeepseekV41ForCausalLMDSpark
-    )
+    model_class = DeepseekV41ForCausalLMDSpark
     draft = model_class.__new__(model_class)
     torch.nn.Module.__init__(draft)
     draft.model = SimpleNamespace(target_layer_ids=(10, 20))
@@ -1155,7 +1142,7 @@ def test_deepseek_block_models_configure_capture_through_common_setup(
     )
     draft.lm_head = object()
     target.logits_processor = SimpleNamespace(tp_group=(0, 1))
-    drafter_class = DeepseekV4DSpark if family == "v4" else DeepseekV41DSpark
+    drafter_class = DeepseekV41DSpark
     drafter = drafter_class.__new__(drafter_class)
     drafter.draft_model = draft
     drafter.wire_target(target)
