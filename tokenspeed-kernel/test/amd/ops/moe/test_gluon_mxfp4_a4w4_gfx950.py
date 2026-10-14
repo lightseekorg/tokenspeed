@@ -150,11 +150,6 @@ def _torch_reference(x, w, topk_weights, topk_ids):
     return out
 
 
-def test_selected_for_dynamic_mxfp4_silu() -> None:
-    plan = _plan(None)
-    assert plan["apply_kernel_name"] == "gluon_mxfp4_a4w4_moe_apply_gfx950"
-
-
 # 1-64 rows run the decode blocks; 300 and 1100 the LDS-staged larger blocks.
 @pytest.mark.parametrize("m", [1, 5, 64, 300, 1100])
 def test_matches_reference(m: int) -> None:

@@ -3462,6 +3462,52 @@ def test_gfx950_softmax_topk_selects_gluon(
     assert too_many_experts.name == "torch_softmax_topk"
 
 
+def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """Dynamic-MXFP4 SiLU experts take the gfx950 A4W4 kernel; plans it does
+    not cover keep their previous kernels."""
+    if KernelRegistry.get().get_by_name("gluon_mxfp4_a4w4_moe_apply_gfx950") is None:
+        pytest.skip("gfx950 Gluon A4W4 MoE is unavailable")
+
+    def plan(**overrides):
+        # Qwen3.8-Flash-Next TP2 experts.
+        kwargs = dict(
+            input_dtype=torch.bfloat16,
+            activation="silu",
+            routing_mode="precomputed_topk",
+            ispp=320,
+            hidden=2560,
+            internal_activation_dtype="mxfp4",
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=False,
+            combine_order="rank",
+        )
+        return kernel_moe_plan("mxfp4", **{**kwargs, **overrides})
+
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        a4w4 = plan()
+        with_bias = plan(with_bias=True)
+        bf16_activations = plan(internal_activation_dtype="input")
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        a4w4,
+        apply="gluon_mxfp4_a4w4_moe_apply_gfx950",
+        preprocessor="gluon_mxfp4_a4w4_moe_weights_gfx950",
+    )
+    assert with_bias["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
+    assert bf16_activations["apply_kernel_name"] == "gluon_mxfp4_precomputed_moe_apply"
+
+
 def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:
     registry = KernelRegistry.get()
     real_platform = Platform.get()
