@@ -307,6 +307,8 @@ if current_platform().is_amd:
 
     # Packed E2M1 weight in 16x16 MFMA-tile order (preshuffle_mxfp4_weight).
     MXFP4_LINEAR_MFMA_LAYOUT = "mfma_16x16"
+    # The kernels address the weight with 32-bit buffer offsets.
+    _MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS = 2**31 - 1
 
     def prepare_mxfp4_linear_mfma_weight(weight: torch.Tensor) -> torch.Tensor:
         """Reorder a checkpoint ``[N, K/2]`` MXFP4 weight for the gfx950 kernels."""
@@ -323,6 +325,7 @@ if current_platform().is_amd:
         traits={
             "n_align": frozenset({16}),
             "k_align": frozenset({64}),
+            "weight_elements_max": frozenset({_MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS}),
             "weight_layout": frozenset({MXFP4_LINEAR_MFMA_LAYOUT}),
         },
     )
@@ -347,6 +350,7 @@ if current_platform().is_amd:
         traits={
             "n_align": frozenset({32}),
             "k_align": frozenset({64}),
+            "weight_elements_max": frozenset({_MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS}),
             "weight_layout": frozenset({MXFP4_LINEAR_MFMA_LAYOUT}),
         },
     )

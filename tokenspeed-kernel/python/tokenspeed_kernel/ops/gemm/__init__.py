@@ -1248,7 +1248,9 @@ class Mxfp4LinearWeight:
 
 
 def _mxfp4_linear_traits(n: int, k: int, layout: str | None) -> dict[str, object]:
-    traits: dict[str, object] = {"n": n, "k": k}
+    # ``weight_elements`` lets kernels bound the weight size (for example by
+    # 32-bit buffer offsets) at selection, before the weight is prepared.
+    traits: dict[str, object] = {"n": n, "k": k, "weight_elements": n * k}
     if layout is not None:
         traits["weight_layout"] = layout
     return traits
