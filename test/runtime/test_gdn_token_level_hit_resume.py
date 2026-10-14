@@ -32,15 +32,20 @@ from __future__ import annotations
 
 import os
 import sys
-import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from test.runtime.test_gdn_state_paging import (
+    _ContractPool,
+    _extend_kwargs,
+    _mamba_config_pair,
+)
+
 from ci_system.ci_register import register_cuda_ci
-from test_gdn_state_paging import _ContractPool, _extend_kwargs, _mamba_config_pair
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
@@ -84,13 +89,13 @@ def _scheduler(ts, make_config):
     )
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class GdnTokenLevelHitResumeTest(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
+class TestGdnTokenLevelHitResumeTest:
     H = 16
     D = 128
     WIDTH = 4
 
-    def setUp(self):
+    def setup_method(self):
         try:
             import tokenspeed_scheduler as ts
             from tokenspeed_kernel.ops.attention.gdn.triton import (
@@ -105,7 +110,7 @@ class GdnTokenLevelHitResumeTest(unittest.TestCase):
             )
             from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs tokenspeed_scheduler + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs tokenspeed_scheduler + tokenspeed_kernel: {exc}")
         self.ts = ts
         self.mamba = mamba
         self.ForwardMode = ForwardMode
@@ -284,7 +289,7 @@ class GdnTokenLevelHitResumeTest(unittest.TestCase):
             cold_decodes = []
             for step in range(DECODES):
                 op, output = self._forward(scheduler, backend)
-                self.assertEqual(op.num_extends(), 0)
+                assert (op.num_extends()) == (0)
                 cold_decodes.append(output)
                 self._land(scheduler, "a", 1000 + step)
             self._finish(scheduler, "a")
@@ -297,7 +302,7 @@ class GdnTokenLevelHitResumeTest(unittest.TestCase):
             chunks = []
             while True:
                 short_prefill, short_output = self._forward(scheduler, backend)
-                self.assertEqual(short_prefill.num_extends(), 1)
+                assert (short_prefill.num_extends()) == (1)
                 begin = int(short_prefill.extend_prefix_lens[0])
                 end = begin + int(short_prefill.input_lengths[0])
                 torch.testing.assert_close(
@@ -310,45 +315,45 @@ class GdnTokenLevelHitResumeTest(unittest.TestCase):
                 self.advance_scheduler(
                     scheduler, [self.make_extend_result_event("c", [])]
                 )
-            self.assertEqual(chunks[0], (0, 4 * PAGE))
+            assert (chunks[0]) == ((0, 4 * PAGE))
             published = int(
                 short_prefill.block_tables_arrays()["linear_attention"][0][1]
             )
             published_state = (conv[published].clone(), recurrent[published].clone())
             early_decode, _ = self._forward(scheduler, backend)
-            self.assertEqual(early_decode.num_extends(), 0)
+            assert (early_decode.num_extends()) == (0)
             early_row = [
                 int(v)
                 for v in early_decode.block_tables_arrays()["linear_attention"][0]
             ]
-            self.assertEqual(early_row[0], published)
-            self.assertNotEqual(early_row[1], published)
+            assert (early_row[0]) == (published)
+            assert (early_row[1]) != (published)
             self._land(scheduler, "c", 2000)
             self._finish(scheduler, "c")
             torch.cuda.synchronize()
             # The decode read the published block and wrote its own.
-            self.assertTrue(torch.equal(conv[published], published_state[0]))
-            self.assertTrue(torch.equal(recurrent[published], published_state[1]))
-            self.assertGreater(recurrent[early_row[1]].abs().max().item(), 0.0)
+            assert torch.equal(conv[published], published_state[0])
+            assert torch.equal(recurrent[published], published_state[1])
+            assert (recurrent[early_row[1]].abs().max().item()) > (0.0)
 
             # X again: resumes at |X| - 1 from the block X[:-1]'s prefill wrote.
             self._submit(scheduler, "b", X, DECODES)
             hit, resumed = self._forward(scheduler, backend)
-            self.assertEqual(list(hit.extend_prefix_lens), [PROMPT - 1])
-            self.assertEqual(list(hit.input_lengths), [1])
+            assert (list(hit.extend_prefix_lens)) == ([PROMPT - 1])
+            assert (list(hit.input_lengths)) == ([1])
             row = [int(v) for v in hit.block_tables_arrays()["linear_attention"][0]]
-            self.assertEqual(row[0], published)
-            self.assertNotEqual(row[1], published)
+            assert (row[0]) == (published)
+            assert (row[1]) != (published)
             torch.cuda.synchronize()
             # The last prompt token's output and the state after it agree with
             # the cold run to the chunked kernel's rounding.
             difference = (resumed.float() - cold_output[:, PROMPT - 1 :].float()).abs()
-            self.assertLess(difference.mean().item(), 1e-3)
-            self.assertLess(difference.max().item(), 1e-1)
-            self.assertTrue(torch.equal(conv[row[1]], cold_state[0]))
+            assert (difference.mean().item()) < (1e-3)
+            assert (difference.max().item()) < (1e-1)
+            assert torch.equal(conv[row[1]], cold_state[0])
             state_difference = (recurrent[row[1]].float() - cold_state[1].float()).abs()
-            self.assertLess(state_difference.mean().item(), 1e-3)
-            self.assertLess(state_difference.max().item(), 5e-2)
+            assert (state_difference.mean().item()) < (1e-3)
+            assert (state_difference.max().item()) < (5e-2)
             self._land(scheduler, "b", 1000)
 
             # Its first decode reads the prompt-end state from slot 0: the
@@ -356,16 +361,16 @@ class GdnTokenLevelHitResumeTest(unittest.TestCase):
             # published under that hash by the cold run -- that canonical
             # block, which the publication at this admission dedups to.
             decode, output = self._forward(scheduler, backend)
-            self.assertEqual(decode.num_extends(), 0)
+            assert (decode.num_extends()) == (0)
             decode_row = [
                 int(v) for v in decode.block_tables_arrays()["linear_attention"][0]
             ]
-            self.assertIn(decode_row[0], (row[1], cold_state_block))
-            self.assertNotIn(decode_row[1], (row[1], cold_state_block, published))
+            assert (decode_row[0]) in ((row[1], cold_state_block))
+            assert (decode_row[1]) not in ((row[1], cold_state_block, published))
             difference = (output.float() - cold_decodes[0].float()).abs()
-            self.assertLess(difference.mean().item(), 1e-3)
-            self.assertLess(difference.max().item(), 1e-1)
+            assert (difference.mean().item()) < (1e-3)
+            assert (difference.max().item()) < (1e-1)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
