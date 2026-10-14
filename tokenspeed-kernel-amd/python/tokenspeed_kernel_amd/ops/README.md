@@ -99,7 +99,8 @@ Decode GEMMs are weight-bandwidth bound, so the decode kernel uses 16- to
 output alone has too few tiles to fill the GPU. When a program's K range has at
 most eight tiles, it can instead give each tile its own LDS buffer and issue
 every copy up front, waiting on one memory round trip rather than one per
-refilled buffer (the Qwen hyper-connection mix-up has K = 320). Each split
+refilled buffer (the Qwen MTP fc splits K into eight 64-wide tiles per
+program). Each split
 writes an FP32 partial through to memory, waits for its stores, and bumps a
 per-tile counter with a relaxed atomic; the last split to arrive sums all
 partials in split order with cache-bypassing loads, writes C, and resets the

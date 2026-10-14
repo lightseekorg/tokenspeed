@@ -1776,31 +1776,8 @@ _DECODE_CONFIGS: dict[
         32: (32, 32, 256, 2, 2, 3, 2, 1),
         64: (32, 32, 256, 2, 2, 3, 1, 8),
     },
-    # Qwen3.8-Flash-Next TP2 per-rank projections.
-    # Hyper-connection mix-down + inject (320 + 4 rows over the 4 x 2560 stream).
-    (324, 10240): {
-        4: (16, 64, 128, 1, 4, 5, 16, 1),
-        8: (16, 64, 128, 1, 4, 5, 16, 1),
-        16: (16, 64, 128, 1, 4, 5, 16, 1),
-        32: (32, 32, 256, 2, 2, 4, 10, 1),
-        64: (32, 32, 256, 2, 2, 4, 10, 8),
-    },
-    # Final hyper-connection mixer: mix-down only.
-    (320, 10240): {
-        4: (16, 64, 128, 1, 4, 5, 16, 1),
-        8: (16, 64, 128, 1, 4, 5, 16, 1),
-        16: (16, 64, 128, 1, 4, 5, 16, 1),
-        32: (32, 32, 512, 2, 2, 2, 10, 1),
-        64: (32, 32, 512, 2, 2, 2, 10, 8),
-    },
-    # Hyper-connection mix-up: every K tile in flight at once.
-    (10240, 320): {
-        4: (16, 64, 64, 1, 4, 5, 1, 1),
-        8: (16, 64, 64, 1, 4, 5, 1, 1),
-        16: (16, 64, 64, 1, 4, 5, 1, 1),
-        32: (32, 64, 64, 1, 4, 5, 1, 1),
-        64: (64, 64, 64, 4, 1, 5, 1, 1),
-    },
+    # Qwen3.8-Flash-Next TP2 per-rank projections. Its hyper-connection mix
+    # GEMMs run inside gluon_hyperconnection_mix_gfx950 at decode sizes.
     # Gated DeltaNet out_proj and attention o_proj.
     (2560, 3072): {
         16: (16, 64, 256, 1, 4, 3, 4, 1),

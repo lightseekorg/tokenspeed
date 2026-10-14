@@ -286,20 +286,16 @@ def test_general_triton_mix_projection_storage(
         * 0.01
     )
     scale = 1.0 / hc_count
-    import tokenspeed_kernel.ops.residual.triton as residual_triton
-
-    # Record at the path's GEMM entry, which may take the decode GEMM
-    # instead of F.linear for small row counts.
-    dense_linear = residual_triton._dense_linear
+    linear = torch.nn.functional.linear
     projection_widths = []
 
-    def record_linear(value, weight):
+    def record_linear(value, weight, *args, **kwargs):
         if not projection_widths:
             assert weight.data_ptr() == projection.data_ptr()
         projection_widths.append(weight.shape[0])
-        return dense_linear(value, weight)
+        return linear(value, weight, *args, **kwargs)
 
-    monkeypatch.setattr(residual_triton, "_dense_linear", record_linear)
+    monkeypatch.setattr(torch.nn.functional, "linear", record_linear)
     actual = gated_residual_mix(
         normalized,
         projection,

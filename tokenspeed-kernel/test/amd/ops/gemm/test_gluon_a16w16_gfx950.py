@@ -490,18 +490,17 @@ def test_decode_add3_row_count_does_not_recompile() -> None:
             run(rows)
 
 
-# Qwen3.8-Flash-Next TP2 decode shapes: split-K with N not a multiple of
-# BLOCK_N (hyper-connection mix-down), every K tile in flight (mix-up), and
-# single-pass tiles, each at a ragged row count inside its bucket.
+# Qwen3.8-Flash-Next TP2 decode shapes, each at a ragged row count inside
+# its bucket: split-K over every K tile in flight (32-row MTP fc, indexer),
+# 64-row tiles (router), and split-K with a few buffers.
 _QWEN38_DECODE_CASES = [
-    pytest.param((61, 324, 10240), id="hc-down-splitk-ragged-n"),
-    pytest.param((5, 324, 10240), id="hc-down-splitk-small-m"),
-    pytest.param((13, 10240, 320), id="hc-up-all-tiles-in-flight"),
-    pytest.param((50, 10240, 320), id="hc-up-64-row-tile"),
     pytest.param((20, 2560, 3072), id="out-proj"),
-    pytest.param((30, 512, 2560), id="router"),
+    pytest.param((30, 512, 2560), id="router-all-tiles-in-flight"),
+    pytest.param((50, 512, 2560), id="router-64-row-tile"),
     pytest.param((3, 640, 2560), id="indexer"),
+    pytest.param((27, 640, 2560), id="indexer-all-tiles-in-flight"),
     pytest.param((16, 2560, 2560), id="mtp-fc"),
+    pytest.param((21, 2560, 2560), id="mtp-fc-all-tiles-in-flight"),
 ]
 
 
@@ -519,7 +518,7 @@ def test_qwen38_decode_gemm_matches_reference(shape: tuple[int, int, int]) -> No
 
 def test_qwen38_decode_row_count_does_not_recompile() -> None:
     torch.manual_seed(0)
-    n, k = 324, 10240
+    n, k = 512, 2560
     a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
 
@@ -534,18 +533,18 @@ def test_qwen38_decode_row_count_does_not_recompile() -> None:
             run(rows)
 
 
-def test_qwen38_coalesced_store_masks_strided_out() -> None:
-    # The 64x64 mix-up tile stores through the coalesced row layout; a padded
-    # row stride and ragged rows must stay inside the output view.
+def test_medium_coalesced_store_masks_strided_out() -> None:
+    # 128x128 medium tiles store through the coalesced row layout; a padded
+    # row stride must stay inside the output view.
     torch.manual_seed(0)
-    m, n, k = 50, 10240, 320
+    m, n, k = 768, 3584, 7168
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
     backing = torch.full((m, n + 8), 7.0, device="cuda", dtype=torch.bfloat16)
     out = backing[:, :n]
 
-    actual = launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.bfloat16, out=out)
+    actual = launch_gluon_mm_a16w16_medium_gfx950(a, b, torch.bfloat16, out=out)
 
     assert actual is out
-    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=_RTOL)
     assert torch.all(backing[:, n:] == 7.0)
