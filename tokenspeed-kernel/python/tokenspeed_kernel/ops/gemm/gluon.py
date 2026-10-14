@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.gemm import KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE
 from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -548,8 +549,8 @@ if platform.is_cdna5:
         priority=Priority.SPECIALIZED,
         traits={
             "tokens": frozenset({1}),
-            "input_size": frozenset({7168}),
-            "output_size": frozenset({3648, 6288}),
+            "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
+            "output_size": frozenset({3648, KIMI3_QKVFAB_SIZE}),
             "num_blocks": frozenset(range(1, 12)),
             "inputs_contiguous": frozenset({True}),
             "gfx1250_linear_attnres_enabled": frozenset({True}),
@@ -590,8 +591,8 @@ if platform.is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "tokens": frozenset({1, 2, 4}),
-            "input_size": frozenset({7168}),
-            "output_size": frozenset({3648, 6288}),
+            "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
+            "output_size": frozenset({3648, KIMI3_QKVFAB_SIZE}),
             "num_blocks": frozenset(range(1, 12)),
             "inputs_contiguous": frozenset({True}),
         },

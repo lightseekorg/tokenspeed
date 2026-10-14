@@ -126,16 +126,13 @@ def _kimi3_shared_situ_projection_gemv_kernel(
 def kimi3_projection_gemv(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
-    *,
-    out: torch.Tensor | None = None,
-    config: tuple[int, int, int, int] | None = None,
+    out: torch.Tensor | None,
+    config: tuple[int, int, int, int],
 ) -> torch.Tensor:
     m, k = hidden_states.shape
     n = weight.shape[0]
     if out is None:
         out = hidden_states.new_empty((m, n))
-    if config is None:
-        config = (2, 1024, 4, 0) if (k, n) == (7168, 3584) else (16, 512, 16, 1)
     block_n, block_k, num_warps, waves_per_eu = config
     _kimi3_projection_gemv_kernel[(triton.cdiv(n, block_n), m)](
         hidden_states,
@@ -161,15 +158,17 @@ def kimi3_shared_situ_projection_gemv(
     beta: float,
     linear_beta: float | None,
 ) -> torch.Tensor:
+    k = hidden_states.shape[1]
+    n = gate_up_weight.shape[0] // 2
     block_n, block_k, num_warps = 4, 1024, 4
-    _kimi3_shared_situ_projection_gemv_kernel[(triton.cdiv(768, block_n),)](
+    _kimi3_shared_situ_projection_gemv_kernel[(triton.cdiv(n, block_n),)](
         hidden_states,
         gate_up_weight,
         out,
         float(beta),
         1.0 if linear_beta is None else float(linear_beta),
-        K=7168,
-        N=768,
+        K=k,
+        N=n,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         HAS_LINEAR_BETA=linear_beta is not None,

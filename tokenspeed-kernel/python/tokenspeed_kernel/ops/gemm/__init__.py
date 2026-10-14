@@ -2147,6 +2147,11 @@ def kimi3_latent_projection(
             hidden_states,
             weight,
             out=out,
+            config=(
+                (2, 1024, 4, 0)
+                if (k, n) == (KIMI3_HIDDEN_SIZE, KIMI3_LATENT_SIZE)
+                else (16, 512, 16, 1)
+            ),
         )
     if solution == "gluon_smallm":
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
