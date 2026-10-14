@@ -55,10 +55,11 @@ _owned_arenas: WeakKeyDictionary[object, list[torch.Tensor]] = WeakKeyDictionary
 
 # Slices start on this many bytes.
 _ALIGN = 256
-# A session sizes its arena at twice the most any earlier session used, within
-# these bounds; the first gets the larger.
-_MIN_ARENA_BYTES = 4096
-_FIRST_ARENA_BYTES = 1 << 20
+# A session's arena holds at least this many bytes (1024 slices; a Qwen3.8 TP2
+# decode graph takes 157), or twice the most any earlier session asked for.
+# The floor keeps the size independent of capture order: a small graph captured
+# first must not shrink the arena of a larger one after it.
+_MIN_ARENA_BYTES = 256 << 10
 
 
 class _Arena:
@@ -144,10 +145,7 @@ def capture_session(owner: object) -> Iterator[None]:
     if not torch.cuda.is_available():
         yield
         return
-    if _sessions.peak_bytes:
-        num_bytes = max(_MIN_ARENA_BYTES, 2 * _sessions.peak_bytes)
-    else:
-        num_bytes = _FIRST_ARENA_BYTES
+    num_bytes = max(_MIN_ARENA_BYTES, 2 * _sessions.peak_bytes)
     arena = _Arena(num_bytes, torch.device("cuda", torch.cuda.current_device()))
     _sessions.arenas.append(arena)
     try:

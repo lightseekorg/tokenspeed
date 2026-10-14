@@ -129,9 +129,10 @@ def test_session_state_never_reuses_memory_freed_earlier_in_the_capture() -> Non
 
 
 def test_session_overflow_zeroes_inside_the_graph(monkeypatch) -> None:
-    # A small earlier peak sizes the arena at its 4 KiB floor; restoring the
-    # peak afterwards keeps later sessions' arenas independent of this test.
-    monkeypatch.setattr(workspace._sessions, "peak_bytes", 1)
+    # A 4 KiB arena; restoring the peak afterwards keeps later sessions'
+    # arenas independent of this test.
+    monkeypatch.setattr(workspace, "_MIN_ARENA_BYTES", 4096)
+    monkeypatch.setattr(workspace._sessions, "peak_bytes", 0)
     fits = torch.empty(64, dtype=torch.int32, device=_DEVICE)
     overflows = torch.empty(2048, dtype=torch.int32, device=_DEVICE)
     stream = torch.cuda.Stream()
