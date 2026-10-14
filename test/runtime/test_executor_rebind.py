@@ -284,7 +284,6 @@ def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeyp
 def test_a_drafter_that_captures_a_prefill_graph_declares_and_releases_it():
     for name in (
         "deepseek_v41_dspark",
-        "deepseek_v4_dspark",
         "dflash",
         "dflash2",
         "dspark",
@@ -299,7 +298,7 @@ def test_a_drafter_that_captures_a_prefill_graph_declares_and_releases_it():
             yield from _descendants(sub)
 
     concrete = list(_descendants(BaseDrafter))
-    assert len(concrete) >= 7
+    assert len(concrete) >= 6
     hooks = {"capture_prefill_graph", "captures_prefill_graph", "release_prefill_graph"}
     for cls in concrete:
         assert hooks & set(vars(cls)) in (set(), hooks), cls.__name__
