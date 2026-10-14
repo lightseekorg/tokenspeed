@@ -61,7 +61,7 @@ _autotune_process_group: dist.ProcessGroup | None = None
 
 @contextlib.contextmanager
 def _reuse_autotune_cache():
-    """Reuse compatible FlashInfer entries regardless of measurement policy."""
+    """Reuse compatible persisted entries regardless of measurement policy."""
     # Legacy bundled entries are not validated or included in saved configs.
     if os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE") == "1":
         yield
@@ -69,7 +69,16 @@ def _reuse_autotune_cache():
     AutoTuner = _autotuner.AutoTuner
     original_search = AutoTuner.search_cache
 
-    def search(tuner, custom_op, runners, input_shapes, tuning_config, inputs=None):
+    def search(
+        tuner,
+        custom_op,
+        runners,
+        input_shapes,
+        tuning_config,
+        inputs=None,
+        *,
+        require_profiling_policy: bool = False,
+    ):
         with tuner._lock:
             # FI 0.7 skips persisted entries for cold-L2 tuning. Use serving
             # lookup rules, then restore tuning so cache misses still profile.
@@ -83,6 +92,7 @@ def _reuse_autotune_cache():
                     input_shapes,
                     tuning_config,
                     inputs=inputs,
+                    require_profiling_policy=require_profiling_policy,
                 )
             finally:
                 tuner.is_tuning_mode = was_tuning
