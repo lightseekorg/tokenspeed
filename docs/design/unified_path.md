@@ -235,9 +235,11 @@ the ordinary collectives. Fusion is enabled automatically for eligible TP2 and
 TP4 projections when the maximum physical owner count is at least 64.
 Batch-invariant collectives retain the ordinary path. Row buckets select the
 prepared kernel variant independently of that threshold. Buckets are 32, 64,
-then multiples of the 128-row GEMM tile. For larger batches, rounding adds fewer
-than 128 rows beyond the maximum owner count and keeps owner boundaries
-tile-aligned. Unequal owners still pad to the shared bucket.
+then 128-row steps through 2048. Above 2048, each power-of-two range has eight
+equal intervals: 256-row steps through 4096, 512-row steps through 8192, and so
+on. This bounds padding overhead below 12.5% above 2048 and makes the number of
+prepared variants grow logarithmically. All owner boundaries remain aligned to
+the 128-row GEMM tile. Unequal owners still pad to the shared bucket.
 All variants up to the rounded workspace capacity compile and warm before use;
 actual owner counts remain runtime inputs, including during graph replay.
 Preparation allocates fused state only for TP sizes enabled in automatic dispatch

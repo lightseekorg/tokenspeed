@@ -109,7 +109,7 @@ def _worker(rank, world_size, rendezvous):
             linear.weight_scale_inv.copy_(
                 torch.rand_like(linear.weight_scale_inv) * 0.005 + 0.005
             )
-        prepare_dp_linear_communication(model, 2048, torch.bfloat16, backend)
+        prepare_dp_linear_communication(model, 4097, torch.bfloat16, backend)
         models.append(model)
     baseline, candidate = models
     workspace = candidate[0].projection_workspace
@@ -118,7 +118,7 @@ def _worker(rank, world_size, rendezvous):
     if world_size == 8:
         # TP8 is available only through an explicitly prepared native state.
         state = create_fused_tp_projection_state(
-            dist.group.WORLD, device, 2048, 7168, candidate[0].output_size
+            dist.group.WORLD, device, 4097, 7168, candidate[0].output_size
         )
     else:
         assert state is not None
@@ -169,6 +169,11 @@ def _worker(rank, world_size, rendezvous):
         1024,
         1025,
         2048,
+        2049,
+        2304,
+        2305,
+        4096,
+        4097,
     ]
     count_cases = [tuple([rows] * world_size) for rows in equal_counts]
     count_cases += [
@@ -213,8 +218,13 @@ def _worker(rank, world_size, rendezvous):
         assert int(state.ready[0]) - epoch == (2 if max(counts) > 0 else 0)
         if max(counts) > 0:
             rows = max(counts)
+            step = 128
+            while rows > 16 * step:
+                step *= 2
             bucket = (
-                32 if rows <= 32 else 64 if rows <= 64 else (rows + 127) // 128 * 128
+                32
+                if rows <= 32
+                else 64 if rows <= 64 else (rows + step - 1) // step * step
             )
             gathered, _ = baseline[0].comm_backend.projection_all_gather(
                 x, rows, False, baseline[0].projection_workspace
@@ -251,6 +261,9 @@ def _worker(rank, world_size, rendezvous):
         ((641, 768, 129, 0), False),
         ((1025, 1024, 0, 1), False),
         ((2048, 1536, 0, 1), False),
+        ((2049, 2304, 0, 129), False),
+        ((2305, 2048, 1, 0), False),
+        ((4097, 4096, 0, 1), False),
     )
     graph_cases = tuple(
         (counts_for_group(counts), native) for counts, native in graph_cases
@@ -336,6 +349,7 @@ def _worker(rank, world_size, rendezvous):
         (32, (32,) * world_size, 1, 1),
         (64, (64,) * world_size, 2, 0),
         (640, counts_for_group((513, 640, 0, 129)), 2, 0),
+        (2305, counts_for_group((2305, 2048, 1, 0)), 1, 1),
     ):
         prepare_dp_linear_communication(
             candidate, capacity, torch.bfloat16, AutoBackend()

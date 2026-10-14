@@ -38,7 +38,9 @@ def _row_bucket(rows: int) -> int:
         return 32
     if rows <= 64:
         return 64
-    return (rows + 127) // 128 * 128
+    # Eight intervals per power-of-two range above 2048 bound startup work.
+    step = max(128, 1 << max(0, (rows - 1).bit_length() - 4))
+    return (rows + step - 1) // step * step
 
 
 class FusedTPProjectionState:
@@ -51,8 +53,8 @@ class FusedTPProjectionState:
         input_size: Full input channel count, divisible by 128.
         output_size: Padded output width, divisible by group size times 128.
 
-    Row buckets of 32, 64, and multiples of 128 share storage and epochs and
-    compile before use.
+    Tile-aligned row buckets share storage and epochs and compile before use.
+    Above 2048 rows, bucket spacing grows with capacity to bound compilation.
     Sequential layers share this storage, but supply their own weights to run.
     Concurrent models/streams require separate states. No layer weight or final
     output pointer is retained. Call close collectively after destroying graphs.
@@ -132,6 +134,9 @@ class FusedTPProjectionState:
         # Every bucket addresses the same allocations with its own logical
         # row stride. Stream order and the final peer acknowledgements protect
         # those views when consecutive calls use different row buckets.
+        buckets = [32]
+        while buckets[-1] < capacity:
+            buckets.append(_row_bucket(buckets[-1] + 1))
         self.row_views = {
             rows: (
                 from_dlpack(
@@ -162,8 +167,7 @@ class FusedTPProjectionState:
                     ),
                 ),
             )
-            for rows in (32, 64, *range(128, capacity + 1, 128))
-            if rows <= capacity
+            for rows in buckets
         }
         self.peer_ready, self.peer_ack, self.peer_input_flags = (
             tuple(from_dlpack(t, assumed_align=16) for t in peers)
