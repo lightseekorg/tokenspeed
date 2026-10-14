@@ -34,9 +34,10 @@ backups and layerwise load fences for L2, the slot-state image for the pool
 
 from __future__ import annotations
 
+import re
 import threading
 from collections.abc import Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import psutil
@@ -78,9 +79,24 @@ def new_cache_stream(priority: int | None):
 
 
 _PROC_SELF_CGROUP = Path("/proc/self/cgroup")
-_CGROUP_MOUNT = Path("/sys/fs/cgroup")
+_PROC_SELF_MOUNTINFO = Path("/proc/self/mountinfo")
 # A cgroup v1 without a limit reports a value near 2**63 instead of "max".
 _CGROUP_V1_UNLIMITED = 1 << 62
+# Per cgroup version: the limit files (the tightest applies), the usage file,
+# and the memory.stat keys of reclaimable file-backed pages. v1's total_
+# counters include descendants, like its usage_in_bytes.
+_CGROUP_MEMORY_FILES = {
+    "v2": (
+        ("memory.max", "memory.high"),
+        "memory.current",
+        ("active_file", "inactive_file"),
+    ),
+    "v1": (
+        ("memory.limit_in_bytes",),
+        "memory.usage_in_bytes",
+        ("total_active_file", "total_inactive_file"),
+    ),
+}
 
 
 def _read_cgroup_int(path: Path) -> int | None:
@@ -92,7 +108,7 @@ def _read_cgroup_int(path: Path) -> int | None:
     return None if value == "max" else int(value)
 
 
-def _cgroup_page_cache(directory: Path, keys: tuple[str, str]) -> int:
+def _cgroup_page_cache(directory: Path, keys: tuple[str, ...]) -> int:
     """File-backed pages charged to the cgroup, which the kernel can reclaim."""
     try:
         lines = (directory / "memory.stat").read_text().splitlines()
@@ -102,65 +118,90 @@ def _cgroup_page_cache(directory: Path, keys: tuple[str, str]) -> int:
     return sum(int(stat.get(key, 0)) for key in keys)
 
 
-def _own_cgroup_dir(controller_root: Path, path: str) -> Path:
-    """This process's directory under ``controller_root``.
+def _mountinfo_path(field: str) -> str:
+    """A mountinfo path field, with its octal escapes (``\\040``) decoded."""
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), field)
 
-    Inside a container the mount is usually the container's own cgroup, so
-    the host-side path from ``/proc/self/cgroup`` does not exist under it.
+
+def _memory_cgroup_dirs() -> list[tuple[str, Path, Path]]:
+    """This process's memory cgroup directories, one per mounted version.
+
+    Each entry is ``(version, directory, mount)``. ``/proc/self/cgroup``
+    names the process's cgroup relative to the hierarchy root, and each
+    mountinfo entry says which subtree of that hierarchy is mounted where:
+    in a container the mount usually is the container's own cgroup, and
+    under a cgroup namespace the process's path is relative to it.
     """
-    directory = controller_root / path.lstrip("/")
-    return directory if directory.is_dir() else controller_root
+    try:
+        cgroup_lines = _PROC_SELF_CGROUP.read_text().splitlines()
+        mount_lines = _PROC_SELF_MOUNTINFO.read_text().splitlines()
+    except OSError:
+        return []
+    paths = {}
+    for line in cgroup_lines:
+        _, controllers, path = line.split(":", 2)
+        if not controllers:
+            paths["v2"] = PurePosixPath(path)
+        elif "memory" in controllers.split(","):
+            paths["v1"] = PurePosixPath(path)
+
+    dirs = []
+    for line in mount_lines:
+        fields, _, fs_fields = line.partition(" - ")
+        fs_type, _, super_options = (fs_fields.split() + ["", "", ""])[:3]
+        if fs_type == "cgroup2":
+            version = "v2"
+        elif fs_type == "cgroup" and "memory" in super_options.split(","):
+            version = "v1"
+        else:
+            continue
+        if version not in paths:
+            continue
+        mount_root = PurePosixPath(_mountinfo_path(fields.split()[3]))
+        mount = Path(_mountinfo_path(fields.split()[4]))
+        path = paths[version]
+        if path.is_relative_to(mount_root):
+            relative = path.relative_to(mount_root)
+        elif mount_root != PurePosixPath("/"):
+            # Under a cgroup namespace the path is relative to the mount.
+            relative = path.relative_to("/")
+        else:
+            continue
+        directory = mount / relative
+        if ".." not in relative.parts and directory.is_dir():
+            dirs.append((version, directory, mount))
+    return dirs
 
 
 def cgroup_memory_headroom() -> tuple[int, str] | None:
     """Memory this process's cgroups still allow, and the cgroup that binds.
 
     Takes the tightest limit over this process's memory cgroup and its
-    ancestors (a container, a Slurm job and its step can each set one).
-    Usage counts reclaimable page cache as free, as ``MemAvailable`` does:
-    right after an earlier run the cache alone can fill most of the limit.
+    ancestors up to the mount (a container, a Slurm job and its step can
+    each set one), on every cgroup version mounted. Usage counts reclaimable
+    page cache as free, as ``MemAvailable`` does: right after an earlier run
+    the cache alone can fill most of the limit.
 
     Returns:
         ``(headroom_bytes, source)``, or None when no memory cgroup limit
         applies (bare metal, or no limit set).
     """
-    try:
-        lines = _PROC_SELF_CGROUP.read_text().splitlines()
-    except OSError:
-        return None
-    if (_CGROUP_MOUNT / "cgroup.controllers").exists():
-        paths = [line.split(":", 2)[2] for line in lines if line.startswith("0::")]
-        if not paths:
-            return None
-        version, root = "v2", _CGROUP_MOUNT
-        limit_name, usage_name = "memory.max", "memory.current"
-        cache_keys = ("active_file", "inactive_file")
-    else:
-        paths = [
-            line.split(":", 2)[2]
-            for line in lines
-            if "memory" in line.split(":", 2)[1].split(",")
-        ]
-        if not paths:
-            return None
-        version, root = "v1", _CGROUP_MOUNT / "memory"
-        limit_name, usage_name = "memory.limit_in_bytes", "memory.usage_in_bytes"
-        # The total_ counters include descendants, like usage_in_bytes.
-        cache_keys = ("total_active_file", "total_inactive_file")
-
     tightest: tuple[int, str] | None = None
-    directory = _own_cgroup_dir(root, paths[0])
-    while True:
-        limit = _read_cgroup_int(directory / limit_name)
-        usage = _read_cgroup_int(directory / usage_name)
-        if limit is not None and limit < _CGROUP_V1_UNLIMITED and usage is not None:
-            usage = max(0, usage - _cgroup_page_cache(directory, cache_keys))
-            headroom = max(0, limit - usage)
-            if tightest is None or headroom < tightest[0]:
-                tightest = (headroom, f"cgroup {version} {directory}")
-        if directory == root or directory.parent == directory:
-            return tightest
-        directory = directory.parent
+    for version, directory, mount in _memory_cgroup_dirs():
+        limit_names, usage_name, cache_keys = _CGROUP_MEMORY_FILES[version]
+        while True:
+            limits = [_read_cgroup_int(directory / name) for name in limit_names]
+            limits = [value for value in limits if value is not None]
+            usage = _read_cgroup_int(directory / usage_name)
+            if limits and min(limits) < _CGROUP_V1_UNLIMITED and usage is not None:
+                usage = max(0, usage - _cgroup_page_cache(directory, cache_keys))
+                headroom = max(0, min(limits) - usage)
+                if tightest is None or headroom < tightest[0]:
+                    tightest = (headroom, f"cgroup {version} {directory}")
+            if directory == mount or directory.parent == directory:
+                break
+            directory = directory.parent
+    return tightest
 
 
 def host_memory_share(*, nprocs_per_node: int, headroom_bytes: int) -> tuple[int, str]:
