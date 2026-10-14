@@ -1,0 +1,165 @@
+# MoE ops
+
+Per-op notes for `ops/moe/`.
+
+## Expert placement dispatch
+
+With redundant experts (`--ep-num-redundant-experts R`) a logical expert has
+several physical replicas across the EP ranks, and routing must emit physical
+ids. Under replicated-input EP every rank runs the same routing over the same
+all-gathered tokens, so the replica choice has to be a pure function of the
+token row and the route rank for exactly one rank to own each (token, expert)
+pair: `replicas[logical, (row + rank) % count]`.
+
+`ExpertDispatch` holds one layer's tables (`replicas [num_logical, X]` int32,
+`-1` padded to a fixed width; `num_replicas [num_logical]` int32). The runtime
+keeps them as views of the placement's device tables so an in-place
+rebalance reaches captured graphs without reallocating.
+
+`dispatch_topk_ids(topk_ids, dispatch)` is the production implementation of
+the replica choice: two gathers and a modulo over `[tokens, top_k]`, in
+tensor ops, graph-capturable. Every id must be a real expert in
+`[0, num_logical)`; the runtime masks zero experts and padded slots around
+the call and counts the mapped ids into its load counters afterwards.
+
+Follow-up: a fused Triton kernel for the same contract (one launch instead of
+four tensor ops per MoE layer per forward). Its arguments must follow the
+compile-time parameter rule: token count, top-k and table width are runtime
+arguments or bucketed, never `constexpr`.
+
+## FlashInfer adapters (`flashinfer.py`)
+
+### NVFP4 routing-map padding
+
+The pinned FlashInfer version (0.7.1rc2) initializes unused rows inside active
+expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
+This prevents unnecessary activation loads in the first GEMM without a separate
+fill-kernel launch. Routing refreshes live mappings and tile padding on every
+invocation, including CUDA graph replay and both logits and precomputed top-k
+entry points. Allocation slack beyond the active tiles and the launcher's extra
+guard entry are not part of this initialization contract.
+
+`thirdparty/flashinfer/trtllm_moe.py` uses the upstream native module while
+retaining the private runner for the small-batch tactic policy described
+later. Warmup must finish before graph capture.
+
+Regression coverage includes live and padded mapping entries, local expert
+partitions, PDL on/off, changing routing within one captured shape, graph replay
+after workspace corruption, untouched allocation slack/guard, and output
+equality with the upstream operator.
+Expert-partition tests retain the loader's global activation input scales while
+sharding expert weights, and select SiTU through FlashInfer's activation enum.
+
+### BF16 intermediate sizes that are multiples of 64
+
+FlashInfer's BF16 TRT-LLM launcher (`Bf16MoeLauncher::check_moe`) rejects an
+intermediate size per partition that is not a multiple of 128. Its BF16 cubins
+need only 64 for gated activations: GEMM1's rows, twice the intermediate size,
+are tiled by 128, and GEMM2 reads its K, the intermediate size, in 128-byte
+blocks of 64 elements. Non-gated activations still need 128.
+
+`thirdparty/flashinfer/trtllm_bf16_moe.py` builds a private copy of the
+installed launcher in which only that check requires 64 for gated and 128 for
+non-gated activations. It uses a source-keyed JIT
+module, private operator names and cloned entry points, and refuses a launcher
+whose check it does not find exactly once. The BF16 TRT-LLM SiLU/SwiGLU
+kernels declare `ispp_alignment` 64 when the adapter applies to the installed
+FlashInfer and FlashInfer's JIT can compile the private module, and 128
+otherwise, with a warning that names the reason. The ReLU2 kernels in that file
+keep 128. The private module is not in FlashInfer's AOT jit-cache, and ninja
+rebuilds a module left in the JIT workspace whenever the build changes, so this
+needs `FLASHINFER_DISABLE_JIT` unset and FlashInfer's nvcc (`FLASHINFER_NVCC`,
+else `bin/nvcc` under its CUDA home). The adapter decides this once per
+process at import, without compiling, so kernel selection and layer padding
+agree. Only sizes that are not multiples of 128 run on the private launcher;
+the first such layer JIT-compiles the whole private TRT-LLM MoE module during
+warmup. Other sizes keep FlashInfer's stock module. These layers keep
+FlashInfer's BF16 routing behavior. Once the minimum supported FlashInfer
+accepts these sizes, remove the adapter.
+
+### FP32 correction bias for in-kernel DeepSeekV3 routing
+
+FlashInfer's grouped DeepSeekV3 router (`routingMainKernel` in
+`trtllm_fused_moe_routing_deepseek.cu`, used when `n_group > 1`) casts the
+correction bias to the BF16 output type before adding it to the FP32 sigmoid
+score, and its tanh-form sigmoid returns 0 for strongly negative logits.
+Reference routers such as DeepSeek-V3's add the bias in FP32, and so do
+TokenSpeed's top-k routers. A model opts in per layer with
+`routing_config["fp32_correction_bias"] = True`; nothing enables it by default.
+
+`moe_plan(fp32_correction_bias=True)` keeps a kernel that routes from logits
+only if its `_tokenspeed_fp32_correction_bias` hook returns True, and otherwise
+plans precomputed top-k. Only the BF16 SiLU/SwiGLU TRT-LLM kernel that routes
+from logits has the hook; the BF16 ReLU2 kernels do not. That hook builds,
+when the plan is made, a copy of FlashInfer's TRT-LLM MoE module whose routing
+source carries the edit of flashinfer-ai/flashinfer#5557 (FP32 bias,
+`1 / (1 + exp(-x))` sigmoid), together with the 64-aligned launcher above when
+that applies, under private operator names. Each edit must be found exactly
+once in its stock form or in #5557's form; any other source, or a failed
+build, logs a warning and the layer plans precomputed top-k. A FlashInfer
+whose routing already has both edits is used as is, so this module is no
+longer built once the minimum supported FlashInfer includes #5557; remove the
+adapter then.
+
+### Qwen3.8 low-batch tactic
+
+For Qwen3.8's 2,560-hidden, 640-intermediate, 512-expert NVFP4 MoE with
+TP4/EP4 and top-k 10, the private runner restricts inputs of at most 32 tokens
+to FlashInfer's valid tile-32 tactics. If the native launcher does not offer
+tile 32 for a profile, all native tactics remain available. Other models and
+larger token counts use the full tuner. Only the matching shape gets a separate
+tuning-cache key, so a previously cached tile-8 choice cannot bypass this
+policy without forcing unrelated shapes to retune. If FlashInfer removes
+either tuning hook, changes the cache-key builder signature, or moves runner
+construction outside the cloned entrypoints, the adapter raises an error.
+
+The cache-key builder derives the policy tag from the target profile.
+During autotuning this is the profile that `p.get_opt_shapes()` selects; during
+serving it is the bucket matched to the request. FlashInfer passes caller
+tensors when checking a profile, but synthesized tensors when storing its
+winner, so the cache-key builder must not compute token-dependent tags from
+those tensors. A scoped hook on FlashInfer's shared cache-key builder adjusts
+only the private runner's keys. Other runners, cache persistence and
+measurement remain unchanged. Different token profiles continue to store
+independent winners.
+
+This is a temporary workaround for FlashInfer 0.7's MoE tactic selection.
+When upstream tuning handles the full decode graph, remove it.
+
+The policy targets CUDA-graph latency across routing, shared experts and MoE
+GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
+selected tile 8, leaving an idle interval before routing. This policy keeps
+tile 32 available for that shape while retaining upstream routing and GEMM
+implementations.
+
+### NVFP4 squared ReLU
+
+Nemotron-H experts use a non-gated `relu(x)**2` activation. GEMM1 holds only
+the up projection, so `w13` is `[E, I, H]` rather than `[E, 2I, H]`. The weight
+preprocessor skips the gate/up half swap and permutes with
+`is_gated_act_gemm=False`. FlashInfer tiles non-gated GEMM1 rows by 128, so
+the kernels declare an `ispp_alignment` of 128 instead of 64.
+
+The kernel applies `output1_scale_gate_scalar` to the GEMM1 accumulator before
+squaring and `output1_scale_scalar` after. Squaring is not linear, so the
+GEMM1 dequant `a13 * w13_scale_2` must go in the first scale and the second
+scale carries only the GEMM2-input requant `1 / a2`. This is the SiTU recipe.
+The SwiGLU recipe folds the up-half dequant into the second scale, which would
+be wrong here. The kernel test checks non-unit input scales against a
+dequantized reference, and checks in-kernel sigmoid-plus-bias routing with 512
+experts and top-22.
+
+### Unquantized CUTLASS MoE workspace
+
+`flashinfer_cutlass_unquant_moe_apply` hands `cutlass_fused_moe` one
+persistent scratch buffer per device (`cutlass_unquant_moe_workspace`),
+sized through `cutlass_fused_moe_workspace_size`, zero-filled when it is
+allocated or grown, and reused across layers and calls. Left to allocate its
+own scratch per call, the SM90 chain read bytes it never wrote: for some
+(EP rank, routing) combinations the rank's routed output was NaN for finite
+inputs, reproducibly for that call, while the identical call with any
+caller-provided buffer matched the fp32 reference. Stream ordering serializes
+consecutive MoE layers through their activations, so one buffer per device
+is never in use by two calls at once; a model that overlapped two MoE calls on
+separate streams would need one buffer per stream. PDL stays off in this
+chain for the race described in the BF16 CUTLASS section of `flashinfer.py`.

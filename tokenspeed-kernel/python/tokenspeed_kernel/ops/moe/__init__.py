@@ -63,8 +63,8 @@ __all__ = [
 # for exactly one rank to own each (token, expert) pair. ``dispatch_topk_ids``
 # is the production implementation of that choice, in tensor ops (two gathers
 # and a modulo over ``[tokens, top_k]``); a fused Triton kernel is a
-# follow-up. Load counting is the runtime's (``record_expert_load``), applied
-# to the mapped ids after routing.
+# follow-up, see ``README.md``. Load counting is the runtime's
+# (``record_expert_load``), applied to the mapped ids after routing.
 
 
 @dataclass(frozen=True)
