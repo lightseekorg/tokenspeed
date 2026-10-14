@@ -168,7 +168,8 @@ class LatentKVCache:
 
     Attributes:
         kv_cache: ``[slots, 1, kv_lora_rank + rope_dim]`` FP8 e4m3 or native
-            rows, or the planes of an FP8_PER_TOKEN_HEAD cache.
+            rows, a strided [pages, page_size, 1, width] view of those rows,
+            or the planes of an FP8_PER_TOKEN_HEAD cache.
         sanitize: Replace NaN/Inf with finite values before storing.
         slots: Dense 1-D destination slot of each written row.
         write_mask: True for each row to store, or None to store every row;

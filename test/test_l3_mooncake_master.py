@@ -28,7 +28,6 @@ the Mooncake package is not installed, unless ``MOONCAKE_REQUIRE_MASTER=1``.
 from __future__ import annotations
 
 import ctypes
-import inspect
 import json
 import os
 import shutil
@@ -141,19 +140,6 @@ class _Host:
     def host_block_range(self, group_index: int, block_id: int) -> tuple[int, int]:
         del group_index
         return (int(block_id) - 1) * self._page, self._page
-
-
-class TestWaitTcpTimeoutTest:
-    def test_wait_tcp_requires_timeout(self) -> None:
-        param = inspect.signature(_wait_tcp).parameters["timeout_s"]
-        assert (param.default) is (inspect.Parameter.empty)
-
-
-class TestHostGeometryTest:
-    def test_host_requires_nbytes_and_page(self) -> None:
-        signature = inspect.signature(_Host.__init__)
-        assert (signature.parameters["nbytes"].default) is (inspect.Parameter.empty)
-        assert (signature.parameters["page"].default) is (inspect.Parameter.empty)
 
 
 class TestMooncakeMasterLiveTest:

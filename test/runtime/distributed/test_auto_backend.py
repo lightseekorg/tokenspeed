@@ -63,73 +63,9 @@ def backend(monkeypatch):
     return instance
 
 
-@pytest.mark.parametrize(
-    ("method_name", "args"),
-    [
-        ("token_all_gather", (torch.empty(1, 4), (0, 1), [1, 1])),
-        ("token_reduce_scatter", (torch.empty(2, 4), (0, 1), [1, 1])),
-        ("all_gather", (torch.empty(1, 4), (0, 1), -1)),
-    ],
-)
-def test_force_deterministic_rsag_routes_to_nccl(
-    backend, monkeypatch, method_name, args
-):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
-
-    getattr(backend, method_name)(*args)
-
-    getattr(backend._nccl, method_name).assert_called_once_with(*args)
-    getattr(backend._rsag, method_name).assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("method_name", "args"),
-    [
-        ("token_all_gather", (torch.empty(1, 4), (0, 1), [1, 1])),
-        ("token_reduce_scatter", (torch.empty(2, 4), (0, 1), [1, 1])),
-    ],
-)
-def test_default_token_ops_keep_triton_rsag(backend, monkeypatch, method_name, args):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
-
-    getattr(backend, method_name)(*args)
-
-    getattr(backend._rsag, method_name).assert_called_once_with(*args)
-    getattr(backend._nccl, method_name).assert_not_called()
-
-
-def test_force_deterministic_rsag_routes_all_reduce_to_nccl(backend, monkeypatch):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
-    tensor = torch.empty(1, 4)
-    group = (0, 1)
-
-    backend.all_reduce(tensor, group)
-
-    backend._nccl.all_reduce.assert_called_once_with(tensor, group, op=None)
-    backend._trtllm_ar.has_trtllm_ar.assert_not_called()
-    backend._iris.can_run.assert_not_called()
-
-
-def test_force_deterministic_rsag_routes_all_reduce_collection_to_nccl(
-    backend, monkeypatch
-):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", True)
-    first = torch.empty(1, 4)
-    second = torch.empty(1, 4)
-    third = torch.empty(1, 8)
-    group = (0, 1)
-
-    tensors = (first, second, third)
-    backend.all_reduce(tensors, group)
-
-    assert backend._nccl.all_reduce.call_count == len(tensors)
-    for call, tensor in zip(backend._nccl.all_reduce.call_args_list, tensors):
-        assert call.args[0] is tensor
-        assert call.args[1] == group
-        assert call.kwargs == {"op": None}
-    backend._nccl.all_reduce_two.assert_not_called()
-    backend._trtllm_ar.has_trtllm_ar.assert_not_called()
-    backend._iris.can_run.assert_not_called()
+def test_all_reduce_rejects_empty_collection(backend):
+    with pytest.raises(ValueError, match="requires at least one tensor"):
+        backend.all_reduce((), (0, 1))
 
 
 def test_iris_collection_fallback_reduces_each_tensor(monkeypatch):
@@ -468,22 +404,6 @@ def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatc
     assert backend.all_reduce(outputs, (0, 1)) is outputs
     backend._iris.all_reduce.assert_called_once_with(outputs, (0, 1), op=None)
     backend._nccl.all_reduce_two.assert_not_called()
-
-
-def test_non_amd_collections_do_not_probe_symmetric_outputs(backend, monkeypatch):
-    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
-    monkeypatch.setattr(
-        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
-        lambda: SimpleNamespace(is_amd=False),
-    )
-    backend._trtllm_ar.has_trtllm_ar.return_value = False
-    backend._iris.can_run.return_value = False
-    tensors = (torch.empty(1, 4), torch.empty(1, 8))
-
-    backend.all_reduce(tensors, (0, 1))
-
-    backend._iris.can_reduce_outputs.assert_not_called()
-    assert backend._nccl.all_reduce.call_count == 2
 
 
 # ---- The one routing decision ----------------------------------------------

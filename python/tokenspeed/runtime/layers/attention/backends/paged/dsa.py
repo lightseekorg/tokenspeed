@@ -154,6 +154,7 @@ class DSABackend(PagedAttentionBackend):
     """
 
     default_kernel_page_size = DSA_SPARSE_PAGE_SIZE
+    _make_dense_leaf = staticmethod(_make_dense_leaf)
 
     # DSA's sparse indexer reads this backend's chunked_prefill_metadata from
     # inside the captured prefill segment, but the prefill graph rebinds only
@@ -168,7 +169,9 @@ class DSABackend(PagedAttentionBackend):
             raise ValueError("DSA KVP candidate topk must be a positive power of two")
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         platform = current_platform()
-        self._dense_backend = _make_dense_leaf(config, spec, platform, kernel_page_size)
+        self._dense_backend = self._make_dense_leaf(
+            config, spec, platform, kernel_page_size
+        )
         self.kvp_group = tuple(config.kvp_group)
         self.kvp_rank = config.kvp_rank
         self.kvp_block_granularity: int | None = None
@@ -1334,4 +1337,5 @@ class DSABackend(PagedAttentionBackend):
         return out.reshape(-1, heads * layer.v_head_dim)
 
 
-register_backend("dsa", {AttentionArch.DSA}, DSABackend)
+if not current_platform().is_npu:
+    register_backend("dsa", {AttentionArch.DSA}, DSABackend)

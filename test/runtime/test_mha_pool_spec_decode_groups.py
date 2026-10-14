@@ -101,7 +101,7 @@ class TestMHAPoolGroupPublicationTest:
         assert (len(pool.arena.cache_group_specs)) == (1)
         spec = pool.arena.cache_group_specs[0]
         assert (spec.group_id) == ("full_attention")
-        assert (spec.retention) == ("full_history")
+        assert (spec.attn_kind) == ("full_history")
         assert ("full_attention") in (pool.arena.cache_group_page_counts)
         assert (pool.arena.buffer) is not None
         assert (pool.k_buffer[0].untyped_storage().data_ptr()) == (

@@ -149,7 +149,7 @@ def test_cache_batch_metadata_accepts_npu_tables():
         group_specs=(
             CacheGroupSpec(
                 group_id="full_attention",
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=4,
                 entry_stride_tokens=1,
                 replayable=False,

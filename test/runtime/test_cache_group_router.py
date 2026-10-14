@@ -392,11 +392,14 @@ class TestGroupTableStacksTest:
         # Spans past max_extend_tokens (16) take a fresh tensor strided by the total.
         run(2, 0, 9)
         kernels = (_unpack_group_kernel, _extend_locs_kernel)
-        with patch.object(
-            kernels[0], "_do_compile", wraps=kernels[0]._do_compile
-        ) as unpack, patch.object(
-            kernels[1], "_do_compile", wraps=kernels[1]._do_compile
-        ) as extend:
+        with (
+            patch.object(
+                kernels[0], "_do_compile", wraps=kernels[0]._do_compile
+            ) as unpack,
+            patch.object(
+                kernels[1], "_do_compile", wraps=kernels[1]._do_compile
+            ) as extend,
+        ):
             for rows, offset, length in ((1, 1, 1), (2, 1, 9), (4, 0, 8), (3, 1, 11)):
                 run(rows, offset, length)
         assert ((unpack.call_count, extend.call_count)) == ((0, 0))
@@ -494,10 +497,14 @@ class _StubLeaf(PagedAttentionBackend):
 def _geometry():
     return CacheGroupGeometry(
         granularities={FULL: 4, SWA: 4, "linear_attention_0": 8},
-        families={FULL: "history", SWA: "history", "linear_attention_0": "state"},
+        attn_kinds={
+            FULL: "full_history",
+            SWA: "sliding_window",
+            "linear_attention_0": "state",
+        },
         full_history_group_id=FULL,
         row_geometry={FULL: (4, 1), SWA: (4, 1)},
-        retentions={FULL: ("full_history", None), SWA: ("sliding_window", 4)},
+        windows={FULL: None, SWA: 4},
     )
 
 
@@ -549,7 +556,7 @@ class TestCacheGroupRouterTest:
             device="cpu",
             consumed_group_ids=None,
         )
-        with pytest.raises((ValueError), match=("family 'state'")):
+        with pytest.raises((ValueError), match=("is a state group")):
             router.bind(_geometry(), {"linear_attention_0": _StubLeaf(8)})
 
     def test_explicit_groups_do_not_build_indexer_attention_leaves(self):
@@ -567,8 +574,7 @@ class TestCacheGroupRouterTest:
                 cache_group_specs=tuple(
                     SimpleNamespace(
                         group_id=gid,
-                        family="history",
-                        retention="full_history",
+                        attn_kind="full_history",
                         block_granularity=4,
                         rows_per_page=4,
                         entry_stride_tokens=1,
@@ -1336,17 +1342,15 @@ class TestCacheGroupRouterTest:
 
 def _spec(
     group_id,
-    family="history",
     granularity=4,
-    retention="full_history",
+    attn_kind="full_history",
     rows_per_page=None,
     entry_stride_tokens=None,
     sliding_window_tokens=None,
 ):
     return SimpleNamespace(
         group_id=group_id,
-        family=family,
-        retention=retention,
+        attn_kind=attn_kind,
         block_granularity=granularity,
         rows_per_page=rows_per_page,
         entry_stride_tokens=entry_stride_tokens,
@@ -1457,15 +1461,15 @@ class TestCacheGroupRouterRebindTest:
         )
 
     def test_rebind_rejects_a_changed_sliding_window(self):
-        """The window length is part of the scheduler's retention contract."""
+        """The window length is part of the scheduler's cache-group contract."""
         router, _ = self._router()
         original = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="sliding_window", sliding_window_tokens=128),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="sliding_window", sliding_window_tokens=128),
         )
         changed = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="sliding_window", sliding_window_tokens=256),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="sliding_window", sliding_window_tokens=256),
         )
         router.set_cache_pool(original)
 
@@ -1474,16 +1478,16 @@ class TestCacheGroupRouterRebindTest:
 
         assert (router.cache_pool) is (original)
 
-    def test_rebind_rejects_a_changed_group_retention_contract(self):
-        """A group's allocation/retention meaning is part of its published contract."""
+    def test_rebind_rejects_a_changed_group_attn_kind(self):
+        """A group's attention kind is part of its published contract."""
         router, _ = self._router()
         original = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="sliding_window", sliding_window_tokens=128),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="sliding_window", sliding_window_tokens=128),
         )
         changed = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="full_history"),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="full_history"),
         )
         router.set_cache_pool(original)
 

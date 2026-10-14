@@ -267,17 +267,38 @@ class TestIngressValidation:
         processor.engine.logger.warning.assert_called_once()
 
 
+class _RecordingWorker:
+    """Stands in for a worker's ZMQ sender, which the test host lacks; records
+    what the controller would send."""
+
+    def __init__(self):
+        self.sent = []
+
+    def send_pyobj(self, obj):
+        self.sent.append(obj)
+
+
+class _RecordingPolicy:
+    """Records the requests handed to the load-balance policy."""
+
+    def __init__(self):
+        self.received = []
+
+    def __call__(self, req):
+        self.received.append(req)
+
+
 def _make_controller(dp_size=4, disaggregation_mode="null"):
     controller = DataParallelController.__new__(DataParallelController)
     controller.server_args = SimpleNamespace(
         disaggregation_mode=disaggregation_mode,
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=dp_size)),
     )
-    controller.workers = [mock.MagicMock() for _ in range(dp_size)]
+    controller.workers = [_RecordingWorker() for _ in range(dp_size)]
     controller.round_robin_counter = 0
     controller.load_balance_method = LoadBalanceMethod.SHORTEST_QUEUE
     controller.dp_budget = DPBudget(LoadBalanceMethod.SHORTEST_QUEUE)
-    controller.dispatching = mock.MagicMock()
+    controller.dispatching = _RecordingPolicy()
     return controller
 
 
@@ -327,41 +348,35 @@ class TestEngineEntrypointForwarding:
         assert (captured["obj"].data_parallel_rank) == (3)
 
 
-class TestDispatcherWiring:
-    def test_pinned_request_routes_via_request_dispatcher(self):
-        # The event loop hands messages to _request_dispatcher; a revert of
-        # the init_dispatcher registration back to self.dispatching would
-        # disable pinning in production while every direct-call test below
-        # still passes.
-        controller = _make_controller()
+class TestControllerPinnedDispatch:
+    def test_delivery_follows_the_pin_through_the_initialized_dispatcher(self):
+        # The event loop hands messages to _request_dispatcher: a valid pin
+        # lands only on the selected worker — checked at the last valid
+        # rank, the `< dp_size` boundary — an unpinned request on the policy.
+        controller = _make_controller(dp_size=4)
         controller.init_dispatcher()
-        req = TokenizedGenerateReqInput(
+        pinned = TokenizedGenerateReqInput(
             rid="wire-1",
             input_ids=[1, 2, 3],
             sampling_params=SamplingParams(),
             stream=False,
-            data_parallel_rank=1,
+            data_parallel_rank=3,
         )
-        controller._request_dispatcher(req)
-        controller.workers[1].send_pyobj.assert_called_once_with(req)
-        controller.dispatching.assert_not_called()
+        controller._request_dispatcher(pinned)
+        assert (controller.workers[3].sent) == ([pinned])
+        for worker in controller.workers[:3]:
+            assert (worker.sent) == ([])
+        assert (controller.dispatching.received) == ([])
 
-
-class TestControllerPinnedDispatch:
-    def test_pin_dispatches_directly(self):
-        controller = _make_controller()
-        req = _tokenized(data_parallel_rank=2)
-        controller.dispatch_generate_request(req)
-        controller.workers[2].send_pyobj.assert_called_once_with(req)
-        controller.dispatching.assert_not_called()
-
-    def test_no_pin_falls_through_to_policy(self):
-        controller = _make_controller()
-        req = _tokenized()
-        controller.dispatch_generate_request(req)
-        controller.dispatching.assert_called_once_with(req)
-        for worker in controller.workers:
-            worker.send_pyobj.assert_not_called()
+        unpinned = TokenizedGenerateReqInput(
+            rid="wire-2",
+            input_ids=[4, 5],
+            sampling_params=SamplingParams(),
+            stream=False,
+        )
+        controller._request_dispatcher(unpinned)
+        assert (controller.dispatching.received) == ([unpinned])
+        assert (controller.workers[3].sent) == ([pinned])
 
     def test_out_of_range_pin_falls_back_never_raises(self):
         # The dispatch loop is fed by a fire-and-forget PUSH socket with no
@@ -369,7 +384,7 @@ class TestControllerPinnedDispatch:
         controller = _make_controller(dp_size=4)
         req = _tokenized(data_parallel_rank=4)
         controller.dispatch_generate_request(req)
-        controller.dispatching.assert_called_once_with(req)
+        assert (controller.dispatching.received) == ([req])
 
     def test_malformed_pin_payload_degrades_never_raises(self, subtests):
         # bool passes a bare range compare; a list raises TypeError on it —
@@ -379,16 +394,16 @@ class TestControllerPinnedDispatch:
                 controller = _make_controller(dp_size=4)
                 req = _tokenized(data_parallel_rank=bad)
                 controller.dispatch_generate_request(req)
-                controller.dispatching.assert_called_once_with(req)
+                assert (controller.dispatching.received) == ([req])
                 for worker in controller.workers:
-                    worker.send_pyobj.assert_not_called()
+                    assert (worker.sent) == ([])
 
     def test_disagg_mode_ignores_pin(self):
         controller = _make_controller(disaggregation_mode="prefill")
         req = _tokenized(data_parallel_rank=1, bootstrap_room=7)
         controller.dispatch_generate_request(req)
-        controller.dispatching.assert_called_once_with(req)
-        controller.workers[1].send_pyobj.assert_not_called()
+        assert (controller.dispatching.received) == ([req])
+        assert (controller.workers[1].sent) == ([])
 
     def test_pin_notes_budget_reservation(self):
         controller = _make_controller(dp_size=2)
@@ -457,12 +472,6 @@ class TestTokenizeBridge:
 
 
 class TestSingleWorkerIdRange:
-    def test_last_rank_is_valid(self):
-        controller = _make_controller(dp_size=4)
-        with mock.patch.dict(os.environ, {"SINGLE_WORKER_ID": "3"}):
-            controller.single_robin_scheduler(_tokenized())
-        controller.workers[3].send_pyobj.assert_called_once()
-
     def test_out_of_range_still_rejected(self):
         controller = _make_controller(dp_size=4)
         with mock.patch.dict(os.environ, {"SINGLE_WORKER_ID": "4"}):

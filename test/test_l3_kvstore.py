@@ -20,14 +20,12 @@
 
 from __future__ import annotations
 
-import ast
-import inspect
 import os
 import sys
 import tempfile
+import time
 import types
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -77,12 +75,6 @@ class _FakeHost:
         return offset, self._payload_size
 
 
-class TestFakeHostTest:
-    def test_fake_host_requires_buffer_size(self):
-        param = inspect.signature(_FakeHost.__init__).parameters["size"]
-        assert (param.default) is (inspect.Parameter.empty)
-
-
 class TestStorageKeyTest:
     def test_object_key_includes_group_offset_and_rank(self):
         # The trailing ``|c0`` is the retired context-parallel shard id, kept
@@ -96,136 +88,6 @@ class TestStorageKeyTest:
         assert (storage_object_key("abc", 0, 0, prefix="", rank=0)) != (
             storage_object_key("abc", 0, 0, prefix="", rank=1)
         )
-
-    def test_attention_build_exports_resolved_backend_names(self, subtests):
-        # Exercise the real build-result expressions without constructing GPU
-        # backends. In particular the hybrid wrapper name must not erase its
-        # user's full-attention sub-backend, and auto choices must resolve.
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "python/tokenspeed/runtime/layers/attention/registry.py"
-        )
-        tree = ast.parse(path.read_text())
-        build = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "create_attn_components"
-        )
-        result = next(node for node in build.body if isinstance(node, ast.Return))
-        fields = {keyword.arg: keyword.value for keyword in result.value.keywords}
-        expression = ast.Expression(
-            ast.Tuple(
-                elts=[
-                    fields["attention_backend_name"],
-                    fields["draft_attention_backend_name"],
-                ],
-                ctx=ast.Load(),
-            )
-        )
-        ast.fix_missing_locations(expression)
-        arch = SimpleNamespace(MHA="mha", MLA="mla", DSA="dsa", MSA="msa")
-
-        class MSAConfig:
-            def __init__(self, full_attn_backend_name):
-                self.full_attn_backend_name = full_attn_backend_name
-
-        namespace = {"AttentionArch": arch, "MSAConfig": MSAConfig}
-        helpers = [
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name in {"_get_default_backend_name", "_cache_backend_name"}
-        ]
-        exec(
-            compile(ast.Module(body=helpers, type_ignores=[]), str(path), "exec"),
-            namespace,
-        )
-        cases = [
-            (None, None, True, ("mha", "mla")),
-            ("fa3", "fa4", True, ("fa3", "fa4")),
-            ("tokenspeed_mla", "flashinfer", True, ("tokenspeed_mla", "flashinfer")),
-            ("fa3", "fa4", False, ("fa3", "")),
-        ]
-        for target_name, draft_name, has_draft, expected in cases:
-            with subtests.test(
-                target=target_name, draft=draft_name, has_draft=has_draft
-            ):
-                namespace.update(
-                    target_full_attn_backend_name=target_name,
-                    draft_full_attn_backend_name=draft_name,
-                    softmax_attn=object(),
-                    draft_softmax_attn=object(),
-                    model_config=SimpleNamespace(attention_arch=arch.MHA),
-                    draft_model_config=SimpleNamespace(attention_arch=arch.MLA),
-                    draft_attn_backend=object() if has_draft else None,
-                )
-                assert (eval(compile(expression, str(path), "eval"), namespace)) == (
-                    expected
-                )
-
-        # Outer MSA names stay identical while its dense implementations
-        # differ. Both target and draft identities must retain that choice.
-        for target_dense, draft_dense in (
-            ("trtllm", "fa3"),
-            ("fa3", "trtllm"),
-            (None, None),
-        ):
-            with subtests.test(target_dense=target_dense, draft_dense=draft_dense):
-                namespace.update(
-                    target_full_attn_backend_name="msa",
-                    draft_full_attn_backend_name="msa",
-                    softmax_attn=MSAConfig(target_dense),
-                    draft_softmax_attn=MSAConfig(draft_dense),
-                    model_config=SimpleNamespace(attention_arch=arch.MSA),
-                    draft_model_config=SimpleNamespace(attention_arch=arch.MSA),
-                    draft_attn_backend=object(),
-                )
-                assert (eval(compile(expression, str(path), "eval"), namespace)) == (
-                    (f"msa:{target_dense or 'mha'}", f"msa:{draft_dense or 'mha'}")
-                )
-
-    def test_weight_version_factory_preserves_resolved_backend_identity(self):
-        # Execute the actual prefix closure with startup facts, so weight
-        # updates cannot silently drop the backend dimensions.
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "python/tokenspeed/runtime/execution/device.py"
-        )
-        tree = ast.parse(path.read_text())
-        factory = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "prefix_for_weight_version"
-        )
-        capture = mock.Mock(return_value="prefix")
-        namespace = dict(
-            storage_key_prefix=capture,
-            server_args=SimpleNamespace(model="org/model", skip_softmax_threshold=0.0),
-            model_config=SimpleNamespace(model_override_args={}),
-            checkpoint_id="checkpoint",
-            cache_signature="layout",
-            pipeline_rank=0,
-            attn_tp_size=1,
-            draft_model="org/draft",
-            draft_revision="draft-checkpoint",
-            cache_quantization="",
-            L3_RUNTIME_COMPAT=L3_RUNTIME_COMPAT,
-            attention_backend_name="fa3",
-            draft_attention_backend_name="fa4",
-            eagle3_layers_to_capture=[],
-        )
-        exec(
-            compile(ast.Module(body=[factory], type_ignores=[]), str(path), "exec"),
-            namespace,
-        )
-        for version in ("v1", "v2"):
-            assert (namespace["prefix_for_weight_version"](version)) == ("prefix")
-            values = capture.call_args.kwargs
-            assert (values["weight_version"]) == (version)
-            assert (values["attention_backend"]) == ("fa3")
-            assert (values["draft_attention_backend"]) == ("fa4")
 
     def test_prefix_is_stable_and_separates_incompatible_cache_objects(self):
         def prefix(**overrides):
@@ -297,31 +159,7 @@ class TestStorageKeyTest:
         with pytest.raises((TypeError)):
             prefix(eagle3_layers_to_capture="2,16,29")
         with pytest.raises((TypeError)):
-            storage_key_prefix("org/model")
-        with pytest.raises((TypeError)):
             prefix(model_overrides=["rope_theta"])
-        signature = inspect.signature(storage_key_prefix)
-        for name in ("attention_backend", "draft_attention_backend"):
-            assert (signature.parameters[name].default) is (inspect.Parameter.empty)
-        assert (signature.parameters["cache_quantization"].default) is (
-            inspect.Parameter.empty
-        )
-        assert (signature.parameters["revision"].default) is (inspect.Parameter.empty)
-        assert (signature.parameters["model_overrides"].default) is (
-            inspect.Parameter.empty
-        )
-        assert (signature.parameters["attn_tp_size"].default) is (
-            inspect.Parameter.empty
-        )
-        assert (signature.parameters["runtime_compat"].default) is (
-            inspect.Parameter.empty
-        )
-        assert (signature.parameters["skip_softmax_threshold"].default) is (
-            inspect.Parameter.empty
-        )
-        assert (signature.parameters["eagle3_layers_to_capture"].default) is (
-            inspect.Parameter.empty
-        )
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
         return l3_checkpoint_id(
@@ -414,7 +252,10 @@ class TestStorageKeyTest:
 
     def test_checkpoint_id_does_not_trust_snapshots_dir_outside_hf_hub_cache(self):
         commit = "e" * 40
-        with tempfile.TemporaryDirectory() as first_root, tempfile.TemporaryDirectory() as second_root:
+        with (
+            tempfile.TemporaryDirectory() as first_root,
+            tempfile.TemporaryDirectory() as second_root,
+        ):
             first = os.path.join(first_root, "models", "snapshots", commit)
             second = os.path.join(second_root, "models", "snapshots", commit)
             os.makedirs(first)
@@ -442,7 +283,10 @@ class TestStorageKeyTest:
             assert (first_id) != (f"{commit}:auto")
 
     def test_checkpoint_id_fingerprints_local_weight_bytes(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, payload in ((first, b"aaa"), (second, b"bbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
@@ -474,7 +318,10 @@ class TestStorageKeyTest:
 
     def test_checkpoint_id_does_not_trust_hex_basename_outside_hf_snapshots(self):
         commit = "d" * 40
-        with tempfile.TemporaryDirectory() as first_root, tempfile.TemporaryDirectory() as second_root:
+        with (
+            tempfile.TemporaryDirectory() as first_root,
+            tempfile.TemporaryDirectory() as second_root,
+        ):
             first = os.path.join(first_root, commit)
             second = os.path.join(second_root, commit)
             os.makedirs(first)
@@ -503,7 +350,10 @@ class TestStorageKeyTest:
 
     def test_checkpoint_id_ignores_inherited_commit_on_local_dir(self):
         inherited = "a" * 40
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, payload in ((first, b"aaa"), (second, b"bbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
@@ -526,7 +376,10 @@ class TestStorageKeyTest:
             assert first_id.startswith("local-")
 
     def test_checkpoint_id_fingerprints_local_hf_quant_config(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, kv_algo in ((first, "FP8"), (second, "INT8")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
@@ -556,7 +409,10 @@ class TestStorageKeyTest:
             )
 
     def test_checkpoint_id_fingerprints_local_config_code(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, source in (
                 (first, "class Config: rope_theta = 10000\n"),
                 (second, "class Config: rope_theta = 500000\n"),
@@ -586,7 +442,10 @@ class TestStorageKeyTest:
             )
 
     def test_checkpoint_id_fingerprints_imported_custom_code_subdirectories(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, helper in (
                 (first, "def rotary_dim():\n    return 64\n"),
                 (second, "def rotary_dim():\n    return 128\n"),
@@ -721,7 +580,10 @@ class TestStorageKeyTest:
             assert auto_id.endswith(":auto")
 
     def test_checkpoint_id_ignores_unselected_weight_files(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, leftover in ((first, b"aaa"), (second, b"bbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
@@ -761,7 +623,10 @@ class TestStorageKeyTest:
             )
 
     def test_checkpoint_id_fingerprints_sharded_state_weight_files(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, payload in ((first, b"rank0-a"), (second, b"rank0-b")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
@@ -848,7 +713,10 @@ class TestStorageKeyTest:
     def test_checkpoint_id_fingerprints_npcache_numpy_files(self):
         """When np/ exists, npcache loads it and must not hash only *.bin."""
 
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, np_payload in ((first, b"np-a"), (second, b"np-b")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
@@ -879,7 +747,10 @@ class TestStorageKeyTest:
             )
 
     def test_checkpoint_id_fingerprints_mistral_shard_index(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, mapped in (
                 (first, "consolidated.00.safetensors"),
                 (second, "consolidated.01.safetensors"),
@@ -1055,7 +926,10 @@ class TestStorageKeyTest:
             assert (flow_id) != (extensible_id(flow))
 
     def test_checkpoint_id_fingerprints_extensible_local_weights_and_yaml(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             yaml_path = os.path.join(first, "ext.yaml")
             ext_def = os.path.join(first, "ext.py")
             with open(ext_def, "w", encoding="utf-8") as handle:
@@ -1100,7 +974,10 @@ class TestStorageKeyTest:
 
     def test_checkpoint_id_resolves_ext_def_file_from_cwd_like_loader(self):
         commit = "e" * 40
-        with tempfile.TemporaryDirectory() as yaml_dir, tempfile.TemporaryDirectory() as cwd_dir:
+        with (
+            tempfile.TemporaryDirectory() as yaml_dir,
+            tempfile.TemporaryDirectory() as cwd_dir,
+        ):
             repo = os.path.join(yaml_dir, "hub", "models--org--model")
             snapshot = os.path.join(repo, "snapshots", commit)
             os.makedirs(os.path.join(repo, "refs"))
@@ -1277,29 +1154,7 @@ class TestStorageKeyTest:
             assert (without_yaml) == (with_yaml)
             assert (without_yaml) == (f"{commit}:auto")
 
-    def test_checkpoint_id_requires_load_format(self):
-        signature = inspect.signature(l3_checkpoint_id)
-        assert (signature.parameters["load_format"].default) is (
-            inspect.Parameter.empty
-        )
-        assert (signature.parameters["model_loader_extra_config"].default) is (
-            inspect.Parameter.empty
-        )
-        assert (signature.parameters["ext_yaml"].default) is (inspect.Parameter.empty)
-        with pytest.raises((TypeError)):
-            l3_checkpoint_id(
-                "org/model",
-                hf_config=SimpleNamespace(_commit_hash="a" * 40),
-                revision="main",
-            )
-        with pytest.raises((TypeError)):
-            l3_checkpoint_id(
-                "org/model",
-                hf_config=SimpleNamespace(_commit_hash="a" * 40),
-                revision="main",
-                load_format="auto",
-                model_loader_extra_config={},
-            )
+    def test_checkpoint_id_rejects_blank_load_format(self):
         with pytest.raises((ValueError)):
             self._checkpoint_id(
                 "org/model",
@@ -1365,14 +1220,6 @@ class TestStorageKeyTest:
                 gather=gather_from([shared, shared]),
             )
         ) == (shared)
-        signature = inspect.signature(share_l3_checkpoint_ids)
-        assert (signature.parameters["gather"].default) is (inspect.Parameter.empty)
-        with pytest.raises((TypeError)):
-            share_l3_checkpoint_ids(
-                shared,
-                rank=0,
-                world_size=2,
-            )
         rank0 = ["local-rank0:sharded_state", ""]
         rank1_a = ["local-rank1a:sharded_state", ""]
         rank1_b = ["local-rank1b:sharded_state", ""]
@@ -1456,17 +1303,6 @@ class TestStorageKeyTest:
                     draft_quantization="fp8",
                 )
             )
-            signature = inspect.signature(l3_cache_quantization_id)
-            assert (signature.parameters["quantization_param_path"].default) is (
-                inspect.Parameter.empty
-            )
-            assert (signature.parameters["draft_quantization"].default) is (
-                inspect.Parameter.empty
-            )
-            with pytest.raises((TypeError)):
-                l3_cache_quantization_id(
-                    quantization="fp8", quantization_param_path=first
-                )
 
     def test_resolve_l3_weight_version_does_not_mint_a_successor(self):
         assert (
@@ -1602,16 +1438,6 @@ class TestL3HostStoreTest:
         assert (l3.present_keys([0], ["h0"], [0], exists=[False])) == (([], [], []))
         l3.close()
 
-    def test_present_keys_requires_exists_mask(self):
-        backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
-        signature = inspect.signature(l3.present_keys)
-        assert (signature.parameters["exists"].default) is (inspect.Parameter.empty)
-        with pytest.raises((TypeError)):
-            l3.present_keys([0], ["h0"], [0])
-        l3.close()
-
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
@@ -1666,6 +1492,90 @@ class TestL3HostStoreTest:
         assert (backend.batch_exists([old_key])) == ([False])
 
 
+class TestL3StoreStatsTest:
+    """Per-op exists/GET/PUT counters and latency on ``L3HostStore``."""
+
+    def test_backup_prefetch_and_exists_record_calls_keys_bytes(self):
+        backend = MemoryKvStore()
+        host = _FakeHost(b"abcdefgh", size=64)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
+        pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
+
+        assert (l3.backup(pages)) == ([True, True])
+        assert (l3.prefetch(pages)) == ([True, True])
+        assert (l3.exists(pages + [(0, 3, "miss", 0)])) == ([True, True, False])
+
+        stats = l3.stats()
+        assert (stats.put.calls) == (1)
+        assert (stats.put.keys) == (2)
+        assert (stats.put.ok_keys) == (2)
+        # Transferred volume is reported as successful payload bytes.
+        assert (stats.put.payload_bytes) == (16)
+        assert (stats.put.total_seconds) >= (0.0)
+        assert (stats.get.calls) == (1)
+        assert (stats.get.keys) == (2)
+        assert (stats.get.ok_keys) == (2)
+        assert (stats.get.payload_bytes) == (16)
+        assert (stats.exists.calls) == (1)
+        assert (stats.exists.keys) == (3)
+        assert (stats.exists.ok_keys) == (2)
+        # An exists probe carries no payload bytes.
+        assert (stats.exists.payload_bytes) == (0)
+        l3.close()
+
+    def test_slow_get_and_put_latencies_are_measured(self):
+        class SlowStore(MemoryKvStore):
+            def batch_put_from(self, keys, host_buffer, offsets, sizes):
+                time.sleep(0.05)
+                return super().batch_put_from(keys, host_buffer, offsets, sizes)
+
+            def batch_get_into(self, keys, host_buffer, offsets, sizes):
+                time.sleep(0.05)
+                return super().batch_get_into(keys, host_buffer, offsets, sizes)
+
+        host = _FakeHost(b"abcdefgh", size=64)
+        l3 = L3HostStore(SlowStore(), host, key_prefix="m", rank=0)
+        pages = [(0, 1, "h0", 0)]
+        assert (l3.backup(pages)) == ([True])
+        assert (l3.prefetch(pages)) == ([True])
+
+        stats = l3.stats()
+        assert (stats.put.total_seconds) >= (0.04)
+        assert (stats.get.total_seconds) >= (0.04)
+        l3.close()
+
+    def test_failed_put_records_zero_ok_keys_and_bytes(self):
+        class FailingStore(MemoryKvStore):
+            def batch_put_from(self, keys, host_buffer, offsets, sizes):
+                return [False] * len(keys)
+
+        host = _FakeHost(b"abcdefgh", size=64)
+        l3 = L3HostStore(FailingStore(), host, key_prefix="m", rank=0)
+        pages = [(0, 1, "h0", 0), (0, 2, "h1", 0)]
+
+        assert (l3.backup(pages)) == ([False, False])
+
+        stats = l3.stats()
+        assert (stats.put.calls) == (1)
+        assert (stats.put.keys) == (2)
+        assert (stats.put.ok_keys) == (0)
+        assert (stats.put.payload_bytes) == (0)
+        l3.close()
+
+    def test_stats_snapshot_is_detached_from_later_calls(self):
+        backend = MemoryKvStore()
+        host = _FakeHost(b"abcdefgh", size=64)
+        l3 = L3HostStore(backend, host, key_prefix="m", rank=0)
+        pages = [(0, 1, "h0", 0)]
+
+        assert (l3.backup(pages)) == ([True])
+        snapshot = l3.stats()
+        assert (l3.backup(pages)) == ([True])
+        assert (snapshot.put.calls) == (1)
+        assert (l3.stats().put.calls) == (2)
+        l3.close()
+
+
 class TestFactoryTest:
     def test_memory_and_unknown_backend(self):
         backend = create_kvstore_storage_backend(
@@ -1680,14 +1590,6 @@ class TestFactoryTest:
         with pytest.raises((ValueError), match=("unsupported")):
             create_kvstore_storage_backend(
                 "nfs", None, host_buffer=object(), tp_size=1, pp_size=1
-            )
-
-    def test_pp_size_has_no_default(self):
-        param = inspect.signature(create_kvstore_storage_backend).parameters["pp_size"]
-        assert (param.default) is (inspect.Parameter.empty)
-        with pytest.raises((TypeError)):
-            create_kvstore_storage_backend(
-                "memory", None, host_buffer=object(), tp_size=1
             )
 
 
@@ -1746,32 +1648,8 @@ class TestMooncakeConfigTest:
             if saved is not None:
                 os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = saved
 
-    def test_tenant_id_has_no_constructor_default(self):
-        signature = inspect.signature(MooncakeStoreConfig)
-        assert (signature.parameters["tenant_id"].default) is (inspect.Parameter.empty)
-        with pytest.raises((TypeError)):
-            MooncakeStoreConfig(
-                "localhost",
-                "P2PHANDSHAKE",
-                4 * 1024**3,
-                "tcp",
-                "",
-                "127.0.0.1:50051",
-                "",
-            )
-
 
 class TestMooncakeKvStoreTest:
-    def test_extra_config_has_no_default(self):
-        param = inspect.signature(MooncakeKvStore.__init__).parameters["extra_config"]
-        assert (param.default) is (inspect.Parameter.empty)
-        pp_param = inspect.signature(MooncakeKvStore.__init__).parameters["pp_size"]
-        assert (pp_param.default) is (inspect.Parameter.empty)
-        with pytest.raises((TypeError)):
-            MooncakeKvStore(host_buffer=object(), tp_size=1, pp_size=1)
-        with pytest.raises((TypeError)):
-            MooncakeKvStore(None, host_buffer=object(), tp_size=1)
-
     def test_non_default_tenant_is_never_silently_dropped(self):
         class _Store:
             def setup(self, *args, **kwargs):

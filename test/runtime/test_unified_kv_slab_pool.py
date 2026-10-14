@@ -308,7 +308,7 @@ class TestMHAPoolSlabLayoutTest:
         assert pool.arena.supports_disaggregation
         assert (base_addr) == (pool.arena.buffer.data_ptr())
         assert (layout.plan) == (pool.arena.plan)
-        groups = {spec.retention: spec for spec in layout.group_specs}
+        groups = {spec.attn_kind: spec for spec in layout.group_specs}
         assert (set(groups)) == ({"full_history", "sliding_window"})
         assert (groups["full_history"].sliding_window_tokens) is None
         assert (groups["sliding_window"].sliding_window_tokens) == (128)
@@ -655,7 +655,7 @@ class TestDeriveStateGroupsByLayerTest:
         )
 
     @staticmethod
-    def _arena(fields, families):
+    def _arena(fields, attn_kinds):
         from types import SimpleNamespace
 
         return SimpleNamespace(
@@ -666,8 +666,8 @@ class TestDeriveStateGroupsByLayerTest:
                 )
             ),
             cache_group_specs=tuple(
-                SimpleNamespace(group_id=group_id, family=family)
-                for group_id, family in families.items()
+                SimpleNamespace(group_id=group_id, attn_kind=attn_kind)
+                for group_id, attn_kind in attn_kinds.items()
             ),
         )
 
@@ -680,10 +680,10 @@ class TestDeriveStateGroupsByLayerTest:
                 ("layer.1.k", "full_attention"),
                 ("layer.1.v", "full_attention"),
             ),
-            families={
+            attn_kinds={
                 "linear_attention_0": "state",
                 "qwen4_exp_ple": "state",
-                "full_attention": "history",
+                "full_attention": "full_history",
             },
         )
         mapping = self.derive(arena, first_layer=0, num_layers=2, state_layer_ids=(0,))
@@ -695,7 +695,10 @@ class TestDeriveStateGroupsByLayerTest:
                 ("layer.0.k", "full_attention"),
                 ("layer.1.conv", "linear_attention_0"),
             ),
-            families={"linear_attention_0": "state", "full_attention": "history"},
+            attn_kinds={
+                "linear_attention_0": "state",
+                "full_attention": "full_history",
+            },
         )
         mapping = self.derive(arena, first_layer=1, num_layers=1, state_layer_ids=(0,))
         assert (mapping) == ({0: "linear_attention_0"})
@@ -706,7 +709,7 @@ class TestDeriveStateGroupsByLayerTest:
                 ("layer.0.conv", "linear_attention_0"),
                 ("layer.0.ssm", "linear_attention_1"),
             ),
-            families={
+            attn_kinds={
                 "linear_attention_0": "state",
                 "linear_attention_1": "state",
             },

@@ -31,7 +31,7 @@ namespace {
 void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroupConfig& group) {
     group.ValidateCapacityInputs();
     const std::string where = "Cache group '" + group.group_id + "': ";
-    if (group.family == CacheGroupFamily::History && config.prefix_granularity % group.block_granularity != 0) {
+    if (group.attn_kind != AttnKind::kState && config.prefix_granularity % group.block_granularity != 0) {
         throw std::invalid_argument(where + "block_granularity must divide the scheduler prefix_granularity");
     }
     if (config.role == Role::kFused) {
@@ -40,7 +40,7 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
     // A group's transfer policy is dictated by the destination layout the
     // scheduler builds for it, so it cannot be chosen independently.
     const CacheTransferPolicy expected =
-        group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+        group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
     if (group.transfer_policy == CacheTransferPolicy::Unspecified) {
         throw std::invalid_argument(where + "PD cache requires an explicit transfer_policy");
     }

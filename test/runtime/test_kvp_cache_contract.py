@@ -82,11 +82,10 @@ register_cuda_ci(
 def _full_history_spec(group_id: str, *, shard_count: int) -> CacheGroupSpec:
     return CacheGroupSpec(
         group_id=group_id,
-        retention="full_history",
+        attn_kind="full_history",
         rows_per_page=64,
         entry_stride_tokens=4,
         sliding_window_tokens=None,
-        family="history",
         shard_count=shard_count,
         replayable=False,
     )
@@ -405,7 +404,7 @@ class TestRecipeDeclarationTest:
                 by_id = {spec.group_id: spec for spec in specs}
                 assert (V4_INDEXER_KV_GROUP_ID) in (by_id)
                 assert (by_id[V4_INDEXER_KV_GROUP_ID].shard_count) == (kvp_size)
-                assert (by_id[V4_INDEXER_KV_GROUP_ID].retention) == ("full_history")
+                assert (by_id[V4_INDEXER_KV_GROUP_ID].attn_kind) == ("full_history")
                 for spec in specs:
                     expected = (
                         kvp_size
@@ -473,63 +472,6 @@ class TestRecipeDeclarationTest:
             ) // sharded.memory_plan.num_lcm_blocks
             _pytest_msg_3 = spec.group_id
             assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
-
-
-class TestPrefillExchangePlanTest:
-    def test_history_rows_are_routed_to_their_owner_and_restore_request_order(
-        self, subtests
-    ):
-        from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4 import (
-            DeepseekV4AttentionBackend,
-        )
-        from tokenspeed.runtime.layers.attention.deepseek_v4.metadata import (
-            DeepseekV4ForwardMetadata,
-        )
-
-        degree = 2
-        # Two requests: 300 tokens (75 compressed rows over pages 1, 2) and
-        # 64 tokens (16 rows on page 5). Page 5's owner is rank 0, 1 -> 0, 2 -> 1.
-        table = torch.tensor([[1, 2], [5, 0]], dtype=torch.int32)
-        seq_lens = torch.tensor([300, 64], dtype=torch.int32)
-        query_lens = torch.tensor([4, 64], dtype=torch.int32)
-        for rank in range(degree):
-            with subtests.test(rank=rank):
-                cache = _metadata(kvp_size=degree, kvp_rank=rank, table=table)
-                metadata = DeepseekV4ForwardMetadata(
-                    seq_lens=seq_lens,
-                    query_lens=query_lens,
-                    query_start_loc=torch.tensor([0, 4, 68], dtype=torch.int32),
-                    token_to_req_indices=torch.repeat_interleave(
-                        torch.arange(2, dtype=torch.int32), query_lens
-                    ),
-                    cache=cache,
-                    is_valid_token=None,
-                    seq_lens_cpu=seq_lens,
-                    query_lens_cpu=query_lens,
-                    forward_mode=None,
-                    num_prefill_reqs=2,
-                    num_prefill_tokens=68,
-                )
-                chunks = DeepseekV4AttentionBackend._build_kvp_prefill_chunks(
-                    metadata, 4, table, chunk_size=8, window_size=128
-                )
-                assert (list(chunks)) == ([(0, 2)])
-                chunk = chunks[0, 2]
-                width = chunk.workspace_width
-                # Request 0: rows 0..63 live on virtual page 1 (owner 0), rows
-                # 64..74 on page 2 (owner 1). Request 1: rows 0..15 on page 5
-                # (owner 0). Row destinations are workspace-relative.
-                expected_by_owner = {
-                    0: list(range(0, 64)) + [width + row for row in range(16)],
-                    1: list(range(64, 75)),
-                }
-                assert (chunk.counts) == (
-                    [len(expected_by_owner[0]), len(expected_by_owner[1])]
-                )
-                assert (chunk.local_destinations.tolist()) == (expected_by_owner[rank])
-                assert (chunk.destinations.tolist()) == (
-                    expected_by_owner[0] + expected_by_owner[1]
-                )
 
 
 class TestMappingTest:

@@ -64,14 +64,12 @@ std::pair<bool, std::string> ClearL1CacheWithCapturedLog(Scheduler* scheduler) {
 }
 
 CacheGroupConfig MakeGroup(const std::string& id, std::int32_t block_granularity, std::int32_t total_pages,
-                           CacheGroupConfig::Retention retention, CacheGroupFamily family,
-                           std::int32_t sliding_window_tokens = 0) {
+                           AttnKind kind, std::int32_t sliding_window_tokens = 0) {
     CacheGroupConfig g;
     g.group_id = id;
-    g.block_granularity = family == CacheGroupFamily::State ? 0 : block_granularity;
+    g.block_granularity = kind == AttnKind::kState ? 0 : block_granularity;
     g.total_pages = total_pages;
-    g.retention = retention;
-    g.family = family;
+    g.attn_kind = kind;
     if (sliding_window_tokens > 0) {
         g.sliding_window_tokens = sliding_window_tokens;
     }
@@ -149,10 +147,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/4),
         };
         SetTestSnapshotPool(cfg);
@@ -234,13 +230,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa_small", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa_small", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/4),
-            MakeGroup("swa_big", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("swa_big", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/8),
         };
         SetTestSnapshotPool(cfg);
@@ -296,13 +289,10 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa_w3", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa_w3", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/3),
-            MakeGroup("swa_w5", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("swa_w5", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/5),
         };
         SetTestSnapshotPool(cfg);
@@ -378,10 +368,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -433,10 +421,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/4),
         };
         SetTestSnapshotPool(cfg);
@@ -622,10 +608,8 @@ protected:
         cfg.enable_mixed_prefill_decode = true;  // decode + prefill in one plan
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/4),
         };
         SetTestSnapshotPool(cfg);
@@ -737,10 +721,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/2),
         };
         SetTestSnapshotPool(cfg);
@@ -810,10 +792,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/4),
         };
         SetTestSnapshotPool(cfg);
@@ -877,10 +857,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/4),
         };
         SetTestSnapshotPool(cfg);
@@ -1074,10 +1052,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -1251,8 +1227,7 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -2073,10 +2048,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -2605,8 +2578,8 @@ protected:
         cfg.max_batch_size = 8;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
-        cfg.cache_groups = {MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History)};
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull)};
         SetTestSnapshotPool(cfg);
         cfg.debug_force_retraction_interval = 3;
         return cfg;
@@ -2842,7 +2815,7 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
     BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
@@ -2879,7 +2852,7 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
     BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
@@ -2925,7 +2898,7 @@ TEST(SnapshotRetractEvent, StampsResumePriorityAndKeepsTheResumePoint) {
     BlockPool snapshot_pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    &snapshot_pool, /*stream_device_cache_to_host=*/false);
@@ -2993,7 +2966,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
     BlockPool snapshot_pool(/*num_lcm_blocks=*/16, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    &snapshot_pool, /*stream_device_cache_to_host=*/false);
@@ -3053,7 +3026,7 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
     BlockPool pool(/*num_lcm_blocks=*/16, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false,
@@ -3293,9 +3266,8 @@ TEST(PdSlidingCapacityTest, CountsPrefixIslandPhasePageAndGroupPacking) {
     sliding.block_granularity = 2;  // group q=2 while scheduler P=4
     sliding.total_pages = 5;        // null + two parents packing two children each
     sliding.cache_blocks_per_lcm_block = 2;
-    sliding.retention = CacheGroupConfig::Retention::SlidingWindow;
+    sliding.attn_kind = AttnKind::kSlidingWindow;
     sliding.sliding_window_tokens = 4;
-    sliding.family = CacheGroupFamily::History;
     sliding.transfer_policy = CacheTransferPolicy::FullSuffix;
     cfg.cache_groups = {sliding};
 
@@ -3472,10 +3444,8 @@ protected:
         cfg.device_allocator.total_pages = 9;  // 8 usable
         cfg.host_allocator.total_pages = 10;
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kState),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -3530,8 +3500,8 @@ TEST(CacheProgressTest, JunctionSurvivesPrefillRounds) {
     BlockPool pool(/*num_lcm_blocks=*/8, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kMambaState,
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState,
                        .sliding_window = 0,
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 0},
@@ -3586,10 +3556,8 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = false;
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kState),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -3676,7 +3644,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     BlockPool pool(/*num_lcm_blocks=*/8, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                                    /*snapshot_pool=*/nullptr,
@@ -3710,7 +3678,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
     BlockPool snapshot_pool(/*num_lcm_blocks=*/12, {1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false,
                                                    /*host_pool=*/nullptr, &snapshot_pool,
@@ -3788,8 +3756,8 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     BlockPool snapshot_pool(/*num_lcm_blocks=*/8, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
                        .sliding_window = 4,
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
@@ -3889,8 +3857,8 @@ TEST(EventFailurePath, ReqPoolExhaustionAtFirstChunkLeavesPoolBalanced) {
     BlockPool pool(/*num_lcm_blocks=*/31, {1, 1});  // Pages are not the constraint.
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
                        .sliding_window = 4,
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
@@ -3931,8 +3899,8 @@ TEST(SwaWindowBoundary, DecodeStepKeepsOldestInWindowPageAtPageBoundary) {
     BlockPool pool(/*num_lcm_blocks=*/32, {1, 1});
     std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
-        CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
                        .sliding_window = 4,
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
@@ -4012,10 +3980,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -4113,10 +4079,9 @@ protected:
         cfg.disable_prefix_cache = DisablePrefixCache();
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History, SlidingWindowTokens()),
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
+                      SlidingWindowTokens()),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -4440,11 +4405,11 @@ protected:
         cfg.disable_prefix_cache = false;
         cfg.prefix_replay_tokens = 8;
 
-        CacheGroupConfig history = MakeGroup("history", /*block_granularity=*/8, cfg.device_allocator.total_pages,
-                                             CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History);
-        CacheGroupConfig state = MakeGroup("state", /*block_granularity=*/2, cfg.device_allocator.total_pages,
-                                           CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
-                                           /*sliding_window_tokens=*/32);
+        CacheGroupConfig history =
+            MakeGroup("history", /*block_granularity=*/8, cfg.device_allocator.total_pages, AttnKind::kFull);
+        CacheGroupConfig state =
+            MakeGroup("state", /*block_granularity=*/2, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
+                      /*sliding_window_tokens=*/32);
         state.cache_blocks_per_lcm_block = 4;
         cfg.cache_groups = {history, state};
         SetTestSnapshotPool(cfg);
@@ -4562,10 +4527,8 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = false;
         cfg.cache_groups = {
-            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_a", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("full_b", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -4673,8 +4636,7 @@ TEST(PrefixReplayConfigTest, RejectsNegativeReplayTokens) {
     cfg.max_batch_size = 1;
     cfg.prefix_replay_tokens = -1;
     cfg.cache_groups = {
-        MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                  CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+        MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
     };
     SetTestSnapshotPool(cfg);
     EXPECT_THROW((void)Scheduler(std::move(cfg)), std::invalid_argument);
@@ -5198,10 +5160,8 @@ protected:
         cfg.disable_prefix_cache = true;
 
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
                       /*sliding_window_tokens=*/4),
         };
         SetTestSnapshotPool(cfg);
@@ -5765,10 +5725,9 @@ protected:
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = false;
         cfg.cache_groups = {
-            MakeGroup("full", 4, cfg.device_allocator.total_pages, CacheGroupConfig::Retention::FullHistory,
-                      CacheGroupFamily::History),
-            MakeGroup("swa", 2, cfg.device_allocator.total_pages, CacheGroupConfig::Retention::SlidingWindow,
-                      CacheGroupFamily::History, /*sliding_window_tokens=*/2),
+            MakeGroup("full", 4, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", 2, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
+                      /*sliding_window_tokens=*/2),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -6223,10 +6182,8 @@ protected:
         cfg.disable_l2_cache = false;
         cfg.disable_prefix_cache = false;
         cfg.cache_groups = {
-            MakeGroup("full_fine", /*block_granularity=*/2, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-            MakeGroup("full_coarse", /*block_granularity=*/4, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full_fine", /*block_granularity=*/2, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("full_coarse", /*block_granularity=*/4, cfg.device_allocator.total_pages, AttnKind::kFull),
         };
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -6344,17 +6301,16 @@ protected:
         cfg.enable_mixed_prefill_decode = MixedPrefillDecode();
         cfg.prefix_replay_tokens = PrefixReplayTokens();
 
-        CacheGroupConfig swa = MakeGroup("swa", /*block_granularity=*/4, cfg.device_allocator.total_pages,
-                                         CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
-                                         /*sliding_window_tokens=*/kReplayWindow);
+        CacheGroupConfig swa =
+            MakeGroup("swa", /*block_granularity=*/4, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
+                      /*sliding_window_tokens=*/kReplayWindow);
         swa.replayable = true;
-        CacheGroupConfig tail = MakeGroup("tail", /*block_granularity=*/2, cfg.device_allocator.total_pages,
-                                          CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History,
-                                          /*sliding_window_tokens=*/2);
+        CacheGroupConfig tail =
+            MakeGroup("tail", /*block_granularity=*/2, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
+                      /*sliding_window_tokens=*/2);
         tail.replayable = true;
         cfg.cache_groups = {
-            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages,
-                      CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
             swa,
             tail,
         };

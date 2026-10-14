@@ -92,19 +92,9 @@ def _segment(
     )
 
 
-def _group(
-    group_id,
-    family,
-    *segments,
-    retention="full_history",
-    sliding_window_tokens: int | None = None,
-):
+def _group(group_id, attn_kind, *segments, sliding_window_tokens: int | None = None):
     return make_group(
-        group_id,
-        *segments,
-        family=family,
-        retention=retention,
-        window=sliding_window_tokens,
+        group_id, *segments, attn_kind=attn_kind, window=sliding_window_tokens
     )
 
 
@@ -112,7 +102,7 @@ def _grouped_groups():
     return (
         _group(
             "history",
-            "history",
+            "full_history",
             _segment("layer.0.kv", producer_step=0, page_zero_offset=0),
         ),
         _group(
@@ -343,7 +333,7 @@ def _ordinary_layerwise_group():
             "layer.4.v", producer_step=4, page_zero_offset=96, page_stride_bytes=128
         ),
     )
-    return _group("history", "history", *segments)
+    return _group("history", "full_history", *segments)
 
 
 def _ordinary_layerwise_layout() -> CacheTransferContract:
@@ -357,7 +347,7 @@ def _ordinary_layerwise_layout() -> CacheTransferContract:
 def _draft_final_group():
     return _group(
         "history",
-        "history",
+        "full_history",
         _segment(
             "layer.0.kv",
             producer_step=0,
@@ -482,7 +472,7 @@ def _heterogeneous_groups(*, destination: bool):
     return (
         _group(
             "history",
-            "history",
+            "full_history",
             _segment("layer.0.latent", producer_step=0, page_zero_offset=0),
         ),
         _group(

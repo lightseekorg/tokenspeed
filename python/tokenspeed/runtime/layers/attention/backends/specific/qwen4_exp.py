@@ -141,9 +141,9 @@ class Qwen4ExpBackend(AttentionBackend):
         )
 
     @property
-    def cache_consumer_families(self) -> frozenset[str]:
+    def cache_consumer_attn_kinds(self) -> frozenset[str]:
         return frozenset().union(
-            *(backend.cache_consumer_families for backend in self.child_backends())
+            *(backend.cache_consumer_attn_kinds for backend in self.child_backends())
         )
 
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:

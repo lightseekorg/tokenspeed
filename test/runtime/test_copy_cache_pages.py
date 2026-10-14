@@ -247,8 +247,7 @@ class TestFinishTailHitCopyCudaTest:
                         group_id="kv",
                         block_granularity=self.PAGE,
                         total_pages=page_count,
-                        retention=ts.CacheRetention.FullHistory,
-                        family=ts.CacheGroupFamily.History,
+                        attn_kind=ts.AttnKind.Full,
                     )
                 ],
             )

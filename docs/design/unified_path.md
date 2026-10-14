@@ -99,7 +99,7 @@ from one first bound to that pool:
   is a retained alias). Atomicity covers rejections only: a failure inside a
   node's own binding work propagates, and the caller rebuilds the tree. A
   node rejects a pool that changes the geometry it owns: the router its
-  group geometry (granularities, families, retentions and the row layout the
+  group geometry (granularities, attention kinds, windows and the row layout the
   leaves' kernels read), the state backends the state group ids and the
   state layers' ids and shapes, DeepSeek V4 the group ids and row geometry,
   Inkling the ShortConv checkpoint groups and their transfer policy. Page
@@ -726,6 +726,22 @@ graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
 
+Synthetic acceptance length shares executor scheduling, logit processing,
+persistent output buffers and downstream state updates with ordinary
+verification. Only the greedy sampler supports this benchmark mode. It runs
+its ordinary full-width verification kernel
+before overriding the result with a forced draft prefix and a target token
+at the selected cutoff. This retains verification cost in the benchmark;
+synchronization and downstream state updates consume only the final synthetic
+outputs. The override reuses the target argmax at the cutoff, without resampling
+or a second executor path. DP sampling and other sampling backends are rejected.
+The persistent length
+buffer is refreshed in `prepare_step` or `prepare_capture`, outside graph
+capture, using a private device generator. Preparation must remain
+asynchronous so it does not stall forward launches.
+The sampler precomputes the configured length's floor, fractional part and
+integer flag at initialization and reuses them for each buffer refresh.
+
 ### Non-speculative serving is the N == 1 case, not a second path
 
 One sampling rule for every batch: **prefill requests sample, decode
@@ -936,7 +952,7 @@ vocabulary is fixed, with exactly one conversion point:
 | `QSAIndexerBackend` | its raw compressed/recent group tables, query lengths, full-KV address view and private verify workspace | MHA leaf metadata, persistent cache allocation |
 | `Qwen4ExpPLEBackend` | its PLE state table, input/output state blocks and verify workspace | Mamba metadata and verify context, persistent cache allocation |
 | paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix when its group is KVP page-sharded, also `page_table_cpu`, the host mirror of its extend rows, for page-owner counts | groups, block tables, contracts, draft/target table provenance |
-| state consumers (Mamba/KDA, Inkling conv, V4) | their own family's raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
+| state consumers (Mamba/KDA, Inkling conv, V4) | their own groups' raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
 The runner (`ForwardStepRunner`) does one thing with tables: hand the
 bridge's `block_tables` dict to the top-level backend. Capture / idle /
@@ -947,8 +963,8 @@ backend carries a "no tables" arm. Delivery is guarded at both dispatch
 points: the runner's inline live-delivery check and the router's
 `_check_live_delivery` fail a live batch whose dict omits any consumed
 group — the persistent decode buffers would otherwise serve stale pages.
-Consumers take their own groups by positive claim
-(`cache_consumer_families`); extra groups ride through untouched.
+Consumers take their own groups by positive claim on the attention kinds they read
+(`cache_consumer_attn_kinds`); extra groups ride through untouched.
 
 Inside the router, `GroupTableStacks` holds the
 `[G, max_bs, stack_max_num_pages]` kernel-page table stack (each group's

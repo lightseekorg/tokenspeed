@@ -51,7 +51,6 @@ import tokenspeed_kernel.ops.attention.dsa.flashinfer as _attention_flashinfer_d
 import tokenspeed_kernel.ops.attention.dsa.gluon as _attention_gluon_dsa
 import tokenspeed_kernel.ops.attention.dsv4 as _attention_dsv4_pkg
 import tokenspeed_kernel.ops.attention.dsv4.cuda as _attention_cuda_dsv4
-import tokenspeed_kernel.ops.attention.dsv4.deep_gemm as _attention_deep_gemm_dsv4
 import tokenspeed_kernel.ops.attention.dsv4.gluon as _attention_gluon_dsv4
 import tokenspeed_kernel.ops.attention.dsv41 as _attention_dsv41_pkg
 import tokenspeed_kernel.ops.attention.dsv41.gluon as _attention_gluon_dsv41
@@ -164,7 +163,6 @@ _RELOAD_MODULES = [
     _attention_cuda_dsv4,
     _attention_flashinfer_dsa,
     _attention_deep_gemm_dsa,
-    _attention_deep_gemm_dsv4,
     _attention_deep_gemm_kpool,
     _attention_cuda,
     _attention_flash_attn,
@@ -360,22 +358,6 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
 
     assert actual_offsets == available_expected
     assert all(spec.priority < Priority.PLUGIN for spec in registry.list_kernels("moe"))
-
-
-def test_dsv4_padded_heads_platform_policy(
-    mi350_platform: PlatformInfo,
-    h100_platform: PlatformInfo,
-) -> None:
-    host_platform = Platform.get()
-    try:
-        Platform.override(mi350_platform)
-        assert _attention_dsv4_pkg.dsv4_padded_heads(16) == 16
-        assert _attention_dsv4_pkg.dsv4_padded_heads(32) == 32
-        Platform.override(h100_platform)
-        assert _attention_dsv4_pkg.dsv4_padded_heads(16) == 64
-        assert _attention_dsv4_pkg.dsv4_padded_heads(65) == 128
-    finally:
-        Platform.override(host_platform)
 
 
 def test_moe_process_weights_returns_for_no_preprocessing_plan():
@@ -2119,59 +2101,6 @@ def _attention_dsv41_index_topk(
     )
 
 
-def _attention_dsv4_prefill_topk_mxfp4() -> object:
-    """Exercise public MXFP4 prefill selection with packed 128-wide queries."""
-    index_q = (
-        torch.empty((2, 64, 64), dtype=torch.uint8),
-        torch.empty((2, 64), dtype=torch.int32),
-    )
-    return _attention_dsv4_pkg.dsv4_prefill_topk(
-        index_q,
-        torch.empty((2, 64), dtype=torch.float32),
-        torch.empty((2, 64 * 68), dtype=torch.uint8),
-        torch.tensor([[0], [1]], dtype=torch.int32),
-        torch.tensor([0, 64, 128], dtype=torch.int32),
-        torch.tensor([0, 64], dtype=torch.int32),
-        torch.tensor([64, 128], dtype=torch.int32),
-        torch.tensor([64, 64], dtype=torch.int32),
-        page_size=64,
-        topk=512,
-        max_seqlen_k=64,
-        index_k_format="mxfp4",
-        block_table_base_offsets=None,
-        gathered_k=None,
-        gather_workspace=None,
-        out=None,
-        override=None,
-        solution=None,
-    )
-
-
-def _attention_dsv4_decode_topk_mxfp4() -> object:
-    """Exercise public MXFP4 decode selection without executing a kernel."""
-    index_q = (
-        torch.empty((2, 64, 64), dtype=torch.uint8),
-        torch.empty((2, 64), dtype=torch.int32),
-    )
-    return _attention_dsv4_pkg.dsv4_decode_topk(
-        index_q,
-        torch.empty((2, 64), dtype=torch.float32),
-        torch.empty((2, 64 * 68), dtype=torch.uint8),
-        torch.tensor([[64], [64]], dtype=torch.int32),
-        torch.tensor([[0], [1]], dtype=torch.int32),
-        page_size=64,
-        topk=512,
-        max_context_len=64,
-        plan=None,
-        index_k_format="mxfp4",
-        block_table_base_offsets=None,
-        out=None,
-        persistent_topk_workspace=None,
-        override=None,
-        solution=None,
-    )
-
-
 def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) -> object:
     q = torch.empty((2, 2, 128), dtype=torch.bfloat16)
     weights = torch.empty((2, 2), dtype=weights_dtype)
@@ -3462,6 +3391,52 @@ def test_gfx950_softmax_topk_selects_gluon(
     assert too_many_experts.name == "torch_softmax_topk"
 
 
+def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """Dynamic-MXFP4 SiLU experts take the gfx950 A4W4 kernel; plans it does
+    not cover keep their previous kernels."""
+    if KernelRegistry.get().get_by_name("gluon_mxfp4_a4w4_moe_apply_gfx950") is None:
+        pytest.skip("gfx950 Gluon A4W4 MoE is unavailable")
+
+    def plan(**overrides):
+        # Qwen3.8-Flash-Next TP2 experts.
+        kwargs = dict(
+            input_dtype=torch.bfloat16,
+            activation="silu",
+            routing_mode="precomputed_topk",
+            ispp=320,
+            hidden=2560,
+            internal_activation_dtype="mxfp4",
+            swiglu_form=None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=False,
+            combine_order="rank",
+        )
+        return kernel_moe_plan("mxfp4", **{**kwargs, **overrides})
+
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        a4w4 = plan()
+        with_bias = plan(with_bias=True)
+        bf16_activations = plan(internal_activation_dtype="input")
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    _assert_moe_plan(
+        a4w4,
+        apply="gluon_mxfp4_a4w4_moe_apply_gfx950",
+        preprocessor="gluon_mxfp4_a4w4_moe_weights_gfx950",
+    )
+    assert with_bias["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
+    assert bf16_activations["apply_kernel_name"] == "gluon_mxfp4_precomputed_moe_apply"
+
+
 def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:
     registry = KernelRegistry.get()
     real_platform = Platform.get()
@@ -3472,6 +3447,37 @@ def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
+
+
+def test_gfx950_mxfp4_linear_falls_back_beyond_32bit_weight_offsets(
+    mi350_platform: PlatformInfo,
+) -> None:
+    """The gfx950 MXFP4 linears address weights with 32-bit offsets, so an
+    oversized weight selects the portable kernel instead of failing later."""
+    if KernelRegistry.get().get_by_name("gluon_mxfp4_linear_gfx950") is None:
+        pytest.skip("gfx950 Gluon MXFP4 linear is unavailable")
+    from tokenspeed_kernel.ops.gemm import (
+        MXFP4_LINEAR_SIGNATURE,
+        _mxfp4_linear_traits,
+    )
+
+    def select(mode, n, k):
+        return _select_on(
+            mi350_platform,
+            "gemm",
+            mode,
+            MXFP4_LINEAR_SIGNATURE,
+            traits=_mxfp4_linear_traits(n, k, None),
+        )
+
+    # n * k just below and at 2**31.
+    for mode, kernel in (
+        ("mxfp4_linear", "gluon_mxfp4_linear_gfx950"),
+        ("mxfp4_swiglu_linear", "gluon_mxfp4_swiglu_linear_gfx950"),
+    ):
+        assert select(mode, 640, 2560) == kernel
+        assert select(mode, 2**16, 2**15 - 64) == kernel
+        assert select(mode, 2**16, 2**15) == f"triton_{mode}"
 
 
 def test_qsa_sparse_attention_selects_gluon_on_gfx950(
@@ -4981,42 +4987,6 @@ _CASES = [
         partial(_attention_dsv41_index_topk, 32, None, 68),
     ),
     _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_prefill_topk",
-        "gluon_dsv4_prefill_topk_mxfp4_gfx950",
-        _attention_dsv4_prefill_topk_mxfp4,
-        id_suffix="mxfp4",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode_topk",
-        "gluon_dsv4_decode_topk_mxfp4_gfx950",
-        _attention_dsv4_decode_topk_mxfp4,
-        id_suffix="mxfp4",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_prefill_topk",
-        "gluon_dsv4_prefill_topk_mxfp4_gfx1250",
-        _attention_dsv4_prefill_topk_mxfp4,
-        id_suffix="mxfp4",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode_topk",
-        "gluon_dsv4_decode_topk_mxfp4_gfx1250",
-        _attention_dsv4_decode_topk_mxfp4,
-        id_suffix="mxfp4",
-    ),
-    _case(
         _is_cdna5,
         "cdna5",
         "attention",
@@ -6509,16 +6479,6 @@ def selected_kernel_spy(monkeypatch):
                     ),
                     torch.empty((tokens,), dtype=torch.int32, device=index_q.device),
                 )
-            if case.mode in {"dsv4_prefill_topk", "dsv4_decode_topk"}:
-                q_values, _ = kwargs["index_q"]
-                indices = torch.empty(
-                    (q_values.shape[0], kwargs["topk"]),
-                    dtype=torch.int32,
-                    device=q_values.device,
-                )
-                if case.mode == "dsv4_prefill_topk":
-                    return indices, None
-                return indices
             if case.mode in {
                 "mla_decode_projected_value",
                 "mla_normalize_project_query",

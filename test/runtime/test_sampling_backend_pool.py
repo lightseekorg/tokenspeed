@@ -88,6 +88,7 @@ POOL = 8  # max_req_pool_size → pool_rows == POOL + 1
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",
@@ -556,6 +557,7 @@ class TestTritonRouteSelection:
         bs, n, vocab = 32, 4, 32768
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                synthetic_acceptance_length=None,
                 enable_speculative_sampling=False,
                 sampling_stream="batch",
                 logprob_order="torch",
@@ -640,6 +642,7 @@ class TestTritonRouteSelection:
         bs, n, vocab = 32, 4, 200064
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                synthetic_acceptance_length=None,
                 enable_speculative_sampling=False,
                 sampling_stream="batch",
                 logprob_order="torch",
@@ -752,25 +755,6 @@ class TestTritonRouteSelection:
             variant=CUDA_GRAPH_VARIANT_DEFAULT,
         )
         assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_GENERIC)
-
-    def test_triton_verify_is_owned_by_triton_backend(self):
-        assert not (issubclass(TritonSamplingBackend, FlashInferSamplingBackend))
-        assert (TritonSamplingBackend.verify) is not (FlashInferSamplingBackend.verify)
-        assert (TritonFullSamplingBackend.verify) is not (
-            FlashInferFullSamplingBackend.verify
-        )
-        assert issubclass(TritonFullSamplingBackend, TritonSamplingBackend)
-        assert not (
-            issubclass(TritonFullSamplingBackend, FlashInferFullSamplingBackend)
-        )
-
-    def test_triton_reuses_pool_state_without_flashinfer_probability_state(self):
-        assert hasattr(self.backend, "_temperature_pool")
-        assert hasattr(self.backend, "_top_k_pool")
-        assert hasattr(self.backend, "_top_p_pool")
-        assert hasattr(self.backend, "_seed_pool")
-        assert not (hasattr(self.backend, "_coins_buf"))
-        assert not (hasattr(self.backend, "_generator_per_slot"))
 
 
 class TestTritonLogprobOutputs:

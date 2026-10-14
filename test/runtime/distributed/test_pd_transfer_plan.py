@@ -76,7 +76,7 @@ def _composite_paged_layout(
                 extent=sum(global_parts),
                 parts=global_parts,
             ),
-            family="state",
+            attn_kind="state",
         ),
         page_bytes=128,
     )
@@ -734,7 +734,7 @@ def _hybrid_layout(*, local_kda_heads: int, shard_count: int):
                 axis=0,
                 extent=8,
             ),
-            family="state",
+            attn_kind="state",
         ),
         page_bytes=128,
     )

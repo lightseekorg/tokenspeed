@@ -50,6 +50,7 @@ PARAMS = {
 
 def _config(logprobs: bool) -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         max_bs=BS,
         max_draft_tokens_per_req=N,
         max_req_pool_size=POOL,

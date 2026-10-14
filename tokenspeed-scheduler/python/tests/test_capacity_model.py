@@ -44,8 +44,7 @@ def _full(group_id: str, block_granularity: int, packing: int) -> "ts.CacheGroup
         group_id=group_id,
         block_granularity=block_granularity,
         total_pages=0,
-        retention=ts.CacheRetention.FullHistory,
-        family=ts.CacheGroupFamily.History,
+        attn_kind=ts.AttnKind.Full,
         cache_blocks_per_lcm_block=packing,
     )
 
@@ -57,9 +56,8 @@ def _sliding(
         group_id=group_id,
         block_granularity=block_granularity,
         total_pages=0,
-        retention=ts.CacheRetention.SlidingWindow,
+        attn_kind=ts.AttnKind.SlidingWindow,
         sliding_window_tokens=window,
-        family=ts.CacheGroupFamily.History,
         cache_blocks_per_lcm_block=packing,
     )
 
@@ -70,8 +68,7 @@ def _state(group_id: str, packing: int) -> "ts.CacheGroupConfig":
         group_id=group_id,
         block_granularity=0,
         total_pages=0,
-        retention=ts.CacheRetention.FullHistory,
-        family=ts.CacheGroupFamily.State,
+        attn_kind=ts.AttnKind.State,
         cache_blocks_per_lcm_block=packing,
     )
 

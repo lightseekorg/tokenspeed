@@ -31,6 +31,7 @@ if not is_cdna4():
     )
 
 
+import tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm as mm_module  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
     supports_gluon_mm_a16w16_prefill_gfx950,
@@ -336,6 +337,8 @@ _DECODE_CASES = [
     pytest.param((20, 1536, 7168), torch.bfloat16, id="shared-gu-splitk"),
     pytest.param((8, 6288, 7168), torch.bfloat16, id="qkvfab-ragged-n"),
     pytest.param((40, 7168, 768), torch.bfloat16, id="shared-dn-ragged-m"),
+    # 16x128 split-K tiles store C through the coalesced row layout.
+    pytest.param((12, 8448, 7168), torch.bfloat16, id="dense-gu-coalesced-store"),
 ]
 
 
@@ -388,9 +391,53 @@ def test_decode_gemm_graph_does_not_share_eager_counters() -> None:
 
     # The graph must use its own counters, not the eager stream's buffer.
     assert captured.data_ptr() != eager.data_ptr()
-    a.copy_(torch.randn_like(a) * 0.25)
-    graph.replay()
-    torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
+    # The counters are zeroed before capture, not by the graph: every replay
+    # relies on the previous one resetting them.
+    for _ in range(3):
+        a.copy_(torch.randn_like(a) * 0.25)
+        graph.replay()
+        torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
+
+
+def test_decode_gemm_graphs_survive_counter_arena_replacement(monkeypatch) -> None:
+    # A small arena fills up after two captures; the next eager call replaces
+    # it while both graphs still bump counters in it on every replay.
+    monkeypatch.setattr(mm_module, "_GRAPH_COUNTER_ARENA_SIZE", 128)
+    monkeypatch.setattr(mm_module, "_graph_counter_arenas", {})
+    monkeypatch.setattr(mm_module, "_retired_graph_counter_arenas", [])
+    torch.manual_seed(0)
+    m, n, k = 4, 896, 7168  # 56 tiles of the split-K router bucket
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    outs = [torch.empty((m, n), device="cuda", dtype=torch.float32) for _ in range(2)]
+
+    stream = torch.cuda.Stream()
+    graphs = [torch.cuda.CUDAGraph() for _ in range(2)]
+    with torch.cuda.stream(stream):
+        for graph, out in zip(graphs, outs, strict=True):
+            launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+            with torch.cuda.graph(graph, stream=stream):
+                launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+        launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=outs[0])
+    stream.synchronize()
+
+    # Fresh allocations on the arena's stream must not land on the counters
+    # the graphs still use.
+    with torch.cuda.stream(stream):
+        fillers = [
+            torch.full((128,), 7, device="cuda", dtype=torch.int32) for _ in range(8)
+        ]
+    stream.synchronize()
+    for _ in range(3):
+        a.copy_(torch.randn_like(a) * 0.25)
+        for graph in graphs:
+            graph.replay()
+        for out in outs:
+            torch.testing.assert_close(
+                out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5
+            )
+    torch.cuda.synchronize()
+    assert all(torch.all(filler == 7) for filler in fillers)
 
 
 def test_decode_gemm_writes_strided_out() -> None:
@@ -485,3 +532,63 @@ def test_decode_add3_row_count_does_not_recompile() -> None:
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (2, 6, 7, 12, 14, 20, 27, 31):
             run(rows)
+
+
+# Qwen3.8-Flash-Next TP2 decode shapes, each at a ragged row count inside
+# its bucket: split-K over every K tile in flight (32-row MTP fc, indexer),
+# 64-row tiles (router), and split-K with a few buffers.
+_QWEN38_DECODE_CASES = [
+    pytest.param((20, 2560, 3072), id="out-proj"),
+    pytest.param((30, 512, 2560), id="router-all-tiles-in-flight"),
+    pytest.param((50, 512, 2560), id="router-64-row-tile"),
+    pytest.param((3, 640, 2560), id="indexer"),
+    pytest.param((27, 640, 2560), id="indexer-all-tiles-in-flight"),
+    pytest.param((16, 2560, 2560), id="mtp-fc"),
+    pytest.param((21, 2560, 2560), id="mtp-fc-all-tiles-in-flight"),
+]
+
+
+@pytest.mark.parametrize("shape", _QWEN38_DECODE_CASES)
+def test_qwen38_decode_gemm_matches_reference(shape: tuple[int, int, int]) -> None:
+    torch.manual_seed(0)
+    m, n, k = shape
+    assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    for _ in range(2):
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+        out = launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
+
+
+def test_qwen38_decode_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    n, k = 512, 2560
+    a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def run(rows):
+        out = launch_gluon_mm_a16w16_decode_gfx950(a[:rows], b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+
+    for rows in (3, 4, 5, 8, 9, 16, 17, 32, 33, 64):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
+            run(rows)
+
+
+def test_medium_coalesced_store_masks_strided_out() -> None:
+    # 128x128 medium tiles store through the coalesced row layout; a padded
+    # row stride must stay inside the output view.
+    torch.manual_seed(0)
+    m, n, k = 768, 3584, 7168
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    backing = torch.full((m, n + 8), 7.0, device="cuda", dtype=torch.bfloat16)
+    out = backing[:, :n]
+
+    actual = launch_gluon_mm_a16w16_medium_gfx950(a, b, torch.bfloat16, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=_RTOL)
+    assert torch.all(backing[:, n:] == 7.0)

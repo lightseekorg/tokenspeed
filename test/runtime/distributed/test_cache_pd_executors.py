@@ -99,7 +99,7 @@ def _layout(
                 offset=state_offset,
                 stride=page_stride_bytes,
             ),
-            family="state",
+            attn_kind="state",
         ),
         capacity=capacity,
         page_bytes=physical_page_bytes,

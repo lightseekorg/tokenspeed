@@ -63,9 +63,8 @@ class _TestCacheGroup:
     """Semantic group input awaiting the shared memory plan."""
 
     group_id: str
-    family: str
+    attn_kind: str
     prefix_granularity: int
-    retention: str
     sliding_window_tokens: int | None
     fields: tuple[_TestCacheField, ...]
     cache_blocks_per_lcm_block: int
@@ -74,11 +73,7 @@ class _TestCacheGroup:
 
     @property
     def transfer_policy(self) -> str:
-        return (
-            "latest_snapshot"
-            if self.family == "state" and self.retention == "full_history"
-            else "full_suffix"
-        )
+        return "latest_snapshot" if self.attn_kind == "state" else "full_suffix"
 
 
 def segment(
@@ -117,15 +112,14 @@ def segment(
 def group(
     group_id: str,
     *segments: _TestCacheField,
-    family: str = "history",
+    attn_kind: str = "full_history",
     q: int = 2,
-    retention: str = "full_history",
     window: int | None = None,
     packing: int = 1,
     shard_count: int = 1,
 ) -> _TestCacheGroup:
     return _TestCacheGroup(
-        group_id, family, q, retention, window, segments, packing, shard_count
+        group_id, attn_kind, q, window, segments, packing, shard_count
     )
 
 
@@ -147,21 +141,18 @@ def layout(
         (
             CacheGroupSpec(
                 group_id=entry.group_id,
-                retention=entry.retention,
-                sliding_window_tokens=entry.sliding_window_tokens,
-                family=entry.family,
+                attn_kind=entry.attn_kind,
                 transfer_policy=entry.transfer_policy,
                 replayable=False,
                 shard_count=entry.shard_count,
             )
-            if entry.family == "state" and entry.retention == "full_history"
+            if entry.attn_kind == "state"
             else CacheGroupSpec(
                 group_id=entry.group_id,
-                retention=entry.retention,
+                attn_kind=entry.attn_kind,
                 rows_per_page=entry.prefix_granularity,
                 entry_stride_tokens=1,
                 sliding_window_tokens=entry.sliding_window_tokens,
-                family=entry.family,
                 transfer_policy=entry.transfer_policy,
                 replayable=False,
                 shard_count=entry.shard_count,

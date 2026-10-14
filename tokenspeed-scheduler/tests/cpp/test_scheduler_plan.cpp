@@ -634,7 +634,7 @@ protected:
         for (std::int32_t i = 0; i < 3; ++i) {
             CacheGroupConfig state = cfg.cache_groups.front();
             state.group_id = "linear_attention_" + std::to_string(i);
-            state.family = CacheGroupFamily::State;
+            state.attn_kind = AttnKind::kState;
             state.block_granularity = 0;
             cfg.cache_groups.push_back(std::move(state));
         }

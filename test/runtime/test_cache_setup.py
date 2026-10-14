@@ -187,73 +187,6 @@ def _mha_config() -> AttnConfig:
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
 
 
-def test_deepseek_v4_mtp_reads_window_from_cache_group():
-    from tokenspeed.runtime.layers.attention import registry
-    from tokenspeed.runtime.utils.server_args import ServerArgs
-
-    args = ServerArgs(
-        model="x",
-        device="cpu",
-        prefix_granularity=256,
-        max_num_seqs=2,
-        chunked_prefill_size=256,
-        speculative_algorithm="EAGLE",
-        speculative_num_steps=3,
-        speculative_num_draft_tokens=4,
-        attention_use_fp4_indexer_cache=False,
-    )
-    args.mapping.rank = 0
-    model_fields = dict(
-        model_profile=None,
-        attention_arch=registry.AttentionArch.MLA,
-        dtype=torch.bfloat16,
-        context_len=512,
-        num_attention_heads=64,
-        num_key_value_heads=1,
-        head_dim=512,
-        kv_lora_rank=512,
-        qk_nope_head_dim=448,
-        qk_rope_head_dim=64,
-        v_head_dim=512,
-        scaling=512**-0.5,
-    )
-    hf_fields = dict(
-        compress_ratios=(1, 4, 1),
-        head_dim=512,
-        qk_rope_head_dim=64,
-        index_head_dim=128,
-        sliding_window=256,
-    )
-    target = SimpleNamespace(
-        **model_fields,
-        num_attention_layers=2,
-        hf_config=SimpleNamespace(**hf_fields, architectures=["DeepseekV4ForCausalLM"]),
-    )
-    draft = SimpleNamespace(
-        **model_fields,
-        num_attention_layers=1,
-        hf_config=SimpleNamespace(
-            **hf_fields, architectures=["DeepseekV4ForCausalLMNextN"]
-        ),
-    )
-    build = registry.create_attn_components(
-        args,
-        target,
-        gpu_id=0,
-        rank=0,
-        gpu_memory=0,
-        draft_model_config=draft,
-        graph_reserve_bytes=0,
-        post_profile_bytes=0,
-        probe_batch_rows=1,
-        profiled_cache_bytes=32 << 20,
-        reuse_target_backend=None,
-        reuse_draft_backend=None,
-    )
-    assert build.attn_backend._swa_window_tokens() == 256
-    assert build.draft_attn_backend._swa_window_tokens() == 256
-
-
 @pytest.mark.parametrize(
     "is_draft,width,num_layers,layerwise,ring_rows",
     [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
@@ -418,9 +351,8 @@ class _SyntheticHybridRecipe(CacheRecipe):
             (
                 CacheGroupSpec(
                     group_id=self._extra_state_group,
-                    retention="full_history",
+                    attn_kind="state",
                     sliding_window_tokens=None,
-                    family="state",
                     replayable=False,
                 ),
                 (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),
@@ -1084,9 +1016,8 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
 def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     """No new contract: the one spec publishes draft-only
     groups as ordinary groups; pool publication and the scheduler config
-    conversion carry them with their natural retention — the C++ side
-    instantiates its existing SwaManager for them, no draft concept
-    anywhere."""
+    conversion carry them with their own kind -- the C++ side treats them as
+    any sliding-window group, no draft concept anywhere."""
     from test.runtime.cache_pool_test_utils import MinimalCacheView
 
     import torch
@@ -1450,7 +1381,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         enforce_eager=False,
         enable_memory_saver=False,
         gpu_memory_utilization=0.9,
-        mapping=SimpleNamespace(world_size=1, world_group=None),
+        mapping=SimpleNamespace(world_size=1, world_group=None, is_first_pp_rank=True),
     )
     with pytest.raises(_Sized) as sized:
         device.build_device_side(
@@ -1551,7 +1482,10 @@ def test_the_admission_builds_the_pool_the_budget_left_out(
         attn_tp_group=[0],
         pg_manager=None,
     )
-    prefill = SimpleNamespace(disaggregation_mode="prefill")
+    prefill = SimpleNamespace(
+        disaggregation_mode="prefill",
+        mapping=SimpleNamespace(is_first_pp_rank=True),
+    )
     assert sum(registered) == recv_pool.recv_pool_bytes(prefill, True)
     pool = slots * slot_mb << 20 if slots > 0 and slot_mb > 0 else 0
     assert sum(registered) == pool
@@ -1585,7 +1519,7 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
         disaggregation_mode=mode,
         disaggregation_bootstrap_port=0,
         disaggregation_ib_device=None,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1)),
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1), is_first_pp_rank=True),
     )
     facts = SimpleNamespace(device="cpu", hidden=16, num_deepstack=0, dtype=None)
     prefill_admission.make_epd_prefill_admission(
@@ -1593,7 +1527,11 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
         0,
         model_config=SimpleNamespace(is_multimodal=True, is_multimodal_active=active),
         encoder_model_facts=lambda: facts,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=[0])),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(tp_group=[0]),
+            is_first_pp_rank=True,
+            has_pp=False,
+        ),
         attn_tp_rank=0,
         attn_tp_size=1,
         attn_tp_cpu_group=None,

@@ -148,7 +148,7 @@ def _supports_a16w4_warp_decode_ep_gfx950(
             _, packed_hidden, intermediate = n16_mxfp4_shape(*tensors)
         except ValueError:
             return False
-        shapes_match = packed_hidden == hidden
+        shapes_match = packed_hidden == hidden and intermediate % 256 == 0
     elif any(t.ndim != 3 for t in tensors):
         return False
     elif linear_weights:
@@ -1115,6 +1115,8 @@ def gluon_a16w4_situ_warp_decode_ep_gfx950(
         )
         if weight_hidden != hidden_dim:
             raise ValueError("N16 W13 shape is inconsistent with activations")
+        if intermediate_dim % 256:
+            raise ValueError("N16 SiTU decode requires I divisible by 256")
         packed_hidden = hidden_dim // 2
         w13_stride_k = w2_stride_k = 1
         w13_stride_n = packed_hidden

@@ -38,9 +38,10 @@ from __future__ import annotations
 import os
 import sys
 import threading
-import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -132,18 +133,19 @@ def _compile(manager: GrammarManager) -> None:
     manager.grammar_backend.get_cached_or_future_value(KEY)[0].result(timeout=5)
 
 
-class TestGrammarTpLockstep(unittest.TestCase):
-    def setUp(self):
+class TestGrammarTpLockstep:
+    @pytest.fixture(autouse=True)
+    def _patch_peer(self, request):
         self.peer = _Peer()
         patcher = mock.patch(
             "torch.distributed.all_gather_object", self.peer.all_gather_object
         )
         patcher.start()
-        self.addCleanup(patcher.stop)
+        request.addfinalizer(patcher.stop)
 
     def _queue(self, manager: GrammarManager) -> RequestState:
         state = _state()
-        self.assertFalse(manager.process_req_with_grammar(state))
+        assert not manager.process_req_with_grammar(state)
         manager.add_to_queue(SimpleNamespace(request_id="r"), state, None)
         return state
 
@@ -151,23 +153,23 @@ class TestGrammarTpLockstep(unittest.TestCase):
         manager = _manager(1)
         _compile(manager)
         state = _state()
-        self.assertTrue(manager.process_req_with_grammar(state))
-        self.assertIsInstance(state.grammar, _Grammar)
+        assert manager.process_req_with_grammar(state)
+        assert isinstance(state.grammar, _Grammar)
 
     def test_cache_hit_waits_for_the_other_rank(self):
         manager = _manager(2)
         _compile(manager)
         state = self._queue(manager)
 
-        self.assertEqual(manager.get_ready_grammar_requests(), [])  # peer compiling
-        self.assertEqual(len(manager), 1)
+        assert manager.get_ready_grammar_requests() == []  # peer compiling
+        assert len(manager) == 1
 
         self.peer.ready = {0}
         promoted = manager.get_ready_grammar_requests()
-        self.assertEqual([entry[1] for entry in promoted], [state])
-        self.assertFalse(state.finished)
-        self.assertIsInstance(state.grammar, _Grammar)
-        self.assertEqual(len(manager), 0)
+        assert [entry[1] for entry in promoted] == [state]
+        assert not state.finished
+        assert isinstance(state.grammar, _Grammar)
+        assert len(manager) == 0
 
     def test_cached_failure_is_aborted_with_the_group(self):
         manager = _manager(2)
@@ -175,10 +177,10 @@ class TestGrammarTpLockstep(unittest.TestCase):
         state = self._queue(manager)
 
         self.peer.ready = {0}
-        self.assertEqual(len(manager.get_ready_grammar_requests()), 1)
+        assert len(manager.get_ready_grammar_requests()) == 1
         reason = state.finished_reason.to_json()
-        self.assertEqual(reason["type"], "abort")
-        self.assertIn("bad schema", reason["message"])
+        assert reason["type"] == "abort"
+        assert "bad schema" in reason["message"]
 
     def test_group_failure_aborts_a_compile_done_here(self):
         manager = _manager(2)
@@ -186,16 +188,16 @@ class TestGrammarTpLockstep(unittest.TestCase):
         state = self._queue(manager)
 
         self.peer.failed = {0}  # the other rank's compile timed out
-        self.assertEqual(len(manager.get_ready_grammar_requests()), 1)
-        self.assertIsNone(state.grammar)
-        self.assertIn("timed out", state.finished_reason.to_json()["message"])
+        assert len(manager.get_ready_grammar_requests()) == 1
+        assert state.grammar is None
+        assert "timed out" in state.finished_reason.to_json()["message"]
         # This rank's compiled grammar stays cached.
         value, hit = manager.grammar_backend.get_cached_or_future_value(KEY)
-        self.assertTrue(hit)
-        self.assertFalse(value.is_invalid)
+        assert hit
+        assert not value.is_invalid
 
 
-class TestGrammarTpOutcome(unittest.TestCase):
+class TestGrammarTpOutcome:
     """Ranks 0 and 1 in threads: one holds KEY's compiled grammar, the other a
     timeout marker for it (rank 0, then rank 1). Both see a cache hit and
     are ready at once; both must finish the request the same way."""
@@ -220,8 +222,8 @@ class TestGrammarTpOutcome(unittest.TestCase):
             for thread in threads:
                 thread.join(timeout=20)
 
-        self.assertIsNotNone(outcomes[0])
-        self.assertEqual(outcomes[0], outcomes[1])
+        assert outcomes[0] is not None
+        assert outcomes[0] == outcomes[1]
         return outcomes[0]
 
     def _marker_and_compiled(self, timeouts: int):
@@ -239,11 +241,11 @@ class TestGrammarTpOutcome(unittest.TestCase):
             self._marker_and_compiled(1)[::-1],
         ):
             queued, reason = self._run(list(managers))
-            self.assertEqual(queued, 0)
-            self.assertEqual(reason["type"], "abort")
-            self.assertIn("timed out", reason["message"])
-            self.assertNotIn("gave up", reason["message"])
-            self.assertIsNone(reason.get("status_code"))
+            assert queued == 0
+            assert reason["type"] == "abort"
+            assert "timed out" in reason["message"]
+            assert "gave up" not in reason["message"]
+            assert reason.get("status_code") is None
 
     def test_permanent_marker_on_one_rank_aborts_on_both(self):
         for managers in (
@@ -251,10 +253,10 @@ class TestGrammarTpOutcome(unittest.TestCase):
             self._marker_and_compiled(2)[::-1],
         ):
             queued, reason = self._run(list(managers))
-            self.assertEqual(queued, 0)
-            self.assertIn("gave up after 1 retries", reason["message"])
-            self.assertEqual(reason.get("status_code"), 400)
+            assert queued == 0
+            assert "gave up after 1 retries" in reason["message"]
+            assert reason.get("status_code") == 400
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

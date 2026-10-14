@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Compile and execute a minimal Triton kernel on Ascend NPU."""
+"""Compile and execute Triton kernels from the kernel package and runtime on NPU."""
 
 from __future__ import annotations
 
@@ -32,6 +32,10 @@ from tokenspeed_kernel._triton import triton as kernel_triton
 from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
 from tokenspeed_kernel_npu._triton import triton as ascend_kernel_triton
 from triton.runtime import driver
+
+from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
+from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
+from tokenspeed.runtime.utils.triton import triton as runtime_triton
 
 
 @triton.jit
@@ -57,6 +61,8 @@ def main() -> None:
         raise RuntimeError("tokenspeed-kernel did not select Triton-Ascend")
     if ascend_kernel_triton is not triton:
         raise RuntimeError("tokenspeed-kernel-npu did not select Triton-Ascend")
+    if runtime_triton is not triton:
+        raise RuntimeError("TokenSpeed runtime did not select Triton-Ascend")
 
     size = 4097
     block_size = 256
@@ -78,6 +84,29 @@ def main() -> None:
     torch.npu.synchronize()
     if backing[128:1128].count_nonzero() or backing[2048:2560].count_nonzero():
         raise AssertionError("TokenSpeed Triton KV-cache kernel produced bad output")
+
+    lengths = torch.tensor([2, 0, 3], device="npu", dtype=torch.int32)
+    prefixes = torch.tensor([5, 0, 10], device="npu", dtype=torch.int32)
+    positions, starts = compute_position_triton(prefixes, lengths, 5)
+    torch.testing.assert_close(
+        positions.cpu(), torch.tensor([5, 6, 10, 11, 12], dtype=torch.int64)
+    )
+    torch.testing.assert_close(starts.cpu(), torch.tensor([0, 2, 2], dtype=torch.int32))
+
+    pool_indices = torch.tensor([2, 0, 1], device="npu", dtype=torch.int32)
+    cache_lengths = torch.tensor([9, 4, 13], device="npu", dtype=torch.int32)
+    decode_positions = torch.empty(12, device="npu", dtype=torch.int64)
+    decode_seq_lens = torch.empty(3, device="npu", dtype=torch.int32)
+    fused_decode_input_prep(
+        decode_positions, decode_seq_lens, pool_indices, cache_lengths, 4
+    )
+    torch.testing.assert_close(
+        decode_positions.cpu(),
+        torch.tensor([13, 14, 15, 16, 9, 10, 11, 12, 4, 5, 6, 7]),
+    )
+    torch.testing.assert_close(
+        decode_seq_lens.cpu(), torch.tensor([17, 13, 8], dtype=torch.int32)
+    )
 
     print(
         "Triton-Ascend verification passed:",

@@ -100,17 +100,15 @@ class TestGroupSpecsFromLayerTypesTest:
         assert ("sliding_attention") in (by_id)
 
         full = by_id["full_attention"]
-        assert (full.retention) == ("full_history")
+        assert (full.attn_kind) == ("full_history")
         assert (full.sliding_window_tokens) is None
         assert (full.rows_per_page) == (16)
         assert (full.entry_stride_tokens) == (1)
-        assert (full.family) == ("history")
 
         swa = by_id["sliding_attention"]
-        assert (swa.retention) == ("sliding_window")
+        assert (swa.attn_kind) == ("sliding_window")
         assert (swa.sliding_window_tokens) == (128)
         assert (swa.rows_per_page) == (16)
-        assert (swa.family) == ("history")
 
     def test_all_full_yields_single_group(self):
         specs = _specs(
@@ -120,7 +118,7 @@ class TestGroupSpecsFromLayerTypesTest:
         )
         assert (len(specs)) == (1)
         assert (specs[0].group_id) == ("full_attention")
-        assert (specs[0].retention) == ("full_history")
+        assert (specs[0].attn_kind) == ("full_history")
         assert (specs[0].sliding_window_tokens) is None
 
     def test_group_order_is_first_appearance(self):
@@ -144,10 +142,9 @@ class TestGroupSpecsFromLayerTypesTest:
         )
         assert ([s.group_id for s in specs]) == (block)
         for s in specs[:5]:
-            assert (s.retention) == ("sliding_window")
+            assert (s.attn_kind) == ("sliding_window")
             assert (s.sliding_window_tokens) == (512)
-            assert (s.family) == ("history")
-        assert (specs[5].retention) == ("full_history")
+        assert (specs[5].attn_kind) == ("full_history")
         assert (specs[5].sliding_window_tokens) is None
         # Single window: group ids stay equal to the raw labels.
         assert (layer_group_ids(layer_types=block * 2, sliding_window_tokens=512)) == (
@@ -196,8 +193,7 @@ class TestGroupSpecsFromLayerTypesTest:
         assert (len(specs)) == (2)
         by_id = {s.group_id: s for s in specs}
         state = by_id["linear_attention"]
-        assert (state.family) == ("state")
-        assert (state.retention) == ("full_history")
+        assert (state.attn_kind) == ("state")
         assert (state.sliding_window_tokens) is None
         # State groups declare no rows and cover no token span.
         assert (state.rows_per_page) is None
@@ -207,7 +203,6 @@ class TestGroupSpecsFromLayerTypesTest:
         with pytest.raises((TypeError)):
             _ = state.page_size
         full = by_id["full_attention"]
-        assert (full.family) == ("history")
         assert (full.page_size) == (16)
         assert (full.block_granularity) == (16)
 
@@ -219,9 +214,8 @@ class TestGroupSpecsFromLayerTypesTest:
             prefix_granularity=16,
         )
         by_id = {s.group_id: s for s in specs}
-        assert (by_id["sliding_attention"].family) == ("history")
         assert (by_id["sliding_attention"].sliding_window_tokens) == (128)
-        assert (by_id["linear_attention"].family) == ("state")
+        assert (by_id["linear_attention"].attn_kind) == ("state")
         assert (by_id["linear_attention"].sliding_window_tokens) is None
 
 
@@ -423,19 +417,18 @@ class TestBroadcastWindowAsymmetryTest:
             )
         }
         state = by_id["linear_attention"]
-        assert (state.family) == ("state")
-        assert (state.retention) == ("full_history")
+        assert (state.attn_kind) == ("state")
         assert (state.sliding_window_tokens) is None
 
 
 class TestCacheGroupSpecShapeTest:
-    """A history spec declares row geometry (paged KV); a state spec declares
-    no span at all."""
+    """A history spec (full history or sliding window) declares row geometry
+    (paged KV); a state spec declares no span at all."""
 
     def test_row_geometry_shape(self):
         spec = CacheGroupSpec(
             group_id="kv",
-            retention="full_history",
+            attn_kind="full_history",
             rows_per_page=16,
             entry_stride_tokens=4,
             sliding_window_tokens=None,
@@ -445,38 +438,29 @@ class TestCacheGroupSpecShapeTest:
         assert (spec.block_granularity) == (64)
 
     def test_state_shape_has_no_span(self):
-        spec = CacheGroupSpec(
-            group_id="state",
-            retention="full_history",
-            sliding_window_tokens=None,
-            family="state",
-            replayable=False,
-        )
+        spec = CacheGroupSpec(group_id="state", attn_kind="state", replayable=False)
         with pytest.raises((TypeError)):
             _ = spec.block_granularity
         with pytest.raises((TypeError)):
             _ = spec.page_size
 
-    def test_state_family_declares_no_rows(self):
+    def test_state_group_declares_no_rows(self):
         # Rows of token history -- V4's compressor tails included -- are a
-        # history group whatever their retention.
+        # sliding-window group, not a state group with a window.
         with pytest.raises((ValueError), match=("no row geometry")):
             CacheGroupSpec(
                 group_id="v4.compressor",
-                retention="sliding_window",
+                attn_kind="state",
                 rows_per_page=16,
                 entry_stride_tokens=4,
-                sliding_window_tokens=256,
-                family="state",
                 replayable=False,
             )
         spec = CacheGroupSpec(
             group_id="v4.compressor",
-            retention="sliding_window",
+            attn_kind="sliding_window",
             rows_per_page=16,
             entry_stride_tokens=4,
             sliding_window_tokens=256,
-            family="history",
             replayable=False,
         )
         assert (spec.page_size) == (64)
@@ -486,7 +470,7 @@ class TestCacheGroupSpecShapeTest:
         with pytest.raises((ValueError)):
             CacheGroupSpec(
                 group_id="kv",
-                retention="full_history",
+                attn_kind="full_history",
                 sliding_window_tokens=None,
                 replayable=False,
             )
@@ -495,7 +479,7 @@ class TestCacheGroupSpecShapeTest:
         with pytest.raises((ValueError)):
             CacheGroupSpec(
                 group_id="kv",
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=16,
                 sliding_window_tokens=None,
                 replayable=False,
@@ -505,31 +489,53 @@ class TestCacheGroupSpecShapeTest:
         with pytest.raises((ValueError)):
             CacheGroupSpec(
                 group_id="kv",
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=0,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
                 replayable=False,
             )
 
-    def test_state_family_rides_full_history_and_is_never_replayed(self):
+    def test_state_group_has_no_window_and_is_never_replayed(self):
         # A checkpoint summarizes everything before it, so nothing in a state
         # group ever slides out, and nothing of it is regenerated by replay.
-        with pytest.raises((ValueError), match=("full_history")):
+        with pytest.raises((ValueError), match=("only a sliding-window group")):
             CacheGroupSpec(
                 group_id="state",
-                retention="sliding_window",
+                attn_kind="state",
                 sliding_window_tokens=256,
-                family="state",
                 replayable=False,
             )
         with pytest.raises((ValueError), match=("bounded replay")):
+            CacheGroupSpec(group_id="state", attn_kind="state", replayable=True)
+
+    def test_window_belongs_to_sliding_groups_only(self):
+        with pytest.raises((ValueError), match=("only a sliding-window group")):
             CacheGroupSpec(
-                group_id="state",
-                retention="full_history",
-                sliding_window_tokens=None,
-                family="state",
-                replayable=True,
+                group_id="kv",
+                attn_kind="full_history",
+                rows_per_page=16,
+                entry_stride_tokens=1,
+                sliding_window_tokens=256,
+                replayable=False,
+            )
+        with pytest.raises((ValueError), match=("positive sliding_window_tokens")):
+            CacheGroupSpec(
+                group_id="swa",
+                attn_kind="sliding_window",
+                rows_per_page=16,
+                entry_stride_tokens=1,
+                replayable=False,
+            )
+
+    def test_unknown_kind_raises(self):
+        with pytest.raises((ValueError), match=("unknown cache-group kind")):
+            CacheGroupSpec(
+                group_id="kv",
+                attn_kind="history",
+                rows_per_page=16,
+                entry_stride_tokens=1,
+                replayable=False,
             )
 
 
@@ -550,7 +556,7 @@ def _fake_pool(specs, *, packing: int) -> SimpleNamespace:
     # validates the runtime class, so cross that boundary explicitly here.
     runtime_specs = tuple(RuntimeCacheGroupSpec(**asdict(spec)) for spec in specs)
     prefix_granularity = math.lcm(
-        *(spec.block_granularity for spec in specs if spec.family == "history")
+        *(spec.block_granularity for spec in specs if spec.attn_kind != "state")
     )
     contract = CacheRuntimeContract(
         prefix_granularity=prefix_granularity,

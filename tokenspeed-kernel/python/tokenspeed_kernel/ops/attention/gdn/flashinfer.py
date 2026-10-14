@@ -17,7 +17,7 @@
 
 """FlashInfer gated delta net (GDN) prefill + decode/MTP kernels.
 
-Prefill: fast-path for GDN chunked prefill on Blackwell (sm100/sm103) + CUDA 13
+Prefill: fast-path for GDN chunked prefill on Hopper/Blackwell + CUDA 13
 + bf16 + head_dim==128. The caller gates on ``is_supported`` and must fail fast
 when the fast-path is unavailable; this module has no Triton fallback for it.
 
@@ -81,11 +81,8 @@ if platform.is_hopper_plus:
 def is_available() -> bool:
     """Whether the flashinfer GDN chunk-prefill kernel can run on this platform."""
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    # flashinfer's gdn_prefill treats compute-capability major 10 as the
-    # Blackwell path (sm100 B200/GB200, sm103 B300), gated on CUDA>=13 and the
-    # prefill kernel being present; it raises NotImplementedError otherwise.
-    # Mirror that here so the caller does not commit to a crashing fast-path.
-    return platform.is_blackwell and cuda_major >= 13
+    # FlashInfer provides separate SM90 and Blackwell prefill kernels.
+    return (platform.is_hopper or platform.is_blackwell) and cuda_major >= 13
 
 
 def is_supported(
@@ -120,7 +117,7 @@ if is_available():
         name="flashinfer_gdn_chunk_prefill",
         solution="flashinfer",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 0),
+            min_arch_version=ArchVersion(9, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -148,7 +145,7 @@ if is_available():
         output_final_state: bool = True,
         output_h: bool = False,
     ):
-        """Run one chunked GDN prefill on the sm100 kernel.
+        """Run one chunked GDN prefill on Hopper or Blackwell.
 
         q, k, v are [B, T, H, D] (B==1) or [T, H, D]; q/k already L2-normalized.
         g, beta are [B, T, H] or [T, H]; g in log space. initial_state is the
