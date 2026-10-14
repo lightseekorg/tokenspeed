@@ -1531,7 +1531,8 @@ if platform.is_amd:
         ):
             raise ValueError("gfx950 A4W4 Gluon MoE supports only standard SiLU")
         return launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
-            x.contiguous(),
+            # Quantization reads rows by stride; only the inner stride must be 1.
+            x if x.stride(1) == 1 else x.contiguous(),
             w.w13_weight,
             w.w13_weight_scale,
             w.w2_weight,

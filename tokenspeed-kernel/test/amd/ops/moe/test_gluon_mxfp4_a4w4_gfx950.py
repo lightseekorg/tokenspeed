@@ -177,6 +177,21 @@ def test_matches_reference(m: int) -> None:
     assert (actual == portable).float().mean().item() > 0.99
 
 
+def test_row_strided_activations_match_contiguous() -> None:
+    w = _weights()
+    plan = _plan(None)
+    moe_process_weights(plan, w)
+    x, topk_weights, topk_ids = _routes(5)
+    # A row slice of a wider buffer is consumed in place.
+    wide = torch.zeros((5, HIDDEN + 512), device="cuda", dtype=torch.bfloat16)
+    wide[:, :HIDDEN] = x
+    strided = moe_apply(
+        plan, wide[:, :HIDDEN], w, None, topk_weights=topk_weights, topk_ids=topk_ids
+    )
+    dense = moe_apply(plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids)
+    torch.testing.assert_close(strided, dense, atol=0, rtol=0)
+
+
 def test_out_of_range_expert_contributes_zero() -> None:
     w = _weights()
     moe_process_weights(_plan(None), w)
