@@ -678,10 +678,14 @@ def test_loader_rejects_a_profile_from_another_architecture(
     )
 
 
-def test_superseded_draft_profile_default_is_reported(caplog) -> None:
-    from tokenspeed.runtime.configs.model_config import _apply_attention_defaults
+def test_superseded_draft_profile_default_is_reported(caplog, monkeypatch) -> None:
+    from tokenspeed.runtime.configs.model_config import (
+        _apply_attention_defaults,
+        logger,
+    )
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
+    monkeypatch.setattr(logger, "propagate", True)
     args = ServerArgs(model="x")
     args.drafter_attention_backend = "target_choice"
     with caplog.at_level("INFO"):
