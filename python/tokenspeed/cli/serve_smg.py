@@ -18,11 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``ts serve`` orchestrator: spawn smg gateway + gRPC engine, tag logs, probe
-readiness, and tear down gateway-first on shutdown.
+"""``ts serve`` supervises SMG and TokenSpeed.
 
-``ts serve`` is the full serving command; today its internals are the smg
-gateway plus the gRPC engine servicer. ``ts serve --headless`` is engine-only:
+The engine retains its gRPC control endpoint for admin, RL and encoding.
+``--connection-mode zmq`` selects direct generation; gRPC remains the default
+until the bundled gateway release contains the matching integration. ``ts serve --headless`` is engine-only:
 nothing else is spawned here — an external frontend such as ``smg serve
 --backend tokenspeed --connection-mode zmq`` binds the msgpack ZMQ sockets and
 this engine dials in at ``tcp://{--data-parallel-address}:
@@ -41,6 +41,7 @@ import os
 import re
 import signal
 import sys
+import tempfile
 from pathlib import Path
 
 from tokenspeed_kernel.platform import current_platform
@@ -125,6 +126,18 @@ def _check_serve_extra_installed() -> None:
             f"Missing: {', '.join(missing)}\n"
         )
         sys.exit(1)
+
+
+def _check_zmq_gateway_supported() -> None:
+    """Reject older bundled gateways before starting either child process."""
+    from smg.router_args import RouterArgs
+
+    if "worker_specs" not in vars(RouterArgs):
+        raise SystemExit(
+            "--connection-mode zmq requires a matching SMG build with "
+            "--worker-specs support. Install SMG from the paired source checkout "
+            "(docs/configuration/server.md), or use --connection-mode grpc."
+        )
 
 
 def _get_from_args(
@@ -670,34 +683,112 @@ class _ChildExitedDuringStartup(Exception):
 
 
 async def _probe_or_stop(
-    probe_coro, stop_event: asyncio.Event, *, proc=None, label: str = ""
+    probe_coro, stop_event: asyncio.Event, *, proc=None, label: str = "", peer=None
 ):
-    """Race a readiness probe against the stop event and (optionally) the
-    subprocess's own exit.
-
-    - probe success → return result
-    - stop event   → raise ``_ShutdownDuringStartup``
-    - proc exits   → raise ``_ChildExitedDuringStartup`` with returncode + label
-    """
+    """Race readiness against shutdown and both supervised processes."""
     probe_task = asyncio.create_task(probe_coro)
     stop_task = asyncio.create_task(stop_event.wait())
-    tasks = [probe_task, stop_task]
-    proc_task = None
-    if proc is not None:
-        proc_task = asyncio.create_task(proc.wait())
-        tasks.append(proc_task)
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for t in pending:
-        t.cancel()
-    if proc_task is not None and proc_task in done:
-        rc = proc_task.result()
-        raise _ChildExitedDuringStartup(
-            f"{label} subprocess exited with rc={rc} during startup; "
-            f"see [{label}] log lines above for the cause"
+    process_tasks = {}
+    for process, name in (
+        (proc, label),
+        (peer, GATEWAY_TAG if label == ENGINE_TAG else ENGINE_TAG),
+    ):
+        if process is not None:
+            process_tasks[asyncio.create_task(process.wait())] = name
+    tasks = [probe_task, stop_task, *process_tasks]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task, name in process_tasks.items():
+            if task in done:
+                raise _ChildExitedDuringStartup(
+                    f"{name} subprocess exited with rc={task.result()} during startup; "
+                    f"see [{name}] log lines above for the cause"
+                )
+        if stop_task in done:
+            raise _ShutdownDuringStartup()
+        return probe_task.result()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _zmq_launch_args(
+    engine_args: list[str], *, engine_port: int, ipc_directory: str, rl_control_url: str
+) -> tuple[list[str], dict]:
+    """Describe the local engine and its separate generation/control endpoints."""
+    role = _get_from_args(engine_args, "--disaggregation-mode", "null")
+    # Resolve attention DP exactly as ServerArgs does, without loading a model.
+    from tokenspeed.runtime.distributed.mapping import _resolve_parallelism_sizes
+
+    topology = detect_topology()
+    nodes = int(
+        _get_from_args(engine_args, "--nnodes", str(topology.nnodes if topology else 1))
+    )
+    pp_size = int(_get_from_args(engine_args, "--pipeline-parallel-size", "1"))
+    tp_arg = _get_from_args(
+        engine_args,
+        "--attn-tp-size",
+        _get_from_args(engine_args, "--tensor-parallel-size"),
+    )
+    dp_arg = _get_from_args(engine_args, "--data-parallel-size")
+    tp_size = int(tp_arg) if tp_arg is not None else None
+    dp_size = int(dp_arg) if dp_arg is not None else None
+    world_size = int(
+        _get_from_args(
+            engine_args, "--world-size", str(pp_size * (tp_size or 1) * (dp_size or 1))
         )
-    if stop_task in done:
-        raise _ShutdownDuringStartup()
-    return probe_task.result()
+    )
+    if pp_size <= 0 or world_size % pp_size:
+        raise ValueError(
+            "--world-size must be divisible by positive --pipeline-parallel-size"
+        )
+    try:
+        _, dp_size = _resolve_parallelism_sizes(world_size // pp_size, tp_size, dp_size)
+    except AssertionError as exc:
+        raise ValueError("incompatible attention parallelism sizes") from exc
+    if nodes > 1 and dp_size > 1:
+        raise ValueError(
+            "ZMQ generation uses host-local IPC and cannot connect DP owners on "
+            "multiple nodes. Use --connection-mode grpc or separate local groups."
+        )
+    control_url = f"grpc://127.0.0.1:{engine_port}"
+    spec = {
+        "url": control_url if role == "encode" else f"ipc://{ipc_directory}/engine",
+        "runtime_type": "tokenspeed",
+        "connection_mode": "grpc" if role == "encode" else "zmq",
+        "worker_type": "regular" if role == "null" else role,
+    }
+    # Encoder workers already have an encode RPC service, not a token scheduler.
+    if role in ("encode", "prefill"):
+        spec["bootstrap_port"] = int(
+            _get_from_args(engine_args, "--disaggregation-bootstrap-port", "8998")
+        )
+    if role == "encode":
+        return engine_args, spec
+    if int(_get_from_args(engine_args, "--zmq-engine-index", "0")) != 0:
+        raise ValueError("ts serve requires --zmq-engine-index 0 for its local worker")
+    host = _get_from_args(engine_args, "--data-parallel-address", "127.0.0.1")
+    handshake_port = _get_from_args(engine_args, "--data-parallel-rpc-port")
+    if handshake_port is None:
+        handshake_port = str(_free_port_avoiding_ephemeral_range())
+        engine_args = [*engine_args, "--data-parallel-rpc-port", handshake_port]
+    if "--zmq-msgpack" not in engine_args:
+        engine_args = [*engine_args, "--zmq-msgpack"]
+    spec.update(
+        {
+            "zmq_handshake_address": f"tcp://{host}:{handshake_port}",
+            "labels": {
+                "zmq_control_url": control_url,
+                "rl.control_url": rl_control_url,
+            },
+            "dp_size": dp_size,
+        }
+    )
+    if role in ("prefill", "decode"):
+        spec["labels"]["zmq_pd"] = "true"
+    return engine_args, spec
 
 
 async def run_smg(
@@ -714,6 +805,7 @@ async def run_smg(
     gateway = None
     engine_log: asyncio.Task | None = None
     gateway_log: asyncio.Task | None = None
+    ipc_directory: tempfile.TemporaryDirectory | None = None
 
     # Install signal handlers before spawning any subprocess so a Ctrl-C
     # during the readiness probe doesn't skip terminate_then_kill.
@@ -735,8 +827,46 @@ async def run_smg(
         # Wire the engine metrics port (only with --enable-metrics).
         engine_args, metrics_url = _add_metrics_port(engine_args)
 
+        worker_spec = None
+        if opts.connection_mode == "zmq":
+            # Keep Unix socket paths below platform limits and isolate each launch.
+            ipc_directory = tempfile.TemporaryDirectory(prefix="ts-smg-", dir="/tmp")
+            engine_args, worker_spec = _zmq_launch_args(
+                engine_args,
+                engine_port=engine_port,
+                ipc_directory=ipc_directory.name,
+                rl_control_url=rl_control_url,
+            )
+            worker_spec["max_connection_attempts"] = max(
+                20, opts.engine_startup_timeout
+            )
+            if "--worker-startup-timeout-secs" not in gateway_args:
+                gateway_args = [
+                    *gateway_args,
+                    "--worker-startup-timeout-secs",
+                    str(opts.engine_startup_timeout),
+                ]
+            if worker_spec["connection_mode"] == "zmq":
+                worker_spec["labels"]["zmq_connect_timeout_secs"] = str(
+                    opts.engine_startup_timeout
+                )
+        elif "--zmq-msgpack" in engine_args:
+            raise ValueError("--zmq-msgpack requires --connection-mode zmq")
+
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)
         engine_log = asyncio.create_task(_stream_to(engine, ENGINE_TAG))
+
+        # Direct engines cannot become ready until SMG has bound their handshake.
+        # Start both peers before the control health probe in ZMQ mode.
+        if worker_spec is not None:
+            gateway_args = _gateway_args_with_default_prometheus_port(gateway_args)
+            gateway = await spawn_gateway(
+                gateway_args,
+                engine_host="127.0.0.1",
+                engine_port=engine_port,
+                worker_spec=worker_spec,
+            )
+            gateway_log = asyncio.create_task(_stream_to(gateway, GATEWAY_TAG))
 
         await _probe_or_stop(
             wait_grpc_serving(
@@ -746,15 +876,18 @@ async def run_smg(
             stop,
             proc=engine,
             label=ENGINE_TAG,
+            peer=gateway,
         )
 
-        # Allocate the metrics port only now — see
-        # _gateway_args_with_default_prometheus_port for why earlier is racy.
-        gateway_args = _gateway_args_with_default_prometheus_port(gateway_args)
-        gateway = await spawn_gateway(
-            gateway_args, engine_host="127.0.0.1", engine_port=engine_port
-        )
-        gateway_log = asyncio.create_task(_stream_to(gateway, GATEWAY_TAG))
+        if gateway is None:
+            gateway_args = _gateway_args_with_default_prometheus_port(gateway_args)
+            gateway = await spawn_gateway(
+                gateway_args,
+                engine_host="127.0.0.1",
+                engine_port=engine_port,
+                worker_spec=None,
+            )
+            gateway_log = asyncio.create_task(_stream_to(gateway, GATEWAY_TAG))
 
         await _probe_or_stop(
             wait_http_ready(
@@ -764,6 +897,7 @@ async def run_smg(
             stop,
             proc=gateway,
             label=GATEWAY_TAG,
+            peer=engine,
         )
 
         sys.stdout.write(f"ts serve ready on http://{user_host}:{user_port}\n")
@@ -819,7 +953,7 @@ async def run_smg(
     except _ShutdownDuringStartup:
         logger.info("shutdown signal received during startup; exiting cleanly")
         return 0
-    except TimeoutError as exc:
+    except (TimeoutError, ValueError) as exc:
         logger.error(f"startup failed: {exc!s}")
         return 1
     except KeyboardInterrupt:
@@ -841,6 +975,9 @@ async def run_smg(
         # Final reap: walk only the children of our two known subprocesses —
         # never os.getpid(), which under pytest would walk the test runner's
         # children and SIGKILL unrelated test fixtures.
+        if ipc_directory is not None:
+            ipc_directory.cleanup()
+
         for proc in (engine, gateway):
             if proc is not None:
                 try:
@@ -891,6 +1028,8 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
 
     _check_serve_extra_installed()
     split = split_argv(raw_argv)
+    if split.opts.connection_mode == "zmq":
+        _check_zmq_gateway_supported()
     engine_args, gateway_args = _args_with_default_model_parsers(
         split.engine, split.gateway
     )
@@ -922,6 +1061,8 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
     else:
         # Non-zero-rank nodes never create a gRPC servicer, so they run the
         # engine directly, skipping the gateway.
+        if split.opts.connection_mode == "zmq" and "--zmq-msgpack" not in engine_args:
+            engine_args = [*engine_args, "--zmq-msgpack"]
         argv = engine_argv(engine_args, host=user_host, port=user_port)
         logger.info(f"follower node: exec {' '.join(argv)}")
         sys.stdout.flush()

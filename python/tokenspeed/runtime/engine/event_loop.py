@@ -55,7 +55,11 @@ from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender, NullSend
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
 from tokenspeed.runtime.engine.load_snapshot import create_load_reporter
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
-from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
+from tokenspeed.runtime.engine.pause import (
+    PauseController,
+    PauseHooks,
+    scheduler_drained,
+)
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     RequestHistoryRows,
@@ -560,6 +564,9 @@ class EventLoop:
         self.request_handler = RequestHandler(
             server_args=self.server_args,
             hf_eos_token_id=self.model_config.hf_eos_token_id,
+            multimodal_hf_config=self.model_config.hf_config,
+            model_is_multimodal=self.model_config.is_multimodal,
+            weight_update_ready_fn=lambda: scheduler_drained(self.scheduler),
             max_req_len=self.max_model_len - 1,
             vocab_size=self.model_config.vocab_size,
             recv_func=self.recv_from_tokenizer,
@@ -744,37 +751,50 @@ class EventLoop:
         return self.attn_tp_rank == 0
 
     def _init_interprocess_comm(self):
-        context = zmq.Context(2)
-        # Chunk-pipeline: request I/O is owned by GLOBAL rank 0 only —
-        # every stage's tp_rank-0 would otherwise try to open the one
-        # frontend socket pair. recv_reqs broadcasts over the world group.
-        if self._owns_request_io():
-            if self.server_args.zmq_msgpack:
-                # SMG drives the scheduler directly: it binds the sockets and
-                # this engine connects in over the msgpack wire; the handshake
-                # (engine identity, ready response) lives in zmq_msgpack.
-                from tokenspeed.runtime.engine import zmq_msgpack
-
-                self.recv_from_tokenizer, self.send_to_tokenizer = (
-                    zmq_msgpack.connect_msgpack_engine_for_loop(context, self)
-                )
-            else:
-                self.recv_from_tokenizer = IpcReceiver(
+        self._io_context = zmq.Context(2)
+        try:
+            # Rank-identical scheduling still receives one request stream. Transport
+            # adapters merge the two frontend sockets before RequestHandler drains it.
+            if self._owns_request_io():
+                control_recv = IpcReceiver(
                     get_zmq_socket(
-                        context,
+                        self._io_context,
                         zmq.PULL,
                         self.port_args.scheduler_input_ipc_name,
                         False,
                     )
                 )
-                self.send_to_tokenizer = IpcSender(
+                control_send = IpcSender(
                     get_zmq_socket(
-                        context, zmq.PUSH, self.port_args.tokenizer_ipc_name, False
+                        self._io_context,
+                        zmq.PUSH,
+                        self.port_args.tokenizer_ipc_name,
+                        False,
                     )
                 )
-        else:
-            self.recv_from_tokenizer = None
-            self.send_to_tokenizer = NullSender()
+                if self.server_args.zmq_msgpack:
+                    from tokenspeed.runtime.engine import zmq_msgpack
+
+                    direct_recv, direct_send = (
+                        zmq_msgpack.connect_msgpack_engine_for_loop(
+                            self._io_context, self
+                        )
+                    )
+                    self.recv_from_tokenizer = zmq_msgpack.SharedFrontendReceiver(
+                        control_recv, direct_recv, max_requests_per_round=128
+                    )
+                    self.send_to_tokenizer = zmq_msgpack.SharedFrontendSender(
+                        control_send, direct_send
+                    )
+                else:
+                    self.recv_from_tokenizer = control_recv
+                    self.send_to_tokenizer = control_send
+            else:
+                self.recv_from_tokenizer = None
+                self.send_to_tokenizer = NullSender()
+        except BaseException:
+            self._io_context.destroy(linger=0)
+            raise
 
     def _init_load_reporter(self) -> None:
         reports_load = self._owns_request_io()
@@ -812,7 +832,7 @@ class EventLoop:
         # Pause-state snapshot for withhold_admissions below: it must be
         # taken before process_requests, which may flip the state mid-batch.
         pause_blocked_before = self._pause.admit_blocked
-        new_req_specs, new_req_states, bootstrap_infos, abort_rids = (
+        new_req_specs, new_req_states, bootstrap_infos, abort_requests = (
             self.request_handler.process_requests(recv_reqs)
         )
         # Sweep TTL-expired abort markers every iteration. Without this
@@ -826,9 +846,18 @@ class EventLoop:
         # grammar_manager.mark_abort call, a request aborted mid-compile
         # would finish compiling and get admitted before being noticed.
         grammar_manager = self.request_handler.grammar_manager
-        for rid in abort_rids:
-            self._request_abort_or_mark(rid, "client cancelled request")
-            grammar_manager.mark_abort(rid)
+        for abort in abort_requests:
+            self._request_abort_or_mark(
+                abort.rid, "client cancelled request", notify_client=abort.notify_client
+            )
+            grammar_manager.mark_abort(abort.rid, notify_client=abort.notify_client)
+
+        if abort_requests:
+            self._pause_hooks.reap_finished_buffered_requests()
+            if self._pause.forward_blocked:
+                for abort in abort_requests:
+                    if abort.notify_client:
+                        self.output_processor.publish_paused_abort(abort.rid)
 
         self._pause_hooks.apply_transitions(grammar_manager)
 
@@ -839,6 +868,7 @@ class EventLoop:
         for spec, state, bootstrap in zip(
             new_req_specs, new_req_states, bootstrap_infos
         ):
+            self.output_processor.apply_pending_abort(spec.request_id, state)
             # Requests pre-marked finished (e.g. invalid session ID aborted
             # in RequestHandler) skip grammar compilation entirely — we'd
             # just be wasting a compile slot on a response we're about to
@@ -1409,6 +1439,7 @@ class EventLoop:
         if callable(close_transfer):
             close_transfer()
         self._device.shutdown_cache()
+        self._io_context.destroy(linger=0)
 
 
 def run_event_loop(
@@ -1521,10 +1552,11 @@ def run_event_loop(
         freeze_startup_heap()
         event_loop.event_loop()
 
-    except Exception:  # noqa: BLE001 - process boundary; report and signal parent
-        traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback!s}")
-        parent_process.send_signal(signal.SIGUSR1)
+    except Exception as exc:  # noqa: BLE001 - process boundary; signal parent
+        if not (isinstance(exc, InterruptedError) and shutdown_event.is_set()):
+            traceback = get_exception_traceback()
+            logger.error(f"Scheduler hit an exception: {traceback!s}")
+            parent_process.send_signal(signal.SIGUSR1)
     finally:
         # SystemExit/KeyboardInterrupt bypass the Exception handler above;
         # report their traceback without swallowing or changing the exit status.

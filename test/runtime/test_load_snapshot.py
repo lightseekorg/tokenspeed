@@ -454,7 +454,7 @@ def test_non_reporting_rank_never_samples_the_scheduler():
 def test_reporter_factory_selects_the_sink_for_each_mode(
     monkeypatch, enabled, direct, expected_sink
 ):
-    """Only a reporting rank opens PUSH; direct mode binds its output setter."""
+    """Reporting ranks publish heartbeats and direct mode also updates its output tail."""
     created_publishers = []
     direct_setters = []
 
@@ -481,7 +481,7 @@ def test_reporter_factory_selects_the_sink_for_each_mode(
     )
 
     assert created_publishers == (
-        [("tcp://metrics", 4, 0.25)] if expected_sink == "publisher" else []
+        [("tcp://metrics", 4, 0.25)] if expected_sink in ("publisher", "direct") else []
     )
     assert direct_setters == ([set_load_snapshot] if expected_sink == "direct" else [])
     if expected_sink == "null":

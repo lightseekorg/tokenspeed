@@ -41,7 +41,6 @@ from tokenspeed.runtime.engine.io_struct import (
     TokenizedGenerateReqInput,
 )
 from tokenspeed.runtime.engine.load_snapshot import LoadSnapshotStore
-from tokenspeed.runtime.engine.request import Req
 from tokenspeed.runtime.utils import (
     configure_logger,
     get_colorful_logger,
@@ -422,7 +421,9 @@ class DataParallelController:
             )
         self.dispatching(req)
 
-    def round_robin_scheduler(self, req: Req):
+    def round_robin_scheduler(
+        self, req: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput
+    ):
         if self.server_args.disaggregation_mode == "null":
             self.workers[self.round_robin_counter].send_pyobj(req)
             self.round_robin_counter = (self.round_robin_counter + 1) % len(

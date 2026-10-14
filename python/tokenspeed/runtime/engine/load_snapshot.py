@@ -296,6 +296,27 @@ class LoadReporter:
         self._publisher.close()
 
 
+class SharedLoadSnapshotSink:
+    """Publish control heartbeats and update the direct generation load tail."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        dp_rank: int,
+        heartbeat_interval: float,
+        direct_setter: Callable[[int, int, int, int], None],
+    ) -> None:
+        self._control = LoadSnapshotPublisher(endpoint, dp_rank, heartbeat_interval)
+        self._direct = DirectLoadSnapshotSink(direct_setter)
+
+    def observe(self, values: _LoadValues) -> None:
+        self._control.observe(values)
+        self._direct.observe(values)
+
+    def close(self) -> None:
+        self._control.close()
+
+
 def create_load_reporter(
     *,
     enabled: bool,
@@ -309,13 +330,15 @@ def create_load_reporter(
     """Build the reporter with the sink this rank and mode call for.
 
     Ranks that do not report get the no-op sink; direct-ZMQ deployments
-    (``direct_setter`` bound) fold the snapshot into the next output batch;
-    everything else opens the private PUSH transport.
+    (``direct_setter`` bound) publish the native heartbeat and fold the snapshot
+    into the next output batch; everything else opens the private PUSH transport.
     """
     if not enabled:
         publisher = NullLoadSnapshotPublisher()
     elif direct_setter is not None:
-        publisher = DirectLoadSnapshotSink(direct_setter)
+        publisher = SharedLoadSnapshotSink(
+            endpoint, dp_rank, heartbeat_interval, direct_setter
+        )
     else:
         publisher = LoadSnapshotPublisher(endpoint, dp_rank, heartbeat_interval)
     return LoadReporter(

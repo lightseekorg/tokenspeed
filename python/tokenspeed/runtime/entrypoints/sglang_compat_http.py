@@ -465,7 +465,7 @@ async def abort_request(request: Request) -> JSONResponse:
                 raise RuntimeError("Failed to resume after aborting requests.")
             llm.allow_generation_admission()
         elif body.get("rid"):
-            llm.abort_request(str(body["rid"]))
+            llm.abort_request_admin(str(body["rid"]), owner=body.get("owner"))
         return {"success": True}
 
     return await _guarded(_do)

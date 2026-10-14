@@ -53,6 +53,7 @@ _ORCH_FLAGS = {
     "--gateway-startup-timeout",
     "--drain-timeout",
     "--control-port",
+    "--connection-mode",
 }
 
 _FANOUT_FLAGS = {"--model", "--reasoning-parser"}
@@ -95,6 +96,7 @@ def _has_model_flag(tokens: Iterable[str]) -> bool:
 
 @dataclass
 class OrchestratorOpts:
+    connection_mode: str = "grpc"
     engine_startup_timeout: int = 3600
     gateway_startup_timeout: int = 60
     drain_timeout: int = 30
@@ -230,6 +232,18 @@ def split_argv(argv: list[str]) -> SplitResult:
     engine_flags = _engine_recognized_flags()
 
     for name, value in items:
+        if name == "--connection-mode":
+            if value not in ("zmq", "grpc"):
+                raise ValueError("--connection-mode must be zmq or grpc")
+            result.opts.connection_mode = value
+            continue
+
+        if name in ("--tokenizer", "--tokenizer-path"):
+            if value is None:
+                raise ValueError(f"{name} requires a value")
+            _append_arg(result.engine, "--tokenizer", value)
+            _append_arg(result.gateway, "--tokenizer-path", value)
+            continue
         if name in _ORCH_FLAGS:
             if value is None or value == "":
                 raise ValueError(f"{name} requires a positive integer (seconds)")

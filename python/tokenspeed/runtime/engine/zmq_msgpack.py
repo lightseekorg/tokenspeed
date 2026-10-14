@@ -1,31 +1,43 @@
 # Copyright (c) 2026 LightSeek Foundation
 #
-# Engine-side ZMQ transport for the direct SMG <-> scheduler msgpack path.
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
 #
-# In the default (pickle) mode the scheduler BINDS a PULL/PUSH pair and the
-# Python tokenizer_manager connects in. SMG cannot speak that pickle protocol,
-# so this module inverts the topology: SMG (the frontend) BINDS the handshake/
-# input/output sockets and the scheduler CONNECTS in, completing the
-# HELLO -> INIT -> READY handshake and then exchanging the msgpack frames
-# defined in ``zmq_wire``.
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
 #
-# The adapters below expose ``recv_pyobj``/``send_pyobj`` so the existing
-# RequestHandler and OutputProcesser drive them unchanged; only the wire codec
-# differs. This module is additive and only reached when ``--zmq-msgpack`` is on.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Engine sockets for direct generation alongside the existing control frontend."""
 
 from __future__ import annotations
 
 import collections
 import logging
 import struct
+from collections.abc import Callable
 
+import msgspec
 import zmq
 
 from tokenspeed.runtime.engine import zmq_wire
 from tokenspeed.runtime.engine.io_struct import (
+    AbortReq,
+    BaseBatchReq,
     BatchTokenIDOut,
     BatchTokenIDOutSlim,
     MsgpackEncoder,
+    TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
 from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
@@ -88,11 +100,8 @@ class MsgpackRecvSocket:
 
         Mirrors the tokenizer-side ``InputProcessor`` gate for the SGLang
         logprob knobs. ``logprob_start_len`` is resolved in place (-1 -> last
-        prompt token). A start that asks for prompt logprobs is refused when
-        the engine cannot compute them (``supports_prompt_logprobs``), and
-        otherwise because the slim per-step output (``BatchTokenIDOutSlim``)
-        has no prompt-logprob columns -- computing them would silently drop
-        them on the wire.
+        prompt token). Prompt scores require the engine's native capability;
+        supported engines return nullable rows on the appended slim output tail.
         """
         if obj.return_logprob and not self._enable_output_logprobs:
             return (
@@ -121,10 +130,6 @@ class MsgpackRecvSocket:
                         "this engine: the model narrows its prefill rows or runs "
                         "pipeline parallel; use logprob_start_len=-1"
                     )
-                return (
-                    "logprob_start_len >= 0 (prompt logprobs) is not carried on the "
-                    "msgpack output wire; use logprob_start_len=-1"
-                )
         try:
             obj.sampling_params.verify(self._vocab_size)
         except ValueError as exc:
@@ -132,6 +137,7 @@ class MsgpackRecvSocket:
         return None
 
     def recv_pyobj(self, flags: int = 0):
+        malformed_count = 0
         while not self._pending:
             # Raises zmq.Again (a zmq.ZMQError) under NOBLOCK when idle, which
             # the caller catches to end the drain loop.
@@ -148,6 +154,9 @@ class MsgpackRecvSocket:
                     f"{[len(frame) for frame in frames]!s}, head="
                     f"{(frames[0][:8].hex() if frames else '')!s}): {exc!s}",
                 )
+                malformed_count += 1
+                if malformed_count >= 32:
+                    raise zmq.Again()
                 continue
             for obj in decoded:
                 # AbortReq carries no sampling_params; only generate requests
@@ -165,7 +174,7 @@ class MsgpackRecvSocket:
         return self._pending.popleft()
 
     def close(self) -> None:
-        self._socket.close()
+        self._socket.close(linger=0)
 
 
 class MsgpackSendSocket:
@@ -178,9 +187,18 @@ class MsgpackSendSocket:
     and are dropped with a warning rather than crashing the scheduler.
     """
 
-    def __init__(self, socket: zmq.Socket, engine_index: int = 0) -> None:
+    def __init__(
+        self,
+        socket: zmq.Socket,
+        engine_index: int = 0,
+        *,
+        weight_version: Callable[[], str | None] | None = None,
+        speculative_num_draft_tokens: int | None = None,
+    ) -> None:
         self._socket = socket
         self._engine_index = engine_index
+        self._weight_version = weight_version
+        self._speculative_num_draft_tokens = speculative_num_draft_tokens
         self._encoder = MsgpackEncoder()
         self._load_snapshot = (0, 0, 0, 0)
 
@@ -216,6 +234,10 @@ class MsgpackSendSocket:
             ) = self._load_snapshot
             slim = BatchTokenIDOutSlim.from_full(
                 obj,
+                weight_version=(
+                    self._weight_version() if self._weight_version is not None else None
+                ),
+                speculative_num_draft_tokens=self._speculative_num_draft_tokens,
                 engine_index=self._engine_index,
                 num_running=num_running,
                 num_waiting=num_waiting,
@@ -241,17 +263,26 @@ class MsgpackSendSocket:
             logger.warning(f"msgpack output: ENGINE_CORE_DEAD send failed: {exc!s}")
 
     def close(self) -> None:
-        self._socket.close()
+        self._socket.close(linger=0)
 
 
-def _recv_init_with_timeout(socket: zmq.Socket) -> list[bytes]:
+def _recv_init_with_timeout(
+    socket: zmq.Socket,
+    *,
+    shutdown_requested: Callable[[], bool] | None = None,
+) -> list[bytes]:
     """Wait for SMG's INIT reply, logging progress each poll slice so operators
     can tell a still-registering frontend from a wedged one."""
     waited_ms = 0
     while waited_ms < _INIT_TIMEOUT_MS:
-        if socket.poll(_INIT_POLL_SLICE_MS, zmq.POLLIN):
+        if shutdown_requested is not None and shutdown_requested():
+            raise InterruptedError("SMG msgpack handshake interrupted by shutdown")
+        poll_ms = min(1000, _INIT_TIMEOUT_MS - waited_ms)
+        if socket.poll(poll_ms, zmq.POLLIN):
             return socket.recv_multipart()
-        waited_ms += _INIT_POLL_SLICE_MS
+        waited_ms += poll_ms
+        if waited_ms % _INIT_POLL_SLICE_MS != 0:
+            continue
         logger.info(
             f"msgpack handshake: waiting for SMG INIT ({waited_ms // 1000:d}s elapsed)",
         )
@@ -269,6 +300,9 @@ def connect_msgpack_engine(
     *,
     enable_output_logprobs: bool,
     supports_prompt_logprobs: bool,
+    weight_version: Callable[[], str | None] | None = None,
+    speculative_num_draft_tokens: int | None = None,
+    shutdown_requested: Callable[[], bool] | None = None,
 ) -> tuple[MsgpackRecvSocket, MsgpackSendSocket]:
     """Run the startup handshake against SMG and return the wrapped
     data-plane sockets.
@@ -283,56 +317,72 @@ def connect_msgpack_engine(
       5. connect the output PUSH.
     """
     identity = _engine_identity(engine_index)
-
     handshake = context.socket(zmq.DEALER)
-    handshake.setsockopt(zmq.IDENTITY, identity)
-    handshake.connect(handshake_address)
-    logger.info(f"msgpack handshake: connected to {handshake_address!s}")
-
-    handshake.send(
-        zmq_wire.encode(
-            zmq_wire.WireReadyMessage(status="HELLO", local=True, headless=True)
+    input_socket: zmq.Socket | None = None
+    output_socket: zmq.Socket | None = None
+    handshake_completed = False
+    try:
+        handshake.setsockopt(zmq.IDENTITY, identity)
+        handshake.connect(handshake_address)
+        logger.info(f"msgpack handshake: connected to {handshake_address!s}")
+        handshake.send(
+            zmq_wire.encode(
+                zmq_wire.WireReadyMessage(status="HELLO", local=True, headless=True)
+            )
         )
-    )
-    init_frames = _recv_init_with_timeout(handshake)
-    init = zmq_wire.decode_init(init_frames[-1])
-    handshake.send(
-        zmq_wire.encode(
-            zmq_wire.WireReadyMessage(status="READY", local=True, headless=True)
+        init_frames = _recv_init_with_timeout(
+            handshake, shutdown_requested=shutdown_requested
         )
-    )
-
-    if not init.addresses.inputs or not init.addresses.outputs:
-        raise ValueError(
-            "SMG INIT message did not carry both input and output addresses: "
-            f"inputs={init.addresses.inputs} outputs={init.addresses.outputs}"
+        init = zmq_wire.decode_init(init_frames[-1])
+        if not init.addresses.inputs or not init.addresses.outputs:
+            raise ValueError(
+                "SMG INIT message did not carry both input and output addresses: "
+                f"inputs={init.addresses.inputs} outputs={init.addresses.outputs}"
+            )
+        handshake.send(
+            zmq_wire.encode(
+                zmq_wire.WireReadyMessage(status="READY", local=True, headless=True)
+            )
         )
-    input_address = init.addresses.inputs[0]
-    output_address = init.addresses.outputs[0]
-    logger.info(
-        f"msgpack handshake: INIT input={input_address!s} output={output_address!s}",
-    )
-
-    input_socket = context.socket(zmq.DEALER)
-    input_socket.setsockopt(zmq.IDENTITY, identity)
-    input_socket.connect(input_address)
-    # Register on the input socket so SMG learns this engine's post-init config.
-    input_socket.send(zmq_wire.encode(ready_response))
-
-    output_socket = context.socket(zmq.PUSH)
-    output_socket.connect(output_address)
-
-    handshake.close()
-    logger.info(f"msgpack handshake: complete (engine_index={engine_index!s})")
-    return (
-        MsgpackRecvSocket(
-            input_socket,
-            vocab_size,
-            enable_output_logprobs=enable_output_logprobs,
-            supports_prompt_logprobs=supports_prompt_logprobs,
-        ),
-        MsgpackSendSocket(output_socket, engine_index=engine_index),
-    )
+        input_address = init.addresses.inputs[0]
+        output_address = init.addresses.outputs[0]
+        logger.info(
+            f"msgpack handshake: INIT input={input_address!s} output={output_address!s}"
+        )
+        input_socket = context.socket(zmq.DEALER)
+        input_socket.setsockopt(zmq.IDENTITY, identity)
+        input_socket.connect(input_address)
+        input_socket.send(zmq_wire.encode(ready_response))
+        output_socket = context.socket(zmq.PUSH)
+        # A dead frontend must not indefinitely block the scheduler at HWM.
+        output_socket.setsockopt(zmq.SNDTIMEO, 1000)
+        output_socket.connect(output_address)
+        handshake_completed = True
+        logger.info(f"msgpack handshake: complete (engine_index={engine_index!s})")
+        return (
+            MsgpackRecvSocket(
+                input_socket,
+                vocab_size,
+                enable_output_logprobs=enable_output_logprobs,
+                supports_prompt_logprobs=supports_prompt_logprobs,
+            ),
+            MsgpackSendSocket(
+                output_socket,
+                engine_index=engine_index,
+                weight_version=weight_version,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            ),
+        )
+    except BaseException:
+        if input_socket is not None:
+            input_socket.close(linger=0)
+        if output_socket is not None:
+            output_socket.close(linger=0)
+        raise
+    finally:
+        # READY may still be queued when the local send returns. Allow a
+        # bounded flush on success; failed startup has no frames to preserve.
+        handshake.close(linger=1000 if handshake_completed else 0)
 
 
 def _tokenspeed_version() -> str:
@@ -375,6 +425,7 @@ def connect_msgpack_engine_for_loop(
         world_size=loop.world_size,
         data_parallel_size=loop.dp_size,
         tensor_parallel_size=loop.attn_tp_size,
+        pipeline_parallel_size=loop.pp_size,
         decode_context_parallel_size=server_args.kv_parallel_size,
         data_parallel_rank=loop.dp_rank,
         max_num_seqs=server_args.max_num_seqs,
@@ -392,4 +443,145 @@ def connect_msgpack_engine_for_loop(
         loop.model_config.vocab_size,
         enable_output_logprobs=server_args.enable_output_logprobs,
         supports_prompt_logprobs=loop.supports_prompt_logprobs,
+        weight_version=lambda: server_args.weight_version,
+        speculative_num_draft_tokens=(
+            server_args.speculative_num_draft_tokens
+            if server_args.speculative_algorithm
+            else None
+        ),
+        shutdown_requested=loop.shutdown_event.is_set,
     )
+
+
+# Separate scheduler IDs let both frontends use the same public request ID.
+# The prefixes are deterministic so PD peers retain the same request identity.
+_CONTROL_RID_PREFIX = "\x00control:"
+_DIRECT_RID_PREFIX = "\x00direct:"
+
+
+class SharedFrontendReceiver:
+    """Fair, bounded ingress from control IPC and direct generation sockets.
+
+    Generation and cancellation IDs are namespaced before scheduler admission;
+    the sender restores the original IDs. No per-request ownership table is
+    retained, so cancellation and failed requests cannot leak routing state.
+    ``recv_pyobj`` is nonblocking, as required by RequestHandler's round drain.
+    ``max_requests_per_round`` bounds admission work even under continuous input.
+    """
+
+    def __init__(self, control, direct, *, max_requests_per_round: int) -> None:
+        if max_requests_per_round <= 0:
+            raise ValueError("max_requests_per_round must be positive")
+        self._receivers = (control, direct)
+        self._prefixes = (_CONTROL_RID_PREFIX, _DIRECT_RID_PREFIX)
+        self._next_receiver = 0
+        self._received = 0
+        self._max_requests_per_round = max_requests_per_round
+
+    def recv_pyobj(self, flags: int = 0):
+        if not flags & zmq.NOBLOCK:
+            raise ValueError("SharedFrontendReceiver requires zmq.NOBLOCK")
+        if self._received == self._max_requests_per_round:
+            self._received = 0
+            raise zmq.Again()
+        for offset in range(2):
+            index = (self._next_receiver + offset) % 2
+            try:
+                obj = self._receivers[index].recv_pyobj(zmq.NOBLOCK)
+            except zmq.Again:
+                continue
+            self._next_receiver = 1 - index
+            self._received += 1
+            if isinstance(
+                obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, AbortReq)
+            ):
+                prefix = self._prefixes[index]
+                if isinstance(obj, AbortReq) and obj.admin_owner is not None:
+                    if index != 0:
+                        raise ValueError(
+                            "Admin abort must enter through control ingress"
+                        )
+                    prefix = self._prefixes[0 if obj.admin_owner == "control" else 1]
+                    obj = msgspec.structs.replace(obj, admin_owner=None)
+                obj = msgspec.structs.replace(obj, rid=prefix + obj.rid)
+                if (
+                    isinstance(obj, TokenizedGenerateReqInput)
+                    and obj.session_params is not None
+                ):
+                    reference = obj.session_params.rid
+                    if reference is not None:
+                        obj.session_params = msgspec.structs.replace(
+                            obj.session_params, rid=prefix + reference
+                        )
+            return obj
+        self._received = 0
+        raise zmq.Again()
+
+    def close(self) -> None:
+        for receiver in self._receivers:
+            receiver.close()
+
+
+class SharedFrontendSender:
+    """Return generation rows to their owner and control replies to AsyncLLM.
+
+    Output columns retain their original order and empty optional columns.
+    Splitting creates new structs, leaving the scheduler's batch untouched.
+    """
+
+    def __init__(self, control, direct: MsgpackSendSocket) -> None:
+        self._control = control
+        self._direct = direct
+
+    def send_pyobj(self, obj) -> None:
+        if not isinstance(obj, BatchTokenIDOut):
+            if isinstance(obj, BaseBatchReq) and obj.rids is not None:
+                if any(not rid.startswith(_CONTROL_RID_PREFIX) for rid in obj.rids):
+                    raise ValueError(
+                        "Non-token output requires a control frontend owner"
+                    )
+                obj = msgspec.structs.replace(
+                    obj, rids=[rid[len(_CONTROL_RID_PREFIX) :] for rid in obj.rids]
+                )
+            self._control.send_pyobj(obj)
+            return
+        owners = ([], [])
+        public_ids = []
+        for index, rid in enumerate(obj.rids):
+            if rid.startswith(_CONTROL_RID_PREFIX):
+                owners[0].append(index)
+                public_ids.append(rid[len(_CONTROL_RID_PREFIX) :])
+            elif rid.startswith(_DIRECT_RID_PREFIX):
+                owners[1].append(index)
+                public_ids.append(rid[len(_DIRECT_RID_PREFIX) :])
+            else:
+                raise ValueError(f"Generation output has no frontend owner: {rid!r}")
+        for sender, indices in zip((self._control, self._direct), owners, strict=True):
+            if not indices:
+                continue
+            columns = {}
+            for field in msgspec.structs.fields(type(obj)):
+                value = getattr(obj, field.name)
+                if isinstance(value, list) and len(value) == len(obj.rids):
+                    value = [value[index] for index in indices]
+                columns[field.name] = value
+            columns["rids"] = [public_ids[index] for index in indices]
+            sender.send_pyobj(type(obj)(**columns))
+
+    def set_load_snapshot(
+        self,
+        num_running: int,
+        num_waiting: int,
+        kv_active_pages: int,
+        kv_total_pages: int,
+    ) -> None:
+        self._direct.set_load_snapshot(
+            num_running, num_waiting, kv_active_pages, kv_total_pages
+        )
+
+    def send_engine_dead(self) -> None:
+        self._direct.send_engine_dead()
+
+    def close(self) -> None:
+        self._control.close(linger=0)
+        self._direct.close()

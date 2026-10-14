@@ -2,7 +2,7 @@
 # EPD (encode-prefill-decode) 1E-1P-2D smoke/eval topology on a single node.
 #
 # Serves nvidia/Qwen3.5-122B-A10B-NVFP4 (override via MODEL). TokenSpeed's EPD
-# data plane requires gRPC, so workers are launched via
+# generation supports SMG_CONNECTION_MODE=zmq; controls and encoding use
 # `python3 -m smg_grpc_servicer.tokenspeed`
 # (one unified entrypoint for all roles) rather than a role-specific adapter.
 # The encode worker is LM-free: it runs only the vision tower and ships image
@@ -15,6 +15,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/worker_cleanup.sh"
+source "$SCRIPT_DIR/smg_transport.sh"
 
 MODEL=${MODEL:-nvidia/Qwen3.5-122B-A10B-NVFP4}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-$MODEL}
@@ -104,6 +105,7 @@ cleanup() {
     stop_worker_pids \
       "epd-1e1p2d" "${WORKER_SHUTDOWN_TIMEOUT:-30}" "${pids[@]}"
   fi
+  cleanup_smg_transport
   exit "$code"
 }
 trap cleanup EXIT INT TERM
@@ -189,6 +191,7 @@ start_worker() {
   local dist_port=$6
   local bootstrap_port=$7   # empty for decode
   local log="$LOG_DIR/${label}.log"
+  configure_smg_worker "$label" "$mode" "$port" "$bootstrap_port"
   # Speculative decoding is LM-only; keep the encode worker independent.
   local -a role_mtp_args=()
   if [[ "$mode" != "encode" ]]; then
@@ -199,6 +202,7 @@ start_worker() {
     export CUDA_VISIBLE_DEVICES="$gpus"
     exec python3 -m smg_grpc_servicer.tokenspeed \
       "${COMMON_ARGS[@]}" \
+      "${SMG_ENGINE_TRANSPORT_ARGS[@]}" \
       "${role_mtp_args[@]}" \
       --world-size "$world_size" \
       --disaggregation-mode "$mode" \
@@ -217,19 +221,19 @@ start_worker decode0 decode "$DECODE0_GPUS" "$DECODE0_WS" "$DECODE0_PORT" "$DECO
 start_worker decode1 decode "$DECODE1_GPUS" "$DECODE1_WS" "$DECODE1_PORT" "$DECODE1_DIST_PORT" ""
 
 # Gate on each worker's model-loaded "SERVING" health (registration != loaded).
-wait_serving encode "${pids[0]}" "$startup_deadline"
-wait_serving prefill "${pids[1]}" "$startup_deadline"
-wait_serving decode0 "${pids[2]}" "$startup_deadline"
-wait_serving decode1 "${pids[3]}" "$startup_deadline"
-wait_http encode-bootstrap "http://127.0.0.1:${ENCODE_BOOTSTRAP_PORT}/health" "$startup_deadline"
+if [[ "$SMG_CONNECTION_MODE" == grpc ]]; then
+  wait_serving encode "${pids[0]}" "$startup_deadline"
+  wait_serving prefill "${pids[1]}" "$startup_deadline"
+  wait_serving decode0 "${pids[2]}" "$startup_deadline"
+  wait_serving decode1 "${pids[3]}" "$startup_deadline"
+  wait_http encode-bootstrap "http://127.0.0.1:${ENCODE_BOOTSTRAP_PORT}/health" "$startup_deadline"
+fi
+configure_smg_gateway
 
 echo "[epd-1e1p2d] starting smg gateway log=$LOG_DIR/gateway.log"
 python3 -m smg launch \
   --epd-disaggregation \
-  --encode "grpc://127.0.0.1:${ENCODE_PORT}" "$ENCODE_BOOTSTRAP_PORT" \
-  --prefill "grpc://127.0.0.1:${PREFILL_PORT}" "$PREFILL_BOOTSTRAP_PORT" \
-  --decode "grpc://127.0.0.1:${DECODE0_PORT}" \
-  --decode "grpc://127.0.0.1:${DECODE1_PORT}" \
+  "${SMG_GATEWAY_WORKER_ARGS[@]}" \
   --host "$LB_HOST" \
   --port "$LB_PORT" \
   --model-path "$MODEL_PATH" \
@@ -247,6 +251,14 @@ python3 -m smg launch \
   >"$LOG_DIR/gateway.log" 2>&1 &
 pids+=("$!")
 logs+=("$LOG_DIR/gateway.log")
+
+if [[ "$SMG_CONNECTION_MODE" == zmq ]]; then
+  wait_serving encode "${pids[0]}" "$startup_deadline"
+  wait_serving prefill "${pids[1]}" "$startup_deadline"
+  wait_serving decode0 "${pids[2]}" "$startup_deadline"
+  wait_serving decode1 "${pids[3]}" "$startup_deadline"
+  wait_http encode-bootstrap "http://127.0.0.1:${ENCODE_BOOTSTRAP_PORT}/health" "$startup_deadline"
+fi
 
 wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" "$startup_deadline"
 echo "[epd-1e1p2d] serving on http://127.0.0.1:${LB_PORT}/v1"

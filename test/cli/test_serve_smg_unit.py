@@ -68,6 +68,14 @@ from tokenspeed.cli.serve_smg import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _mock_control_server():
+    with patch(
+        "tokenspeed.cli.serve_smg._start_control_server", AsyncMock(return_value=True)
+    ):
+        yield
+
+
 def _make_proc(returncode: int | None = None) -> MagicMock:
     proc = MagicMock()
     proc.returncode = returncode
@@ -709,7 +717,11 @@ def test_inkling_rejects_incompatible_attention_backend(tmp_path):
         )
 
 
-def test_inkling_preserves_enabled_prefix_caching(tmp_path):
+@patch(
+    "tokenspeed.cli.serve_smg.current_platform",
+    return_value=SimpleNamespace(is_nvidia=True),
+)
+def test_inkling_preserves_enabled_prefix_caching(_platform, tmp_path):
     model = _make_inkling_model_dir(tmp_path)
 
     engine_args, _ = _args_with_default_model_parsers(

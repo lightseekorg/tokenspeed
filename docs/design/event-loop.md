@@ -562,7 +562,12 @@ For orientation, one iteration of `event_loop`:
   yet dequeued its copy would keep looping and wait for this rank in the
   per-round all-reduce, a deadlock. One op completes per round, and the
   replica MIN-reduces its result before the loop publishes the L3 weight
-  version or sends the reply. The same gate carries the online expert
+  version or sends the reply. Parameter loads also close admission through
+  the existing pause buffer on every DP worker and wait for all admitted
+  requests to drain; frontend locks cannot cover direct ZMQ requests. This
+  temporary admission hold does not change explicit pause state. The forward
+  thread then synchronizes the execution stream before loading, so a previous
+  DP-idle forward cannot still read parameters as they change. The same gate carries the online expert
   rebalance's *internal* ops (`EplbSnapshot`, `EplbCommit`,
   `EplbApplyChunk`) from a second FIFO with three more lanes: frontend
   ops arrive on different DP workers in different rounds while the hooks
@@ -607,3 +612,15 @@ For orientation, one iteration of `event_loop`:
   cache-owning rank still enters the replica MIN; raising would hang healthy
   peers. Clients are not failed. The D role never prefetches: its admission
   probes Device only.
+
+Direct MessagePack serving keeps the native AsyncLLM control frontend attached
+through the existing IPC pair. `SharedFrontendReceiver` drains native control
+and direct generation sockets fairly, with a bounded admission budget per
+round, before the ordinary request broadcast and handler. The adapters give
+frontend generation IDs separate deterministic namespaces (also used by abort
+and session references), and restore public IDs when splitting mixed output
+batches. Control replies always return to AsyncLLM, including DP fanout replies;
+no scheduler or handler is duplicated. Load reporting publishes native
+heartbeats and updates the direct output tail from the same observation.
+Encode-only roles retain their existing encode RPC loop and do not join the
+token-generation handshake.

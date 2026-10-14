@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -82,15 +83,29 @@ async def spawn_gateway(
     *,
     engine_host: str,
     engine_port: int,
+    worker_spec: dict | None,
 ) -> asyncio.subprocess.Process:
     """Spawn ``python -m smg launch`` with PIPE stdio."""
+    if worker_spec is None:
+        worker_args = ["--worker-urls", f"grpc://{engine_host}:{engine_port}"]
+    else:
+        # Merge peer specs supplied for a PD/EPD topology with the local worker.
+        specs = [worker_spec]
+        args = list(args)
+        while "--worker-specs" in args:
+            index = args.index("--worker-specs")
+            extra = json.loads(args[index + 1])
+            if not isinstance(extra, list):
+                raise ValueError("--worker-specs must be a JSON array")
+            specs.extend(extra)
+            del args[index : index + 2]
+        worker_args = ["--worker-specs", json.dumps(specs)]
     cmd = [
         sys.executable,
         "-m",
         _GATEWAY_MODULE,
         "launch",
-        "--worker-urls",
-        f"grpc://{engine_host}:{engine_port}",
+        *worker_args,
         "--disable-retries",
         "--disable-circuit-breaker",
         *args,

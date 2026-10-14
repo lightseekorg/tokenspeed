@@ -43,6 +43,174 @@ class _Sender:
         self.items.append(obj)
 
 
+@pytest.mark.parametrize("before_register", [False, True])
+def test_admin_abort_retains_terminal_notification_after_ordinary_repeat(
+    before_register,
+):
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=3)
+    if not before_register:
+        processor.register("admin", state)
+    processor.mark_abort("admin", notify_client=True)
+    processor.mark_abort("admin")
+    if before_register:
+        processor.register("admin", state)
+    assert state.finished
+    assert state.abort_notify_client is True
+    processor.reap_finished_orphan("admin", state)
+    assert "admin" not in processor.rid_to_state
+    assert len(sender.items) == 1
+    assert sender.items[0].rids == ["admin"]
+    assert sender.items[0].finished_reasons[0]["type"] == "abort"
+
+
+def test_admin_abort_before_admission_skips_grammar_wait_and_notifies():
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3], computed_length=0)
+    processor.mark_abort("early", notify_client=True)
+    processor.apply_pending_abort("early", state)
+    assert state.finished and state.abort_notify_client
+    processor.publish_finished_at_admission("early", state)
+    assert processor.rid_to_state == {}
+    assert processor.pending_aborts == {}
+    assert len(sender.items) == 1
+    assert sender.items[0].rids == ["early"]
+
+
+def test_admin_abort_cancels_grammar_queue_without_cancelling_shared_compile():
+    from concurrent.futures import Future
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
+
+    state = _state([1, 2, 3], computed_length=0)
+    other = _state([4, 5, 6], computed_length=0)
+    shared_future = Future()
+    manager = GrammarManager.__new__(GrammarManager)
+    manager.grammar_queue = [
+        (SimpleNamespace(request_id="admin"), state, shared_future),
+        (SimpleNamespace(request_id="other"), other, shared_future),
+    ]
+    manager.mark_abort("admin", notify_client=True)
+    manager.mark_abort("admin", notify_client=False)
+    assert state.finished and state.abort_notify_client
+    assert not other.finished
+    assert not shared_future.cancelled()
+
+
+def test_admin_abort_of_buffered_request_notifies_without_resuming_keep_pause():
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.engine.io_struct import NullSender
+    from tokenspeed.runtime.engine.pause import PauseController, PauseHooks, PauseState
+
+    sender = _Sender()
+    processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    cancelled = _state([1, 2, 3])
+    live = _state([4, 5, 6])
+    processor.register("cancelled", cancelled)
+    processor.register("live", live)
+    pause = PauseController(NullSender())
+    pause.state = PauseState.PAUSED_NEW
+    cancelled_spec = SimpleNamespace(request_id="cancelled")
+    live_spec = SimpleNamespace(request_id="live")
+    pause.buffer_specs([cancelled_spec, live_spec])
+    hooks = PauseHooks(SimpleNamespace(output_processor=processor), pause, None)
+    processor.mark_abort("cancelled", notify_client=True)
+    hooks.reap_finished_buffered_requests()
+    assert pause.state == PauseState.PAUSED_NEW
+    assert pause.buffered_specs == [live_spec]
+    assert list(processor.rid_to_state) == ["live"]
+    assert sender.items[0].rids == ["cancelled"]
+
+
+@pytest.mark.parametrize("phase", ["new", "grammar", "paused", "active_paused"])
+def test_event_loop_admin_abort_publishes_terminal_before_any_admission(phase):
+    """Execute the real admission methods without importing GPU constructors."""
+    import ast
+    from concurrent.futures import Future
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.engine.io_struct import AbortReq, NullSender
+    from tokenspeed.runtime.engine.pause import PauseController, PauseHooks, PauseState
+    from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
+
+    source = (
+        Path(__file__).parents[2] / "python/tokenspeed/runtime/engine/event_loop.py"
+    )
+    tree = ast.parse(source.read_text())
+    event_loop = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EventLoop"
+    )
+    methods = [
+        node
+        for node in event_loop.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("_process_new_requests", "_request_abort_or_mark")
+    ]
+    namespace = {}
+    exec(
+        compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"),
+        namespace,
+    )
+    loop = type("AdmissionLoop", (), namespace)()
+    sender = _Sender()
+    loop.output_processor = OutputProcesser(sender, attn_tp_rank=0, metrics=_Metrics())
+    state = _state([1, 2, 3])
+    spec = SimpleNamespace(request_id="target")
+    manager = GrammarManager.__new__(GrammarManager)
+    manager.grammar_queue = []
+    manager.grammar_sync_size = 1
+    new_specs, new_states, bootstraps = [], [], []
+    pause = PauseController(NullSender())
+    if phase == "new":
+        new_specs, new_states, bootstraps = [spec], [state], [None]
+    elif phase == "grammar":
+        state.grammar = Future()
+        manager.grammar_queue = [(spec, state, None)]
+    else:
+        loop.output_processor.register("target", state)
+        if phase == "active_paused":
+            pause.state = PauseState.PAUSED_ALL
+        else:
+            pause.state = PauseState.PAUSED_NEW
+            pause.buffer_specs([spec])
+    loop._pause = pause
+    loop._pause_hooks = PauseHooks(loop, pause, None)
+    abort = AbortReq(rid="target", notify_client=True)
+    loop.request_handler = SimpleNamespace(
+        recv_reqs=lambda: [abort],
+        process_requests=lambda _reqs: (new_specs, new_states, bootstraps, [abort]),
+        grammar_manager=manager,
+    )
+    loop._submit_scheduler_requests = lambda _specs: pytest.fail(
+        "Aborted request admitted"
+    )
+    loop._process_new_requests()
+    assert len(sender.items) == 1
+    assert sender.items[0].rids == ["target"]
+    assert sender.items[0].finished_reasons[0]["type"] == "abort"
+    if phase == "active_paused":
+        # Publishing a passive terminal must retain pages/state until the
+        # scheduler or PD transfer fence can complete normal cleanup.
+        assert loop.output_processor.rid_to_state == {"target": state}
+        assert state.finished_output is True
+        assert pause.state == PauseState.PAUSED_ALL
+        loop.output_processor.finish_prefill_request("target")
+        assert len(sender.items) == 1
+    assert loop.output_processor.rid_to_state == {}
+    assert loop.output_processor.pending_aborts == {}
+    assert manager.grammar_queue == []
+    if phase == "paused":
+        assert pause.state == PauseState.PAUSED_NEW
+        assert pause.buffered_specs == []
+
+
 class _Tokenizer:
     eos_token_id = None
     additional_stop_token_ids = None

@@ -970,6 +970,12 @@ class DeviceHandle:
         )
 
         def _apply_update():
+            if loads_weights:
+                # A drained scheduler may still have a queued DP-idle forward.
+                # FIFO orders CPU submissions, but the model's execution stream
+                # must finish before the loader mutates parameters on its stream.
+                with allow_host_sync("weight update drain"):
+                    self._executor.execution_stream.synchronize()
             result = handler(req)
             if loads_weights and result[0] and self._executor.drafter is not None:
                 self._executor.drafter.on_target_weights_updated()

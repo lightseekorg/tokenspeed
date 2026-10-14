@@ -35,8 +35,6 @@ from __future__ import annotations
 
 import torch
 
-from tokenspeed.runtime.layers.rotary_embedding import MRotaryEmbedding
-
 # Architectures whose HF configs follow the Qwen-VL M-RoPE layout
 # (vision_config.spatial_merge_size, image/video/vision_start token ids, etc.).
 _MROPE_ARCHITECTURES = {
@@ -233,6 +231,23 @@ def _compute_qwen3_omni_mrope_positions(hf_config, input_ids, mm_items):
     return positions, delta
 
 
+def prepare_mrope_inputs(hf_config, input_ids, multimodal_inputs) -> None:
+    """Populate shared M-RoPE metadata from tokenizer-valid prompt ids.
+
+    Both tokenizer ingress and direct tokenized scheduler ingress call this
+    before execution. Existing position overrides are authoritative.
+    """
+    if multimodal_inputs.mrope_positions is not None:
+        return
+    positions, delta = compute_mrope_positions(
+        hf_config, input_ids, multimodal_inputs.mm_items
+    )
+    multimodal_inputs.mrope_positions = positions
+    multimodal_inputs.mrope_position_delta = delta
+    if delta is not None:
+        multimodal_inputs.mrope_position_delta_scalar = int(delta.flatten()[0].item())
+
+
 def compute_mrope_positions(hf_config, input_ids, mm_items):
     """Compute ``(mrope_positions, mrope_position_delta)`` for MRoPE models.
 
@@ -281,6 +296,8 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
             video_grid_thw, video_grid_thw[:, 0].to(torch.long), dim=0
         )
         video_grid_thw[:, 0] = 1
+
+    from tokenspeed.runtime.layers.rotary_embedding import MRotaryEmbedding
 
     input_ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
     mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(

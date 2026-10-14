@@ -39,7 +39,7 @@ from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     structural_tag_for_reasoning_json_schema,
 )
 from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
-from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
+from tokenspeed.runtime.multimodal.mrope import prepare_mrope_inputs
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 if TYPE_CHECKING:
@@ -288,21 +288,12 @@ class InputProcessor:
                 input_ids_list = (
                     input_ids if isinstance(input_ids, list) else list(input_ids)
                 )
-            if (
-                input_ids_list is not None
-                and getattr(multimodal_inputs, "mrope_positions", None) is None
-            ):
-                mrope_positions, mrope_position_delta = compute_mrope_positions(
+            if input_ids_list is not None:
+                prepare_mrope_inputs(
                     self.engine.model_config.hf_config,
                     input_ids_list,
-                    multimodal_inputs.mm_items,
+                    multimodal_inputs,
                 )
-                multimodal_inputs.mrope_positions = mrope_positions
-                multimodal_inputs.mrope_position_delta = mrope_position_delta
-                if mrope_position_delta is not None:
-                    multimodal_inputs.mrope_position_delta_scalar = int(
-                        mrope_position_delta.flatten()[0].item()
-                    )
             if input_ids_list is not None:
                 input_ids_unpadded = input_ids_list
                 input_ids = pad_input_tokens(input_ids_list, multimodal_inputs)

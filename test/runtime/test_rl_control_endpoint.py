@@ -25,6 +25,60 @@ from tokenspeed.runtime.entrypoints.sglang_compat_http import (  # noqa: E402
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 
+def test_http_admin_abort_uses_live_scheduler_for_unknown_direct_rid():
+    from tokenspeed.runtime.engine.scheduler_control_client import (
+        SchedulerControlClient,
+    )
+
+    class LiveAdminLLM(FakeLLM, SchedulerControlClient):
+        pass
+
+    llm = LiveAdminLLM()
+    llm.server_args.zmq_msgpack = True
+    sent = []
+    llm.engine_core_client = SimpleNamespace(
+        send_to_scheduler=SimpleNamespace(send_pyobj=sent.append)
+    )
+    llm.rid_to_state = {"same": object()}
+    client = TestClient(build_sglang_compat_app(llm))
+    response = client.post("/abort_request", json={"rid": "same"})
+    assert response.status_code == 200
+    assert len(sent) == 1
+    assert sent[0].rid == "same"
+    assert sent[0].admin_owner == "direct"
+    assert sent[0].notify_client is True
+    assert "same" in llm.rid_to_state
+    response = client.post("/abort_request", json={"rid": "same", "owner": "control"})
+    assert response.status_code == 200
+    assert sent[-1].admin_owner == "control"
+    assert llm.scheduler_calls == []
+
+
+def test_http_admin_abort_rejects_invalid_or_unavailable_owner():
+    from tokenspeed.runtime.engine.scheduler_control_client import (
+        SchedulerControlClient,
+    )
+
+    class LiveAdminLLM(FakeLLM, SchedulerControlClient):
+        pass
+
+    llm = LiveAdminLLM()
+    llm.server_args.zmq_msgpack = False
+    sent = []
+    llm.engine_core_client = SimpleNamespace(
+        send_to_scheduler=SimpleNamespace(send_pyobj=sent.append)
+    )
+    client = TestClient(build_sglang_compat_app(llm))
+    for owner in ("invalid", "direct"):
+        response = client.post("/abort_request", json={"rid": "same", "owner": owner})
+        assert response.status_code == 400
+    assert sent == []
+    response = client.post("/abort_request", json={"rid": "native"})
+    assert response.status_code == 200
+    assert sent[0].admin_owner == "control"
+    assert sent[0].notify_client is True
+
+
 def _args(**overrides):
     base = {"host": "127.0.0.1", "rl_control_port": 40100, "rl_control_host": None}
     base.update(overrides)

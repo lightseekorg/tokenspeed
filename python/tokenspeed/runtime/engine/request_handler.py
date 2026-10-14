@@ -80,6 +80,9 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqOutput,
     mooncake_load_weight_version,
 )
+from tokenspeed.runtime.engine.multimodal_request import (
+    prepare_tokenized_multimodal_request,
+)
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import (
     UNBOUNDED_CACHED_PREFIX_TOKENS,
@@ -142,7 +145,7 @@ _INTERNAL_OPS: tuple[type, ...] = (EplbSnapshot, EplbCommit, EplbApplyChunk)
 _INTERNAL_OP_CODES: dict[type, int] = {
     kind: code for code, kind in enumerate(_INTERNAL_OPS, start=1)
 }
-_WEIGHT_GATE_WIDTH = 7
+_WEIGHT_GATE_WIDTH = 10
 
 
 class InternalOpCompleter(Protocol):
@@ -205,6 +208,9 @@ class RequestHandler:
         architectures: list[str] | None = None,
         *,
         tokenizer_kwargs: Mapping[str, object],
+        multimodal_hf_config,
+        model_is_multimodal: bool,
+        weight_update_ready_fn,
         pause_controller=None,
         memory_controller=None,
         device=None,
@@ -212,8 +218,13 @@ class RequestHandler:
 
         self.forward_ct = 0
         self.server_args = server_args
+        self.multimodal_hf_config = multimodal_hf_config
+        self.model_is_multimodal = model_is_multimodal
         # Owns pause/resume state; shared with the event loop. See pause.py.
         self.pause_controller = pause_controller
+        # A load must drain requests admitted through either frontend. The
+        # AsyncLLM reader/writer lock alone does not cover direct ZMQ work.
+        self.weight_update_ready_fn = weight_update_ready_fn
         # Owns release/resume_memory_occupation (data plane). See
         # memory_occupation.py. Shares the pause controller's drain machinery.
         self.memory_controller = memory_controller
@@ -369,7 +380,7 @@ class RequestHandler:
 
     def process_requests(self, recv_reqs: list):
         """Dispatch control requests and return new generate request specs and states."""
-        new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
+        new_req_specs, req_states, bootstrap_infos, abort_requests = [], [], [], []
         pending_flush_outputs = 0
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
@@ -386,7 +397,7 @@ class RequestHandler:
                     self.send_func.send_pyobj(output)
             elif isinstance(recv_req, AbortReq):
                 logger.debug(f"AbortReq for rid={recv_req.rid!s}")
-                abort_rids.append(recv_req.rid)
+                abort_requests.append(recv_req)
             elif isinstance(recv_req, FlushCacheReqInput):
                 pending_flush_outputs += 1
             elif isinstance(recv_req, PauseSchedulerReqInput):
@@ -453,7 +464,7 @@ class RequestHandler:
             self._complete_weight_update(ready_op, flush_success=flush_success)
         elif ready_internal is not None:
             self._complete_internal_op(ready_internal)
-        return new_req_specs, req_states, bootstrap_infos, abort_rids
+        return new_req_specs, req_states, bootstrap_infos, abort_requests
 
     # ------------------------------------------------------------------
     # Internal control ops (online expert rebalance)
@@ -551,6 +562,9 @@ class RequestHandler:
             [4] -1 if this rank has a queued internal op, else 0
             [5] +type code of the internal head (0 without one)
             [6] -type code of the internal head
+            [7] weight-load intent (any rank closes admission on every rank)
+            [8] load refused: active requests frozen by keep, or weights released
+            [9] load still draining admitted requests (any rank)
 
         A head is popped only when every rank has one; the flush intent of
         a load op then counts because every rank reads it off its own copy
@@ -573,6 +587,15 @@ class RequestHandler:
 
         head = self._pending_weight_ops[0] if self._pending_weight_ops else None
         head_code = 0 if head is None else _WEIGHT_OP_CODES[type(head)]
+        load_pending = isinstance(head, _WEIGHT_LOAD_OPS)
+        drained = not load_pending or self.weight_update_ready_fn()
+        refuse_load = load_pending and (
+            (
+                self.memory_controller is not None
+                and "weights" in self.memory_controller.released_tags
+            )
+            or (self.pause_controller.forward_blocked and not drained)
+        )
         internal = self._pending_internal_ops[0] if self._pending_internal_ops else None
         internal_code = 0 if internal is None else _INTERNAL_OP_CODES[type(internal)]
         want_standalone_flush = pending_flush_outputs > 0
@@ -581,18 +604,24 @@ class RequestHandler:
         if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
             buf = self._replica_flush_want_buf
             buf[0] = 1 if want_standalone_flush else 0
-            buf[1] = -1 if head is not None else 0
+            buf[1] = -1 if all_have_head else 0
             buf[2] = head_code
             buf[3] = -head_code
             buf[4] = -1 if internal is not None else 0
             buf[5] = internal_code
             buf[6] = -internal_code
+            buf[7] = int(load_pending)
+            buf[8] = int(refuse_load)
+            buf[9] = int(not drained)
             torch.distributed.all_reduce(
                 buf, op=torch.distributed.ReduceOp.MAX, group=self.attn_dp_cpu_group
             )
             reduced = buf.tolist()
             want_standalone_flush = reduced[0] > 0
             all_have_head = reduced[1] == -1
+            load_pending = reduced[7] > 0
+            refuse_load = reduced[8] > 0
+            drained = reduced[9] == 0
             if all_have_head and reduced[2] != -reduced[3]:
                 raise RuntimeError(
                     "attention-DP ranks hold different weight-update operations "
@@ -608,12 +637,29 @@ class RequestHandler:
                     f"{type(internal).__name__}); the rebalance controller "
                     "must enqueue the same ops in the same rounds on every rank"
                 )
-        ready_op = self._pending_weight_ops.popleft() if all_have_head else None
+        # Held through the synchronous device update and released on the next
+        # round. DP peers close admission even before their copy of the load
+        # arrives, so continuous direct traffic cannot starve the drain.
+        self.pause_controller.weight_update_pending = load_pending
+        ready_op = (
+            self._pending_weight_ops.popleft()
+            if all_have_head and (drained or refuse_load)
+            else None
+        )
         ready_internal = (
             self._pending_internal_ops.popleft()
             if all_have_internal and ready_op is None
             else None
         )
+        if ready_op is not None and refuse_load:
+            self.send_func.send_pyobj(
+                _WEIGHT_OP_OUTPUTS[type(ready_op)](
+                    success=False,
+                    message="weight load requires drained requests and resident "
+                    "weights; resume keep-paused requests or weights, then retry",
+                )
+            )
+            ready_op = None
         want_flush = want_standalone_flush or (
             ready_op is not None and _weight_op_wants_flush(ready_op)
         )
@@ -639,8 +685,9 @@ class RequestHandler:
             # is), and the snapshot it takes runs its collectives inside this
             # gated round like the weight ops do.
             if self._internal_op_completer is None:
-                local_ok, msg = False, (
-                    "expert rebalancing needs the server to start with --enable-eplb"
+                local_ok, msg = (
+                    False,
+                    ("expert rebalancing needs the server to start with --enable-eplb"),
                 )
             else:
                 local_ok, msg = self._internal_op_completer.begin_manual_rebalance()
@@ -768,6 +815,20 @@ class RequestHandler:
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+        if recv_req.multimodal_inputs is not None and recv_req.validation_error is None:
+            try:
+                prepare_tokenized_multimodal_request(
+                    recv_req,
+                    hf_config=self.multimodal_hf_config,
+                    model_is_multimodal=self.model_is_multimodal,
+                    language_model_only=self.server_args.language_model_only,
+                    disaggregation_mode=self.server_args.disaggregation_mode,
+                )
+            except (ValueError, TypeError, RuntimeError) as exc:
+                recv_req.validation_error = (
+                    f"multimodal position preparation failed: {exc}"
+                )
+
         # The decode role never computes prompt rows (the prefill node returns
         # the prompt logprobs), so it neither accumulates them nor caps its
         # admission probe for them.
@@ -795,7 +856,7 @@ class RequestHandler:
         # A transport that validates requests itself (msgpack ZMQ) marks
         # rejected ones instead of dropping them; admit pre-finished so the
         # client gets a terminal abort rather than a hung stream.
-        if getattr(recv_req, "validation_error", None):
+        if recv_req.validation_error is not None:
             req_state.finished_reason = FINISH_ABORT(
                 f"Invalid request: {recv_req.validation_error}"
             )

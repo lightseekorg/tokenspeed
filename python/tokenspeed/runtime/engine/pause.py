@@ -144,6 +144,9 @@ class PauseController:
         # which run the model (touch weights) and must be suppressed while the
         # weights region is unmapped.
         self.released: bool = False
+        # Weight loads share the admission buffer without changing explicit
+        # pause state. Running requests keep stepping until the load can drain.
+        self.weight_update_pending: bool = False
         # Set by a pause(mode="abort"); consumed once by the event loop to
         # cancel in-flight requests already in the scheduler.
         self._abort_all_pending = False
@@ -160,7 +163,7 @@ class PauseController:
     @property
     def admit_blocked(self) -> bool:
         """Whether new requests should be withheld from the scheduler."""
-        return self.state != PauseState.UNPAUSED
+        return self.state != PauseState.UNPAUSED or self.weight_update_pending
 
     @property
     def forward_blocked(self) -> bool:
@@ -389,7 +392,7 @@ class PauseHooks:
                 loop._request_abort_or_mark(
                     rid, "request aborted by pause", notify_client=True
                 )
-                grammar_manager.mark_abort(rid)
+                grammar_manager.mark_abort(rid, notify_client=True)
 
         if self._pause.consume_cancel_grammar():
             for _, state, _ in grammar_manager.grammar_queue:
@@ -403,6 +406,14 @@ class PauseHooks:
             ]
             if specs:
                 loop._submit_scheduler_requests(specs)
+
+    def reap_finished_buffered_requests(self) -> None:
+        """Finish targeted cancellations while admissions remain paused."""
+        self._pause.buffered_specs = [
+            spec
+            for spec in self._pause.buffered_specs
+            if self._reap_or_keep_buffered_spec(spec)
+        ]
 
     def _reap_or_keep_buffered_spec(self, spec) -> bool:
         """Resolve a buffered spec on resume; return True if it should be admitted.
@@ -447,7 +458,7 @@ class PauseHooks:
         """
         if not self._pause.admit_blocked:
             return False
-        if admitted_specs and not pause_blocked_before:
+        if admitted_specs and not pause_blocked_before and self._pause.is_paused:
             logger.warning(
                 f"Pause engaged in the same recv batch as {len(admitted_specs):d} "
                 "generate "

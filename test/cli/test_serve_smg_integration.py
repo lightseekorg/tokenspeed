@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import socket
@@ -43,11 +44,13 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_http_200(url: str, deadline: float) -> bool:
+def _wait_http_200(url: str, deadline: float, proc) -> bool:
     import urllib.error
     import urllib.request
 
     while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
         try:
             with urllib.request.urlopen(url, timeout=2) as resp:
                 if resp.status == 200:
@@ -58,7 +61,15 @@ def _wait_http_200(url: str, deadline: float) -> bool:
     return False
 
 
-def test_orchestrator_runs_against_fake_engine():
+@pytest.mark.parametrize("connection_mode", ["grpc", "zmq"])
+def test_orchestrator_runs_against_fake_engine(connection_mode):
+    if connection_mode == "zmq":
+        pytest.importorskip("zmq")
+        pytest.importorskip("msgspec")
+        from smg.router_args import RouterArgs
+
+        if "worker_specs" not in vars(RouterArgs):
+            pytest.skip("ZMQ integration requires the paired SMG source build")
     user_port = _free_port()
 
     env = os.environ.copy()
@@ -72,6 +83,8 @@ def test_orchestrator_runs_against_fake_engine():
             "-m",
             "tokenspeed.cli",
             "serve",
+            "--connection-mode",
+            connection_mode,
             "--model",
             "/fake",
             "--host",
@@ -97,14 +110,30 @@ def test_orchestrator_runs_against_fake_engine():
 
     try:
         ok = _wait_http_200(
-            f"http://127.0.0.1:{user_port}/readiness", time.monotonic() + 60
+            f"http://127.0.0.1:{user_port}/readiness", time.monotonic() + 60, proc
         )
         if not ok:
+            proc.terminate()
             stdout, stderr = proc.communicate(timeout=5)
             pytest.fail(
                 f"gateway never became healthy.\nstdout:\n{stdout.decode()}\n"
                 f"stderr:\n{stderr.decode()}"
             )
+
+        # The selected transport reaches readiness, and admin remains connected
+        # to the same engine through its native control service.
+        import urllib.request
+
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{user_port}/flush_cache", method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = json.load(response)
+        assert body["status"] == "success", body
+        assert body["workers_flushed"] == 1, body
+        if connection_mode == "zmq":
+            assert body["total_zmq_workers"] == 1, body
+            assert body["total_zmq_workers_skipped"] == 0, body
 
         proc.send_signal(signal.SIGTERM)
         try:

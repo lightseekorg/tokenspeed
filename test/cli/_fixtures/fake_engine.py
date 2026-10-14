@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Minimal in-process fake of the TokenSpeed gRPC engine."""
+"""CPU engine fixture with native control RPCs and the SMG ZMQ handshake."""
 
 from __future__ import annotations
 
@@ -47,6 +47,7 @@ def _add_tokenspeed_servicer(server) -> None:
     """Register a no-op TokenSpeedScheduler servicer for readiness + shutdown tests."""
     from smg_grpc_proto import tokenspeed_scheduler_pb2 as pb
     from smg_grpc_proto import tokenspeed_scheduler_pb2_grpc as pbg
+    from smg_grpc_proto.generated import common_pb2
 
     class _Servicer(pbg.TokenSpeedSchedulerServicer):
         def GetModelInfo(self, request, context):
@@ -75,10 +76,65 @@ def _add_tokenspeed_servicer(server) -> None:
         def GetLoads(self, request, context):
             return pb.GetLoadsResponse()
 
+        def FlushCache(self, request, context):
+            return common_pb2.FlushCacheResponse(success=True, message="flushed")
+
     pbg.add_TokenSpeedSchedulerServicer_to_server(_Servicer(), server)
 
 
-async def _serve(host: str, port: int) -> None:
+async def _connect_zmq(address: str):
+    import msgspec
+    import zmq
+    import zmq.asyncio
+
+    context = zmq.asyncio.Context()
+    handshake = context.socket(zmq.DEALER)
+    incoming = context.socket(zmq.DEALER)
+    outgoing = context.socket(zmq.PUSH)
+    sockets = (handshake, incoming, outgoing)
+    try:
+        handshake.setsockopt(zmq.IDENTITY, b"\x00\x00")
+        handshake.connect(address)
+        await handshake.send(
+            msgspec.msgpack.encode({"status": "HELLO", "local": True, "headless": True})
+        )
+        init = msgspec.msgpack.decode(await handshake.recv())
+        await handshake.send(
+            msgspec.msgpack.encode({"status": "READY", "local": True, "headless": True})
+        )
+        incoming.setsockopt(zmq.IDENTITY, b"\x00\x00")
+        incoming.connect(init["addresses"]["inputs"][0])
+        outgoing.connect(init["addresses"]["outputs"][0])
+        await incoming.send(
+            msgspec.msgpack.encode(
+                {
+                    "max_model_len": 2048,
+                    "num_gpu_blocks": 16,
+                    "prefix_granularity": 1,
+                    "dtype": "bfloat16",
+                    "world_size": 1,
+                    "data_parallel_size": 1,
+                    "tensor_parallel_size": 1,
+                    "pipeline_parallel_size": 1,
+                    "decode_context_parallel_size": 1,
+                    "data_parallel_rank": 0,
+                    "max_num_seqs": 16,
+                    "max_num_batched_tokens": 2048,
+                    "instance_id": "fake-zmq",
+                    "vllm_version": "",
+                }
+            )
+        )
+        return context, sockets
+    except BaseException:
+        for sock in sockets:
+            sock.close(linger=0)
+        context.term()
+        raise
+
+
+async def _serve(host: str, port: int, handshake_address: str | None) -> None:
+    transport = await _connect_zmq(handshake_address) if handshake_address else None
     server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=4))
     health_pb2_grpc.add_HealthServicer_to_server(_FakeHealth(), server)
     _add_tokenspeed_servicer(server)
@@ -92,14 +148,24 @@ async def _serve(host: str, port: int) -> None:
         await stop.wait()
     finally:
         await server.stop(grace=2.0)
+        if transport is not None:
+            context, sockets = transport
+            for sock in sockets:
+                sock.close(linger=0)
+            context.term()
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--zmq-msgpack", action="store_true")
+    parser.add_argument("--data-parallel-rpc-port", type=int)
     args, _ignored = parser.parse_known_args(argv)
-    asyncio.run(_serve(args.host, args.port))
+    handshake_address = (
+        f"tcp://127.0.0.1:{args.data_parallel_rpc_port}" if args.zmq_msgpack else None
+    )
+    asyncio.run(_serve(args.host, args.port, handshake_address))
 
 
 if __name__ == "__main__":

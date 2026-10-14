@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import unittest
 from collections import deque
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -42,6 +43,7 @@ from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqInput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PauseSchedulerReqInput,
     RebalanceExpertsReqInput,
     RebalanceExpertsReqOutput,
     UpdateWeightFromDiskReqInput,
@@ -53,8 +55,10 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import (
     _INTERNAL_OP_CODES,
+    _WEIGHT_GATE_WIDTH,
     _WEIGHT_OP_CODES,
     RequestHandler,
 )
@@ -62,6 +66,7 @@ from tokenspeed.runtime.engine.scheduler_control_client import (
     SchedulerControlClient,
     combined_weight_update_output,
 )
+from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.moe.expert_rebalance import (
     EplbApplyChunk,
     EplbCommit,
@@ -91,7 +96,7 @@ def _mooncake(version: int = 7, flush_cache: bool = True, weight_version=None):
 class _DpPeer:
     """The other attention-DP rank, as seen through ``all_reduce``.
 
-    MAX reduces merge this rank's seven-lane gate vector with the peer's
+    MAX reduces merge this rank's gate vector with the peer's
     (``head``: the peer's frontend op, ``internal``: its internal op); MIN
     reduces (replica decisions) pass unless ``min_ok`` is False.
     """
@@ -103,11 +108,15 @@ class _DpPeer:
         flush: bool = False,
         min_ok=True,
         internal: type | None = None,
+        load_ready: bool = True,
+        refuse_load: bool = False,
     ):
         self.head = head
         self.internal = internal
         self.flush = flush
         self.min_ok = min_ok
+        self.load_ready = load_ready
+        self.refuse_load = refuse_load
         self.calls: list[tuple[object, object]] = []
         self.gate_vectors: list[list[int]] = []
 
@@ -126,6 +135,15 @@ class _DpPeer:
                     -1 if self.internal else 0,
                     internal,
                     -internal,
+                    int(
+                        self.head
+                        in (
+                            UpdateWeightsFromDistributedReqInput,
+                            UpdateWeightsFromMooncakeReqInput,
+                        )
+                    ),
+                    int(self.refuse_load),
+                    int(not self.load_ready),
                 ],
                 dtype=buf.dtype,
             )
@@ -137,6 +155,9 @@ class _DpPeer:
 def _handler(*, dp_size: int = 1):
     handler = RequestHandler.__new__(RequestHandler)
     handler.send_func = mock.Mock()
+    handler.pause_controller = PauseController(handler.send_func)
+    handler.memory_controller = mock.Mock(released_tags=set())
+    handler.weight_update_ready_fn = mock.Mock(return_value=True)
     handler.server_args = mock.Mock(weight_version="v1", kvstore_storage_backend=None)
     handler.can_clear_cache_fn = mock.Mock(return_value=True)
     handler.clear_cache_fn = mock.Mock(return_value=True)
@@ -147,7 +168,7 @@ def _handler(*, dp_size: int = 1):
     handler.attn_dp_size = dp_size
     handler.attn_dp_cpu_group = "dp" if dp_size > 1 else None
     handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-    handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
+    handler._replica_flush_want_buf = torch.zeros(_WEIGHT_GATE_WIDTH, dtype=torch.int32)
     handler._pending_weight_ops = deque()
     handler._pending_internal_ops = deque()
     handler._internal_op_completer = None
@@ -162,6 +183,144 @@ def _replies(handler) -> list:
 
 
 class TestSameRoundGate(unittest.TestCase):
+    def test_load_withholds_new_work_until_active_requests_finish(self):
+        handler = _handler()
+        handler.weight_update_ready_fn.return_value = False
+        req = _distributed(flush_cache=False, weight_version=None)
+
+        handler.process_requests([req])
+
+        handler._device.update_weights.assert_not_called()
+        handler.send_func.send_pyobj.assert_not_called()
+        self.assertTrue(handler.pause_controller.admit_blocked)
+        self.assertFalse(handler.pause_controller.forward_blocked)
+        self.assertEqual(list(handler._pending_weight_ops), [req])
+        handler.pause_controller.buffer_specs(["new-direct-request"])
+
+        handler.weight_update_ready_fn.return_value = True
+        handler._device.update_weights.side_effect = lambda _: (
+            handler.pause_controller.admit_blocked,
+            "updated with admission closed",
+        )
+        handler.process_requests([])
+        handler._device.update_weights.assert_called_once_with(req)
+        self.assertTrue(_replies(handler)[0].success)
+        self.assertEqual(
+            handler.pause_controller.buffered_specs, ["new-direct-request"]
+        )
+        handler.process_requests([])
+        self.assertFalse(handler.pause_controller.admit_blocked)
+
+    def test_admission_hooks_buffer_new_requests_until_load_completes(self):
+        handler = _handler()
+        handler.weight_update_ready_fn.return_value = False
+        spec = SimpleNamespace(request_id="new-direct-request")
+        loop = SimpleNamespace(
+            output_processor=SimpleNamespace(
+                rid_to_state={spec.request_id: SimpleNamespace(finished=False)},
+            ),
+            _submit_scheduler_requests=mock.Mock(),
+        )
+        hooks = PauseHooks(loop, handler.pause_controller, device=mock.Mock())
+        grammar_manager = SimpleNamespace(grammar_queue=[])
+        handler.process_requests([_distributed(flush_cache=False, weight_version=None)])
+        self.assertTrue(hooks.withhold_admissions([spec], pause_blocked_before=False))
+        hooks.apply_transitions(grammar_manager)
+        loop._submit_scheduler_requests.assert_not_called()
+        handler.weight_update_ready_fn.return_value = True
+        handler.process_requests([])
+        hooks.apply_transitions(grammar_manager)
+        loop._submit_scheduler_requests.assert_not_called()
+        handler.process_requests([])
+        hooks.apply_transitions(grammar_manager)
+        loop._submit_scheduler_requests.assert_called_once_with([spec])
+
+    def test_keep_pause_with_active_requests_refuses_load_instead_of_deadlocking(self):
+        handler = _handler()
+        handler.weight_update_ready_fn.return_value = False
+        handler.pause_controller.handle_pause(PauseSchedulerReqInput(mode="keep"))
+        handler.send_func.reset_mock()
+
+        handler.process_requests([_distributed(flush_cache=False, weight_version=None)])
+
+        handler._device.update_weights.assert_not_called()
+        self.assertFalse(_replies(handler)[0].success)
+        self.assertIn("keep", _replies(handler)[0].message)
+        self.assertFalse(handler._pending_weight_ops)
+        self.assertTrue(handler.pause_controller.forward_blocked)
+
+    def test_load_does_not_resume_an_explicit_pause(self):
+        handler = _handler()
+        handler.pause_controller.handle_pause(PauseSchedulerReqInput(mode="wait"))
+        handler.send_func.reset_mock()
+        handler.process_requests([_distributed(flush_cache=False, weight_version=None)])
+        handler.process_requests([])
+        self.assertTrue(handler.pause_controller.admit_blocked)
+        self.assertTrue(handler.pause_controller.is_paused)
+
+    def test_group_initialization_does_not_wait_for_active_requests(self):
+        handler = _handler()
+        handler.weight_update_ready_fn.return_value = False
+        request = InitWeightsUpdateGroupReqInput(
+            master_address="localhost",
+            master_port=1234,
+            rank_offset=1,
+            world_size=2,
+            group_name="weights",
+            backend="nccl",
+        )
+        handler.process_requests([request])
+        handler._device.update_weights.assert_called_once_with(request)
+        self.assertFalse(handler.pause_controller.admit_blocked)
+
+    def test_load_waits_for_peer_drain_and_holds_admission_before_local_arrival(self):
+        handler = _handler(dp_size=2)
+        peer = _DpPeer(head=UpdateWeightsFromDistributedReqInput, load_ready=False)
+        req = _distributed(flush_cache=False, weight_version=None)
+        with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+            handler.process_requests([])
+            self.assertTrue(handler.pause_controller.admit_blocked)
+            handler.process_requests([req])
+            handler._device.update_weights.assert_not_called()
+            handler.send_func.send_pyobj.assert_not_called()
+            peer.load_ready = True
+            handler.process_requests([])
+        handler._device.update_weights.assert_called_once_with(req)
+        self.assertTrue(_replies(handler)[0].success)
+
+    def test_peer_keep_refusal_skips_flush_and_load_on_every_rank(self):
+        handler = _handler(dp_size=2)
+        # A peer's keep/release can freeze collective forwards before this
+        # rank receives its copy; refusal must not wait for this local drain.
+        handler.weight_update_ready_fn.return_value = False
+        peer = _DpPeer(head=UpdateWeightsFromDistributedReqInput, refuse_load=True)
+        with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
+            handler.process_requests([_distributed()])
+        handler._device.update_weights.assert_not_called()
+        handler.can_clear_cache_fn.assert_not_called()
+        self.assertEqual(peer.calls, [("dp", MAX)])
+        self.assertFalse(_replies(handler)[0].success)
+
+    def test_released_memory_refuses_even_a_drained_load(self):
+        handler = _handler()
+        handler.pause_controller.set_released(True)
+        handler.memory_controller.released_tags = {"weights", "kv_cache"}
+        handler.process_requests([_mooncake()])
+        handler._device.update_weights.assert_not_called()
+        self.assertFalse(_replies(handler)[0].success)
+
+    def test_load_with_released_kv_preserves_sleep_until_kv_resume(self):
+        handler = _handler()
+        handler.pause_controller.set_released(True)
+        handler.memory_controller.released_tags = {"kv_cache"}
+        req = _mooncake()
+        handler.process_requests([req])
+        handler.process_requests([])
+        handler._device.update_weights.assert_called_once_with(req)
+        self.assertTrue(_replies(handler)[0].success)
+        self.assertTrue(handler.pause_controller.released)
+        self.assertTrue(handler.pause_controller.forward_blocked)
+
     def test_op_waits_until_every_dp_rank_holds_one(self):
         handler = _handler(dp_size=2)
         peer = _DpPeer(head=None)
@@ -176,7 +335,7 @@ class TestSameRoundGate(unittest.TestCase):
         self.assertEqual(list(handler._pending_weight_ops), [req])
         # Only the gate itself was reduced; no flush collectives.
         self.assertEqual(peer.calls, [("dp", MAX)])
-        self.assertEqual(peer.gate_vectors, [[0, -1, 2, -2, 0, 0, 0]])
+        self.assertEqual(peer.gate_vectors, [[0, -1, 2, -2, 0, 0, 0, 1, 0, 0]])
 
     def test_ready_op_flushes_updates_and_replies_once(self):
         handler = _handler(dp_size=2)
@@ -373,7 +532,7 @@ class TestInternalOpGate(unittest.TestCase):
 
         self.assertEqual(completer.completed, [])
         self.assertEqual(list(handler._pending_internal_ops), [EplbSnapshot()])
-        self.assertEqual(peer.gate_vectors, [[0, 0, 0, 0, -1, 1, -1]])
+        self.assertEqual(peer.gate_vectors, [[0, 0, 0, 0, -1, 1, -1, 0, 0, 0]])
 
         arrived = _DpPeer(head=None, internal=EplbSnapshot)
         with mock.patch.object(torch.distributed, "all_reduce", arrived.all_reduce):
@@ -718,6 +877,63 @@ class TestSchedulerControlClientFanIn(unittest.IsolatedAsyncioTestCase):
                     client.model_update_lock.writer_lock.entered,
                     1 if takes_writer_lock else 0,
                 )
+
+
+class TestWeightLoadDeviceOrdering(unittest.TestCase):
+    def test_loads_wait_for_execution_stream_before_mutating_weights(self):
+        for req in (_distributed(), _mooncake()):
+            with self.subTest(op=type(req).__name__):
+                trace = []
+                runner = mock.Mock()
+                runner.update_weights_from_distributed.side_effect = lambda _: (
+                    trace.append("load") or True,
+                    "updated",
+                )
+                runner.update_weights_from_mooncake.side_effect = lambda *_: (
+                    trace.append("load") or True,
+                    "updated",
+                )
+                stream = mock.Mock()
+                stream.synchronize.side_effect = lambda: trace.append("synchronize")
+                thread = mock.Mock()
+                thread.run.side_effect = lambda fn: (
+                    trace.append("forward-thread"),
+                    fn(),
+                )[1]
+                drafter = mock.Mock()
+                drafter.on_target_weights_updated.side_effect = lambda: trace.append(
+                    "draft"
+                )
+                handle = DeviceHandle(
+                    SimpleNamespace(
+                        forward_thread=thread,
+                        execution_stream=stream,
+                        model_runner=runner,
+                        draft_model_runner=None,
+                        drafter=drafter,
+                    )
+                )
+                self.assertEqual(handle.update_weights(req), (True, "updated"))
+                self.assertEqual(
+                    trace, ["forward-thread", "synchronize", "load", "draft"]
+                )
+
+    def test_group_setup_does_not_require_stream_synchronization(self):
+        runner = mock.Mock()
+        runner.init_weights_update_group.return_value = (True, "joined")
+        thread = mock.Mock()
+        thread.run.side_effect = lambda fn: fn()
+        # No execution stream exists on this fake: group setup does not need it.
+        handle = DeviceHandle(
+            SimpleNamespace(forward_thread=thread, model_runner=runner)
+        )
+        request = InitWeightsUpdateGroupReqInput(
+            master_address="localhost",
+            master_port=1234,
+            rank_offset=1,
+            world_size=2,
+        )
+        self.assertEqual(handle.update_weights(request), (True, "joined"))
 
 
 if __name__ == "__main__":

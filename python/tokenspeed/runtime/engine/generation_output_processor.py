@@ -209,7 +209,7 @@ class RequestState:
         """
         self.to_abort = True
         self.to_abort_message = message
-        self.abort_notify_client = notify_client
+        self.abort_notify_client = self.abort_notify_client or notify_client
         self.finished_reason = FINISH_ABORT(message=message, status_code=status_code)
 
     @classmethod
@@ -470,12 +470,12 @@ class OutputProcesser:
         self._last_step_ts: float = 0.0
         self.log_cnt = 0
         self.rid_to_state: dict[str, RequestState] = {}
-        # rid → monotonic ts at which the abort was seen. Covers the
+        # rid → (monotonic ts, terminal notification intent). Covers the
         # "abort arrives before register()" race (pre-arrival reorder),
         # plus grammar-queued aborts that publish_finished_at_admission
         # handles. Entries for rids that never register are swept by TTL
         # to keep this bounded across a long-running server.
-        self.pending_aborts: dict[str, float] = {}
+        self.pending_aborts: dict[str, tuple[float, bool]] = {}
         # ``DeviceHandle.run_multimodal_work``, or None where there is no
         # data plane (unit tests, CPU-only harnesses).
         self._defer_to_device = defer_to_device
@@ -564,7 +564,7 @@ class OutputProcesser:
         cutoff = time.monotonic() - self._PENDING_ABORT_TTL_S
         while self.pending_aborts:
             oldest_rid = next(iter(self.pending_aborts))
-            if self.pending_aborts[oldest_rid] >= cutoff:
+            if self.pending_aborts[oldest_rid][0] >= cutoff:
                 break
             self.pending_aborts.pop(oldest_rid)
 
@@ -591,16 +591,27 @@ class OutputProcesser:
             return
 
         self.sweep_pending_aborts()
-        self.pending_aborts[rid] = time.monotonic()
+        previous = self.pending_aborts.pop(rid, None)
+        self.pending_aborts[rid] = (
+            time.monotonic(),
+            notify_client or (previous is not None and previous[1]),
+        )
 
     def register(self, rid, state):
         self.rid_to_state[rid] = state
         if self.enable_log_request_stats:
             state.stats = RequestStatsTracker()
-        if self.pending_aborts.pop(rid, None) is not None:
+        self.apply_pending_abort(rid, state)
+
+    def apply_pending_abort(self, rid: str, state: RequestState) -> None:
+        """Apply an early cancellation before admission or grammar compilation."""
+        pending_abort = self.pending_aborts.pop(rid, None)
+        if pending_abort is not None:
             # Same reasoning as ``mark_abort``: drive the abort all the
             # way to ``finished_reason`` so the slot-release gate fires.
-            state.set_finish_with_abort("AbortReq from client")
+            state.set_finish_with_abort(
+                "AbortReq from client", notify_client=pending_abort[1]
+            )
 
     def publish_finished_at_admission(self, rid: str, state: RequestState) -> None:
         """Stream a finish for a request that was finished before admission.
@@ -611,7 +622,8 @@ class OutputProcesser:
         """
         self.rid_to_state[rid] = state
         try:
-            state.finished_output = False
+            if not (state.to_abort and state.abort_notify_client):
+                state.finished_output = False
             self.stream_output([rid], [state])
         finally:
             self._release_multimodal_features(state)
@@ -620,6 +632,22 @@ class OutputProcesser:
             # drop any queued abort marker so pending_aborts doesn't leak
             # and a reused rid isn't instantly re-aborted on next register.
             self.pending_aborts.pop(rid, None)
+
+    def publish_paused_abort(self, rid: str) -> None:
+        """Notify a passive client while retaining scheduler-owned resources.
+
+        Keep-pause prevents the next forward from publishing an active abort.
+        Only send its terminal here; normal scheduler/PD completion must still
+        fence outstanding writes and release state and multimodal features.
+        """
+        state = self.rid_to_state.get(rid)
+        if (
+            state is not None
+            and state.finished
+            and state.to_abort
+            and state.abort_notify_client
+        ):
+            self.stream_output([rid], [state])
 
     def reap_finished_orphan(self, rid: str, state: RequestState) -> None:
         """Resolve a finished request that no future forward op will reap.
@@ -1234,7 +1262,8 @@ class OutputProcesser:
         # Ensure a finish reason is set so TokenizerManager marks the request done.
         if not rs.finished:
             rs.finished_reason = FINISH_LENGTH(length=len(rs.output_ids))
-        rs.finished_output = False
+        if not (rs.to_abort and rs.abort_notify_client):
+            rs.finished_output = False
         # PD prefill node's terminal path (the other finish/abort logging lives in
         # post_process_forward_op). Self-guarded, so a no-op when the flag is off.
         self._log_request_stats(req_id, rs, time.time())

@@ -47,6 +47,7 @@ import msgspec
 import numpy as np
 import torch
 
+from tokenspeed.runtime.engine.output_metadata import speculative_token_counts
 from tokenspeed.runtime.multimodal.inputs import MultimodalInputs
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils.env import envs
@@ -285,8 +286,7 @@ class GenerateReqInput:
             if isinstance(self.data_parallel_rank, list):
                 _require(
                     len(self.data_parallel_rank) == 1,
-                    "data_parallel_rank list should have length 1 for "
-                    "single request.",
+                    "data_parallel_rank list should have length 1 for single request.",
                 )
                 # Unwrap: TokenizedGenerateReqInput types this int | None.
                 self.data_parallel_rank = self.data_parallel_rank[0]
@@ -742,11 +742,8 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Sampled-token logprobs, parallel to rids: one inner list per request,
     # holding the value/token-id of each newly-decoded token this step. Empty []
     # for a request that did not ask for logprobs, so the columns stay
-    # non-ragged (always length == len(rids)). Prompt (input) logprobs have no
-    # column here: the msgpack ingress refuses a ``logprob_start_len`` that
-    # would produce them (``MsgpackRecvSocket._validation_error``). Carrying
-    # them means appending ``input_token_logprobs_val/idx`` at the wire tail
-    # together with the frontend's decoder.
+    # non-ragged (always length == len(rids)). Prompt columns are appended
+    # at the tail so older output decoders retain their existing positions.
     output_token_logprobs_val: list[list[float]]
     output_token_logprobs_idx: list[list[int]]
     # Producing DP rank's engine index (the identity it dialed the frontend
@@ -760,6 +757,13 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     num_waiting: int = 0
     kv_active_pages: int = 0
     kv_total_pages: int = 0
+    # Live provenance at send time; append-only tail, absent on older peers.
+    weight_version: str | None = None
+    finished_reason_details: list[dict[str, Any] | None] | None = None
+    spec_accepted_tokens: list[int] | None = None
+    spec_draft_tokens: list[int] | None = None
+    input_token_logprobs_val: list[list[float | None]] | None = None
+    input_token_logprobs_idx: list[list[int]] | None = None
 
     @classmethod
     def from_full(
@@ -767,6 +771,8 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
         out: BatchTokenIDOut,
         engine_index: int = 0,
         *,
+        weight_version: str | None,
+        speculative_num_draft_tokens: int | None,
         num_running: int = 0,
         num_waiting: int = 0,
         kv_active_pages: int = 0,
@@ -784,7 +790,34 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
                 "BatchTokenIDOut.output_ids is None; the msgpack wire needs "
                 "the per-request generated token ids"
             )
+        counts = [
+            (
+                speculative_token_counts(
+                    out.completion_tokens[i],
+                    out.spec_verify_ct[i],
+                    speculative_num_draft_tokens,
+                )
+                if speculative_num_draft_tokens is not None
+                and out.finished_reasons[i] is not None
+                else (0, 0)
+            )
+            for i in range(len(out.rids))
+        ]
         return cls(
+            weight_version=weight_version,
+            finished_reason_details=list(out.finished_reasons),
+            spec_accepted_tokens=[count[0] for count in counts],
+            spec_draft_tokens=[count[1] for count in counts],
+            input_token_logprobs_val=(
+                list(out.input_token_logprobs_val)
+                if out.input_token_logprobs_val
+                else [[] for _ in out.rids]
+            ),
+            input_token_logprobs_idx=(
+                list(out.input_token_logprobs_idx)
+                if out.input_token_logprobs_idx
+                else [[] for _ in out.rids]
+            ),
             engine_index=engine_index,
             num_running=num_running,
             num_waiting=num_waiting,
@@ -1083,7 +1116,10 @@ class IsSleepingReqOutput(BaseReq, kw_only=True):
 
 class AbortReq(BaseReq, kw_only=True):
     # The request id rides in the ``rid`` base field.
-    pass
+    # Admin requests enter through the native control socket but may target
+    # either frontend. Ordinary cancellation leaves the ingress owner intact.
+    admin_owner: Literal["control", "direct"] | None = None
+    notify_client: bool = False
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):

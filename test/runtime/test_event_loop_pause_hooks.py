@@ -76,7 +76,7 @@ class _GrammarManager:
         self.grammar_queue = [(None, state, None) for state in queued_states]
         self.aborted: list[str] = []
 
-    def mark_abort(self, rid: str) -> None:
+    def mark_abort(self, rid: str, *, notify_client: bool) -> None:
         self.aborted.append(rid)
 
 

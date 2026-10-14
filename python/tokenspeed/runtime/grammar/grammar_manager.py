@@ -127,7 +127,7 @@ class GrammarManager:
         if self.grammar_backend:
             self.grammar_backend.reset()
 
-    def mark_abort(self, rid: str) -> None:
+    def mark_abort(self, rid: str, *, notify_client: bool) -> None:
         """Cancel a queued request whose grammar is still compiling.
 
         Paired with ``OutputProcesser.mark_abort`` in the event loop:
@@ -146,7 +146,9 @@ class GrammarManager:
                 # would raise CancelledError on still-valid waiters.
                 # The compile runs to completion in the background and
                 # its result lands in the cache for future reuse.
-                state.set_finish_with_abort("Aborted by AbortReq.")
+                state.set_finish_with_abort(
+                    "Aborted by AbortReq.", notify_client=notify_client
+                )
 
                 # The queue entry is cleaned up by the next
                 # get_ready_grammar_requests pass (which treats

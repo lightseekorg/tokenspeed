@@ -49,7 +49,9 @@ async def test_spawn_gateway_disables_retries_and_circuit_breaker(monkeypatch):
         return _P()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    await spawn_gateway([], engine_host="127.0.0.1", engine_port=12345)
+    await spawn_gateway(
+        [], engine_host="127.0.0.1", engine_port=12345, worker_spec=None
+    )
     cmd = captured["cmd"]
     assert "--disable-retries" in cmd
     assert "--disable-circuit-breaker" in cmd

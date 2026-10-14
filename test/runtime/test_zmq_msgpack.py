@@ -241,7 +241,9 @@ def test_slim_out_from_full_roundtrip():
     # Logprobs off: the two logprob columns stay non-ragged (one empty inner
     # list per request).
     out = _make_batch_out()
-    slim = BatchTokenIDOutSlim.from_full(out)
+    slim = BatchTokenIDOutSlim.from_full(
+        out, speculative_num_draft_tokens=None, weight_version=None
+    )
     rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(_encode_payload(slim))
     assert rt.rids == ["r1"]
     assert rt.output_ids == [[10, 11]]
@@ -261,7 +263,12 @@ def test_slim_out_from_full_roundtrip():
 def test_slim_out_carries_the_producing_engine_index():
     # The output PULL socket has no routing identity, so under DP the batch
     # itself names its producing rank; 0 stays the single-engine default.
-    slim = BatchTokenIDOutSlim.from_full(_make_batch_out(), engine_index=3)
+    slim = BatchTokenIDOutSlim.from_full(
+        _make_batch_out(),
+        speculative_num_draft_tokens=None,
+        weight_version=None,
+        engine_index=3,
+    )
     rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(_encode_payload(slim))
     assert rt.engine_index == 3
 
@@ -271,7 +278,12 @@ def test_slim_out_load_tail_defaults_for_older_senders(
     prefix_length: int, expected_engine_index: int
 ):
     # Pre-DP 9-element and pre-load 10-element senders both omit the load tail.
-    slim = BatchTokenIDOutSlim.from_full(_make_batch_out(), engine_index=7)
+    slim = BatchTokenIDOutSlim.from_full(
+        _make_batch_out(),
+        speculative_num_draft_tokens=None,
+        weight_version=None,
+        engine_index=7,
+    )
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(
         msgspec.msgpack.encode(raw[:prefix_length])
@@ -292,7 +304,9 @@ def test_slim_out_sources_output_ids_not_the_detok_window():
         decode_ids=[[7, 8, 9, 10, 11]],  # detok window: prompt tail + output
         output_ids=[[10, 11]],  # newly generated only
     )
-    slim = BatchTokenIDOutSlim.from_full(out)
+    slim = BatchTokenIDOutSlim.from_full(
+        out, speculative_num_draft_tokens=None, weight_version=None
+    )
     assert slim.output_ids == [[10, 11]]
 
 
@@ -301,7 +315,9 @@ def test_slim_out_output_ids_none_is_rejected():
     # lose tokens on the frontend; from_full must fail loud instead.
     out = _make_batch_out(output_ids=None)
     with pytest.raises(ValueError, match="output_ids"):
-        BatchTokenIDOutSlim.from_full(out)
+        BatchTokenIDOutSlim.from_full(
+            out, speculative_num_draft_tokens=None, weight_version=None
+        )
 
 
 def test_slim_out_carries_logprob_columns():
@@ -310,7 +326,9 @@ def test_slim_out_carries_logprob_columns():
         output_token_logprobs_val=[[-0.5, -1.25]],
         output_token_logprobs_idx=[[10, 11]],
     )
-    slim = BatchTokenIDOutSlim.from_full(out)
+    slim = BatchTokenIDOutSlim.from_full(
+        out, speculative_num_draft_tokens=None, weight_version=None
+    )
     rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(_encode_payload(slim))
     assert rt.output_token_logprobs_val == [[pytest.approx(-0.5), pytest.approx(-1.25)]]
     assert rt.output_token_logprobs_idx == [[10, 11]]
@@ -323,6 +341,8 @@ def test_slim_out_is_tagged_positional_tuple():
     )
     slim = BatchTokenIDOutSlim.from_full(
         out,
+        speculative_num_draft_tokens=None,
+        weight_version=None,
         engine_index=1,
         num_running=2,
         num_waiting=3,
@@ -332,7 +352,7 @@ def test_slim_out_is_tagged_positional_tuple():
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     assert isinstance(raw, list)
     assert raw[0] == "BatchTokenIDOutSlim"
-    assert len(raw) == 14
+    assert len(raw) == 20
     assert raw[1] == ["r1"]  # rids
     assert raw[2] == [[10, 11]]  # output_ids
     assert raw[3] == ["length"]  # finished_reasons
@@ -347,7 +367,9 @@ def test_slim_out_is_tagged_positional_tuple():
 
 def test_slim_out_finish_reason_none_maps_to_empty():
     out = _make_batch_out(finished_reasons=[None])
-    slim = BatchTokenIDOutSlim.from_full(out)
+    slim = BatchTokenIDOutSlim.from_full(
+        out, speculative_num_draft_tokens=None, weight_version=None
+    )
     assert slim.finished_reasons == [""]
 
 
@@ -417,7 +439,9 @@ def test_recv_socket_aborts_request_with_invalid_sampling_params():
     out = _make_batch_out(
         finished_reasons=[FINISH_ABORT("Invalid request: bad top_k").to_json()]
     )
-    slim = BatchTokenIDOutSlim.from_full(out)
+    slim = BatchTokenIDOutSlim.from_full(
+        out, speculative_num_draft_tokens=None, weight_version=None
+    )
     assert slim.finished_reasons == ["abort"]
 
 
@@ -453,8 +477,6 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
 @pytest.mark.parametrize(
     ("overrides", "needle"),
     [
-        ({"logprob_start_len": 0}, "msgpack output wire"),
-        ({"logprob_start_len": 1}, "msgpack output wire"),
         ({"logprob_start_len": 3}, "smaller than the prompt length"),
         ({"logprob_start_len": -2}, "must be -1 or >= 0"),
         ({"top_logprobs_num": 2}, "top_logprobs_num"),
@@ -911,3 +933,176 @@ def test_two_dp_ranks_connect_with_distinct_identities():
         frontend.close()
         ctx.term()
         tmp.cleanup()
+
+
+def test_slim_out_appends_weight_version_and_defaults_for_old_sender():
+    slim = BatchTokenIDOutSlim.from_full(
+        _make_batch_out(), speculative_num_draft_tokens=None, weight_version="v9"
+    )
+    raw = msgspec.msgpack.decode(_encode_payload(slim))
+    assert raw[14] == "v9"
+    restored = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(
+        _encode_payload(slim)
+    )
+    assert restored.weight_version == "v9"
+    old = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(
+        msgspec.msgpack.encode(raw[:14])
+    )
+    assert old.weight_version is None
+
+
+def test_native_pd_epd_fixture_pins_every_bootstrap_slot_and_metadata():
+    import torch
+
+    from tokenspeed.runtime.engine.io_struct import MsgpackDecoder
+
+    fixture = Path(__file__).parent / "fixtures/tokenspeed_pd_epd_request.msgpack"
+    request = MsgpackDecoder(TokenizedGenerateReqInput).decode([fixture.read_bytes()])
+    assert _encode_payload(request) == fixture.read_bytes()
+    assert request.bootstrap_host == "prefill.local"
+    assert request.bootstrap_port == 9001
+    assert request.bootstrap_room == 1 << 50
+    assert request.data_parallel_rank == 2
+    assert request.sampling_params.seed == 0
+    assert request.input_ids_unpadded == [10, 9, 9, 20]
+    item = request.multimodal_inputs.mm_items[0]
+    assert item.feature is None
+    assert item.encode_handshake == {
+        "bootstrap_host": "encode.local",
+        "bootstrap_port": 9100,
+        "bootstrap_room": 1 << 51,
+    }
+    assert torch.equal(
+        item.model_specific_data["image_grid_thw"], torch.tensor([[1, 2, 4]])
+    )
+
+
+@pytest.mark.parametrize("modality_name", ["IMAGE", "VIDEO", "AUDIO"])
+@pytest.mark.parametrize("feature_transport", ["inline", "shm"])
+def test_native_mm_payload_preserves_each_modality_and_feature_transport(
+    modality_name: str, feature_transport: str
+):
+    import torch
+
+    from tokenspeed.runtime.engine.io_struct import MsgpackDecoder
+    from tokenspeed.runtime.multimodal.inputs import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+    from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
+
+    # A page-sized payload is portable to POSIX hosts that round SHM mappings.
+    feature = torch.full((64, 64), 1.25, dtype=torch.float32)
+    handle = ShmTensorHandle.publish(feature) if feature_transport == "shm" else None
+    item = MultimodalDataItem(
+        modality=Modality[modality_name],
+        hash=1,
+        offsets=[(1, 2)],
+        feature=feature if handle is None else None,
+        feature_shm=handle,
+        model_specific_data={"grid": torch.tensor([[1, 2, 3]], dtype=torch.int64)},
+    )
+    item.set_pad_value()
+    request = _make_request(
+        input_ids=[10, item.pad_value, item.pad_value],
+        input_ids_unpadded=[10, 9, 9],
+        multimodal_inputs=MultimodalInputs(mm_items=[item]),
+    )
+    restored = MsgpackDecoder(TokenizedGenerateReqInput).decode(
+        MsgpackEncoder().encode(request)
+    )
+    result = restored.multimodal_inputs.mm_items[0]
+    assert result.modality == item.modality
+    assert result.pad_value == item.pad_value
+    assert result.offsets == [(1, 2)]
+    assert torch.equal(
+        result.model_specific_data["grid"], item.model_specific_data["grid"]
+    )
+    if handle is None:
+        assert torch.equal(result.feature, feature)
+        assert result.feature_shm is None
+    else:
+        try:
+            assert result.feature is None
+            assert result.feature_shm.shm_name == handle.shm_name
+            result.feature_shm.attach()
+            actual = torch.empty_like(feature)
+            result.feature_shm.copy_into(actual)
+            assert torch.equal(actual, feature)
+        finally:
+            result.feature_shm.release()
+
+
+def test_slim_out_preserves_finish_match_and_shared_speculative_counters():
+    out = _make_batch_out(
+        output_ids=[[3]],
+        completion_tokens=[7],
+        spec_verify_ct=[2],
+        finished_reasons=[{"type": "stop", "matched": 3}],
+    )
+    slim = BatchTokenIDOutSlim.from_full(
+        out, weight_version="v9", speculative_num_draft_tokens=4
+    )
+    raw = msgspec.msgpack.decode(_encode_payload(slim))
+    assert raw[15] == [{"type": "stop", "matched": 3}]
+    assert raw[16] == [4]
+    assert raw[17] == [6]
+    restored = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(
+        _encode_payload(slim)
+    )
+    assert restored.finished_reason_details == out.finished_reasons
+    assert restored.spec_accepted_tokens == [4]
+    assert restored.spec_draft_tokens == [6]
+
+
+def test_native_finish_metadata_fixture_preserves_matched_stop_and_spec_counts():
+    fixture = (
+        Path(__file__).parent / "fixtures/tokenspeed_finish_metadata_output.msgpack"
+    )
+    restored = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(fixture.read_bytes())
+    assert restored.input_token_logprobs_val is None
+    assert restored.input_token_logprobs_idx is None
+    assert restored.weight_version == "v9"
+    assert restored.finished_reason_details == [{"type": "stop", "matched": 3}]
+    assert restored.spec_accepted_tokens == [4]
+    assert restored.spec_draft_tokens == [6]
+
+
+def test_recv_socket_accepts_prompt_logprobs_when_engine_supports_them():
+    sock = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket(
+            [
+                _add_frames(
+                    "prompt", SamplingParams(), return_logprob=True, logprob_start_len=0
+                )
+            ]
+        ),
+        vocab_size=32000,
+        enable_output_logprobs=True,
+        supports_prompt_logprobs=True,
+    )
+    request = sock.recv_pyobj(zmq.NOBLOCK)
+    assert request.validation_error is None
+    assert request.logprob_start_len == 0
+
+
+def test_slim_out_preserves_nullable_prompt_logprob_columns():
+    out = _make_batch_out(
+        input_token_logprobs_val=[[None, -0.25, -0.5]],
+        input_token_logprobs_idx=[[1, 2, 3]],
+    )
+    slim = BatchTokenIDOutSlim.from_full(
+        out, weight_version=None, speculative_num_draft_tokens=None
+    )
+    raw = msgspec.msgpack.decode(_encode_payload(slim))
+    assert raw[18] == [[None, -0.25, -0.5]]
+    assert raw[19] == [[1, 2, 3]]
+
+
+def test_native_prompt_output_fixture_keeps_nullable_token_logprobs():
+    fixture = Path(__file__).parent / "fixtures/tokenspeed_prompt_output.msgpack"
+    restored = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(fixture.read_bytes())
+    assert _encode_payload(restored) == fixture.read_bytes()
+    assert restored.input_token_logprobs_val == [[None, -0.25, -0.5]]
+    assert restored.input_token_logprobs_idx == [[1, 2, 3]]

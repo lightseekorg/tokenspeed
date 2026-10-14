@@ -7,6 +7,99 @@ TokenSpeed-specific knobs for runtime features with different meaning.
 For a compact compatibility table, see
 [Compatible parameters](./compatible-parameters.md).
 
+## SMG generation transport
+
+`ts serve MODEL --connection-mode zmq` launches SMG with direct ZMQ generation
+over private local IPC sockets. gRPC remains the default until the bundled SMG
+wheel pins contain this integration; it is also explicitly selectable with
+`--connection-mode grpc`.
+Install SMG and TokenSpeed builds containing the matching ZMQ integration;
+the gateway must support `smg launch --worker-specs`.
+
+For testing before publishing wheels, activate the TokenSpeed GPU environment,
+install TokenSpeed from this checkout using its usual development setup, then
+build and install the paired SMG checkout into that same environment:
+
+```bash
+cd /path/to/smg
+python -m pip install maturin
+python -m pip install ./crates/grpc_client/python ./grpc_servicer
+make python-dev
+```
+
+These source packages provide the `smg`, `smg_grpc_proto`, and
+`smg_grpc_servicer` modules. Reinstalling TokenSpeed with its older pinned wheels
+can overwrite them; install the paired SMG build last. Production wheel pins
+should be advanced together after the matching builds are published.
+
+Both modes launch one scheduler group. The existing engine gRPC endpoint handles
+admin and encode RPCs; the existing HTTP control server on `--port + 1` (or
+`--control-port`) exposes RL weight updates, pause/resume, abort, memory controls,
+and model/version queries. `POST /flush_cache` on the gateway also works in ZMQ
+mode. `--enable-rl` additionally enables SMG's `/v1/rl` discovery and fan-out API.
+
+Targeted `POST /abort_request` accepts `{"rid": "request-id"}` and sends a
+terminal response to the selected generation stream. It defaults to direct
+requests in ZMQ mode and native requests in gRPC mode. To select the coexisting
+native frontend explicitly, add `"owner": "control"`; `"owner": "direct"`
+selects ZMQ. Cancellation matches the exact request ID within that frontend, so
+the same public ID on the other frontend is unaffected. `abort_all` remains an
+engine-wide operation.
+
+The orchestrator starts both peers before waiting for readiness: the engine
+cannot finish startup until SMG binds its handshake socket. Its handshake and
+control-discovery budgets follow `--engine-startup-timeout`. Socket paths are
+unique per launch and removed after the child processes stop. ZMQ data sockets
+are host-local: a grouped DP worker cannot place request-I/O owners on multiple
+nodes. Use gRPC for that layout, or separate locally attached groups. Multi-node
+TP/PP with a single global request-I/O owner retains its existing engine
+collectives.
+
+Multimodal requests use the same engine M-RoPE preparation as gRPC, including
+image/video grid metadata and the existing audio/model-specific paths. ZMQ
+preserves PD bootstrap fields, EPD encode handshakes, explicit DP rank selection,
+seeded sampling, prompt logprob offsets, and response weight versions. Model
+support and engine feature restrictions are unchanged.
+
+For an explicitly registered SMG worker, use `connection_mode: "zmq"`,
+`runtime_type: "tokenspeed"`, and an `ipc://` URL. Its `zmq_control_url` label must
+name that same engine's `grpc://` endpoint. Use `zmq_handshake_address` to match
+`--data-parallel-address` / `--data-parallel-rpc-port`, and `dp_size` for the number
+of engine ranks on that socket set. The `zmq_connect_timeout_secs` label extends
+the default 600-second handshake budget for large checkpoints. RL discovery uses
+`rl.control_url`, pointing to the engine's HTTP RL endpoint. TokenSpeed P/D
+workers must opt in with `zmq_pd: "true"` after both
+repositories contain the matching wire support. Encode-only workers retain
+their existing gRPC encode service.
+
+### GPU validation
+
+The local CPU tests validate supervision, routing, serialization, and control
+coexistence. Run the existing functional GPU tests to verify model output and
+transfer behavior with the actual checkpoint and hardware:
+
+```bash
+# Existing test defaults remain gRPC; opt in to direct ZMQ generation.
+SMG_CONNECTION_MODE=zmq pytest -v -s \
+  test/runtime/distributed/test_qwen35_pd_1p1d.py
+SMG_CONNECTION_MODE=zmq pytest -v -s \
+  test/runtime/distributed/test_qwen35_epd_1e1p2d.py
+```
+
+The EPD test sends a generated image through the encode, prefill, and decode
+workers and checks its contents. These launchers use ZMQ for P/D and the existing
+gRPC encoder. `SMG_ZMQ_HANDSHAKE_BASE` overrides their handshake port range.
+
+For regular serving, run
+`ts serve MODEL --connection-mode zmq --enable-output-logprobs` and exercise
+streaming/non-streaming generation, cancellation, sampled/prompt logprobs,
+multimodal requests supported by the model, and admin calls. Repeat with gRPC to
+compare seeded token IDs and metadata. With a disposable RL model, pause and
+continue generation, perform the supported weight update, and confirm the next
+response carries the updated `meta_info.weight_version`. Memory release/resume
+and distributed weight updates require their usual engine configuration and
+trainer peers. No GPU test is launched by selecting the transport alone.
+
 ## Model loading
 
 | Parameter | Purpose |
@@ -351,8 +444,16 @@ Trainer-side contract:
 - Pause dispatch at the router before calling and resume after the reply.
   The scheduler's control thread blocks for the duration of the SDK read,
   so load reporting, PD transfer polling, and health responses stall on
-  every worker. The frontend's writer lock only drains requests already
-  admitted on this engine.
+  every worker. Before loading, the scheduler closes admission on every DP
+  worker and drains active requests from both native and direct ZMQ frontends.
+  New requests remain buffered until the update replies. An explicit pause
+  remains in force afterwards. Use a completed `wait`/`abort` pause when
+  training with native and direct frontends together. Resume `keep` before
+  updating: a frozen native request retains its frontend reader lock, so the
+  update waits for resume; a load that reaches the scheduler with frozen
+  active requests is refused.
+  Weight memory must be resident, but KV-cache memory may remain released
+  while weights are updated.
 - While PD transfers or Host write-backs are in flight on any replica rank,
   the engine rejects `flush_cache=true` (and skips the load). Retry after
   they drain, or send intermediate updates with `flush_cache=false` and

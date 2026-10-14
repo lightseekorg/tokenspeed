@@ -62,7 +62,7 @@ def main() -> None:
         "serve",
         help="Launch the TokenSpeed inference server.",
         description="Launch the TokenSpeed inference server: the full serving "
-        "stack by default (currently an smg gateway fronting a gRPC engine), "
+        "stack by default (SMG with an engine), "
         "or the engine alone with --headless.",
     )
     serve_parser.add_argument(
@@ -75,6 +75,13 @@ def main() -> None:
         "tcp://127.0.0.1:30500). Implies --zmq-msgpack and "
         "--skip-tokenizer-init.",
     )
+    serve_parser.add_argument(
+        "--connection-mode",
+        choices=("zmq", "grpc"),
+        default="grpc",
+        help="Generation transport between SMG and TokenSpeed (default: grpc until the bundled SMG release includes ZMQ integration). "
+        "Both modes retain the existing admin and RL control APIs.",
+    )
     serve_parser.set_defaults(func=_serve)
 
     env_parser = subparsers.add_parser(
@@ -86,8 +93,7 @@ def main() -> None:
     merge_traces_parser = subparsers.add_parser(
         "merge-traces",
         add_help=False,
-        help="Merge one or more Proton/VizTracer trace pairs onto a shared "
-        "timeline.",
+        help="Merge one or more Proton/VizTracer trace pairs onto a shared timeline.",
     )
     merge_traces_parser.set_defaults(func=_merge_traces, merge_args=[])
 

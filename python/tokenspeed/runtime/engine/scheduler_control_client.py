@@ -26,9 +26,11 @@ from collections.abc import Sequence
 from typing import (
     TYPE_CHECKING,
     Any,
+    Literal,
 )
 
 from tokenspeed.runtime.engine.io_struct import (
+    AbortReq,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     FlushCacheReqInput,
@@ -122,6 +124,26 @@ def combined_weight_update_output(
 
 class SchedulerControlClient:
     """Scheduler control-plane client methods for AsyncLLM."""
+
+    def abort_request_admin(
+        self: AsyncLLM, rid: str, *, owner: Literal["control", "direct"] | None
+    ) -> None:
+        """Terminate a selected frontend's request and notify its live reader.
+
+        Direct requests bypass AsyncLLM's native request map, so administrative
+        cancellation must always reach the scheduler. Native collectors also
+        remain registered until they consume the terminal response.
+        """
+        direct_enabled = self.server_args.zmq_msgpack
+        if owner is None:
+            owner = "direct" if direct_enabled else "control"
+        if owner not in ("control", "direct"):
+            raise ValueError("Abort owner must be 'control' or 'direct'.")
+        if owner == "direct" and not direct_enabled:
+            raise ValueError("Direct abort owner requires ZMQ msgpack mode.")
+        self.engine_core_client.send_to_scheduler.send_pyobj(
+            AbortReq(rid=rid, admin_owner=owner, notify_client=True)
+        )
 
     def init_communicators(self: AsyncLLM, server_args: ServerArgs):
         # Communicators

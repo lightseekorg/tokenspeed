@@ -13,7 +13,8 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
 )
-from tokenspeed.runtime.engine.request_handler import RequestHandler
+from tokenspeed.runtime.engine.pause import PauseController
+from tokenspeed.runtime.engine.request_handler import _WEIGHT_GATE_WIDTH, RequestHandler
 from tokenspeed.runtime.engine.scheduler_control_client import (
     SchedulerControlClient,
     combined_flush_cache_output,
@@ -25,6 +26,9 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
     def _handler(self, can_clear, clear_result):
         handler = RequestHandler.__new__(RequestHandler)
         handler.send_func = mock.Mock()
+        handler.pause_controller = PauseController(handler.send_func)
+        handler.memory_controller = None
+        handler.weight_update_ready_fn = mock.Mock(return_value=True)
         handler.can_clear_cache_fn = mock.Mock(return_value=can_clear)
         handler.clear_cache_fn = mock.Mock(return_value=clear_result)
         handler.clear_l1_cache_fn = mock.Mock(return_value=not clear_result)
@@ -35,7 +39,9 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
         handler.attn_dp_size = 1
         handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
+        handler._replica_flush_want_buf = torch.zeros(
+            _WEIGHT_GATE_WIDTH, dtype=torch.int32
+        )
         handler._pending_weight_ops = deque()
         handler._pending_internal_ops = deque()
         handler._internal_op_completer = None
@@ -267,6 +273,9 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
     def _handler(self):
         handler = RequestHandler.__new__(RequestHandler)
         handler.send_func = mock.Mock()
+        handler.pause_controller = PauseController(handler.send_func)
+        handler.memory_controller = None
+        handler.weight_update_ready_fn = mock.Mock(return_value=True)
         handler.server_args = mock.Mock(
             weight_version="v1", kvstore_storage_backend=None
         )
@@ -278,7 +287,9 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         handler.attn_dp_size = 1
         handler.attn_dp_cpu_group = None
         handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
+        handler._replica_flush_want_buf = torch.zeros(
+            _WEIGHT_GATE_WIDTH, dtype=torch.int32
+        )
         handler._pending_weight_ops = deque()
         handler._pending_internal_ops = deque()
         handler._internal_op_completer = None

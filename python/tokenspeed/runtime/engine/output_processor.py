@@ -51,6 +51,7 @@ from tokenspeed.runtime.engine.io_struct import (
     BatchTokenIDOut,
 )
 from tokenspeed.runtime.engine.logprobs import LogprobsProcessor
+from tokenspeed.runtime.engine.output_metadata import speculative_token_counts
 from tokenspeed.runtime.metrics.collector import RequestFinishStats
 
 if TYPE_CHECKING:
@@ -310,13 +311,13 @@ class OutputProcessor:
                     verify_ct = recv_obj.spec_verify_ct[i]
                     meta_info["spec_verify_ct"] = verify_ct
                     if verify_ct > 0:
-                        # Prefill emits 1 token and each verify step 1 more;
-                        # the rest are accepted drafts.
-                        n = self.engine.server_args.speculative_num_draft_tokens
-                        meta_info["spec_accepted_tokens"] = (
-                            recv_obj.completion_tokens[i] - 1 - verify_ct
+                        accepted, drafted = speculative_token_counts(
+                            recv_obj.completion_tokens[i],
+                            verify_ct,
+                            self.engine.server_args.speculative_num_draft_tokens,
                         )
-                        meta_info["spec_draft_tokens"] = verify_ct * (n - 1)
+                        meta_info["spec_accepted_tokens"] = accepted
+                        meta_info["spec_draft_tokens"] = drafted
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
 

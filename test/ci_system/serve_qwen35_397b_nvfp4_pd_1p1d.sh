@@ -6,6 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/worker_cleanup.sh"
+source "$SCRIPT_DIR/smg_transport.sh"
 
 MODEL=${MODEL:-nvidia/Qwen3.5-397B-A17B-NVFP4}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-$MODEL}
@@ -94,6 +95,7 @@ cleanup() {
     stop_worker_pids \
       "pd-1p1d" "${WORKER_SHUTDOWN_TIMEOUT:-30}" "${pids[@]}"
   fi
+  cleanup_smg_transport
   exit "$code"
 }
 trap cleanup EXIT INT TERM
@@ -180,11 +182,13 @@ start_worker() {
   local bootstrap_port=$4
   local dist_init_addr=$5
   local log="$LOG_DIR/${role}.log"
+  configure_smg_worker "$role" "$role" "$port" "$bootstrap_port"
   echo "[pd-1p1d] starting ${role}: gpus=$gpus port=$port bootstrap=${bootstrap_port:-none} log=$log"
   (
     export CUDA_VISIBLE_DEVICES="$gpus"
     exec python3 -m smg_grpc_servicer.tokenspeed \
       "${COMMON_ARGS[@]}" \
+      "${SMG_ENGINE_TRANSPORT_ARGS[@]}" \
       --port "$port" \
       --dist-init-addr "$dist_init_addr" \
       ${bootstrap_port:+--disaggregation-bootstrap-port "$bootstrap_port"} \
@@ -199,14 +203,16 @@ start_worker() {
 start_worker prefill "$PREFILL_GPUS" "$PREFILL_PORT" "$PREFILL_BOOTSTRAP_PORT" "$PREFILL_DIST_INIT_ADDR"
 start_worker decode "$DECODE_GPUS" "$DECODE_PORT" "" "$DECODE_DIST_INIT_ADDR"
 
-wait_serving prefill "${pids[0]}" 2400
-wait_serving decode "${pids[1]}" 2400
+if [[ "$SMG_CONNECTION_MODE" == grpc ]]; then
+  wait_serving prefill "${pids[0]}" 2400
+  wait_serving decode "${pids[1]}" 2400
+fi
+configure_smg_gateway
 
 echo "[pd-1p1d] starting smg lb log=$LOG_DIR/lb.log"
 python3 -m smg launch \
   --pd-disaggregation \
-  --prefill "grpc://127.0.0.1:${PREFILL_PORT}" "$PREFILL_BOOTSTRAP_PORT" \
-  --decode "grpc://127.0.0.1:${DECODE_PORT}" \
+  "${SMG_GATEWAY_WORKER_ARGS[@]}" \
   --host "$LB_HOST" \
   --port "$LB_PORT" \
   --model-path "$MODEL_PATH" \
@@ -227,6 +233,11 @@ python3 -m smg launch \
   >"$LOG_DIR/lb.log" 2>&1 &
 pids+=("$!")
 logs+=("$LOG_DIR/lb.log")
+
+if [[ "$SMG_CONNECTION_MODE" == zmq ]]; then
+  wait_serving prefill "${pids[0]}" 2400
+  wait_serving decode "${pids[1]}" 2400
+fi
 
 wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" 600
 echo "[pd-1p1d] serving on http://127.0.0.1:${LB_PORT}/v1"
