@@ -53,15 +53,21 @@ def test_eager_launches_share_one_buffer_per_stream() -> None:
     assert torch.all(other == 0)
 
 
+@pytest.mark.parametrize("inference", [False, True], ids=["grad", "inference"])
 @pytest.mark.parametrize("session", [True, False], ids=["session", "no-session"])
-def test_capture_zeroes_state_once_or_per_replay(session: bool) -> None:
+def test_capture_zeroes_state_once_or_per_replay(
+    session: bool, inference: bool
+) -> None:
+    # Serving runs the captured forward under inference mode.
     out = torch.empty(4, dtype=torch.int32, device=_DEVICE)
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
+    mode = torch.inference_mode() if inference else contextlib.nullcontext()
     with torch.cuda.stream(stream):
         scope = capture_session(graph) if session else contextlib.nullcontext()
         with scope, torch.cuda.graph(graph, stream=stream):
-            state = _bump_and_restore(out)
+            with mode:
+                state = _bump_and_restore(out)
     stream.synchronize()
 
     graph.replay()
@@ -70,7 +76,8 @@ def test_capture_zeroes_state_once_or_per_replay(session: bool) -> None:
 
     # With a session the graph itself never zeroes the state, so a launch
     # sees whatever the previous one left; without one every replay zeroes.
-    state.fill_(5)
+    with torch.inference_mode():
+        state.fill_(5)
     graph.replay()
     torch.cuda.synchronize()
     assert torch.all(out == (6 if session else 1))
@@ -98,3 +105,23 @@ def test_session_keeps_captured_state_alive_with_its_owner() -> None:
     torch.cuda.synchronize()
     assert torch.all(out == 1)
     assert torch.all(inner == 7) and torch.all(outer == 9)
+
+
+def test_session_state_never_reuses_memory_freed_earlier_in_the_capture() -> None:
+    # The graph pool would hand the state memory a tensor freed earlier in the
+    # capture used; every replay rewrites that tensor before the state's
+    # launch reads it.
+    out = torch.empty(64, dtype=torch.int32, device=_DEVICE)
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            scratch = torch.full((64,), 3, dtype=torch.int32, device=_DEVICE)
+            del scratch
+            _bump_and_restore(out)
+    stream.synchronize()
+
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.all(out == 1)

@@ -26,32 +26,66 @@ every launch leaves it zero again, so it needs zeroing once, not per launch.
 :func:`zeroed_state` hands out these buffers.
 
 Eager launches share one buffer per stream: same-stream launches are ordered
-and each leaves the buffer zeroed for the next. A graph captured inside
-:func:`capture_session` gets buffers of its own that are zeroed once after
-capture, outside the graph, so replays carry no zeroing nodes. The session
-ties their lifetime to an owner object, normally the graph: a graph replays
-the addresses it captured but holds no reference to them. Without a session,
-a captured launch falls back to zeroing a fresh buffer inside the graph.
+and each leaves the buffer zeroed for the next.
+
+A graph captured inside :func:`capture_session` takes its buffers from an
+arena the session zeroes before capture starts, so replays carry no zeroing
+nodes. The arena lives outside the graph's memory pool on purpose: during
+capture the pool hands out memory that tensors freed earlier in the capture
+used, and their kernels write it again on every replay, before a later
+launch's state would be read. The session keeps the arena alive as long as an
+owner object, normally the graph, which replays the addresses it captured but
+holds no reference to them. Without a session, or once the arena is used up, a
+captured launch falls back to zeroing a fresh buffer inside the graph.
 """
 
 from __future__ import annotations
 
 import contextlib
 import threading
+import warnings
 from collections.abc import Iterator
 from weakref import WeakKeyDictionary
 
 import torch
 
 _eager_buffers: dict[tuple[int, int, torch.dtype, int], torch.Tensor] = {}
-# Buffers captured graphs use, kept alive by their owners.
-_owned_buffers: WeakKeyDictionary[object, list[torch.Tensor]] = WeakKeyDictionary()
+# Arenas captured graphs use, kept alive by their owners.
+_owned_arenas: WeakKeyDictionary[object, list[torch.Tensor]] = WeakKeyDictionary()
+
+# Slices start on this many bytes.
+_ALIGN = 256
+# A session sizes its arena at twice the most any earlier session used, within
+# these bounds; the first gets the larger.
+_MIN_ARENA_BYTES = 4096
+_FIRST_ARENA_BYTES = 1 << 20
+
+
+class _Arena:
+    """Zeroed bytes a capture session carves state from."""
+
+    def __init__(self, num_bytes: int, device: torch.device) -> None:
+        self.storage = torch.zeros((num_bytes,), dtype=torch.uint8, device=device)
+        self.used = 0
+        # Bytes every take asked for, including those that did not fit.
+        self.wanted = 0
+
+    def take(self, numel: int, dtype: torch.dtype) -> torch.Tensor | None:
+        size = numel * dtype.itemsize
+        start = self.used
+        end = start + (size + _ALIGN - 1) // _ALIGN * _ALIGN
+        self.wanted += end - start
+        if end > self.storage.numel():
+            return None
+        self.used = end
+        return self.storage[start : start + size].view(dtype)
 
 
 class _Sessions(threading.local):
     def __init__(self) -> None:
-        # Buffers awaiting zeroing for each open session, innermost last.
-        self.pending: list[list[torch.Tensor]] = []
+        # The arena of each open session, innermost last.
+        self.arenas: list[_Arena] = []
+        self.peak_bytes = 0
 
 
 _sessions = _Sessions()
@@ -74,11 +108,14 @@ def zeroed_state(
         gets a buffer that only that launch uses.
     """
     if torch.cuda.is_current_stream_capturing():
-        if not _sessions.pending:
-            # No session to zero it after capture: zero it inside the graph.
+        arena = _sessions.arenas[-1] if _sessions.arenas else None
+        index = torch.cuda.current_device() if device.index is None else device.index
+        buffer = None
+        if arena is not None and arena.storage.device.index == index:
+            buffer = arena.take(numel, dtype)
+        if buffer is None:
+            # No pre-zeroed memory: zero a fresh buffer inside the graph.
             return torch.zeros((numel,), dtype=dtype, device=device)
-        buffer = torch.empty((numel,), dtype=dtype, device=device)
-        _sessions.pending[-1].append(buffer)
         return buffer
 
     device_index = torch.cuda.current_device() if device.index is None else device.index
@@ -95,29 +132,37 @@ def zeroed_state(
 def capture_session(owner: object) -> Iterator[None]:
     """Give the launches captured in this scope pre-zeroed state.
 
-    Enter it around the whole capture, outside ``torch.cuda.graph``, so that
-    the capture has ended when the session closes. The buffers captured
-    launches got from :func:`zeroed_state` are then zeroed outside the graph
-    and kept alive as long as ``owner``.
+    Enter it before the capture starts: it allocates and zeroes the arena the
+    captured launches carve their :func:`zeroed_state` from, on the current
+    device, and keeps it alive as long as ``owner``.
 
     Args:
         owner: Object that outlives every replay of the captured graph or
             graphs, normally the ``torch.cuda.CUDAGraph``; it must support
             weak references.
     """
-    pending: list[torch.Tensor] = []
-    _sessions.pending.append(pending)
+    if not torch.cuda.is_available():
+        yield
+        return
+    if _sessions.peak_bytes:
+        num_bytes = max(_MIN_ARENA_BYTES, 2 * _sessions.peak_bytes)
+    else:
+        num_bytes = _FIRST_ARENA_BYTES
+    arena = _Arena(num_bytes, torch.device("cuda", torch.cuda.current_device()))
+    _sessions.arenas.append(arena)
     try:
         yield
     finally:
-        _sessions.pending.pop()
-    if not pending:
-        return
-    for buffer in pending:
-        buffer.zero_()
-    # Replays may run on other streams; make the zeros visible to them.
-    torch.cuda.synchronize(pending[0].device)
-    _owned_buffers.setdefault(owner, []).extend(pending)
+        _sessions.arenas.pop()
+    _sessions.peak_bytes = max(_sessions.peak_bytes, arena.wanted)
+    if arena.wanted > num_bytes:
+        warnings.warn(
+            f"capture_session arena of {num_bytes} bytes ran out; the rest of the "
+            "captured launches zero their state inside the graph",
+            stacklevel=3,
+        )
+    if arena.used:
+        _owned_arenas.setdefault(owner, []).append(arena.storage)
 
 
 __all__ = ["capture_session", "zeroed_state"]
