@@ -1672,7 +1672,6 @@ class TestGPU:
                 True,
                 min_split_kv,
                 True,
-                True,
                 torch.float8_e4m3fn,
             ),
             300,
