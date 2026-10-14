@@ -1087,7 +1087,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     def plan_indexer_queries(
         self, layer_id, positions, requests, forward_mode, index_process_group
     ) -> InterleavedQueryPlan | None:
-        """Plan encoder indexer rows before projection, using shared host metadata."""
+        """Plan encoder indexer QCP rows before projection using shared host metadata."""
         owner = self.spec.kv_owners[layer_id]
         source = self.spec.index_sources[layer_id]
         group = self.spec.indexer_query_group
@@ -1251,7 +1251,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._partitioned_index_layers.add(layer_id)
                 if self.spec.indexer_query_rank == 0:
                     logging.getLogger(__name__).info(
-                        f"V4.1 indexer query partition: layer={layer_id}, "
+                        f"V4.1 indexer QCP: layer={layer_id}, "
                         f"layout=interleave, size={partition.size}, "
                         f"global_rows={partition.total_rows}, local_rows={n}, "
                         f"local_projection={projected_partition is not None}"
@@ -1767,7 +1767,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ):
                 if layer_id not in self._attention_exchange_layers:
                     logging.getLogger(__name__).info(
-                        f"V4.1 attention query exchange: layer={layer_id}, "
+                        f"V4.1 prefill attention QCP: layer={layer_id}, "
                         f"size={len(group)}, rows={request_q.shape[0]}, "
                         f"local_heads={request_q.shape[1]}"
                     )

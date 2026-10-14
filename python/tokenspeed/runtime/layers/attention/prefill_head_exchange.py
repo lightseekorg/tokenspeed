@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Query/head redistribution around replicated-KV prefill attention."""
+"""Operator-level QCP via query/head exchange around replicated-KV prefill attention."""
 
 import torch
 from tokenspeed_kernel.ops.attention import dsv41

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Interleaved query ownership, independent of cache storage and head TP."""
+"""Interleaved QCP query ownership, independent of cache storage and head TP."""
 
 from dataclasses import dataclass
 

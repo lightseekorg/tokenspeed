@@ -3427,7 +3427,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.deepseek_v41_attention_query_swa_min_tokens,
             help="Additional minimum query rows per request for SWA-only V4.1 "
-            "attention head exchange (default: 4096). The larger of this and "
+            "attention QCP head exchange (default: 4096). The larger of this and "
             "--deepseek-v41-attention-query-min-tokens applies. Tune for the "
             "deployment; this is not a hardware auto-tuner.",
         )
@@ -3436,7 +3436,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.deepseek_v41_attention_query_min_tokens,
             help="Minimum query rows per request in the current prefill window "
-            "for V4.1 attention head exchange (default: 1024). Also requires "
+            "for V4.1 attention QCP head exchange (default: 1024). Also requires "
             "at least one query per rank. This threshold does not enable "
             "exchange or auto-tune for the GPU/interconnect.",
         )
@@ -3444,7 +3444,7 @@ class ServerArgs:
             "--deepseek-v41-attention-query-parallel-size",
             type=int,
             default=ServerArgs.deepseek_v41_attention_query_parallel_size,
-            help="Exchange DeepSeek V4.1 prefill query heads for token shards "
+            help="Enable DeepSeek V4.1 prefill attention QCP via query/head exchange "
             "over attention TP. Set 1 to disable (default), or attention TP "
             "size to enable for eligible long requests with 64 total heads. "
             "KV storage and model projections remain unchanged.",
@@ -3453,10 +3453,10 @@ class ServerArgs:
             "--deepseek-v41-indexer-query-parallel-size",
             type=int,
             default=ServerArgs.deepseek_v41_indexer_query_parallel_size,
-            help="Partition DeepSeek V4.1 long-prefill encoder indexer query "
+            help="Enable DeepSeek V4.1 long-prefill encoder indexer QCP for query "
             "projections and scoring over attention TP. Set 1 to disable "
             "(default), or the attention TP size to enable. KV remains "
-            "replicated; this does not enable model-level prefill CP.",
+            "replicated; this does not enable the generic QCP execution path.",
         )
         parser.add_argument(
             "--prefill-context-parallel-size",
