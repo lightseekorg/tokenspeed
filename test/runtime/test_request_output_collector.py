@@ -34,6 +34,8 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402

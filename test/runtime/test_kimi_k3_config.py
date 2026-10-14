@@ -330,7 +330,7 @@ class TestKimiK3RegistrationTests:
         )
         config, mapping = built.config, built.mapping
         linear_calls, multicast_calls = built.linear_calls, built.multicast_calls
-        layer, get_pg = built.layer, built.get_pg
+        _layer, get_pg = built.layer, built.get_pg
         self._assert_latent_projection_sharding(linear_calls, mapping, trtllm=True)
         # The native plan cannot reach this shard at all (it is AMD-only), so the
         # multicast wiring has to be asserted here or nowhere.

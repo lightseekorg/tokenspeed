@@ -174,4 +174,6 @@ class TestN16A16LayoutTests:
 
 
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+    raise SystemExit(
+        pytest.main([__file__, f"--confcutdir={Path(__file__).parent}", *sys.argv[1:]])
+    )

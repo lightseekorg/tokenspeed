@@ -10,6 +10,7 @@ import os
 import sys
 from unittest import mock
 
+import pytest
 import torch
 from transformers import PretrainedConfig
 

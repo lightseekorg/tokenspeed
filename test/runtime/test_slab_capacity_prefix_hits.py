@@ -220,10 +220,11 @@ class TestSlabCapacityPrefixHits:
     working set cached; the legacy arm's halved pool LRU-cycles it."""
 
     def setup_method(self):
-        try:
-            import tokenspeed_scheduler
-        except ImportError:
-            pytest.skip("tokenspeed_scheduler ext is not installed")
+        pytest.importorskip(
+            "tokenspeed_scheduler",
+            reason="tokenspeed_scheduler ext is not installed",
+            exc_type=ImportError,
+        )
         if os.environ.get("TOKENSPEED_CI_SMALL_KV_SIZE"):
             pytest.skip(
                 "TOKENSPEED_CI_SMALL_KV_SIZE pins the token pool for both "

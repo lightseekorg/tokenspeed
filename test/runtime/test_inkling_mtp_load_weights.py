@@ -176,7 +176,7 @@ class TestInklingMTPLoadWeights:
 
     def test_qkvr_fusion_with_kv_replication(self):
         text = self.text
-        hd, heads = text.head_dim, text.num_attention_heads
+        hd, _heads = text.head_dim, text.num_attention_heads
         # Hetero (default): depth blocks are full-attention and serve their
         # native ckpt KV heads — the loader's replication is a no-op.
         hetero = True  # gate retired 2026-07-15; hetero KV is unconditional

@@ -28,61 +28,17 @@ _KV_CACHE_DIR = (
 _RECIPE_DIR = _KV_CACHE_DIR / "recipes"
 
 
-def _load(module_name: str, path: pathlib.Path):
-    spec = importlib.util.spec_from_file_location(module_name, path)
+@pytest.fixture(scope="class", autouse=True)
+def cache_plan_module(request):
+    module_name = "tokenspeed.runtime.layers.attention.kv_cache.recipes.plan"
+    spec = importlib.util.spec_from_file_location(module_name, _RECIPE_DIR / "plan.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_cache_modules():
-    for package_name in (
-        "tokenspeed",
-        "tokenspeed.runtime",
-        "tokenspeed.runtime.configs",
-        "tokenspeed.runtime.layers",
-        "tokenspeed.runtime.layers.attention",
-        "tokenspeed.runtime.layers.attention.kv_cache",
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes",
-    ):
-        sys.modules.setdefault(package_name, types.ModuleType(package_name))
-    # The V4 recipe imports the kernel-page registry by its real name;
-    # register it from its file path before the recipe loads.
-    _load(
-        "tokenspeed.runtime.layers.attention.kernel_page_sizes",
-        _KV_CACHE_DIR.parent / "kernel_page_sizes.py",
-    )
-    plan = _load(
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes.plan",
-        _RECIPE_DIR / "plan.py",
-    )
-    _load(
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes",
-        _RECIPE_DIR / "__init__.py",
-    )
-    recipes = {}
-    for recipe in (
-        "deepseek_v4",
-        "ordinary",
-        "inkling",
-        "kimi_k3",
-        "qwen35",
-    ):
-        recipes[recipe] = _load(
-            f"tokenspeed.runtime.layers.attention.kv_cache.recipes.{recipe}",
-            _RECIPE_DIR / f"{recipe}.py",
-        )
-    layouts = types.SimpleNamespace(
-        **{
-            name: getattr(module, name)
-            for module in recipes.values()
-            for name in dir(module)
-            if name.endswith("_cache_fields")
-        }
-    )
-    return plan, layouts
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, module_name, module)
+        spec.loader.exec_module(module)
+        request.cls.plan_module = module
+        yield
 
 
 def _tagged_field(group_id, field_id, plane_id, shape, dtype, **kwargs):
@@ -105,17 +61,11 @@ def _group(group_id: str, *fields, **spec_kwargs):
     Row geometry defaults so a byte-layout test need not restate scheduler
     semantics; ``rows_per_page`` is the group's CacheBlock token span.
     """
-    # A duck-typed spec: the planner reads only ``spec.group_id``, and this
-    # module loads its subject by file path -- importing the real spec module
-    # here would shadow it in sys.modules for every later test.
+    # A duck-typed spec: the planner reads only spec.group_id.
     return types.SimpleNamespace(group_id=group_id, **spec_kwargs), tuple(fields)
 
 
 class TestCacheMemoryPlanTest:
-    @classmethod
-    def setup_class(cls):
-        cls.plan_module, cls.layouts_module = _load_cache_modules()
-
     def _plan_fields(
         self,
         fields,
