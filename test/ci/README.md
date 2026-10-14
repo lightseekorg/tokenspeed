@@ -43,10 +43,17 @@ concurrently with unit tests. Matrix entries within
 each stage run in parallel. The workflow treats a stage with no matching tasks
 as successfully satisfied.
 
-`ut-tokenspeed-kernel-part-i` runs tests outside `tokenspeed-kernel/test/ops/`,
-keeping the numerics, TRT-LLM communication and CUDA suites in separate processes.
-`ut-tokenspeed-kernel-part-ii` runs `tokenspeed-kernel/test/ops/`. Together the
-two tasks cover the kernel suite once.
+On NVIDIA runners, `ut-tokenspeed-kernel-part-i` runs tests outside
+`tokenspeed-kernel/test/ops/`, keeping the numerics, TRT-LLM communication and
+CUDA suites in separate processes. `ut-tokenspeed-kernel-part-ii` runs
+`tokenspeed-kernel/test/ops/`. Together the two tasks cover the kernel suite
+once. AMD runners run the same commands in the single `ut-tokenspeed-kernel`
+task.
+
+Conversely, AMD runners split the `runtime-1gpu` suite across
+`ut-runtime-1gpu-part-i` and `ut-runtime-1gpu-part-ii`, which balance test files
+by their registered `est_time` (`run_ci_suite.py --auto-partition-*`). Other
+runners run the whole suite in `ut-runtime-1gpu`.
 
 PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
 Applying the label starts a new CI run immediately and cancels the older run
@@ -77,6 +84,10 @@ The long-context performance report accepts both current EvalScope metrics
 invalid TPOT fails collection instead of producing a zero-throughput report.
 Unavailable acceptance metrics appear as `N/A` (empty CSV cells). An aggregate
 is unavailable if any run for that prompt length lacks the metric.
+
+Model performance CSVs support `Throughput (tps/gpu)` and
+`Output Throughput (tok/min/gpu)`. The second value in each `perf_reference`
+pair uses the throughput column's units and token-counting definition.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
@@ -143,10 +154,10 @@ workflows map that to GitHub Actions `continue-on-error`.
 # whole task can fail without blocking the workflow
 optional: true
 
-# only the MI35x 1-GPU entry is non-blocking; other entries of the same
+# only the MI355 1-GPU entry is non-blocking; other entries of the same
 # task still block on failure
 optional:
-  amd-mi35x-1gpu-test: true
+  amd-mi355-1gpu: true
 ```
 
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
@@ -323,7 +334,7 @@ smoke test. For a meaningful manual comparison, use `K8s Dispatch`: selecting a
 pull request uses its target and head revisions, while selecting a commit
 compares it with the latest `main`. Both revisions always execute serially in one task allocation.
 
-The task requests the ci-infra-managed `amd-mi350-1gpu-bench` runner pool and
+The task requests the ci-infra-managed `amd-mi355-1gpu` runner pool and
 exposes logical device 0. Each allocation must provide one `gfx950` GPU,
 working ROCm device permissions, Git, Bash, Python virtual-environment support,
 sufficient temporary storage, and access to the configured package indexes. The normal AMD

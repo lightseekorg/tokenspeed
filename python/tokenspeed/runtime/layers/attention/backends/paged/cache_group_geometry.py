@@ -21,8 +21,8 @@
 """Cache-group geometry learned from the pool's published specs.
 
 One immutable value object answers every "what shape is this group?"
-question a backend asks — group block granularities, every group's family
-(the positive-claim vocabulary ``cache_consumer_families`` filters against),
+question a backend asks — group block granularities, every group's kind
+(the positive-claim vocabulary ``cache_consumer_attn_kinds`` filters against),
 and which group is the full history the draft chain writes along. Learned
 exactly once, at ``set_cache_pool`` (the arena's published specs are the
 only source, so the eager and CUDA-graph arms can never answer
@@ -42,31 +42,30 @@ class CacheGroupGeometry:
         granularities: ``group_id -> block_granularity`` for every non-state
             group (rows-per-page span; equals the group's page size for the
             row-geometry groups kept here).
-        families: ``group_id -> family`` for every published group. The
+        attn_kinds: ``group_id -> attn_kind`` for every published group. The
             positive-claim vocabulary: a backend keeps exactly the delivered
-            groups whose family it declared in ``cache_consumer_families``;
-            the rest (state blocks for the mamba backend, wrapper-owned conv
+            groups whose kind it declared in ``cache_consumer_attn_kinds``; the
+            rest (state blocks for the mamba backend, wrapper-owned conv
             groups) ride the same dict to their own consumers. Empty when
             no pool is bound (unit fixtures, pre-contract draft pools).
-        full_history_group_id: The first ``family="history"`` group with
-            ``retention="full_history"`` — the table the router's draft
-            write locations ride — or None when the pool publishes no such
-            group (a single-group pool's sole group then serves as the
-            history). Chosen from the pool at every bind, so it takes no
-            part in geometry equality.
+        full_history_group_id: The first ``attn_kind="full_history"`` group — the
+            table the router's draft write locations ride — or None when the
+            pool publishes no such group (a single-group pool's sole group
+            then serves as the history). Chosen from the pool at every bind,
+            so it takes no part in geometry equality.
         row_geometry: ``group_id -> (rows_per_page, entry_stride_tokens)``
             for every non-state group: the physical row layout the leaves'
             kernels read, so a rebind keeps it.
-        retentions: ``group_id -> (retention, sliding_window_tokens)`` for
-            every non-state group: the scheduler's retention contract, and the
-            fact ``full_history_group_id`` is chosen from.
+        windows: ``group_id -> sliding_window_tokens`` for every non-state
+            group (None for full history): the scheduler's retention
+            contract, which a rebind must keep as well.
     """
 
     granularities: dict[str, int] = field(default_factory=dict)
-    families: dict[str, str] = field(default_factory=dict)
+    attn_kinds: dict[str, str] = field(default_factory=dict)
     full_history_group_id: str | None = field(default=None, compare=False)
     row_geometry: dict[str, tuple[int | None, int | None]] = field(kw_only=True)
-    retentions: dict[str, tuple[str, int | None]] = field(kw_only=True)
+    windows: dict[str, int | None] = field(kw_only=True)
 
     def granularity_of(self, group_id: str) -> int:
         """This group's block granularity; an unknown id is a contract bug.
@@ -96,31 +95,28 @@ def learn_cache_group_geometry(cache_group_specs) -> CacheGroupGeometry:
         The frozen geometry.
     """
     full_history = next(
-        (
-            spec
-            for spec in cache_group_specs
-            if spec.family == "history" and spec.retention == "full_history"
-        ),
-        None,
+        (spec for spec in cache_group_specs if spec.attn_kind == "full_history"), None
     )
     return CacheGroupGeometry(
         granularities={
             str(spec.group_id): spec.block_granularity
             for spec in cache_group_specs
-            if spec.family != "state"
+            if spec.attn_kind != "state"
         },
-        families={str(spec.group_id): str(spec.family) for spec in cache_group_specs},
+        attn_kinds={
+            str(spec.group_id): str(spec.attn_kind) for spec in cache_group_specs
+        },
         full_history_group_id=(
             str(full_history.group_id) if full_history is not None else None
         ),
         row_geometry={
             str(spec.group_id): (spec.rows_per_page, spec.entry_stride_tokens)
             for spec in cache_group_specs
-            if spec.family != "state"
+            if spec.attn_kind != "state"
         },
-        retentions={
-            str(spec.group_id): (str(spec.retention), spec.sliding_window_tokens)
+        windows={
+            str(spec.group_id): spec.sliding_window_tokens
             for spec in cache_group_specs
-            if spec.family != "state"
+            if spec.attn_kind != "state"
         },
     )

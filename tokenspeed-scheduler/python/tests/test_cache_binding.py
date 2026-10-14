@@ -158,7 +158,10 @@ def test_snapshot_pool_is_stated_explicitly():
     cfg.disable_l2_cache = True
     cfg.cache_groups = [
         ts.CacheGroupConfig(
-            group_id="full_attention", block_granularity=16, total_pages=64
+            group_id="full_attention",
+            block_granularity=16,
+            total_pages=64,
+            attn_kind=ts.AttnKind.Full,
         )
     ]
     # Unset: the pool is a behavioural choice, not a default. The diagnostics

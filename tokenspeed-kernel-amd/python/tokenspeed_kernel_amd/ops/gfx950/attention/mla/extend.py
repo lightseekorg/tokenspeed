@@ -53,7 +53,6 @@ from tokenspeed_kernel_amd._scheduling import (
 from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2_VALUE,
-    _LN2,
     max,
     maximum,
     padded_shared_layout,

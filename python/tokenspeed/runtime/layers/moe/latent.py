@@ -37,7 +37,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_expert_shared,
     native_latent_moe_available,
 )
-from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 

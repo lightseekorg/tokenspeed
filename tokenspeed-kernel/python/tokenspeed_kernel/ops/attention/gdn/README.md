@@ -29,13 +29,6 @@ one compiled kernel across different token counts instead of compiling a new
 variant for each length. Tests compare irregular lengths around the usual
 prefill graph buckets against an independent PyTorch result.
 
-The checkpoint output inverse gather also keeps body, tail, and output token
-counts as runtime values. Breakable graphs run recurrent-state scans at eager
-attention breaks, where those counts change with each grouped prefill batch.
-The gather still specializes on feature geometry and strides, but it reuses the
-same compiled kernel across different token splits and output lengths. Tests
-cover irregular splits, padded output rows, and strided scan outputs.
-
 Compilation guards warm these kernels, then sweep token counts (and PLE
 request counts) without allowing new Triton specializations. PLE covers
 transitions between single-request, uniform multi-request and ragged indexing

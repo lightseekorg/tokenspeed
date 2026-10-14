@@ -23,7 +23,7 @@ from __future__ import annotations
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -102,6 +102,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     validate_scheduler_config,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
+    local_page_pairs_by_group,
     local_pages_by_group,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -149,6 +150,35 @@ def _sampling_info_for_requests(
         ]
         info.vocab_mask = mask[::mask_width].contiguous() if prefill else mask
     return info
+
+
+def _with_prefill_sample_offsets(
+    sampling_info: SamplingBatchInfo, input_lengths: torch.Tensor
+) -> SamplingBatchInfo:
+    """Key each prefill row's sample on the position of its last input token.
+
+    The pool kernels draw a request's noise from (seed, offset), and decode
+    and verify take the offset from ``valid_cache_lengths``, which is the
+    absolute position of the step's first input token. A prefill samples
+    before its frontier advances, so that table still holds the chunk's
+    prefix length: a prefix-cache hit or a chunk boundary would move the
+    first sampled token's stream, and the same seeded request would diverge
+    from its first token. The last input position is the same however the
+    prompt was split, and it sits one below the first decode's offset.
+    ``sampling_info`` covers exactly the prefill rows; ``input_lengths`` are
+    their input lengths, in the same order.
+    """
+    cache_lengths = sampling_info.valid_cache_lengths
+    if cache_lengths is None or sampling_info.req_pool_indices is None:
+        return sampling_info
+    pool_rows = sampling_info.req_pool_indices.long()
+    last = cache_lengths.index_select(0, pool_rows) + input_lengths[
+        : pool_rows.shape[0]
+    ].to(cache_lengths.dtype)
+    offsets = cache_lengths.index_copy(
+        0, pool_rows, (last - 1).clamp_min(0).to(cache_lengths.dtype)
+    )
+    return replace(sampling_info, valid_cache_lengths=offsets)
 
 
 PREFILL_GRAPH_DEFAULT_MAX_TOKENS = 2048
@@ -218,6 +248,7 @@ def select_dspark_context_producer(
     pp_size: int,
     draft_model: torch.nn.Module | None,
     draft_token_to_kv_pool,
+    draft_attn_backend,
 ):
     """Return the stage's DSpark context producer, or None when nothing is produced.
 
@@ -259,7 +290,9 @@ def select_dspark_context_producer(
     )
 
     if isinstance(draft_model, DSparkContextModel):
-        return DSparkContextProducer(draft_model, draft_token_to_kv_pool)
+        return DSparkContextProducer(
+            draft_model, draft_token_to_kv_pool, attn_backend=draft_attn_backend
+        )
     if is_block_drafter(spec_algo, is_draft=True):
         raise TypeError(
             f"{type(draft_model).__name__} cannot produce DSpark context across "
@@ -565,6 +598,7 @@ class ModelExecutor:
                 draft_model_runner.model if draft_model_runner is not None else None
             ),
             draft_token_to_kv_pool=draft_token_to_kv_pool,
+            draft_attn_backend=draft_attn_backend,
         )
         if self.config.spec_algo is not None and self._pp_is_last_stage:
             # Model-to-model wiring (shared embed/head, eagle3 capture ids)
@@ -649,6 +683,7 @@ class ModelExecutor:
         self._active_positions_override = None
 
         self._graph_support = graph_support
+        self.device_module = torch.get_device_module(self.device)
         self._build_graph_owners()
 
         # Encoder graphs are installed before KV-cache sizing and retained by
@@ -657,7 +692,6 @@ class ModelExecutor:
             self.model_runner, "encoder_graph_wrappers", {}
         )
 
-        self.device_module = torch.get_device_module(self.device)
         # Two streams, named once. `default_stream` is the forward thread's
         # own: page zeroing runs here, and the cache ops take it by name for
         # their fences and start events. `execution_stream` carries the model
@@ -746,6 +780,7 @@ class ModelExecutor:
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
         self.attn_backend.configure_runtime(
+            request_slot_capacity=self.config.max_req_pool_size + 1,
             cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
             cache_group_page_counts=_cache_arena_attr(
                 self.token_to_kv_pool, "cache_group_page_counts", None
@@ -1390,7 +1425,12 @@ class ModelExecutor:
         num_prefill_outputs = layout.num_prefill_outputs
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
-            return self.sampling_backend.sample(logits_output, sampling_info)
+            return self.sampling_backend.sample(
+                logits_output,
+                _with_prefill_sample_offsets(
+                    sampling_info, self.input_buffers.input_lengths_buf
+                ),
+            )
         if num_extends == 0:
             output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output,
@@ -1426,8 +1466,11 @@ class ModelExecutor:
             prefill_out = LogitsProcessorOutput(next_token_logits=logits[prefill])
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
-                _sampling_info_for_requests(
-                    sampling_info, prefill, mask_width=mask_width, prefill=True
+                _with_prefill_sample_offsets(
+                    _sampling_info_for_requests(
+                        sampling_info, prefill, mask_width=mask_width, prefill=True
+                    ),
+                    self.input_buffers.input_lengths_buf,
                 ),
             )
             # verify writes the same backend buffers; snapshot the prefix.
@@ -1536,6 +1579,13 @@ class ModelExecutor:
                 input_ids_buf_slice=slice_, candidate_start=ctx.num_extends
             )
 
+        # KV offloading uses scheduler request slots to bind hot partitions;
+        # ordinary backends keep their existing path through a no-op hook.
+        self.attn_backend.prepare_cache_batch(
+            self.input_buffers.req_pool_indices_buf[:bs],
+            num_extends=ctx.num_extends,
+            stream=self.device_module.current_stream(),
+        )
         ctx.dspark_context_producer = self.dspark_context_producer
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
@@ -1569,6 +1619,10 @@ class ModelExecutor:
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates
         )
+
+        # Offloading must persist accepted target-input KV before completion
+        # can publish prefixes or allow a scheduler request slot to be reused.
+        self.attn_backend.writeback_accepted_kv(accept_lengths)
 
         # Backstop: flag any request whose sampled id falls outside [0, vocab)
         # so the output processor can terminate it. Covers sampler/verify kernel
@@ -1682,123 +1736,127 @@ class ModelExecutor:
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
-        graph_forward_mode = ForwardMode.DECODE
-        ctx = ForwardContext(
-            attn_backend=self.attn_backend,
-            token_to_kv_pool=self.token_to_kv_pool,
-            bs=0,
-            num_extends=0,
-            output_layout=ForwardOutputLayout(0, 0, 0, 1),
-            input_num_tokens=0,
-            forward_mode=graph_forward_mode,
-            global_num_tokens=dp_metadata.global_num_tokens,
-            global_bs=dp_metadata.global_batch_size,
-            all_decode_or_idle=dp_metadata.all_decode_or_idle,
-        )
-        sampling_info = SamplingBatchInfo(
-            req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
-            valid_cache_lengths=self.runtime_states.valid_cache_lengths,
-            vocab_size=self.runtime_states.vocab_size,
-            device=self.device,
-        )
-        if self.forward_step.can_run(bs=0, ctx=ctx):
-            padded_bs = self.forward_step.padded_bs(bs=0, ctx=ctx)
-            self.input_buffers.fill_dummy_decode_buffers(
-                batch_size=padded_bs,
-                total_tokens=padded_bs * self.config.output_length,
+        self.execution_stream.wait_stream(self.default_stream)
+        with self.device_module.stream(self.execution_stream):
+            graph_forward_mode = ForwardMode.DECODE
+            ctx = ForwardContext(
+                attn_backend=self.attn_backend,
+                token_to_kv_pool=self.token_to_kv_pool,
+                bs=0,
+                num_extends=0,
+                output_layout=ForwardOutputLayout(0, 0, 0, 1),
+                input_num_tokens=0,
+                forward_mode=graph_forward_mode,
+                global_num_tokens=dp_metadata.global_num_tokens,
+                global_bs=dp_metadata.global_batch_size,
+                all_decode_or_idle=dp_metadata.all_decode_or_idle,
             )
-            # Captured hostfunc pops one entry per replay; push a dummy
-            # for this idle replay, same as run_once.
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.add_batch(
-                    grammars=[None] * padded_bs,
-                    bs=padded_bs,
-                    has_candidates=False,
-                    output_layout=ForwardOutputLayout(
-                        0, 0, padded_bs, self.config.output_length
-                    ),
+            sampling_info = SamplingBatchInfo(
+                req_pool_indices=self.input_buffers.req_pool_indices_buf[:0],
+                valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+                vocab_size=self.runtime_states.vocab_size,
+                device=self.device,
+            )
+            if self.forward_step.can_run(bs=0, ctx=ctx):
+                padded_bs = self.forward_step.padded_bs(bs=0, ctx=ctx)
+                self.input_buffers.fill_dummy_decode_buffers(
+                    batch_size=padded_bs,
+                    total_tokens=padded_bs * self.config.output_length,
                 )
-            # IDLE doesn't produce tokens, so no sampler/drafter call here —
-            # only the model forward, which still participates in collectives.
-            # The draft router's idle refresh zeroes its history stack rows,
-            # so the captured drafter steps' KV writes land on the dummy
-            # page (#955's aliasing hazard is handled at the table source).
-            ib = self.input_buffers
-            with nvtx_range("forward_step idle", color="blue"):
-                self.forward_step(
-                    bs=0,
-                    ctx=ctx,
-                    sampling_info=sampling_info,
-                    extend_with_prefix=False,
-                    extend_prefix_lens=ib.extend_prefix_lens_buf[:0],
-                    extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:0],
-                    extend_seq_lens=ib.extend_seq_lens_buf[:0],
-                    extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
-                    extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:0],
-                    extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:0],
-                    # No request, so no group tables on either side.
-                    block_tables_cpu={},
-                )
-            return
-
-        # Run model forward with IDLE mode — skips attention but still
-        # participates in MLP NCCL collectives (dense all-gather, MoE).
-        ctx.forward_mode = ForwardMode.IDLE
-        empty = torch.zeros(0, dtype=torch.int32, device=self.device)
-        self.model_runner.forward(
-            ctx,
-            input_ids=empty,
-            positions=empty,
-            **self._model_input_kwargs(0, 0, slice(0, 0)),
-        )
-
-        # If a drafter is active, its model also has MoE layers that issue
-        # NCCL collectives. Idle ranks must match those collectives: the
-        # drafter lists the draft forwards the active ranks run per round,
-        # each as the per-rank token counts sizing its collectives
-        # (idle_forward_global_num_tokens); every step runs the IDLE forward
-        # over an empty window with its own spec_step_idx.
-        if self.drafter is not None:
-            # A draft model that reads request-token history takes the view
-            # on every forward; the idle rank hands it an empty one, as the
-            # target's idle forward above does.
-            draft_kwargs: dict[str, object] = {}
-            if (
-                self.drafter.draft_model_runner.model_config.requires_request_token_history
-            ):
-                ib = self.input_buffers
-                draft_kwargs["request_token_history"] = (
-                    self.runtime_states.draft_request_token_history_view(
-                        req_pool_indices=ib.req_pool_indices_buf[:0],
-                        input_start_offsets=ib.input_start_offsets_buf[:1],
-                        active_request_mask=ib.active_request_mask_buf[:0],
-                        committed_lengths=self.runtime_states.valid_cache_lengths,
-                        row_offset=0,
+                # Captured hostfunc pops one entry per replay; push a dummy
+                # for this idle replay, same as run_once.
+                if self.capturable_grammar is not None:
+                    self.capturable_grammar.add_batch(
+                        grammars=[None] * padded_bs,
+                        bs=padded_bs,
+                        has_candidates=False,
+                        output_layout=ForwardOutputLayout(
+                            0, 0, padded_bs, self.config.output_length
+                        ),
                     )
-                )
-            step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
-                dp_metadata.global_num_tokens, dp_metadata.global_batch_size
+                # IDLE doesn't produce tokens, so no sampler/drafter call here —
+                # only the model forward, which still participates in collectives.
+                # The draft router's idle refresh zeroes its history stack rows,
+                # so the captured drafter steps' KV writes land on the dummy
+                # page (#955's aliasing hazard is handled at the table source).
+                ib = self.input_buffers
+                with nvtx_range("forward_step idle", color="blue"):
+                    self.forward_step(
+                        bs=0,
+                        ctx=ctx,
+                        sampling_info=sampling_info,
+                        extend_with_prefix=False,
+                        extend_prefix_lens=ib.extend_prefix_lens_buf[:0],
+                        extend_prefix_lens_cpu=ib.extend_prefix_lens_cpu[:0],
+                        extend_seq_lens=ib.extend_seq_lens_buf[:0],
+                        extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:0],
+                        extend_replay_lens_cpu=ib.extend_replay_lens_cpu[:0],
+                        extend_prompt_lens_cpu=ib.extend_prompt_lens_cpu[:0],
+                        # No request, so no group tables on either side.
+                        block_tables_cpu={},
+                    )
+                return
+
+            # Run model forward with IDLE mode — skips attention but still
+            # participates in MLP NCCL collectives (dense all-gather, MoE).
+            ctx.forward_mode = ForwardMode.IDLE
+            empty = torch.zeros(0, dtype=torch.int32, device=self.device)
+            self.model_runner.forward(
+                ctx,
+                input_ids=empty,
+                positions=empty,
+                **self._model_input_kwargs(0, 0, slice(0, 0)),
             )
-            for step_idx, draft_global_num_tokens in enumerate(step_global_num_tokens):
-                draft_ctx = ForwardContext(
-                    attn_backend=self.drafter.attn_backend,
-                    token_to_kv_pool=self.drafter.token_to_kv_pool,
-                    bs=0,
-                    num_extends=0,
-                    output_layout=ForwardOutputLayout(0, 0, 0, 1),
-                    input_num_tokens=0,
-                    forward_mode=ForwardMode.IDLE,
-                    global_num_tokens=draft_global_num_tokens,
-                    global_bs=dp_metadata.global_batch_size,
-                    all_decode_or_idle=dp_metadata.all_decode_or_idle,
+
+            # If a drafter is active, its model also has MoE layers that issue
+            # NCCL collectives. Idle ranks must match those collectives: the
+            # drafter lists the draft forwards the active ranks run per round,
+            # each as the per-rank token counts sizing its collectives
+            # (idle_forward_global_num_tokens); every step runs the IDLE forward
+            # over an empty window with its own spec_step_idx.
+            if self.drafter is not None:
+                # A draft model that reads request-token history takes the view
+                # on every forward; the idle rank hands it an empty one, as the
+                # target's idle forward above does.
+                draft_kwargs: dict[str, object] = {}
+                if (
+                    self.drafter.draft_model_runner.model_config.requires_request_token_history
+                ):
+                    ib = self.input_buffers
+                    draft_kwargs["request_token_history"] = (
+                        self.runtime_states.draft_request_token_history_view(
+                            req_pool_indices=ib.req_pool_indices_buf[:0],
+                            input_start_offsets=ib.input_start_offsets_buf[:1],
+                            active_request_mask=ib.active_request_mask_buf[:0],
+                            committed_lengths=self.runtime_states.valid_cache_lengths,
+                            row_offset=0,
+                        )
+                    )
+                step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
+                    dp_metadata.global_num_tokens, dp_metadata.global_batch_size
                 )
-                self.drafter.draft_model_runner.forward(
-                    draft_ctx,
-                    input_ids=empty,
-                    positions=empty,
-                    spec_step_idx=step_idx,
-                    **draft_kwargs,
-                )
+                for step_idx, draft_global_num_tokens in enumerate(
+                    step_global_num_tokens
+                ):
+                    draft_ctx = ForwardContext(
+                        attn_backend=self.drafter.attn_backend,
+                        token_to_kv_pool=self.drafter.token_to_kv_pool,
+                        bs=0,
+                        num_extends=0,
+                        output_layout=ForwardOutputLayout(0, 0, 0, 1),
+                        input_num_tokens=0,
+                        forward_mode=ForwardMode.IDLE,
+                        global_num_tokens=draft_global_num_tokens,
+                        global_bs=dp_metadata.global_batch_size,
+                        all_decode_or_idle=dp_metadata.all_decode_or_idle,
+                    )
+                    self.drafter.draft_model_runner.forward(
+                        draft_ctx,
+                        input_ids=empty,
+                        positions=empty,
+                        spec_step_idx=step_idx,
+                        **draft_kwargs,
+                    )
 
     # ------------------------------------------------------------------
     # Slot-state image (SlotStateExporter): the retraction snapshot's blob
@@ -1832,6 +1890,37 @@ class ModelExecutor:
             exporters.append(self.drafter)
         exporters.append(self.sampling_backend)
         return tuple(exporters)
+
+    def copy_cache_pages(self, pairs: Mapping[str, Sequence[Sequence[int]]]) -> None:
+        """Copy cached blocks whole onto newly granted blocks of the same group.
+
+        A prefix hit that ends inside a block takes a private copy of that
+        block (copy-on-write); a request that keeps writing past its prompt
+        end moves to a copy so the block it published stays immutable. Runs
+        on ``default_stream`` behind the forwards in flight on
+        ``execution_stream`` -- the source may have been written by the
+        previous forward -- and ahead of this plan's zeroing: a source may be
+        re-granted and zeroed in the same plan, and the next forward's prologue
+        waits on the default stream.
+
+        Args:
+            pairs: Scheduler (virtual) ``(source, destination)`` block ids per
+                cache group id. Under KVP a rank copies only the pairs it owns
+                (both ends share one owner by construction); a replicated
+                group copies every pair.
+        """
+        local_pairs = {
+            group_id: local
+            for group_id, local in local_page_pairs_by_group(
+                pairs, contract=self._cache_runtime_contract, rank=self._cache_kvp_rank
+            ).items()
+            if len(local)
+        }
+        if not local_pairs:
+            return
+        self.default_stream.wait_stream(self.execution_stream)
+        with nvtx_range("copy_cache_pages", color="purple"):
+            self.token_to_kv_pool.arena.copy_blocks(local_pairs)
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.
@@ -1937,8 +2026,9 @@ class ModelExecutor:
         A PD decode destination never executes the prompt locally, so no
         forward of its own can establish these lengths — they come from the
         complete remotely-computed prompt instead, before the first local
-        decode. The cache-transfer path additionally selects the transferred
-        recurrent-state snapshot block from the resulting sequence length.
+        decode. The transferred recurrent state needs no length: it lands in
+        the live slot of the request's state row, which the first decode reads
+        and evolves in place.
         """
         num_extends = forward_op.num_extends()
         if num_extends <= 0:
@@ -1965,6 +2055,11 @@ class ModelExecutor:
                 pin_memory=True,
             ).to(self.device, non_blocking=True)
             self.runtime_states.reset_states(rows, values)
+            # KV offloading tags may still describe a previous owner or a
+            # replaced history view; invalidate them without erasing history.
+            self.attn_backend.invalidate_cache_residency(
+                rows, stream=self.execution_stream
+            )
 
     def execute_forward_op(
         self,
@@ -2031,9 +2126,7 @@ class ModelExecutor:
                     bs,
                     self.input_buffers.req_pool_indices_buf[:bs],
                     self.runtime_states.future_parent_map,
-                )
-                self.tree_spec.depth_positions(
-                    bs, self.input_buffers.positions_buf[:total_tokens]
+                    self.input_buffers.positions_buf[:total_tokens],
                 )
             if request_history_seeds is not None:
                 self.runtime_states.seed_request_token_history(request_history_seeds)

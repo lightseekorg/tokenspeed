@@ -89,6 +89,7 @@ class StubCoreAttention:
     def __init__(self, layer_id: int):
         self.layer_id = layer_id
         self.calls = 0
+        self.latent: torch.Tensor | None = None
 
     def latent_prologue(
         self, query, q_pe, latent_cache, positions, ctx, *, slots, expanded, key_rows

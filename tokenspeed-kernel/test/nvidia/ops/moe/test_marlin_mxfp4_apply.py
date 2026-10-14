@@ -32,7 +32,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from kimi3_reference import _mxfp4_linear, mxfp4_moe_reference
-from tokenspeed_kernel.ops.moe.marlin.mxfp4 import (
+from tokenspeed_kernel.ops.moe.marlin import (
     _swiglu_limit,
     marlin_mxfp4_moe_weights,
     marlin_mxfp4_precomputed_moe_apply,

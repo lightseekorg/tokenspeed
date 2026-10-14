@@ -25,7 +25,7 @@ from ctypes import c_void_p
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import ErrorClass, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -83,6 +83,7 @@ __all__ = [
     "reducescatter_residual_rmsnorm",
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
+    "trtllm_workspace_all_gather",
     "trtllm_workspace_allreduce",
     "group_spans_nodes",
     "armed_workspace_hidden_dim",
@@ -103,6 +104,7 @@ trtllm_reduce_scatter = error_fn
 MNNVL_TWOSHOT_MAX_TOKEN = 0
 allgather_dual_rmsnorm = error_fn
 allreduce_residual_rmsnorm = error_fn
+trtllm_workspace_all_gather = error_fn
 trtllm_workspace_allreduce = error_fn
 armed_workspace_hidden_dim = error_fn
 ensure_workspace_initialized = error_fn
@@ -129,6 +131,7 @@ if current_platform().is_nvidia:
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
         trtllm_create_mnnvl_workspace_for_all_reduce_fusion,
         trtllm_destroy_ipc_workspace_for_all_reduce_fusion,
+        trtllm_mnnvl_allgather,
         trtllm_reducescatter_fusion,
     )
 
@@ -764,6 +767,30 @@ if current_platform().is_nvidia:
             allreduce_out=allreduce_out,
         )
         return allreduce_out.view(input_tensor.shape)
+
+    def trtllm_workspace_all_gather(
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor | None:
+        """All-gather of 16-bit rows along the last dim through the group's
+        mnnvl workspace: one lamport exchange, no barrier.
+
+        Args:
+            input_tensor: ``[T, W]`` rows of this rank.
+            group: process group whose armed workspace to use.
+
+        Returns:
+            ``[T, world * W]`` (rank-major columns, bit for bit), or None when
+            no mnnvl workspace serves the shape.
+        """
+        manager = _manager_for_group(group)
+        mnnvl = manager.mnnvl_workspace
+        if mnnvl is None or input_tensor.dim() != 2:
+            return None
+        gathered = trtllm_mnnvl_allgather(input_tensor, mnnvl, pdl_enabled())
+        if gathered is not None:
+            _mark_captured(manager, mnnvl)
+        return gathered
 
     def allreduce_residual_rmsnorm(
         input_tensor: torch.Tensor,

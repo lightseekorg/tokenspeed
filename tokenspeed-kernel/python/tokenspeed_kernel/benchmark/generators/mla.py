@@ -434,6 +434,20 @@ def prepare_mla_normalize_project_query(
         generator=generator,
         dtype=dtype,
     )
+    from tokenspeed_kernel.ops.attention import mla as mla_ops
+
+    try:
+        mla_ops.validate_mla_query_projection(
+            query_norm_weight,
+            kv_norm_weight,
+            projection_weight,
+            eps=eps,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+        )
+    except ValueError as exc:
+        raise BenchmarkCaseError(BenchmarkStatus.INVALID_CASE, str(exc)) from exc
+
     kv_snapshot = kv.clone()
 
     signature_roles = {
@@ -475,8 +489,6 @@ def prepare_mla_normalize_project_query(
             "split_output": prepare_absorbed_query,
         },
     )
-
-    from tokenspeed_kernel.ops.attention import mla as mla_ops
 
     def reset() -> None:
         # The operation normalizes the KV latent in place.

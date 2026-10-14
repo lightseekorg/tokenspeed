@@ -27,7 +27,6 @@ adapter owns query preparation, bounded query tiling, and selection.
 
 from __future__ import annotations
 
-import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 __all__ = ["dsv41_index_logits_gfx1250"]

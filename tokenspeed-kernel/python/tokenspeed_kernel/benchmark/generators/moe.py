@@ -985,7 +985,7 @@ def prepare_latent_input(
     )
 
     load_builtin_kernels()
-    from tokenspeed_kernel.ops.moe.latent_input import (
+    from tokenspeed_kernel.ops.moe import (
         REGION_ALIGNMENT,
         latent_moe_input_projections,
         packed_projection_weight_view,
@@ -1148,9 +1148,9 @@ def prepare_latent_expert_shared(
         routed_out=dense_tensor_format(routed_out.dtype),
         shared_out=dense_tensor_format(shared_out.dtype),
     )
-    weights_are_linear = w2_weight.ndim != 6
+    weights_are_linear = w13_weight.ndim != 6
     processed_intermediate_size = (
-        w2_weight.shape[-1] * 2 if weights_are_linear else w2_weight.shape[2] * 128
+        w2_weight.shape[-1] * 2 if weights_are_linear else w13_weight.shape[1] * 8
     )
     traits = {
         "tokens": tokens,
@@ -1180,7 +1180,7 @@ def prepare_latent_expert_shared(
     }
     spec = _selected_spec(request, platform, signature, traits)
 
-    from tokenspeed_kernel.ops.moe.latent_decode import latent_moe_expert_shared
+    from tokenspeed_kernel.ops.moe import latent_moe_expert_shared
 
     def reset() -> None:
         routed_out.zero_()

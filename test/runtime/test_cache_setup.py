@@ -187,73 +187,6 @@ def _mha_config() -> AttnConfig:
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
 
 
-def test_deepseek_v4_mtp_reads_window_from_cache_group():
-    from tokenspeed.runtime.layers.attention import registry
-    from tokenspeed.runtime.utils.server_args import ServerArgs
-
-    args = ServerArgs(
-        model="x",
-        device="cpu",
-        prefix_granularity=256,
-        max_num_seqs=2,
-        chunked_prefill_size=256,
-        speculative_algorithm="EAGLE",
-        speculative_num_steps=3,
-        speculative_num_draft_tokens=4,
-        attention_use_fp4_indexer_cache=False,
-    )
-    args.mapping.rank = 0
-    model_fields = dict(
-        model_profile=None,
-        attention_arch=registry.AttentionArch.MLA,
-        dtype=torch.bfloat16,
-        context_len=512,
-        num_attention_heads=64,
-        num_key_value_heads=1,
-        head_dim=512,
-        kv_lora_rank=512,
-        qk_nope_head_dim=448,
-        qk_rope_head_dim=64,
-        v_head_dim=512,
-        scaling=512**-0.5,
-    )
-    hf_fields = dict(
-        compress_ratios=(1, 4, 1),
-        head_dim=512,
-        qk_rope_head_dim=64,
-        index_head_dim=128,
-        sliding_window=256,
-    )
-    target = SimpleNamespace(
-        **model_fields,
-        num_attention_layers=2,
-        hf_config=SimpleNamespace(**hf_fields, architectures=["DeepseekV4ForCausalLM"]),
-    )
-    draft = SimpleNamespace(
-        **model_fields,
-        num_attention_layers=1,
-        hf_config=SimpleNamespace(
-            **hf_fields, architectures=["DeepseekV4ForCausalLMNextN"]
-        ),
-    )
-    build = registry.create_attn_components(
-        args,
-        target,
-        gpu_id=0,
-        rank=0,
-        gpu_memory=0,
-        draft_model_config=draft,
-        graph_reserve_bytes=0,
-        post_profile_bytes=0,
-        probe_batch_rows=1,
-        profiled_cache_bytes=32 << 20,
-        reuse_target_backend=None,
-        reuse_draft_backend=None,
-    )
-    assert build.attn_backend._swa_window_tokens() == 256
-    assert build.draft_attn_backend._swa_window_tokens() == 256
-
-
 @pytest.mark.parametrize(
     "is_draft,width,num_layers,layerwise,ring_rows",
     [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
@@ -365,7 +298,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
         **kwargs,
     ) -> None:
         super().__init__(
-            server_args=SimpleNamespace(max_total_tokens=None),
+            server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
             model_config=None,
             attn_config=_ns_config(
                 prefix_granularity=4,
@@ -418,10 +351,8 @@ class _SyntheticHybridRecipe(CacheRecipe):
             (
                 CacheGroupSpec(
                     group_id=self._extra_state_group,
-                    retention="full_history",
+                    attn_kind="state",
                     sliding_window_tokens=None,
-                    family="state",
-                    checkpoint_granularity=self.prefix_granularity,
                     replayable=False,
                 ),
                 (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),
@@ -503,6 +434,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         **_model_wide_kwargs(),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         prefix_granularity=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
@@ -601,6 +533,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         components=(replace(target_spec, cache_layer_types=(FULL_ATTENTION,)),),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=draft_tokens,
@@ -666,6 +599,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         else None
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=width,
@@ -742,7 +676,7 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget(
         sliding_window_tokens=512,
     )
     attn_config = replace(attn_config, components=(mha,))
-    server_args = SimpleNamespace(max_total_tokens=None)
+    server_args = SimpleNamespace(kv_offload_config=None, max_total_tokens=None)
 
     setup = prepare_cache_setup(
         family="mha",
@@ -782,7 +716,7 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
         hf_config=SimpleNamespace(),
     )
     attn_config = _mla_config()
-    server_args = SimpleNamespace(max_total_tokens=None)
+    server_args = SimpleNamespace(kv_offload_config=None, max_total_tokens=None)
 
     setup = prepare_cache_setup(
         family="mla",
@@ -828,7 +762,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
 
     setup = prepare_cache_setup(
         family=family,
-        server_args=SimpleNamespace(max_total_tokens=None),
+        server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
         model_config=model_config,
         attn_config=target_attn_config,
         draft_model_config=draft_model_config,
@@ -986,6 +920,7 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
         lambda config: getattr(config, "is_deepseek_v4", False),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         attention_backend=None,
         drafter_attention_backend=None,
         disaggregation_mode="prefill",
@@ -1081,9 +1016,8 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
 def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     """No new contract: the one spec publishes draft-only
     groups as ordinary groups; pool publication and the scheduler config
-    conversion carry them with their natural retention — the C++ side
-    instantiates its existing SwaManager for them, no draft concept
-    anywhere."""
+    conversion carry them with their own kind -- the C++ side treats them as
+    any sliding-window group, no draft concept anywhere."""
     from test.runtime.cache_pool_test_utils import MinimalCacheView
 
     import torch
@@ -1226,7 +1160,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         (None, "tokenspeed_mla", None),
         ("trtllm_mla", None, "does not support MLA DCP"),
         (None, "trtllm_mla", r"\(DCP decode\) currently requires"),
-        (None, "flashmla", "does not yet support speculation"),
+        (None, "flashmla", None),
     ],
 )
 def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
@@ -1286,8 +1220,8 @@ def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
     def profile(**kwargs):
         config = kwargs["attn_config"]
         assert config.component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
-        assert (
-            built_draft[0].component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        assert built_draft[0].component(SoftmaxAttnConfig).backend_name == (
+            draft_backend or "tokenspeed_mla"
         )
         raise ReadyForAllocation
 
@@ -1332,8 +1266,8 @@ def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
         assert args.drafter_attention_backend == draft_backend
 
 
-@pytest.mark.parametrize("degree", [1, 2])
-def test_kimi_dspark_rejects_sharded_context_writes(degree):
+@pytest.mark.parametrize("degree", [1, 2, 8])
+def test_kimi_dspark_preserves_backend_with_kvp(degree):
     from tokenspeed.runtime.layers.attention import registry
 
     def side(architecture):
@@ -1352,12 +1286,9 @@ def test_kimi_dspark_rejects_sharded_context_writes(degree):
     )
     target = side("KimiK3ForConditionalGeneration")
     draft = side("K3DSparkModel")
-    if degree > 1:
-        with pytest.raises(ValueError, match="K3 DSpark does not support KVP"):
-            registry._apply_backend_overrides(args, target, draft)
-    else:
-        registry._apply_backend_overrides(args, target, draft)
-        assert args.drafter_attention_backend == "tokenspeed_mla"
+    registry._apply_backend_overrides(args, target, draft)
+    assert args.attention_backend == registry.HYBRID_LINEAR_ATTN_BACKEND
+    assert args.drafter_attention_backend == "tokenspeed_mla"
 
 
 class _Sized(Exception):

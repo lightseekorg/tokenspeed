@@ -11,7 +11,6 @@ import importlib.util
 import socket
 from functools import partial
 from types import SimpleNamespace
-from typing import List
 from unittest.mock import Mock
 
 import pytest
@@ -37,9 +36,10 @@ class TestAutoBackendTopology:
         backend = AutoBackend.__new__(AutoBackend)
         backend._nccl = Mock()
         backend._rsag = Mock()
-        backend._triton_ar = Mock()
+        backend._iris = Mock()
         backend._trtllm_ar = Mock()
         backend._trtllm_ar.has_trtllm_ar.return_value = False
+        backend._trtllm_ar.lamport_all_gather.return_value = None
         # A host-spread group's rsag routing keys on the fabric probe, so pin
         # both the probe and the local device count the tests assume.
         monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
@@ -145,7 +145,7 @@ class TestAutoBackendTopology:
             tensor, tuple(range(8)), op=None
         )
         backend._trtllm_ar.has_trtllm_ar.assert_called_once_with(tuple(range(8)))
-        backend._triton_ar.can_run.assert_not_called()
+        backend._iris.can_run.assert_not_called()
 
     def test_cross_node_all_reduce_uses_trtllm_when_armed(self, backend):
         """An armed mnnvl workspace serves cross-node groups directly."""
@@ -216,7 +216,7 @@ class TestAutoBackendTopology:
         backend._nccl.all_reduce.return_value = "nccl-result"
 
         assert backend.all_reduce(tensor, tuple(range(8))) == "nccl-result"
-        backend._triton_ar.can_run.assert_not_called()
+        backend._iris.can_run.assert_not_called()
 
 
 def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
@@ -447,6 +447,90 @@ def _test_all_reduce(rank, world_size, device, group, ref_group):
     results = all_reduce(tuple(tensor.clone() for tensor in inputs), group)
     for result, reference in zip(results, expected):
         torch.testing.assert_close(result, reference)
+
+    from tokenspeed_kernel.platform import current_platform
+
+    if not current_platform().is_cdna4 or importlib.util.find_spec("iris") is None:
+        return
+    from tokenspeed.runtime.distributed.comm_backend import get_global_backend
+    from tokenspeed.runtime.distributed.comm_ops import (
+        acquire_all_reduce_outputs,
+        prepare_all_reduce_buffers,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    previous_force = global_server_args_dict["force_deterministic_rsag"]
+    global_server_args_dict["force_deterministic_rsag"] = False
+    try:
+        backend = get_global_backend().iris
+        capacities = dict(
+            staged_max_numel=512 * 1024,
+            producer_direct_max_numel=1024 * 1024,
+            dtype=torch.bfloat16,
+            backend=None,
+        )
+        assert prepare_all_reduce_buffers(group, **capacities)
+        staged = torch.full((128,), rank + 1, dtype=torch.bfloat16, device=device)
+        torch.testing.assert_close(
+            all_reduce(staged, group),
+            torch.full_like(staged, world_size * (world_size + 1) // 2),
+            atol=0,
+            rtol=0,
+        )
+        states = []
+        for dtype in (torch.bfloat16, torch.float32):
+            shapes = (
+                ((384 * 1024,), (384 * 1024,))
+                if dtype == torch.bfloat16
+                else ((128,), (256,))
+            )
+            like = torch.empty(0, dtype=dtype, device=device)
+            outputs = acquire_all_reduce_outputs(shapes, like, group)
+            state = backend.state(group, dtype)
+            states.append(state)
+            assert state.owns_outputs(outputs)
+            pointer = state.producer.data.data_ptr()
+            for index, output in enumerate(outputs, start=1):
+                output.fill_(index * (rank + 1))
+            results = all_reduce(outputs, group)
+            for index, result in enumerate(results, start=1):
+                torch.testing.assert_close(
+                    result,
+                    torch.full_like(result, index * world_size * (world_size + 1) // 2),
+                    atol=0,
+                    rtol=0,
+                )
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                results = all_reduce(outputs, group)
+            if dtype == torch.bfloat16:
+                assert prepare_all_reduce_buffers(
+                    group,
+                    staged_max_numel=128,
+                    producer_direct_max_numel=256,
+                    dtype=dtype,
+                    backend=None,
+                )
+            for scale in (2, 3):
+                for index, output in enumerate(outputs, start=1):
+                    output.fill_(scale * index * (rank + 1))
+                graph.replay()
+                for index, result in enumerate(results, start=1):
+                    torch.testing.assert_close(
+                        result,
+                        torch.full_like(
+                            result, scale * index * world_size * (world_size + 1) // 2
+                        ),
+                        atol=0,
+                        rtol=0,
+                    )
+            assert backend.state(group, dtype) is state
+            assert state.producer.data.data_ptr() == pointer
+        assert states[0].producer.data.data_ptr() != states[1].producer.data.data_ptr()
+    finally:
+        global_server_args_dict["force_deterministic_rsag"] = previous_force
 
 
 def _test_all_gather(rank, world_size, device, group, ref_group):

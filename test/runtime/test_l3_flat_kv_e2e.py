@@ -97,6 +97,10 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         )
 
         class SyntheticPool:
+            def __init__(self):
+                self.load_tracker = None
+                self.arena = None
+
             def cache_transfer_layout(self):
                 return layout
 

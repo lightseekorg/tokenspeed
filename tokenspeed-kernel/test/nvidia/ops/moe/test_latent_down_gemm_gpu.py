@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.latent_down import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     _DOWN_SENTINEL,
     _LAMPORT_CTAS,
     _LAMPORT_THREADS,
@@ -244,7 +244,7 @@ def test_the_widths_this_file_parametrizes_still_select_three_stores() -> None:
 # a gather that does NOT finish, which needs its own process to bound.
 _WAITER = """
 import torch
-from tokenspeed_kernel.ops.moe.latent_down import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     _DOWN_SENTINEL,
     _LAMPORT_CTAS,
     _LAMPORT_THREADS,
@@ -337,7 +337,7 @@ def test_the_gather_waits_for_every_word_of_a_fragment(word: int) -> None:
 # not a failure a pytest process can report, so this runs in a bounded child.
 _CROSS = """
 import torch
-from tokenspeed_kernel.ops.moe.latent_down import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     _DOWN_SENTINEL,
     _LAMPORT_CTAS,
     _LAMPORT_THREADS,

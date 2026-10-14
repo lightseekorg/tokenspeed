@@ -4,8 +4,8 @@ import contextlib
 from unittest import mock
 
 import pytest
+import tokenspeed_kernel.ops.moe._cute_dsl.latent_down as latent_down
 import torch
-from tokenspeed_kernel.ops.moe import latent_down
 
 
 @pytest.fixture(autouse=True)

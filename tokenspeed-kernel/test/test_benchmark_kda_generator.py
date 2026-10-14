@@ -161,12 +161,10 @@ def test_kda_prefill_binds_chunk_hint_to_converted_boundaries(
         *_args,
         cu_seqlens,
         capacity,
-        inputs_packed,
         **_kwargs,
     ):
         seen["operation"] = cu_seqlens
         seen["capacity"] = capacity
-        seen["inputs_packed"] = inputs_packed
         return object()
 
     monkeypatch.setattr(kda_generator.torch, "randn", cpu_randn)
@@ -224,7 +222,6 @@ def test_kda_prefill_binds_chunk_hint_to_converted_boundaries(
     assert operation_boundaries.dtype == torch.int32
     assert seen["hint"] is seen["operation"]
     assert seen["capacity"] is None
-    assert seen["inputs_packed"] is False
 
 
 def test_kda_generator_builds_flat_decay_bias() -> None:

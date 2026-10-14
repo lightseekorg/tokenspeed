@@ -193,9 +193,9 @@ def test_emulation_keeps_the_layout_without_fused_all_reduce():
         ({"mm_encoder_tp_mode": "data"}, "--mm-encoder-tp-mode data"),
         (
             {
-                "prefill_context_parallel_size": 8,
+                "kv_parallel_size": 8,
+                "query_context_parallel_size": 8,
                 "disaggregation_mode": "prefill",
-                "disable_prefill_graph": True,
                 "attention_backend": "dsa",
             },
             "query context parallelism",

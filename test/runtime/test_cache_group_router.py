@@ -28,6 +28,7 @@ from runtime.cache_pool_test_utils import (
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -498,10 +499,14 @@ class _StubLeaf(PagedAttentionBackend):
 def _geometry():
     return CacheGroupGeometry(
         granularities={FULL: 4, SWA: 4, "linear_attention_0": 8},
-        families={FULL: "history", SWA: "history", "linear_attention_0": "state"},
+        attn_kinds={
+            FULL: "full_history",
+            SWA: "sliding_window",
+            "linear_attention_0": "state",
+        },
         full_history_group_id=FULL,
         row_geometry={FULL: (4, 1), SWA: (4, 1)},
-        retentions={FULL: ("full_history", None), SWA: ("sliding_window", 4)},
+        windows={FULL: None, SWA: 4},
     )
 
 
@@ -553,7 +558,7 @@ class CacheGroupRouterTest(unittest.TestCase):
             device="cpu",
             consumed_group_ids=None,
         )
-        with self.assertRaisesRegex(ValueError, "family 'state'"):
+        with self.assertRaisesRegex(ValueError, "is a state group"):
             router.bind(_geometry(), {"linear_attention_0": _StubLeaf(8)})
 
     def test_explicit_groups_do_not_build_indexer_attention_leaves(self):
@@ -567,18 +572,18 @@ class CacheGroupRouterTest(unittest.TestCase):
         pool = SimpleNamespace(
             paged_group_ids=groups,
             arena=SimpleNamespace(
+                offload=None,
                 cache_group_specs=tuple(
                     SimpleNamespace(
                         group_id=gid,
-                        family="history",
-                        retention="full_history",
+                        attn_kind="full_history",
                         block_granularity=4,
                         rows_per_page=4,
                         entry_stride_tokens=1,
                         sliding_window_tokens=None,
                     )
                     for gid in groups
-                )
+                ),
             ),
         )
         router = CacheGroupRouter(
@@ -676,6 +681,40 @@ class CacheGroupRouterTest(unittest.TestCase):
                 2,
                 save_kv_cache=False,
             )
+
+    def test_ordinary_sparse_prepare_returns_history_writes(self):
+        router, leaves = self._router()
+        router.refresh_decode_metadata(
+            2,
+            2,
+            torch.arange(2, dtype=torch.int32),
+            torch.tensor([9, 4], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(),
+        )
+        layer = _layer(FULL)
+        history = router.write_locations(layer, ForwardMode.DECODE)
+        selected = torch.tensor([[4096, -1, 4096], [8192, 0, -1]])
+        before = selected.clone()
+        positions = torch.tensor([8, 3], dtype=torch.int32)
+        self.assertIs(
+            router.prepare_sparse_kv_access(
+                layer, selected, positions, forward_mode=ForwardMode.DECODE
+            ),
+            history,
+        )
+        self.assertIs(
+            AttentionBackend.prepare_sparse_kv_access(
+                router, layer, selected, positions, forward_mode=ForwardMode.DECODE
+            ),
+            history,
+        )
+        self.assertTrue(torch.equal(selected, before))
+        q = torch.zeros(2)
+        router.forward(
+            q, None, None, layer, None, ForwardMode.DECODE, 2, save_kv_cache=False
+        )
+        self.assertIs(leaves[FULL].calls[-1][2], history)
 
     def test_decode_write_location_views_are_pointer_stable_per_bs(self):
         router, _ = self._router(spec=2)
@@ -1317,17 +1356,15 @@ class CacheGroupRouterTest(unittest.TestCase):
 
 def _spec(
     group_id,
-    family="history",
     granularity=4,
-    retention="full_history",
+    attn_kind="full_history",
     rows_per_page=None,
     entry_stride_tokens=None,
     sliding_window_tokens=None,
 ):
     return SimpleNamespace(
         group_id=group_id,
-        family=family,
-        retention=retention,
+        attn_kind=attn_kind,
         block_granularity=granularity,
         rows_per_page=rows_per_page,
         entry_stride_tokens=entry_stride_tokens,
@@ -1337,7 +1374,7 @@ def _spec(
 
 def _pool(*specs, paged=(FULL, SWA)):
     return SimpleNamespace(
-        arena=SimpleNamespace(cache_group_specs=tuple(specs)),
+        arena=SimpleNamespace(cache_group_specs=tuple(specs), offload=None),
         paged_group_ids=tuple(paged),
     )
 
@@ -1439,15 +1476,15 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
         )
 
     def test_rebind_rejects_a_changed_sliding_window(self):
-        """The window length is part of the scheduler's retention contract."""
+        """The window length is part of the scheduler's cache-group contract."""
         router, _ = self._router()
         original = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="sliding_window", sliding_window_tokens=128),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="sliding_window", sliding_window_tokens=128),
         )
         changed = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="sliding_window", sliding_window_tokens=256),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="sliding_window", sliding_window_tokens=256),
         )
         router.set_cache_pool(original)
 
@@ -1456,16 +1493,16 @@ class CacheGroupRouterRebindTest(unittest.TestCase):
 
         self.assertIs(router.cache_pool, original)
 
-    def test_rebind_rejects_a_changed_group_retention_contract(self):
-        """A group's allocation/retention meaning is part of its published contract."""
+    def test_rebind_rejects_a_changed_group_attn_kind(self):
+        """A group's attention kind is part of its published contract."""
         router, _ = self._router()
         original = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="sliding_window", sliding_window_tokens=128),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="sliding_window", sliding_window_tokens=128),
         )
         changed = _pool(
-            _spec(FULL, retention="full_history"),
-            _spec(SWA, retention="full_history"),
+            _spec(FULL, attn_kind="full_history"),
+            _spec(SWA, attn_kind="full_history"),
         )
         router.set_cache_pool(original)
 
@@ -1669,6 +1706,10 @@ class PagedLeafRebindTest(unittest.TestCase):
                 "kvp_block_granularity",
                 "kvp_virtual_block_count",
                 "dcp_metadata",
+                "_dcp_visible_lens_buf",
+                "_dcp_query_offsets",
+                "_dcp_page_table_rows",
+                "_dcp_kernel_seq_lens",
             ],
             workspace_buffer=torch.empty(1 << 20, dtype=torch.uint8, device="cuda"),
             indices_updater_prefill=SimpleNamespace(prefill_wrapper_ragged=None),

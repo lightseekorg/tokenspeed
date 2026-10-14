@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from math import prod
 
 # Backend registration (side-effect imports)
@@ -50,6 +51,10 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (
     prepare_nvfp4_a16_weights,
     use_flashinfer_fp8_blockscale_prepacked,
 )
+from tokenspeed_kernel.ops.gemm.gluon import (
+    MXFP4_LINEAR_MFMA_LAYOUT,
+    prepare_mxfp4_linear_mfma_weight,
+)
 from tokenspeed_kernel.ops.gemm.kimi3 import (
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
@@ -62,6 +67,10 @@ from tokenspeed_kernel.ops.gemm.kimi3 import (
 from tokenspeed_kernel.ops.gemm.linear_attnres_partials import (
     linear_attnres_partials,
     linear_attnres_partials_available,
+)
+from tokenspeed_kernel.ops.gemm.triton import (
+    MXFP4_LINEAR_LINEAR_LAYOUT,
+    MXFP4_LINEAR_SIGNATURE,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import Platform, pdl_enabled
@@ -79,13 +88,16 @@ from tokenspeed_kernel.signature import (
     format_signature,
     tensor_format,
 )
+from tokenspeed_kernel.weights import get_weight_broker
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "Mxfp4LinearWeight",
     "bmm",
     "dsv4_grouped_output_projection",
     "dsv4_grouped_output_projection_plan",
+    "dsv4_grouped_output_projection_preprocessor",
     "dsv4_grouped_output_projection_warmup",
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
@@ -103,7 +115,10 @@ __all__ = [
     "kimi3_shared_down_projection",
     "kimi3_shared_situ_projection",
     "mm",
+    "mxfp4_linear",
+    "mxfp4_swiglu_linear",
     "prepare_fp8_linear",
+    "prepare_mxfp4_linear",
     "prepare_nvfp4_a16_weights",
 ]
 
@@ -138,8 +153,6 @@ _fp8_dtype = torch.float8_e4m3fn
 
 @dataclass(frozen=True)
 class _GroupedOutputProjectionPlan:
-    kernel: SelectedKernel
-    warmup: Callable | None
     input_dtype: torch.dtype
     weight_dtype: torch.dtype
     weight_scale_dtype: torch.dtype
@@ -151,8 +164,6 @@ class _GroupedOutputProjectionPlan:
     output_dim: int
     block_size: tuple[int, int]
     scale_format: str | None
-    tma_aligned_scales: bool
-    execution_recipe: tuple[int, int, int]
 
 
 def dsv4_grouped_output_projection_plan(
@@ -168,12 +179,10 @@ def dsv4_grouped_output_projection_plan(
     output_dim: int,
     block_size: tuple[int, int] | list[int],
     scale_format: str | None = None,
-    solution: str | None = None,
 ) -> object:
     """Create an opaque plan for the DeepSeek V4 grouped output projection.
 
-    The plan currently selects the portable Triton implementation, which
-    consumes canonical checkpoint scales without preprocessing.
+    The configuration records the projection geometry and source formats.
 
     Args:
         input_dtype: Attention output dtype before dynamic FP8 quantization.
@@ -187,7 +196,6 @@ def dsv4_grouped_output_projection_plan(
         output_dim: Output width of each grouped projection.
         block_size: Logical weight-scale block shape ``[block_n, block_k]``.
         scale_format: Logical checkpoint scale encoding, such as ``"ue8m0"``.
-        solution: Optional implementation family override.
 
     Returns:
         An opaque plan accepted by the execution and warmup APIs.
@@ -214,33 +222,7 @@ def dsv4_grouped_output_projection_plan(
             f"rope_dim={rope_dim}, block_k={block_k}"
         )
 
-    signature = format_signature(
-        attention=dense_tensor_format(input_dtype),
-        weight=dense_tensor_format(weight_dtype),
-    )
-    traits = {
-        "block_size": (block_n, block_k),
-        "scale_format": scale_format,
-        "weight_scale_dtype": weight_scale_dtype,
-    }
-    if solution not in {None, "triton"}:
-        raise NotImplementedError(
-            "DeepSeek V4 grouped output projections currently support only "
-            "canonical scales through the Triton implementation"
-        )
-    kernel = select_kernel(
-        "gemm",
-        "dsv4_grouped_output_projection",
-        signature,
-        traits=traits,
-        solution="triton",
-    )
-
-    tma_aligned_scales = False
-    execution_recipe = (1, block_n, block_k)
     return _GroupedOutputProjectionPlan(
-        kernel=kernel,
-        warmup=None,
         input_dtype=input_dtype,
         weight_dtype=weight_dtype,
         weight_scale_dtype=weight_scale_dtype,
@@ -252,8 +234,6 @@ def dsv4_grouped_output_projection_plan(
         output_dim=output_dim,
         block_size=(block_n, block_k),
         scale_format=scale_format,
-        tma_aligned_scales=tma_aligned_scales,
-        execution_recipe=execution_recipe,
     )
 
 
@@ -265,6 +245,84 @@ def _require_grouped_output_projection_plan(
     return plan
 
 
+def dsv4_grouped_output_projection_preprocessor(
+    plan: object,
+    *,
+    solution: str | None = None,
+) -> tuple[tuple[str, ...], Callable] | None:
+    """Select tensor preprocessing for a grouped output projection layer.
+
+    Args:
+        plan: Opaque grouped output projection plan.
+        solution: Optional implementation family preference for preparation.
+
+    Returns:
+        Source attribute names and their transformation with geometry bound,
+        or None when the layer should enroll canonical weights. The layer runs
+        the returned preprocessor through the shared weight broker.
+    """
+    typed_plan = _require_grouped_output_projection_plan(plan)
+    selected = select_kernel(
+        "gemm",
+        "dsv4_grouped_output_projection",
+        format_signature(
+            attention=dense_tensor_format(typed_plan.input_dtype),
+            weight=dense_tensor_format(typed_plan.weight_dtype),
+        ),
+        traits={
+            "block_size": typed_plan.block_size,
+            "scale_format": typed_plan.scale_format,
+            "weight_scale_dtype": typed_plan.weight_scale_dtype,
+        },
+        solution=solution,
+        ignore_layout=True,
+    )
+    spec = KernelRegistry.get().get_by_name(selected.name)
+    assert spec is not None
+    if spec.weight_preprocessor is None:
+        return None
+    names, transform = spec.weight_preprocessor
+    return names, partial(
+        transform,
+        config={
+            "num_groups": typed_plan.num_groups,
+            "output_dim": typed_plan.output_dim,
+            "input_dim": typed_plan.heads_per_group * typed_plan.head_dim,
+            "block_size": typed_plan.block_size,
+        },
+    )
+
+
+def _select_grouped_output_projection(
+    plan: _GroupedOutputProjectionPlan,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    allow_unknown_layout: bool,
+    solution: str | None,
+) -> SelectedKernel:
+    broker = get_weight_broker()
+    layouts = frozenset(
+        broker.layout(tensor, allow_unknown=allow_unknown_layout)
+        for tensor in (weight, weight_scale)
+    )
+    return select_kernel(
+        "gemm",
+        "dsv4_grouped_output_projection",
+        format_signature(
+            layouts=layouts,
+            attention=dense_tensor_format(plan.input_dtype),
+            weight=dense_tensor_format(weight.dtype),
+        ),
+        traits={
+            "block_size": plan.block_size,
+            "scale_format": plan.scale_format,
+            "weight_scale_dtype": weight_scale.dtype,
+        },
+        solution=solution,
+    )
+
+
 def dsv4_grouped_output_projection(
     plan: object,
     attention: torch.Tensor,
@@ -272,6 +330,9 @@ def dsv4_grouped_output_projection(
     cos_sin_cache: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
+    *,
+    allow_unknown_layout: bool,
+    solution: str | None = None,
 ) -> torch.Tensor:
     """Run inverse RoPE, FP8 quantization, and grouped ``wo_a`` projection.
 
@@ -281,7 +342,10 @@ def dsv4_grouped_output_projection(
         positions: Position index for each token.
         cos_sin_cache: Rotary embedding cache used to undo output RoPE.
         weight: Processed grouped FP8 projection weight.
-        weight_scale: Scales returned by the plan's preprocessing API.
+        weight_scale: Scales prepared by the layer.
+        allow_unknown_layout: Whether unenrolled storage may be treated as
+            canonical. Layers that preprocess weights must pass False.
+        solution: Optional implementation family preference for this call.
 
     Returns:
         Grouped BF16 output shaped ``[tokens, num_groups, output_dim]``.
@@ -314,7 +378,13 @@ def dsv4_grouped_output_projection(
         "N": typed_plan.output_dim,
         "K": typed_plan.heads_per_group * typed_plan.head_dim,
     }
-    kernel = typed_plan.kernel
+    kernel = _select_grouped_output_projection(
+        typed_plan,
+        weight,
+        weight_scale,
+        allow_unknown_layout=allow_unknown_layout,
+        solution=solution,
+    )
     ShapeCapture.get().record(
         "gemm",
         "dsv4_grouped_output_projection",
@@ -341,8 +411,6 @@ def dsv4_grouped_output_projection(
             nope_dim=typed_plan.nope_dim,
             rope_dim=typed_plan.rope_dim,
             block_size=typed_plan.block_size,
-            tma_aligned_scales=typed_plan.tma_aligned_scales,
-            recipe=typed_plan.execution_recipe,
         )
 
 
@@ -351,30 +419,42 @@ def dsv4_grouped_output_projection_warmup(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     max_tokens: int,
+    *,
+    allow_unknown_layout: bool,
+    solution: str | None = None,
 ) -> None:
-    """Warm the implementation pinned by a grouped output projection plan.
+    """Warm the implementation selected for the current prepared weights.
 
     Args:
         plan: Opaque grouped output projection plan.
         weight: Processed grouped FP8 projection weight.
-        weight_scale: Scales returned by the plan's preprocessing API.
+        weight_scale: Scales prepared by the layer.
         max_tokens: Largest token count to include in the warmup sweep.
+        allow_unknown_layout: Whether unenrolled storage may be treated as
+            canonical. Layers that preprocess weights must pass False.
+        solution: Optional implementation family preference for this call.
 
     Returns:
         None.
     """
     typed_plan = _require_grouped_output_projection_plan(plan)
-    if typed_plan.warmup is None:
+    kernel = _select_grouped_output_projection(
+        typed_plan,
+        weight,
+        weight_scale,
+        allow_unknown_layout=allow_unknown_layout,
+        solution=solution,
+    )
+    warmup = getattr(kernel.impl, "_tokenspeed_warmup", None)
+    if warmup is None:
         return
-    typed_plan.warmup(
+    warmup(
         weight=weight,
         weight_scale=weight_scale,
         num_groups=typed_plan.num_groups,
         output_dim=typed_plan.output_dim,
         input_dim=typed_plan.heads_per_group * typed_plan.head_dim,
         block_size=typed_plan.block_size,
-        tma_aligned_scales=typed_plan.tma_aligned_scales,
-        recipe=typed_plan.execution_recipe,
         max_tokens=max_tokens,
     )
 
@@ -382,30 +462,52 @@ def dsv4_grouped_output_projection_warmup(
 def dsv4_grouped_output_projection_warmup_model(
     model: torch.nn.Module,
     max_tokens: int,
+    *,
+    allow_unknown_layout: bool,
+    solution: str | None = None,
 ) -> None:
     """Warm every distinct grouped output projection plan attached to a model.
 
     Args:
         model: Model containing layers with prepared grouped projection plans.
         max_tokens: Largest token count to include in each backend warmup sweep.
+        allow_unknown_layout: Whether unenrolled storage may be treated as
+            canonical. Layers that preprocess weights must pass False.
+        solution: Optional implementation family preference for this call.
 
     Returns:
         None.
     """
-    seen: set[_GroupedOutputProjectionPlan] = set()
+    seen: set[tuple] = set()
     for module in model.modules():
         plan = getattr(module, "_dsv4_grouped_output_projection_plan", None)
         if plan is None:
             continue
         typed_plan = _require_grouped_output_projection_plan(plan)
-        if typed_plan in seen:
+        # Validate every layer even when another layer already warmed its shape.
+        kernel = _select_grouped_output_projection(
+            typed_plan,
+            module.weight,
+            module.weight_scale_inv,
+            allow_unknown_layout=allow_unknown_layout,
+            solution=solution,
+        )
+        key = (
+            typed_plan,
+            kernel.name,
+            module.weight_scale_inv.dtype,
+            module.weight.device,
+        )
+        if key in seen:
             continue
-        seen.add(typed_plan)
+        seen.add(key)
         dsv4_grouped_output_projection_warmup(
             typed_plan,
             module.weight,
             module.weight_scale_inv,
             max_tokens,
+            allow_unknown_layout=allow_unknown_layout,
+            solution=solution,
         )
 
 
@@ -1127,6 +1229,153 @@ def bmm(
 # ---------------------------------------------------------------------------
 # Prepared FP8 block-scale linear (prepacked FlashInfer path)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Mxfp4LinearWeight:
+    """A dense MXFP4 weight prepared for the selected MXFP4 linear kernels.
+
+    Attributes:
+        weight: Packed E2M1 ``[N, K/2]`` uint8 in ``layout`` order.
+        weight_scale: UE8M0 ``[N, K/32]`` uint8, one scale per 32 K values.
+        layout: Weight layout the selected kernels read; the ``weight_layout``
+            trait of their registrations.
+    """
+
+    weight: torch.Tensor
+    weight_scale: torch.Tensor
+    layout: str
+
+
+def _mxfp4_linear_traits(n: int, k: int, layout: str | None) -> dict[str, object]:
+    # ``weight_elements`` lets kernels bound the weight size (for example by
+    # 32-bit buffer offsets) at selection, before the weight is prepared.
+    traits: dict[str, object] = {"n": n, "k": k, "weight_elements": n * k}
+    if layout is not None:
+        traits["weight_layout"] = layout
+    return traits
+
+
+def _prepare_mxfp4_weight_layout(layout: str, weight: torch.Tensor) -> torch.Tensor:
+    if layout == MXFP4_LINEAR_LINEAR_LAYOUT:
+        return weight
+    if layout == MXFP4_LINEAR_MFMA_LAYOUT:
+        return prepare_mxfp4_linear_mfma_weight(weight)
+    raise ValueError(f"unknown MXFP4 linear weight layout {layout!r}")
+
+
+def prepare_mxfp4_linear(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    swiglu: bool,
+    solution: str | None = None,
+) -> Mxfp4LinearWeight:
+    """Prepare a checkpoint MXFP4 weight for ``mxfp4_linear``.
+
+    Selects the kernel that will run the layer and reorders the weight into
+    the layout it reads, once, at load time.
+
+    Args:
+        weight: Packed E2M1 ``[N, K/2]`` uint8 in checkpoint order.
+        weight_scale: UE8M0 ``[N, K/32]`` uint8.
+        swiglu: Whether the layer runs ``mxfp4_swiglu_linear`` (``weight``
+            stacks the gate rows over the up rows) instead of
+            ``mxfp4_linear``.
+        solution: Optional registered solution to restrict selection to.
+
+    Returns:
+        The prepared weight; ``weight`` itself when the layout is unchanged.
+    """
+    n, k = weight.shape[0], weight.shape[1] * 2
+    kernel = select_kernel(
+        "gemm",
+        "mxfp4_swiglu_linear" if swiglu else "mxfp4_linear",
+        MXFP4_LINEAR_SIGNATURE,
+        traits=_mxfp4_linear_traits(n, k, None),
+        solution=solution,
+    )
+    (layout,) = KernelRegistry.get().get_by_name(kernel.name).traits["weight_layout"]
+    return Mxfp4LinearWeight(
+        weight=_prepare_mxfp4_weight_layout(layout, weight),
+        weight_scale=weight_scale,
+        layout=layout,
+    )
+
+
+def _run_mxfp4_linear(
+    mode: str,
+    x: torch.Tensor,
+    weight: Mxfp4LinearWeight,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    n, k = weight.weight.shape[0], weight.weight.shape[1] * 2
+    if x.ndim != 2 or x.shape[1] != k or x.dtype != torch.bfloat16:
+        raise ValueError(
+            f"{mode} expects BF16 [M, {k}] activations, got {x.dtype} {tuple(x.shape)}"
+        )
+    kernel = select_kernel(
+        "gemm",
+        mode,
+        MXFP4_LINEAR_SIGNATURE,
+        traits=_mxfp4_linear_traits(n, k, weight.layout),
+    )
+    shape_params = {"M": x.shape[0], "N": n, "K": k}
+    ShapeCapture.get().record("gemm", mode, kernel.name, x.dtype, shape_params)
+    with kernel_scope(
+        "gemm",
+        mode,
+        x.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+        has_out=out is not None,
+    ):
+        return kernel(x, weight.weight, weight.weight_scale, out=out)
+
+
+def mxfp4_linear(
+    x: torch.Tensor,
+    weight: Mxfp4LinearWeight,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Dense MXFP4 linear with dynamic MXFP4 activations.
+
+    Computes ``mxfp4(x) @ W.T`` where ``mxfp4`` quantizes each 32-value group
+    of ``x`` to E2M1 with a UE8M0 scale (the ``quantize_mxfp4`` recipe).
+
+    Args:
+        x: BF16 ``[M, K]`` activations with unit inner stride.
+        weight: Weight from ``prepare_mxfp4_linear(..., swiglu=False)``.
+        out: Optional BF16 ``[M, N]`` destination with unit inner stride.
+
+    Returns:
+        BF16 ``[M, N]``; ``out`` when provided.
+    """
+    return _run_mxfp4_linear("mxfp4_linear", x, weight, out)
+
+
+def mxfp4_swiglu_linear(
+    x: torch.Tensor,
+    weight: Mxfp4LinearWeight,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Dense MXFP4 gate/up projection followed by ``silu(gate) * up``.
+
+    Equals ``silu_and_mul(mxfp4_linear(x, weight))`` with the projection
+    output rounded to BF16 before the activation, as the unfused path does.
+
+    Args:
+        x: BF16 ``[M, K]`` activations with unit inner stride.
+        weight: Weight from ``prepare_mxfp4_linear(..., swiglu=True)``; its
+            rows ``[0, N/2)`` are the gate and ``[N/2, N)`` the up projection.
+        out: Optional BF16 ``[M, N/2]`` destination with unit inner stride.
+
+    Returns:
+        BF16 ``[M, N/2]``; ``out`` when provided.
+    """
+    return _run_mxfp4_linear("mxfp4_swiglu_linear", x, weight, out)
 
 
 @dataclass(frozen=True)

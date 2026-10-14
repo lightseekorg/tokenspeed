@@ -49,7 +49,7 @@ class HybridLinearAttnBackend(AttentionBackend):
     """Hybrid backend that routes between full attention and linear attention by layer ID."""
 
     # Both sub-backends consume per-group tables (MHA: KV pages; Mamba:
-    # dual-index state pages). Target verify publishes only the accepted
+    # two-slot state tables). Target verify publishes only the accepted
     # position.
 
     def __init__(
@@ -151,11 +151,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self._backend_for_layer(layer.layer_id).cache_placement(layer)
 
     @property
-    def cache_consumer_families(self) -> frozenset[str]:
+    def cache_consumer_attn_kinds(self) -> frozenset[str]:
         """Cache families consumed by the two child backends."""
         return (
-            self.full_attn_backend.cache_consumer_families
-            | self.linear_attn_backend.cache_consumer_families
+            self.full_attn_backend.cache_consumer_attn_kinds
+            | self.linear_attn_backend.cache_consumer_attn_kinds
         )
 
     def child_backends(self):

@@ -123,7 +123,9 @@ bool Scheduler::pdTransferInFlight(const Request& request) const {
         case Role::kD:
             return request.Is<fsm::RemotePrefilling>();
         case Role::kP:
-            return request.HoldsPages();
+            // Every page-holding state but Finishing: SucceededEvent moves a
+            // request there once the peer has read its pages.
+            return request.HoldsPages() && !request.Is<fsm::Finishing>();
         case Role::kFused:
             return false;
     }
@@ -158,7 +160,11 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
                    "KV event boundary marked for reconcile lost its token descriptor");
         KvEventBoundary& event_boundary = it->second;
         event_boundary.needs_reconcile = false;
-        const CacheCoordinator::BoundaryResidency residency = coordinator_.DeviceBoundaryResidency(boundary);
+        // A tail's descriptor carries fewer tokens than a page.
+        const auto descriptor_tokens = static_cast<std::int32_t>(event_boundary.stored.token_ids.size());
+        const std::int32_t tail_tokens = descriptor_tokens < config_.prefix_granularity ? descriptor_tokens : 0;
+        const CacheCoordinator::BoundaryResidency residency =
+            coordinator_.DeviceBoundaryResidency(boundary, tail_tokens);
         const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
         if (complete && !event_boundary.published) {
             stored.emplace_back(event_boundary.depth, event_boundary.stored);
@@ -272,6 +278,34 @@ void Scheduler::registerKvEventPrefixPages(const Request& request, std::span<con
     }
 }
 
+void Scheduler::registerKvEventPublication(const Request& request, std::span<const std::string> prefix_hashes,
+                                           const CompletedPages& completed) {
+    registerKvEventPrefixPages(request, prefix_hashes, completed.first_new_prefix_page);
+    if (!config_.enable_kv_cache_events || !completed.tail) {
+        return;
+    }
+    const auto full_pages = static_cast<std::int32_t>(prefix_hashes.size());
+    const KvEventHashProgress& progress = kv_event_hash_progress_.at(request.Id());
+    _assert(progress.block_hashes.size() == prefix_hashes.size(), "the tail's parent page has its KV event hash");
+    const std::optional<std::uint64_t> parent_hash =
+        full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes.back()};
+    const std::span<const std::int32_t> tail_tokens =
+        request.TokenSlice(full_pages * config_.prefix_granularity, completed.tail->tail_tokens);
+    const CacheKey key{.content_hash = completed.tail->hash};
+    KvBlockStoredEvent event{
+        .block_hashes = {HashKvBlock(tail_tokens, parent_hash)},
+        .parent_block_hash = parent_hash,
+        .token_ids = std::vector<std::int32_t>(tail_tokens.begin(), tail_tokens.end()),
+        .block_size = config_.prefix_granularity,
+    };
+    const auto [it, inserted] =
+        kv_event_boundaries_.try_emplace(key, KvEventBoundary{.stored = std::move(event), .depth = full_pages});
+    FatalCheck(inserted || (it->second.stored.block_hashes.front() == HashKvBlock(tail_tokens, parent_hash) &&
+                            it->second.depth == full_pages),
+               "one cache content hash mapped to different KV event blocks");
+    markKvEventBoundaryForReconcile(key);
+}
+
 void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
     // Descriptors are erased only by DrainKvEvents, so every cache mutation of
     // a registered boundary finds one here.
@@ -308,7 +342,8 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
         }
         if (token_limit > max_single_request_tokens_) {
-            throw std::invalid_argument("Scheduler: request token limit exceeds cache capacity");
+            throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +
+                                        " exceeds cache capacity " + std::to_string(max_single_request_tokens_));
         }
         pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
     }
@@ -417,6 +452,12 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     }
     ++plan_calls_;
     ExecutionPlan plan;
+    // Every group is listed, empty or not, so the runtime indexes the maps
+    // without guarding for absent groups.
+    for (const std::string& group_id : cache_group_ids_) {
+        plan.pages_to_zero[group_id];
+        plan.pages_to_copy[group_id];
+    }
     BuiltOperations built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
 
     plan.With(ForwardBatch{std::move(built.forward)});
@@ -456,6 +497,9 @@ void Scheduler::Advance(const ExecutionEvent& event) {
     for (const auto& item : event.Events()) {
         std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }
+    // Finishing is entered and forwards land only here, so this is the one
+    // place a finished request can become settleable.
+    settleFinishedRequests();
 }
 
 }  // namespace tokenspeed
