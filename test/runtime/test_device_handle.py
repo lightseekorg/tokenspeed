@@ -282,6 +282,7 @@ def _planned(*, num_extends, label=None):
         ngram_inputs=None,
         request_history_seeds=None,
         input_logprob_plan=None,
+        sampled_top_k=0,
     )
 
 

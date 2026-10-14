@@ -31,6 +31,8 @@ lists, the admission-probe cap handed to the C++ scheduler, and the wire codec.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
 import os
 import sys
 from types import SimpleNamespace
@@ -74,6 +76,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
 from tokenspeed.runtime.execution.types import (  # noqa: E402
     ForwardLogprobs,
     InputLogprobPlan,
+    PlannedForward,
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
@@ -438,6 +441,18 @@ def test_sampled_top_k_follows_the_extend_slots_that_return_logprobs():
     assert sampled_top_k_for_forward(_Op(["off"], [10], [0], 1), states) == 0
     # A decode row never asks: its token comes from a captured step.
     assert sampled_top_k_for_forward(_Op(["decode"], [1], [], 0), states) == 0
+
+
+def test_the_sampled_k_has_no_default_like_the_prompt_logprob_plan():
+    """A caller that does not pass the sampled k fails where it builds the
+    round or calls the forward, not later at the output processor."""
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+    fields = {field.name: field for field in dataclasses.fields(PlannedForward)}
+    params = inspect.signature(ModelExecutor.execute_forward_op).parameters
+    for name in ("input_logprob_plan", "sampled_top_k"):
+        assert fields[name].default is dataclasses.MISSING
+        assert params[name].default is inspect.Parameter.empty
 
 
 # --------------------------------------------------------------------------
@@ -1194,7 +1209,8 @@ def test_sampled_top_logprobs_are_the_prefill_rows_log_softmax_top_k():
 def test_prompt_top_k_rides_the_chunk_loop_of_the_prompt_logprobs(chunk_tokens):
     """With a plan's top_k every chunk's fp32 log-softmax yields both the
     targets' values (bit for bit the logprob without top-k) and each row's
-    alternatives; top_k 0 leaves the output as it was."""
+    alternatives; top_k 0 leaves the output as it was, and a top_k past the
+    vocabulary returns every token."""
     from tokenspeed.runtime.execution.context import InputLogprobRows
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.logits_processor import (
@@ -1242,6 +1258,10 @@ def test_prompt_top_k_rides_the_chunk_loop_of_the_prompt_logprobs(chunk_tokens):
     assert torch.equal(with_top.input_top_logprobs_val, top.values)
     assert torch.equal(with_top.input_top_logprobs_idx, top.indices)
     assert with_top.input_top_logprobs_idx.dtype == torch.int64
+    every = run(vocab + 8)
+    whole = logprobs.topk(vocab, dim=-1)
+    assert torch.equal(every.input_top_logprobs_val, whole.values)
+    assert torch.equal(every.input_top_logprobs_idx, whole.indices)
 
 
 if __name__ == "__main__":

@@ -869,7 +869,9 @@ class LogitsProcessor(nn.Module):
             raise ValueError(
                 f"{num_rows} prompt-logprob targets for {staged_rows} rows"
             )
-        top_k = plan.top_k
+        # A k larger than the vocabulary returns every token, as the sampled
+        # token's alternatives do (``_set_sampled_top_logprobs``).
+        top_k = min(plan.top_k, self.config.vocab_size)
         if top_k > 0 and self.logprob_order != "torch":
             raise ValueError(
                 "top-k prompt logprobs need --logprob-order torch, not "

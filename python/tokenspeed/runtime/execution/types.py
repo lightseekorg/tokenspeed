@@ -184,7 +184,7 @@ class PlannedForward:
     ngram_inputs: NGramInputs | None
     request_history_seeds: RequestHistorySeeds | None
     input_logprob_plan: InputLogprobPlan | None
-    sampled_top_k: int = 0
+    sampled_top_k: int
 
 
 @dataclass
