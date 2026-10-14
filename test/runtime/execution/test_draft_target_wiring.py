@@ -796,6 +796,9 @@ class _WeightUpdatingRunner:
     def update_weights_from_distributed(self, req):
         return True, "updated"
 
+    def update_weights_from_disk(self, req):
+        raise AssertionError("not the request under test")
+
     def update_weights_from_mooncake(self, version, models):
         raise AssertionError("not the request under test")
 
