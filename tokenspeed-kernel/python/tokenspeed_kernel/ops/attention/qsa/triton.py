@@ -1700,7 +1700,7 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     )
 
 
-def _qwen4_exp_qsa_block_topk_stream(
+def triton_qsa_block_topk_stream(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -1710,7 +1710,7 @@ def _qwen4_exp_qsa_block_topk_stream(
     page_size: int,
     block_topk: int,
     max_partial_bytes: int,
-    enable_pdl: bool = True,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Fused streaming path: score tiles and fold them into a running top-k.
 
@@ -1841,7 +1841,7 @@ def _qwen4_exp_qsa_block_topk_stream(
     return selected
 
 
-def _qwen4_exp_qsa_block_topk_logits(
+def triton_qsa_block_scores(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -1849,26 +1849,15 @@ def _qwen4_exp_qsa_block_topk_logits(
     complete_blocks: torch.Tensor,
     *,
     page_size: int,
-    block_topk: int,
     queries_per_request: int | None,
-    persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool,
 ) -> torch.Tensor:
-    """Materialized path: score every block to FP32, then radix-select.
-
-    Writes the ``[rows, num_blocks]`` score matrix (blocks at or beyond
-    ``complete_blocks`` are ``-inf``). On NVIDIA, a valid caller-owned
-    workspace routes selection through the length-aware persistent CUDA radix
-    kernel; ``complete_blocks`` prevents the selector from rescanning
-    graph-padded columns. Other platforms and direct callers without a
-    workspace retain the portable Triton top-k fallback. Callers bound the
-    score matrix via the routing heuristic in ``qwen4_exp_qsa_block_topk``.
-    """
+    """Portable QSA block scoring; see ``qsa_block_scores``."""
 
     rows = query.shape[0]
     num_blocks = page_table.shape[1] * page_size
-    logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
     use_pdl = _is_nvidia and enable_pdl
+    logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     block_h = triton.next_power_of_2(query.shape[1])
     # Long uniform runs reuse K across 32 queries. With four index heads this
@@ -1911,123 +1900,96 @@ def _qwen4_exp_qsa_block_topk_logits(
         num_stages=2,
         **pdl_kwargs,
     )
+    return logits
+
+
+def triton_qsa_block_topk_select(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    lengths: torch.Tensor,
+    persistent_workspace: torch.Tensor | None,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Portable QSA block top-k selection; see ``qsa_block_topk_select``.
+
+    On NVIDIA, a valid caller-owned workspace routes selection through the
+    length-aware persistent CUDA radix kernel; ``lengths`` keeps it from
+    rescanning graph-padded columns. Otherwise the Triton top-k runs.
+    """
+
     if (
         _is_nvidia
-        and persistent_topk_workspace is not None
-        and block_topk in (512, 1024, 2048)
-        and persistent_topk_workspace.is_cuda
-        and persistent_topk_workspace.device == logits.device
-        and persistent_topk_workspace.dtype == torch.uint8
-        and persistent_topk_workspace.numel() >= _PERSISTENT_TOPK_WORKSPACE_BYTES
+        and persistent_workspace is not None
+        and topk in (512, 1024, 2048)
+        and persistent_workspace.is_cuda
+        and persistent_workspace.device == logits.device
+        and persistent_workspace.dtype == torch.uint8
+        and persistent_workspace.numel() >= _PERSISTENT_TOPK_WORKSPACE_BYTES
         and has_ragged_decode_topk()
     ):
         selected = torch.empty(
-            (rows, block_topk), dtype=torch.int32, device=query.device
+            (logits.shape[0], topk), dtype=torch.int32, device=logits.device
         )
         ragged_decode_topk(
             logits,
             selected,
-            block_topk,
-            lengths=complete_blocks,
-            workspace=persistent_topk_workspace,
-            max_seq_len=num_blocks,
+            topk,
+            lengths=lengths,
+            workspace=persistent_workspace,
+            max_seq_len=logits.shape[1],
         )
         return selected
-    return triton_topk_from_logits(logits, block_topk, enable_pdl=use_pdl)
+    return triton_topk_from_logits(logits, topk, enable_pdl=_is_nvidia and enable_pdl)
 
 
-def qwen4_exp_qsa_block_topk(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    request_indices: torch.Tensor,
-    complete_blocks: torch.Tensor,
-    *,
-    page_size: int,
-    block_topk: int,
-    queries_per_request: int | None,
-    max_partial_bytes: int,
-    solution: str,
-    persistent_topk_workspace: torch.Tensor | None,
-    enable_pdl: bool,
-) -> torch.Tensor:
-    """Select the highest-scoring compressed blocks for each query row.
+_FP32_SCORES = format_signature(logits=dense_tensor_format(torch.float32))
 
-    Args:
-        query: Query tensor shaped ``[rows, heads, head_dim]``.
-        key_cache: Flattened compressed keys shaped ``[slots, 1, head_dim]``.
-        page_table: Raw compressed-cache block ids shaped ``[requests, max_pages]``,
-            with holes and padding normalized to zero; one entry per logical page.
-        request_indices: Owning request id per query row.
-        complete_blocks: Fully compressed block counts shaped ``[rows]``.
-        page_size: Compressed-cache rows covered by one logical page.
-        block_topk: Blocks selected per row; must be a power of two and at
-            least 64.
-        queries_per_request: Uniform number of consecutive query rows per
-            request, or None for ragged/mixed layouts. A positive width must
-            divide ``rows``; the caller guarantees that each width-sized run
-            has one owning request. Logits scoring shares K tiles within these
-            runs while preserving each row's complete-block frontier.
-        max_partial_bytes: Memory budget for the partial top-k buffers
-            (``stream`` solution only).
-        solution: ``"stream"`` fuses scoring and selection without
-            materializing scores; ``"logits"`` materializes the
-            ``[rows, num_blocks]`` FP32 scores and radix-selects them.
-        persistent_topk_workspace: Optional caller-owned CUDA uint8 workspace
-            of at least 1 MiB. The ``"logits"`` solution uses it for the
-            length-aware persistent radix top-k when that kernel is available;
-            otherwise selection falls back to portable Triton.
-        enable_pdl: Wait for query/cache/metadata producers and release
-            successor setup early between scoring and selection on NVIDIA GPUs.
+register_kernel(
+    "attention",
+    "qsa_block_scores",
+    name="triton_qsa_block_scores",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                query=dense_tensor_format(dtype),
+                key_cache=dense_tensor_format(dtype),
+            )
+            for dtype in (torch.bfloat16, torch.float16, torch.float32)
+        }
+    ),
+    priority=Priority.PORTABLE,
+)(triton_qsa_block_scores)
 
-    Returns:
-        Int32 block ids shaped ``[rows, block_topk]``; invalid entries are
-        ``-1``.
-    """
+register_kernel(
+    "attention",
+    "qsa_block_topk_stream",
+    name="triton_qsa_block_topk_stream",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                query=dense_tensor_format(dtype),
+                key_cache=dense_tensor_format(dtype),
+            )
+            for dtype in (torch.bfloat16, torch.float16, torch.float32)
+        }
+    ),
+    priority=Priority.PORTABLE,
+)(triton_qsa_block_topk_stream)
 
-    if query.ndim != 3 or key_cache.ndim != 3:
-        raise ValueError("Qwen4-Exp QSA block top-k expects rank-three tensors")
-    if block_topk < 64 or (block_topk & (block_topk - 1)):
-        raise ValueError("Qwen4-Exp QSA block top-k needs a power-of-two topk >= 64")
-    if solution not in ("stream", "logits"):
-        raise ValueError(
-            "Qwen4-Exp QSA block top-k solution must be 'stream' or 'logits', "
-            f"got {solution!r}"
-        )
-    rows = query.shape[0]
-    if queries_per_request is not None and (
-        queries_per_request < 1 or rows % queries_per_request
-    ):
-        raise ValueError("QSA queries_per_request must be positive and divide rows")
-    num_blocks = page_table.shape[1] * page_size
-    if rows == 0 or num_blocks == 0:
-        return torch.full(
-            (rows, block_topk), -1, dtype=torch.int32, device=query.device
-        )
-    if solution == "logits":
-        return _qwen4_exp_qsa_block_topk_logits(
-            query,
-            key_cache,
-            page_table,
-            request_indices,
-            complete_blocks,
-            page_size=page_size,
-            block_topk=block_topk,
-            queries_per_request=queries_per_request,
-            persistent_topk_workspace=persistent_topk_workspace,
-            enable_pdl=enable_pdl,
-        )
-    return _qwen4_exp_qsa_block_topk_stream(
-        query,
-        key_cache,
-        page_table,
-        request_indices,
-        complete_blocks,
-        page_size=page_size,
-        block_topk=block_topk,
-        max_partial_bytes=max_partial_bytes,
-        enable_pdl=enable_pdl,
-    )
+register_kernel(
+    "attention",
+    "qsa_block_topk_select",
+    name="triton_qsa_block_topk_select",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({_FP32_SCORES}),
+    priority=Priority.PORTABLE,
+)(triton_qsa_block_topk_select)
 
 
 @triton.jit
@@ -2438,10 +2400,12 @@ register_kernel(
 
 
 __all__ = [
-    "qwen4_exp_qsa_block_topk",
     "qwen4_exp_qsa_compress_and_store",
     "qwen4_exp_qsa_prepare_metadata",
     "qwen4_exp_qsa_recent_write",
     "qwen4_exp_qsa_selected_slots",
+    "triton_qsa_block_scores",
+    "triton_qsa_block_topk_select",
+    "triton_qsa_block_topk_stream",
     "triton_qsa_sparse_attention",
 ]

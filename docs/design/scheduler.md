@@ -368,6 +368,8 @@ recipes size a pool from the same model before the arena is allocated
 demand at `max_batch_size` live requests), and then lets the `Scheduler`
 bound requests against the pool they sized. The per-request working set —
 `decode_width + overlap_schedule_depth * decode_width` protected tokens, the
+next verify window a speculative decode's draft steps write on the roles that
+decode (`DraftWindowTokens`, which `scheduleDecode` reserves from), the
 two slots of a State group (`kStateSlots`), the most blocks a sliding
 window can need behind a boundary (one more than behind a page-aligned one,
 `SlidingWindowBlocks`) — exists in that one file; neither side restates it. The two answers are tied by an
@@ -380,7 +382,7 @@ Per group, `ConcurrentGroupPages` charges: a State group two slots per live
 request (the working set does not grow with history); a prefix-closed history
 group `ceil(T / g)` dense pages plus,
 per request, `ceil((g - 1 + protected) / g)` for the unaligned tail and the
-protected tokens that may spill past it; a sliding group, per request,
+protected tokens (the draft window included) that may spill past it; a sliding group, per request,
 `ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
 pages, plus one in-flight prefill chunk behind its lookback (or, on the
 decode role, the landing bound `min(dense, lookback + window)` per request).
@@ -400,7 +402,10 @@ needing a copy), the owner publishes nothing at that point instead of
 waiting (§1).
 
 Speculative decode admission grows from the committed token frontier plus the verify
-spans still in flight and the span being scheduled. Already reserved slots
+spans still in flight, the span being scheduled and the next span, which the
+draft steps write; that last span stops at the request's token limit, so it
+stays inside the admission limit, a request without a declared budget reserves
+none, and the capacity model charges it per live request. Already reserved slots
 cover that extent first. A prefill interruption must not charge the same
 speculative slots again when decode resumes; otherwise rejected draft tokens
 accumulate in the logical tables beyond the context-length bound.

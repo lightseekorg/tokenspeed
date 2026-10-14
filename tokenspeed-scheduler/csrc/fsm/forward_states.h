@@ -84,7 +84,6 @@ struct Submitted {
 
     TokenContainer* TokenContainerPtr() const { return token_container_; }
     std::int32_t PrefixGranularity() const { return prefix_granularity_; }
-    std::size_t NumPrefetchedHostEntries() const { return prefetched_host_entries_.size(); }
     // A further prefetch (the remainder beyond what landed) carries these on,
     // so the first fetch's entries stay pinned until the admission that
     // claims them all.

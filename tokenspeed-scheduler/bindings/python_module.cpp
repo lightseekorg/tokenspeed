@@ -509,7 +509,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Count RemotePrefilling requests; these are also included in prefilling_size().")
         .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
              "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
-        .def("pd_transfer_pinned", &tokenspeed::Scheduler::PdTransferPinned, nb::arg("request_id"))
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
         .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)

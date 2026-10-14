@@ -18,7 +18,7 @@ gather / reduce-scatter of a shard's ids.
 """
 
 import socket
-from typing import List, Optional
+from typing import List
 
 import pytest
 import torch

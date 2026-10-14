@@ -27,11 +27,9 @@ import torch
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+from tokenspeed_kernel.ops.moe.flashinfer import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
     TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT,
-)
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant import (
     TRTLLM_UNQUANT_ISPP_ALIGNMENT,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -234,7 +232,7 @@ class MoELayer(torch.nn.Module):
             # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
             # ispp_alignment={TRTLLM_UNQUANT_ISPP_ALIGNMENT}: 64, or 128 when
             # the installed FlashInfer launcher cannot be relaxed or built
-            # (ops/moe/flashinfer/trtllm_unquant.py); without padding
+            # (ops/moe/flashinfer.py); without padding
             # moe_plan does not select them for a misaligned intermediate
             # size. Other activations keep 128. The padded tail rows/columns
             # stay zero (create_dense_weight_pair zero-initializes) and

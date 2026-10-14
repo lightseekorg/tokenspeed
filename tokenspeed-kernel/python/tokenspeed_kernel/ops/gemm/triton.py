@@ -1033,19 +1033,22 @@ def triton_bmm_fp8_blockscale(
     return C
 
 
+_TRITON_GROUPED_OUTPUT_SIGNATURES = frozenset(
+    format_signature(
+        attention=dense_tensor_format(input_dtype),
+        weight=dense_tensor_format(_fp8_dtype),
+    )
+    for input_dtype in (torch.float16, torch.bfloat16)
+)
+
+
 @register_kernel(
     "gemm",
     "dsv4_grouped_output_projection",
     name="triton_dsv4_grouped_output_projection",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    signatures=frozenset(
-        format_signature(
-            attention=dense_tensor_format(input_dtype),
-            weight=dense_tensor_format(_fp8_dtype),
-        )
-        for input_dtype in (torch.float16, torch.bfloat16)
-    ),
+    signatures=_TRITON_GROUPED_OUTPUT_SIGNATURES,
     traits={},
     priority=Priority.PERFORMANT + 3,
 )
@@ -1062,13 +1065,8 @@ def triton_dsv4_grouped_output_projection(
     nope_dim: int,
     rope_dim: int,
     block_size: tuple[int, int],
-    tma_aligned_scales: bool,
-    recipe: tuple[int, int, int],
 ) -> torch.Tensor:
     """Run V4's grouped output projection with canonical scales and Triton BMM."""
-    del recipe
-    if tma_aligned_scales:
-        raise ValueError("the portable projection requires canonical scales")
     from tokenspeed_kernel.ops.attention.dsv4.triton import (
         dsv4_fused_inv_rope_fp8_quant,
     )

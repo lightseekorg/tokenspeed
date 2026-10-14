@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.ops.moe.triton.softmax_topk import triton_softmax_topk
+from tokenspeed_kernel.ops.moe._triton.softmax_topk import triton_softmax_topk
 from tokenspeed_kernel.platform import Platform
 
 

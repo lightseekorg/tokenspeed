@@ -61,7 +61,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
 )
-from tokenspeed.runtime.layers.linear import LinearBase, MergedColumnParallelLinear
+from tokenspeed.runtime.layers.linear import LinearBase
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.moe import expert as expert_module
 from tokenspeed.runtime.layers.moe.expert import MoELayer

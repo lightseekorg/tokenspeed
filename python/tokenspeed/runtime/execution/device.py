@@ -924,7 +924,8 @@ class DeviceHandle:
 
         Type-dispatched on the request — join the trainer's NCCL group,
         receive and apply one broadcast, read one committed version from the
-        Mooncake weight store, or tear the group down. One entry point because
+        Mooncake weight store, reload a checkpoint from disk, or tear the group
+        down. One entry point because
         it is one capability: rewriting model parameters in place, which must
         be ordered against forwards rather than raced with them.
 
@@ -940,6 +941,7 @@ class DeviceHandle:
         from tokenspeed.runtime.engine.io_struct import (
             DestroyWeightsUpdateGroupReqInput,
             InitWeightsUpdateGroupReqInput,
+            UpdateWeightFromDiskReqInput,
             UpdateWeightsFromDistributedReqInput,
             UpdateWeightsFromMooncakeReqInput,
         )
@@ -956,6 +958,7 @@ class DeviceHandle:
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
+            UpdateWeightFromDiskReqInput: runner.update_weights_from_disk,
         }
         handler = handlers.get(type(req))
         if handler is None:
@@ -963,6 +966,7 @@ class DeviceHandle:
         loads_weights = type(req) in (
             UpdateWeightsFromDistributedReqInput,
             UpdateWeightsFromMooncakeReqInput,
+            UpdateWeightFromDiskReqInput,
         )
 
         def _apply_update():
@@ -1853,7 +1857,7 @@ def _build_kv_transfer(
             bootstrap_port=server_args.disaggregation_bootstrap_port,
             dist_init_addr=server_args.dist_init_addr,
             topology=topology,
-            enable_metrics=False,
+            enable_metrics=server_args.enable_metrics,
             served_model_name=server_args.served_model_name,
             app_key=server_args.app_key,
             metrics_reporters=server_args.metrics_reporters,

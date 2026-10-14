@@ -5,18 +5,14 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.platform import CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
 from tokenspeed_kernel.thirdparty.cuda.routing import (
     hash_softplus_sqrt_topk_flash,
     routing_available,
     softplus_sqrt_topk_flash,
 )
-
-try:
-    from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
-except ImportError:
-    moe_finalize_fuse_shared = error_fn
 
 
 def cuda_sqrt_softplus_topk(

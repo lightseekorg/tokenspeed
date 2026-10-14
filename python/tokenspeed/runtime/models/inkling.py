@@ -694,7 +694,7 @@ class InklingGate(nn.Module):
     thus compete for probability mass without entering top-k (a "sink").
 
     Selection and weighting run in one fused Triton kernel
-    (``tokenspeed_kernel.ops.moe.triton.inkling_topk``, reached through
+    (``tokenspeed_kernel.ops.moe._triton.inkling_topk``, reached through
     ``TopK`` / ``select_experts``), which implements the reference's
     deterministic lowest-index tie-breaking and computes the sink
     normalization in linear space (identical to the reference's

@@ -496,7 +496,7 @@ def _situ_backend(calls, fail, tuning):
         _register_mxfp4_situ_kernel=lambda fn: fn,
     )
     backend = _functions(
-        KERNEL / "ops/moe/flashinfer/trtllm_mxfp4.py",
+        KERNEL / "ops/moe/flashinfer.py",
         None,
         (
             "_autotune_mxfp4_situ_moe",
@@ -656,7 +656,7 @@ def test_situ_shared_launcher_preserves_ep_routing_and_return_contract(
     )
     fi = Mock(return_value=output if finalize else deferred)
     backend = _functions(
-        KERNEL / "ops/moe/flashinfer/trtllm_mxfp4.py",
+        KERNEL / "ops/moe/flashinfer.py",
         None,
         (
             "_local_expert_range",

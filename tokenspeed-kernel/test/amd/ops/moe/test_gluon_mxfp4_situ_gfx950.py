@@ -156,7 +156,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as gluon_mxfp4
+    import tokenspeed_kernel.ops.moe.gluon as gluon_mxfp4
 
     generator = torch.Generator(device="cuda").manual_seed(20260720 + num_tokens)
     num_local_experts = 2
@@ -286,7 +286,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
 def test_ep_decode_unsupported_a16_shape_uses_a8_fallback_gfx950(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as gluon_mxfp4
+    import tokenspeed_kernel.ops.moe.gluon as gluon_mxfp4
 
     generator = torch.Generator(device="cuda").manual_seed(20260903)
     num_tokens, top_k = 1, 1
@@ -902,7 +902,7 @@ def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as mxfp4_module
+    import tokenspeed_kernel.ops.moe.gluon as mxfp4_module
 
     grouped = mxfp4_module.gluon_a16w4_situ_grouped_ep_gfx950
     grouped_calls = 0
@@ -1771,7 +1771,7 @@ def test_tp_situ_package_prefill_tiles_match_block128_gfx950(
 def test_ep_situ_package_prefill_matches_reference_gfx950(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from tokenspeed_kernel.ops.moe.gluon import mxfp4 as gluon_mxfp4
+    import tokenspeed_kernel.ops.moe.gluon as gluon_mxfp4
 
     generator = torch.Generator(device="cuda").manual_seed(20260830)
     # Exercise a ragged MXFP8 tile beyond this plan's four-row A16 decode path.

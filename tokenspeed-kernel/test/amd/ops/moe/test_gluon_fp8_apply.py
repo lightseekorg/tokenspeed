@@ -57,8 +57,8 @@ def test_gluon_block_fp8_large_batch_uses_bf16_prefill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _requires_gfx950()
-    from tokenspeed_kernel.ops.moe.gluon import bf16 as bf16_moe
-    from tokenspeed_kernel.ops.moe.gluon.fp8 import (
+    import tokenspeed_kernel.ops.moe.gluon as gluon_moe
+    from tokenspeed_kernel.ops.moe.gluon import (
         gluon_fp8_block_precomputed_moe_apply,
     )
 
@@ -93,7 +93,7 @@ def test_gluon_block_fp8_large_batch_uses_bf16_prefill(
         assert args[2].w2_weight is weights.w2_weight_prefill_bf16
         return sentinel
 
-    monkeypatch.setattr(bf16_moe, "gluon_bf16_precomputed_moe_apply", fake_bf16_apply)
+    monkeypatch.setattr(gluon_moe, "gluon_bf16_precomputed_moe_apply", fake_bf16_apply)
     actual = gluon_fp8_block_precomputed_moe_apply(
         {"activation": "swiglu"},
         x,
@@ -110,7 +110,7 @@ def test_gluon_block_fp8_medium_batch_uses_exact_mfma(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _requires_gfx950()
-    from tokenspeed_kernel.ops.moe.gluon import fp8 as fp8_moe
+    import tokenspeed_kernel.ops.moe.gluon as gluon_moe
 
     num_tokens = 64
     weights = torch.nn.Module()
@@ -133,11 +133,11 @@ def test_gluon_block_fp8_medium_batch_uses_exact_mfma(
     sentinel = torch.full_like(x, 3.0)
 
     monkeypatch.setattr(
-        fp8_moe,
+        gluon_moe,
         "gluon_fp8_block_exact_mfma_moe",
         lambda *args, **kwargs: sentinel,
     )
-    actual = fp8_moe.gluon_fp8_block_precomputed_moe_apply(
+    actual = gluon_moe.gluon_fp8_block_precomputed_moe_apply(
         {"activation": "swiglu"},
         x,
         weights,

@@ -29,7 +29,8 @@
 namespace tokenspeed {
 
 // The per-request cache working-set model: the decode reservation, the
-// overlap-protected step, a State group's two slots, a sliding group's
+// overlap-protected step, the next verify window a speculative decode's draft
+// steps write, a State group's two slots, a sliding group's
 // lookback and resident window. Two callers must
 // agree on it -- the Python recipes size a pool from it before any pool
 // exists, and the Scheduler bounds a single request against the pool they
@@ -61,6 +62,9 @@ public:
 
     // Largest token_limit whose SingleRequestGroupPages fit usable_lcm_blocks.
     std::int32_t MaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
+
+    // Tokens of the next verify window a speculative decode reserves for its draft steps; 0 without one or on P.
+    static std::int64_t DraftWindowTokens(const SchedulerConfig& config);
 
 private:
     struct Group {

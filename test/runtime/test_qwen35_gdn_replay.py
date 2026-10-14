@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import sys
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -383,6 +382,65 @@ def test_qwen_replay_tree_matches_staged_tree(state_dtype, parents, paths):
             else dict(atol=1e-6, rtol=1e-5)
         ),
     )
+
+
+@pytest.mark.parametrize("parents", [None, [[-1, 0, 0], [-1, 0, 1]]])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_staged_verify_reading_committed_state_matches_seeded_scratch(
+    state_dtype, parents
+):
+    """A staged verify that reads the committed state in place (no seed copy
+    into the scratch) and q/k/v as packed conv-output views (no split copy)
+    verifies and commits exactly like the seeded scratch and split inputs."""
+    draft_tokens = DRAFT_TOKENS if parents is None else len(parents[0])
+    conv, recurrent = _initial_pools(state_dtype=state_dtype)
+    results = []
+    for in_place in (False, True):
+        backend, pool = _make_backend(
+            conv.clone(), recurrent.clone(), replay=False, draft_tokens=draft_tokens
+        )
+        backend._verify_reads_committed_recurrent_state = in_place
+        backend._verify_packed_qkv_views = in_place
+        if parents is not None:
+            backend.bind_tree_verify(_tree_verify_inputs(parents))
+        out = _prepare_verify(backend, pool, _inputs(draft_tokens=draft_tokens))
+        accepted = torch.tensor([2, 3], dtype=torch.int32, device=DEVICE)
+        path = (
+            None
+            if parents is None
+            else torch.tensor([[0, 2, -1], [0, 1, 2]], dtype=torch.int32, device=DEVICE)
+        )
+        backend.commit_verified_state(accepted, accepted_path=path)
+        torch.cuda.synchronize()
+        results.append((out, pool.get_component(0, "recurrent_state").clone()))
+    (seeded_out, seeded_state), (in_place_out, in_place_state) = results
+    torch.testing.assert_close(in_place_out, seeded_out, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(in_place_state, seeded_state, atol=0.0, rtol=0.0)
+
+
+def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
+    """GdnAttnBackend reads the committed state in place and the packed q/k/v
+    views exactly where the selected verify kernel accepts them."""
+    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp_supports
+
+    from tokenspeed.runtime.layers.attention.backends.state.gdn import (
+        GdnAttnBackend,
+    )
+
+    conv, recurrent = _initial_pools()
+    pool = _ContractPool({0: ("linear_attention", conv, recurrent)})
+    backend = GdnAttnBackend(*_config(replay=False))
+    backend.set_kv_pool(pool)
+
+    def supports(trait):
+        return gdn_decode_mtp_supports(
+            torch.bfloat16, head_dim=HEAD_K_DIM, trait=trait, solution=None
+        )
+
+    assert backend._verify_reads_committed_recurrent_state == supports(
+        "separate_output_state"
+    )
+    assert backend._verify_packed_qkv_views == supports("strided_qkv")
 
 
 @pytest.mark.parametrize("chunked", [False, True])

@@ -127,7 +127,10 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
         ),
     ]
     scheduler = Scheduler(cfg)
-    scheduler.submit_requests([_make_spec("long", list(range(16)))])
+    # A declared budget, so its decodes also hold the next verify window.
+    long_request = _make_spec("long", list(range(16)))
+    long_request.max_new_tokens = 4096
+    scheduler.submit_requests([long_request])
     pending = deque()
     for step in range(100):
         if step % 5 == 3:
@@ -138,7 +141,7 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
                 table = op.block_tables["compressor"][row]
                 committed = scheduler.request_token_size("long") - 1
                 reservation_end = (
-                    committed + (overlap_depth + 1) * cfg.decode_input_tokens
+                    committed + (overlap_depth + 2) * cfg.decode_input_tokens
                 )
                 assert len(table) <= (reservation_end + 3) // 4
                 assert table[committed // 4] > 0
@@ -163,6 +166,80 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
                     reserve.reserve_num_tokens_in_next_schedule_event = accepted_tokens
                     events.add_event(reserve)
             scheduler.advance(events)
+
+
+def _speculative_config(
+    verify_width: int, overlap_depth: int, total_pages: int
+) -> SchedulerConfig:
+    cfg = _base_config(num_device_pages=total_pages)
+    cfg.prefix_granularity = 1
+    cfg.decode_input_tokens = verify_width
+    cfg.overlap_schedule_depth = overlap_depth
+    # A sliding group prepays no generation, so it holds exactly what decode reserves; no token expires here.
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="swa",
+            block_granularity=1,
+            total_pages=total_pages,
+            retention=CacheRetention.SlidingWindow,
+            sliding_window_tokens=1024,
+            family=CacheGroupFamily.History,
+        )
+    ]
+    return cfg
+
+
+def _speculative_scheduler(
+    verify_width: int, overlap_depth: int, max_new_tokens: int, total_pages: int = 256
+) -> Scheduler:
+    """A two-token prompt whose prefill is done: its next plan is the first decode."""
+    scheduler = Scheduler(_speculative_config(verify_width, overlap_depth, total_pages))
+    spec = _make_spec("r", [1, 2])
+    spec.max_new_tokens = max_new_tokens
+    scheduler.submit_requests([spec])
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    _advance_tokens(scheduler, "r", [3])
+    return scheduler
+
+
+def _used_pages(scheduler: Scheduler) -> int:
+    # Page 0 is the allocator's.
+    return 256 - 1 - scheduler.cache_group_available_pages("swa")
+
+
+@pytest.mark.parametrize("overlap_depth", [0, 1])
+@pytest.mark.parametrize("verify_width", [2, 4, 16])
+def test_speculative_decode_reserves_the_next_verify_window(
+    overlap_depth: int, verify_width: int
+):
+    """Draft steps and draft-tree lanes write into the next verify window, so
+    from the first decode on a speculative decode holds it too."""
+    scheduler = _speculative_scheduler(verify_width, overlap_depth, 64)
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    assert _used_pages(scheduler) == 2 + 2 * verify_width
+
+
+def test_an_overlapped_decode_reserves_the_next_verify_window_too():
+    """A decode planned before the previous result commits holds the window
+    after its own, not only the first decode."""
+    scheduler = _speculative_scheduler(4, 1, 64)
+    for _ in range(2):
+        assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    # The in-flight verify window, this decode's and the next one.
+    assert _used_pages(scheduler) == 2 + 3 * 4
+
+
+@pytest.mark.parametrize("max_new_tokens", [0, 3])
+def test_a_pool_sized_to_the_admission_limit_runs_the_first_decode(
+    max_new_tokens: int,
+):
+    """Admission validates the prompt plus max(max_new_tokens, N): a budget
+    ending inside the verify window holds only that window, and an undeclared
+    one reserves no draft window, so either decodes in a pool of exactly that size."""
+    # Page 0 is the allocator's: six usable pages hold the prompt and one window.
+    scheduler = _speculative_scheduler(4, 0, max_new_tokens, total_pages=7)
+    assert _request_ids_in_plan(scheduler.next_execution_plan()) == {"r"}
+    assert scheduler.cache_group_available_pages("swa") == 0
 
 
 def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():

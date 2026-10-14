@@ -352,6 +352,8 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "separate_output_state": frozenset({False}),
+            "strided_qkv": frozenset({False}),
         },
     )
     def flashinfer_gdn_decode_mtp(
@@ -370,6 +372,7 @@ if is_decode_available():
         use_qk_l2norm: bool = True,
         intermediate_states_buffer: torch.Tensor | None = None,
         output_state_indices: torch.Tensor | None = None,
+        output_state: torch.Tensor | None = None,
         tree_ancestors: torch.Tensor | None,
         replay_payload: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -411,6 +414,10 @@ if is_decode_available():
         if tree_ancestors is not None or replay_payload is not None:
             raise NotImplementedError(
                 "FlashInfer GDN MTP kernels follow a chain; draft trees run the Triton kernel"
+            )
+        if output_state is not None:
+            raise NotImplementedError(
+                "FlashInfer GDN MTP kernels write states into initial_state only"
             )
         # Normalize decay inputs for FlashInfer's FP32 CuteDSL/DLPack boundary.
         A_log = A_log.detach().float()

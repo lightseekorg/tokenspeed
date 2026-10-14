@@ -565,6 +565,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
 
 
 def _layerwise_fanout_context():
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     layout = _ordinary_layerwise_layout()
@@ -598,7 +599,7 @@ def _layerwise_fanout_context():
         for rank, request in enumerate(requests)
     }
     manager.layerwise_debug = False
-    manager.kv_transfer_metrics = None
+    manager.kv_transfer_metrics = KVTransferMetrics({}, enabled=False)
     manager.session_failures = defaultdict(int)
     return manager, requests
 
