@@ -99,8 +99,10 @@ partial through to memory, waits for its stores, and bumps a per-tile counter
 with a relaxed atomic; the last split to arrive sums all partials in split
 order with cache-bypassing loads, writes C, and resets the counter, so one
 launch does both phases without an acquire-release fence and results are
-deterministic. An optional XCD remap keeps the M tiles that
-share a weight tile on one XCD's L2.
+deterministic. The caller passes the counters zeroed and gets them back zeroed
+(`gemm/splitk.py`); `gluon_mm_a16w16_decode_num_counters_gfx950` sizes them.
+An optional XCD remap keeps the M tiles that share a weight tile on one XCD's
+L2.
 
 ### gfx950 MXFP8 projection
 

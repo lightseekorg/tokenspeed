@@ -34,6 +34,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _supports_largem_shape,
     launch_gluon_mm_a16w16_prefill_gfx950,
 )
+from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
 
 cdna4 = gl.amd.cdna4
 async_copy = gl.amd.cdna4.async_copy
@@ -57,7 +58,6 @@ LARGEM_DISPATCH_MIN_M = 2048
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
-_counter_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def _dense16_bmm_launch_metadata(grid, kernel, args):
@@ -1849,25 +1849,12 @@ def supports_gluon_mm_a16w16_decode_gfx950(M: int, N: int, K: int) -> bool:
     return _choose_decode_config(M, N, K) is not None
 
 
-def _get_splitk_counters(device: torch.device, num_tiles: int) -> torch.Tensor:
-    """Return stream-local zeroed per-tile arrival counters.
-
-    The last program of each tile resets its counter, so the buffer is zero
-    again whenever a launch completes and same-stream launches can share it.
-    """
-    if torch.cuda.is_current_stream_capturing():
-        # Keep captured launches on graph-private counters; never bake the
-        # shared eager buffer into a graph.
-        return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-
-    device_index = torch.cuda.current_device() if device.index is None else device.index
-    stream_id = torch.cuda.current_stream(device_index).cuda_stream
-    key = (device_index, stream_id, num_tiles)
-    counters = _counter_cache.get(key)
-    if counters is None:
-        counters = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-        _counter_cache[key] = counters
-    return counters
+def gluon_mm_a16w16_decode_num_counters_gfx950(M: int, N: int, K: int) -> int:
+    """Split-K arrival counters a decode GEMM launch needs; 0 without split-K."""
+    config = _choose_decode_config(M, N, K)
+    if config is None or config[6] == 1:
+        return 0
+    return triton.cdiv(M, config[0]) * triton.cdiv(N, config[1])
 
 
 def launch_gluon_mm_a16w16_decode_gfx950(
@@ -1875,6 +1862,7 @@ def launch_gluon_mm_a16w16_decode_gfx950(
     B: torch.Tensor,
     out_dtype: torch.dtype,
     *,
+    counters: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute decode-sized dense ``A @ B.T`` with measured split-K tiling.
@@ -1883,6 +1871,9 @@ def launch_gluon_mm_a16w16_decode_gfx950(
         A: Contiguous fp16/bf16 activation ``[M, K]``.
         B: Contiguous weight ``[N, K]`` with ``A``'s dtype.
         out_dtype: Output dtype: ``A``'s dtype or fp32.
+        counters: Zeroed int32 split-K arrival counters, at least
+            ``gluon_mm_a16w16_decode_num_counters_gfx950(M, N, K)`` of them;
+            the launch leaves them zeroed (see ``splitk.py``).
         out: Optional ``[M, N]`` destination with unit inner stride.
 
     Returns:
@@ -1921,8 +1912,10 @@ def launch_gluon_mm_a16w16_decode_gfx950(
     C = _resolve_output(A, (M, N), out_dtype, out, "decode dense16 GEMM")
     num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
     if split_k > 1:
+        check_splitk_counters(
+            counters, num_tiles, A.device, "gfx950 decode dense16 GEMM"
+        )
         partial = _get_partial_scratch(A.device, num_tiles, split_k, block_n, block_m)
-        counters = _get_splitk_counters(A.device, num_tiles)
     else:
         partial = counters = C
     gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](

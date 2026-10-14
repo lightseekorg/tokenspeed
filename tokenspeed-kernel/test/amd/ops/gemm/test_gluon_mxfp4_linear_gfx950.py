@@ -38,9 +38,10 @@ from tokenspeed_kernel.ops.gemm import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.gemm.triton import triton_mm_mxfp4  # noqa: E402
 from tokenspeed_kernel.ops.quantization.triton import mxfp4_quantize  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import mm  # noqa: E402
+from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4.mm import (  # noqa: E402
     gluon_mxfp4_linear_gfx950,
+    gluon_mxfp4_linear_num_counters_gfx950,
     gluon_mxfp4_swiglu_linear_gfx950,
     launch_gluon_mxfp4_linear_gfx950,
     launch_gluon_mxfp4_swiglu_linear_gfx950,
@@ -57,6 +58,30 @@ _RTOL = 2**-8
 # [2560, 320].
 _HIDDEN = 2560
 _INTERMEDIATE = 320
+
+
+def _counters(x, weight, swiglu):
+    return zeroed_state(
+        gluon_mxfp4_linear_num_counters_gfx950(
+            x.shape[0], weight.shape[0], x.shape[1], swiglu
+        ),
+        dtype=torch.int32,
+        device=x.device,
+    )
+
+
+def _linear(x, weight, scale, out=None):
+    counters = _counters(x, weight, False)
+    return launch_gluon_mxfp4_linear_gfx950(
+        x, weight, scale, counters=counters, out=out
+    )
+
+
+def _swiglu(x, weight, scale, out=None):
+    counters = _counters(x, weight, True)
+    return launch_gluon_mxfp4_swiglu_linear_gfx950(
+        x, weight, scale, counters=counters, out=out
+    )
 
 
 def _weight(n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -93,15 +118,11 @@ def test_shared_expert_matches_unfused_path(m: int) -> None:
     gate_up, gate_up_scale = _weight(2 * _INTERMEDIATE, _HIDDEN)
     down, down_scale = _weight(_HIDDEN, _INTERMEDIATE)
 
-    act = launch_gluon_mxfp4_swiglu_linear_gfx950(
-        x, preshuffle_mxfp4_weight(gate_up), gate_up_scale, out=None
-    )
+    act = _swiglu(x, preshuffle_mxfp4_weight(gate_up), gate_up_scale)
     expected_act = _unfused_swiglu(x, gate_up, gate_up_scale)
     _assert_close(act, expected_act)
 
-    out = launch_gluon_mxfp4_linear_gfx950(
-        expected_act, preshuffle_mxfp4_weight(down), down_scale, out=None
-    )
+    out = _linear(expected_act, preshuffle_mxfp4_weight(down), down_scale)
     _assert_close(out, _unfused_linear(expected_act, down, down_scale))
 
 
@@ -118,9 +139,7 @@ def test_heuristic_shapes_match_unfused_path(m: int, n: int, k: int) -> None:
     torch.manual_seed(0)
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     weight, scale = _weight(n - n % 16, k)
-    actual = launch_gluon_mxfp4_linear_gfx950(
-        x, preshuffle_mxfp4_weight(weight), scale, out=None
-    )
+    actual = _linear(x, preshuffle_mxfp4_weight(weight), scale)
     _assert_close(actual, _unfused_linear(x, weight, scale))
 
 
@@ -132,13 +151,13 @@ def test_writes_strided_out_deterministically() -> None:
     shuffled = preshuffle_mxfp4_weight(weight)
     backing = torch.empty((m, _INTERMEDIATE + 24), device="cuda", dtype=torch.bfloat16)
     out = backing[:, :_INTERMEDIATE]
-    actual = launch_gluon_mxfp4_swiglu_linear_gfx950(x, shuffled, scale, out=out)
+    actual = _swiglu(x, shuffled, scale, out=out)
     assert actual is out
     _assert_close(out, _unfused_swiglu(x, weight, scale))
     # The split-K reduction sums partials in split order.
     for _ in range(3):
         assert torch.equal(
-            launch_gluon_mxfp4_swiglu_linear_gfx950(x, shuffled, scale, out=None),
+            _swiglu(x, shuffled, scale),
             out,
         )
 
@@ -153,10 +172,8 @@ def test_row_count_does_not_recompile() -> None:
     act = torch.randn((4096, _INTERMEDIATE), device="cuda", dtype=torch.bfloat16)
 
     def run(rows: int) -> None:
-        launch_gluon_mxfp4_swiglu_linear_gfx950(
-            x[:rows], gate_up, gate_up_scale, out=None
-        )
-        launch_gluon_mxfp4_linear_gfx950(act[:rows], down, down_scale, out=None)
+        _swiglu(x[:rows], gate_up, gate_up_scale)
+        _linear(act[:rows], down, down_scale)
 
     # One row count per M bucket compiles each tile configuration.
     for rows in (1, 65, 257, 513, 2049):
@@ -168,7 +185,9 @@ def test_row_count_does_not_recompile() -> None:
             run(rows)
 
 
-def test_hip_graph_replay_uses_private_counters() -> None:
+def test_hip_graph_replay_keeps_counters_zeroed() -> None:
+    # A captured split-K launch gets counters zeroed outside the graph; every
+    # replay leaves them zeroed for the next.
     torch.manual_seed(0)
     m = 16  # split-K route
     x = torch.randn((m, _HIDDEN), device="cuda", dtype=torch.bfloat16)
@@ -178,15 +197,12 @@ def test_hip_graph_replay_uses_private_counters() -> None:
     stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.stream(stream):
-        # Eager warmup on the capture stream fills the per-stream caches.
-        launch_gluon_mxfp4_swiglu_linear_gfx950(x, shuffled, scale, out=out)
-        eager_counters = dict(mm._counter_cache)
-        with torch.cuda.graph(graph, stream=stream):
-            launch_gluon_mxfp4_swiglu_linear_gfx950(x, shuffled, scale, out=out)
+        _swiglu(x, shuffled, scale, out=out)
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            _swiglu(x, shuffled, scale, out=out)
     stream.synchronize()
-    assert mm._counter_cache == eager_counters
 
-    for _ in range(2):
+    for _ in range(3):
         x.copy_(torch.randn_like(x))
         graph.replay()
         torch.cuda.synchronize()

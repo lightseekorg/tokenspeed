@@ -25,6 +25,7 @@ from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.workspace import capture_session
 
 from tokenspeed.runtime.execution.context import CapturedRows, ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
@@ -382,7 +383,7 @@ class DeepseekV4DSpark(BaseDrafter):
         graph = torch.cuda.CUDAGraph()
         # Own pool: target prefill and decode graphs must not recycle these
         # intermediates, including any pointers memoized by quantized GEMMs.
-        with observer, torch.cuda.graph(graph, stream=stream):
+        with capture_session(graph), observer, torch.cuda.graph(graph, stream=stream):
             run_once()
         graph.replay()
         torch.cuda.synchronize(self.device)
