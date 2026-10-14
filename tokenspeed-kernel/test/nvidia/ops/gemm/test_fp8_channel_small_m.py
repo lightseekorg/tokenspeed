@@ -125,11 +125,12 @@ def test_scale_layouts(a_layout, b_layout, out_dtype):
 
 
 def test_the_quantizer_follows_trtllms_per_token_rule():
-    """Scale max(amax / 448, 1 / (448 * 512)), codes RN(x * min(448 / amax,
+    """quantize_fp8's token quantizer up to 64 rows (fp8_quantize_per_token):
+    scale max(amax / 448, 1 / (448 * 512)), codes RN(x * min(448 / amax,
     448 * 512)) saturated, in FP32 with IEEE divisions; a zero row is zeros."""
     x = _rows(9, 4096, seed=5)
     x[3] = 0
-    codes, scales = fp8_quantize_per_token(x)
+    codes, scales = quantize_fp8(x, granularity="token")
     amax = x.float().abs().amax(1, keepdim=True)
     # IEEE divisions by tensors: on CUDA a division by a Python scalar
     # (amax / 448.0) multiplies by its rounded reciprocal, and 448.0 / amax
@@ -212,7 +213,7 @@ def test_row_counts_do_not_recompile():
     w8, w_scales = _weight(n, k, seed=11)
 
     def run(m):
-        a8, a_scales = fp8_quantize_per_token(_rows(m, k, seed=m))
+        a8, a_scales = quantize_fp8(_rows(m, k, seed=m), granularity="token")
         triton_fp8_channel.triton_mm_fp8_channel_small_m(
             a8, w8.t(), a_scales, w_scales, torch.bfloat16
         )

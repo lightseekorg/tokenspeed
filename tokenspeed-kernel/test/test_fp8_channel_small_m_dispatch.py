@@ -23,8 +23,9 @@
 On a synthetic SM100 / SM103 / SM90 platform: which ``gemm.mm`` kernel serves
 per-token x per-channel FP8 rows, what it receives for ``quant="fp8"``
 without ``A_scales`` (FP8 codes and ``[M, 1]`` scales, from the Triton
-quantizer up to 64 rows and from TRT-LLM's token quantizer above), and the
-scale layouts and tile constexprs the small-M wrapper launches with.
+quantizer up to 64 rows and from TRT-LLM's token quantizer above, as
+``quantize_fp8`` selects them by row count), and the scale layouts and tile
+constexprs the small-M wrapper launches with.
 Kernel bodies and launches are recorders; the numerics run on the GPU
 (``test/nvidia/ops/gemm/test_fp8_channel_small_m.py``).
 """
@@ -35,15 +36,18 @@ import dataclasses
 
 import pytest
 import tokenspeed_kernel.ops.gemm as gemm
+import tokenspeed_kernel.ops.quantization as quantization
 import torch
 from tokenspeed_kernel.ops.gemm import triton_fp8_channel
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
-from tokenspeed_kernel.platform import ArchVersion, Platform
+from tokenspeed_kernel.platform import ArchVersion, Platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel
 
 FP8 = torch.float8_e4m3fn
 SMALL_M = "triton_mm_fp8_channel_small_m"
+PER_TOKEN = "triton_quantize_fp8_per_token"
 
 
 @pytest.fixture
@@ -65,18 +69,18 @@ def arch(b200_platform):
 
 def _stand_in_quantizer(monkeypatch, quantized):
     """TRT-LLM's per-token quantizer (codes, FP32 [M, 1] scales) and the Triton
-    one, recorded as ("trtllm" | "triton", rows)."""
+    one, recorded as ("trtllm" | "triton", rows, the Triton one's enable_pdl)."""
 
     def quantize(x):
         scale = (x.float().abs().amax(-1, keepdim=True) / 448.0).clamp_min(1e-12)
         return (x.float() / scale).clamp(-448, 448).to(FP8), scale
 
     def quantize_e4m3_activation(x):
-        quantized.append(("trtllm", x))
+        quantized.append(("trtllm", x, None))
         return quantize(x)
 
-    def fp8_quantize_per_token(x):
-        quantized.append(("triton", x))
+    def fp8_quantize_per_token(x, enable_pdl):
+        quantized.append(("triton", x, enable_pdl))
         return quantize(x)
 
     monkeypatch.setattr(
@@ -122,8 +126,8 @@ def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
     gemm.mm(x, weight, B_scales=scales, out_dtype=torch.bfloat16, quant="fp8")
     (call,) = calls
     assert call["kernel"] == SMALL_M
-    ((source, rows),) = quantized
-    assert source == "triton" and rows is x
+    ((source, rows, enable_pdl),) = quantized
+    assert source == "triton" and rows is x and enable_pdl == pdl_enabled()
     assert call["A"].dtype == FP8 and tuple(call["A_scales"].shape) == (m, 1)
 
 
@@ -149,7 +153,7 @@ def test_other_kernels_receive_rows_quantized_per_token(
     gemm.mm(x, weight, B_scales=scales, out_dtype=torch.bfloat16, quant="fp8")
     (call,) = calls
     assert call["kernel"] == expected
-    ((source, rows),) = quantized
+    ((source, rows, _),) = quantized
     assert source == quantizer and rows is x
     assert call["A"].dtype == FP8 and tuple(call["A_scales"].shape) == (m, 1)
 
@@ -317,3 +321,75 @@ def test_wrapper_refusals(a, a_scales, b, kwargs, match):
         triton_fp8_channel.triton_mm_fp8_channel_small_m(
             x, b_arg, scales, torch.ones(128, 1), torch.bfloat16, **kwargs
         )
+
+
+def _quantizer_selections(monkeypatch):
+    """quantize_fp8's kernel selections as (name, traits); the kernels do not run."""
+    selections = []
+    select = quantization.select_kernel
+
+    def selected(*args, **kwargs):
+        kernel = select(*args, **kwargs)
+        selections.append((kernel.name, kwargs["traits"]))
+        return SelectedKernel(kernel.name, lambda x, **_: (x, None))
+
+    monkeypatch.setattr(quantization, "select_kernel", selected)
+    return selections
+
+
+@pytest.mark.parametrize("major,minor", [(9, 0), (10, 0), (10, 3)])
+@pytest.mark.parametrize("shape", [(1, 4096), (64, 4096), (65, 4096), (1, 4, 4096)])
+def test_token_quantization_takes_the_triton_quantizer_up_to_64_rows(
+    arch, monkeypatch, major, minor, shape
+):
+    """quantize_fp8 states the rows of a 2-D input as ``m``. The Triton
+    per-token quantizer declares ``m_max`` 64 on SM100 and newer, so it takes
+    1 to 64 rows there, and neither 65 rows nor a 3-D input (no ``m``)."""
+    arch(major, minor)
+    selections = _quantizer_selections(monkeypatch)
+    quantize_fp8(torch.empty(shape, dtype=torch.bfloat16), granularity="token")
+    ((name, traits),) = selections
+    assert traits.get("m") == (shape[0] if len(shape) == 2 else None)
+    expected = major >= 10 and len(shape) == 2 and shape[0] <= 64
+    assert (name == PER_TOKEN) is expected
+
+
+@pytest.mark.parametrize(
+    "granularity,group_size,scale_encoding",
+    [
+        ("token_group", 128, "float32"),
+        ("token_group", 128, "ue8m0"),
+        ("token_group", 32, "ue8m0"),
+        ("block", None, "float32"),
+    ],
+)
+def test_other_granularities_ignore_the_row_count(
+    arch, monkeypatch, granularity, group_size, scale_encoding
+):
+    """No other quantization.fp8_with_scale kernel bounds rows: a 2-D input
+    (with ``m``) selects what the same row as a 3-D input (no ``m``) does."""
+    selections = _quantizer_selections(monkeypatch)
+    for shape in [(1, 4096), (1, 1, 4096)]:
+        quantize_fp8(
+            torch.empty(shape, dtype=torch.bfloat16),
+            granularity=granularity,
+            group_size=group_size,
+            block_size=(128, 128) if granularity == "block" else None,
+            scale_encoding=scale_encoding,
+        )
+    (with_m, traits), (without_m, _) = selections
+    assert traits["m"] == 1 and with_m == without_m
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_the_triton_quantizer_launches_as_asked(arch, monkeypatch, enable_pdl):
+    """quantize_fp8's ``enable_pdl`` reaches the launch; one program per row."""
+    recorder = _LaunchRecorder()
+    monkeypatch.setattr(quant_triton, "_fp8_token_quantize_kernel", recorder)
+    x = torch.empty(8, 4096, dtype=torch.bfloat16)
+    codes, scales = quantize_fp8(x, granularity="token", enable_pdl=enable_pdl)
+    (launch,) = recorder.launches
+    assert launch["grid"] == (8,)
+    assert launch["kwargs"]["ENABLE_PDL"] is enable_pdl
+    assert launch["kwargs"].get("launch_pdl", False) is enable_pdl
+    assert codes.dtype == FP8 and tuple(scales.shape) == (8, 1)

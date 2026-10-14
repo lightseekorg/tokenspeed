@@ -157,12 +157,6 @@ _KERNELS_WITH_FUSED_BIAS: frozenset[str] = frozenset(
     }
 )
 
-# Up to this many 16-bit rows, ``quant="fp8"`` without ``A_scales`` quantizes
-# them per token with the one-launch Triton quantizer (``fp8_quantize_per_token``,
-# about a quarter of TRT-LLM's launch on GB200 at decode rows); above it with
-# the registered token quantizer (TRT-LLM's on NVIDIA arch 10).
-_TRITON_TOKEN_FP8_MAX_M = 64
-
 # Kernels that accept an ``enable_pdl`` kwarg for Programmatic Dependent Launch.
 _KERNELS_WITH_PDL: frozenset[str] = frozenset(
     {
@@ -369,8 +363,7 @@ def mm(
         B: Weight matrix.
         A_scales: Activation scales. With ``quant="fp8"``, None for BF16/FP16
             ``A`` quantizes it per token here before the call (FP8 E4M3, one
-            FP32 scale per row; on NVIDIA up to 64 rows by the Triton
-            quantizer, otherwise by the registered token quantizer).
+            FP32 scale per row, by ``quantize_fp8(granularity="token")``).
         B_scales: Weight scales (layout depends on quant type).
         bias: Optional bias vector of shape ``[N]`` added to the
             output.  When the selected kernel supports a fused bias
@@ -541,14 +534,7 @@ def mm(
         and A.dtype != _fp8_dtype
         and B_scales is not None
     ):
-        if M <= _TRITON_TOKEN_FP8_MAX_M and current_platform().is_nvidia:
-            from tokenspeed_kernel.ops.quantization.triton import (
-                fp8_quantize_per_token,
-            )
-
-            A, A_scales = fp8_quantize_per_token(A)
-        else:
-            A, A_scales = quantize_fp8(A, granularity="token")
+        A, A_scales = quantize_fp8(A, granularity="token", enable_pdl=enable_pdl)
 
     kernel_args = (A, B, A_scales, B_scales, out_dtype)
     kernel_kwargs: dict[str, object] = {

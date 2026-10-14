@@ -264,6 +264,10 @@ def _quantize_fp8_dynamic(
         "granularity": granularity_trait,
         "scale_encoding": scale_encoding,
     }
+    if x.ndim == 2:
+        # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
+        # without one ignore it; a kernel with one never gets other ranks.
+        traits["m"] = x.shape[0]
     signature = format_signature(x=dense_tensor_format(x.dtype))
     kernel = select_kernel(
         "quantization",

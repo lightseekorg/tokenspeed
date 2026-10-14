@@ -520,7 +520,7 @@ def _stand_ins(monkeypatch, calls, op_scale_shape="M1"):
         codes = (x.float() / scale).clamp(-448, 448).to(FP8)
         return codes, scale if op_scale_shape == "M1" else scale.squeeze(-1)
 
-    def fp8_quantize_per_token(x):
+    def fp8_quantize_per_token(x, enable_pdl):
         scale = x.float().abs().amax(-1, keepdim=True) / 448.0
         return (x.float() / scale).clamp(-448, 448).to(FP8), scale
 
@@ -629,7 +629,7 @@ def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
     calls, quantized = [], []
 
     def quantizer(name):
-        def quantize(x):
+        def quantize(x, enable_pdl=None):
             quantized.append((name, x))
             x_scale = x.float().abs().amax(-1, keepdim=True) / 448.0
             return (x.float() / x_scale).clamp(-448, 448).to(FP8), x_scale

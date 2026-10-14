@@ -19,7 +19,7 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -264,11 +264,15 @@ def _fp8_token_quantize_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-def fp8_quantize_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def fp8_quantize_per_token(
+    x: torch.Tensor, enable_pdl: bool | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize the rows of ``x`` to FP8 E4M3 with one FP32 scale each, in one launch.
 
     Args:
         x: ``[M, K]`` BF16 or FP16 activations with a contiguous last axis.
+        enable_pdl: Launch with Programmatic Dependent Launch (Hopper+); None
+            takes the platform setting.
 
     Returns:
         ``(codes, scales)``: contiguous ``[M, K]`` FP8 E4M3 codes and FP32
@@ -287,7 +291,7 @@ def fp8_quantize_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     if m == 0:
         return codes, scales
     block = triton.next_power_of_2(k)
-    enable_pdl = pdl_enabled()
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     _fp8_token_quantize_kernel[(m,)](
         x,
         codes,
@@ -598,6 +602,60 @@ def triton_quantize_fp8_with_scale(
         f"with group_size 32 or 128; got granularity={granularity!r}, "
         f"group_size={group_size}."
     )
+
+
+# Up to this many rows, fp8_quantize_per_token takes about a third of the
+# vendor token quantizer's time on GB200.
+_FP8_PER_TOKEN_MAX_M = 64
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_per_token",
+    solution="triton",
+    # SM100 and newer, where the per-token FP8 GEMMs that take its output run.
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "m_max": frozenset({_FP8_PER_TOKEN_MAX_M}),
+        "granularity": frozenset({"token"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def triton_quantize_fp8_per_token(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``quantize_fp8(x, granularity="token")`` by ``fp8_quantize_per_token``.
+
+    Selected for a 2-D ``x`` of at most 64 rows (the ``m`` trait).
+
+    Args:
+        x: ``[M, K]`` BF16 or FP16 activations with a contiguous last axis.
+        granularity: Must be ``"token"``.
+        group_size: Must be None; a token is one group.
+        scale_encoding: Must be ``"float32"``.
+        enable_pdl: Launch with Programmatic Dependent Launch.
+
+    Returns:
+        FP8 E4M3 ``[M, K]`` codes and FP32 ``[M, 1]`` dequant scales.
+    """
+    if granularity != "token" or group_size is not None or scale_encoding != "float32":
+        raise ValueError(
+            "the per-token FP8 quantizer takes token granularity with float32 "
+            f"scales, got granularity={granularity!r}, group_size={group_size}, "
+            f"scale_encoding={scale_encoding!r}"
+        )
+    return fp8_quantize_per_token(x, enable_pdl=enable_pdl)
 
 
 @triton.jit
