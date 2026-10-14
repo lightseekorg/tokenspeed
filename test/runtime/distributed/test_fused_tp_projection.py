@@ -158,8 +158,14 @@ def _worker(rank, world_size, rendezvous):
         129,
         256,
         257,
+        383,
+        384,
+        385,
         512,
         513,
+        639,
+        640,
+        641,
         1024,
         1025,
         2048,
@@ -207,7 +213,9 @@ def _worker(rank, world_size, rendezvous):
         assert int(state.ready[0]) - epoch == (2 if max(counts) > 0 else 0)
         if max(counts) > 0:
             rows = max(counts)
-            bucket = max(32, 1 << (rows - 1).bit_length())
+            bucket = (
+                32 if rows <= 32 else 64 if rows <= 64 else (rows + 127) // 128 * 128
+            )
             gathered, _ = baseline[0].comm_backend.projection_all_gather(
                 x, rows, False, baseline[0].projection_workspace
             )
@@ -237,8 +245,10 @@ def _worker(rank, world_size, rendezvous):
         ((64,) * 4, False),
         ((0, 128), False),
         ((129, 255, 128, 0), False),
-        ((257, 512, 33, 1), False),
+        ((257, 384, 33, 0), False),
+        ((385, 512, 1, 0), False),
         ((513, 640, 0, 129), False),
+        ((641, 768, 129, 0), False),
         ((1025, 1024, 0, 1), False),
         ((2048, 1536, 0, 1), False),
     )
@@ -321,26 +331,23 @@ def _worker(rank, world_size, rendezvous):
     torch.testing.assert_close(
         retained, expected[(32,) * world_size][0][0], rtol=0, atol=0
     )
-    prepare_dp_linear_communication(candidate, 32, torch.bfloat16, AutoBackend())
-    counts = (32,) * world_size
-    inputs[counts].copy_(source[counts][1])
-    torch.testing.assert_close(
-        candidate[1](inputs[counts], ctx=contexts[counts])[0],
-        expected[counts][1][1],
-        rtol=0,
-        atol=0,
-    )
-    release_dp_linear_communication(candidate)
-    prepare_dp_linear_communication(candidate, 64, torch.bfloat16, AutoBackend())
-    counts = (64,) * world_size
-    inputs[counts].copy_(source[counts][2])
-    torch.testing.assert_close(
-        candidate[0](inputs[counts], ctx=contexts[counts])[0],
-        expected[counts][2][0],
-        rtol=0,
-        atol=0,
-    )
-    release_dp_linear_communication(candidate)
+    # Reprepare below/at the dispatch cutoff and at a non-power-of-two capacity.
+    for capacity, counts, sample, layer in (
+        (32, (32,) * world_size, 1, 1),
+        (64, (64,) * world_size, 2, 0),
+        (640, counts_for_group((513, 640, 0, 129)), 2, 0),
+    ):
+        prepare_dp_linear_communication(
+            candidate, capacity, torch.bfloat16, AutoBackend()
+        )
+        inputs[counts].copy_(source[counts][sample])
+        torch.testing.assert_close(
+            candidate[layer](inputs[counts], ctx=contexts[counts])[0],
+            expected[counts][sample][layer],
+            rtol=0,
+            atol=0,
+        )
+        release_dp_linear_communication(candidate)
     dist.destroy_process_group()
 
 

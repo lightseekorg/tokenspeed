@@ -234,7 +234,12 @@ Its peer-memory transport requires a node-local group. Cross-node groups retain
 the ordinary collectives. Fusion is enabled automatically for eligible TP2 and
 TP4 projections when the maximum physical owner count is at least 64.
 Batch-invariant collectives retain the ordinary path. Row buckets select the
-prepared kernel variant independently of that threshold.
+prepared kernel variant independently of that threshold. Buckets are 32, 64,
+then multiples of the 128-row GEMM tile. For larger batches, rounding adds fewer
+than 128 rows beyond the maximum owner count and keeps owner boundaries
+tile-aligned. Unequal owners still pad to the shared bucket.
+All variants up to the rounded workspace capacity compile and warm before use;
+actual owner counts remain runtime inputs, including during graph replay.
 Preparation allocates fused state only for TP sizes enabled in automatic dispatch
 and capacities that can reach their minimum row count. Direct kernel APIs may
 support additional TP sizes without allocating their state in ordinary serving.

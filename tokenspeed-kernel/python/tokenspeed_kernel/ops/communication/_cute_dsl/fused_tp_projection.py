@@ -32,6 +32,15 @@ from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection_kernel im
 )
 
 
+def _row_bucket(rows: int) -> int:
+    """Keep small shared tiles; align larger owners to whole 128-row tiles."""
+    if rows <= 32:
+        return 32
+    if rows <= 64:
+        return 64
+    return (rows + 127) // 128 * 128
+
+
 class FusedTPProjectionState:
     """Collectively prepare a TP2/4/8 projection before graph capture.
 
@@ -42,7 +51,8 @@ class FusedTPProjectionState:
         input_size: Full input channel count, divisible by 128.
         output_size: Padded output width, divisible by group size times 128.
 
-    Power-of-two row buckets share storage and epochs and compile before use.
+    Row buckets of 32, 64, and multiples of 128 share storage and epochs and
+    compile before use.
     Sequential layers share this storage, but supply their own weights to run.
     Concurrent models/streams require separate states. No layer weight or final
     output pointer is retained. Call close collectively after destroying graphs.
@@ -78,7 +88,7 @@ class FusedTPProjectionState:
         self.shard_size = output_size // self.world_size
         self.closed = False
         self.max_rows = max_rows
-        capacity = max(32, 1 << (max_rows - 1).bit_length())
+        capacity = _row_bucket(max_rows)
         self.a = symm_mem.empty(
             (capacity * self.world_size, input_size),
             dtype=torch.float8_e4m3fn,
@@ -152,7 +162,8 @@ class FusedTPProjectionState:
                     ),
                 ),
             )
-            for rows in (1 << exponent for exponent in range(5, capacity.bit_length()))
+            for rows in (32, 64, *range(128, capacity + 1, 128))
+            if rows <= capacity
         }
         self.peer_ready, self.peer_ack, self.peer_input_flags = (
             tuple(from_dlpack(t, assumed_align=16) for t in peers)
@@ -240,7 +251,7 @@ class FusedTPProjectionState:
         ):
             raise ValueError("Fused TP projection counts exceed prepared capacity")
         rows = owner_rows[self.rank]
-        bucket = max(32, 1 << (max(owner_rows) - 1).bit_length())
+        bucket = _row_bucket(max(owner_rows))
         for tensor, shape, dtype in (
             (inputs, (rows, self.input_size), torch.bfloat16),
             (weight, (self.shard_size, self.input_size), torch.float8_e4m3fn),

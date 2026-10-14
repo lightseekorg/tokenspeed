@@ -50,10 +50,9 @@ shared-memory capacity. Accumulator and epilogue register budgets remain 256
 and 128. One lane per peer in CTA zero acquires the final acknowledgements;
 other warps can retire while stream ordering protects the next scratch reuse.
 
-Two, four, or eight node-local GB300 GPUs use a common power-of-two row bucket,
-at least 32,
-aligned widths and a fixed, fully resident grid on idle GPUs. Input staging
-zero-fills each owner's row tail inside this kernel, and the final copy writes
+Two, four, or eight node-local GB300 GPUs use a common row bucket of 32, 64,
+or a multiple of 128, aligned widths and a fixed, fully resident grid on idle GPUs.
+Input staging zero-fills each owner's row tail inside this kernel, and the final copy writes
 only that owner's actual rows. Empty owners still compute their weight shard
 and participate in every epoch. Remote stores split tiles at owner boundaries.
 Concurrent workspace use and arbitrary competing collectives are unsupported.
@@ -2173,7 +2172,9 @@ class FusedTPProjectionKernel:
         # weight shard and strided N tiles. Smaller row buckets put multiple
         # owners in one GEMM tile, so those N tiles can have different producer
         # CTAs. Acquire each distinct producer before reading its output.
-        assert rows >= 32 and rows & (rows - 1) == 0
+        # Small buckets divide one M tile; larger owners contain whole M tiles.
+        # This keeps owner boundaries aligned for remote stores and producer waits.
+        assert rows in (32, 64) or (rows >= 128 and rows % 128 == 0)
         world = len(peer_ready)
         shard_width = width // world
         n_tiles = shard_width // 128
@@ -2185,7 +2186,9 @@ class FusedTPProjectionKernel:
         ) // producer_groups
         # TP2 at the 32-row bucket has one partially filled M tile.
         m_tiles = cute.ceil_div(world * rows, self.cta_tile_shape_mnk[0])
-        # Column producer indices repeat after max(1, 128 / rows) steps.
+        # For whole-tile owners, advancing by producer_groups N tiles shifts
+        # the producer by blocks * (rows / 128), hence wraps to the same CTA.
+        # Small buckets repeat after max(1, 128 / rows) such steps.
         # Owners larger than a GEMM tile also need each local M-tile producer.
         for row_tile in cutlass.range_constexpr(max(1, rows // 128)):
             if row_tile * 128 < valid_rows:
