@@ -1238,8 +1238,13 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
-    if config.kvp_size > 1 and (
-        model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+    if (
+        config.kvp_size > 1
+        # V4.1 validates KVP in its config and specialized recipe.
+        and softmax_attn.backend_name != "deepseek_v41"
+        and (
+            model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
+        )
     ):
         _validate_mla_dcp_backend(
             target_full_attn_backend_name, model_config.attention_arch

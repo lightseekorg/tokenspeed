@@ -318,6 +318,8 @@ def _dsv4_sparse_attention_kernel(
     lens_ptr,
     sink_ptr,
     out_ptr,
+    lse_ptr,
+    num_heads,
     q_stride_token,
     q_stride_head,
     kv_stride_row,
@@ -341,8 +343,12 @@ def _dsv4_sparse_attention_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    max_logit = tl.load(sink_ptr + head_idx).to(tl.float32)
-    denominator = tl.full((), 1.0, tl.float32)
+    if sink_ptr is not None:
+        max_logit = tl.load(sink_ptr + head_idx).to(tl.float32)
+        denominator = tl.full((), 1.0, tl.float32)
+    else:
+        max_logit = tl.full((), -float("inf"), tl.float32)
+        denominator = tl.full((), 0.0, tl.float32)
     accumulator = tl.zeros((BLOCK_DIM,), tl.float32)
     valid_len = tl.minimum(tl.maximum(tl.load(lens_ptr + token_idx), 0), TOPK)
     topk_offsets = tl.arange(0, BLOCK_TOPK)
@@ -366,8 +372,10 @@ def _dsv4_sparse_attention_kernel(
         logits = tl.where(valid, logits, -float("inf"))
         block_max = tl.max(logits, axis=0)
         next_max = tl.maximum(max_logit, block_max)
-        previous_scale = tl.exp(max_logit - next_max)
-        probabilities = tl.exp(logits - next_max)
+        # Empty shards/tiles must not introduce exp(-inf - -inf).
+        safe_max = tl.where(next_max == -float("inf"), 0.0, next_max)
+        previous_scale = tl.exp(max_logit - safe_max)
+        probabilities = tl.exp(logits - safe_max)
         probabilities = tl.where(valid, probabilities, 0.0)
         accumulator = accumulator * previous_scale + tl.sum(
             probabilities[:, None] * kv,
@@ -376,6 +384,11 @@ def _dsv4_sparse_attention_kernel(
         denominator = denominator * previous_scale + tl.sum(probabilities, axis=0)
         max_logit = next_max
 
+    if lse_ptr is not None:
+        logsumexp = tl.where(
+            denominator > 0.0, max_logit + tl.log(denominator), -float("inf")
+        )
+        tl.store(lse_ptr + token_idx * num_heads + head_idx, logsumexp)
     output = tl.where(denominator > 0.0, accumulator / denominator, 0.0)
     tl.store(
         out_ptr + token_idx * out_stride_token + head_idx * out_stride_head + dim,
@@ -402,7 +415,8 @@ def _dsv4_sparse_attention_kernel(
         "head_dim": frozenset({DEEPSEEK_V4_HEAD_DIM}),
         "cache_layout": frozenset({"dense_workspace"}),
         "metadata_dtypes": frozenset({torch.int32, torch.int64}),
-        "sinks": frozenset({True}),
+        "sinks": frozenset({True, False}),
+        "return_lse": frozenset({True, False}),
     },
     priority=Priority.PORTABLE,
 )
@@ -411,9 +425,10 @@ def triton_dsv4_prefill(
     kv: torch.Tensor,
     indices: torch.Tensor,
     lens: torch.Tensor,
-    attn_sink: torch.Tensor,
+    attn_sink: torch.Tensor | None,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run selected shared-KV attention for DeepSeek V4 geometry."""
 
@@ -426,7 +441,7 @@ def triton_dsv4_prefill(
     lens = lens.reshape(-1).contiguous()
     if indices_2d.shape[0] != q.shape[0] or lens.shape[0] != q.shape[0]:
         raise ValueError("selected-attention metadata must have one row per query")
-    if attn_sink.numel() < q.shape[1]:
+    if attn_sink is not None and attn_sink.numel() < q.shape[1]:
         raise ValueError("attention sink must provide one value per query head")
 
     output = out if out is not None else torch.empty_like(q)
@@ -437,6 +452,8 @@ def triton_dsv4_prefill(
         lens,
         attn_sink,
         output,
+        lse,
+        q.shape[1],
         q.stride(0),
         q.stride(1),
         kv_2d.stride(0),
