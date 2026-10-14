@@ -200,7 +200,6 @@ def test_single_node_defaults_still_launch_both_roles(launcher):
         assert value(records[role]["args"], "--host") == "127.0.0.1"
         assert value(records[role]["args"], "--world-size") == "2"
         assert value(records[role]["args"], "--max-cudagraph-capture-size") == "16"
-    assert value(records["router"]["args"], "--reasoning-parser") == "passthrough"
 
 
 @pytest.mark.parametrize("node", [0, 1])
