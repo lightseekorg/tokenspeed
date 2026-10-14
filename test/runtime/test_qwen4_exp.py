@@ -96,6 +96,7 @@ from tokenspeed.runtime.layers.hyperconnection import (
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.ple_lookup import PLELookup
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
     QWEN4_EXP_PLE_CACHE_GROUP,
@@ -162,6 +163,27 @@ def test_qwen4_exp_nextn_preserves_quantized_mtp_config() -> None:
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
 
+def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
+    mtp_linear_modules = [
+        f"mtp.layers.0.{module}"
+        for module in (
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.shared_expert.gate_proj",
+            "mlp.shared_expert.up_proj",
+            "mlp.shared_expert.down_proj",
+        )
+    ]
+    # Quark lists linear modules only; the fused MTP experts are never named.
+    excluded = Mxfp4Config(ignored_layers=["lm_head", *mtp_linear_modules])
+    assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
+
+    quantized = Mxfp4Config(ignored_layers=["lm_head"])
+    assert qwen4_exp_nextn._resolve_mtp_quant_config(quantized) is quantized
+
+
 def test_qwen4_exp_gdn_norm_uses_sigmoid_output_gate() -> None:
     norm = _Qwen4ExpRMSNormGated(hidden_size=2, eps=1e-6)
     value = torch.tensor([[3.0, 4.0]])
@@ -195,6 +217,18 @@ def test_qwen4_exp_gdn_norm_fused_matches_eager(dtype: torch.dtype) -> None:
     torch.testing.assert_close(
         norm(x, z_wide[:, 1]), reference(x, z_wide[:, 1]), rtol=2e-2, atol=2e-2
     )
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=_requires_cuda)])
+def test_qwen4_exp_gdn_norm_normalizes_each_head_of_a_row(device: str) -> None:
+    torch.manual_seed(5)
+    heads, head_v_dim = 3, 128
+    norm = _Qwen4ExpRMSNormGated(head_v_dim, 1e-6).to(device)
+    x = torch.randn(9, heads * head_v_dim, device=device)
+    z = torch.randn_like(x)
+    per_head = norm(x.view(-1, head_v_dim), z.view(-1, head_v_dim)).view_as(x)
+
+    torch.testing.assert_close(norm(x, z), per_head, rtol=0, atol=0)
 
 
 def test_qwen4_exp_selects_checkpoint_output_gate_type() -> None:
@@ -1848,11 +1882,12 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].entry_stride_tokens == 1
     assert groups[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].block_granularity == 64
     assert setup.spec.memory_plan.prefix_granularity == 256
+    # A State group's blocks are its two state slots and span no tokens.
     assert all(
         setup.spec.memory_plan.prefix_granularity % group.block_granularity == 0
         for group in groups.values()
+        if group.family != "state"
     )
-    assert groups[QWEN4_EXP_PLE_CACHE_GROUP].block_granularity == 256
     assert fields[context_field].dtype == "int64"
     selected, consumers = select_layer_fields(
         setup.spec.memory_plan.fields,

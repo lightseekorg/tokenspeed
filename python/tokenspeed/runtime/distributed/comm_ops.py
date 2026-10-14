@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.communication import (
 
 from tokenspeed.runtime.distributed.comm_backend import (
     CommBackend,
+    CommWork,
     Group,
     get_global_backend,
 )
@@ -241,10 +242,6 @@ def prepare_all_reduce_buffers(
     *,
     staged_max_numel: int,
     producer_direct_max_numel: int,
-    attnres_max_numel: int,
-    attnres_max_rows: int,
-    enable_lamport: bool,
-    moe_tail_max_rows: int,
     dtype: torch.dtype,
     backend: CommBackend | None,
 ) -> bool:
@@ -254,11 +251,6 @@ def prepare_all_reduce_buffers(
         group: Global ranks participating in the reductions.
         staged_max_numel: Maximum ordinary all-reduce payload in elements.
         producer_direct_max_numel: Maximum producer-direct payload in elements.
-        attnres_max_numel: Maximum fused AttnRes payload in elements.
-        attnres_max_rows: Maximum fused AttnRes payload in rows.
-        enable_lamport: Allow Lamport for eligible producer-direct payloads.
-        moe_tail_max_rows: Maximum rows in the reusable symmetric result buffer;
-            zero skips its allocation.
         dtype: Element type shared by the prepared paths.
         backend: Backend to prepare, or ``None`` to use the global backend.
 
@@ -272,10 +264,6 @@ def prepare_all_reduce_buffers(
         group,
         staged_max_numel=staged_max_numel,
         producer_direct_max_numel=producer_direct_max_numel,
-        attnres_max_numel=attnres_max_numel,
-        attnres_max_rows=attnres_max_rows,
-        enable_lamport=enable_lamport,
-        moe_tail_max_rows=moe_tail_max_rows,
         dtype=dtype,
     )
 
@@ -360,6 +348,22 @@ def all_gather_single(
     if backend is None:
         backend = get_global_backend()
     backend.all_gather_single(output, input, group)
+
+
+def all_gather_single_async(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> CommWork:
+    """Start :func:`all_gather_single` and return its work; ``wait()`` on it
+    orders the current stream after the collective. To overlap the shared
+    collectives over the same ranks, pass a backend on named process groups
+    (``CommBackend.for_named_groups``): collectives sharing a communicator
+    run in issue order."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.all_gather_single_async(output, input, group)
 
 
 def reduce_scatter(

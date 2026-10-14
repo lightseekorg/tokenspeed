@@ -39,7 +39,7 @@ class DisaggDecodeExecutor:
         self.kv_manager = MooncakeKVManagerDecode(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
-        self._admissions: dict[str, tuple[int, int]] = {}
+        self._admissions: dict[str, int] = {}
         self._remote_cache_slots: dict[str, int] = {}
         self._remote_cached_tokens: dict[str, int] = {}
         self._remote_bootstrap_logprobs: dict[str, float | None] = {}
@@ -70,6 +70,7 @@ class DisaggDecodeExecutor:
                 request_row=index,
                 prefix_len=prefix_len,
                 prompt_len=int(op.prefill_lengths[index]),
+                state_prefix_cached=bool(op.state_prefix_cached[index]),
             )
             pending.append(
                 (
@@ -83,10 +84,7 @@ class DisaggDecodeExecutor:
         # Validate every row before publishing any destination manifest. A later
         # invalid row must not leave an earlier Prefill sender waiting forever.
         for request_id, receiver, request_pool_index, block_manifest in pending:
-            self._admissions[request_id] = (
-                request_pool_index,
-                block_manifest.prefix_len,
-            )
+            self._admissions[request_id] = request_pool_index
             receiver.prefill(block_manifest=block_manifest)
 
     def register(
@@ -150,11 +148,9 @@ class DisaggDecodeExecutor:
                     cached_tokens,
                     bootstrap_logprob,
                 ) = self.kv_manager.pop_prefill_metadata(bootstrap_room)
-                request_pool_index, local_cached_tokens = self._admissions[req_id]
+                request_pool_index = self._admissions[req_id]
                 self._remote_cache_slots[req_id] = request_pool_index
-                self._remote_cached_tokens[req_id] = max(
-                    local_cached_tokens, cached_tokens
-                )
+                self._remote_cached_tokens[req_id] = cached_tokens
                 self._remote_bootstrap_logprobs[req_id] = bootstrap_logprob
                 if spec_candidate_ids is not None:
                     self._remote_spec_candidate_ids[req_id] = (

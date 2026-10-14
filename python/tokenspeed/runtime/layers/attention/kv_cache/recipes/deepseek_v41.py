@@ -223,7 +223,6 @@ class DeepseekV41Recipe(CacheRecipe):
                 replayable=windows[gid] is not None,
                 family="history",
                 transfer_policy=None,
-                checkpoint_granularity=None,
             )
             for gid, (rows, stride) in V41_GROUP_GEOMETRY.items()
         ]

@@ -29,8 +29,8 @@
 namespace tokenspeed {
 
 // The per-request cache working-set model: the decode reservation, the
-// overlap-protected step, a snapshot-state group's checkpoints and banked
-// growth, a sliding group's lookback and resident window. Two callers must
+// overlap-protected step, a State group's two slots, a sliding group's
+// lookback and resident window. Two callers must
 // agree on it -- the Python recipes size a pool from it before any pool
 // exists, and the Scheduler bounds a single request against the pool they
 // sized -- so it lives here once and reads only SchedulerConfig fields that
@@ -68,11 +68,15 @@ private:
         std::int64_t cache_blocks_per_lcm_block{};
         // Prefix-match policy, the same one the coordinator's matcher answers.
         bool prefix_closed{};
+        // The most blocks a sliding window needs behind a boundary
+        // (CacheCoordinator::SlidingWindowBlocks over every alignment); 0 for
+        // other groups.
         std::int64_t lookback_pages{};
     };
 
     std::int64_t decodeWidth() const;
     std::int64_t protectedTokens() const;
+    std::int64_t tailHandoverBlocks(std::size_t group_index) const;
 
     SchedulerConfig config_;
     std::vector<Group> groups_;

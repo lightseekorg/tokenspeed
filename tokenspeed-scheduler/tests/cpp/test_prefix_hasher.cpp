@@ -106,6 +106,26 @@ TEST(HashPrefixPageTest, PriorHashChangesOutput) {
     EXPECT_NE(no_prior, with_prior);
 }
 
+// A tail hash (hash@T over the page's first T mod P tokens, same prior) is
+// the same function as the page hash; the token_count frame keeps it apart
+// from the full page and from every other offset under that prior.
+TEST(HashPrefixPageTest, TailHashesAreDistinctFromThePageAndFromEachOther) {
+    const std::vector<std::int32_t> page = {1, 2, 3, 4};
+    const std::string prior = HashPrefixPage(Tokens({9, 9, 9, 9}), "");
+    const std::string full = HashPrefixPage(Tokens(page), prior);
+    std::vector<std::string> tails;
+    for (std::size_t t = 1; t < page.size(); ++t) {
+        tails.push_back(HashPrefixPage(token_span(page.data(), t), prior));
+        EXPECT_NE(tails.back(), full);
+        EXPECT_NE(tails.back(), HashPrefixPage(token_span(page.data(), t), "")) << "the prior frames the tail";
+    }
+    EXPECT_NE(tails[0], tails[1]);
+    EXPECT_NE(tails[1], tails[2]);
+    // The page's own chain hash is what a tail's prior names, so a tail of
+    // the next page never collides with a tail of this one.
+    EXPECT_NE(HashPrefixPage(token_span(page.data(), 1), full), tails[0]);
+}
+
 TEST(HashPrefixPageTest, EmptyExtraKeysEqualsTwoArgForm) {
     std::vector<std::int32_t> toks = {1, 2, 3};
     std::vector<std::string> empty;

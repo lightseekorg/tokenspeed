@@ -85,7 +85,6 @@ CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
 CUDA_OBJS_DIR = THIRDPARTY_DIR / "cuda" / "objs"
 
 # JIT kernels source directory (no pre-compilation, just need sources available)
-JIT_CSRC_DIR = THIRDPARTY_DIR / "jit_kernel" / "csrc"
 
 CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 NVCC = os.environ.get("FLASHINFER_NVCC", f"{CUDA_HOME}/bin/nvcc")

@@ -204,16 +204,15 @@ class GroupSpecsFromLayerTypesTest(unittest.TestCase):
         self.assertEqual(state.family, "state")
         self.assertEqual(state.retention, "full_history")
         self.assertIsNone(state.sliding_window_tokens)
-        # Snapshot-state groups declare checkpoint_granularity, not rows.
-        self.assertEqual(state.checkpoint_granularity, 16)
+        # State groups declare no rows and cover no token span.
         self.assertIsNone(state.rows_per_page)
         self.assertIsNone(state.entry_stride_tokens)
-        self.assertEqual(state.block_granularity, 16)
+        with self.assertRaises(TypeError):
+            _ = state.block_granularity
         with self.assertRaises(TypeError):
             _ = state.page_size
         full = by_id["full_attention"]
         self.assertEqual(full.family, "history")
-        self.assertIsNone(full.checkpoint_granularity)
         self.assertEqual(full.page_size, 16)
         self.assertEqual(full.block_granularity, 16)
 
@@ -441,8 +440,8 @@ class BroadcastWindowAsymmetryTest(unittest.TestCase):
 
 
 class CacheGroupSpecShapeTest(unittest.TestCase):
-    """A spec declares exactly one geometry shape: row geometry (paged KV)
-    or checkpoint_granularity (snapshot state)."""
+    """A history spec declares row geometry (paged KV); a state spec declares
+    no span at all."""
 
     def test_row_geometry_shape(self):
         spec = CacheGroupSpec(
@@ -455,89 +454,24 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
         )
         self.assertEqual(spec.page_size, 64)
         self.assertEqual(spec.block_granularity, 64)
-        self.assertIsNone(spec.checkpoint_granularity)
 
-    def test_checkpoint_shape(self):
+    def test_state_shape_has_no_span(self):
         spec = CacheGroupSpec(
             group_id="state",
             retention="full_history",
             sliding_window_tokens=None,
             family="state",
-            checkpoint_granularity=64,
             replayable=False,
         )
-        self.assertEqual(spec.block_granularity, 64)
+        with self.assertRaises(TypeError):
+            _ = spec.block_granularity
         with self.assertRaises(TypeError):
             _ = spec.page_size
 
-    def test_shapes_are_mutually_exclusive(self):
-        with self.assertRaises(ValueError):
-            CacheGroupSpec(
-                group_id="state",
-                retention="full_history",
-                rows_per_page=16,
-                entry_stride_tokens=1,
-                sliding_window_tokens=None,
-                family="state",
-                checkpoint_granularity=16,
-                replayable=False,
-            )
-
-    def test_missing_shape_raises(self):
-        with self.assertRaises(ValueError):
-            CacheGroupSpec(
-                group_id="kv",
-                retention="full_history",
-                sliding_window_tokens=None,
-                replayable=False,
-            )
-
-    def test_partial_row_geometry_raises(self):
-        with self.assertRaises(ValueError):
-            CacheGroupSpec(
-                group_id="kv",
-                retention="full_history",
-                rows_per_page=16,
-                sliding_window_tokens=None,
-                replayable=False,
-            )
-
-    def test_checkpoint_requires_state_family(self):
-        with self.assertRaises(ValueError):
-            CacheGroupSpec(
-                group_id="kv",
-                retention="full_history",
-                sliding_window_tokens=None,
-                family="history",
-                checkpoint_granularity=16,
-                replayable=False,
-            )
-
-    def test_nonpositive_geometry_raises(self):
-        with self.assertRaises(ValueError):
-            CacheGroupSpec(
-                group_id="kv",
-                retention="full_history",
-                rows_per_page=0,
-                entry_stride_tokens=1,
-                sliding_window_tokens=None,
-                replayable=False,
-            )
-        with self.assertRaises(ValueError):
-            CacheGroupSpec(
-                group_id="state",
-                retention="full_history",
-                sliding_window_tokens=None,
-                family="state",
-                checkpoint_granularity=0,
-                replayable=False,
-            )
-
-    def test_state_family_requires_checkpoint_shape(self):
+    def test_state_family_declares_no_rows(self):
         # Rows of token history -- V4's compressor tails included -- are a
-        # history group whatever their retention; the state family names the
-        # checkpoint shape and nothing else.
-        with self.assertRaisesRegex(ValueError, "checkpoint_granularity"):
+        # history group whatever their retention.
+        with self.assertRaisesRegex(ValueError, "no row geometry"):
             CacheGroupSpec(
                 group_id="v4.compressor",
                 retention="sliding_window",
@@ -559,17 +493,54 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
         self.assertEqual(spec.page_size, 64)
         self.assertEqual(spec.block_granularity, 64)
 
-    def test_state_family_rides_full_history(self):
+    def test_missing_row_geometry_raises(self):
+        with self.assertRaises(ValueError):
+            CacheGroupSpec(
+                group_id="kv",
+                retention="full_history",
+                sliding_window_tokens=None,
+                replayable=False,
+            )
+
+    def test_partial_row_geometry_raises(self):
+        with self.assertRaises(ValueError):
+            CacheGroupSpec(
+                group_id="kv",
+                retention="full_history",
+                rows_per_page=16,
+                sliding_window_tokens=None,
+                replayable=False,
+            )
+
+    def test_nonpositive_geometry_raises(self):
+        with self.assertRaises(ValueError):
+            CacheGroupSpec(
+                group_id="kv",
+                retention="full_history",
+                rows_per_page=0,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+                replayable=False,
+            )
+
+    def test_state_family_rides_full_history_and_is_never_replayed(self):
         # A checkpoint summarizes everything before it, so nothing in a state
-        # group ever slides out.
+        # group ever slides out, and nothing of it is regenerated by replay.
         with self.assertRaisesRegex(ValueError, "full_history"):
             CacheGroupSpec(
                 group_id="state",
                 retention="sliding_window",
                 sliding_window_tokens=256,
                 family="state",
-                checkpoint_granularity=64,
                 replayable=False,
+            )
+        with self.assertRaisesRegex(ValueError, "bounded replay"):
+            CacheGroupSpec(
+                group_id="state",
+                retention="full_history",
+                sliding_window_tokens=None,
+                family="state",
+                replayable=True,
             )
 
 
@@ -589,7 +560,9 @@ def _fake_pool(specs, *, packing: int) -> SimpleNamespace:
     # The declaration tests use an isolated spec module. The actual contract
     # validates the runtime class, so cross that boundary explicitly here.
     runtime_specs = tuple(RuntimeCacheGroupSpec(**asdict(spec)) for spec in specs)
-    prefix_granularity = math.lcm(*(spec.block_granularity for spec in specs))
+    prefix_granularity = math.lcm(
+        *(spec.block_granularity for spec in specs if spec.family == "history")
+    )
     contract = CacheRuntimeContract(
         prefix_granularity=prefix_granularity,
         num_lcm_blocks=1023,
@@ -637,9 +610,9 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         group_ids = {g.group_id for g in groups}
         self.assertEqual(group_ids, {"full_attention", "sliding_attention"})
 
-    def test_both_declaration_shapes_cross_the_bridge_as_block_granularity(self):
-        """The scheduler config carries no declaration shape: a checkpoint
-        spec and a row-geometry spec both arrive as a bare slot span."""
+    def test_both_families_cross_the_bridge_with_a_bare_slot_span(self):
+        """The scheduler config carries no declaration shape: a row-geometry
+        spec arrives as its slot span, a state spec as span 0 (no span)."""
         pool_to_cache_groups = self._import_converter()
 
         specs = _specs(
@@ -652,10 +625,9 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         groups = {g.group_id: g for g in pool_to_cache_groups(fake_pool)}
 
         state = groups["linear_attention"]
-        self.assertEqual(state.block_granularity, 16)
+        self.assertEqual(state.block_granularity, 0)
         self.assertFalse(hasattr(state, "rows_per_page"))
         self.assertFalse(hasattr(state, "entry_stride_tokens"))
-        self.assertFalse(hasattr(state, "checkpoint_granularity"))
         full = groups["full_attention"]
         self.assertEqual(full.block_granularity, 16)
 

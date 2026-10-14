@@ -34,41 +34,38 @@ import pickle
 import random
 import re
 import resource
-import shutil
 import subprocess
 import tempfile
-import uuid
+import threading
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
-from contextlib import contextmanager
-from dataclasses import dataclass
 from functools import lru_cache
-from io import BytesIO
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
-    Generic,
-    Literal,
     Protocol,
     TypeVar,
 )
-from urllib.parse import unquote, urlparse
 
 import numpy as np
 import psutil
 import pybase64
-import requests
 import torch
 import torch.distributed
 import torch.distributed as dist
 import zmq
-from PIL import Image
-from pydantic import BaseModel
 from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.metrics.func_timer import enable_func_timer
+from tokenspeed.runtime.utils.network import get_free_port
+
+if TYPE_CHECKING:
+    import uvicorn
+
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -238,166 +235,6 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-@dataclass
-class ImageData:
-    url: str
-    detail: Literal["auto", "low", "high"] | None = "auto"
-
-
-image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
-
-
-def is_jpeg_with_cuda(image_bytes: bytes = b"", gpu_image_decode: bool = True) -> bool:
-    """
-    Check three conditions:
-    1. whether CUDA is available.
-    2. whether input is recognized as JPEG.
-    3. whether GPU image decode is enabled.
-    """
-    if not current_platform().is_nvidia or not gpu_image_decode:
-        return False
-    if image_bytes != b"":
-        return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
-    return False
-
-
-def _load_image(
-    image_bytes: bytes = b"",
-    image_file: str = "",
-    gpu_image_decode: bool = True,
-) -> torch.Tensor | Image.Image:
-    """
-    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
-    otherwise fallback to decode with PIL on CPU and return a PIL Image.
-    """
-    if image_file != "":
-        image_bytes = get_image_bytes(image_file)
-    if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
-        try:
-            from torchvision.io import decode_jpeg
-
-            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
-            return image_tensor
-        except Exception as exc:
-            logger.warning(
-                f"Failed to decode JPEG on GPU, falling back to CPU. Error: {exc}"
-            )
-    return Image.open(BytesIO(image_bytes))
-
-
-def load_image(
-    image_file: Image.Image | str | ImageData | bytes,
-    gpu_image_decode: bool = True,
-) -> tuple[torch.Tensor | Image.Image, tuple[int, int] | None]:
-    """
-    Load image from multiple input formats, including:
-    ImageData, PIL Image, bytes, URL, file path, file:// URL, data URL, or base64.
-    """
-    if isinstance(image_file, ImageData):
-        image_file = image_file.url
-
-    image = None
-    image_size: tuple[int, int] | None = None
-    if isinstance(image_file, Image.Image):
-        image = image_file
-        image_size = (image.width, image.height)
-    elif isinstance(image_file, bytes):
-        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
-    elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
-    elif isinstance(image_file, str) and image_file.startswith("file://"):
-        image = _load_image(
-            image_file=unquote(urlparse(image_file).path),
-            gpu_image_decode=gpu_image_decode,
-        )
-    elif isinstance(image_file, str) and image_file.lower().endswith(
-        image_extension_names
-    ):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
-    elif isinstance(image_file, str) and image_file.startswith("data:"):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
-    elif isinstance(image_file, str):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
-    else:
-        raise ValueError(f"Invalid image: {image_file}")
-
-    return image, image_size
-
-
-def get_image_bytes(image_file: str | bytes) -> bytes:
-    """Normalize various image inputs into raw bytes."""
-    if isinstance(image_file, bytes):
-        return image_file
-    if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
-        try:
-            response.raise_for_status()
-            result = response.content
-        finally:
-            response.close()
-        return result
-    if image_file.startswith("file://"):
-        with open(unquote(urlparse(image_file).path), "rb") as f:
-            return f.read()
-    if image_file.startswith("/"):
-        with open(image_file, "rb") as f:
-            return f.read()
-    if image_file.lower().endswith(image_extension_names):
-        with open(image_file, "rb") as f:
-            return f.read()
-    if isinstance(image_file, str) and image_file.startswith("data:"):
-        _, encoded = image_file.split(",", 1)
-        return pybase64.b64decode(encoded, validate=True)
-    if isinstance(image_file, str):
-        return pybase64.b64decode(image_file, validate=True)
-    raise NotImplementedError(f"Invalid image: {image_file}")
-
-
-def load_audio(
-    audio_file: str | bytes,
-    sr: int | None = None,
-    mono: bool = True,
-) -> np.ndarray:
-    # Use soundfile directly; librosa delegates to it and is moving away from
-    # audio loading support.
-    import soundfile as sf
-    from scipy.signal import resample
-
-    if sr is None:
-        sr = 16000
-
-    if isinstance(audio_file, bytes):
-        audio, original_sr = sf.read(BytesIO(audio_file))
-    elif audio_file.startswith("data:"):
-        _, encoded = audio_file.split(",", 1)
-        audio, original_sr = sf.read(
-            BytesIO(pybase64.b64decode(encoded, validate=True))
-        )
-    elif audio_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
-        try:
-            response.raise_for_status()
-            audio, original_sr = sf.read(BytesIO(response.content))
-        finally:
-            response.close()
-    elif isinstance(audio_file, str):
-        audio, original_sr = sf.read(audio_file)
-    else:
-        raise ValueError(f"Invalid audio format: {audio_file}")
-
-    if original_sr != sr:
-        num_samples = int(len(audio) * float(sr) / original_sr)
-        audio = resample(audio, num_samples)
-
-    if mono and len(audio.shape) > 1:
-        audio = np.mean(audio, axis=1)
-
-    return audio
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -639,14 +476,6 @@ def get_zmq_socket(
     return socket
 
 
-def delete_directory(dirpath):
-    try:
-        # This will remove the directory and all its contents
-        shutil.rmtree(dirpath)
-    except OSError as e:
-        logger.warning(f"Failed to delete directory {dirpath!s}: {e.strerror!s}")
-
-
 # Temporary directory for prometheus multiprocess mode
 # Cleaned up automatically when this object is garbage collected
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -868,29 +697,6 @@ class MultiprocessingSerializer:
         return ForkingPickler.loads(data)
 
 
-def debug_timing(func):
-    def wrapper(*args, **kwargs):
-        if logger.isEnabledFor(logging.DEBUG):
-            tic = torch.cuda.Event(enable_timing=True)
-            toc = torch.cuda.Event(enable_timing=True)
-            tic.record()
-            result = func(*args, **kwargs)
-            toc.record()
-            toc.synchronize()  # Wait for the function to complete without synchronizing all ops on the GPU
-            elapsed = tic.elapsed_time(toc)
-            indices = kwargs.get("indices", args[1] if len(args) > 1 else None)
-            num_tokens = len(indices) if indices is not None else 0
-            throughput = num_tokens / elapsed * 1000 if elapsed > 0 else 0
-            logger.debug(
-                f"Transfer time: {elapsed!s} ms, throughput: {throughput!s} tokens/s",
-            )
-            return result
-        else:
-            return func(*args, **kwargs)
-
-    return wrapper
-
-
 def nullable_str(val: str):
     if not val or val == "None":
         return None
@@ -950,6 +756,53 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         server.run()
 
 
+def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
+    """Serve the engine's Prometheus /metrics endpoint on a daemon thread.
+
+    With --enable-metrics every engine process on this node writes to the
+    shared PROMETHEUS_MULTIPROC_DIR; this serves the aggregate from the
+    engine's main process, which otherwise has no HTTP surface (the gRPC
+    servicer speaks gRPC only). The daemon thread keeps the synchronous
+    launch path free of event-loop assumptions. The socket is bound eagerly
+    on the calling thread, so a bind failure degrades to an error log and
+    None — metrics must never take down serving — and the
+    allocate-then-rebind race stays closed. Returns the ``uvicorn.Server``
+    (poll ``started`` for readiness), or None when --enable-metrics is off or
+    the bind failed.
+    """
+    if not server_args.enable_metrics:
+        return None
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    host = server_args.metrics_host or server_args.host
+    port = server_args.metrics_port or get_free_port()
+
+    app = FastAPI()
+    add_prometheus_middleware(app)
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    try:
+        sock = config.bind_socket()
+    except SystemExit:
+        logger.error(
+            f"metrics server failed to bind {host!s}:{port!s}; "
+            "metrics endpoint disabled"
+        )
+        return None
+    server = uvicorn.Server(config)
+
+    def _serve():
+        try:
+            server.run(sockets=[sock])
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"metrics server stopped: {e!s}")
+
+    threading.Thread(target=_serve, daemon=True, name="engine-metrics-server").start()
+    logger.info(f"Prometheus metrics available at http://{host!s}:{port!s}/metrics")
+    return server
+
+
 def set_cuda_arch():
     platform = current_platform()
     if not platform.is_nvidia:
@@ -987,75 +840,6 @@ def log_info_on_rank0(logger, msg):
 
 
 T = TypeVar("T")
-
-
-class Withable(Generic[T]):
-    def __init__(self):
-        self._value: T | None = None
-
-    @property
-    def value(self) -> T:
-        return self._value
-
-    @contextmanager
-    def with_value(self, new_value: T):
-        if self._value is not None:
-            raise RuntimeError("Withable value is already set.")
-        self._value = new_value
-        try:
-            yield
-        finally:
-            if self._value is not new_value:
-                raise RuntimeError("Withable value changed while context was active.")
-            self._value = None
-
-
-def find_local_repo_dir(repo_id: str, revision: str | None = None) -> str | None:
-    import huggingface_hub as hf
-
-    # Build cache path
-    cache_path = os.path.join(
-        hf.constants.HF_HUB_CACHE,
-        hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
-    )
-
-    # Get revision from main ref if not specified
-    if not revision:
-        ref_path = os.path.join(cache_path, "refs", "main")
-        if os.path.isfile(ref_path):
-            with open(ref_path) as f:
-                revision = f.read().strip()
-
-    # List files from revision directory
-    if revision:
-        rev_dir = os.path.join(cache_path, "snapshots", revision)
-        if os.path.isdir(rev_dir):
-            return rev_dir
-
-    return None
-
-
-def read_system_prompt_from_file(model_name: str) -> str:
-    """Read system prompt from a file in the HuggingFace cache directory.
-
-    Args:
-        model_name: The model name to construct the file path
-
-    Returns:
-        The system prompt content from the file, or empty string if file not found
-    """
-    try:
-        local_repo_dir = find_local_repo_dir(model_name)
-        if local_repo_dir:
-            system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
-            if os.path.exists(system_prompt_file):
-                with open(system_prompt_file, encoding="utf-8") as f:
-                    return f.read()
-
-        return ""
-    except Exception:
-        # If anything fails, return empty string
-        return ""
 
 
 class LazyValue:
@@ -1219,10 +1003,6 @@ def maybe_model_redirect(model: str) -> str:
     return model
 
 
-def random_uuid() -> str:
-    return str(uuid.uuid4().hex)
-
-
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
         return [
@@ -1230,33 +1010,3 @@ def flatten_nested_list(nested_list):
         ]
     else:
         return [nested_list]
-
-
-def convert_json_schema_to_str(json_schema: dict | str | type[BaseModel]) -> str:
-    """Convert a JSON schema to a string.
-    Parameters
-    ----------
-    json_schema
-        The JSON schema.
-    Returns
-    -------
-    str
-        The JSON schema converted to a string.
-    Raises
-    ------
-    ValueError
-        If the schema is not a dictionary, a string or a Pydantic class.
-    """
-    if isinstance(json_schema, dict):
-        schema_str = json.dumps(json_schema)
-    elif isinstance(json_schema, str):
-        schema_str = json_schema
-    elif issubclass(json_schema, BaseModel):
-        schema_str = json.dumps(json_schema.model_json_schema())
-    else:
-        raise ValueError(
-            f"Cannot parse schema {json_schema}. The schema must be either "
-            + "a Pydantic class, a dictionary or a string that contains the JSON "
-            + "schema specification"
-        )
-    return schema_str

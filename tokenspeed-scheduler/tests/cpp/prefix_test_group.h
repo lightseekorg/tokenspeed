@@ -78,10 +78,6 @@ public:
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         return allocator_.BlockTablePageIds(table);
     }
-    void AppendHostExtension(BlockPool& pool, BlockTable& table, std::vector<CacheBlockRef>&& host_block_refs,
-                             std::vector<BlockTransfer>& load_pairs) {
-        allocator_.AppendHostExtension(pool, table, std::move(host_block_refs), load_pairs);
-    }
 
     // --- retention (token API, policy converted through GroupGeometry) ---
     void ReclaimExpired(BlockPool& pool, BlockTable& table, std::int32_t num_computed_tokens) {

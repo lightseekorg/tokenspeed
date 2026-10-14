@@ -36,7 +36,17 @@ SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 # after startup (a per-batch constexpr) fails the run instead of stalling it.
 SERVING_TASK_TYPES = {"server_smoke", "eval", "perf"}
 JIT_COMPILE_CHECK_ENV = "TOKENSPEED_JIT_COMPILE_CHECK"
-SUPPORTED_TRIGGERS = {"per-commit", "manual", "nightly", "debug", "slurm"}
+SUPPORTED_TRIGGERS = {
+    "per-commit",
+    "post-submit",
+    "manual",
+    "nightly",
+    "debug",
+    "slurm",
+}
+# Task triggers each scan trigger selects. `per-commit` tasks run on pull
+# requests and on pushes to main; `post-submit` tasks run only on pushes.
+SCAN_TRIGGER_TASK_TRIGGERS = {"post-submit": {"per-commit", "post-submit"}}
 WORKFLOW_STAGE_TYPES = {
     "unit-test": {"ut", "server_smoke"},
     "kernel-benchmark": {"perf"},
@@ -399,9 +409,10 @@ def build_matrix(
         raise ValueError(f"unsupported multi-node filter: {multi_node!r}")
     include = []
     excluded_runner_labels = get_excluded_runner_labels()
+    task_triggers = SCAN_TRIGGER_TASK_TRIGGERS.get(trigger, {trigger})
     for path in find_task_files(root):
         task = normalize_task(path, repo_root)
-        if trigger and trigger not in task["triggers"]:
+        if trigger and task_triggers.isdisjoint(task["triggers"]):
             continue
         is_multi_node = task.get("slurm", {}).get("nodes", 1) > 1
         if multi_node == "only" and not is_multi_node:
@@ -1830,6 +1841,15 @@ def execute_task(
     env["CI_RUNNER_LABEL"] = runner
     env.update(get_default_runner_env(runner))
     env.update(get_runner_specific_env(task, declared_runner))
+    if setup_mode == "ci" and runner.startswith("b200v2-"):
+        # Use the same persistent root as package_cache.sh.
+        cache_root = env.get("CI_CACHE_ROOT") or str(
+            Path(env.get("FLASHINFER_CACHE_DIR") or "/raid/cache/flashinfer").parent
+        )
+        env.setdefault(
+            "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR",
+            os.path.join(cache_root, "tokenspeed", "flashinfer-autotune"),
+        )
     if task["type"] in SERVING_TASK_TYPES:
         # Only the task itself may relax the check; a value inherited from
         # the runner's environment must not.

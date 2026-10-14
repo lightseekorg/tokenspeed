@@ -395,16 +395,6 @@ def pdl_enabled(overwrite: bool | None = None) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _torch_version() -> tuple[int, ...]:
-    """Return PyTorch version as a comparable tuple, e.g. (2, 7, 0)."""
-    try:
-        import torch
-
-        return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:3])
-    except Exception:
-        return (0, 0, 0)
-
-
 def _detect_platform() -> PlatformInfo:
     """Detect current platform capabilities."""
     try:

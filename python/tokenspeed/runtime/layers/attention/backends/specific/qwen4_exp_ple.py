@@ -91,22 +91,20 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         self.forward_metadata: PLEForwardMetadata | None = None
         self._context_field_id: str | None = None
         self._conv_field_ids: tuple[str, ...] = ()
-        self._checkpoint_granularity = 1
         self._ple_verify_scratch: dict[str, torch.Tensor] = {}
         self._ple_verify_tables: dict | None = None
         self._ple_commit_rows: torch.Tensor | None = None
         self._verify_commit_ctx: tuple[torch.Tensor, int, int] | None = None
         self._decode_input_blocks: torch.Tensor | None = None
         self._decode_output_blocks: torch.Tensor | None = None
-        self._decode_committed: torch.Tensor | None = None
         self._decode_views_by_bs: dict[int, PLEForwardMetadata] = {}
 
     def _cache_fields(
         self, cache_pool: CachePool
-    ) -> tuple[str | None, tuple[str, ...], int]:
+    ) -> tuple[str | None, tuple[str, ...]]:
         """Validate the local PLE fields before the backend tree publishes a pool."""
         if self.is_draft:
-            return None, (), 1
+            return None, ()
         fields = tuple(
             field
             for field in cache_pool.arena.plan.fields
@@ -119,7 +117,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             if cache_field_plane(field.field_id) == "qwen4_exp.ple.conv"
         )
         if not conv_fields:
-            return None, (), 1
+            return None, ()
         context_fields = tuple(
             field.field_id
             for field in fields
@@ -138,16 +136,11 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             ),
             None,
         )
-        if (
-            group is None
-            or group.family != "state"
-            or group.checkpoint_granularity is None
-        ):
-            raise RuntimeError("PLE requires a checkpoint-shaped state cache group")
+        if group is None or group.family != "state":
+            raise RuntimeError("PLE requires a state-family cache group")
         return (
             context_fields[0],
             tuple(sorted(conv_fields, key=cache_field_layer_id)),
-            int(group.checkpoint_granularity),
         )
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
@@ -159,11 +152,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         super()._publish_cache_pool(cache_pool)
         if already_bound:
             return
-        (
-            self._context_field_id,
-            self._conv_field_ids,
-            self._checkpoint_granularity,
-        ) = self._cache_fields(cache_pool)
+        self._context_field_id, self._conv_field_ids = self._cache_fields(cache_pool)
         # The commit tables point into the old arena; preallocation rebuilds them.
         self._ple_verify_tables = None
         self._ple_commit_rows = None
@@ -185,9 +174,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             (max_bs,), -1, dtype=torch.int32, device=self.device
         )
         self._decode_output_blocks = torch.full_like(self._decode_input_blocks, -1)
-        self._decode_committed = torch.empty(
-            max_bs, dtype=torch.int64, device=self.device
-        )
 
     def _decode_view(self, bs: int) -> PLEForwardMetadata:
         if (
@@ -258,9 +244,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         )
         input_blocks, output_blocks = compute_state_block_indices(
             self._block_rows(block_tables),
-            self._checkpoint_granularity,
             before,
-            after,
             validate=cache_debug_enabled(),
             group_id=QWEN4_EXP_PLE_CACHE_GROUP,
         )
@@ -304,23 +288,14 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 if self._ple_commit_rows is None:
                     raise RuntimeError("PLE verify workspace was not preallocated")
                 verify_state_blocks(
-                    seq_lens,
-                    rows,
-                    batch_size=actual_bs,
-                    draft_tokens=metadata.verify_width,
-                    granularity=self._checkpoint_granularity,
-                    pages_out=metadata.input_blocks,
-                    committed_out=self._decode_committed,
+                    rows, batch_size=actual_bs, pages_out=metadata.input_blocks
                 )
                 if forward_mode.is_decode():
                     self._verify_commit_ctx = (rows, actual_bs, metadata.verify_width)
             else:
-                after = seq_lens[:actual_bs]
                 input_blocks, output_blocks = compute_state_block_indices(
                     rows,
-                    self._checkpoint_granularity,
-                    after - 1,
-                    after,
+                    seq_lens[:actual_bs] - 1,
                     validate=cache_debug_enabled(),
                     group_id=QWEN4_EXP_PLE_CACHE_GROUP,
                 )
@@ -450,11 +425,9 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         ).unbind(0)
         commit_state_pages(
             accepted_lengths,
-            self._decode_committed,
             rows_table,
             batch_size=bs,
             draft_tokens=width,
-            granularity=self._checkpoint_granularity,
             pages_out=pages.unsqueeze(0),
             out_row=0,
             steps_out=steps,

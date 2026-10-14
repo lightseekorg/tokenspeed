@@ -154,6 +154,25 @@ def _get_from_args(
     return args[index + 1]
 
 
+def _drop_from_args(args: list[str], flag: str) -> list[str]:
+    """Return a copy of the argv with every ``flag value`` pair removed.
+
+    Same canonical-form assumption as ``_get_from_args``: only space-separated
+    pairs are handled.
+    """
+    out: list[str] = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == flag:
+            skip_next = True
+            continue
+        out.append(arg)
+    return out
+
+
 def _gateway_args_with_default_port(gateway_args: list[str]) -> list[str]:
     if "--port" in gateway_args:
         return gateway_args
@@ -558,6 +577,32 @@ def _add_rl_control_port(engine_args: list[str]) -> tuple[list[str], str]:
     return [*engine_args, "--rl-control-port", str(port)], (f"http://127.0.0.1:{port}")
 
 
+def _add_metrics_port(engine_args: list[str]) -> tuple[list[str], str | None]:
+    """Wire the engine's Prometheus /metrics port when metrics are enabled.
+
+    With ``--enable-metrics`` the engine serves /metrics from its main process
+    (see ``ServerArgs.metrics_port``). Pin a stable port — like
+    ``--rl-control-port`` — so the scrape target survives engine restarts and
+    can be printed at startup. An operator-pinned ``--metrics-port`` is
+    preserved untouched; ``--metrics-port 0`` means auto-allocate, matching
+    the engine-side treatment of an unset port. Returns the scrape URL, or
+    None when metrics are off.
+    """
+    if "--enable-metrics" not in engine_args:
+        return engine_args, None
+    host = _get_from_args(engine_args, "--metrics-host", "127.0.0.1")
+    pinned = _get_from_args(engine_args, "--metrics-port")
+    if pinned is not None and int(pinned) != 0:
+        return engine_args, f"http://{host}:{int(pinned)}/metrics"
+    if pinned is not None:
+        engine_args = _drop_from_args(engine_args, "--metrics-port")
+    port = _free_port_avoiding_ephemeral_range()
+    return (
+        [*engine_args, "--metrics-port", str(port)],
+        f"http://{host}:{port}/metrics",
+    )
+
+
 async def _start_control_server(
     *,
     gateway_url: str,
@@ -687,6 +732,9 @@ async def run_smg(
         # before spawn_engine.
         engine_args, rl_control_url = _add_rl_control_port(engine_args)
 
+        # Wire the engine metrics port (only with --enable-metrics).
+        engine_args, metrics_url = _add_metrics_port(engine_args)
+
         engine = await spawn_engine(engine_args, host="127.0.0.1", port=engine_port)
         engine_log = asyncio.create_task(_stream_to(engine, ENGINE_TAG))
 
@@ -741,6 +789,8 @@ async def run_smg(
                 f"http://{user_host}:{control_port} (port in use?); "
                 f"serving continues without it\n"
             )
+        if metrics_url is not None:
+            sys.stdout.write(f"engine metrics available at {metrics_url}\n")
         sys.stdout.flush()
 
         engine_wait = asyncio.create_task(engine.wait())

@@ -44,7 +44,7 @@ payload packing).
 
 Node `i` of a request's verify window has RoPE position `vc + depth[i]` and KV
 slot `write_locations[b * N + i]`. Only positions change for a tree:
-`TreeSpec.depth_positions` shifts the window's `vc + i` to `vc + depth` before
+`TreeSpec.load_step` shifts the window's `vc + i` to `vc + depth` before
 the forward, and `TreeSpec.compact_rows` shifts them back after the forward
 (row `i` then holds the path node at depth `i`).
 
@@ -87,8 +87,11 @@ state after its parent, not after node `t - 1`: `mamba2_verify_scan` takes
 `parent_indices` and `gdn_decode_mtp` the tree's ancestor mask (the one tree
 attention reads), and both reload the parent's state at branch points (a chain
 never reloads). `causal_conv1d_update` with `parent_indices` rebuilds each
-node's window from its ancestors' inputs and the initial window. The commit
-copies the scratch row of the
+node's window from its ancestors' inputs and the initial window. Where the
+selected GDN verify kernel takes a separate destination pool
+(`gdn_decode_mtp(output_state=...)`), roots read the committed recurrent state
+in place and only the node states go to the scratch, so the scratch is never
+seeded with a copy of the committed state. The commit copies the scratch row of the
 last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
 familiar `accept_len`. The fused KDA verify kernel follows a chain and refuses
 trees.
@@ -99,7 +102,9 @@ per node). Under ReplaySSM the verify
 never writes the state pool. The verify runs a GDN tree of 8 to 16 nodes
 (`GDN_TREE_VERIFY_CHUNKED_MIN_NODES`, `GDN_TREE_VERIFY_CHUNKED_MAX_NODES`) in
 the chunked form of the delta rule, every node at once with the ancestor mask
-in place of the causal one, and keeps no node states. In other
+in place of the causal one, and keeps no node states; it also writes each
+node's replay payload row (`[k | v | a | b]`) as it reads them, so that verify
+skips the q/k/v split. In other
 trees the state of every branch point (a node with a child other than the next
 node) goes to one workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),

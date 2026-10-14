@@ -89,6 +89,7 @@ import tokenspeed_kernel.ops.moe.flashinfer as _moe_flashinfer
 import tokenspeed_kernel.ops.moe.gluon as _moe_gluon
 import tokenspeed_kernel.ops.moe.gluon.fp8 as _moe_gluon_fp8
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk as _moe_gluon_sigmoid_topk
+import tokenspeed_kernel.ops.moe.gluon.softmax_topk as _moe_gluon_softmax_topk
 import tokenspeed_kernel.ops.moe.gluon.sqrt_softplus_topk as _moe_gluon_sqrt_softplus
 import tokenspeed_kernel.ops.moe.latent_decode as _moe_latent_decode
 import tokenspeed_kernel.ops.moe.marlin as _moe_marlin
@@ -251,6 +252,7 @@ _RELOAD_MODULES = [
     _moe_sigmoid_topk,
     _moe_softmax_topk,
     _moe_gluon_sigmoid_topk,
+    _moe_gluon_softmax_topk,
     _moe_gluon,
     _moe_marlin_deepep_mxfp4,
     _moe_marlin_mxfp4,
@@ -356,6 +358,7 @@ def test_residual_family_exports_and_modes():
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "pad_gated_residual_projection_weight",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -481,10 +484,6 @@ def _is_blackwell_sm100(platform: PlatformInfo) -> bool:
 
 def _is_blackwell_sm103(platform: PlatformInfo) -> bool:
     return platform.is_blackwell and platform.arch_version == ArchVersion(10, 3)
-
-
-def _is_blackwell_non_sm100(platform: PlatformInfo) -> bool:
-    return platform.is_blackwell and platform.arch_version != ArchVersion(10, 0)
 
 
 def _is_blackwell_plus(platform: PlatformInfo) -> bool:
@@ -3443,7 +3442,6 @@ def test_gfx1250_sigmoid_topk_selects_by_token_count(
 
 
 def test_amd_softmax_topk_selects_triton_on_gfx1250(
-    mi350_platform: PlatformInfo,
     mi450_platform: PlatformInfo,
 ) -> None:
     registry = KernelRegistry.get()
@@ -3460,15 +3458,6 @@ def test_amd_softmax_topk_selects_triton_on_gfx1250(
     )
     real_platform = Platform.get()
     try:
-        Platform.override(mi350_platform)
-        registry.clear_cache()
-        gfx950 = select_kernel(
-            "moe",
-            "softmax_topk",
-            bf16_signature,
-            traits={"tokens": 1, "experts": 128, "topk": 4},
-        )
-
         Platform.override(mi450_platform)
         registry.clear_cache()
         standard_shape = select_kernel(
@@ -3487,9 +3476,46 @@ def test_amd_softmax_topk_selects_triton_on_gfx1250(
         Platform.override(real_platform)
         registry.clear_cache()
 
-    assert gfx950.name == "torch_softmax_topk"
     assert standard_shape.name == "triton_softmax_topk_gfx1250"
     assert general_shape.name == "triton_softmax_topk_gfx1250"
+
+
+def test_gfx950_softmax_topk_selects_gluon(
+    mi350_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    gluon_spec = registry.get_by_name("gluon_softmax_topk_gfx950")
+    if gluon_spec is None:
+        pytest.skip("gfx950 Gluon softmax top-k is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        selected = {
+            (dtype, tokens): select_kernel(
+                "moe",
+                "softmax_topk",
+                format_signature(router_logits=dense_tensor_format(dtype)),
+                traits={"tokens": tokens, "experts": 512, "topk": 10},
+            ).name
+            # Qwen3.8 MTP draft, verify and prefill token counts.
+            for dtype in (torch.bfloat16, torch.float16, torch.float32)
+            for tokens in (16, 64, 8192)
+        }
+        too_many_experts = select_kernel(
+            "moe",
+            "softmax_topk",
+            format_signature(router_logits=dense_tensor_format(torch.bfloat16)),
+            traits={"tokens": 64, "experts": 2048, "topk": 10},
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert gluon_spec.priority == Priority.SPECIALIZED
+    assert set(selected.values()) == {"gluon_softmax_topk_gfx950"}
+    assert too_many_experts.name == "torch_softmax_topk"
 
 
 def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(

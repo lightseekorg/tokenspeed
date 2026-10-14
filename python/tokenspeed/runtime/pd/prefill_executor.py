@@ -140,6 +140,7 @@ class DisaggPrefillExecutor:
                 prompt_len=prompt_len,
                 chunk_start=selection_start,
                 chunk_end=chunk_end,
+                state_prefix_cached=first.block_manifest.state_prefix_cached,
             )
             for destination in destinations:
                 if destination.block_manifest is None:
@@ -149,6 +150,8 @@ class DisaggPrefillExecutor:
                 if (
                     destination.block_manifest.prefix_len != prefix_len
                     or destination.block_manifest.prompt_len != prompt_len
+                    or destination.block_manifest.state_prefix_cached
+                    != first.block_manifest.state_prefix_cached
                 ):
                     raise ValueError(
                         "Cache-transfer destinations disagree on the prompt window"
@@ -252,6 +255,7 @@ class DisaggPrefillExecutor:
                 request_row=index,
                 prefix_len=destination.block_manifest.prefix_len,
                 prompt_len=destination.block_manifest.prompt_len,
+                state_prefix_cached=destination.block_manifest.state_prefix_cached,
             )
             for destination in destinations:
                 if destination.block_manifest is None:
@@ -262,6 +266,8 @@ class DisaggPrefillExecutor:
                     destination.block_manifest.prefix_len != block_manifest.prefix_len
                     or destination.block_manifest.prompt_len
                     != block_manifest.prompt_len
+                    or destination.block_manifest.state_prefix_cached
+                    != block_manifest.state_prefix_cached
                 ):
                     raise ValueError(
                         "Cache-transfer destinations disagree on the prompt window"

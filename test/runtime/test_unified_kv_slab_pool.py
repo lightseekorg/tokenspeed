@@ -46,15 +46,6 @@ def _specs_for_layers(**kwargs):
     return specs_for_layers(**kwargs)
 
 
-def _real_spec():
-    # The REAL package module (not the file-loaded shadow above): pool
-    # constructions need specs whose class passes the contract's
-    # isinstance check.
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes import spec
-
-    return spec
-
-
 GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12
 
 # One Inkling-style layer block: 5 sliding sub-groups + 1 full layer.
@@ -458,9 +449,9 @@ class MLAPoolAllocationHookTest(unittest.TestCase):
 
 class StateCacheGroupPageCountTest(unittest.TestCase):
     """The scheduler's capacity model over a state + full-history pair: a
-    snapshot-state group's demand is a fixed working set per live request
-    (retained input checkpoint, aligned checkpoint, final continuation and
-    banked growth), independent of how much history the requests hold.
+    state group's demand is two blocks per live request (the input checkpoint
+    and the live block), independent of how much history the requests hold,
+    how the chunk is cut or how deep the overlap runs.
     Needs the real package and the scheduler extension.
     """
 
@@ -519,30 +510,28 @@ class StateCacheGroupPageCountTest(unittest.TestCase):
         self.assertGreater(pages["linear_attention"], 0)
         self.assertLessEqual(pages["linear_attention"], pages["full_attention"])
 
-    def test_state_branch_is_independent_of_total_token_width(self):
+    def test_state_demand_is_two_blocks_per_live_request(self):
         small = self._pages(max_total_tokens=128)
         large = self._pages(max_total_tokens=1 << 20)
         self.assertEqual(small["linear_attention"], large["linear_attention"])
-        # Per live request: the retained input checkpoint, the aligned
-        # checkpoint, and 1 + ceil((15 + 16) / 16) blocks for an unaligned
-        # finishing tail plus one banked growth block -- four, times two.
-        self.assertEqual(small["linear_attention"], 2 * 4)
-        # A chunk that always ends on a block boundary has no tail to hold.
+        self.assertEqual(small["linear_attention"], 2 * 2)
         self.assertEqual(
-            self._pages(max_scheduled_tokens=16)["linear_attention"], 2 * 3
+            self._pages(max_scheduled_tokens=16)["linear_attention"], 2 * 2
+        )
+        self.assertEqual(
+            self._pages(max_scheduled_tokens=37)["linear_attention"], 2 * 2
         )
 
-    def test_overlap_protects_a_growth_block_only_past_one_block(self):
-        # One protected token still fits the banked growth block.
-        baseline = self._pages(overlap_schedule_depth=0, decode_input_tokens=1)
-        overlapped = self._pages(overlap_schedule_depth=1, decode_input_tokens=1)
-        self.assertEqual(baseline["linear_attention"], overlapped["linear_attention"])
-        # A full-block decode width plus its protected step needs one more.
-        wide = self._pages(overlap_schedule_depth=0, decode_input_tokens=16)
-        wide_overlapped = self._pages(overlap_schedule_depth=1, decode_input_tokens=16)
-        self.assertEqual(
-            wide_overlapped["linear_attention"] - wide["linear_attention"], 2 * 1
-        )
+    def test_overlap_and_decode_width_change_nothing_for_state(self):
+        for depth in (0, 1):
+            for width in (1, 16):
+                self.assertEqual(
+                    self._pages(
+                        overlap_schedule_depth=depth, decode_input_tokens=width
+                    )["linear_attention"],
+                    2 * 2,
+                    (depth, width),
+                )
 
 
 class CachePoolFieldBindingTest(unittest.TestCase):

@@ -258,49 +258,49 @@ class KdaPrefillFallbackTest(unittest.TestCase):
         ):
             scan.return_value = output
             for bs, bucket in ((1, 128), (2, 2048), (4, 4096), (1, 8192)):
-                for checkpoint in (None, object()):
-                    live = SimpleNamespace(prefill_checkpoint_batch=checkpoint)
-                    backend.forward_metadata = live
+                # The live (uncaptured) metadata the fallback must keep serving.
+                live = SimpleNamespace()
+                backend.forward_metadata = live
 
-                    def forward():
-                        results.append(
-                            backend.forward_extend(
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                bs,
-                                ForwardMode.EXTEND,
-                                save_kv_cache=True,
-                                layer_id=0,
-                                seq_len=bucket,
-                            )
+                def forward():
+                    results.append(
+                        backend.forward_extend(
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            bs,
+                            ForwardMode.EXTEND,
+                            save_kv_cache=True,
+                            layer_id=0,
+                            seq_len=bucket,
                         )
+                    )
 
-                    capture.segments = [forward]
-                    for iteration in range(3):
-                        with self.subTest(bs=bs, bucket=bucket, iteration=iteration):
-                            scan.reset_mock()
-                            capture.replay(valid_rows=bucket - 1)
-                            scan.assert_called_once_with(
-                                backend,
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                bs,
-                                ForwardMode.EXTEND,
-                                save_kv_cache=True,
-                                layer_id=0,
-                                seq_len=bucket,
-                            )
-                            self.assertIs(results[-1], output)
-                            self.assertIs(backend.forward_metadata, live)
-                            self.assertFalse(backend.prefill_metadata_is_capture_ready)
+                capture.segments = [forward]
+                for iteration in range(3):
+                    with self.subTest(bs=bs, bucket=bucket, iteration=iteration):
+                        scan.reset_mock()
+                        capture.replay(valid_rows=bucket - 1)
+                        scan.assert_called_once_with(
+                            backend,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            bs,
+                            ForwardMode.EXTEND,
+                            save_kv_cache=True,
+                            layer_id=0,
+                            seq_len=bucket,
+                        )
+                        self.assertIs(results[-1], output)
+                        self.assertIs(backend.forward_metadata, live)
+                        self.assertFalse(backend.prefill_metadata_is_capture_ready)
             graph.assert_not_called()
-        self.assertEqual(len(results), 24)
+        self.assertEqual(len(results), 12)
 
 
 def _spec(
@@ -314,10 +314,10 @@ def _spec(
     """A published group spec.
 
     The real dataclass, not a namespace: it derives ``block_granularity`` from
-    the geometry the way production does, refuses ``page_size`` on a
-    checkpoint-state group, and carries ``retention`` -- which the width rule
-    deliberately ignores, and which a namespace double cannot express at all,
-    so ``test_sliding_window_group_still_spans_the_whole_extent`` could not be
+    the geometry the way production does, refuses ``page_size`` on a state
+    group, and carries ``retention`` -- which the width rule deliberately
+    ignores, and which a namespace double cannot express at all, so
+    ``test_sliding_window_group_still_spans_the_whole_extent`` could not be
     written against one.
     """
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -329,7 +329,6 @@ def _spec(
             group_id=group_id,
             retention=retention,
             family="state",
-            checkpoint_granularity=block_granularity,
             sliding_window_tokens=sliding_window_tokens,
             replayable=False,
         )
@@ -418,7 +417,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 _spec("full_attention", block_granularity=64),
                 _spec("sliding_attention", block_granularity=64),
                 # state: included
-                _spec("linear_attention", family="state", block_granularity=128),
+                _spec("linear_attention", family="state"),
             )
         )
         tables = self._bare(backend, pool)._dummy_group_tables(1)
@@ -426,17 +425,20 @@ class DummyGroupTablesTest(unittest.TestCase):
             set(tables),
             {"full_attention", "sliding_attention", "linear_attention"},
         )
-        # Each group in its own grain, rounded UP: 1000 is a multiple of
-        # neither, so a floor would give 15 and 7 and fail here.
+        # Each history group in its own grain, rounded UP: 1000 is not a
+        # multiple of 64, so a floor would give 15 and fail here. A state row
+        # is its two slots.
         self.assertEqual(tables["full_attention"].shape, (1, 16))
-        self.assertEqual(tables["linear_attention"].shape, (1, 8))
-        for group_id, table in tables.items():
+        self.assertEqual(tables["linear_attention"].shape, (1, 2))
+        for group_id in ("full_attention", "sliding_attention"):
             self.assertGreater(
-                int(table.min()),
+                int(tables[group_id].min()),
                 0,
                 f"{group_id}: capture writes KV, so no group may get the "
                 "reserved null block",
             )
+        # The fabricated request starts from the zero state and writes a real block.
+        self.assertEqual(tables["linear_attention"].tolist(), [[0, 1]])
 
     def test_width_spans_the_extent_at_a_realistic_magnitude(self):
         """Width is ceil(physical extent / grain), at a size where a silent
@@ -512,12 +514,14 @@ class DummyGroupTablesTest(unittest.TestCase):
         pool = _fake_pool(
             specs=(
                 _spec("full_attention", block_granularity=128),
-                _spec("linear_attention", family="state", block_granularity=128),
+                _spec("linear_attention", family="state"),
             )
         )
         tables = self._bare(wrapper, pool)._dummy_group_tables(1)
         self.assertEqual(set(tables), {"full_attention", "linear_attention"})
         self.assertEqual(tables["full_attention"].shape, (1, 8))  # ceil(1000/128)
+        # A state row is its two slots: a null input checkpoint and the live block.
+        self.assertEqual(tables["linear_attention"].tolist(), [[0, 1]])
 
     def test_each_capture_row_gets_its_own_block(self):
         """A state group needs one working block per request: two rows sharing
@@ -535,7 +539,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         pool = _fake_pool(
             specs=(
                 _spec("full_attention", block_granularity=64),
-                _spec("linear_attention", family="state", block_granularity=128),
+                _spec("linear_attention", family="state"),
             )
         )
         bare = self._bare(_backend(), pool)
@@ -543,24 +547,21 @@ class DummyGroupTablesTest(unittest.TestCase):
         tables = bare._dummy_group_tables(3)
         for group_id, table in tables.items():
             self.assertEqual(table.shape[0], 3, group_id)
-            self.assertGreater(int(table.min()), 0, group_id)
-            # The state path gathers at (seq_len - 1) // grain -- the LAST live
-            # column, never column 0. Asserting only on column 0 admits a table
-            # that aliases everywhere the runtime actually reads.
+            # The live block the state path writes is the LAST column; the
+            # history rows hold one block throughout.
             last_column = table[:, -1].tolist()
             self.assertEqual(
                 len(set(last_column)),
                 3,
-                f"{group_id}: rows alias at the column the state path reads, "
+                f"{group_id}: rows alias at the column the state path writes, "
                 f"got {last_column}",
             )
+        self.assertGreater(int(tables["full_attention"].min()), 0)
         # Strongest form: hand the shipped table to the production helper and
         # let its own uniqueness rule be the assertion.
         compute_state_block_indices(
             tables["linear_attention"],
-            128,
             torch.zeros(3, dtype=torch.int32),
-            torch.full((3,), 1024, dtype=torch.int32),
             validate=True,
             group_id="linear_attention",
         )
@@ -661,7 +662,6 @@ class DummyGroupTablesTest(unittest.TestCase):
         order, and every entry inside ``group_page_counts - 1``; a capture
         they refuse kills the boot, so they are the assertion.
         """
-        from unittest import mock
 
         import torch
 
@@ -1385,6 +1385,48 @@ class PrefillRoleGraphsTest(unittest.TestCase):
                 input_buffers=object(),
                 config=config,
             )
+
+    def test_placeholder_tables_give_a_state_group_its_two_slots(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            STATE_TABLE_SLOTS,
+            CacheGroupSpec,
+        )
+
+        class Backend:
+            def init_cuda_graph_state(self, *args, **kwargs):
+                pass
+
+        specs = (
+            CacheGroupSpec(
+                group_id="full",
+                retention="full_history",
+                rows_per_page=128,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+                replayable=False,
+            ),
+            CacheGroupSpec(
+                group_id="state",
+                retention="full_history",
+                sliding_window_tokens=None,
+                family="state",
+                replayable=False,
+            ),
+        )
+        runner = self.forward_step.ForwardStepRunner(
+            forward_func=lambda *args, **kwargs: None,
+            attn_backend=Backend(),
+            token_to_kv_pool=_fake_pool(specs=specs, cache_group_page_counts={}),
+            input_buffers=object(),
+            config=self._config(prefill_only=False),
+        )
+        tables = runner._placeholder_tables
+        self.assertEqual(set(tables), {"full", "state"})
+        self.assertEqual(tables["state"].shape[1], STATE_TABLE_SLOTS)
+        self.assertGreater(tables["full"].shape[1], STATE_TABLE_SLOTS)
+        self.assertTrue(
+            all(table.shape[0] == runner.max_decode_bs for table in tables.values())
+        )
 
     def test_prefill_role_skips_the_decode_graph_and_keeps_the_prefill_graph(
         self,

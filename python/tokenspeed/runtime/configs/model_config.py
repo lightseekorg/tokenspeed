@@ -112,6 +112,7 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
 _CACHE_LAYER_VIEW_ARCHITECTURES = frozenset(
     {
         "NemotronHForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     }
 )
 
@@ -612,7 +613,11 @@ class ModelConfig:
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures)
-        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
+        self.is_multimodal = (
+            self.model_profile.is_multimodal
+            if self.model_profile is not None
+            else is_multimodal_model(self.hf_config.architectures)
+        )
         self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
         self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
         self.is_audio_model = is_audio_model(self.hf_config.architectures)
@@ -1036,6 +1041,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -1053,6 +1059,7 @@ def is_audio_model(model_architectures: list[str] | None):
         "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     }
     return any(arch in audio_architectures for arch in model_architectures or [])
 

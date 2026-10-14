@@ -21,10 +21,13 @@
 """Real scheduler allocations drive GPU KDA as working state blocks are recycled.
 
 The small three-group pool and KDA kernels come from the existing numerical
-harness. Every working block id, prefix hit and sparse hole comes from the
-real C++ scheduler through the runtime contract bridge. This is not a model
-or MLA numerical test: history blocks participate in scheduling and matching,
-while the GPU computations exercise convolution and recurrent state.
+harness. Every block id and prefix hit comes from the real C++ scheduler
+through the runtime contract bridge: a state group's row is its two slots, an
+interior chunk end's block is recycled once the next chunk has consumed it,
+and the prompt-end checkpoint is the one a later prompt resumes from. This is
+not a model or MLA numerical test: history blocks participate in scheduling
+and matching, while the GPU computations exercise convolution and recurrent
+state.
 """
 
 from __future__ import annotations
@@ -63,6 +66,10 @@ from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
     pool_to_cache_groups,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    STATE_INPUT_SLOT,
+    STATE_LIVE_SLOT,
+)
 
 register_cuda_ci(
     est_time=180,
@@ -270,7 +277,7 @@ class _ScheduledKDA:
                 else self.kernel.decode(*inputs, bs=1)
             )
             outputs[layer] = output.clone()
-            state_block = tables[group][0][(end - 1) // _P]
+            state_block = tables[group][0][STATE_LIVE_SLOT]
             for component in _COMPONENTS:
                 states[layer, component] = self.pool.get_component(layer, component)[
                     state_block
@@ -287,9 +294,11 @@ class _ScheduledKDA:
             if request_id == "source" and is_prefill:
                 row = tables[group][0]
                 previous = self.previous_tables.get(group, [])
-                for slot, old_block in enumerate(previous):
-                    if old_block > 0 and row[slot] == 0:
-                        self.released[group].add(old_block)
+                # Each chunk reads the previous chunk's block from slot 0 and
+                # writes a fresh slot 1; the block that left the row was the
+                # zeroed block the first chunk read or an interior chunk end
+                # nobody published.
+                self.released[group] |= set(previous) - set(row) - {0}
                 if state_block in self.released[group]:
                     self.reused_outputs[group].add(state_block)
                 self.previous_tables[group] = row
@@ -310,10 +319,10 @@ class _ScheduledKDA:
         self.computed[request_id] = end
         return _Step(begin, end, outputs, states, tables)
 
-    def snapshot(self, tables: dict[str, list[list[int]]], boundary: int):
+    def snapshot(self, tables: dict[str, list[list[int]]], slot: int):
         return {
             (layer, component): self.pool.get_component(layer, component)[
-                tables[group][0][boundary // _P - 1]
+                tables[group][0][slot]
             ].clone()
             for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True)
             for component in _COMPONENTS
@@ -358,9 +367,10 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
         steps += 1
         assert active.scheduler.empty_lcm_blocks() > 0
         if steps == 3:
-            # Packing is one block per parent. Ordinary prefill checkpoints
-            # are never published, so the first checkpoint returns to the
-            # pool when its last working reference leaves the table.
+            # Packing is one block per parent. An interior chunk end is not a
+            # publication point, so the zeroed block the first chunk read and
+            # the first chunk's own block are back in the pool once the chunk
+            # after each has read what it needed.
             materialized = sum(
                 block > 0
                 for rows in actual.tables.values()
@@ -370,28 +380,40 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
             assert active.scheduler.empty_lcm_blocks() == (
                 _USABLE_BLOCKS - materialized
             )
-            assert all(len(active.released[group]) == 1 for group in KIMI_STATE_GROUPS)
+            assert all(len(active.released[group]) == 2 for group in KIMI_STATE_GROUPS)
 
     # The released parents cycle through the allocator and become real GPU
     # output destinations again. Unpublished working state returns directly
     # to the pool, keeping the entire prefill below capacity.
     assert all(active.reused_outputs[group] for group in KIMI_STATE_GROUPS)
 
-    boundary = 15 * _P
-    snapshot_tables = actual.tables
-    snapshots = active.snapshot(snapshot_tables, boundary)
-    for _ in range(4):
+    # The prompt-end state is the live block of the final chunk; the first
+    # decode reads it from slot 0 and writes a fresh live block, so it stays
+    # byte-identical through every decode.
+    prompt_end_tables = actual.tables
+    prompt_end = active.snapshot(prompt_end_tables, STATE_LIVE_SLOT)
+    for index in range(4):
         actual = active.step("source", source_streams)
+        for group in KIMI_STATE_GROUPS:
+            row = actual.tables[group][0]
+            if index == 0:
+                assert (
+                    row[STATE_INPUT_SLOT]
+                    == prompt_end_tables[group][0][STATE_LIVE_SLOT]
+                )
+            else:
+                assert row[STATE_INPUT_SLOT] == 0
+            assert row[STATE_LIVE_SLOT] != prompt_end_tables[group][0][STATE_LIVE_SLOT]
         _assert_steps_match(actual, reference.step(actual.begin, actual.end))
-    for key, state in active.snapshot(snapshot_tables, boundary).items():
-        assert torch.equal(
-            state, snapshots[key]
-        ), "decode modified the prefill checkpoint"
+    for key, state in active.snapshot(prompt_end_tables, STATE_LIVE_SLOT).items():
+        assert torch.equal(state, prompt_end[key]), "decode modified the checkpoint"
     active.finish("source")
 
-    # Decode crossed token 16P, but reuse still starts at the prefill checkpoint.
-    # Recompute the remaining prompt and decode history with a different suffix.
-    shared_tokens = 16 * _P
+    # A later prompt that shares the source's prompt and two of its decoded
+    # tokens resumes at the prompt-end checkpoint: that is the longest
+    # published state the new prompt agrees with (the finish checkpoint
+    # covers tokens the new prompt does not have).
+    shared_tokens = _PROMPT_TOKENS + 2
     resume_tokens = source_tokens[:shared_tokens] + list(range(30_000, 30_009))
     resume_streams = {}
     for layer in _LAYERS:
@@ -405,20 +427,25 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
     # Recompute the prefix independently from zero; never seed the oracle
     # from the very cache snapshot whose correctness it must establish.
     reference = _NumericalReference(active.kernel, resume_streams)
-    reference.step(0, boundary)
+    reference.step(0, _PROMPT_TOKENS)
     active.submit("resume", resume_tokens, shared_tokens + 7)
     actual = active.step("resume", resume_streams)
-    assert actual.begin == boundary
+    assert actual.begin == _PROMPT_TOKENS
+    for group in KIMI_STATE_GROUPS:
+        assert (
+            actual.tables[group][0][STATE_INPUT_SLOT]
+            == prompt_end_tables[group][0][STATE_LIVE_SLOT]
+        )
     _assert_steps_match(actual, reference.step(actual.begin, actual.end))
     while active.computed["resume"] < shared_tokens + 7:
         actual = active.step("resume", resume_streams)
         _assert_steps_match(actual, reference.step(actual.begin, actual.end))
     actual = active.step("resume", resume_streams)
     _assert_steps_match(actual, reference.step(actual.begin, actual.end))
-    for key, state in active.snapshot(snapshot_tables, boundary).items():
+    for key, state in active.snapshot(prompt_end_tables, STATE_LIVE_SLOT).items():
         assert torch.equal(
-            state, snapshots[key]
-        ), "prefix resume modified the shared snapshot"
+            state, prompt_end[key]
+        ), "prefix resume modified the shared checkpoint"
     active.finish("resume")
     for layer in _LAYERS:
         for component in _COMPONENTS:

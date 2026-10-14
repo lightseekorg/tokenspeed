@@ -44,9 +44,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CachePlaneLayout,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_LIVE_SLOT,
     CacheGroupSpec,
-    Retention,
-    TransferPolicy,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
     CacheFieldPartition,
@@ -97,9 +96,38 @@ class CacheTransferContract:
     plan: CacheMemoryPlan
     group_specs: tuple[CacheGroupSpec, ...]
     transfer_schema: CacheTransferSchema = CacheTransferSchema()
+    # Endpoint bindings; absent in the rank-independent bootstrap layout.
+    field_addresses: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
+        plan_group_ids = {group.group_id for group in self.plan.groups}
+        spec_group_ids = {spec.group_id for spec in self.group_specs}
+        if plan_group_ids != spec_group_ids:
+            raise CacheContractError(
+                "cache plan and scheduler group IDs disagree: "
+                f"missing={sorted(plan_group_ids - spec_group_ids)}, "
+                f"extra={sorted(spec_group_ids - plan_group_ids)}"
+            )
         self.transfer_schema.validate(self.plan)
+        if self.field_addresses is not None:
+            if not isinstance(self.field_addresses, dict):
+                raise CacheContractError("field addresses must be a mapping")
+            if set(self.field_addresses) != {f.field_id for f in self.plan.fields}:
+                raise CacheContractError("field addresses must cover the complete plan")
+            if any(
+                type(p) is not int or not 0 < p < 2**64
+                for p in self.field_addresses.values()
+            ):
+                raise CacheContractError("field addresses must be nonzero uint64")
+
+    def field_address(self, base: int, field_id: str) -> int:
+        if self.field_addresses is not None:
+            return self.field_addresses[field_id]
+        return base + self.plan.field_page_byte_offset(field_id, 0)
+
+    def shard_count(self, group_id: str) -> int:
+        """Return the cache group's cyclic owner count; one means replicated."""
+        return self.group_spec(group_id).shard_count
 
     def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:
         return tuple(
@@ -173,6 +201,7 @@ class CacheTransferContract:
             schema_payload = payload["transfer_schema"]
             return cls(
                 plan=plan,
+                field_addresses=payload.get("field_addresses"),
                 group_specs=tuple(
                     CacheGroupSpec(**spec) for spec in payload["group_specs"]
                 ),
@@ -203,14 +232,6 @@ def build_cache_transfer_contract(
 ) -> tuple[CacheTransferContract, int]:
     """Bind one cache memory plan to its semantics and raw slab."""
     specs = tuple(group_specs)
-    plan_group_ids = tuple(group.group_id for group in plan.groups)
-    spec_group_ids = tuple(spec.group_id for spec in specs)
-    if set(plan_group_ids) != set(spec_group_ids):
-        raise CacheContractError(
-            "cache plan and scheduler group IDs disagree: "
-            f"missing={sorted(set(plan_group_ids) - set(spec_group_ids))}, "
-            f"extra={sorted(set(spec_group_ids) - set(plan_group_ids))}"
-        )
     contract = CacheTransferContract(
         plan=plan,
         group_specs=specs,
@@ -235,11 +256,18 @@ def build_arena_cache_transfer_contract(
     transfer_schema: CacheTransferSchema = CacheTransferSchema(),
 ) -> tuple[CacheTransferContract, int]:
     """Build the PD wire envelope from the cache arena it transfers."""
-    return build_cache_transfer_contract(
-        plan=arena.plan,
-        buffer=arena.contract_binding(),
-        group_specs=arena.cache_group_specs,
-        transfer_schema=transfer_schema,
+    if not arena.supports_disaggregation:
+        raise RuntimeError("cache arena has no transfer policy in its runtime contract")
+    return (
+        CacheTransferContract(
+            plan=arena.plan,
+            group_specs=tuple(arena.cache_group_specs),
+            transfer_schema=transfer_schema,
+            field_addresses={
+                f.field_id: arena.field_address(f.field_id) for f in arena.plan.fields
+            },
+        ),
+        arena.registration_regions()[0][0],
     )
 
 
@@ -318,6 +346,10 @@ class CachePDBlockManifest:
     groups: tuple[CachePDGroupBlocks, ...]
     prefix_len: int
     prompt_len: int
+    # The Decode found every state group's prompt-end checkpoint in its own
+    # cache: no ``latest_snapshot`` group transfers (their block lists are
+    # empty on both sides); the KV groups are still trimmed by ``prefix_len``.
+    state_prefix_cached: bool
 
     def to_wire_bytes(self) -> bytes:
         return _dump_wire_json(
@@ -338,6 +370,7 @@ class CachePDBlockManifest:
             ),
             prefix_len=payload["prefix_len"],
             prompt_len=payload["prompt_len"],
+            state_prefix_cached=bool(payload["state_prefix_cached"]),
         )
 
 
@@ -363,23 +396,32 @@ class CachePDLayerwiseBlockSelection:
 
 
 def _logical_slots(
-    policy: TransferPolicy,
+    spec: CacheGroupSpec,
     prefix_len: int,
     prompt_len: int,
-    block_granularity: int,
-    retention: Retention,
-    sliding_window_tokens: int | None,
+    *,
+    state_prefix_cached: bool,
 ) -> tuple[int, ...]:
-    if policy == "full_suffix":
+    """The block-table slots one group transfers for a prompt.
+
+    ``full_suffix`` (history) sends every retained block from the one holding
+    ``prefix_len`` -- the Prefill's private, fully valid copy when the prefix
+    hit ended inside it -- through the final partial block. ``latest_snapshot``
+    (state) sends the live slot: the exact prompt-end state, which the Decode
+    lands in its own live slot and evolves in place; nothing when the Decode
+    already holds that checkpoint (``state_prefix_cached``).
+    """
+    if spec.transfer_policy == "full_suffix":
+        block_granularity = spec.block_granularity
         begin = prefix_len // block_granularity
-        if retention == "sliding_window":
+        if spec.retention == "sliding_window":
             # The next decode token can attend the preceding window - 1 raw
             # tokens. Include every group block intersecting that retained tail.
-            retained_begin = max(0, prompt_len - sliding_window_tokens + 1)
+            retained_begin = max(0, prompt_len - spec.sliding_window_tokens + 1)
             begin = max(begin, retained_begin // block_granularity)
         end = (prompt_len + block_granularity - 1) // block_granularity
         return tuple(range(begin, end))
-    return ((prompt_len - 1) // block_granularity,)
+    return () if state_prefix_cached else (STATE_LIVE_SLOT,)
 
 
 def validate_cache_peer_layout(
@@ -394,14 +436,14 @@ def validate_cache_peer_layout(
     for local_spec, peer_spec in zip(
         layout.group_specs, peer_layout.group_specs, strict=True
     ):
-        # shard_count is deliberately not compared: a KVP-sharded Prefill
-        # transfers into an unsharded Decode. Which rank sets exchange which
-        # pages is the transfer planner's decision, not a contract mismatch.
+        # shard_count is deliberately not compared: Prefill and Decode shard
+        # a group independently (either, both or neither). Which rank sets
+        # exchange which pages is the transfer planner's decision, not a
+        # contract mismatch.
         if (
             local_spec.family != peer_spec.family
             or local_spec.rows_per_page != peer_spec.rows_per_page
             or local_spec.entry_stride_tokens != peer_spec.entry_stride_tokens
-            or local_spec.checkpoint_granularity != peer_spec.checkpoint_granularity
             or local_spec.retention != peer_spec.retention
             or local_spec.sliding_window_tokens != peer_spec.sliding_window_tokens
             or local_spec.replayable != peer_spec.replayable
@@ -449,24 +491,21 @@ def validate_cache_manifest(
     layout: CacheTransferContract,
     peer: str,
 ) -> None:
-    if manifest.prefix_len >= manifest.prompt_len:
-        raise CacheContractError(f"{peer} manifest requires prefix_len < prompt_len")
+    if not 0 <= manifest.prefix_len < manifest.prompt_len:
+        raise CacheContractError(
+            f"{peer} manifest requires 0 <= prefix_len < prompt_len, got "
+            f"prefix_len={manifest.prefix_len} prompt_len={manifest.prompt_len}"
+        )
     expected = tuple(spec.group_id for spec in layout.group_specs)
     actual = tuple(group.group_id for group in manifest.groups)
     if actual != expected:
         raise CacheContractError(f"{peer} manifest group order disagrees with layout")
-    if manifest.prefix_len % layout.plan.prefix_granularity:
-        raise CacheContractError(
-            f"{peer} manifest prefix_len is not aligned to prefix_granularity"
-        )
     for group, spec in zip(manifest.groups, layout.group_specs, strict=True):
         required = _logical_slots(
-            spec.transfer_policy,
+            spec,
             manifest.prefix_len,
             manifest.prompt_len,
-            spec.block_granularity,
-            spec.retention,
-            spec.sliding_window_tokens,
+            state_prefix_cached=manifest.state_prefix_cached,
         )
         if len(group.block_ids) != len(required):
             raise CacheContractError(
@@ -487,14 +526,11 @@ def build_cache_block_manifest(
     request_row: int,
     prefix_len: int,
     prompt_len: int,
+    state_prefix_cached: bool,
 ) -> CachePDBlockManifest:
     """Select each group's blocks according to its explicit transfer policy."""
     if prefix_len >= prompt_len:
         raise CacheContractError("Cache-transfer PD requires prefix_len < prompt_len")
-    if prefix_len % layout.plan.prefix_granularity:
-        raise CacheContractError(
-            "Cache-transfer PD prefix_len must be aligned to prefix_granularity"
-        )
     mapping = forward_op.block_tables_arrays()  # type: ignore[attr-defined]
     expected_ids = {group.group_id for group in layout.group_specs}
     if set(mapping) != expected_ids:
@@ -508,12 +544,7 @@ def build_cache_block_manifest(
     for spec in layout.group_specs:
         table = mapping[spec.group_id]
         logical_slots = _logical_slots(
-            spec.transfer_policy,
-            prefix_len,
-            prompt_len,
-            spec.block_granularity,
-            spec.retention,
-            spec.sliding_window_tokens,
+            spec, prefix_len, prompt_len, state_prefix_cached=state_prefix_cached
         )
         if logical_slots and logical_slots[-1] >= table.shape[1]:
             raise CacheContractError(
@@ -536,7 +567,10 @@ def build_cache_block_manifest(
             )
         )
     return CachePDBlockManifest(
-        groups=tuple(groups), prefix_len=prefix_len, prompt_len=prompt_len
+        groups=tuple(groups),
+        prefix_len=prefix_len,
+        prompt_len=prompt_len,
+        state_prefix_cached=state_prefix_cached,
     )
 
 
@@ -549,18 +583,15 @@ def build_cache_layerwise_block_selection(
     prompt_len: int,
     chunk_start: int,
     chunk_end: int,
+    state_prefix_cached: bool,
 ) -> CachePDLayerwiseBlockSelection:
     """Select blocks that became transferable during one Prefill chunk.
 
     Full-suffix groups publish newly completed retained blocks (plus the final
     partial block). Latest-snapshot groups publish only the prompt's final
-    snapshot. The returned destination positions refer to Decode's immutable
-    full manifest.
+    state, once the final chunk has written it. The returned destination
+    positions refer to Decode's immutable full manifest.
     """
-    if prefix_len % layout.plan.prefix_granularity:
-        raise CacheContractError(
-            "Cache-transfer PD prefix_len must be aligned to prefix_granularity"
-        )
     if prefix_len >= prompt_len:
         raise CacheContractError("layerwise selection requires prefix_len < prompt_len")
     if chunk_start >= chunk_end:
@@ -581,16 +612,11 @@ def build_cache_layerwise_block_selection(
     selections = []
     for spec in layout.group_specs:
         table = mapping[spec.group_id]
-        block_granularity = spec.block_granularity
         final_slots = _logical_slots(
-            spec.transfer_policy,
-            prefix_len,
-            prompt_len,
-            block_granularity,
-            spec.retention,
-            spec.sliding_window_tokens,
+            spec, prefix_len, prompt_len, state_prefix_cached=state_prefix_cached
         )
         if spec.transfer_policy == "full_suffix":
+            block_granularity = spec.block_granularity
             group_start_position = (
                 max(
                     0,
@@ -617,8 +643,8 @@ def build_cache_layerwise_block_selection(
                 final_slots[position] for position in destination_positions
             )
         elif spec.transfer_policy == "latest_snapshot":
-            destination_positions = (0,) if is_final else ()
-            logical_slots = (final_slots[0],) if is_final else ()
+            destination_positions = (0,) if is_final and final_slots else ()
+            logical_slots = final_slots if is_final else ()
         if logical_slots and logical_slots[-1] >= table.shape[1]:
             raise CacheContractError(
                 f"table {spec.group_id!r} misses logical slot {logical_slots[-1]}"

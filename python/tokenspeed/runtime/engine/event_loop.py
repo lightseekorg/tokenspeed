@@ -45,6 +45,11 @@ from tokenspeed.runtime.engine.eplb_hooks import (
     make_expert_rebalance_controller,
     rebalance_release_refusal,
 )
+from tokenspeed.runtime.engine.gc_hooks import (
+    FULL_COLLECTION_INTERVAL,
+    GcHooks,
+    freeze_startup_heap,
+)
 from tokenspeed.runtime.engine.generation_output_processor import OutputProcesser
 from tokenspeed.runtime.engine.io_struct import IpcReceiver, IpcSender, NullSender
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
@@ -309,7 +314,6 @@ class EventLoop:
         # Planning reads this every round; keep the value, not the handle.
         self._uses_eager_grammar = specs.uses_eager_grammar
         cache_groups = specs.cache_groups
-        # The builder may have lowered this to the cache-group checkpoint grain.
         max_scheduled_tokens = server_args.chunked_prefill_size
         # The forward token bound also caps each multimodal encoder call.
         self._max_encoder_tokens = max_scheduled_tokens
@@ -340,7 +344,7 @@ class EventLoop:
         cache_replica_tp_size = self.attn_tp_cpu_group.size()
         # Cache-op accounting + rank-synced completion tracking (see
         # cache_hooks.py); a no-op shell when the engine cannot emit cache
-        # ops -- armed hooks cost a gloo all-reduce per round. The Host L2
+        # ops -- armed hooks cost a gloo all-reduce per cache-op round. The Host L2
         # tier arms them, and so does the retraction snapshot pool (its
         # stores and restores are cache ops too). The hooks get the handle,
         # not the executor: polling goes through it.
@@ -583,6 +587,10 @@ class EventLoop:
             ),
             ep_group_ranks=tuple(mapping.moe.ep_group),
         )
+        # Full garbage collections: one every FULL_COLLECTION_INTERVAL
+        # forwarded rounds, in the same round on every rank, once
+        # freeze_startup_heap has taken them over (see gc_hooks.py).
+        self._gc_hooks = GcHooks(full_collection_interval=FULL_COLLECTION_INTERVAL)
 
         self.output_processor = OutputProcesser(
             send_to_tokenizer=self.send_to_tokenizer,
@@ -659,6 +667,16 @@ class EventLoop:
         )
 
     def _submit_scheduler_requests(self, specs) -> None:
+        if self.metrics.enabled:
+            # Queue-time histogram anchor: the specs enter the scheduler's
+            # waiting queue here. EPD-staged and pause-withheld requests reach
+            # this same funnel only when finally submitted, so their stamp
+            # excludes the staged/withheld wait.
+            enqueue_time = time.time()
+            for spec in specs:
+                state = self.output_processor.rid_to_state.get(spec.request_id)
+                if state is not None:
+                    state.scheduler_enqueue_time = enqueue_time
         self._l3_hooks.submit_requests(specs)
 
     # ------------------------------------------------------------------
@@ -1235,6 +1253,7 @@ class EventLoop:
                             request_changes.extend(self._drain_in_flight(in_flight))
 
                         self._mark_stats_scheduled(forward_op)
+                        self._record_request_queue_time(forward_op)
                         planned = PlannedForward(
                             forward_op=forward_op,
                             sampling_params_list=sampling_params_list,
@@ -1272,9 +1291,11 @@ class EventLoop:
                     # Online expert rebalance: count this rank's forward (real
                     # or DP-idle, rank-identical) and enqueue the ops it makes
                     # due; they complete through the request handler's gate.
-                    self._eplb_hooks.note_round(
-                        forwarded=pending is not None or need_idle_forward
-                    )
+                    forwarded = pending is not None or need_idle_forward
+                    self._eplb_hooks.note_round(forwarded=forwarded)
+                    # The same count times the full garbage collections, so
+                    # every rank pauses for one in the same round.
+                    self._gc_hooks.note_round(forwarded=forwarded)
 
                 if not paused_round:
                     # Commit from the head once the queue exceeds the depth
@@ -1318,6 +1339,27 @@ class EventLoop:
             st = rid_to_state.get(rid)
             if st is not None:
                 st.stats.mark_scheduled(now)
+
+    def _record_request_queue_time(self, forward_op) -> None:
+        # Observe each request's waiting-queue wall time once, when its first
+        # forward dispatches. The enqueue stamp rides the RequestState from
+        # _submit_scheduler_requests; a retracted request re-enters the C++
+        # waiting queue without a new stamp, and the recorded flag keeps its
+        # re-dispatch from producing a second observation. --enable-metrics.
+        if not self.metrics.enabled:
+            return
+        now = time.time()
+        rid_to_state = self.output_processor.rid_to_state
+        for rid in forward_op.request_ids:
+            state = rid_to_state.get(rid)
+            if (
+                state is None
+                or state.queue_time_recorded
+                or state.scheduler_enqueue_time <= 0.0
+            ):
+                continue
+            state.queue_time_recorded = True
+            self.metrics.observe_request_queue_time(now - state.scheduler_enqueue_time)
 
     def _gather_sampling_params(self, forward_op) -> list[SamplingParams]:
         """Look up per-request SamplingParams from the output processor. The
@@ -1479,6 +1521,10 @@ def run_event_loop(
         # compilation on the data plane is a stall.
         arm_data_plane_sync_debug(server_args.device)
         mark_jit_compile_serving()
+        # The same boundary for the garbage collector: startup's objects leave
+        # its generations, and full collections run only where the loop runs
+        # them (gc_hooks.py).
+        freeze_startup_heap()
         event_loop.event_loop()
 
     except Exception:  # noqa: BLE001 - process boundary; report and signal parent

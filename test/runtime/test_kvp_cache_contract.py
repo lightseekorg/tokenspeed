@@ -67,10 +67,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.virtual_blocks import (
     local_pages_by_group,
     owned_local_pages,
 )
-from tokenspeed.runtime.utils.server_args import (
-    ServerArgs,
-    validate_kvp_disaggregation_role,
-)
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 register_cuda_ci(
     est_time=10,
@@ -122,6 +119,7 @@ def _recipe(*, kvp_size: int, fp4: bool, draft: bool) -> DeepseekV4Recipe:
     )
     return DeepseekV4Recipe(
         server_args=SimpleNamespace(
+            kv_offload_config=None,
             max_total_tokens=None,
             chunked_prefill_size=8192,
             disaggregation_mode="null",
@@ -634,7 +632,7 @@ class ConfigurationTest(unittest.TestCase):
         # the KVStore (and the retraction snapshot pool) serve a sharded
         # engine; an L3 key has no owner-stable form under sharding.
         args = object.__new__(ServerArgs)
-        args.disaggregation_mode = "null"
+        args.disaggregation_mode = "decode"
         args.kv_parallel_size = 2
         args.disable_kvstore = False
         args.enable_kvstore = False
@@ -646,15 +644,6 @@ class ConfigurationTest(unittest.TestCase):
         args.kvstore_storage_backend = "mooncake"
         with self.assertRaisesRegex(ValueError, "L3"):
             args.validate_cache_options()
-
-    def test_kvp_allows_aggregated_and_prefill_roles_only(self):
-        for mode in ("null", "prefill"):
-            validate_kvp_disaggregation_role(has_kvp=True, disaggregation_mode=mode)
-        for mode in ("null", "prefill", "decode", "encode"):
-            validate_kvp_disaggregation_role(has_kvp=False, disaggregation_mode=mode)
-        for mode in ("decode", "encode"):
-            with self.assertRaisesRegex(ValueError, "only the prefill side"):
-                validate_kvp_disaggregation_role(has_kvp=True, disaggregation_mode=mode)
 
 
 if __name__ == "__main__":

@@ -56,6 +56,7 @@ _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS = 8192
 _AUTOTUNE_CACHE_DIR_ENV = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
 
 _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
+_autotune_process_group: dist.ProcessGroup | None = None
 
 
 @contextlib.contextmanager
@@ -91,8 +92,13 @@ def _reuse_autotune_cache():
                 and hit
                 and not tuner._blocklist.filter(custom_op, runners[runner_id], [tactic])
             ):
-                return False, 0, -1, None
-            return result
+                hit = False
+            if was_tuning and _autotune_process_group is not None:
+                hits = [False] * dist.get_world_size(_autotune_process_group)
+                dist.all_gather_object(hits, hit, group=_autotune_process_group)
+                hit = all(hits)
+            # Rank-specific keys can miss even after loading identical files.
+            return result if hit else (False, 0, -1, None)
 
     AutoTuner.search_cache = search
     try:
@@ -271,14 +277,16 @@ def untuned(*ops: str) -> Generator[None]:
 def set_autotune_process_group(process_group) -> None:
     """Average per-tactic profile timings across ``process_group`` ranks.
 
-    Ranks must enter tuning with identical caches and profile the same ops in
-    the same order. Clear the group after tuning. A no-op without FlashInfer.
+    Ranks must profile the same ops in the same order. Cache hits are agreed
+    across the group. Clear the group after tuning. A no-op without FlashInfer.
 
     Args:
         process_group: A ``torch.distributed`` process group covering the
             ranks that tune together (prefer a CPU/gloo group), or ``None``
             to restore independent per-rank tuning.
     """
+    global _autotune_process_group
+    _autotune_process_group = process_group
     if _autotuner is not None:
         _autotuner.set_autotune_process_group(process_group)
 
@@ -406,16 +414,28 @@ def save_autotune_cache(
         return False
     if not _autotuner_available(process_group):
         return False
-    if process_group is not None:
-        dist.barrier(group=process_group)
     payload = None
-    if process_group is None or dist.get_rank() == owner_rank:
-        try:
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
-            _autotuner.AutoTuner.get().save_configs(path)
-            payload = Path(path).read_bytes()
-        except Exception:
-            logger.warning(f"Could not save FlashInfer cache {path}", exc_info=True)
+    try:
+        with tempfile.NamedTemporaryFile() as tmp:
+            _autotuner.AutoTuner.get().save_configs(tmp.name)
+            payload = Path(tmp.name).read_bytes()
+    except Exception:
+        logger.warning(f"Could not save FlashInfer cache {path}", exc_info=True)
+    if process_group is not None:
+        payloads = [None] * dist.get_world_size(process_group)
+        dist.all_gather_object(payloads, payload, group=process_group)
+        payload = None
+        if dist.get_rank() == owner_rank and all(p is not None for p in payloads):
+            try:
+                # MoE cache keys include TP/EP rank: keep every rank's entries.
+                merged = {}
+                for rank_payload in payloads:
+                    merged.update(json.loads(rank_payload))
+                payload = json.dumps(merged).encode()
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"Could not merge FlashInfer cache {path}", exc_info=True
+                )
     return _mirror_autotune_cache(path, payload, process_group, owner_rank)
 
 

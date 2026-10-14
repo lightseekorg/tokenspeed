@@ -24,7 +24,6 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 
 _FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz})
-_MLA_PREFILL_DTYPES = frozenset({torch.float16, torch.bfloat16}) | _FP8_DTYPES
 
 
 @triton.jit

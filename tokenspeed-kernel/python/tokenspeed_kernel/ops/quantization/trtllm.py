@@ -46,7 +46,14 @@ if platform.is_nvidia:
                 "trtllm fp8_quantize_1x128 only supports group_size=128, "
                 f"got {group_size}"
             )
-        return torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+        q, scale = torch.ops.trtllm.fp8_quantize_1x128(x, use_ue8m0)
+        if scale.ndim == 1:
+            # Native scales have a 4-row stride and trailing allocation padding.
+            rows, columns = x.shape
+            padded_rows = (rows + 3) // 4 * 4
+            groups = columns // group_size
+            scale = scale[: groups * padded_rows].view(groups, padded_rows)[:, :rows]
+        return q, scale
 
     def _per_token_quant_fp8(
         input: torch.Tensor, output: torch.Tensor, scale: torch.Tensor

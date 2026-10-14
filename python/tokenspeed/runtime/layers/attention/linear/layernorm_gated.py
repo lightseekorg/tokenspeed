@@ -58,6 +58,7 @@ def _rms_norm_fwd_kernel(
     ENABLE_PDL: tl.constexpr,
     WEIGHTS_INDEPENDENT: tl.constexpr,
     OUT_FP8: tl.constexpr,
+    SHARED_WEIGHT: tl.constexpr,
 ):
     # Each program normalizes BLOCK_M rows of one group, one warp per row.
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -65,8 +66,11 @@ def _rms_norm_fwd_kernel(
     cols = tl.arange(0, BLOCK_N)
     col_mask = cols < N
     mask = (rows < M)[:, None] & col_mask[None, :]
+    # Row offsets in int64: z may be a view with a projection-wide row stride.
+    rows = rows.to(tl.int64)
     offsets = group * N + cols[None, :]
-    W += group * N
+    if not SHARED_WEIGHT:
+        W += group * N
     if WEIGHTS_INDEPENDENT:
         w = tl.load(W + cols, mask=col_mask).to(tl.float32)
     if ENABLE_PDL:
@@ -114,6 +118,7 @@ def rmsnorm_fn(
     norm(x * silu(z)); ``sigmoid_gate`` swaps silu(z) for sigmoid(z). With
     ``group_size`` set, each group of that many features is normalized on its
     own (``None`` means one group over the whole last dim).
+    A ``weight`` of ``group_size`` features is shared by every group.
 
     ``weights_independent`` promises the weight is already visible before the
     preceding PDL producer starts, permitting its load before the input wait.
@@ -138,7 +143,7 @@ def rmsnorm_fn(
         group_size = N
     assert N % group_size == 0
     ngroups = N // group_size
-    assert weight.shape == (N,)
+    assert weight.shape in ((N,), (group_size,))
     out = torch.empty_like(
         x, dtype=x.dtype if fp8_scale is None else torch.float8_e4m3fn
     )
@@ -172,6 +177,7 @@ def rmsnorm_fn(
             ENABLE_PDL=enable_pdl,
             WEIGHTS_INDEPENDENT=weights_independent,
             OUT_FP8=fp8_scale is not None,
+            SHARED_WEIGHT=weight.shape[0] != N,
             **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out.reshape(x_shape_og)

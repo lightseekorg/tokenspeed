@@ -39,6 +39,7 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_geometry import (
     V4_KERNEL_BLOCK_ROWS,
     V4_SWA_KV_GROUP_ID,
     DeepseekV4CacheLayout,
+    deepseek_v4_swa_row_bytes,
     parse_v4_compressed_kv_group_id,
     parse_v4_compressor_state_group_id,
     v4_compressed_kv_group_id,
@@ -483,6 +484,10 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
             return int(spec.rows_per_page)
 
         self.swa_block_size = _group_rows(V4_SWA_KV_GROUP_ID)
+        if self.swa_block_size <= 0:
+            raise ValueError(
+                f"SWA page_size must be positive, got {self.swa_block_size}"
+            )
         self.compressed_block_sizes = tuple(
             layout.storage_block_size(ratio) if ratio > 1 else prefix_granularity
             for ratio in layout.layer_ratio
@@ -508,6 +513,21 @@ class HybridDeepseekV4TokenToKVPool(CachePool):
             for ratio in layout.layer_ratio
         )
         self._bind_layer_planes()
+        # Validate the same flattened page views the SWA insert kernel receives.
+        page_bytes = self.swa_block_size * deepseek_v4_swa_row_bytes(512, 64)
+        for buffer in self.swa_kv_buffer:
+            if buffer is None:
+                continue
+            cache = buffer.view(buffer.shape[0], -1)
+            if (
+                cache.dtype != torch.uint8
+                or cache.shape[1] < page_bytes
+                or cache.stride(1) != 1
+            ):
+                raise ValueError(
+                    "swa_kv_cache must be a 2D uint8 page-planar cache with "
+                    f"at least {page_bytes} bytes per page"
+                )
 
         logger.info(
             f"Initialized DeepSeek V4 cache pool: {plan.num_lcm_blocks:d} parents, P="

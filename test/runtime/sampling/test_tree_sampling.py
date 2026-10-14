@@ -100,7 +100,9 @@ def _tree(parent: list[int], req: torch.Tensor) -> TreeSpec:
     parent_map = torch.tensor(parent, dtype=torch.int32, device="cuda").repeat(
         POOL + 1, 1
     )
-    spec.load_step(BS, req, parent_map)
+    spec.load_step(
+        BS, req, parent_map, torch.zeros(BS * N, dtype=torch.int64, device="cuda")
+    )
     return spec
 
 

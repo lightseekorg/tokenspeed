@@ -53,6 +53,9 @@ class ModelCase:
     # chat-template rendering with enable_thinking=False to suppress
     # reasoning output.
     is_thinking_model: bool = False
+    # Whether the model carries recurrent-state cache groups, whose prefix
+    # hits exist only at published checkpoints and resume within tolerance.
+    has_state_groups: bool = False
 
 
 _MODEL_CASES = [
@@ -71,6 +74,7 @@ _MODEL_CASES = [
             "quantization": "nvfp4",
         },
         is_thinking_model=True,
+        has_state_groups=True,
     ),
 ]
 
@@ -138,7 +142,7 @@ def _render_simple_prompt(case: ModelCase, user_msg: str) -> str:
     return user_msg
 
 
-def _make_engine(case: ModelCase, enable_prefix_caching: bool) -> Engine:
+def _make_engine(case: ModelCase, enable_prefix_caching: bool, **overrides) -> Engine:
     kwargs = {
         "model": case.model_path,
         "dtype": get_dtype_str(_TORCH_DTYPE),
@@ -153,6 +157,7 @@ def _make_engine(case: ModelCase, enable_prefix_caching: bool) -> Engine:
         "disable_autotune": True,
     }
     kwargs.update(case.extra_kwargs)
+    kwargs.update(overrides)
     return Engine(**kwargs)
 
 
@@ -195,7 +200,7 @@ class TestPrefixCacheDisabled(unittest.TestCase):
 
 
 class TestPrefixCacheEnabled(unittest.TestCase):
-    """When prefix caching is enabled, a promoted shared prefix becomes reusable."""
+    """When prefix caching is enabled, a shared prefix becomes reusable."""
 
     def test_prefix_cache_enabled_has_cached_tokens(self):
         for case in _ACTIVE_MODELS:
@@ -204,10 +209,11 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                 try:
                     sampling = {"max_new_tokens": 8, "temperature": 0}
 
-                    # The first request publishes its endpoint. The second
-                    # request discovers the shorter shared Full-KV prefix and
-                    # materializes the matching State/SWA boundary. The third
-                    # request can then reuse that converged cross-group prefix.
+                    # The first request publishes its prompt end and finish.
+                    # The second request shares the system prefix below that,
+                    # hits its hash-complete pages and, under the junction
+                    # cut, ends its first chunk at the shared boundary so the
+                    # third request hits the converged cross-group prefix.
                     engine.generate(
                         prompt=_render_prompt(
                             case, "What is 1+1? Reply with just the number."
@@ -236,6 +242,144 @@ class TestPrefixCacheEnabled(unittest.TestCase):
                         f"[{case.model_path}] cached_tokens should be > 0 when "
                         f"prefix caching is enabled, got {cached}",
                     )
+                finally:
+                    engine.shutdown()
+
+
+def _prompt_ids(case: ModelCase, user_msg: str) -> list[int]:
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(case.model_path, trust_remote_code=True)
+    return tok(_render_prompt(case, user_msg), add_special_tokens=False)["input_ids"]
+
+
+def _greedy_ids(
+    engine: Engine, input_ids: list[int], max_new_tokens: int, *, bypass_cache: bool
+):
+    """Greedy continuation and the prefix-cache hit the request got.
+
+    ``bypass_cache`` asks for prompt logprobs from position 0: every scored
+    position must be recomputed, so the admission probe is bounded at 0 and
+    the request computes its whole prompt whatever the cache holds (the only
+    per-request cache bound the API exposes). Its forwards are the same
+    layer computations; only the LM head additionally scores the prompt rows.
+    """
+    resp = engine.generate(
+        input_ids=input_ids,
+        sampling_params={"max_new_tokens": max_new_tokens, "temperature": 0},
+        return_logprob=bypass_cache,
+        logprob_start_len=0 if bypass_cache else None,
+        stream=False,
+    )
+    return list(resp["output_ids"]), int(resp["meta_info"].get("cached_tokens", 0))
+
+
+class TestTokenLevelPrefixHits(unittest.TestCase):
+    """A hit ends at the token where a published prefix ended, not at a page.
+
+    The oracle is shape-matched: under ``--numerics auto`` a position's
+    logits depend on the shape of the forward that computed them (a 1-row
+    extend and a 276-row prefill round differently), so the reference must
+    run the same forwards as the warm path. With ``chunked_prefill_size =
+    |X| - 1`` the reference ``X`` is prefilled as ``[0, |X|-1)`` then the
+    1-row chunk ``[|X|-1, |X|)``; the warm path is ``X[:-1]`` prefilled whole
+    (the same ``[0, |X|-1)`` forward, run first so nothing it could hit is
+    published yet) followed by a repeat of ``X`` that resumes at its
+    published prompt end, a 1-row extend from the same boundary with the same
+    state and KV rows. The reference bypasses the cache so it computes the
+    same forwards itself; the warm repeat must then reproduce its continuation
+    token for token, for KV-only and recurrent-state models alike. ``X + Y``
+    hits the reference's prompt end exactly; ``X[:-37]`` ends inside the last
+    page before any publication point and finds no state below it; a next
+    turn hits the reference's finish, which settled after its last forward
+    landed and so covers every token the reference sampled.
+    """
+
+    STEPS = 24
+
+    def test_hits_at_natural_boundaries_reproduce_the_cold_continuation(self):
+        for case in _ACTIVE_MODELS:
+            with self.subTest(model=case.model_path):
+                hybrid = case.has_state_groups
+                prefix = _prompt_ids(
+                    case,
+                    "Please summarize, in order, the forty-two rules of the "
+                    "house style guide, then explain why rule seventeen "
+                    "exists and how it interacts with rules three and nine. "
+                    "For each rule, name the section it belongs to, the "
+                    "year it was introduced, the most common way it is "
+                    "broken in practice, and the reviewer who usually "
+                    "catches that mistake. Where two rules appear to "
+                    "conflict, say which one wins and why the committee "
+                    "decided so. Reply with the summary only, one rule per "
+                    "line, without any preamble or closing remarks.",
+                )
+                # The cuts below must leave at least one hash-complete page
+                # under the largest prefix granularity a case may use.
+                self.assertGreater(len(prefix), 128 + 37)
+                engine = _make_engine(
+                    case,
+                    enable_prefix_caching=True,
+                    chunked_prefill_size=len(prefix) - 1,
+                    # The reference asks for prompt logprobs (its cache bypass).
+                    enable_output_logprobs=True,
+                )
+                try:
+                    # X[:-1] first: one cold forward over [0, |X|-1), the
+                    # shape the reference's first chunk has. Its prompt end
+                    # publishes the tail and the state at |X| - 1.
+                    shorter = prefix[:-1]
+                    warm, cached = _greedy_ids(engine, shorter, 1, bypass_cache=False)
+                    self.assertEqual(cached, 0)
+                    self.assertEqual(len(warm), 1)
+
+                    # The reference: X computed whole, chunked [0, |X|-1) and
+                    # [|X|-1, |X|), with the cache bypassed.
+                    cold, cached = _greedy_ids(
+                        engine, prefix, self.STEPS, bypass_cache=True
+                    )
+                    self.assertEqual(cached, 0)
+                    self.assertEqual(len(cold), self.STEPS)
+
+                    # X + Y: the reference's prompt-end checkpoint is hit
+                    # exactly, whatever the page geometry, by KV and state
+                    # groups alike.
+                    suffix = _prompt_ids(case, "Now do the same for the other guide.")
+                    _, cached = _greedy_ids(
+                        engine, prefix + suffix, 4, bypass_cache=False
+                    )
+                    self.assertEqual(cached, len(prefix))
+
+                    # X[:-37] ends inside the last page, before any publication
+                    # point: a hybrid finds no state below it; a KV-only model
+                    # may resume at its hash-complete pages when every group
+                    # holds them (a sliding-window group only where its
+                    # lookback was published).
+                    deeper = prefix[:-37]
+                    warm, cached = _greedy_ids(engine, deeper, 1, bypass_cache=False)
+                    self.assertLess(cached, len(deeper))
+                    if hybrid:
+                        self.assertEqual(cached, 0)
+                    self.assertEqual(len(warm), 1)
+
+                    # X again: resumes at |X| - 1 from the state and KV rows
+                    # X[:-1] published -- the same forward the reference's
+                    # second chunk ran -- so the continuation is the
+                    # reference's, token for token.
+                    warm, cached = _greedy_ids(
+                        engine, prefix, self.STEPS, bypass_cache=False
+                    )
+                    self.assertEqual(cached, len(prefix) - 1)
+                    self.assertEqual(warm, cold)
+
+                    # A next turn -- X, the reference's whole continuation and
+                    # more -- hits its finish checkpoint: the frontier the
+                    # last forward landed, the final sampled token included,
+                    # for KV and state groups alike.
+                    _, cached = _greedy_ids(
+                        engine, prefix + cold + suffix, 1, bypass_cache=False
+                    )
+                    self.assertEqual(cached, len(prefix) + len(cold))
                 finally:
                     engine.shutdown()
 
