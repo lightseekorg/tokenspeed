@@ -46,7 +46,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     try_kda_fused_paged_verify,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import capture_replay_payload
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import current_platform
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
