@@ -1125,9 +1125,8 @@ if platform.is_nvidia:
 # weights with one FP32 scale per output row, activations quantized per token at
 # run time) run on ``trtllm_fp8_per_channel_scale_moe``. Its rounding points:
 #
-# - the input is quantized per token by TRT-LLM's FP8 quantizer
-#   (``quantize_fp8_with_scale(granularity="token")``, one FP32 scale per
-#   token);
+# - the input is quantized per token, one FP32 scale per token, by the kernel
+#   that ``quantize_fp8_with_scale(granularity="token")`` selects;
 # - FC1 accumulates in FP32, applies the token and row scales, runs SiLU(gate) *
 #   up in its epilogue and writes BF16;
 # - the FC2 input is quantized per routed row, over this rank's intermediate
