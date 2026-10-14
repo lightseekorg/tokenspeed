@@ -31,9 +31,10 @@ accounting for pinned traffic, and the ``SINGLE_WORKER_ID`` range fix.
 
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -76,7 +77,7 @@ def _make_input_processor(**engine_kwargs):
     return processor
 
 
-class TestGenerateReqInputPlumbing(unittest.TestCase):
+class TestGenerateReqInputPlumbing:
     def test_scalar_broadcast_on_n_gt_1(self):
         obj = GenerateReqInput(
             text="hello",
@@ -84,7 +85,7 @@ class TestGenerateReqInputPlumbing(unittest.TestCase):
             data_parallel_rank=5,
         )
         obj.normalize_batch_and_arguments()
-        self.assertEqual(obj.data_parallel_rank, [5, 5, 5])
+        assert (obj.data_parallel_rank) == ([5, 5, 5])
 
     def test_list_rejected_on_n_gt_1(self):
         obj = GenerateReqInput(
@@ -92,7 +93,7 @@ class TestGenerateReqInputPlumbing(unittest.TestCase):
             sampling_params={"n": 2},
             data_parallel_rank=[0, 1],
         )
-        with self.assertRaisesRegex(ValueError, "data_parallel_rank"):
+        with pytest.raises((ValueError), match=("data_parallel_rank")):
             obj.normalize_batch_and_arguments()
 
     def test_getitem_carries_rank(self):
@@ -102,26 +103,26 @@ class TestGenerateReqInputPlumbing(unittest.TestCase):
             data_parallel_rank=[3, 4],
         )
         obj.normalize_batch_and_arguments()
-        self.assertEqual(obj[0].data_parallel_rank, 3)
-        self.assertEqual(obj[1].data_parallel_rank, 4)
+        assert (obj[0].data_parallel_rank) == (3)
+        assert (obj[1].data_parallel_rank) == (4)
 
     def test_default_is_none(self):
         obj = GenerateReqInput(text="hello", sampling_params={})
         obj.normalize_batch_and_arguments()
-        self.assertIsNone(obj.data_parallel_rank)
+        assert (obj.data_parallel_rank) is None
 
     def test_single_request_length1_list_unwrapped(self):
         # A list pin surviving normalize on a single request would fail the
         # int|None typed msgpack decode in the DP controller's dispatch loop.
         obj = GenerateReqInput(text="hello", sampling_params={}, data_parallel_rank=[2])
         obj.normalize_batch_and_arguments()
-        self.assertEqual(obj.data_parallel_rank, 2)
+        assert (obj.data_parallel_rank) == (2)
 
     def test_single_request_longer_list_rejected(self):
         obj = GenerateReqInput(
             text="hello", sampling_params={}, data_parallel_rank=[1, 2]
         )
-        with self.assertRaisesRegex(ValueError, "data_parallel_rank"):
+        with pytest.raises((ValueError), match=("data_parallel_rank")):
             obj.normalize_batch_and_arguments()
 
     def test_batch_list_length_mismatch_rejected(self):
@@ -130,7 +131,7 @@ class TestGenerateReqInputPlumbing(unittest.TestCase):
             sampling_params=[{}, {}, {}],
             data_parallel_rank=[0, 1],
         )
-        with self.assertRaisesRegex(ValueError, "batch size"):
+        with pytest.raises((ValueError), match=("batch size")):
             obj.normalize_batch_and_arguments()
 
     def test_tokenized_field_is_last_on_the_wire(self):
@@ -139,29 +140,29 @@ class TestGenerateReqInputPlumbing(unittest.TestCase):
         # transport decodes TokenizedGenerateReqInput straight off the wire,
         # so the new field must stay the last one.
         fields = msgspec.structs.fields(TokenizedGenerateReqInput)
-        self.assertEqual(fields[-1].name, "data_parallel_rank")
+        assert (fields[-1].name) == ("data_parallel_rank")
 
 
-class TestIngressValidation(unittest.TestCase):
+class TestIngressValidation:
     def test_colocated_out_of_range_raises(self):
         processor = _make_input_processor(dp_size=8)
         obj = GenerateReqInput(text="hello", sampling_params={}, data_parallel_rank=8)
-        with self.assertRaisesRegex(ValueError, r"\[0, 8\)"):
+        with pytest.raises((ValueError), match=(r"\[0, 8\)")):
             processor.validate_request(obj)
 
     def test_colocated_in_range_kept(self):
         processor = _make_input_processor(dp_size=8)
         obj = GenerateReqInput(text="hello", sampling_params={}, data_parallel_rank=7)
         processor.validate_request(obj)
-        self.assertEqual(obj.data_parallel_rank, 7)
+        assert (obj.data_parallel_rank) == (7)
 
     def test_no_attn_dp_pin_dropped_silently(self):
         processor = _make_input_processor(has_attn_dp=False)
         obj = GenerateReqInput(text="hello", sampling_params={}, data_parallel_rank=3)
         processor.validate_request(obj)
-        self.assertIsNone(obj.data_parallel_rank)
+        assert (obj.data_parallel_rank) is None
 
-    def test_non_int_pin_rejected_everywhere(self):
+    def test_non_int_pin_rejected_everywhere(self, subtests):
         # bool passes a bare range compare and floats/lists fail the int|None
         # typed msgpack decode downstream — reject at the choke point.
         for bad in (True, 1.5, "3"):
@@ -170,8 +171,8 @@ class TestIngressValidation(unittest.TestCase):
                 obj = GenerateReqInput(
                     text="hello", sampling_params={}, data_parallel_rank=bad
                 )
-                with self.subTest(bad=bad, mode=mode):
-                    with self.assertRaisesRegex(ValueError, "must be an int"):
+                with subtests.test(bad=bad, mode=mode):
+                    with pytest.raises((ValueError), match=("must be an int")):
                         processor.validate_request(obj)
 
     def test_colocated_batch_list_out_of_range_raises(self):
@@ -181,7 +182,7 @@ class TestIngressValidation(unittest.TestCase):
             sampling_params=[{}, {}],
             data_parallel_rank=[1, 99],
         )
-        with self.assertRaisesRegex(ValueError, "99"):
+        with pytest.raises((ValueError), match=("99")):
             processor.validate_request(obj)
 
     def test_colocated_batch_list_partial_pin_kept(self):
@@ -192,11 +193,11 @@ class TestIngressValidation(unittest.TestCase):
             data_parallel_rank=[None, 3],
         )
         processor.validate_request(obj)
-        self.assertEqual(obj.data_parallel_rank, [None, 3])
+        assert (obj.data_parallel_rank) == ([None, 3])
 
-    def test_disagg_room_authoritative_conflict_warns_and_drops(self):
+    def test_disagg_room_authoritative_conflict_warns_and_drops(self, subtests):
         for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode):
+            with subtests.test(mode=mode):
                 processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
                 obj = GenerateReqInput(
                     text="hello",
@@ -205,12 +206,12 @@ class TestIngressValidation(unittest.TestCase):
                     data_parallel_rank=5,
                 )
                 processor.validate_request(obj)
-                self.assertIsNone(obj.data_parallel_rank)
+                assert (obj.data_parallel_rank) is None
                 processor.engine.logger.warning.assert_called_once()
 
-    def test_disagg_consistent_pin_dropped_without_warning(self):
+    def test_disagg_consistent_pin_dropped_without_warning(self, subtests):
         for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode):
+            with subtests.test(mode=mode):
                 processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
                 obj = GenerateReqInput(
                     text="hello",
@@ -219,7 +220,7 @@ class TestIngressValidation(unittest.TestCase):
                     data_parallel_rank=2,  # == 10 % 8, consistent
                 )
                 processor.validate_request(obj)
-                self.assertIsNone(obj.data_parallel_rank)
+                assert (obj.data_parallel_rank) is None
                 processor.engine.logger.warning.assert_not_called()
 
     def test_disagg_non_int_room_warns_and_drops_never_raises(self):
@@ -234,7 +235,7 @@ class TestIngressValidation(unittest.TestCase):
             data_parallel_rank=2,
         )
         processor.validate_request(obj)
-        self.assertIsNone(obj.data_parallel_rank)
+        assert (obj.data_parallel_rank) is None
         processor.engine.logger.warning.assert_called_once()
 
     def test_disagg_unequal_lists_still_warn(self):
@@ -248,7 +249,7 @@ class TestIngressValidation(unittest.TestCase):
             data_parallel_rank=[0, 0, 5],
         )
         processor.validate_request(obj)
-        self.assertIsNone(obj.data_parallel_rank)
+        assert (obj.data_parallel_rank) is None
         processor.engine.logger.warning.assert_called_once()
 
     def test_disagg_scalar_pin_checked_against_every_room(self):
@@ -262,7 +263,7 @@ class TestIngressValidation(unittest.TestCase):
             data_parallel_rank=2,
         )
         processor.validate_request(obj)
-        self.assertIsNone(obj.data_parallel_rank)
+        assert (obj.data_parallel_rank) is None
         processor.engine.logger.warning.assert_called_once()
 
 
@@ -286,7 +287,7 @@ def _tokenized(data_parallel_rank=None, bootstrap_room=None):
     )
 
 
-class TestEngineEntrypointForwarding(unittest.IsolatedAsyncioTestCase):
+class TestEngineEntrypointForwarding:
     """Engine.generate / async_generate are the documented API surface for
     the pin; each must forward it into GenerateReqInput."""
 
@@ -295,7 +296,7 @@ class TestEngineEntrypointForwarding(unittest.IsolatedAsyncioTestCase):
         try:
             from tokenspeed.runtime.entrypoints.engine import Engine
         except ImportError as exc:  # pragma: no cover - env-dependent import
-            raise unittest.SkipTest(f"entrypoints.engine unimportable: {exc}")
+            pytest.skip(f"entrypoints.engine unimportable: {exc}")
 
         return Engine.__new__(Engine)
 
@@ -309,8 +310,9 @@ class TestEngineEntrypointForwarding(unittest.IsolatedAsyncioTestCase):
 
         eng.llm = SimpleNamespace(generate=_capture, generate_stream=_capture)
         eng.generate(prompt="hi", data_parallel_rank=3)
-        self.assertEqual(captured["obj"].data_parallel_rank, 3)
+        assert (captured["obj"].data_parallel_rank) == (3)
 
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_async_generate_forwards_pin(self):
         eng = self._engine()
         captured = {}
@@ -321,11 +323,11 @@ class TestEngineEntrypointForwarding(unittest.IsolatedAsyncioTestCase):
 
         eng.tokenizer_manager = SimpleNamespace(generate_request=_agen)
         result = await eng.async_generate(prompt="hi", data_parallel_rank=3)
-        self.assertEqual(result, {})
-        self.assertEqual(captured["obj"].data_parallel_rank, 3)
+        assert (result) == ({})
+        assert (captured["obj"].data_parallel_rank) == (3)
 
 
-class TestDispatcherWiring(unittest.TestCase):
+class TestDispatcherWiring:
     def test_pinned_request_routes_via_request_dispatcher(self):
         # The event loop hands messages to _request_dispatcher; a revert of
         # the init_dispatcher registration back to self.dispatching would
@@ -345,7 +347,7 @@ class TestDispatcherWiring(unittest.TestCase):
         controller.dispatching.assert_not_called()
 
 
-class TestControllerPinnedDispatch(unittest.TestCase):
+class TestControllerPinnedDispatch:
     def test_pin_dispatches_directly(self):
         controller = _make_controller()
         req = _tokenized(data_parallel_rank=2)
@@ -369,11 +371,11 @@ class TestControllerPinnedDispatch(unittest.TestCase):
         controller.dispatch_generate_request(req)
         controller.dispatching.assert_called_once_with(req)
 
-    def test_malformed_pin_payload_degrades_never_raises(self):
+    def test_malformed_pin_payload_degrades_never_raises(self, subtests):
         # bool passes a bare range compare; a list raises TypeError on it —
         # both must fall back to the policy, not escape the dispatch loop.
         for bad in (True, [1], 2.5):
-            with self.subTest(bad=bad):
+            with subtests.test(bad=bad):
                 controller = _make_controller(dp_size=4)
                 req = _tokenized(data_parallel_rank=bad)
                 controller.dispatch_generate_request(req)
@@ -397,11 +399,11 @@ class TestControllerPinnedDispatch(unittest.TestCase):
         controller.dp_budget.update_budget(loads)
         controller.dp_budget.update_budget(loads)  # same order -> reservations live
         controller.dispatch_generate_request(_tokenized(data_parallel_rank=1))
-        self.assertEqual(controller.dp_budget.reservations[1], 1)
-        self.assertEqual(controller.dp_budget.reservations[0], 0)
+        assert (controller.dp_budget.reservations[1]) == (1)
+        assert (controller.dp_budget.reservations[0]) == (0)
 
 
-class TestDPBudgetPinnedDispatch(unittest.TestCase):
+class TestDPBudgetPinnedDispatch:
     def test_pinned_reservation_steers_budget_away(self):
         budget = DPBudget(LoadBalanceMethod.SHORTEST_QUEUE)
         loads = [
@@ -410,19 +412,20 @@ class TestDPBudgetPinnedDispatch(unittest.TestCase):
         ]
         budget.update_budget(loads)
         budget.update_budget(loads)
-        self.assertEqual(budget.dispatch(pinned_rank=0), 0)
+        assert (budget.dispatch(pinned_rank=0)) == (0)
         # rank 0 now carries a pinned in-flight request; the next budget
         # dispatch must prefer rank 1.
-        self.assertEqual(budget.dispatch(), 1)
+        assert (budget.dispatch()) == (1)
 
     def test_pinned_before_first_snapshot_is_noop(self):
         budget = DPBudget(LoadBalanceMethod.SHORTEST_QUEUE)
         # no rank_order yet — must not raise
-        self.assertEqual(budget.dispatch(pinned_rank=0), 0)
-        self.assertEqual(budget.reservations, {})
+        assert (budget.dispatch(pinned_rank=0)) == (0)
+        assert (budget.reservations) == ({})
 
 
-class TestTokenizeBridge(unittest.IsolatedAsyncioTestCase):
+class TestTokenizeBridge:
+    @pytest.mark.asyncio(loop_scope="function")
     async def test_pin_reaches_tokenized_request(self):
         # The only bridge that puts the pin onto the wire is
         # tokenize_one_request copying obj.data_parallel_rank into
@@ -449,11 +452,11 @@ class TestTokenizeBridge(unittest.IsolatedAsyncioTestCase):
         )
         obj.normalize_batch_and_arguments()
         tokenized = await processor.tokenize_one_request(obj)
-        self.assertIsInstance(tokenized, TokenizedGenerateReqInput)
-        self.assertEqual(tokenized.data_parallel_rank, 6)
+        assert isinstance((tokenized), (TokenizedGenerateReqInput))
+        assert (tokenized.data_parallel_rank) == (6)
 
 
-class TestSingleWorkerIdRange(unittest.TestCase):
+class TestSingleWorkerIdRange:
     def test_last_rank_is_valid(self):
         controller = _make_controller(dp_size=4)
         with mock.patch.dict(os.environ, {"SINGLE_WORKER_ID": "3"}):
@@ -463,9 +466,9 @@ class TestSingleWorkerIdRange(unittest.TestCase):
     def test_out_of_range_still_rejected(self):
         controller = _make_controller(dp_size=4)
         with mock.patch.dict(os.environ, {"SINGLE_WORKER_ID": "4"}):
-            with self.assertRaises(ValueError):
+            with pytest.raises((ValueError)):
                 controller.single_robin_scheduler(_tokenized())
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
