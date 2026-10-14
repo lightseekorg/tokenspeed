@@ -90,6 +90,7 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.quantization import quantize_fp8_with_gate
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -748,6 +749,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             gate is not None
             and ctx.num_extends == 0
             and ctx.attn_backend.supports_mla_projected_value_decode
+            and not self.o_proj.supports_fp8_group128_input
         )
         expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
         attn_output = self._attn(
@@ -760,8 +762,15 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             absorbed_query=absorbed_query,
         )
         if gate is not None and not fuse_value_gate:
-            # Fused in-place fp32 sigmoid+mul; the gate shard matches the
-            # head-sharded attn_output.
+            if self.o_proj.supports_fp8_group128_input:
+                values, scales = quantize_fp8_with_gate(
+                    attn_output,
+                    gate,
+                    norm_weight=None,
+                    eps=0.0,
+                    enable_pdl=pdl_enabled(),
+                )
+                return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
             attn_output = sigmoid_mul(attn_output, gate)
         if projection_out is not None:
             # K3AttnComm supplies this only for the unbiased BF16 TP shard.
@@ -1546,7 +1555,6 @@ class KimiLinearKDA(nn.Module):
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
         conv_weights = self.conv_weights
-        fuse_decode_output_norm = ctx.forward_mode.is_decode() and num_tokens == ctx.bs
 
         core_out = ctx.attn_backend.forward(
             q=None,
@@ -1571,26 +1579,29 @@ class KimiLinearKDA(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             lower_bound=self.gate_lower_bound,
-            output_gate=out_gate if fuse_decode_output_norm else None,
-            norm_weight=self.o_norm.weight if fuse_decode_output_norm else None,
-            norm_eps=self.o_norm.variance_epsilon if fuse_decode_output_norm else None,
             layer_id=self.layer_id,
             seq_len=num_tokens,
         )
 
         core_out = core_out.reshape(num_tokens, hn * hd)
-        if not fuse_decode_output_norm:
-            # Decode kernels may fuse this epilogue; prefill retains the shared
-            # per-head norm implementation.
-            core_out = rmsnorm_gated_sigmoid(
-                core_out.contiguous(),
+        if self.head_dim == 128 and self.o_proj.supports_fp8_group128_input:
+            values, scales = quantize_fp8_with_gate(
+                core_out,
                 out_gate,
-                self.o_norm.weight,
-                self.o_norm.variance_epsilon,
-                hn,
-                hd,
+                norm_weight=self.o_norm.weight,
+                eps=self.o_norm.variance_epsilon,
                 enable_pdl=pdl_enabled(),
             )
+            return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
+        core_out = rmsnorm_gated_sigmoid(
+            core_out.contiguous(),
+            out_gate,
+            self.o_norm.weight,
+            self.o_norm.variance_epsilon,
+            hn,
+            hd,
+            enable_pdl=pdl_enabled(),
+        )
         if projection_out is not None:
             return mm(core_out, self.o_proj.weight, bias=None, out=projection_out)
         output, _ = self.o_proj(core_out, ctx=ctx)

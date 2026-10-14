@@ -201,7 +201,6 @@ def test_checkpoint_shards():
 
 @torch.no_grad()
 def _model_worker(rank, size, rendezvous):
-    from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
@@ -270,16 +269,6 @@ def _model_worker(rank, size, rendezvous):
     # projection GEMMs and collectives below are the production implementations.
     def local_kda(**kwargs):
         value = kwargs["mixed_qkv"][:, 2 * proj : 3 * proj].contiguous()
-        if kwargs["output_gate"] is not None:
-            value = rmsnorm_gated_sigmoid(
-                value,
-                kwargs["output_gate"],
-                kwargs["norm_weight"],
-                kwargs["norm_eps"],
-                heads,
-                head_dim,
-                enable_pdl=False,
-            )
         return value
 
     comm = SimpleNamespace(pre_attn_comm=lambda value, ctx: value)

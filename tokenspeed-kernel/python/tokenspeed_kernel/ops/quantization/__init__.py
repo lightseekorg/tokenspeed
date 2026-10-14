@@ -25,6 +25,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "quantize_fp8",
+    "quantize_fp8_with_gate",
     "quantize_fp8_with_scale",
     "quantize_mxfp8",
     "quantize_nvfp4",
@@ -524,6 +525,37 @@ def quantize_mxfp4(
             scale_layout=scale_layout,
             enable_pdl=enable_pdl,
         )
+
+
+def quantize_fp8_with_gate(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    *,
+    norm_weight: torch.Tensor | None,
+    eps: float,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply optional RMSNorm, sigmoid gating, and dynamic FP8 quantization.
+
+    Args:
+        x: BF16 rows [tokens, channels], with channels divisible by 128.
+        gate: BF16 sigmoid logits with the same shape; rows may be strided.
+        norm_weight: Per-head [128] RMSNorm weight, or None to apply only gating.
+        eps: RMSNorm epsilon; unused when norm_weight is None.
+        enable_pdl: Enable the producer/consumer programmatic-launch dependency.
+
+    Returns:
+        Contiguous E4M3 values and FP32 scales [tokens, channels / 128].
+        Normalization and gating round to BF16 before the per-group quantizer.
+    """
+    kernel = select_kernel(
+        "quantization",
+        "gated_fp8",
+        format_signature(
+            x=dense_tensor_format(x.dtype), gate=dense_tensor_format(gate.dtype)
+        ),
+    )
+    return kernel(x, gate, norm_weight=norm_weight, eps=eps, enable_pdl=enable_pdl)
 
 
 # Backend registration (side-effect imports).
