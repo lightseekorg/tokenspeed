@@ -108,56 +108,30 @@ def _radio(final_norm: bool) -> RadioVisionModel:
 
 
 def _reference_vit(model: RadioVisionModel, embedded: torch.Tensor) -> torch.Tensor:
-    """Pre-norm ViT in fp32, rounding each layer output to the model dtype."""
-    dtype = model.dtype
+    """Pre-norm ViT in the model dtype with independent per-sequence math attention."""
     heads = model.blocks[0].attn.num_attention_heads_per_partition
-    x = torch.cat([model.cls_token, embedded.to(dtype)])
+    x = torch.cat([model.cls_token, embedded.to(model.dtype)])
     for block in model.blocks:
         h = F.layer_norm(
-            x.float(),
-            x.shape[-1:],
-            block.norm1.weight.float(),
-            block.norm1.bias.float(),
-            1e-6,
-        ).to(dtype)
-        qkv = F.linear(
-            h.float(),
-            block.attn.qkv_proj.weight.float(),
-            block.attn.qkv_proj.bias.float(),
-        ).to(dtype)
+            x, x.shape[-1:], block.norm1.weight, block.norm1.bias, block.norm1.eps
+        )
+        qkv = F.linear(h, block.attn.qkv_proj.weight, block.attn.qkv_proj.bias)
         q, k, v = (
             t.unflatten(-1, (heads, -1)).transpose(0, 1) for t in qkv.chunk(3, -1)
         )
-        attn = (
-            F.scaled_dot_product_attention(q.float(), k.float(), v.float())
-            .transpose(0, 1)
-            .flatten(1)
-            .to(dtype)
-        )
-        x = x + F.linear(
-            attn.float(), block.attn.proj.weight.float(), block.attn.proj.bias.float()
-        ).to(dtype)
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+            attn = F.scaled_dot_product_attention(q, k, v).transpose(0, 1).flatten(1)
+        x = x + F.linear(attn, block.attn.proj.weight, block.attn.proj.bias)
         h = F.layer_norm(
-            x.float(),
-            x.shape[-1:],
-            block.norm2.weight.float(),
-            block.norm2.bias.float(),
-            1e-6,
-        ).to(dtype)
-        mlp = block.mlp
-        h = F.linear(h.float(), mlp.fc1.weight.float(), mlp.fc1.bias.float()).to(dtype)
-        h = F.gelu(h.float()).to(dtype)
-        x = x + F.linear(h.float(), mlp.fc2.weight.float(), mlp.fc2.bias.float()).to(
-            dtype
+            x, x.shape[-1:], block.norm2.weight, block.norm2.bias, block.norm2.eps
         )
+        mlp = block.mlp
+        h = F.gelu(F.linear(h, mlp.fc1.weight, mlp.fc1.bias))
+        x = x + F.linear(h, mlp.fc2.weight, mlp.fc2.bias)
     if model.norm is not None:
         x = F.layer_norm(
-            x.float(),
-            x.shape[-1:],
-            model.norm.weight.float(),
-            model.norm.bias.float(),
-            1e-6,
-        ).to(dtype)
+            x, x.shape[-1:], model.norm.weight, model.norm.bias, model.norm.eps
+        )
     return x[model.num_prefix_tokens :].float()
 
 
@@ -196,10 +170,8 @@ def test_radio_packs_images_of_any_size_like_one_at_a_time(final_norm: bool):
         refs = [
             _reference_vit(
                 model,
-                F.linear(
-                    image.to(model.dtype).float(), model.embedder.weight.float()
-                ).to(model.dtype)
-                + _reference_position(model, rows, cols),
+                F.linear(image.to(model.dtype), model.embedder.weight)
+                + _reference_position(model, rows, cols).to(model.dtype),
             )
             for image, (rows, cols) in zip(images, grids)
         ]
@@ -242,10 +214,10 @@ def test_radio_video_pairs_frames_and_repeats_an_odd_last_frame():
             _reference_vit(
                 model,
                 F.linear(
-                    torch.cat([pair[0], pair[1]], dim=-1).to(model.dtype).float(),
-                    model.video_embedder.weight.float(),
-                ).to(model.dtype)
-                + _reference_position(model, rows, cols),
+                    torch.cat([pair[0], pair[1]], dim=-1).to(model.dtype),
+                    model.video_embedder.weight,
+                )
+                + _reference_position(model, rows, cols).to(model.dtype),
             )
             for pair in tubelets
         ]
