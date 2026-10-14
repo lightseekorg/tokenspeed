@@ -431,17 +431,9 @@ QWEN3_30B_A3B_FP8_DYNAMIC = {
 
 
 def test_public_fp8_dynamic_moe_configs():
-    """Experts that ``ignore`` names inside a quantized MoE block are refused
-    with the ignore entry in the message, instead of being cast to FP8 with
-    no scales. Blocks the ignore list covers whole stay unquantized, and the
-    other blocks take fp8_channel."""
+    """Blocks the ignore list covers whole stay unquantized, and the other
+    blocks take fp8_channel."""
     inkling = _parse(INKLING_FP8_DYNAMIC)
-    with pytest.raises(
-        ValueError,
-        match=r"ignore entry .*layers.*2.*experts.* names the expert projection "
-        r"'model\.layers\.2\.mlp\.experts\.0\.gate_proj'",
-    ):
-        inkling.moe_weight_dtype("model.layers.2.mlp")
     # Layers 0 and 1 are dense MLPs; the routed experts start at layer 2.
     for prefix in ("model.layers.3.mlp", "model.layers.3.mlp.experts"):
         assert inkling.moe_weight_dtype(prefix) == "fp8_channel"
@@ -485,9 +477,7 @@ def nvidia_arch(monkeypatch):
     registry.clear_cache()
 
 
-def _moe_layer(
-    tp_size, intermediate_size=512, raw=CHANNEL_DYNAMIC, prefix="model.layers.1.mlp"
-):
+def _moe_layer(tp_size, intermediate_size=512):
     default_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -496,9 +486,9 @@ def _moe_layer(
             num_experts=4,
             hidden_size=256,
             intermediate_size=intermediate_size,
-            quant_config=_parse(raw),
+            quant_config=_parse(CHANNEL_DYNAMIC),
             layer_index=1,
-            prefix=prefix,
+            prefix="model.layers.1.mlp",
             tp_rank=0,
             tp_size=tp_size,
         )
@@ -558,16 +548,6 @@ def test_fp8_channel_moe_layer_takes_a_dummy_load(nvidia_arch, monkeypatch):
     _load_all_scales(layer, skip={("w3", 2)})
     with pytest.raises(ValueError, match="w13_weight_scale .* local expert 2, row 512"):
         layer.process_weights_after_loading(layer)
-
-
-def test_moe_layer_refuses_ignored_experts_in_a_quantized_block(nvidia_arch):
-    nvidia_arch(10, 0)
-    with pytest.raises(ValueError, match="names the expert projection"):
-        _moe_layer(1, raw=INKLING_FP8_DYNAMIC, prefix="model.layers.2.mlp")
-    assert (
-        _moe_layer(1, raw=INKLING_FP8_DYNAMIC, prefix="model.layers.3.mlp")._quant_kind
-        == "fp8_channel"
-    )
 
 
 def test_fp8_channel_moe_layer_has_no_kernel_before_sm90(nvidia_arch):

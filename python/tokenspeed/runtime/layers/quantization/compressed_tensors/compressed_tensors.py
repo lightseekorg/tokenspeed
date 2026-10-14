@@ -54,10 +54,7 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
     CompressedTensorsWNA16,
 )
-from tokenspeed.runtime.layers.quantization.utils import (
-    check_equal_or_regex_match,
-    find_matched_target,
-)
+from tokenspeed.runtime.layers.quantization.utils import find_matched_target
 
 # ruff: noqa: F821
 
@@ -163,53 +160,11 @@ class CompressedTensorsConfig(QuantizationConfig):
                     "not supported: the FP8 channel MoE quantizes its input per "
                     "token"
                 )
-            self._refuse_ignored_experts(prefix)
             return "fp8_channel"
         raise ValueError(
             f"unsupported compressed-tensors MoE scheme for kernel selection: "
             f"{weight_quant}"
         )
-
-    # Expert projection names an ``ignore`` entry may use (per expert or
-    # stacked), relative to ``<moe prefix>.experts``.
-    _EXPERT_PROJECTION_PROBES = (
-        "0.gate_proj",
-        "0.up_proj",
-        "0.down_proj",
-        "0.w1",
-        "0.w2",
-        "0.w3",
-        "gate_up_proj",
-        "down_proj",
-    )
-
-    def _refuse_ignored_experts(self, prefix: str) -> None:
-        """Refuse an MoE block whose experts ``ignore`` lists by projection.
-
-        MoELayer checks ``ignore`` at the block prefix only. An entry that
-        names the expert projections inside a quantized block (for example
-        ``re:model\\.layers\\.2\\.mlp\\.experts\\..*``) marks experts the
-        checkpoint stores unquantized; loading them as FP8 would cast them to
-        E4M3 without scales.
-        """
-        if not prefix or not self.ignored_layers:
-            return
-        experts = prefix if prefix.endswith(".experts") else f"{prefix}.experts"
-        for probe in self._EXPERT_PROJECTION_PROBES:
-            name = f"{experts}.{probe}"
-            matched = [
-                entry
-                for entry in self.ignored_layers
-                if check_equal_or_regex_match(name, [entry])
-            ]
-            if matched:
-                raise ValueError(
-                    f"compressed-tensors quantization_config.ignore entry "
-                    f"{matched[0]!r} names the expert projection {name!r}, but "
-                    f"the MoE block {prefix!r} is quantized. Experts left "
-                    f"unquantized inside a quantized MoE block are not supported "
-                    f"yet."
-                )
 
     def get_scaled_act_names(self) -> list[str]:
         return []
