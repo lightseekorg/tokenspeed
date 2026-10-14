@@ -1240,6 +1240,8 @@ def create_attn_components(
     if (
         config.kvp_size > 1
         and not target.is_deepseek_v4
+        # V4.1 validates prefill-only KVP in its config and specialized recipe.
+        and softmax_attn.backend_name != "deepseek_v41"
         and (
             model_config.attention_arch == AttentionArch.MLA or target.is_hybrid_linear
         )

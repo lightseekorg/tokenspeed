@@ -68,6 +68,15 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             raise NotImplementedError(
                 "V4.1 FlatKV config describes target attention only"
             )
+        if server_args.mapping.attn.kvp_size > 1:
+            if server_args.disaggregation_mode not in ("null", "prefill"):
+                raise ValueError("V4.1 KVP supports aggregate or prefill roles only")
+            if server_args.speculative_algorithm is not None:
+                raise ValueError("V4.1 KVP does not yet support speculation")
+            if not server_args.disable_prefill_graph or server_args.enable_mixed_batch:
+                raise ValueError(
+                    "V4.1 KVP requires eager execution without mixed batches"
+                )
         verify_width = (
             resolve_speculative_num_tokens(server_args, is_draft)
             if server_args.speculative_algorithm is not None
