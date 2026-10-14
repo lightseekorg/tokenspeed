@@ -601,6 +601,9 @@ if platform.is_amd:
         gluon_mxfp_fused_moe,
         gluon_mxfp_precomputed_mxfp4_fused_moe,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp4_gemm import (
+        launch_gluon_mxfp4_a4w4_moe_apply_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (
         n16_mxfp4_shape,
         preprocess_n16_mxfp4_weights,
@@ -1447,6 +1450,94 @@ if platform.is_amd:
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
             out=getattr(w, "_situ_output_buffer", None),
+        )
+
+    def gluon_mxfp4_a4w4_moe_weights_gfx950(plan: dict, w: torch.nn.Module) -> None:
+        del plan
+        preprocess_n16_mxfp4_weights(w)
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_a4w4_moe_apply_gfx950",
+        solution="gluon",
+        weight_preprocessor=gluon_mxfp4_a4w4_moe_weights_gfx950,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"silu", "swiglu"}),
+            "swiglu_form": frozenset({"standard"}),
+            "activation_clamped": frozenset({False}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "ispp_alignment": frozenset({64}),
+            "hidden_alignment": frozenset({512}),
+            "internal_activation_dtype": frozenset({"mxfp4"}),
+            "supports_bias": frozenset({False}),
+            "combine_order": frozenset({"rank"}),
+        },
+        # Beats the portable Triton dynamic-MXFP4 path on gfx950.
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mxfp4_a4w4_moe_apply_gfx950(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Apply SiLU experts with dynamic MXFP4 activations and MXFP4 weights.
+
+        Both GEMMs are E2M1 x E2M1 scaled MFMAs; activations and the SiLU
+        intermediate are quantized per 32 values like the portable Triton
+        path, so results match it up to FP32 accumulation order.
+
+        Args:
+            plan: MoE plan from ``moe_plan``.
+            x: BF16 hidden states ``[tokens, hidden]``.
+            w: Module holding the N16 banks written by the weight
+                preprocessor.
+            router_logits: Unused; routing must be precomputed.
+            topk_weights: Route weights ``[tokens, top_k]``.
+            topk_ids: Expert ids ``[tokens, top_k]``; out-of-range ids add 0.
+            num_tokens_global: Unused; expert parallelism is unsupported.
+            max_num_tokens_per_gpu: Unused token-capacity hint.
+            do_finalize: Must be true.
+            enable_pdl: Unused launch hint.
+
+        Returns:
+            BF16 output ``[tokens, hidden]``.
+        """
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del enable_pdl
+        if not do_finalize:
+            raise ValueError("gfx950 A4W4 Gluon MoE cannot defer finalization")
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("gfx950 A4W4 Gluon MoE requires precomputed top-k")
+        # The kernels compute SiLU(gate) * up: alpha 1, no clamp (limit 0), beta 0.
+        if _swiglu_args(w) != (1.0, 0.0, 0.0):
+            raise ValueError("gfx950 A4W4 Gluon MoE supports only standard SiLU")
+        return launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
+            # Quantization reads rows by stride; only the inner stride must be 1.
+            x if x.stride(1) == 1 else x.contiguous(),
+            w.w13_weight,
+            w.w13_weight_scale,
+            w.w2_weight,
+            w.w2_weight_scale,
+            topk_weights,
+            topk_ids,
         )
 
     @register_kernel(

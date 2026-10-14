@@ -4,9 +4,8 @@ from collections import deque
 
 import pytest
 from tokenspeed_scheduler import (
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     ExecutionEvent,
     ForwardEvent,
     RequestSpec,
@@ -75,8 +74,7 @@ def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
             group_id="overlap.history",
             block_granularity=1,
             total_pages=total_pages,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     scheduler = Scheduler(cfg)
@@ -110,20 +108,20 @@ def test_speculative_reservations_do_not_accumulate_across_prefill_interruptions
             group_id="history",
             block_granularity=64,
             total_pages=4096,
+            attn_kind=AttnKind.Full,
         ),
         CacheGroupConfig(
             group_id="compressor",
             block_granularity=4,
             total_pages=4096,
-            retention=CacheRetention.SlidingWindow,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=8,
         ),
         CacheGroupConfig(
             group_id="state",
             block_granularity=0,
             total_pages=4096,
-            family=CacheGroupFamily.State,
+            attn_kind=AttnKind.State,
         ),
     ]
     scheduler = Scheduler(cfg)
@@ -181,9 +179,8 @@ def _speculative_config(
             group_id="swa",
             block_granularity=1,
             total_pages=total_pages,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=1024,
-            family=CacheGroupFamily.History,
         )
     ]
     return cfg
@@ -250,6 +247,7 @@ def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
             group_id="history",
             block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
+            attn_kind=AttnKind.Full,
         )
     ]
     for invalid_depth in (-1, 2):
@@ -277,7 +275,7 @@ def test_sliding_release_before_admit_prevents_oom():
             group_id="swa.test",
             block_granularity=2,
             total_pages=8,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=4,
         )
     ]
@@ -306,7 +304,7 @@ def test_batch_admission_debits_simulated_free_pages():
             group_id=f"swa.g{i}",
             block_granularity=2,
             total_pages=14,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=4,
         )
         for i in range(2)
@@ -330,17 +328,15 @@ def test_group_tables_use_each_groups_block_granularity():
             group_id="history",
             block_granularity=8,
             total_pages=17,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         ),
         CacheGroupConfig(
             group_id="swa",
             block_granularity=2,
             total_pages=65,
             cache_blocks_per_lcm_block=4,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=4,
-            family=CacheGroupFamily.History,
         ),
     ]
     scheduler = Scheduler(cfg)
@@ -367,16 +363,14 @@ def _hybrid_chunked_scheduler(num_usable_pages: int) -> Scheduler:
             group_id="history",
             block_granularity=4,
             total_pages=cfg.num_device_pages,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         ),
         CacheGroupConfig(
             group_id="swa",
             block_granularity=4,
             total_pages=cfg.num_device_pages,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=4,
-            family=CacheGroupFamily.History,
         ),
     ]
     return Scheduler(cfg)

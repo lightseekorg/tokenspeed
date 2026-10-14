@@ -154,6 +154,7 @@ class DSABackend(PagedAttentionBackend):
     """
 
     default_kernel_page_size = DSA_SPARSE_PAGE_SIZE
+    _make_dense_leaf = staticmethod(_make_dense_leaf)
 
     # DSA's sparse indexer reads this backend's chunked_prefill_metadata from
     # inside the captured prefill segment, but the prefill graph rebinds only
@@ -168,7 +169,7 @@ class DSABackend(PagedAttentionBackend):
             raise ValueError("DSA KVP candidate topk must be a positive power of two")
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         platform = current_platform()
-        self._dense_backend = self._create_dense_leaf(
+        self._dense_backend = self._make_dense_leaf(
             config, spec, platform, kernel_page_size
         )
         self.kvp_group = tuple(config.kvp_group)
@@ -231,15 +232,6 @@ class DSABackend(PagedAttentionBackend):
             # dummy's gather. Overrides the KPool consumer's declaration too.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
             self._probe_history_gather_topk_leaf(spec)
-
-    def _create_dense_leaf(
-        self,
-        config: AttnConfig,
-        spec: DSAConfig,
-        platform,
-        kernel_page_size: int,
-    ) -> PagedAttentionBackend:
-        return _make_dense_leaf(config, spec, platform, kernel_page_size)
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
         """Select, at construction, the indexer leaf the sharded extend arm

@@ -40,7 +40,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
 def geometry():
     group = CacheGroupSpec(
         group_id="history",
-        retention="full_history",
+        attn_kind="full_history",
         rows_per_page=8,
         entry_stride_tokens=1,
         transfer_policy="full_suffix",
@@ -202,8 +202,7 @@ def test_remote_pd_landing_holds_the_only_hot_request_partition():
             group_id="history",
             block_granularity=64,
             total_pages=129,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]
@@ -249,8 +248,7 @@ def test_decode_capacity_abort_releases_the_request_partition_without_recovery()
             group_id="history",
             block_granularity=256,
             total_pages=65,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]

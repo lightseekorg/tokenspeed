@@ -26,34 +26,38 @@ Two quantities anchor the vocabulary:
   tokens). Two requests share cache below the longest published boundary that
   is a prefix of both.
 * **`block_granularity`** — the number of tokens covered by one block-table
-  slot (one `CacheBlock`) of a `history` group. This is the unit in which
-  family-agnostic code (admission, capacity planning, PD slot selection)
+  slot (one `CacheBlock`) of a history group. This is the unit in which
+  kind-agnostic code (admission, capacity planning, PD slot selection)
   addresses the cache.
 
-A group's **family** (Python `CacheGroupSpec`) says whether its blocks span
-tokens at all:
+A group's **attention kind** (Python `CacheGroupSpec.attn_kind`, the C++
+`AttnKind`) is its one classification: what its blocks hold and how long they
+stay. There are exactly three, and every scheduler decision that depends on
+the group's nature switches on this value and nothing else:
 
-* **Row geometry** (`rows_per_page` × `entry_stride_tokens`, exposed as
-  **`page_size`**, the group's `block_granularity`) — the `history` family:
-  paged KV-cache consumers whose blocks physically hold rows of entries
-  (per-token KV, sliding windows, compressed entries, compressor input
-  tails). "Page" vocabulary is *only* legal here. Retention is
-  `full_history` or `sliding_window`.
-* **No span** — the `state` family: recurrent/conv state whose block holds
-  the state after some token count, whichever count a forward happened to
-  end at. Such a group has no rows, no pages and no token span per block;
-  declaring row geometry for it is a bug, not a convention, and its
-  `block_granularity` is a `TypeError`. A state summarizes everything before
-  it, so nothing in it ever slides out: retention is always `full_history`.
-  A request holds exactly two blocks of every state group (see "Recurrent
-  state: two slots, natural checkpoints").
+* **`full_history`** (`kFull`) — rows of token history that stay resident for
+  the request's whole life; prefix-closed and shared.
+* **`sliding_window`** (`kSlidingWindow`) — rows of token history of which
+  only the trailing `sliding_window_tokens` stay resident; the rest slide out
+  (`ExpiredBlocksAt`). A trailing window of token rows (DeepSeek V4's SWA kv
+  and compressor tails) is this kind whatever a kernel calls its buffer.
+* **`state`** (`kState`) — recurrent/conv state whose block holds the state
+  after some token count, whichever count a forward happened to end at. A
+  state summarizes everything before it, so nothing in it ever slides out and
+  it carries no window. A request holds exactly two blocks of every state
+  group (see "Recurrent state: two slots, natural checkpoints").
 
-`CacheGroupSpec.__post_init__` holds each family to its shape, so exactly
-three `(family, retention)` combinations exist — the C++ `AttnKind { kFull,
-kSlidingWindow, kMambaState }`. A trailing window of token rows (DeepSeek
-V4's SWA kv and compressor tails) is a sliding `history` group whatever a
-kernel calls its buffer; `state` is not a routing label for "some backend
-owns this table".
+The first two are the **history** groups: their declaration is **row
+geometry** (`rows_per_page` × `entry_stride_tokens`, exposed as
+**`page_size`**, the group's `block_granularity`), and they are the paged
+KV-cache consumers whose blocks physically hold rows of entries (per-token KV,
+sliding windows, compressed entries, compressor input tails). "Page"
+vocabulary is *only* legal here. A `state` group declares **no span**: no
+rows, no pages, no token span per block; declaring row geometry for it is a
+bug, not a convention, and its `block_granularity` is a `TypeError`.
+`CacheGroupSpec.__post_init__` holds each kind to its shape (a window only on
+a sliding group, rows only on a history group, replay only on a sliding
+group). `state` is not a routing label for "some backend owns this table".
 
 None of these say anything about storage. A slot of `block_granularity = 64`
 tokens may be backed by only 16 units of physical storage under compression —
@@ -154,7 +158,7 @@ contradict. Three types carry one group across the boundary, and none of
 them says "paged":
 
 ```
-Python  CacheGroupSpec     declaration shape (rows | no span) + policy
+Python  CacheGroupSpec     kind + declaration shape (rows | no span)
   ↓     pool_to_cache_groups                      the single folding point
 C++     CacheGroupConfig   boundary config, nanobind-exposed (SchedulerConfig.cache_groups)
   ↓     MakeSpecsFromConfig
@@ -165,10 +169,10 @@ The first and third share a name and differ in fields, so always qualify
 which side you mean; `CacheGroupConfig` in between is the only one visible
 from both.
 
-Declaration-shape vocabulary stops at the bridge; only the generic span
-crosses it. Neither `rows_per_page` nor `entry_stride_tokens` enters
-`tokenspeed-scheduler` at all: they are the Python-side *declaration shape*
-of a `history` `CacheGroupSpec`, and the bridge
+Declaration-shape vocabulary stops at the bridge; only the kind and the
+generic span cross it. Neither `rows_per_page` nor `entry_stride_tokens`
+enters `tokenspeed-scheduler` at all: they are the Python-side *declaration
+shape* of a history `CacheGroupSpec`, and the bridge
 (`scheduler_utils.pool_to_cache_groups`) folds them to
 `CacheGroupSpec.block_granularity = rows_per_page × entry_stride_tokens`
 before constructing the C++ `CacheGroupConfig`, whose only span field is
@@ -178,15 +182,16 @@ bridge with `block_granularity = 0`: its blocks cover no tokens, and
 carrying a fictional span for it would be a claim its contents contradict,
 the same way a `Paged` type name would.
 
-A `history` group's `block_granularity` is **required and explicit**: a
+A history group's `block_granularity` is **required and explicit**: a
 positive divisor of `prefix_granularity`, rejected by
 `SchedulerConfig::Validate()` before construction and asserted again at
 coordinator construction. There is no zero-means-default fallback — every
-paged group states its span, and `0` is the `state` family's declaration
-that it has none.
+paged group states its span, and `0` is the `state` kind's declaration that
+it has none.
 
-One flag crosses the bridge beside the token quantities: `replayable`, set
-only on a sliding History group that is **regenerated by bounded replay**
+One flag crosses the bridge beside the kind and the token quantities:
+`replayable`, set only on a `sliding_window` group that is **regenerated by
+bounded replay**
 instead of being prefix-cached (DeepSeek V4.1's SWA rows and compressor
 tails). Before a prefix hit the model re-feeds the group's whole
 `sliding_window_tokens`: retention keeps exactly what the queries after the
@@ -1193,7 +1198,7 @@ An attention layer has two contracts that a single `layer_types` string used
 to carry at once, and they are kept apart on purpose:
 
 * **Storage** — which cache group the layer's KV rides, hence how long the
-  scheduler retains it (`CacheGroupSpec.retention`, `sliding_window_tokens`).
+  scheduler retains it (`CacheGroupSpec.attn_kind`, `sliding_window_tokens`).
   Owned by the cache plan: the recipe assigns `group_ids` per layer, `pack`
   places the fields, and the model never spells a group id. At executor
   startup `bind_cache_groups` (`layers/paged_attention.py`) reads
@@ -1653,7 +1658,7 @@ Enforced:
   are grep-zero across `tokenspeed-scheduler` (csrc, tests, python bindings)
   — the slot span is spelled `block_granularity` everywhere, and
   `CacheGroupConfig` carries it as its only span field;
-* a `history` group's `block_granularity` is required and explicit: every
+* a history group's `block_granularity` is required and explicit: every
   paged group states its span, with no zero-means-default fallback, and the
   coordinator asserts a positive divisor of P at construction; a `state`
   group crosses the bridge as `0`, the declaration that its blocks span no
@@ -1745,7 +1750,7 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   several history groups one V4 layer reads at once (its pool view reports
   no `PagedAttention` binding and no router leaf). Mamba's group set comes from
   its recurrent fields, so a PLE state group cannot arm its verify
-  state. `cache_consumer_families` remains the boot-time coverage
+  state. `cache_consumer_attn_kinds` remains the boot-time coverage
   declaration (`validate_scheduler_config`). Extra delivered groups ride
   through untouched; a table for a group the bound pool never published
   fails loudly.

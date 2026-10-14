@@ -47,16 +47,14 @@ def _make_config() -> ts.SchedulerConfig:
         group_id="full",
         block_granularity=cfg.prefix_granularity,
         total_pages=cfg.num_device_pages,
-        retention=ts.CacheRetention.FullHistory,
-        family=ts.CacheGroupFamily.History,
+        attn_kind=ts.AttnKind.Full,
     )
     swa = ts.CacheGroupConfig(
         group_id="swa",
         block_granularity=cfg.prefix_granularity,
         total_pages=cfg.num_device_pages,
-        retention=ts.CacheRetention.SlidingWindow,
+        attn_kind=ts.AttnKind.SlidingWindow,
         sliding_window_tokens=4,
-        family=ts.CacheGroupFamily.History,
     )
     cfg.cache_groups = [full, swa]
     return cfg
@@ -299,8 +297,7 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
                 group_id="state",
                 block_granularity=0,
                 total_pages=usable_blocks + 1,
-                retention=ts.CacheRetention.FullHistory,
-                family=ts.CacheGroupFamily.State,
+                attn_kind=ts.AttnKind.State,
             )
         ]
         capacity = ts.Scheduler(cfg).max_single_request_tokens()
@@ -359,8 +356,7 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
             group_id="state",
             block_granularity=0,
             total_pages=33,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.State,
+            attn_kind=ts.AttnKind.State,
         )
     ]
     scheduler = ts.Scheduler(cfg)
@@ -637,16 +633,14 @@ def _make_replay_config() -> ts.SchedulerConfig:
         group_id="full",
         block_granularity=cfg.prefix_granularity,
         total_pages=cfg.num_device_pages,
-        retention=ts.CacheRetention.FullHistory,
-        family=ts.CacheGroupFamily.History,
+        attn_kind=ts.AttnKind.Full,
     )
     swa = ts.CacheGroupConfig(
         group_id="swa",
         block_granularity=4,
         total_pages=cfg.num_device_pages,
-        retention=ts.CacheRetention.SlidingWindow,
+        attn_kind=ts.AttnKind.SlidingWindow,
         sliding_window_tokens=16,
-        family=ts.CacheGroupFamily.History,
         replayable=True,
     )
     cfg.cache_groups = [full, swa]
@@ -664,7 +658,7 @@ def test_cache_group_config_replayable_round_trips() -> None:
     full = _make_replay_config().cache_groups[0]
     assert full.replayable is False
     full.replayable = True
-    with pytest.raises(ValueError, match="sliding History group"):
+    with pytest.raises(ValueError, match="sliding-window group"):
         full.validate()
 
 

@@ -35,7 +35,7 @@ std::vector<GroupDemand> MakeGroupDemands(std::vector<BlockTable>& tables,
     for (std::size_t i = 0; i < tables.size(); ++i) {
         GroupDemand demand = prototype;
         demand.table = &tables[i];
-        if (cache_groups[i].Kind() == AttnKind::kMambaState) {
+        if (cache_groups[i].attn_kind == AttnKind::kState) {
             demand.extent = state_step;
             demand.reserve_tokens = 0;
         }
@@ -47,10 +47,10 @@ std::vector<GroupDemand> MakeGroupDemands(std::vector<BlockTable>& tables,
 namespace {
 
 std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillReserve& reserve) {
-    if (group.Kind() == AttnKind::kMambaState) {
+    if (group.attn_kind == AttnKind::kState) {
         return 0;
     }
-    if (group.Kind() == AttnKind::kSlidingWindow) {
+    if (group.attn_kind == AttnKind::kSlidingWindow) {
         return reserve.DecodeTokens();
     }
     return std::max(reserve.DecodeTokens(), reserve.prompt_headroom_tokens);

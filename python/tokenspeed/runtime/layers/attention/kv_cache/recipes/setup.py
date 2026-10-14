@@ -34,6 +34,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v4 import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v41 import (
     DeepseekV41Recipe,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.dots3_note import (
+    Dots3NoteRecipe,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
     Glm53FlashRecipe,
 )
@@ -175,6 +178,7 @@ _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "glm53_flash": Glm53FlashRecipe,
     "deepseek_v4": DeepseekV4Recipe,
     "deepseek_v41": DeepseekV41Recipe,
+    "dots3_note": Dots3NoteRecipe,
 }
 
 

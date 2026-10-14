@@ -631,6 +631,9 @@ def mla_prefill(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    window_left: int = -1,
+    query_start_offsets: torch.Tensor | None = None,
 ) -> AttentionResult:
     """MLA prefill/cross-attention from explicit, non-cached Q/K/V tensors.
 
@@ -663,6 +666,13 @@ def mla_prefill(
         return_lse: Whether to also return natural-log log-sum-exp values with
             shape [total_q, num_q_heads]. Required when partial attention states
             will be merged.
+        window_left: Number of historical positions visible per query, or -1
+            for full history. Zero permits only the current position.
+        query_start_offsets: Optional contiguous int32/int64 [batch] tensor on
+            the query device. Entry i is the first query's position relative to
+            the first key in sequence i. Prefix replay chunks need these offsets
+            because their keys end before the query suffix. None aligns queries
+            to the end of the KV sequence, with the offset clamped at zero.
         out: Optional output tensor with shape [total_q, num_q_heads, v_head_dim].
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
@@ -674,6 +684,26 @@ def mla_prefill(
     # Problem sizes are read from shapes so selection never syncs and also
     # works under graph capture.
     batch_size = cu_seqlens_q.shape[0] - 1
+    if window_left < -1:
+        raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
+    if query_start_offsets is not None and (
+        query_start_offsets.shape != (batch_size,)
+        or query_start_offsets.dtype not in (torch.int32, torch.int64)
+        or query_start_offsets.device != q.device
+        or query_start_offsets.stride(0) != 1
+    ):
+        raise ValueError(
+            "query_start_offsets must be a contiguous int32/int64 [batch] tensor "
+            "on the query device"
+        )
+    features = set()
+    extra_kwargs = {}
+    if window_left >= 0:
+        features.add("sliding_window")
+        extra_kwargs["window_left"] = window_left
+    if query_start_offsets is not None:
+        features.add("query_start_offsets")
+        extra_kwargs["query_start_offsets"] = query_start_offsets
     traits = mla_prefill_traits(
         batch_size=batch_size,
         total_kv=k.shape[0],
@@ -689,6 +719,7 @@ def mla_prefill(
         "mla_prefill",
         signature,
         traits=traits,
+        features=frozenset(features),
         solution=solution,
         override=override,
     )
@@ -733,6 +764,7 @@ def mla_prefill(
             logit_cap=logit_cap,
             return_lse=return_lse,
             out=out,
+            **extra_kwargs,
         )
 
 

@@ -64,6 +64,7 @@ from tokenspeed.runtime.configs import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
 from tokenspeed.runtime.configs.nemotron_omni_config import NemotronHOmniConfig
@@ -73,6 +74,7 @@ _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 logger = logging.getLogger(__name__)
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    Dots3NoteConfig.model_type: Dots3NoteConfig,
     Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
@@ -475,6 +477,9 @@ def get_config(
             config.architectures[0] += "DSpark"
         else:
             config.architectures[0] += "NextN"
+
+    if text_config.architectures == ["Dots3NoteForCausalLMNextN"]:
+        config = text_config = text_config.for_mtp()
 
     if text_config.architectures == ["LlamaForCausalLMNextN"]:
         text_config.num_hidden_layers = 1

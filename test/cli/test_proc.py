@@ -23,7 +23,6 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -31,6 +30,26 @@ from tokenspeed.cli._proc import (
     spawn_gateway,
     terminate_then_kill,
 )
+
+
+class _RecordingProcess:
+    """Stands in for an ``asyncio.subprocess.Process``: records the signals it
+    receives and drains ``wait`` on a test-controlled delay."""
+
+    def __init__(self, returncode, wait_delay=0.0):
+        self.returncode = returncode
+        self.wait_delay = wait_delay
+        self.signals = []
+
+    def terminate(self):
+        self.signals.append("terminate")
+
+    def kill(self):
+        self.signals.append("kill")
+
+    async def wait(self):
+        await asyncio.sleep(self.wait_delay)
+        return self.returncode
 
 
 @pytest.mark.asyncio
@@ -56,45 +75,17 @@ async def test_spawn_gateway_disables_retries_and_circuit_breaker(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_terminate_then_kill_uses_sigterm_first_then_sigkill():
-    """If the child doesn't exit within drain_timeout, we escalate to SIGKILL."""
-    proc = MagicMock()
-    proc.returncode = None  # Still running.
-    proc.terminate = MagicMock()
-    proc.kill = MagicMock()
+async def test_terminate_then_kill_escalates_only_when_the_drain_times_out():
+    """The signals are the observable effect: noop on a dead child, SIGTERM
+    alone when it drains in time, SIGTERM then SIGKILL when it doesn't."""
+    dead = _RecordingProcess(returncode=0)
+    await terminate_then_kill(dead, drain_timeout=0.5)
+    assert dead.signals == []
 
-    async def fake_wait():
-        await asyncio.sleep(0.1)
+    draining = _RecordingProcess(returncode=None)
+    await terminate_then_kill(draining, drain_timeout=0.5)
+    assert draining.signals == ["terminate"]
 
-    proc.wait = MagicMock(side_effect=fake_wait)
-    await terminate_then_kill(proc, drain_timeout=0.05)
-    proc.terminate.assert_called_once()
-    proc.kill.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_terminate_then_kill_skips_kill_when_drain_succeeds():
-    proc = MagicMock()
-    proc.returncode = None
-
-    async def fake_wait():
-        proc.returncode = 0
-        return
-
-    proc.wait = MagicMock(side_effect=fake_wait)
-    proc.terminate = MagicMock()
-    proc.kill = MagicMock()
-    await terminate_then_kill(proc, drain_timeout=0.5)
-    proc.terminate.assert_called_once()
-    proc.kill.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_terminate_then_kill_noop_on_already_dead():
-    proc = MagicMock()
-    proc.returncode = 0
-    proc.terminate = MagicMock()
-    proc.kill = MagicMock()
-    await terminate_then_kill(proc, drain_timeout=0.5)
-    proc.terminate.assert_not_called()
-    proc.kill.assert_not_called()
+    stuck = _RecordingProcess(returncode=None, wait_delay=0.1)
+    await terminate_then_kill(stuck, drain_timeout=0.05)
+    assert stuck.signals == ["terminate", "kill"]

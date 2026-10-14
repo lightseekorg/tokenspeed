@@ -161,7 +161,7 @@ private:
         if (sliding_window_ == 0) {
             return 0;
         }
-        const CacheGroupSpec spec{.kind = AttnKind::kSlidingWindow,
+        const CacheGroupSpec spec{.attn_kind = AttnKind::kSlidingWindow,
                                   .sliding_window = sliding_window_,
                                   .block_granularity = geometry_.BlockGranularity()};
         return geometry_.ExpiredBlocksAt(spec, num_computed_tokens);

@@ -1148,9 +1148,9 @@ def prepare_latent_expert_shared(
         routed_out=dense_tensor_format(routed_out.dtype),
         shared_out=dense_tensor_format(shared_out.dtype),
     )
-    weights_are_linear = w2_weight.ndim != 6
+    weights_are_linear = w13_weight.ndim != 6
     processed_intermediate_size = (
-        w2_weight.shape[-1] * 2 if weights_are_linear else w2_weight.shape[2] * 128
+        w2_weight.shape[-1] * 2 if weights_are_linear else w13_weight.shape[1] * 8
     )
     traits = {
         "tokens": tokens,

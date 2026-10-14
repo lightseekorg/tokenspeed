@@ -322,13 +322,8 @@ class AscendDSABackend(DSABackend):
             )
         return ASCEND_SFAD_PAGE_SIZE
 
-    def _create_dense_leaf(
-        self,
-        config,
-        spec,
-        platform,
-        kernel_page_size: int,
-    ):
+    @staticmethod
+    def _make_dense_leaf(config, spec, platform, kernel_page_size):
         del platform
         dense_spec = dataclasses.replace(spec, backend_name=None)
         return MLAAttnBackend(config, dense_spec, kernel_page_size=kernel_page_size)

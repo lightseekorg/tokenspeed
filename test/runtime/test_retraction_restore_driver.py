@@ -70,8 +70,7 @@ def _scheduler(*, l2: bool, force_interval: int) -> ts.Scheduler:
             group_id="history",
             block_granularity=PAGE,
             total_pages=64 + 1,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         )
     ]
     config = make_config(
@@ -377,8 +376,7 @@ def test_a_capacity_blocked_round_with_no_fitting_image_aborts_the_newest_reside
             group_id="history",
             block_granularity=page,
             total_pages=256 + 1,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         )
     ]
     scheduler = ts.Scheduler(

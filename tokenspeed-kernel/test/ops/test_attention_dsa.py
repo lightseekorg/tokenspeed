@@ -1084,6 +1084,70 @@ def test_gather_index_candidates_matches_tensor_reference(device):
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("channel_stride", [1, 2])
+def test_dsa_strided_pages_are_read_in_place(dtype, channel_stride, monkeypatch):
+    import tokenspeed_kernel.ops.attention.dsa.triton as dsa_triton
+    from utils import assert_no_triton_compile
+
+    torch.manual_seed(193)
+    page_size, rank, rope = 64, 512, 64
+    storage = torch.randn(
+        4, page_size + 7, 1, (rank + rope) * channel_stride, device="cuda"
+    ).to(dtype)
+    cache = storage[:, :page_size, :, ::channel_stride]
+    q = torch.randn(3, 2, rank + rope, device="cuda").to(dtype)
+    slots = torch.tensor(
+        [[0, 63, 64, 129, 250, -1], [130, 195, 66, -1, -1, -1], [-1] * 6],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    slots = torch.nn.functional.pad(slots, (0, 512 - slots.shape[1]), value=-1)
+    lens = torch.tensor([5, 3, 0], device="cuda", dtype=torch.int32)
+    run_dense = dsa_triton._run_dense_kv
+
+    def require_original_storage(q, kv_cache, *args, **kwargs):
+        assert kv_cache.data_ptr() == cache.data_ptr()
+        return run_dense(q, kv_cache, *args, **kwargs)
+
+    monkeypatch.setattr(dsa_triton, "_run_dense_kv", require_original_storage)
+
+    def run():
+        return dsa_decode(
+            q=q,
+            kv_cache=cache,
+            sparse_kv_cache=None,
+            topk_slots=slots,
+            topk_lens=lens,
+            max_seqlen_k=256,
+            qk_nope_head_dim=128,
+            kv_lora_rank=rank,
+            qk_rope_head_dim=rope,
+            softmax_scale=192**-0.5,
+            page_size=page_size,
+            solution="triton",
+            slot_order="selection",
+            return_lse=True,
+        )
+
+    out, lse = run()
+    with assert_no_triton_compile(dsa_triton._dsa_dense_kv_kernel):
+        out2, lse2 = run()
+    flat = cache.float().reshape(-1, rank + rope)
+    for row, count in enumerate(lens.tolist()):
+        if not count:
+            assert torch.count_nonzero(out[row]) == 0
+            assert torch.isneginf(lse[row]).all()
+            continue
+        selected = flat[slots[row, :count]]
+        logits = q[row].float() @ selected.T * (192**-0.5)
+        ref = logits.softmax(-1) @ selected[:, :rank]
+        torch.testing.assert_close(out[row].float(), ref, atol=0.03, rtol=0.03)
+        torch.testing.assert_close(lse[row], logits.logsumexp(-1), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out, out2)
+    torch.testing.assert_close(lse, lse2)
+
+
 @pytest.mark.parametrize("cols", [32759, 32763, 32768, 32768 + 64])
 def test_large_padded_topk_uses_bounded_compilation(monkeypatch, cols):
     from tokenspeed_kernel.ops.attention.dsa._triton import topk as impl

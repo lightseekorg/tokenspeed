@@ -25,7 +25,6 @@ from tokenspeed_kernel.platform import current_platform
 platform = current_platform()
 
 from tokenspeed.runtime.layers.attention.backends.specific import (  # noqa: F401
-    deepseek_v4,
     deepseek_v41,
 )
 

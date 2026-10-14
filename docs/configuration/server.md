@@ -554,6 +554,7 @@ validates the parser names, so use the values accepted by the bundled
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
+| `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
 | `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters (see below). Off by default. |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
@@ -562,6 +563,45 @@ validates the parser names, so use the values accepted by the bundled
 
 Prefer `--speculative-config` for recipe-style launches because it keeps method,
 draft model, and token count together.
+
+### Synthetic Acceptance Length
+
+The supported benchmark configuration is `--sampling-backend greedy`, with
+speculative decoding enabled and `--dp-sampling` and `--enable-output-logprobs`
+disabled. Draft trees are unsupported. Other sampling backends and these options
+are rejected at startup.
+As with ordinary greedy sampling, token selection is always argmax; stochastic
+sampling and penalties are not supported. Use unconstrained greedy requests
+(`temperature: 0`) for this benchmark.
+
+Use `--synthetic-acceptance-length L` to benchmark speculative execution at a
+fixed mean acceptance length (AL). AL includes the guaranteed target token,
+so `1 <= L <= --speculative-num-draft-tokens` (the verify width). AL `1`
+rejects every draft; AL equal to the verify width accepts every draft. A
+fractional AL emits either `floor(L)` or `ceil(L)` tokens per verification,
+with probability `L - floor(L)` of the larger length. For example, AL `2.6`
+accepts one draft token on 40% of steps and two on 60%, plus a target token.
+
+The draft and target models and the normal verification kernel still execute.
+The verification result is then overridden with synthetic acceptance before
+committing tokens and updating request state, preserving verification overhead.
+The override copies the forced draft prefix and selects the existing target
+argmax at the cutoff. It adds no second verification or target-resampling pass.
+**Do not use generated text for correctness or accuracy evaluation.** Request
+termination can truncate the last verification's output.
+
+Either spelling below configures three draft slots (verify width four) and
+AL `2.6`:
+
+```bash
+--sampling-backend greedy --speculative-algorithm MTP --speculative-num-steps 3 --synthetic-acceptance-length 2.6
+--sampling-backend greedy --speculative-config '{"method":"mtp","num_speculative_tokens":3,"synthetic_acceptance_length":2.6}'
+```
+
+Conflicting values between the flag and JSON configuration are rejected.
+The value must be finite and speculative decoding must be enabled.
+For block drafters with implicit widths, the upper bound is checked against
+the checkpoint's resolved verify width when the sampler is initialized.
 
 `EAGLE3` and `MTP` drafts are chains by default: `--speculative-num-draft-tokens`
 must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 1
@@ -789,6 +829,56 @@ Where the endpoint lives depends on the launch mode:
 | `tokenspeed:decode_time_per_output_token_seconds` | Decode time per output token after the first output frame; excludes queueing and TTFT. |
 | `tokenspeed:inter_token_latency_seconds` | Per-token interval between output frames, measured by frontend wall clock. |
 | `tokenspeed:scheduler_inter_token_latency_seconds` | Per-token interval between output frames, measured by scheduler timestamps. |
+
+`tokenspeed:time_to_first_token_seconds` and
+`tokenspeed:e2e_request_latency_seconds` carry a `stream` label
+(`"true"`/`"false"`, the request's streaming flag) in addition to the base
+labels.
+
+### Request counters, token distributions, and preemptions
+
+The request counters `tokenspeed:num_requests_total` (every finished request)
+and `tokenspeed:request_success_total` (finished without an abort) carry two
+labels beyond the base `model_name`/`app_key`:
+
+| Label | Values |
+| --- | --- |
+| `finish_reason` | `stop`, `length`, `abort`, `abort:transfer_failed`, `abort:unknown_error`, `abort:numerical_error`, `abort:capacity_abort`, `unknown`. The finish-reason type (`BaseFinishReason.to_json()`), with the bounded `ABORT_CODE` subclass folded in as `abort:<code>`; an abort with an unrecognized `err_type` stays plain `abort`. Unbounded payloads (abort message, matched stop string) are never labels. |
+| `stream` | `"true"` / `"false"` — the request's streaming flag. |
+
+Two per-request histograms (same `stream` label, observed once at request
+finish) use a 1-2-5 bucket grid (1, 2, 5, 10, …) capped at the model's
+context length:
+
+| Metric | Semantics |
+| --- | --- |
+| `tokenspeed:request_prompt_tokens` | Prompt token count per finished request. |
+| `tokenspeed:request_generation_tokens` | Generation token count per finished request. |
+
+The scheduler process exports `tokenspeed:num_preemptions_total`: requests
+preempted by a capacity retraction — suspended
+with their pages imaged to the Host snapshot pool (they resume by restore;
+nothing is recomputed) to free Device pages for a blocked admission. One
+increment per retraction victim, counted from the plan's snapshot-store ops;
+forced retractions from `--debug-force-retraction-interval` count too. A
+retraction whose victim cannot be imaged aborts it instead — those are
+`tokenspeed:num_capacity_aborted_requests`, never preemptions.
+
+The cached/uncached token split (the billing split Baseten/Fireworks-style
+dashboards show) derives from existing counters, no dedicated metric needed:
+
+```promql
+cached_prompt_tokens   = tokenspeed:prefix_cache_hits_total
+uncached_prompt_tokens = tokenspeed:prompt_tokens_total - tokenspeed:prefix_cache_hits_total
+```
+
+**Wire-compatibility note.** Adding `finish_reason` to
+`tokenspeed:num_requests_total` / `tokenspeed:request_success_total` and
+`stream` to `tokenspeed:time_to_first_token_seconds` /
+`tokenspeed:e2e_request_latency_seconds` changes those metrics' series
+identity: the pre-change series (without the new labels) stop updating, and
+queries pinning an exact label set must include the new labels. Aggregate
+queries (`sum by (...)` that drops them) are unaffected.
 
 ### Per-request stats
 

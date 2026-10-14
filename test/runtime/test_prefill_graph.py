@@ -306,17 +306,16 @@ class KdaPrefillFallbackTest(unittest.TestCase):
 def _spec(
     group_id: str,
     *,
-    family: str = "history",
+    attn_kind: str = "full_history",
     block_granularity: int = 64,
-    retention: str = "full_history",
     sliding_window_tokens: int | None = None,
 ):
     """A published group spec.
 
     The real dataclass, not a namespace: it derives ``block_granularity`` from
     the geometry the way production does, refuses ``page_size`` on a state
-    group, and carries ``retention`` -- which the width rule deliberately
-    ignores, and which a namespace double cannot express at all, so
+    group, and carries ``attn_kind`` -- which the width rule deliberately ignores,
+    and which a namespace double cannot express at all, so
     ``test_sliding_window_group_still_spans_the_whole_extent`` could not be
     written against one.
     """
@@ -324,18 +323,11 @@ def _spec(
         CacheGroupSpec,
     )
 
-    if family == "state":
-        return CacheGroupSpec(
-            group_id=group_id,
-            retention=retention,
-            family="state",
-            sliding_window_tokens=sliding_window_tokens,
-            replayable=False,
-        )
+    if attn_kind == "state":
+        return CacheGroupSpec(group_id=group_id, attn_kind=attn_kind, replayable=False)
     return CacheGroupSpec(
         group_id=group_id,
-        retention=retention,
-        family=family,
+        attn_kind=attn_kind,
         rows_per_page=block_granularity,
         entry_stride_tokens=1,
         sliding_window_tokens=sliding_window_tokens,
@@ -417,7 +409,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 _spec("full_attention", block_granularity=64),
                 _spec("sliding_attention", block_granularity=64),
                 # state: included
-                _spec("linear_attention", family="state"),
+                _spec("linear_attention", attn_kind="state"),
             )
         )
         tables = self._bare(backend, pool)._dummy_group_tables(1)
@@ -467,7 +459,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 _spec(
                     "sliding_attention",
                     block_granularity=128,
-                    retention="sliding_window",
+                    attn_kind="sliding_window",
                     sliding_window_tokens=128,
                 ),
             )
@@ -480,7 +472,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertEqual(
             tables["sliding_attention"].shape[1],
             64,
-            "retention must not narrow a capture row; the window bound is a "
+            "a sliding window must not narrow a capture row; the window bound is a "
             "decode-side answer to a different question",
         )
         # The bound the runtime actually enforces, restated here so the number
@@ -514,7 +506,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         pool = _fake_pool(
             specs=(
                 _spec("full_attention", block_granularity=128),
-                _spec("linear_attention", family="state"),
+                _spec("linear_attention", attn_kind="state"),
             )
         )
         tables = self._bare(wrapper, pool)._dummy_group_tables(1)
@@ -539,7 +531,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         pool = _fake_pool(
             specs=(
                 _spec("full_attention", block_granularity=64),
-                _spec("linear_attention", family="state"),
+                _spec("linear_attention", attn_kind="state"),
             )
         )
         bare = self._bare(_backend(), pool)
@@ -1292,16 +1284,17 @@ class TrtllmPrefillGraphSeamsTest(unittest.TestCase):
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
 
-    def test_router_declares_history_contract_family(self):
-        # The family claim moved off the leaves: the runner-facing node in
+    def test_router_declares_the_history_kinds(self):
+        # The kind claim moved off the leaves: the runner-facing node in
         # front of every trtllm leaf is the CacheGroupRouter, whose base
-        # declaration is the history family.
+        # declaration is the two history kinds.
         from tokenspeed.runtime.layers.attention.backends.paged.router import (
             CacheGroupRouter,
         )
 
         self.assertEqual(
-            CacheGroupRouter.cache_consumer_families, frozenset({"history"})
+            CacheGroupRouter.cache_consumer_attn_kinds,
+            frozenset({"full_history", "sliding_window"}),
         )
 
 
@@ -1399,19 +1392,13 @@ class PrefillRoleGraphsTest(unittest.TestCase):
         specs = (
             CacheGroupSpec(
                 group_id="full",
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=128,
                 entry_stride_tokens=1,
                 sliding_window_tokens=None,
                 replayable=False,
             ),
-            CacheGroupSpec(
-                group_id="state",
-                retention="full_history",
-                sliding_window_tokens=None,
-                family="state",
-                replayable=False,
-            ),
+            CacheGroupSpec(group_id="state", attn_kind="state", replayable=False),
         )
         runner = self.forward_step.ForwardStepRunner(
             forward_func=lambda *args, **kwargs: None,

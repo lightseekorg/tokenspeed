@@ -100,7 +100,7 @@ class MHAPoolGroupPublicationTest(unittest.TestCase):
         self.assertEqual(len(pool.arena.cache_group_specs), 1)
         spec = pool.arena.cache_group_specs[0]
         self.assertEqual(spec.group_id, "full_attention")
-        self.assertEqual(spec.retention, "full_history")
+        self.assertEqual(spec.attn_kind, "full_history")
         self.assertIn("full_attention", pool.arena.cache_group_page_counts)
         self.assertIsNotNone(pool.arena.buffer)
         self.assertEqual(

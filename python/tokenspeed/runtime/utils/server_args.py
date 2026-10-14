@@ -534,6 +534,7 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    synthetic_acceptance_length: float | None = None
     # Standard (draft-prob) rejection sampling for the chain drafters: the
     # drafter samples each step from its own distribution q and records it,
     # verify accepts with coin * q(x) < p(x). Off: the target-only rule
@@ -739,6 +740,27 @@ class ServerArgs:
 
             if not isinstance(config, dict):
                 raise ValueError("--speculative-config must be a JSON object")
+
+            if "synthetic_acceptance_length" in config:
+                length = config["synthetic_acceptance_length"]
+                if (
+                    isinstance(length, bool)
+                    or not isinstance(length, (int, float))
+                    or not math.isfinite(length)
+                ):
+                    raise ValueError(
+                        "synthetic_acceptance_length must be a finite number"
+                    )
+                if (
+                    self.synthetic_acceptance_length is not None
+                    and self.synthetic_acceptance_length != length
+                ):
+                    raise ValueError(
+                        "--synthetic-acceptance-length conflicts with "
+                        "synthetic_acceptance_length in --speculative-config"
+                    )
+                if self.synthetic_acceptance_length is None:
+                    self.synthetic_acceptance_length = length
 
             method = config.get("method")
             if method is not None and self.speculative_algorithm is None:
@@ -1315,6 +1337,50 @@ class ServerArgs:
                 raise ValueError(
                     "DUMMY drafting requires --speculative-num-draft-tokens > 1"
                 )
+        if self.synthetic_acceptance_length is not None:
+            length = self.synthetic_acceptance_length
+            if (
+                isinstance(length, bool)
+                or not isinstance(length, (int, float))
+                or not math.isfinite(length)
+            ):
+                raise ValueError("synthetic_acceptance_length must be a finite number")
+            if self.speculative_algorithm is None:
+                raise ValueError(
+                    "--synthetic-acceptance-length requires speculative decoding"
+                )
+            # Block checkpoints may replace the default width in ModelConfig.
+            # SamplingBackend checks the final width before allocating buffers.
+            checkpoint_sets_width = (
+                self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS
+                and not self._speculative_widths_explicit
+            )
+            if length < 1 or (
+                not checkpoint_sets_width and length > self.speculative_num_draft_tokens
+            ):
+                raise ValueError(
+                    "synthetic_acceptance_length must be in "
+                    f"[1, {self.speculative_num_draft_tokens}] "
+                    "(the speculative verify width including the target token)"
+                )
+            if self.sampling_backend != "greedy":
+                raise ValueError(
+                    "--synthetic-acceptance-length requires --sampling-backend greedy"
+                )
+            if self.speculative_eagle_topk != 1:
+                raise ValueError(
+                    "--synthetic-acceptance-length does not support draft trees"
+                )
+            if self.dp_sampling or self.enable_output_logprobs:
+                raise ValueError(
+                    "--synthetic-acceptance-length does not support "
+                    "--dp-sampling or --enable-output-logprobs"
+                )
+            logger.warning(
+                f"Synthetic acceptance length {length:.4f} enabled for benchmarking. "
+                "Generated text is synthetic and must not be used for correctness "
+                "or accuracy evaluation."
+            )
 
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
@@ -3156,7 +3222,7 @@ class ServerArgs:
             "--speculative_config",
             type=str,
             default=ServerArgs.speculative_config,
-            help="JSON speculative decoding configuration. Supported keys are method, model, and num_speculative_tokens.",
+            help="JSON speculative decoding configuration. Supported keys are method, model, num_speculative_tokens, and synthetic_acceptance_length.",
         )
         parser.add_argument(
             "--speculative-algorithm",
@@ -3194,6 +3260,16 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--synthetic-acceptance-length",
+            type=float,
+            default=ServerArgs.synthetic_acceptance_length,
+            help="Benchmark-only mean accepted length including the guaranteed "
+            "target token, in [1, speculative_num_draft_tokens]. Forces a "
+            "floor/ceil acceptance distribution; generated text is not valid "
+            "for correctness evaluation. Requires --sampling-backend greedy without "
+            "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )
         parser.add_argument(
             "--enable-speculative-sampling",

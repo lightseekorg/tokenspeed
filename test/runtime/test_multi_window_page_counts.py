@@ -75,10 +75,10 @@ def group_specs_from_layer_types(**kwargs):
     )
 
 
-def _spec(group_id, retention, window=None, rows_per_page=PAGE):
+def _spec(group_id, attn_kind, window=None, rows_per_page=PAGE):
     return CacheGroupSpec(
         group_id=group_id,
-        retention=retention,
+        attn_kind=attn_kind,
         rows_per_page=rows_per_page,
         entry_stride_tokens=1,
         sliding_window_tokens=window,

@@ -67,6 +67,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.deepseek_v41 import (
     DeepseekV41Recipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 RATIOS = (0, 0) + (2,) * 18 + (1,) * 20
 OWNERS = (2, 8, 14, 20)
@@ -959,24 +960,12 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     recipe = _recipe("cpu")
     hf = recipe.model_config.hf_config
     hf.candidate_topk_blocks, hf.candidate_block_size, hf.index_topk = 2, 8, 4
-    args = SimpleNamespace(
+    args = ServerArgs(
+        model="x",
         device="cpu",
         attn_tp_size=1,
         data_parallel_size=2,
-        mapping=SimpleNamespace(
-            attn=SimpleNamespace(
-                tp_size=1,
-                dp_size=2,
-                kvp_size=1,
-                kvp_rank=0,
-                kvp_group=(0,),
-                qcp_size=1,
-                qcp_rank=0,
-                qcp_group=(0,),
-            )
-        ),
         prefix_granularity=128,
-        spec_context_pad=2 * verify_width,
         max_num_seqs=4,
         chunked_prefill_size=3,
         max_total_tokens=1024,
@@ -984,10 +973,14 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         disaggregation_mode="null",
         disaggregation_layerwise_interval=1,
         pipeline_parallel_size=1,
-        speculative_algorithm="DSPARK" if verify_width > 1 else None,
+        # spec_context_pad is derived (3 * draft tokens); a width-1 DSPARK
+        # keeps context_len in the 576-score-column bucket the workspace
+        # arithmetic below pins, which no real no-spec config can reach.
+        speculative_algorithm="DSPARK",
         speculative_num_draft_tokens=verify_width,
         speculative_num_steps=verify_width - 1,
     )
+    args.mapping.rank = 0
     model = SimpleNamespace(
         hf_config=hf,
         num_attention_layers=40,
@@ -1253,7 +1246,7 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
     assert dict(layout.group_packing) == dict(V41_CACHE_FORMATS["v41"].group_packing)
     specs = {s.group_id: s for s, _ in recipe.groups()}
     assert [specs[g].block_granularity for g in V41_GROUP_GEOMETRY] == [64, 128, 64, 2]
-    assert all(s.family == "history" for s in specs.values())
+    assert all(s.attn_kind != "state" for s in specs.values())
     assert specs[SWA].sliding_window_tokens == 128
     assert specs[TAIL].sliding_window_tokens == 2
     payload = {
