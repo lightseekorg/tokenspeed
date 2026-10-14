@@ -41,7 +41,8 @@ if TYPE_CHECKING:
 
 # Minimum physical subgroup maximum for automatic fusion, independent of bucket.
 # Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
-_FUSED_MIN_ROWS_BY_TP = {2: 64, 4: 88}
+_FUSED_TP_SIZES = (2, 4)
+_FUSED_MIN_ROWS = 64
 
 logger = logging.getLogger(__name__)
 
@@ -319,7 +320,7 @@ class ProjectionBackend:
         spec: ProjectionSpec,
         use_lamport: bool,
         use_lamport_reduction: bool,
-        use_fused_projection: bool,
+        batch_invariant: bool,
         scratch_pool: "WorkspacePool | None",
     ) -> ProjectionWorkspace:
         """Allocate and warm a workspace bound to this dispatcher's backend."""
@@ -334,17 +335,18 @@ class ProjectionBackend:
                 fused_tp_projection_supported,
             )
 
-            minimum_rows = _FUSED_MIN_ROWS_BY_TP.get(len(spec.group))
             if spec.kind != "column":
                 fused_disabled_reason = "only column projections support fusion"
-            elif minimum_rows is None:
+            elif batch_invariant:
+                fused_disabled_reason = "batch-invariant collectives are enabled"
+            elif len(spec.group) not in _FUSED_TP_SIZES:
                 fused_disabled_reason = (
                     f"automatic TP{len(spec.group)} fusion is disabled"
                 )
-            elif spec.max_tokens < minimum_rows:
+            elif spec.max_tokens < _FUSED_MIN_ROWS:
                 fused_disabled_reason = (
                     f"prepared capacity {spec.max_tokens} is below the "
-                    f"TP{len(spec.group)} minimum of {minimum_rows} rows"
+                    f"TP{len(spec.group)} minimum of {_FUSED_MIN_ROWS} rows"
                 )
             elif not fused_tp_projection_supported(
                 len(spec.group),
@@ -364,16 +366,18 @@ class ProjectionBackend:
                 hosts,
                 (
                     socket.gethostname(),
-                    use_fused_projection,
+                    batch_invariant,
                     fused_disabled_reason is None,
                 ),
                 group=pg_manager.get_process_group("gloo", spec.group),
             )
             if len({value[1] for value in hosts}) != 1:
-                raise ValueError("Fused projection setting differs across ranks")
+                raise ValueError(
+                    "Batch-invariant collective setting differs across ranks"
+                )
             if len({value[0] for value in hosts}) == 1:
                 self._prepare_lamport(workspace, use_lamport_reduction)
-                if use_fused_projection and all(value[2] for value in hosts):
+                if all(value[2] for value in hosts):
                     from tokenspeed_kernel.ops.communication.cute_dsl import (
                         create_fused_tp_projection_state,
                     )
@@ -391,7 +395,7 @@ class ProjectionBackend:
                 fused_disabled_reason = "the projection group spans multiple nodes"
 
         if (
-            use_fused_projection
+            spec.kind == "column"
             and workspace.fused_column is None
             and dist.get_rank() == spec.group[0]
         ):
@@ -414,14 +418,13 @@ class ProjectionBackend:
     ) -> bool:
         """Run fused DP column-linear, or leave out untouched and return False."""
         # Use the subgroup maximum so unequal or empty owners take the same
-        # collective path. Each TP size uses one cutoff across all row buckets.
+        # collective path. TP2 and TP4 share one cutoff across all row buckets.
         rows = max(owner_rows)
-        minimum_rows = _FUSED_MIN_ROWS_BY_TP.get(len(owner_rows))
-        if minimum_rows is None:
+        if len(owner_rows) not in _FUSED_TP_SIZES:
             return False
         if (
             workspace.fused_column is None
-            or rows < minimum_rows
+            or rows < _FUSED_MIN_ROWS
             or weight_scales is None
             or weight.dtype != torch.float8_e4m3fn
             or weight_scales.dtype != torch.float32

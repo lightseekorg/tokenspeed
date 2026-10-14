@@ -231,13 +231,14 @@ operations.
 The fused column projection specializes its prepared state by TP size and padded
 channel widths; actual owner counts remain runtime data within warmed row buckets.
 Its peer-memory transport requires a node-local group. Cross-node groups retain
-the ordinary collectives. Automatic fusion uses one TP-specific minimum for the
-maximum physical owner count. Row buckets select the prepared kernel variant
-independently of that threshold.
+the ordinary collectives. Fusion is enabled automatically for eligible TP2 and
+TP4 projections when the maximum physical owner count is at least 64.
+Batch-invariant collectives retain the ordinary path. Row buckets select the
+prepared kernel variant independently of that threshold.
 Preparation allocates fused state only for TP sizes enabled in automatic dispatch
 and capacities that can reach their minimum row count. Direct kernel APIs may
 support additional TP sizes without allocating their state in ordinary serving.
-When fusion is requested but cannot be prepared, the first rank in each subgroup
+When column projection fusion cannot be prepared, the first rank in each subgroup
 logs the reason once during workspace preparation, outside the forward path.
 
 ### Padding contract

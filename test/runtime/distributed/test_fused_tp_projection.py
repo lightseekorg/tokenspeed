@@ -46,6 +46,7 @@ def _worker(rank, world_size, rendezvous):
     from tokenspeed_kernel.ops.quantization import quantize_fp8
 
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
     from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -56,7 +57,6 @@ def _worker(rank, world_size, rendezvous):
         release_dp_linear_communication,
     )
     from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
-    from tokenspeed.runtime.utils.env import envs
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
@@ -79,7 +79,7 @@ def _worker(rank, world_size, rendezvous):
         scale_fmt=None,
     )
     models = []
-    for enabled in (False, True):
+    for backend in (NcclBackend(), AutoBackend()):
         with torch.device(device):
             model = torch.nn.ModuleList(
                 [
@@ -109,8 +109,7 @@ def _worker(rank, world_size, rendezvous):
             linear.weight_scale_inv.copy_(
                 torch.rand_like(linear.weight_scale_inv) * 0.005 + 0.005
             )
-        with envs.TOKENSPEED_FUSED_TP_PROJECTION.override(enabled):
-            prepare_dp_linear_communication(model, 2048, torch.bfloat16, AutoBackend())
+        prepare_dp_linear_communication(model, 2048, torch.bfloat16, backend)
         models.append(model)
     baseline, candidate = models
     workspace = candidate[0].projection_workspace
@@ -143,15 +142,16 @@ def _worker(rank, world_size, rendezvous):
         ]
 
     def uses_fusion(rows):
-        return (world_size == 2 and rows >= 64) or (world_size == 4 and rows >= 88)
+        return world_size in (2, 4) and rows >= 64
 
-    # Cover bucket boundaries, both dispatch cutoffs, and small native GEMMs.
+    # Cover bucket boundaries, the shared dispatch cutoff, and small native GEMMs.
     equal_counts = [
         1,
         9,
         32,
         63,
         64,
+        65,
         87,
         88,
         128,
@@ -234,7 +234,7 @@ def _worker(rank, world_size, rendezvous):
         ((32,) * 4, False),
         ((32,) * 4, True),
         ((64, 17, 0, 63), False),
-        ((88,) * 4, False),
+        ((64,) * 4, False),
         ((0, 128), False),
         ((129, 255, 128, 0), False),
         ((257, 512, 33, 1), False),
@@ -321,8 +321,7 @@ def _worker(rank, world_size, rendezvous):
     torch.testing.assert_close(
         retained, expected[(32,) * world_size][0][0], rtol=0, atol=0
     )
-    with envs.TOKENSPEED_FUSED_TP_PROJECTION.override(True):
-        prepare_dp_linear_communication(candidate, 32, torch.bfloat16, AutoBackend())
+    prepare_dp_linear_communication(candidate, 32, torch.bfloat16, AutoBackend())
     counts = (32,) * world_size
     inputs[counts].copy_(source[counts][1])
     torch.testing.assert_close(
@@ -332,9 +331,8 @@ def _worker(rank, world_size, rendezvous):
         atol=0,
     )
     release_dp_linear_communication(candidate)
-    with envs.TOKENSPEED_FUSED_TP_PROJECTION.override(True):
-        prepare_dp_linear_communication(candidate, 88, torch.bfloat16, AutoBackend())
-    counts = (88,) * world_size
+    prepare_dp_linear_communication(candidate, 64, torch.bfloat16, AutoBackend())
+    counts = (64,) * world_size
     inputs[counts].copy_(source[counts][2])
     torch.testing.assert_close(
         candidate[0](inputs[counts], ctx=contexts[counts])[0],

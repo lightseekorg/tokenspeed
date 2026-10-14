@@ -291,8 +291,6 @@ class Envs:
     # Independent projection groups retain attention's local token ownership.
     TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE = EnvInt(1)
     TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE = EnvInt(1)
-    # Fixed-shape, fully resident TP projection; use on isolated GB300 GPUs.
-    TOKENSPEED_FUSED_TP_PROJECTION = EnvBool(False)
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)

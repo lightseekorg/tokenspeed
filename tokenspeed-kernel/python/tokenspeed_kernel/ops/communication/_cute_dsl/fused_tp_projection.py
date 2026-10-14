@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass.cute.runtime import from_dlpack
-from tokenspeed_kernel.thirdparty.cute_dsl.fused_tp_projection.kernel import (
+from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection_kernel import (
     FusedTPProjectionKernel,
 )
 

@@ -554,23 +554,12 @@ class AutoBackend(CommBackend):
             and spec.dtype == torch.bfloat16
             and not self._force_deterministic_rsag()
         )
-        use_fused_projection = envs.TOKENSPEED_FUSED_TP_PROJECTION.get()
         batch_invariant = self._batch_invariant_collectives()
-        if (
-            use_fused_projection
-            and spec.kind == "column"
-            and batch_invariant
-            and torch.distributed.get_rank() == spec.group[0]
-        ):
-            logger.info(
-                f"Fused TP projection not prepared for group {spec.group}: "
-                "batch-invariant collectives are enabled; using ordinary projection"
-            )
         return self._projection.prepare(
             spec,
             use_lamport,
             use_lamport and not batch_invariant,
-            use_fused_projection and not batch_invariant,
+            batch_invariant,
             scratch_pool,
         )
 
