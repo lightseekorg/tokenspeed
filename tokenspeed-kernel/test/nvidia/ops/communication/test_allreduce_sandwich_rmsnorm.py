@@ -364,59 +364,63 @@ def _skip_unless_triton_compiles_for_sm100():
         pytest.skip(f"Triton cannot compile for sm_100 here: {exc}")
 
 
+def _rmsnorm_launch(hidden: int, residual: bool):
+    """The ``_rmsnorm_kernel`` arguments (by name) and launch options of the
+    unfused chain's ``rmsnorm()`` call on one row: the post norm (no
+    residual) or the next pre-norm (the scaled BF16 residual add). The launch
+    needs a GPU, so it is recorded instead of run."""
+    from tokenspeed_kernel.ops.layernorm import triton as layernorm
+
+    launches = []
+
+    class RecordLaunch:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: launches.append((args, kwargs))
+
+    x = torch.empty(1, hidden, dtype=torch.bfloat16, device="meta")
+    weight = torch.empty(hidden, dtype=torch.bfloat16, device="meta")
+    add = {}
+    if residual:
+        add = dict(
+            residual=torch.empty_like(x),
+            round_residual_sum_bf16=True,
+            x_scale=1.0,
+            residual_scale=1.0,
+        )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(layernorm, "_rmsnorm_kernel", RecordLaunch())
+        layernorm.rmsnorm(x, weight, 1e-6, enable_pdl=True, **add)
+    ((args, kwargs),) = launches
+    names = layernorm._rmsnorm_kernel.arg_names
+    values = dict(zip(names, args))
+    values.update((k, v) for k, v in kwargs.items() if k in names)
+    return values, {k: v for k, v in kwargs.items() if k not in names}
+
+
 def _compile_triton_rmsnorm(hidden: int, residual: bool):
-    from tokenspeed_kernel._triton import triton
     from tokenspeed_kernel.ops.layernorm.triton import _rmsnorm_kernel
 
-    signature = {
-        "x_ptr": "*bf16",
-        "residual_ptr": "*bf16" if residual else "constexpr",
-        "weight_ptr": "*bf16",
-        "out_ptr": "*bf16",
-        "residual_out_ptr": "*bf16" if residual else "constexpr",
-        "x_scale": "fp32",
-        "residual_scale": "fp32",
-        "x_row_stride": "i32",
-    }
-    constexprs = {
-        "n_cols": hidden,
-        "eps": 1e-6,
-        "BLOCK": triton.next_power_of_2(hidden),
-        "HAS_RESIDUAL": residual,
-        "ROUND_RESIDUAL_SUM_BF16": residual,
-        "SCALE_INPUTS_BF16": residual,
-        "ENABLE_PDL": True,
-    }
-    if not residual:
-        constexprs.update({"residual_ptr": None, "residual_out_ptr": None})
-    # Every other parameter of the kernel is a constant. One that rmsnorm()
-    # leaves out takes its default, as at the launch (a constexpr or None
-    # default); a parameter without such a default fails the test.
-    for param in _rmsnorm_kernel.params:
-        if param.name in signature:
+    # The kernel as rmsnorm() launches it. Constexprs and None arguments are
+    # constants; the other arguments take the types Triton gives them at the
+    # launch. A parameter rmsnorm() leaves out takes its default.
+    values, options = _rmsnorm_launch(hidden, residual)
+    signature, constexprs, attrs = {}, {}, {}
+    for index, param in enumerate(_rmsnorm_kernel.params):
+        assert param.name in values or param.has_default, param.name
+        value = values.get(param.name, param.default)
+        if param.is_constexpr or value is None:
+            signature[param.name] = "constexpr"
+            constexprs[param.name] = value
             continue
-        if param.name not in constexprs:
-            assert param.has_default and (
-                param.is_constexpr or param.default is None
-            ), f"_rmsnorm_kernel has a parameter this test does not set: {param.name}"
-            constexprs[param.name] = param.default
-        signature[param.name] = "constexpr"
-    names = _rmsnorm_kernel.arg_names
-    # The product launch's tensors are 16-byte aligned and its row stride is
-    # the hidden size, a multiple of 16.
-    attrs = {
-        (names.index(name),): [["tt.divisibility", 16]]
-        for name in (
-            "x_ptr",
-            "residual_ptr",
-            "weight_ptr",
-            "out_ptr",
-            "residual_out_ptr",
-            "x_row_stride",
-        )
-        if signature[name] != "constexpr"
-    }
-    return _compile_for_sm100(_rmsnorm_kernel, signature, constexprs, attrs)
+        if isinstance(value, torch.Tensor):
+            signature[param.name] = {torch.bfloat16: "*bf16"}[value.dtype]
+        else:
+            signature[param.name] = "fp32" if isinstance(value, float) else "i32"
+        # The product launch's tensors are 16-byte aligned and its row stride
+        # is the hidden size, a multiple of 16.
+        if signature[param.name] != "fp32":
+            attrs[(index,)] = [["tt.divisibility", 16]]
+    return _compile_for_sm100(_rmsnorm_kernel, signature, constexprs, attrs, **options)
 
 
 @pytest.mark.parametrize("hidden", [1024, 4096, 7168])
