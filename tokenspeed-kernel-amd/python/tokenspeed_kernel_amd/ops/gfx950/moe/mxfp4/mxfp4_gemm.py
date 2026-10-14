@@ -798,6 +798,20 @@ def launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
     """
     num_tokens, hidden = x.shape
     num_experts, weight_hidden, inter = n16_mxfp4_shape(w13, w13_scale, w2, w2_scale)
+    # The kernels index routes as token * top_k + slot without bounds checks.
+    if (
+        topk_ids.ndim != 2
+        or topk_ids.shape[0] != num_tokens
+        or topk_weights.shape != topk_ids.shape
+        or topk_ids.dtype not in (torch.int32, torch.int64)
+        or not topk_weights.is_floating_point()
+    ):
+        raise ValueError(
+            "A4W4 MoE requires integer topk_ids and floating topk_weights shaped "
+            f"[{num_tokens}, top_k], got {topk_ids.dtype} "
+            f"{tuple(topk_ids.shape)} and {topk_weights.dtype} "
+            f"{tuple(topk_weights.shape)}"
+        )
     top_k = int(topk_ids.shape[1])
     device = x.device
     if x.dtype != torch.bfloat16 or x.stride(1) != 1:
