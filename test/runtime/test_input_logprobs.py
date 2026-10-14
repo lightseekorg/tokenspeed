@@ -1207,10 +1207,10 @@ def test_sampled_top_logprobs_are_the_prefill_rows_log_softmax_top_k():
 
 @pytest.mark.parametrize("chunk_tokens", [1, 2, 64])
 def test_prompt_top_k_rides_the_chunk_loop_of_the_prompt_logprobs(chunk_tokens):
-    """With a plan's top_k every chunk's fp32 log-softmax yields both the
-    targets' values (bit for bit the logprob without top-k) and each row's
-    alternatives; top_k 0 leaves the output as it was, and a top_k past the
-    vocabulary returns every token."""
+    """With a plan's top_k every chunk makes two calls: gather_token_logprobs
+    for the targets' values (bit for bit the logprob without top-k), then
+    top_token_logprobs for each row's alternatives; top_k 0 leaves the output
+    as it was, and a top_k past the vocabulary returns every token."""
     from tokenspeed.runtime.execution.context import InputLogprobRows
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.logits_processor import (
@@ -1262,6 +1262,55 @@ def test_prompt_top_k_rides_the_chunk_loop_of_the_prompt_logprobs(chunk_tokens):
     whole = logprobs.topk(vocab, dim=-1)
     assert torch.equal(every.input_top_logprobs_val, whole.values)
     assert torch.equal(every.input_top_logprobs_idx, whole.indices)
+
+
+def test_prompt_rows_and_sampled_rows_take_the_same_top_k_of_the_same_logits():
+    """docs/design/numerics.md: one arithmetic for prompt and output. Scored
+    as prompt rows (in uneven chunks) or sampled, the same bf16 logits rows
+    get the same alternatives bit for bit, values and ids, exact ties in
+    the top-k included."""
+    from tokenspeed.runtime.execution.context import InputLogprobRows
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.model_executor import _set_sampled_top_logprobs
+    from tokenspeed.runtime.layers.logits_processor import (
+        LogitsMetadata,
+        LogitsProcessor,
+    )
+
+    torch.manual_seed(0)
+    vocab, k, num_rows = 64, 8, 5
+    # The identity head makes each row's logits its activations, exactly.
+    # Three tokens tie for every row's largest logit, and the coarse grid
+    # ties more of the rest.
+    hidden = (torch.randint(-16, 17, (num_rows, vocab)) / 4).to(torch.bfloat16)
+    hidden[:, [3, 17, 40]] = 5.0
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=vocab),
+        dp_lm_head_tp=False,
+    )
+    out = processor(
+        input_ids=None,
+        hidden_states=hidden,
+        lm_head=SimpleNamespace(weight=torch.eye(vocab, dtype=torch.bfloat16)),
+        logits_metadata=LogitsMetadata(
+            forward_mode=ForwardMode.EXTEND,
+            query_shard=None,
+            gather_ids=torch.arange(num_rows),
+            input_logprob_rows=InputLogprobRows(
+                rows=torch.arange(num_rows),
+                targets=torch.zeros(num_rows, dtype=torch.int64),
+                slots=torch.zeros(num_rows, dtype=torch.int64),
+                num_input_rows=num_rows,
+                chunk_tokens=2,
+                rows_per_rank=None,
+                top_k=k,
+            ),
+        ),
+    )
+    _set_sampled_top_logprobs(out, out.next_token_logits, k)
+
+    assert torch.equal(out.input_top_logprobs_val, out.sampled_top_logprobs_val)
+    assert torch.equal(out.input_top_logprobs_idx, out.sampled_top_logprobs_idx)
 
 
 if __name__ == "__main__":

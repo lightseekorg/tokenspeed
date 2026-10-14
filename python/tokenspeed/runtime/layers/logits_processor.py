@@ -74,7 +74,10 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
 )
-from tokenspeed.runtime.sampling.utils import gather_token_logprobs
+from tokenspeed.runtime.sampling.utils import (
+    gather_token_logprobs,
+    top_token_logprobs,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -801,12 +804,12 @@ class LogitsProcessor(nn.Module):
                 (``_query_shard``): the plan whose rows ``hidden_states`` are,
                 ``None`` when they are the whole forward's.
 
-        With the plan's ``top_k`` each chunk's fp32 log-softmax is computed
-        once: the targets are gathered from it (the arithmetic of
-        ``gather_token_logprobs_torch``, so a target's value equals its own
-        top-k entry bit for bit) and its ``top_k`` largest values are kept.
-        Top-k is taken in torch's logprob order only (the ingress refuses it
-        otherwise).
+        With the plan's ``top_k`` each chunk's rows also get their ``top_k``
+        most likely tokens from ``top_token_logprobs``, the function the
+        sampled rows' alternatives come from, so a row's alternatives are
+        the same whether it is a prompt row or a sampled one, and a target's
+        value equals its own top-k entry bit for bit. Top-k is taken in
+        torch's logprob order only (the ingress refuses it otherwise).
 
         Returns:
             fp32 ``[plan rows]`` logprobs in row order, the whole plan's, and
@@ -869,8 +872,8 @@ class LogitsProcessor(nn.Module):
             raise ValueError(
                 f"{num_rows} prompt-logprob targets for {staged_rows} rows"
             )
-        # A k larger than the vocabulary returns every token, as the sampled
-        # token's alternatives do (``_set_sampled_top_logprobs``).
+        # A k larger than the vocabulary returns every token
+        # (``top_token_logprobs``), so the buffers below hold that many.
         top_k = min(plan.top_k, self.config.vocab_size)
         if top_k > 0 and self.logprob_order != "torch":
             raise ValueError(
@@ -898,19 +901,11 @@ class LogitsProcessor(nn.Module):
                 plan=None,
                 require_full_vocab=True,
             )
-            if top is None:
-                out[begin:end] = gather_token_logprobs(
-                    logits, plan.targets[begin:end], logprob_order=self.logprob_order
-                )
-            else:
-                logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float32)
-                out[begin:end] = logprobs.gather(
-                    -1, plan.targets[begin:end].unsqueeze(-1)
-                ).squeeze(-1)
-                values, ids = logprobs.topk(top_k, dim=-1)
-                top[0][begin:end] = values
-                top[1][begin:end] = ids
-                del logprobs, values, ids
+            out[begin:end] = gather_token_logprobs(
+                logits, plan.targets[begin:end], logprob_order=self.logprob_order
+            )
+            if top is not None:
+                top[0][begin:end], top[1][begin:end] = top_token_logprobs(logits, top_k)
             del logits
         return out, top
 

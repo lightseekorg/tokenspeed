@@ -118,6 +118,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
 )
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+from tokenspeed.runtime.sampling.utils import top_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
@@ -189,14 +190,14 @@ def _set_sampled_top_logprobs(
 
     ``prefill_logits`` are the rows the sampler drew from (any grammar mask
     already applied in place), so the alternatives are of the distribution
-    the sampled token's own logprob is read from: fp32 log-softmax values,
-    most likely first. Only eager prefills ask (``ForwardContext.sampled_top_k``
-    is 0 in every captured graph), so no graph records this.
+    the sampled token's own logprob is read from: ``top_token_logprobs``, the
+    prompt rows' top-k arithmetic too, most likely first. Only eager
+    prefills ask (``ForwardContext.sampled_top_k`` is 0 in every captured
+    graph), so no graph records this.
     """
     if top_k <= 0 or prefill_logits.shape[0] == 0:
         return
-    logprobs = torch.log_softmax(prefill_logits, dim=-1, dtype=torch.float32)
-    values, ids = logprobs.topk(min(top_k, logprobs.shape[-1]), dim=-1)
+    values, ids = top_token_logprobs(prefill_logits, top_k)
     logits_output.sampled_top_logprobs_val = values
     logits_output.sampled_top_logprobs_idx = ids
 
