@@ -18,24 +18,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""RMSNorm's per-token FP8 output (``rmsnorm(..., token_fp8_out=...)``).
+"""RMSNorm's per-token FP8 output (``rmsnorm_quantize_fp8``).
 
-The same launch writes the BF16 output, unchanged bit for bit, and its
-per-token FP8 E4M3 codes and FP32 scales, bit for bit those of
-``fp8_quantize_per_token`` of that output; with the residual and its BF16
-rounding, with and without the x and residual scales. Over many rows, where
-summing a row's squares in another order would change some output bits, also
-without a residual and with the FP32 residual sum.
+One launch writes the BF16 output, bit for bit that of the Triton RMSNorm
+without the FP8 output, and its per-token FP8 E4M3 codes and FP32 scales, bit
+for bit those of ``fp8_quantize_per_token`` of that output; with the residual
+and its BF16 rounding, with and without the x and residual scales. Over many
+rows, where summing a row's squares in another order would change some output
+bits, also without a residual and with the FP32 residual sum.
 """
 
 import pytest
 import torch
 from tokenspeed_kernel.ops.layernorm.triton import rmsnorm
+from tokenspeed_kernel.ops.quantization import rmsnorm_quantize_fp8
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize_per_token
-from utils import is_nvidia
+from tokenspeed_kernel.platform import pdl_enabled
+from utils import kernel_supported
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_nvidia(), reason="NVIDIA GPU test"
+    not torch.cuda.is_available()
+    or not kernel_supported("triton_rmsnorm_quantize_fp8"),
+    reason="the FP8-output RMSNorm is registered for NVIDIA SM100 and newer",
 )
 
 FP8 = torch.float8_e4m3fn
@@ -55,16 +59,15 @@ def test_rmsnorm_writes_the_per_token_fp8_of_its_output(rows, scaled):
     x = _rows(rows, hidden, seed=12)
     residual = _rows(rows, hidden, seed=13)
     weight = (1 + 0.1 * torch.randn(hidden, device="cuda")).to(torch.bfloat16)
-    kwargs = dict(residual=residual, enable_pdl=None, round_residual_sum_bf16=True)
+    kwargs = dict(residual=residual, round_residual_sum_bf16=True)
     if scaled:
         kwargs.update(x_scale=0.75, residual_scale=1.25)
-    out, residual_out = rmsnorm(x, weight, 1e-6, **kwargs)
-    codes = torch.empty(rows, hidden, device="cuda", dtype=FP8)
-    scales = torch.empty(rows, 1, device="cuda", dtype=torch.float32)
-    fused_out, fused_residual = rmsnorm(
-        x, weight, 1e-6, token_fp8_out=(codes, scales), **kwargs
+    out, residual_out = rmsnorm(x, weight, 1e-6, enable_pdl=None, **kwargs)
+    fused_out, fused_residual, codes, scales = rmsnorm_quantize_fp8(
+        x, weight, 1e-6, enable_pdl=pdl_enabled(), **kwargs
     )
     assert torch.equal(out, fused_out) and torch.equal(residual_out, fused_residual)
+    assert codes.dtype == FP8 and tuple(codes.shape) == (rows, hidden)
     expected_codes, expected_scales = fp8_quantize_per_token(out)
     assert torch.equal(scales, expected_scales)
     assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
@@ -79,20 +82,18 @@ def test_token_fp8_out_keeps_every_output_bit(hidden, residual):
     rows = 2048
     x = _rows(rows, hidden, seed=16)
     weight = (1 + 0.1 * torch.randn(hidden, device="cuda")).to(torch.bfloat16)
-    kwargs = dict(enable_pdl=None)
+    kwargs = dict(round_residual_sum_bf16=residual in ("bf16_sum", "scaled"))
     if residual != "none":
         kwargs["residual"] = _rows(rows, hidden, seed=17)
-    if residual in ("bf16_sum", "scaled"):
-        kwargs["round_residual_sum_bf16"] = True
     if residual == "scaled":
         kwargs.update(x_scale=0.75, residual_scale=1.25)
-    plain = rmsnorm(x, weight, 1e-6, **kwargs)
-    codes = torch.empty(rows, hidden, device="cuda", dtype=FP8)
-    scales = torch.empty(rows, 1, device="cuda", dtype=torch.float32)
-    fused = rmsnorm(x, weight, 1e-6, token_fp8_out=(codes, scales), **kwargs)
+    plain = rmsnorm(x, weight, 1e-6, enable_pdl=None, **kwargs)
+    *fused, codes, scales = rmsnorm_quantize_fp8(
+        x, weight, 1e-6, enable_pdl=pdl_enabled(), **kwargs
+    )
     if residual == "none":
-        plain, fused = (plain,), (fused,)
-    for want, got in zip(plain, fused):
+        plain, fused = (plain,), fused[:1]
+    for want, got in zip(plain, fused, strict=True):
         differ = (want.view(torch.int16) != got.view(torch.int16)).sum().item()
         assert differ == 0, f"{differ} elements differ from the plain call"
     expected_codes, expected_scales = fp8_quantize_per_token(plain[0])

@@ -24,12 +24,6 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
-from tokenspeed_kernel.ops.quantization.triton import (
-    fp8_dequantize_unscaled,
-    fp8_quantize_by_multiplier,
-    fp8_token_multiplier,
-    fp8_token_scale,
-)
 from tokenspeed_kernel.platform import pdl_enabled
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
@@ -42,7 +36,6 @@ __all__ = [
     "relu2",
     "sigmoid_mul",
     "silu_and_mul",
-    "silu_and_mul_fp8_dequant",
     "situ_and_mul",
     "swiglu_oai",
 ]
@@ -391,131 +384,6 @@ def silu_and_mul(
         **pdl_kwargs,
     )
     return out
-
-
-# The widest [gate | up] half one program holds (a row per program, for the
-# per-token amax of the FP8 output).
-SILU_AND_MUL_FP8_DEQUANT_MAX_WIDTH = 16384
-
-
-@triton.jit
-def _silu_and_mul_fp8_dequant_kernel(
-    y_ptr,
-    token_scale_ptr,
-    channel_scale_ptr,
-    codes_ptr,
-    scale_ptr,
-    width,
-    y_row_stride,
-    codes_row_stride,
-    BLOCK: tl.constexpr,
-    ENABLE_PDL: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, BLOCK)
-    mask = cols < width
-    # The channel scales are parameters nothing in the decode graph writes.
-    gate_scale = tl.load(channel_scale_ptr + cols, mask=mask, other=0.0)
-    up_scale = tl.load(channel_scale_ptr + width + cols, mask=mask, other=0.0)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    token_scale = tl.load(token_scale_ptr + row)
-    y_row = y_ptr + row * y_row_stride
-    gate = fp8_dequantize_unscaled(
-        tl.load(y_row + cols, mask=mask, other=0.0), token_scale, gate_scale
-    )
-    up = fp8_dequantize_unscaled(
-        tl.load(y_row + width + cols, mask=mask, other=0.0), token_scale, up_scale
-    )
-    # silu_and_mul's FP32 SwiGLU, rounded once to the 16-bit dtype it stores.
-    act = (gate * tl.sigmoid(gate) * up).to(y_ptr.dtype.element_ty).to(tl.float32)
-    act = tl.where(mask, act, 0.0)
-    amax = tl.max(tl.abs(act), axis=0)
-    codes = fp8_quantize_by_multiplier(act, fp8_token_multiplier(amax))
-    tl.store(codes_ptr + row * codes_row_stride + cols, codes, mask=mask)
-    tl.store(scale_ptr + row, fp8_token_scale(amax))
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
-
-
-def silu_and_mul_fp8_dequant(
-    y: torch.Tensor,
-    token_scales: torch.Tensor,
-    channel_scales: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """SwiGLU of an unscaled FP8 gate/up GEMM output, quantized per token.
-
-    The consumer of an FP8 W8A8 gate/up projection run with unit scales: it
-    applies the scales the GEMM left out, then the activation, then the next
-    FP8 linear's per-token quantization, in one launch with one program per
-    row. Each element is the scaled GEMM's 16-bit output
-    (``fp8_dequantize_unscaled``), the SwiGLU ``silu(gate) * up`` is evaluated
-    in FP32 and rounded once to ``y``'s dtype as ``silu_and_mul`` stores it,
-    and that row is quantized as ``fp8_quantize_per_token`` would quantize it.
-
-    Args:
-        y: ``[M, 2 * I]`` BF16 or FP16 unscaled GEMM output (gate columns,
-            then up columns) with a contiguous last axis.
-        token_scales: FP32 ``[M, 1]`` or ``[M]`` per-token scales of the
-            GEMM's FP8 input.
-        channel_scales: FP32 ``[2 * I, 1]`` or ``[2 * I]`` per-channel weight
-            scales of the GEMM.
-
-    Returns:
-        ``(codes, scales)``: contiguous FP8 E4M3 ``[M, I]`` codes and FP32
-        ``[M, 1]`` scales of the activation.
-
-    Raises:
-        ValueError: A layout or dtype outside the above, or ``I`` above
-            ``SILU_AND_MUL_FP8_DEQUANT_MAX_WIDTH``.
-    """
-    if y.ndim != 2 or y.stride(-1) != 1 or y.shape[-1] % 2:
-        raise ValueError(
-            "y must be [M, 2 * I] with a contiguous last axis, got shape "
-            f"{tuple(y.shape)} stride {y.stride()}"
-        )
-    if y.dtype not in (torch.bfloat16, torch.float16):
-        raise ValueError(f"y must be BF16 or FP16, got {y.dtype}")
-    m, width = y.shape[0], y.shape[1] // 2
-    if width > SILU_AND_MUL_FP8_DEQUANT_MAX_WIDTH:
-        raise ValueError(
-            f"I={width} exceeds the one-row-per-program limit "
-            f"{SILU_AND_MUL_FP8_DEQUANT_MAX_WIDTH}"
-        )
-    for name, scales, count in (
-        ("token_scales", token_scales, m),
-        ("channel_scales", channel_scales, 2 * width),
-    ):
-        if (
-            scales.dtype != torch.float32
-            or scales.numel() != count
-            or not scales.is_contiguous()
-        ):
-            raise ValueError(
-                f"{name} must be {count} contiguous FP32 values, got "
-                f"{scales.dtype} {tuple(scales.shape)}"
-            )
-    codes = torch.empty((m, width), dtype=torch.float8_e4m3fn, device=y.device)
-    scales = torch.empty((m, 1), dtype=torch.float32, device=y.device)
-    if m == 0:
-        return codes, scales
-    block = triton.next_power_of_2(width)
-    enable_pdl = pdl_enabled()
-    _silu_and_mul_fp8_dequant_kernel[(m,)](
-        y,
-        token_scales,
-        channel_scales,
-        codes,
-        scales,
-        width,
-        y.stride(0),
-        codes.stride(0),
-        BLOCK=block,
-        ENABLE_PDL=enable_pdl,
-        num_warps=min(max(block // 512, 1), 16),
-        **({"launch_pdl": True} if enable_pdl else {}),
-    )
-    return codes, scales
 
 
 @triton.jit

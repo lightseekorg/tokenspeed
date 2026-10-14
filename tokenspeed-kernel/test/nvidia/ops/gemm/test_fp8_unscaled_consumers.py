@@ -25,7 +25,7 @@ can run on the registry's per-tensor FP8 GEMM (cuBLASLt) with both scales 1:
 its BF16 output is the codes' product rounded once. The next kernel that reads
 that output applies ``token_scale * channel_scale`` (``fp8_dequantize_unscaled``)
 before its own work, such as the SwiGLU with the down projection's per-token
-quantization (``silu_and_mul_fp8_dequant``).
+quantization (``silu_and_mul_quantize_fp8``).
 
 Range: ``|code| <= 448``, so ``|sum| <= 448^2 * K`` (8.2e8 at K = 4,096), far
 inside BF16's range; the unscaled output's rounding is relative (2^-9), as the
@@ -34,17 +34,16 @@ scaled GEMM's own output rounding is.
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.activation import triton as activation_triton
-from tokenspeed_kernel.ops.activation.triton import (
-    silu_and_mul,
-    silu_and_mul_fp8_dequant,
-)
+from tokenspeed_kernel.ops.activation.triton import silu_and_mul
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.gemm import triton_fp8_channel
+from tokenspeed_kernel.ops.quantization import silu_and_mul_quantize_fp8
+from tokenspeed_kernel.ops.quantization import triton as quant_triton
 from tokenspeed_kernel.ops.quantization.triton import (
     dequantize_unscaled_fp8,
     fp8_quantize_per_token,
 )
+from tokenspeed_kernel.platform import pdl_enabled
 from utils import assert_no_triton_compile, kernel_supported
 
 pytestmark = pytest.mark.skipif(
@@ -117,7 +116,9 @@ def test_silu_and_mul_dequantizes_then_quantizes_per_token(m, width):
     w8, w_scales = _weight(2 * width, k, seed=width)
     a8, a_scales = fp8_quantize_per_token(_rows(m, k, seed=20 + m))
     y = _unscaled(a8, w8)
-    codes, scales = silu_and_mul_fp8_dequant(y, a_scales, w_scales)
+    codes, scales = silu_and_mul_quantize_fp8(
+        y, a_scales, w_scales, enable_pdl=pdl_enabled()
+    )
     # The statements it replaces: the scaled GEMM's BF16 output, SwiGLU in
     # FP32 rounded to BF16, per-token quantization of that.
     scaled = dequantize_unscaled_fp8(y, a_scales, w_scales)
@@ -154,9 +155,11 @@ def test_row_counts_do_not_recompile():
 
     def run(m):
         a8, a_scales = fp8_quantize_per_token(_rows(m, k, seed=40 + m))
-        silu_and_mul_fp8_dequant(_unscaled(a8, w8), a_scales, w_scales)
+        silu_and_mul_quantize_fp8(
+            _unscaled(a8, w8), a_scales, w_scales, enable_pdl=pdl_enabled()
+        )
 
     run(1)
-    with assert_no_triton_compile(activation_triton._silu_and_mul_fp8_dequant_kernel):
+    with assert_no_triton_compile(quant_triton._silu_and_mul_quantize_fp8_kernel):
         for m in (7, 16, 64):
             run(m)

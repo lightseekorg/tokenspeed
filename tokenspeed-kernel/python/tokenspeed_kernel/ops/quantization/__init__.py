@@ -27,6 +27,8 @@ __all__ = [
     "quantize_fp8",
     "quantize_fp8_with_gate",
     "quantize_fp8_with_scale",
+    "rmsnorm_quantize_fp8",
+    "silu_and_mul_quantize_fp8",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_mxfp4",
@@ -341,6 +343,145 @@ def quantize_fp8_with_scale(
         solution=solution,
         override=override,
     )
+
+
+def rmsnorm_quantize_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    residual: torch.Tensor | None = None,
+    round_residual_sum_bf16: bool,
+    x_scale: float | None = None,
+    residual_scale: float | None = None,
+    # kernel options
+    enable_pdl: bool,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """RMSNorm that also quantizes its output to FP8 per token, in one kernel.
+
+    The codes and scales are bit for bit those the Triton per-token quantizer
+    (``quantize_fp8(granularity="token")`` up to 64 rows on SM100 and newer)
+    writes for the stored output, for an FP8 GEMM that reads it.
+
+    Args:
+        x: ``[..., hidden_size]`` BF16 or FP16 input.
+        weight: ``[hidden_size]`` affine weight.
+        eps: Epsilon added to the mean of squares.
+        residual: Optional ``x``-shaped tensor added to ``x`` before the norm.
+        round_residual_sum_bf16: Round the sum ``x + residual`` to BF16 before
+            it is stored and normalized, as an eager BF16 add followed by the
+            norm. Needs BF16 ``x`` and ``residual``.
+        x_scale, residual_scale: Optional float multipliers of ``x`` and
+            ``residual``, each product rounded to BF16 before the add. Need
+            ``round_residual_sum_bf16=True``.
+        enable_pdl: Launch with Programmatic Dependent Launch.
+        override: Optional exact registered kernel override.
+        solution: Optional restriction to a registered backend family.
+
+    Returns:
+        ``(out, residual_sum, codes, scales)``: the ``x``-shaped output, the
+        residual sum (None without ``residual``), and contiguous FP8 E4M3
+        ``[rows, hidden_size]`` codes and FP32 ``[rows, 1]`` scales of ``out``.
+    """
+    # Each option the call uses must be one the kernel implements.
+    features = set()
+    if residual is not None:
+        features.add("residual")
+    if round_residual_sum_bf16:
+        features.add("round_residual_sum_bf16")
+    if x_scale is not None or residual_scale is not None:
+        features.add("input_scales")
+    signature = format_signature(x=dense_tensor_format(x.dtype))
+    kernel = select_kernel(
+        "quantization",
+        "rmsnorm_fp8",
+        signature,
+        features=frozenset(features) if features else None,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {"shape": tuple(x.shape), "residual": residual is not None}
+    ShapeCapture.get().record(
+        "quantization", "rmsnorm_fp8", kernel.name, x.dtype, shape_params
+    )
+    with kernel_scope(
+        "quantization", "rmsnorm_fp8", x.dtype, kernel_name=kernel.name, **shape_params
+    ):
+        return kernel(
+            x,
+            weight,
+            eps,
+            residual=residual,
+            round_residual_sum_bf16=round_residual_sum_bf16,
+            x_scale=x_scale,
+            residual_scale=residual_scale,
+            enable_pdl=enable_pdl,
+        )
+
+
+def silu_and_mul_quantize_fp8(
+    x: torch.Tensor,
+    token_scales: torch.Tensor,
+    channel_scales: torch.Tensor,
+    *,
+    # kernel options
+    enable_pdl: bool,
+    # dispatch options
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SwiGLU of an FP8 GEMM output whose scales are not applied yet,
+    quantized to FP8 per token, in one kernel.
+
+    For an FP8 W8A8 gate/up projection run with unit scales: the kernel
+    applies the per-token and per-channel scales the GEMM left out (the
+    ``dequant`` feature), then ``silu(gate) * up`` as ``silu_and_mul``
+    rounds it, then quantizes each row as the Triton per-token quantizer
+    (``quantize_fp8(granularity="token")`` up to 64 rows on SM100 and newer)
+    does, for the down projection.
+
+    Args:
+        x: ``[M, 2 * I]`` BF16 or FP16 GEMM output (gate columns, then up
+            columns) with a contiguous last axis.
+        token_scales: FP32 ``[M, 1]`` or ``[M]`` per-token scales of the
+            GEMM's FP8 input.
+        channel_scales: FP32 ``[2 * I, 1]`` or ``[2 * I]`` per-channel weight
+            scales of the GEMM.
+        enable_pdl: Launch with Programmatic Dependent Launch.
+        override: Optional exact registered kernel override.
+        solution: Optional restriction to a registered backend family.
+
+    Returns:
+        ``(codes, scales)``: contiguous FP8 E4M3 ``[M, I]`` codes and FP32
+        ``[M, 1]`` scales of the activation.
+    """
+    # A kernel bounds the width it takes (``intermediate_size_max``).
+    traits = {"intermediate_size": x.shape[-1] // 2}
+    signature = format_signature(x=dense_tensor_format(x.dtype))
+    kernel = select_kernel(
+        "quantization",
+        "silu_and_mul_fp8",
+        signature,
+        features=frozenset({"dequant"}),
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    shape_params = {"shape": tuple(x.shape)}
+    ShapeCapture.get().record(
+        "quantization", "silu_and_mul_fp8", kernel.name, x.dtype, shape_params
+    )
+    with kernel_scope(
+        "quantization",
+        "silu_and_mul_fp8",
+        x.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(x, token_scales, channel_scales, enable_pdl=enable_pdl)
 
 
 def quantize_mxfp8(

@@ -269,6 +269,7 @@ def rmsnorm(
             launch also writes the output quantized per token, as
             ``ops/quantization/triton.py``'s ``fp8_quantize_per_token`` would
             quantize the stored output, for an FP8 GEMM that reads it.
+            Callers reach it through ``ops.quantization.rmsnorm_quantize_fp8``.
 
     Returns:
         ``out``, or ``(out, residual_sum)`` when ``residual`` is given.
