@@ -78,7 +78,7 @@ def torch_mm_fp8_scaled(
         B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``).
         A_scales: FP32 ``[M, 1]`` per-token or one-element per-tensor scales.
         B_scales: FP32 ``[N, 1]`` per-channel or one-element per-tensor scales.
-        out_dtype: BF16 (the selection admits nothing else).
+        out_dtype: BF16; the row-wise scaling writes nothing else.
         alpha: Must be None; the scales carry the dequant.
         block_size: Must be None; the scales are per token or channel.
         out: Optional ``[M, N]`` output buffer.
@@ -88,6 +88,10 @@ def torch_mm_fp8_scaled(
     """
     if alpha is not None or block_size is not None:
         raise ValueError("row-wise scaled FP8 GEMM takes no alpha or block_size")
+    # The out_dtype trait keeps FP16 away in normal selection, but an override
+    # skips trait matching; torch._scaled_mm writes garbage rather than refusing.
+    if out_dtype != torch.bfloat16:
+        raise ValueError(f"row-wise scaled FP8 GEMM writes BF16, not {out_dtype}")
     m, n = A.shape[0], B.shape[1]
     # The kernel takes only dense [M, 1] and [1, N] scales; per-tensor ones are expanded.
     scale_a = A_scales.reshape(-1, 1).expand(m, 1).contiguous()

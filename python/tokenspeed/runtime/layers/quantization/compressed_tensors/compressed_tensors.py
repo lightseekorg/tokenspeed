@@ -123,7 +123,8 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         """The linear method of ``layer``: its config group's scheme, or the
         unquantized method for an ignored layer (by name, regex, or a class
-        name of the layer, as compressed-tensors matches ``ignore``)."""
+        name of the layer, as compressed-tensors matches ``ignore``). A
+        quantized MLA ``kv_b_proj`` is refused."""
         from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
 
         if should_ignore_quant_layer(
@@ -135,18 +136,19 @@ class CompressedTensorsConfig(QuantizationConfig):
         scheme = self.get_scheme(layer, layer_name=prefix)
         if scheme is None:
             return UnquantizedLinearMethod()
-        if isinstance(scheme, CompressedTensorsW8A8Fp8) and prefix.endswith(
-            "kv_b_proj"
-        ):
+        if prefix.endswith("kv_b_proj"):
             # MLA models absorb kv_b_proj into w_kc/w_vc in post_load_weights,
-            # which runs inside load_weights: before this scheme's
-            # process_weights_after_loading, and without its weight_scale.
+            # which runs inside load_weights: before any scheme's
+            # process_weights_after_loading, and reading layer.weight, which a
+            # packed scheme does not even register.
             raise ValueError(
-                f"{prefix}: compressed-tensors FP8 weights on an MLA kv_b_proj are "
-                "not supported yet. The model absorbs kv_b_proj into its "
-                "attention weights while loading, before the FP8 weight scales "
-                "are applied, so it would read raw FP8 codes. Checkpoints whose "
-                "quantization_config.ignore keeps kv_b_proj unquantized load."
+                f"{prefix}: compressed-tensors quantized weights on an MLA "
+                f"kv_b_proj are not supported yet ({type(scheme).__name__}). The "
+                "model absorbs kv_b_proj into its attention weights while "
+                "loading, before the scheme restores the weight from the "
+                "checkpoint, so it would read the stored codes. Checkpoints "
+                "whose quantization_config.ignore keeps kv_b_proj unquantized "
+                "load."
             )
         layer.scheme = scheme
         return CompressedTensorsLinearMethod(self)
@@ -198,6 +200,13 @@ class CompressedTensorsConfig(QuantizationConfig):
             config=config
         )
         packed_modules_mapping = config.get("packed_modules_mapping", {})
+        kv_cache_scheme = config.get("kv_cache_scheme")
+        if kv_cache_scheme is not None:
+            logger.warning(
+                f"compressed-tensors kv_cache_scheme {kv_cache_scheme} is not "
+                "applied: the KV cache dtype follows --kv-cache-dtype, which "
+                "keeps the model dtype by default."
+            )
 
         return cls(
             target_scheme_map=target_scheme_map,
@@ -205,7 +214,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             quant_format=quant_format,
             sparsity_scheme_map=sparsity_scheme_map,
             sparsity_ignore_list=sparsity_ignore_list,
-            kv_cache_scheme=config.get("kv_cache_scheme"),
+            kv_cache_scheme=kv_cache_scheme,
             config=config,
             packed_modules_mapping=packed_modules_mapping,
         )

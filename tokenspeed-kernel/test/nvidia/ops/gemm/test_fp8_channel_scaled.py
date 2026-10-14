@@ -67,6 +67,23 @@ def test_fp16_output_stays_on_triton():
     )
 
 
+def test_fp16_output_is_refused_on_the_override_path():
+    # An override skips trait matching, so the kernel itself refuses FP16.
+    a, a_scales, b, b_scales = make_fp8_per_channel_gemm_operands(
+        TORCH_FP8_SCALED_MIN_M, 1536, 1024, seed=1
+    )
+    with pytest.raises(ValueError, match="row-wise scaled FP8 GEMM writes BF16"):
+        kernel_mm(
+            a,
+            b.t(),
+            A_scales=a_scales,
+            B_scales=b_scales,
+            out_dtype=torch.float16,
+            quant="fp8",
+            override="torch_mm_fp8_scaled",
+        )
+
+
 @pytest.mark.parametrize("m", [TORCH_FP8_SCALED_MIN_M, 1024])
 @pytest.mark.parametrize(
     ("a_per_token", "b_per_channel"), [(False, True), (True, False), (True, True)]

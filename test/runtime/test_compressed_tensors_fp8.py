@@ -693,6 +693,23 @@ def test_scales_must_be_present_finite_and_positive(platform, value):
         layer.quant_method.process_weights_after_loading(layer)
 
 
+def test_kv_cache_scheme_is_kept_and_reported_as_not_applied(caplog):
+    """Nothing consumes the checkpoint's KV-cache scheme yet, so parsing it
+    says so once; the linears are quantized as usual."""
+    caplog.set_level(logging.WARNING, logger=ct.__name__)
+    scheme = {"num_bits": 8, "type": "float", "strategy": "tensor", "dynamic": False}
+    config = _parse(dict(CHANNEL_DYNAMIC, kv_cache_scheme=scheme))
+    assert config.kv_cache_scheme == scheme
+    assert [r.getMessage() for r in caplog.records] == [
+        f"compressed-tensors kv_cache_scheme {scheme} is not applied: the KV "
+        "cache dtype follows --kv-cache-dtype, which keeps the model dtype by "
+        "default."
+    ]
+    caplog.clear()
+    assert _parse(CHANNEL_DYNAMIC).kv_cache_scheme is None
+    assert not caplog.records
+
+
 # quantization_config fields of mconcat/GLM-5.1-FP8-Dynamic's config.json: every
 # Linear but the routers, norms and lm_head is FP8, kv_b_proj included.
 GLM_5_1_FP8_DYNAMIC = {
@@ -777,8 +794,9 @@ def test_mla_kv_b_proj_in_fp8_is_refused(platform, monkeypatch, raw, q_lora_rank
     monkeypatch.setitem(global_server_args_dict, "tp_batch_invariant", "none")
     with pytest.raises(
         ValueError,
-        match="model.layers.0.self_attn.kv_b_proj: compressed-tensors FP8 weights "
-        "on an MLA kv_b_proj are not supported",
+        match="model.layers.0.self_attn.kv_b_proj: compressed-tensors quantized "
+        r"weights on an MLA kv_b_proj are not supported yet "
+        r"\(CompressedTensorsW8A8Fp8\)",
     ):
         _mla_attention(_parse(raw), q_lora_rank)
     keep = dict(raw, ignore=[*raw["ignore"], "re:.*kv_b_proj$"])
@@ -787,6 +805,38 @@ def test_mla_kv_b_proj_in_fp8_is_refused(platform, monkeypatch, raw, q_lora_rank
     first = attn.q_b_proj if q_lora_rank else attn.q_proj
     assert type(first.quant_method) is ct.CompressedTensorsLinearMethod
     assert first.weight.dtype == FP8
+
+
+def test_mla_kv_b_proj_is_refused_for_every_scheme(platform):
+    """The absorption reads kv_b_proj.weight before any scheme's post-load
+    fix-up, not only FP8's, so a pack-quantized kv_b_proj (weight_packed and
+    no weight) is refused by name as well."""
+    raw = _config(
+        QuantizationArgs(
+            num_bits=4,
+            type="int",
+            symmetric=True,
+            strategy="group",
+            group_size=128,
+            dynamic=False,
+        ),
+        None,
+        fmt="pack-quantized",
+    )
+    with pytest.raises(
+        ValueError,
+        match="model.layers.0.self_attn.kv_b_proj: compressed-tensors quantized "
+        r"weights on an MLA kv_b_proj are not supported yet "
+        r"\(CompressedTensorsWNA16\)",
+    ):
+        ReplicatedLinear(
+            64,
+            32,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=_parse(raw),
+            prefix="model.layers.0.self_attn.kv_b_proj",
+        )
 
 
 def _fused_qkv_a(config):

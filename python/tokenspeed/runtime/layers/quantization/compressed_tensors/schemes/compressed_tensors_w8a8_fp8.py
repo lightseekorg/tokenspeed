@@ -137,7 +137,7 @@ def _check_scales(layer: torch.nn.Module, name: str, scale: torch.Tensor) -> Non
     # A scale the checkpoint did not provide keeps its NaN fill.
     if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
         raise ValueError(
-            f"{getattr(layer, 'prefix', type(layer).__name__)}.{name}: "
+            f"{layer.prefix}.{name}: "
             "compressed-tensors FP8 scales must be finite and positive "
             "(missing from the checkpoint?)"
         )
