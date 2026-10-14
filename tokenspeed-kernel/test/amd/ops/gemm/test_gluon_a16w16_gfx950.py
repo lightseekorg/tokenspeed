@@ -337,6 +337,8 @@ _DECODE_CASES = [
     pytest.param((20, 1536, 7168), torch.bfloat16, id="shared-gu-splitk"),
     pytest.param((8, 6288, 7168), torch.bfloat16, id="qkvfab-ragged-n"),
     pytest.param((40, 7168, 768), torch.bfloat16, id="shared-dn-ragged-m"),
+    # 16x128 split-K tiles store C through the coalesced row layout.
+    pytest.param((12, 8448, 7168), torch.bfloat16, id="dense-gu-coalesced-store"),
 ]
 
 
