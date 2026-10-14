@@ -58,6 +58,10 @@ LARGEM_DISPATCH_MIN_M = 2048
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
 _counter_cache: dict[tuple[int, int, int], torch.Tensor] = {}
+# Per-device [zeroed counters, next free index] handed out to captured
+# launches; see _get_splitk_counters.
+_graph_counter_arenas: dict[int, list] = {}
+_GRAPH_COUNTER_ARENA_SIZE = 1 << 20
 
 
 def _dense16_bmm_launch_metadata(grid, kernel, args):
@@ -1860,17 +1864,32 @@ def supports_gluon_mm_a16w16_decode_gfx950(M: int, N: int, K: int) -> bool:
 
 
 def _get_splitk_counters(device: torch.device, num_tiles: int) -> torch.Tensor:
-    """Return stream-local zeroed per-tile arrival counters.
+    """Return zeroed per-tile arrival counters.
 
     The last program of each tile resets its counter, so the buffer is zero
     again whenever a launch completes and same-stream launches can share it.
+    A captured launch gets its own slice of a counter arena zeroed before
+    capture, so replays need no zeroing node; once the arena is used up, it
+    falls back to graph-private counters zeroed inside the graph.
     """
+    device_index = torch.cuda.current_device() if device.index is None else device.index
     if torch.cuda.is_current_stream_capturing():
-        # Keep captured launches on graph-private counters; never bake the
-        # shared eager buffer into a graph.
+        arena = _graph_counter_arenas.get(device_index)
+        if arena is not None and arena[1] + num_tiles <= arena[0].numel():
+            start = arena[1]
+            arena[1] += num_tiles
+            return arena[0][start : start + num_tiles]
         return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
 
-    device_index = torch.cuda.current_device() if device.index is None else device.index
+    # Eager runs (serving warms each graph's forward up before capturing it)
+    # keep a quarter of an arena free for the next capture; captured slices
+    # keep their old arena alive.
+    arena = _graph_counter_arenas.get(device_index)
+    if arena is None or arena[0].numel() - arena[1] < _GRAPH_COUNTER_ARENA_SIZE // 4:
+        _graph_counter_arenas[device_index] = [
+            torch.zeros((_GRAPH_COUNTER_ARENA_SIZE,), dtype=torch.int32, device=device),
+            0,
+        ]
     stream_id = torch.cuda.current_stream(device_index).cuda_stream
     key = (device_index, stream_id, num_tiles)
     counters = _counter_cache.get(key)

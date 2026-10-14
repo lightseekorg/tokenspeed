@@ -104,8 +104,10 @@ writes an FP32 partial through to memory, waits for its stores, and bumps a
 per-tile counter with a relaxed atomic; the last split to arrive sums all
 partials in split order with cache-bypassing loads, writes C, and resets the
 counter, so one launch does both phases without an acquire-release fence and
-results are deterministic. Tiles with at least eight outputs per lane store C
-through a row-contiguous layout, 16 bytes per lane. An optional XCD remap
+results are deterministic. A launch captured into a HIP graph takes its
+counters from an arena zeroed before capture, so a replay adds no zeroing
+node. Tiles with at least eight outputs per lane store C through a
+row-contiguous layout, 16 bytes per lane. An optional XCD remap
 keeps the M tiles that share a weight tile on one XCD's L2.
 
 ### gfx950 MXFP8 projection

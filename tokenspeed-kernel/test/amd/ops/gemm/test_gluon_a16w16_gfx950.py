@@ -388,9 +388,12 @@ def test_decode_gemm_graph_does_not_share_eager_counters() -> None:
 
     # The graph must use its own counters, not the eager stream's buffer.
     assert captured.data_ptr() != eager.data_ptr()
-    a.copy_(torch.randn_like(a) * 0.25)
-    graph.replay()
-    torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
+    # The counters are zeroed before capture, not by the graph: every replay
+    # relies on the previous one resetting them.
+    for _ in range(3):
+        a.copy_(torch.randn_like(a) * 0.25)
+        graph.replay()
+        torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
 
 
 def test_decode_gemm_writes_strided_out() -> None:
