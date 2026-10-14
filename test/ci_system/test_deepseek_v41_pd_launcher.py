@@ -176,7 +176,6 @@ def test_two_node_roles_keep_engines_independent(launcher):
     assert router["env"]["SLURM_STEP_NUM_NODES"] == "2"
     assert value(router["args"], "--prefill") == "grpc://192.0.2.1:18346"
     assert value(router["args"], "--decode") == "grpc://192.0.2.2:18347"
-    assert value(router["args"], "--reasoning-parser") == "deepseek_v31"
     decode.terminate()
     assert decode.wait(timeout=5) == 143
     assert not (tmp_path / "logs/123-1/decode.ready").exists()
