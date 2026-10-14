@@ -66,6 +66,10 @@ KEY = ("json", SCHEMA)
 
 
 class _Grammar(BaseGrammarObject):
+    @property
+    def memory_size_bytes(self) -> int:
+        return 0
+
     def copy(self):
         return _Grammar()
 

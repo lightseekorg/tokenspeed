@@ -72,8 +72,9 @@ class BaseGrammarObject:
     @property
     def memory_size_bytes(self) -> int:
         """Host memory held by this grammar object (an estimate), counted
-        against RETAINED_GRAMMAR_LIMIT_BYTES. Backends override it."""
-        return 0
+        against RETAINED_GRAMMAR_LIMIT_BYTES. Every backend must define it:
+        without it the bound would count only the keys."""
+        raise NotImplementedError()
 
 
 class InvalidGrammarObject(BaseGrammarObject):
