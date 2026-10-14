@@ -27,12 +27,9 @@ import math
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
-from tokenspeed_kernel.ops.gemm import triton_bf16x3
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    _select,
-    decode_gemv,
-    decode_gemv_weight_split,
-)
+from tokenspeed_kernel.ops.gemm import _select_decode_gemv as _select
+from tokenspeed_kernel.ops.gemm import decode_gemv, decode_gemv_weight_split
+from tokenspeed_kernel.ops.gemm._triton import bf16x3 as triton_bf16x3
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from utils import (

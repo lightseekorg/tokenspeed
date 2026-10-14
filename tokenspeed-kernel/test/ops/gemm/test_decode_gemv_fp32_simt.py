@@ -36,19 +36,15 @@ from fractions import Fraction
 from unittest.mock import Mock
 
 import pytest
-import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
+import tokenspeed_kernel.ops.gemm as gemm_api
 import torch
-from tokenspeed_kernel.ops.gemm import gluon_gemv, triton_gemv
-from tokenspeed_kernel.ops.gemm.gluon_gemv import gluon_simt_gemm_fp32
-from tokenspeed_kernel.ops.gemm.triton_bf16x3 import triton_bf16x3_gemm_fp32
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    _BF16_FP32_SIG,
-    _FP32_SIG,
-    _select,
-    decode_gemv,
-    decode_gemv_weight_split,
-    torch_decode_gemv,
-)
+from tokenspeed_kernel.ops.gemm import _select_decode_gemv as _select
+from tokenspeed_kernel.ops.gemm import decode_gemv, decode_gemv_weight_split
+from tokenspeed_kernel.ops.gemm._gluon import gemv as gluon_gemv
+from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
+from tokenspeed_kernel.ops.gemm._triton.bf16x3 import triton_bf16x3_gemm_fp32
+from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv
+from tokenspeed_kernel.ops.gemm.triton import _BF16_FP32_SIG, _FP32_SIG
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     Platform,
@@ -291,7 +287,7 @@ def test_split_kernel_keeps_the_rows_above_96(nvidia_platform, monkeypatch):
     # them, this kernel serves rows 17 to 96 from the FP32 weight whether or
     # not the split is passed, and the split kernel serves rows from 97.
     split = Mock(return_value=object())
-    monkeypatch.setattr(triton_gemv, "split_fp32_weight_bf16x3", split)
+    monkeypatch.setattr(gemm_api, "split_fp32_weight_bf16x3", split)
     both = (gluon_simt_gemm_fp32, triton_bf16x3_gemm_fp32)
     shared = range(2048, 8192 + 1, 512)
     for k in shared:
@@ -324,7 +320,7 @@ def test_decode_gemv_hands_this_kernel_the_fp32_weight(monkeypatch):
     # The split goes only to the split kernel; this kernel reads the weight.
     result = torch.empty(32, 256)
     kernel = Mock(return_value=result)
-    monkeypatch.setattr(triton_gemv, "_select", Mock(return_value=kernel))
+    monkeypatch.setattr(gemm_api, "_select_decode_gemv", Mock(return_value=kernel))
     x = torch.zeros(32, 512, dtype=torch.bfloat16)
     weight = torch.zeros(256, 512)
     pieces = torch.zeros(3, 256, 512, dtype=torch.bfloat16)
@@ -399,7 +395,7 @@ def test_noncontiguous_inputs_skip_the_registry(
     def registry_lookup(*args):
         raise AssertionError("a noncontiguous input reached the registry")
 
-    monkeypatch.setattr(triton_gemv, "_select", registry_lookup)
+    monkeypatch.setattr(gemm_api, "_select_decode_gemv", registry_lookup)
     generator = torch.Generator().manual_seed(2)
     x = torch.randn(24, 2 * 512, generator=generator).to(x_dtype)
     weight = torch.randn(2 * 64, 512, generator=generator).to(weight_dtype)
@@ -545,7 +541,7 @@ def test_noncontiguous_rows_take_torch(monkeypatch, x_dtype, strided):
         calls.append(args)
         return torch_decode_gemv(*args)
 
-    monkeypatch.setattr(triton_gemv, "torch_decode_gemv", torch_leaf)
+    monkeypatch.setattr(gemm_api, "torch_decode_gemv", torch_leaf)
     got = decode_gemv(x, weight)
     assert len(calls) == 1
     # Torch picks its own summation order: hold it to the bound of any order.

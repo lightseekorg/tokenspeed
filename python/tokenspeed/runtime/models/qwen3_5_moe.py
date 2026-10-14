@@ -30,7 +30,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     fused_swiglu_fp8_ue8m0,
 )
-from tokenspeed_kernel.ops.gemm.cute_dsl import (
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
     nvfp4_gemm_swiglu_nvfp4_quant,
 )
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize

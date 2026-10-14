@@ -24,7 +24,7 @@ import dataclasses
 
 import torch
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
-from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
+from tokenspeed_kernel.ops.gemm import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     DistArgmaxState,

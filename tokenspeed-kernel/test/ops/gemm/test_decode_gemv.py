@@ -25,7 +25,8 @@ from __future__ import annotations
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
-from tokenspeed_kernel.ops.gemm.triton_gemv import _select, decode_gemv, use_decode_gemv
+from tokenspeed_kernel.ops.gemm import _select_decode_gemv as _select
+from tokenspeed_kernel.ops.gemm import decode_gemv, use_decode_gemv
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -55,17 +56,17 @@ def test_registry_fallback_selection():
 
 @pytest.mark.parametrize("projection,n", [("kda", 3216), ("mla", 3648)])
 def test_kimi_projections_honor_small_m_joint_route(monkeypatch, projection, n):
-    from tokenspeed_kernel.ops.gemm import kimi3, triton_gemv
+    import tokenspeed_kernel.ops.gemm as gemm_api
 
     x = torch.empty(32, 7168, device="meta", dtype=torch.bfloat16)
     weight = torch.empty(n, 7168, device="meta", dtype=torch.bfloat16)
     output = torch.empty(32, n, device="meta", dtype=torch.bfloat16)
-    monkeypatch.setattr(kimi3, "use_decode_gemv", lambda *_: True)
-    monkeypatch.setattr(triton_gemv, "decode_gemv", lambda *_: output)
+    monkeypatch.setattr(gemm_api, "use_decode_gemv", lambda *_: True)
+    monkeypatch.setattr(gemm_api, "decode_gemv", lambda *_: output)
     if projection == "kda":
-        assert kimi3.kimi3_qkvfab_projection(x, weight) is output
+        assert gemm_api.kimi3_qkvfab_projection(x, weight) is output
     else:
-        result = kimi3.kimi3_mla_qkv_gate_projection(x, weight, 2112)
+        result = gemm_api.kimi3_mla_qkv_gate_projection(x, weight, 2112)
         assert result.packed is output
         assert result.qkv.shape == (32, 2112)
         assert result.gate.shape == (32, 1536)
@@ -75,7 +76,7 @@ def test_kimi_projections_honor_small_m_joint_route(monkeypatch, projection, n):
 def test_shared_projections_route_and_match_torch(m):
     """The K3 shared gate_up/down call sites use the joint path and
     agree with the Torch composition within BF16 tolerances."""
-    from tokenspeed_kernel.ops.gemm.kimi3 import (
+    from tokenspeed_kernel.ops.gemm import (
         kimi3_shared_down_projection,
         kimi3_shared_situ_projection,
     )
@@ -101,7 +102,7 @@ def test_forced_torch_solution_is_not_routed():
     joint FI path supports, or A/B comparisons silently measure the route."""
     from unittest.mock import patch
 
-    from tokenspeed_kernel.ops.gemm import kimi3
+    import tokenspeed_kernel.ops.gemm as gemm_api
 
     x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
     latent_w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
@@ -109,11 +110,11 @@ def test_forced_torch_solution_is_not_routed():
     y = torch.randn(1, 768, device="cuda", dtype=torch.bfloat16)
 
     with patch(
-        "tokenspeed_kernel.ops.gemm.triton_gemv.decode_gemv",
+        "tokenspeed_kernel.ops.gemm.decode_gemv",
         side_effect=AssertionError("forced torch path must not route"),
     ):
-        kimi3.kimi3_latent_projection(x, latent_w, solution="torch")
-        kimi3.kimi3_shared_down_projection(y, down_w, solution="torch")
+        gemm_api.kimi3_latent_projection(x, latent_w, solution="torch")
+        gemm_api.kimi3_shared_down_projection(y, down_w, solution="torch")
     # Drain the queued vendor-BLAS work here: under emulation it otherwise keeps
     # executing into the next test and charges its runtime against that test.
     torch.cuda.synchronize()
@@ -418,10 +419,8 @@ def _fp64_reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 @_requires_nvidia
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
 def test_fp32_selection_follows_dtype_and_rows(x_dtype):
-    from tokenspeed_kernel.ops.gemm.triton_gemv import (
-        torch_decode_gemv,
-        triton_rowcta_gemm_fp32,
-    )
+    from tokenspeed_kernel.ops.gemm._triton.gemv import triton_rowcta_gemm_fp32
+    from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv
 
     fp32 = (x_dtype, torch.float32, False)
     _select.cache_clear()
@@ -456,10 +455,8 @@ def test_fp32_selection_follows_dtype_and_rows(x_dtype):
 )
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
 def test_fp32_selection_keeps_the_measured_envelope(m, n, k, expected, x_dtype):
-    from tokenspeed_kernel.ops.gemm.triton_gemv import (
-        torch_decode_gemv,
-        triton_rowcta_gemm_fp32,
-    )
+    from tokenspeed_kernel.ops.gemm._triton.gemv import triton_rowcta_gemm_fp32
+    from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv
 
     _select.cache_clear()
     selected = _select(m, n, k, True, x_dtype, torch.float32, False)
@@ -509,7 +506,7 @@ def test_bf16_rows_with_fp32_weight_skip_the_widening_copy(m, n, k):
 @pytest.mark.parametrize("m", [1, 4, 16])
 @pytest.mark.parametrize("n,k", [(0, 17), (3, 0), (19, 127), (3, 65537)])
 def test_fp32_rowcta_empty_odd_and_wide_rows(m, n, k):
-    from tokenspeed_kernel.ops.gemm.triton_gemv import triton_rowcta_gemm_fp32
+    from tokenspeed_kernel.ops.gemm._triton.gemv import triton_rowcta_gemm_fp32
 
     # The registry only routes the measured envelope to the kernel, but a
     # direct call computes any shape. Sums of ones are exact, so any lost or
@@ -536,7 +533,7 @@ def test_fp32_rowcta_empty_odd_and_wide_rows(m, n, k):
 )
 @pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16])
 def test_fp32_rowcta_launch_configuration(monkeypatch, m, k, launch, x_dtype):
-    from tokenspeed_kernel.ops.gemm import triton_gemv
+    from tokenspeed_kernel.ops.gemm._triton import gemv as triton_gemv
 
     launches = []
 

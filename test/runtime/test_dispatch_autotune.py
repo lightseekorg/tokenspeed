@@ -1023,7 +1023,7 @@ def test_joint_adapter_propagates_fi_failure():
     ],
 )
 def test_projection_discovery_precedes_auto_dispatch(name):
-    tree = ast.parse((KERNEL / "ops/gemm/kimi3.py").read_text())
+    tree = ast.parse((KERNEL / "ops/gemm/__init__.py").read_text())
     fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
     auto = next(
         n
@@ -1139,7 +1139,7 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
         is_contiguous=lambda: True,
     )
     api = _functions(
-        KERNEL / "ops/gemm/triton_gemv.py",
+        KERNEL / "ops/gemm/__init__.py",
         None,
         ("use_decode_gemv",),
         dict(
@@ -1147,7 +1147,7 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
             BF16_GEMM_MAX_M=32,
             flashinfer_joint_bf16_supported=lambda *args: fi,
             current_platform=lambda: SimpleNamespace(is_cdna5=cdna5),
-            _select=select,
+            _select_decode_gemv=select,
             torch_decode_gemv=fallback,
         ),
     )
@@ -1189,9 +1189,9 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
     )
     signature = object()
     api = _functions(
-        KERNEL / "ops/gemm/triton_gemv.py",
+        KERNEL / "ops/gemm/__init__.py",
         None,
-        ("_select",),
+        ("_select_decode_gemv",),
         dict(
             functools=functools,
             KernelRegistry=SimpleNamespace(get=lambda: registry),
@@ -1199,10 +1199,12 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
             spec_matches_traits=spec_matches_traits,
             spec_matches_shape_traits=spec_matches_shape_traits,
             torch_decode_gemv=fallback,
-            _SIGNATURES={(torch.bfloat16, torch.bfloat16): signature},
+            _DECODE_GEMV_SIGNATURES={(torch.bfloat16, torch.bfloat16): signature},
         ),
     )
-    selected = api._select(m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False)
+    selected = api._select_decode_gemv(
+        m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False
+    )
     assert selected is (impl if expected else fallback)
     if on_cuda:
         registry.get_for_operator.assert_called_once_with(
@@ -1212,9 +1214,9 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
         registry.get_for_operator.assert_not_called()
     # A dtype pair without a registry signature never reaches the registry.
     registry.get_for_operator.reset_mock()
-    assert api._select(m, n, k, on_cuda, torch.float16, torch.float16, False) is (
-        fallback
-    )
+    assert api._select_decode_gemv(
+        m, n, k, on_cuda, torch.float16, torch.float16, False
+    ) is (fallback)
     registry.get_for_operator.assert_not_called()
 
 
@@ -1232,9 +1234,7 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
     ],
 )
 def test_fp32_rowcta_routing_bounds_k(m, k, routed):
-    api = _functions(
-        KERNEL / "ops/gemm/triton_gemv.py", None, ("_fp32_rowcta_k_fits",), {}
-    )
+    api = _functions(KERNEL / "ops/gemm/triton.py", None, ("_fp32_rowcta_k_fits",), {})
     # A direct call takes any width, but the registry sends a second 64K block
     # for one row, and more than 15 blocks of 512 for more rows, to Torch.
     assert api._fp32_rowcta_k_fits(m, 256, k) is routed
@@ -1251,7 +1251,7 @@ def test_skinny_add3_preserves_capture_trust(capturing, warmed, failure):
     kernel.supports.return_value = True
     fallback = Mock()
     api = _functions(
-        KERNEL / "ops/gemm/kimi3.py",
+        KERNEL / "ops/gemm/__init__.py",
         None,
         ("_skinny_gemv_add3",),
         dict(
@@ -1335,7 +1335,7 @@ def test_pipeline_stages_share_shape_keyed_cache_identity():
 )
 def test_skinny_add3_uses_only_measured_architecture(capability, expected):
     api = _functions(
-        KERNEL / "ops/gemm/kimi3.py",
+        KERNEL / "ops/gemm/__init__.py",
         None,
         ("_skinny_add3_arch_supported",),
         dict(
@@ -1390,7 +1390,7 @@ def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(serving):
     """Once serving, FI's rows skip both FI and the registry's possibly cold Triton GEMV."""
     joint, fallback, select = Mock(), Mock(), Mock()
     api = _functions(
-        KERNEL / "ops/gemm/triton_gemv.py",
+        KERNEL / "ops/gemm/__init__.py",
         None,
         ("use_decode_gemv", "decode_gemv"),
         dict(
@@ -1401,7 +1401,7 @@ def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(serving):
             flashinfer_bf16_gemm=joint,
             is_serving=lambda: serving,
             torch_decode_gemv=fallback,
-            _select=select,
+            _select_decode_gemv=select,
         ),
     )
     x = torch.ones(1, 128, dtype=torch.bfloat16)

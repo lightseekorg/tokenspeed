@@ -25,13 +25,11 @@ from dataclasses import astuple
 import pytest
 import torch
 from tokenspeed_kernel import compile_monitor
+from tokenspeed_kernel.ops.gemm import decode_gemv
 from tokenspeed_kernel.ops.gemm import flashinfer as fi
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    _rowcta_gemv_kernel,
-    decode_gemv,
-    use_decode_gemv,
-)
+from tokenspeed_kernel.ops.gemm import use_decode_gemv
+from tokenspeed_kernel.ops.gemm._triton.gemv import _rowcta_gemv_kernel
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(

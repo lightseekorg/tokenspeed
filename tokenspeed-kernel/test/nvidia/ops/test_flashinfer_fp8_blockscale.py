@@ -12,8 +12,10 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_fp8_linear,
 )
-from tokenspeed_kernel.ops.gemm.flashinfer import (
+from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
     flashinfer_fp8_blockscale_quantize_prepacked,
+)
+from tokenspeed_kernel.ops.gemm.flashinfer import (
     gemm_fp8_nt_groupwise,
     has_flashinfer_fp8_blockscale,
     prepare_flashinfer_fp8_blockscale_weight_scales,

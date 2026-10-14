@@ -40,9 +40,6 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import TensorDescriptor, tl, triton
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "BF16X3_MIN_M",
@@ -54,7 +51,6 @@ __all__ = [
 # reduction over 1.5x the FP32 weight bytes) loses to an FP32 kernel that
 # streams each weight row once.
 BF16X3_MIN_M = 17
-
 # K block of one load and the MMA accumulator span: every BK block is drained.
 _BLOCK_K = 64
 _DRAIN = 64
@@ -246,44 +242,6 @@ def _bf16x3_config(m: int, n: int, k: int) -> _Bf16x3Config:
     return _Bf16x3Config(swap, block_a, block_b, num_stages, split)
 
 
-@register_kernel(
-    "gemm",
-    "decode_gemv",
-    name="triton_bf16x3_gemm_fp32",
-    solution="triton",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 3),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=frozenset(
-        {
-            format_signature(
-                x=dense_tensor_format(torch.bfloat16),
-                weight=dense_tensor_format(torch.float32),
-            )
-        }
-    ),
-    traits={
-        "m_min": frozenset({BF16X3_MIN_M}),
-        "n_align": frozenset({128}),
-        # In a GB200 sweep (N 128 to 1024, K 2048 to 8192, 17 to 2048 rows)
-        # this kernel was up to 1.6x slower than the FP32 Torch product for
-        # 128-row weights at most row counts up to 128, and at least 1.05x
-        # faster at every point for weights of 256 rows and more. 128-row
-        # weights stay on Torch.
-        "n_min": frozenset({256}),
-        "n_max": frozenset({1024}),
-        "k_align": frozenset({_BLOCK_K}),
-        # K stays within that sweep's range. Up to 128 rows the smallest margin
-        # for 256-row weights fell from 1.52x at K 6144 to 1.05x at K 2048.
-        "k_min": frozenset({2048}),
-        "k_max": frozenset({8192}),
-        "weight_split": frozenset({True}),
-    },
-    priority=Priority.SPECIALIZED,
-    weight_preprocessor=split_fp32_weight_bf16x3,
-)
 def triton_bf16x3_gemm_fp32(
     x: torch.Tensor, weight_split: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:

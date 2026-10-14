@@ -38,12 +38,9 @@ import json
 import statistics
 
 import torch
-from tokenspeed_kernel.ops.gemm.triton_bf16x3 import triton_bf16x3_gemm_fp32
-from tokenspeed_kernel.ops.gemm.triton_gemv import (
-    _select,
-    decode_gemv,
-    decode_gemv_weight_split,
-)
+from tokenspeed_kernel.ops.gemm import _select_decode_gemv as _select
+from tokenspeed_kernel.ops.gemm import decode_gemv, decode_gemv_weight_split
+from tokenspeed_kernel.ops.gemm._triton.bf16x3 import triton_bf16x3_gemm_fp32
 
 
 def _graph_us(fn, calls: int, repeats: int) -> float:

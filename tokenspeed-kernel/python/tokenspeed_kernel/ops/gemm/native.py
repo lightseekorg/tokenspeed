@@ -23,7 +23,17 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
+
+# ===-----------------------------------------------------------------------===#
+# Scaled FP8: PyTorch row-wise scaled GEMM (NVIDIA SM100)
+# ===-----------------------------------------------------------------------===#
+
 
 _FP8_CHANNEL_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
 # Below this many rows the Triton kernel is as fast and skips the scale expansion.
@@ -92,3 +102,39 @@ def torch_mm_fp8_scaled(
     return torch._scaled_mm(
         A, B, scale_a=scale_a, scale_b=scale_b, out_dtype=out_dtype, out=out
     )
+
+
+# ===-----------------------------------------------------------------------===#
+# Decode GEMV: PyTorch
+# ===-----------------------------------------------------------------------===#
+
+
+@register_kernel(
+    "gemm",
+    "decode_gemv",
+    name="torch_decode_gemv",
+    solution="torch",
+    signatures=frozenset(
+        format_signature(
+            x=dense_tensor_format(x_dtype),
+            weight=dense_tensor_format(weight_dtype),
+        )
+        for x_dtype, weight_dtype in (
+            (torch.bfloat16, torch.bfloat16),
+            (torch.float32, torch.float32),
+            (torch.bfloat16, torch.float32),
+        )
+    ),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def torch_decode_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if x.dtype == torch.bfloat16 and weight.dtype == torch.float32:
+        x = x.float()
+    if out is not None:
+        return torch.mm(x, weight.t(), out=out)
+    return x @ weight.t()

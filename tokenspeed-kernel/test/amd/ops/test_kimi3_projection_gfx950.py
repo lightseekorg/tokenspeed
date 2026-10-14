@@ -6,6 +6,11 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.activation import situ_and_mul as kernel_situ_and_mul
 from tokenspeed_kernel.ops.gemm import (
+    _use_gluon_largem,
+    _use_gluon_mediumm,
+    decode_gemv,
+)
+from tokenspeed_kernel.ops.gemm import (
     kimi3_latent_projection as kernel_kimi3_latent_projection,
 )
 from tokenspeed_kernel.ops.gemm import (
@@ -23,8 +28,9 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection as kernel_kimi3_shared_situ_projection,
 )
-from tokenspeed_kernel.ops.gemm.kimi3 import _use_gluon_largem, _use_gluon_mediumm
-from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv, use_decode_gemv
+from tokenspeed_kernel.ops.gemm import (
+    use_decode_gemv,
+)
 from tokenspeed_kernel.ops.moe import _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk
 from utils import is_cdna4
 

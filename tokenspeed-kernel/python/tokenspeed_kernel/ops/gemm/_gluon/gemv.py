@@ -51,9 +51,6 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon, triton
-from tokenspeed_kernel.ops.gemm.triton_gemv import _BF16_FP32_SIG
-from tokenspeed_kernel.platform import CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
 
 __all__ = ["gluon_simt_gemm_fp32"]
 
@@ -174,35 +171,6 @@ def _simt_tile(
     return _TILE_8X4
 
 
-# Registered where it beat Torch's FP32 path at every point of a GB200 module
-# bench (CUDA graphs of 49 calls over cold weights, 291 points): BF16
-# activations, 132 points with N 4 to 256 and K 512 to 8192 from 17 to 96
-# rows, at 1.23x to 5.17x (median 2.72x). FP32 activations, and N 512 or 1024,
-# were slower than Torch at some points in those rows (28 of 105 and 3 of 36)
-# and are left to Torch. Against the BF16x3 split kernel on 256-row weights (K
-# 3072 to 7168, separate runs), this kernel was faster at every K up to 48
-# rows, while at 64 and 96 rows the split kernel was faster at some K from
-# 4096, by up to 1.29x; the band is not cut there, since without a split this
-# kernel is the only fast path. One step above the band start, so a broader
-# FP32 kernel registered at the band start for the same rows does not take
-# them.
-@register_kernel(
-    "gemm",
-    "decode_gemv",
-    name="gluon_simt_gemm_fp32",
-    solution="gluon",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_BF16_FP32_SIG,
-    traits={
-        "m": frozenset(range(17, 97)),
-        "n_align": frozenset({4}),
-        "n_max": frozenset({256}),
-        "k_align": frozenset({_K_ALIGN}),
-        "k_min": frozenset({_K_ALIGN}),
-        "k_max": frozenset({_MAX_K}),
-    },
-    priority=Priority.SPECIALIZED + 1,
-)
 def gluon_simt_gemm_fp32(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
