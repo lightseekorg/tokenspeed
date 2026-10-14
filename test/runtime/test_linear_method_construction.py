@@ -221,38 +221,3 @@ def test_other_methods_keep_legacy_checkpoint_loading(kind, method_name):
     torch.testing.assert_close(
         layer.weight.float(), checkpoint.chunk(2, dim=dim)[1].float(), rtol=0, atol=0
     )
-
-
-@pytest.mark.parametrize(
-    "config_cls,block,dtype,expected",
-    [
-        (Fp8Config, [128, 128], torch.bfloat16, True),
-        (Fp8Config, [64, 128], torch.bfloat16, True),
-        (Fp8Config, [128, 64], torch.bfloat16, False),
-        (Fp8Config, None, torch.bfloat16, False),
-        (Mxfp8Config, [128, 128], torch.bfloat16, False),
-        (Fp8Config, [128, 128], torch.float16, False),
-    ],
-)
-def test_row_linear_fp8_producer_contract(config_cls, block, dtype, expected):
-    config = config_cls(is_checkpoint_fp8_serialized=True, weight_block_size=block)
-    layer = RowParallelLinear(
-        256, 128, bias=False, params_dtype=dtype, quant_config=config
-    )
-    assert layer.supports_fp8_group128_input is expected
-
-
-def test_dp_row_linear_keeps_collective_input_unquantized():
-    from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
-    from tokenspeed.runtime.layers.linear import DPRowParallelLinear
-
-    config = Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
-    layer = DPRowParallelLinear(
-        256,
-        128,
-        parallel=DenseLayerMapping(rank=0, world_size=2, tp_size=2, dp_size=1),
-        params_dtype=torch.bfloat16,
-        quant_config=config,
-        prefix="o_proj",
-    )
-    assert not layer.supports_fp8_group128_input

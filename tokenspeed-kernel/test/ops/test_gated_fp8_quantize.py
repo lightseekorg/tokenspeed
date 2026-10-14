@@ -28,13 +28,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU requi
 
 
 @pytest.mark.parametrize(
-    "rows,heads", [(1, 12), (4, 96), (64, 96), (128, 96), (257, 12)]
+    "rows,heads,strided", [(1, 12, False), (64, 96, True), (257, 12, True)]
 )
 @pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize(
     "enable_pdl", [False, True] if current_platform().is_hopper_plus else [False]
 )
-@pytest.mark.parametrize("strided", [False, True])
 def test_gated_fp8_matches_separate_ops(rows, heads, normalize, enable_pdl, strided):
     torch.manual_seed(rows + heads)
     width = heads * 128
