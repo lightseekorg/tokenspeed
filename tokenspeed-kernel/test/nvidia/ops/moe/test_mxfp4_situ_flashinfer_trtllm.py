@@ -98,7 +98,7 @@ def _kernel_routing_case(seed: int, num_tokens: int):
 
 
 def _prepare_kernel_routing_weights(raw, correction_bias):
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_mxfp4_situ_moe_weights,
     )
 
@@ -117,7 +117,7 @@ def _prepare_kernel_routing_weights(raw, correction_bias):
 
 @requires_flashinfer_situ
 def test_flashinfer_situ_kernel_routing_matches_portable_reference() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_mxfp4_situ_moe_apply,
     )
 
@@ -150,7 +150,7 @@ def test_flashinfer_situ_kernel_routing_matches_portable_reference() -> None:
 
 @requires_flashinfer_situ
 def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_mxfp4_situ_moe_apply,
     )
 
@@ -187,7 +187,7 @@ def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> Non
 
 @requires_flashinfer_situ
 def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_mxfp4_situ_moe_apply,
     )
 

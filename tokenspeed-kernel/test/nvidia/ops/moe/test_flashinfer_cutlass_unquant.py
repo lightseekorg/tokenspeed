@@ -61,7 +61,7 @@ def _requires_flashinfer_hopper() -> None:
 
 def test_wrapper_never_enables_pdl(monkeypatch) -> None:
     _requires_flashinfer_hopper()
-    from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant
+    import tokenspeed_kernel.ops.moe.flashinfer as cutlass_unquant
 
     seen = {}
 
@@ -91,8 +91,8 @@ def test_wrapper_passes_one_persistent_zeroed_workspace(monkeypatch) -> None:
     allocated, reused while it fits, grown (and re-zeroed) when a larger
     batch arrives."""
     _requires_flashinfer_hopper()
+    import tokenspeed_kernel.ops.moe.flashinfer as cutlass_unquant
     from flashinfer.fused_moe import cutlass_fused_moe_workspace_size
-    from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant
 
     calls = []
 

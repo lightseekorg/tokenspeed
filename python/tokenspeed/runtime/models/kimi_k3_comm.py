@@ -44,7 +44,7 @@ from tokenspeed_kernel.ops.communication.multimem import (
     multimem_prealloc,
     multimem_stage,
 )
-from tokenspeed_kernel.ops.moe.latent_tail import (
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
     K3_SHARED_RS_MAX_TOKENS,
     KimiK3LatentTailOp,
     attn_reduce_shape_supported,

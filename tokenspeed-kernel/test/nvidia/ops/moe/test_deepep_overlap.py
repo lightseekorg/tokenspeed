@@ -10,12 +10,12 @@ numerical check would notice, so it is asserted here.
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.moe.deep_ep as deepep_fp8
 import torch
 from tokenspeed_kernel.ops.moe import moe_apply
-from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8
 
 pytestmark = pytest.mark.skipif(
-    not hasattr(deepep_fp8, "_apply_low_latency"),
+    not hasattr(deepep_fp8, "_deep_gemm_fp8_apply_low_latency"),
     reason="DeepEP FP8 MoE path needs an NVIDIA platform with DeepGEMM",
 )
 
@@ -103,7 +103,7 @@ def stub_compute(monkeypatch):
 
 
 def _run_low_latency(calls: list[str], overlap_fn, *, enable_pdl: bool = False) -> None:
-    deepep_fp8._apply_low_latency(
+    deepep_fp8._deep_gemm_fp8_apply_low_latency(
         _RecordingDispatcher(calls),
         torch.zeros((1, HIDDEN), dtype=torch.bfloat16),
         _weights(),

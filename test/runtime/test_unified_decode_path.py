@@ -526,10 +526,6 @@ class RunnerSignatureConformanceTest(_TorchCase):
             "MSAHybridAttnBackend",
         ),
         (
-            "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v4",
-            "DeepseekV4AttentionBackend",
-        ),
-        (
             "tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41",
             "DeepseekV41AttentionBackend",
         ),

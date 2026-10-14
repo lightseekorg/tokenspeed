@@ -18,7 +18,7 @@ SwiGLU) and DeepSeek V4 (EP8, 384 experts, top-6, 7168x3072, bias-free SiLU).
 The HIP VMM binding is compiled on first use through
 `torch.utils.cpp_extension`, so a ROCm development environment is required.
 
-The TokenSpeed adapter lives in `tokenspeed_kernel.ops.moe.gluon.petit` and
+The TokenSpeed adapter lives in `tokenspeed_kernel.ops.moe.gluon` and
 registers this runtime as the `gluon` solution with `gluon_petit_*` function
 and kernel registration names. The serving options are `--moe-backend gluon_petit`
 and `--all2all-backend gluon_petit`; the runtime maps the MoE backend to `gluon`

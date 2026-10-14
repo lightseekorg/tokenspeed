@@ -1225,7 +1225,7 @@ def test_qrita_top_k_top_p_row_count():
 
 
 def test_marlin_deepep_pack_global_token_count():
-    from tokenspeed_kernel.ops.moe.marlin import deepep_layout
+    import tokenspeed_kernel.ops.moe._deep_ep.layout as deepep_layout
 
     experts, recv_m, hidden, top_k, block_m = 4, 24, 256, 2, 16
     counts = torch.tensor([5, 0, 17, 3], dtype=torch.int32, device=DEVICE)

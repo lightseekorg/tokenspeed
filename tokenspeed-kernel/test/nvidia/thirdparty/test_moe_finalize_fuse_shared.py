@@ -122,7 +122,7 @@ def test_routed_deferred_finalize_matches_finalized(
     """trtllm routed unquant MoE: do_finalize=False + our fused finalize must
     reproduce do_finalize=True. Also proves the deferred gemm2 rows are
     un-weighted (the finalize applies the only weighting)."""
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant
+    import tokenspeed_kernel.ops.moe.flashinfer as trtllm_unquant
 
     monkeypatch.setattr("tokenspeed_kernel.ops.moe.pdl_enabled", lambda: enable_pdl)
 

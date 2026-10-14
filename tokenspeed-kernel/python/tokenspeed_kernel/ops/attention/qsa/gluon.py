@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shim registering the AMD GFX950 Gluon QSA sparse attention kernel."""
+"""Registrations of the AMD GFX950 Gluon QSA kernels."""
 
 from __future__ import annotations
 
@@ -33,6 +33,8 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.qsa import (
+        launch_gluon_qsa_block_scores_gfx950,
+        launch_gluon_qsa_block_topk_select_gfx950,
         launch_gluon_qsa_sparse_attention_gfx950,
     )
 
@@ -65,6 +67,81 @@ if current_platform().is_amd:
     def gluon_qsa_sparse_attention_gfx950(*args, **kwargs):
         return launch_gluon_qsa_sparse_attention_gfx950(*args, **kwargs)
 
-    __all__ = ["gluon_qsa_sparse_attention_gfx950"]
+    @register_kernel(
+        "attention",
+        "qsa_block_scores",
+        name="gluon_qsa_block_scores_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    query=dense_tensor_format(torch.bfloat16),
+                    key_cache=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_qsa_block_scores_gfx950(
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        request_indices: torch.Tensor,
+        complete_blocks: torch.Tensor,
+        *,
+        page_size: int,
+        queries_per_request: int | None,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        # The kernel finds each tile's request runs itself, and GFX950 has no
+        # programmatic dependent launch.
+        del queries_per_request, enable_pdl
+        return launch_gluon_qsa_block_scores_gfx950(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            page_size=page_size,
+        )
+
+    @register_kernel(
+        "attention",
+        "qsa_block_topk_select",
+        name="gluon_qsa_block_topk_select_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {format_signature(logits=dense_tensor_format(torch.float32))}
+        ),
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_qsa_block_topk_select_gfx950(
+        logits: torch.Tensor,
+        topk: int,
+        *,
+        lengths: torch.Tensor,
+        persistent_workspace: torch.Tensor | None,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        # Columns past each row's length hold -inf and are never selected, so
+        # the radix select needs no lengths, persistent state or PDL.
+        del lengths, persistent_workspace, enable_pdl
+        return launch_gluon_qsa_block_topk_select_gfx950(logits, topk)
+
+    __all__ = [
+        "gluon_qsa_block_scores_gfx950",
+        "gluon_qsa_block_topk_select_gfx950",
+        "gluon_qsa_sparse_attention_gfx950",
+    ]
 else:
     __all__ = []

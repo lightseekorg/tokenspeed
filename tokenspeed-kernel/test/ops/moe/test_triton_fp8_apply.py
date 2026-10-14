@@ -169,7 +169,8 @@ def test_triton_fp8_moe_matches_torch(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_triton_fp8_moe_token_count():
     _skip_unless_supported()
-    from tokenspeed_kernel.ops.moe.triton import _common, fp8
+    from tokenspeed_kernel.ops.moe._triton import common as _common
+    from tokenspeed_kernel.ops.moe._triton import fp8
 
     num_experts, top_k, hidden_size, intermediate_size = 4, 2, 256, 128
     max_tokens = 1500

@@ -201,7 +201,7 @@ def test_gluon_petit_rejects_decode_capacity_above_workspace_limit() -> None:
 
 
 def test_dsv4_gluon_petit_zero_token_routing_shapes() -> None:
-    from tokenspeed.runtime.models.deepseek_v4 import DeepseekV4MoE
+    from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 
     layer = DeepseekV4MoE.__new__(DeepseekV4MoE)
     layer.config = SimpleNamespace(num_experts_per_tok=6, n_routed_experts=384)

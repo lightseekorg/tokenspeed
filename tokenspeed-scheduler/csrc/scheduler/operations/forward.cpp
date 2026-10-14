@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -41,6 +42,7 @@
 #include "cache/tier/transfer.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
+#include "scheduler/capacity_model.h"
 #include "scheduler/operations/cache.h"
 #include "scheduler/operations/forward.h"
 #include "scheduler/operations/group_demands.h"
@@ -489,7 +491,15 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         // Every token-spanned group covers the same logical extent. Reuse
         // reserved speculative slots after a prefill interrupts decode instead
         // of charging another verify span on every restart.
-        std::int32_t reserved_end = num_computed_tokens + pending_decode_tokens + decode_width;
+        const std::int32_t verify_end = num_computed_tokens + pending_decode_tokens + decode_width;
+        // Draft writes land in the next verify window up to the token limit; admission covers none without a budget.
+        const std::int64_t draft_end =
+            request->HasDeclaredBudget()
+                ? std::min({std::int64_t{verify_end} + CapacityModel::DraftWindowTokens(config_), request->TokenLimit(),
+                            std::int64_t{std::numeric_limits<std::int32_t>::max()}})
+                : verify_end;
+        const auto decode_end = static_cast<std::int32_t>(std::max<std::int64_t>(verify_end, draft_end));
+        std::int32_t reserved_end = decode_end;
         for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
             if (coordinator_.GroupIsState(static_cast<std::size_t>(i))) {
                 continue;
@@ -498,7 +508,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
             reserved_end = table.NumBlocks() * coordinator_.GroupBlockGranularity(i) - table.AvailableTokens();
             break;
         }
-        reserve_tokens = std::max(num_computed_tokens + pending_decode_tokens + decode_width - reserved_end, 0);
+        reserve_tokens = std::max(decode_end - reserved_end, 0);
     }
     // The first decode on the fused role is the owner's prompt end: the
     // partial page and the state are published and the owner moves to fresh

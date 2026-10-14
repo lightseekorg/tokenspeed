@@ -44,7 +44,7 @@ def test_lamport_copy_releases_successors_before_rearming() -> None:
 def test_shared_rs_does_not_run_routed_collective():
     from unittest.mock import Mock
 
-    from tokenspeed_kernel.ops.moe.latent_tail import KimiK3LatentTailOp
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import KimiK3LatentTailOp
 
     shared = torch.ones(2, 4)
     shard = torch.ones(64, 2)
@@ -111,7 +111,7 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
 
     # Each mailbox names its own: the down projection's producers cannot all
     # sanitize -0, so it needs the pattern that takes two coincidences to spell.
-    tail = (package / "ops/moe/latent_tail.py").read_text()
+    tail = (package / "ops/moe/_cute_dsl/latent_tail.py").read_text()
     assert "sentinel=NEG_ZERO_F32_BITS" in tail
     tail_imports = {
         alias.asname or alias.name
@@ -120,7 +120,7 @@ def test_only_the_down_projection_moved_off_the_upstream_sentinel() -> None:
         for alias in node.names
     }
     assert "NEG_ZERO_F32_BITS" in tail_imports
-    down = (package / "ops/moe/latent_down.py").read_text()
+    down = (package / "ops/moe/_cute_dsl/latent_down.py").read_text()
     assert "sentinel=_DOWN_SENTINEL" in down
     assert "_DOWN_SENTINEL = 0x80008000" in down
 
@@ -163,7 +163,7 @@ def test_the_probe_is_skipped_only_within_one_host_window(
     from unittest import mock
 
     import tokenspeed_kernel.ops.communication.fabric as fabric
-    import tokenspeed_kernel.ops.moe.latent_tail as tail
+    import tokenspeed_kernel.ops.moe._cute_dsl.latent_tail as tail
 
     seen: list[list[int]] = []
     asked = mock.Mock()
@@ -210,7 +210,7 @@ def test_the_world_group_is_tested_like_any_other(per_host, probed) -> None:
     from unittest import mock
 
     import tokenspeed_kernel.ops.communication.fabric as fabric
-    import tokenspeed_kernel.ops.moe.latent_tail as tail
+    import tokenspeed_kernel.ops.moe._cute_dsl.latent_tail as tail
 
     seen: list[list[int]] = []
     saved = fabric._host_map
@@ -252,7 +252,7 @@ def test_an_ungathered_map_declines_rather_than_guessing_placement() -> None:
     from unittest import mock
 
     import tokenspeed_kernel.ops.communication.fabric as fabric
-    import tokenspeed_kernel.ops.moe.latent_tail as tail
+    import tokenspeed_kernel.ops.moe._cute_dsl.latent_tail as tail
 
     saved = fabric._host_map
     fabric._host_map = None
