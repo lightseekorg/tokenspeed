@@ -6,11 +6,11 @@ via the /v1/chat/completions API with known prompts and expected content.
 
 Usage:
     cd test/runtime
-    python3 -m unittest models.test_kimi_models -v
-    python3 -m unittest models.test_kimi_models.TestKimiK25.test_base -v
-    python3 -m unittest models.test_kimi_models.TestKimiK25.test_tsckpt_eagle3 -v
-    python3 -m unittest models.test_kimi_models.TestKimiK25.test_nvckpt_eagle3 -v
-    python3 -m unittest models.test_kimi_models.TestKimiK25.test_dflash -v
+    python3 -m pytest models/test_kimi_models.py -v
+    python3 -m pytest models/test_kimi_models.py::TestKimiK25::test_base -v
+    python3 -m pytest models/test_kimi_models.py::TestKimiK25::test_tsckpt_eagle3 -v
+    python3 -m pytest models/test_kimi_models.py::TestKimiK25::test_nvckpt_eagle3 -v
+    python3 -m pytest models/test_kimi_models.py::TestKimiK25::test_dflash -v
 
 Environment (all optional):
     KIMI_K25_MODEL                HF model id or path (default: nvidia/Kimi-K2.5-NVFP4)
@@ -26,8 +26,8 @@ import os
 import subprocess
 import sys
 import time
-import unittest
 
+import pytest
 import requests
 
 from tokenspeed.runtime.utils.process import kill_process_tree
@@ -254,24 +254,26 @@ MESH_CASES = {
 # ── Tests ────────────────────────────────────────────────────────────
 
 
-class TestKimiK25(unittest.TestCase):
+class TestKimiK25:
 
     def _run_quality_checks(self, case: MeshCase):
         port = _next_server_port()
         proc = _serve_server(port, case.extra_args)
         try:
             if not _wait_for_server(port):
-                self.fail(f"[{case.name}] Server did not start within {TIMEOUT}s")
+                _pytest_msg_1 = f"[{case.name}] Server did not start within {TIMEOUT}s"
+                assert False, _pytest_msg_1
 
             for i, q in enumerate(QUALITY_CHECKS):
                 data = _chat(port, q["messages"], max_tokens=q["max_tokens"])
                 content = data["choices"][0]["message"]["content"]
-                self.assertIn(
-                    q["expected"],
-                    content,
+                _pytest_member_2 = q["expected"]
+                _pytest_container_3 = content
+                _pytest_msg_4 = (
                     f"[{case.name}] check {i}: "
-                    f'expected {q["expected"]!r} in {content!r}',
+                    f'expected {q["expected"]!r} in {content!r}'
                 )
+                assert _pytest_member_2 in _pytest_container_3, _pytest_msg_4
         finally:
             kill_process_tree(proc.pid)
 
@@ -293,4 +295,4 @@ class TestKimiK25(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

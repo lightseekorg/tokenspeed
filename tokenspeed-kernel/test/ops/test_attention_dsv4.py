@@ -16,8 +16,9 @@
 # SOFTWARE.
 
 import math
-import unittest
+import sys
 
+import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_indexer_mxfp4_paged_gather,
@@ -520,8 +521,8 @@ def _expected_overlap_normed(
     return compressed * torch.rsqrt(variance + eps) * rms_weight
 
 
-class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
-    def test_indexer_q_serial_four_block_selector_is_fail_closed(self):
+class TestDeepseekV4AttentionOpsCpuValidationTest:
+    def test_indexer_q_serial_four_block_selector_is_fail_closed(self, subtests):
         valid = {
             "num_tokens": 8192,
             "head_dim": 128,
@@ -535,7 +536,7 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
             "devices_valid": True,
             "inner_strides": (1, 1, 1, 1),
         }
-        self.assertTrue(_dsv4_use_serial_four_block_indexer_q(**valid))
+        assert _dsv4_use_serial_four_block_indexer_q(**valid)
         invalid_overrides = (
             {"num_tokens": 8191},
             {"head_dim": 64},
@@ -551,10 +552,10 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         )
         for override in invalid_overrides:
             case = valid | override
-            with self.subTest(override=override):
-                self.assertFalse(_dsv4_use_serial_four_block_indexer_q(**case))
+            with subtests.test(override=override):
+                assert not (_dsv4_use_serial_four_block_indexer_q(**case))
 
-    def test_v4_table_kernels_do_not_specialize_runtime_geometry(self):
+    def test_v4_table_kernels_do_not_specialize_runtime_geometry(self, subtests):
         cases = (
             (
                 _dsv4_fused_sparse_compress_cache_kernel,
@@ -580,12 +581,12 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         for kernel, names in cases:
             parameters = {parameter.name: parameter for parameter in kernel.params}
             for name in names:
-                with self.subTest(kernel=kernel.__name__, name=name):
+                with subtests.test(kernel=kernel.__name__, name=name):
                     parameter = parameters[name]
-                    self.assertFalse(parameter.is_constexpr)
-                    self.assertTrue(parameter.do_not_specialize)
+                    assert not (parameter.is_constexpr)
+                    assert parameter.do_not_specialize
 
-    def test_sparse_prefill_gather_launch_config(self):
+    def test_sparse_prefill_gather_launch_config(self, subtests):
         cases = (
             (1, 0, (128, 4)),
             (1, 512, (128, 4)),
@@ -601,11 +602,8 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
             (8, 8192, (2048, 1)),
         )
         for num_reqs, max_rows, expected in cases:
-            with self.subTest(num_reqs=num_reqs, max_rows=max_rows):
-                self.assertEqual(
-                    _dsv4_gather_launch_config(num_reqs, max_rows),
-                    expected,
-                )
+            with subtests.test(num_reqs=num_reqs, max_rows=max_rows):
+                assert (_dsv4_gather_launch_config(num_reqs, max_rows)) == (expected)
 
     def test_swa_slot_mapping_guard_masks_out_of_range_slots(self):
         slots = torch.tensor([-3, -1, 0, 7, 8, 99], dtype=torch.int64)
@@ -666,7 +664,7 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         cos_sin = torch.zeros(1, ROPE_DIM, dtype=torch.float32)
         weights = torch.ones(1, 1, dtype=torch.float32)
 
-        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+        with pytest.raises((ValueError), match=("only supports CUDA")):
             deepseek_v4_prepare_indexer_q_mxfp4(
                 q,
                 positions,
@@ -681,7 +679,7 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         cache = torch.zeros(1, 64 * 68, dtype=torch.uint8)
         slots = torch.zeros(1, dtype=torch.int64)
 
-        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+        with pytest.raises((ValueError), match=("only supports CUDA")):
             write_deepseek_v4_indexer_mxfp4_cache(index_k, cache, slots, 64)
 
     def test_compressor_state_writer_requires_cuda(self):
@@ -692,7 +690,7 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         slots = torch.zeros(1, dtype=torch.int64)
         positions = torch.zeros(1, dtype=torch.int64)
 
-        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+        with pytest.raises((ValueError), match=("only supports CUDA")):
             save_deepseek_v4_compressor_state(
                 kv=kv,
                 score=score,
@@ -719,7 +717,7 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         )
         kv_slots = torch.zeros(1, dtype=torch.int64)
 
-        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+        with pytest.raises((ValueError), match=("only supports CUDA")):
             deepseek_v4_hca_compress_kv_cache_insert(
                 state_cache=state_cache,
                 token_to_req_indices=token_to_req_indices,
@@ -748,7 +746,7 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
         kv_cache = torch.zeros(1, 64 * 68, dtype=torch.uint8)
         kv_slots = torch.zeros(1, dtype=torch.int64)
 
-        with self.assertRaisesRegex(ValueError, "only supports CUDA"):
+        with pytest.raises((ValueError), match=("only supports CUDA")):
             deepseek_v4_csa_indexer_cache_insert(
                 state_cache=state_cache,
                 token_to_req_indices=token_to_req_indices,
@@ -767,8 +765,8 @@ class DeepseekV4AttentionOpsCpuValidationTest(unittest.TestCase):
             )
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class DeepseekV4AttentionOpsTest(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
+class TestDeepseekV4AttentionOpsTest:
 
     def test_sanitized_insert_write_safety_under_graph_replay(self):
         # Full producer -> sanitize -> CUDA graph replay -> cache write path.
@@ -831,7 +829,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 run_once()
             except RuntimeError as exc:
                 if "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert" in str(exc):
-                    self.skipTest(str(exc))
+                    pytest.skip(str(exc))
                 raise
             run_once()
         torch.cuda.current_stream().wait_stream(stream)
@@ -868,10 +866,9 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             host = storage.cpu()
             allowed = written_mask(expected)
             outside = host[~allowed]
-            self.assertTrue(
-                bool((outside == sentinel).all()),
-                f"bytes outside legal slots {expected} were modified",
-            )
+            _pytest_expr_1 = bool((outside == sentinel).all())
+            _pytest_msg_2 = f"bytes outside legal slots {expected} were modified"
+            assert _pytest_expr_1, _pytest_msg_2
             for slot in expected:
                 block, pos = divmod(slot, block_size)
                 region = host[
@@ -879,11 +876,10 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                     + pos * token_bytes : block * block_stride
                     + (pos + 1) * token_bytes
                 ]
-                self.assertFalse(
-                    bool((region == sentinel).all()),
-                    f"legal slot {slot} was not written",
-                )
-        self.assertTrue(bool((guard.cpu() == sentinel).all()))
+                _pytest_expr_3 = bool((region == sentinel).all())
+                _pytest_msg_4 = f"legal slot {slot} was not written"
+                assert not _pytest_expr_3, _pytest_msg_4
+        assert bool((guard.cpu() == sentinel).all())
 
     def test_fused_qnorm_rope_kv_insert_matches_reference(self):
         torch.manual_seed(1234)
@@ -918,7 +914,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             )
         except RuntimeError as exc:
             if "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert" in str(exc):
-                self.skipTest(str(exc))
+                pytest.skip(str(exc))
             raise
         torch.cuda.synchronize()
 
@@ -951,8 +947,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                     atol=0,
                     rtol=0,
                 )
-                self.assertEqual(int(scale_bytes[qblock]), expected_scale)
-            self.assertEqual(int(scale_bytes[7]), 0)
+                assert (int(scale_bytes[qblock])) == (expected_scale)
+            assert (int(scale_bytes[7])) == (0)
             expected_rope = expected_k[token_idx, NOPE_DIM:].view(torch.uint8)
             torch.testing.assert_close(
                 token_bytes[NOPE_DIM:].cpu(),
@@ -963,7 +959,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         # The fourth token was DP-style padding for KV insert: Q is still updated,
         # but no cache row is written for it.
-        self.assertEqual(int(cache.view(-1)[3 * 576 : 4 * 576].sum()), 0)
+        assert (int(cache.view(-1)[3 * 576 : 4 * 576].sum())) == (0)
 
     def test_hca_compressor_state_insert_matches_reference(self):
         torch.manual_seed(4321)
@@ -1076,18 +1072,15 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 atol=0,
                 rtol=0,
             )
-            self.assertEqual(int(flat_cache[scale_base + qblock]), expected_scale)
-        self.assertEqual(int(flat_cache[scale_base + 7]), 0)
+            assert (int(flat_cache[scale_base + qblock])) == (expected_scale)
+        assert (int(flat_cache[scale_base + 7])) == (0)
         torch.testing.assert_close(
             flat_cache[NOPE_DIM:SWA_TOKEN_STRIDE].cpu(),
             expected_rope.cpu(),
             atol=0,
             rtol=0,
         )
-        self.assertEqual(
-            int(flat_cache[SWA_TOKEN_STRIDE : 2 * SWA_TOKEN_STRIDE].sum()),
-            0,
-        )
+        assert (int(flat_cache[SWA_TOKEN_STRIDE : 2 * SWA_TOKEN_STRIDE].sum())) == (0)
 
     def test_csa_compressor_state_insert_matches_reference(self):
         torch.manual_seed(5678)
@@ -1193,8 +1186,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                     atol=0,
                     rtol=0,
                 )
-                self.assertEqual(int(flat_cache[scale_base + qblock]), expected_scale)
-            self.assertEqual(int(flat_cache[scale_base + 7]), 0)
+                assert (int(flat_cache[scale_base + qblock])) == (expected_scale)
+            assert (int(flat_cache[scale_base + 7])) == (0)
             torch.testing.assert_close(
                 flat_cache[base + NOPE_DIM : base + SWA_TOKEN_STRIDE].cpu(),
                 expected_rope.cpu(),
@@ -1235,7 +1228,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 atol=0,
                 rtol=0,
             )
-        self.assertEqual(int(flat_cache[128:256].sum()), 0)
+        assert (int(flat_cache[128:256].sum())) == (0)
 
         q = torch.randn(4, 3, 128, device=device, dtype=dtype)
         k = torch.randn(6, 128, device=device, dtype=dtype)
@@ -1270,7 +1263,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 expected = torch.full((topk,), -1, dtype=torch.int32)
                 if raw_len > 0:
                     expected[:raw_len] = torch.arange(raw_len, dtype=torch.int32)
-                self.assertTrue(torch.equal(row_output, expected))
+                assert torch.equal(row_output, expected)
                 continue
 
             expected = (
@@ -1284,11 +1277,11 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 .sort()
                 .values.cpu()
             )
-            self.assertTrue(torch.equal(row_output.sort().values, expected))
+            assert torch.equal(row_output.sort().values, expected)
 
     def test_persistent_topk_matches_torch_across_decode_medium_large_paths(self):
         if not has_persistent_topk():
-            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+            pytest.skip("DeepSeek V4 persistent top-k op is not available")
 
         torch.manual_seed(6790)
         device = torch.device("cuda")
@@ -1322,7 +1315,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
     def test_persistent_topk_noncluster_fallback_matches_torch(self):
         if not has_persistent_topk():
-            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+            pytest.skip("DeepSeek V4 persistent top-k op is not available")
 
         torch.manual_seed(6791)
         device = torch.device("cuda")
@@ -1357,9 +1350,11 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         self._assert_persistent_topk_matches_torch(logits, lengths, output, topk)
 
-    def test_persistent_topk_cluster_path_matches_torch_for_all_supported_k(self):
+    def test_persistent_topk_cluster_path_matches_torch_for_all_supported_k(
+        self, subtests
+    ):
         if not has_persistent_topk():
-            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+            pytest.skip("DeepSeek V4 persistent top-k op is not available")
 
         torch.manual_seed(6792)
         device = torch.device("cuda")
@@ -1367,7 +1362,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         workspace = torch.empty((1024 * 1024,), device=device, dtype=torch.uint8)
 
         for topk in (512, 1024, 2048):
-            with self.subTest(topk=topk):
+            with subtests.test(topk=topk):
                 lengths = torch.tensor(
                     [topk + 1, 8192, 65537, 131071, 262143],
                     device=device,
@@ -1399,9 +1394,9 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                     logits, lengths, output, topk
                 )
 
-    def test_persistent_topk_cluster_pdl_is_cuda_graph_capture_safe(self):
+    def test_persistent_topk_cluster_pdl_is_cuda_graph_capture_safe(self, subtests):
         if not has_persistent_topk():
-            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+            pytest.skip("DeepSeek V4 persistent top-k op is not available")
 
         torch.manual_seed(6794)
         device = torch.device("cuda")
@@ -1412,7 +1407,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             (131072, [1024, 8192, 65537, 131071]),
             (262144, [1024, 8192, 131073, 262143]),
         ):
-            with self.subTest(stride=stride):
+            with subtests.test(stride=stride):
                 lengths = torch.tensor(raw_lengths, device=device, dtype=torch.int32)
                 logits = torch.randn(
                     (lengths.numel(), stride),
@@ -1440,9 +1435,9 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                     logits, lengths, output, topk
                 )
 
-    def test_persistent_topk_cluster_specialization_boundaries(self):
+    def test_persistent_topk_cluster_specialization_boundaries(self, subtests):
         if not has_persistent_topk():
-            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+            pytest.skip("DeepSeek V4 persistent top-k op is not available")
 
         torch.manual_seed(6795)
         device = torch.device("cuda")
@@ -1452,7 +1447,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         # Exercise both sides of the register-cluster and cluster-16 ceilings,
         # including the portable cluster-8 fallback above 256K.
         for max_seq_len in (65537, 131072, 131073, 262144, 262145):
-            with self.subTest(max_seq_len=max_seq_len):
+            with subtests.test(max_seq_len=max_seq_len):
                 actual_len = max_seq_len - 1
                 lengths = torch.tensor([actual_len], device=device, dtype=torch.int32)
                 logits = torch.randn(
@@ -1477,7 +1472,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
     def test_persistent_topk_verify_mode_uses_causal_request_lengths(self):
         if not has_persistent_topk():
-            self.skipTest("DeepSeek V4 persistent top-k op is not available")
+            pytest.skip("DeepSeek V4 persistent top-k op is not available")
 
         torch.manual_seed(6793)
         device = torch.device("cuda")
@@ -1566,11 +1561,11 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 atol=0,
                 rtol=0,
             )
-        self.assertEqual(int(flat_cache[64:128].sum()), 0)
+        assert (int(flat_cache[64:128].sum())) == (0)
 
     def test_indexer_mxfp4_paged_gather_matches_paged_layout(self):
         if not has_indexer_mxfp4_paged_gather():
-            self.skipTest("DeepSeek V4 paged MXFP4 gather op is not available")
+            pytest.skip("DeepSeek V4 paged MXFP4 gather op is not available")
 
         device = torch.device("cuda")
         block_size = 4
@@ -1639,13 +1634,13 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         ]
         expected_values = torch.stack([value_rows[item] for item in expected_plan])
         expected_scales = torch.stack([scale_rows[item] for item in expected_plan])
-        self.assertTrue(torch.equal(values_out[:7].cpu(), expected_values.cpu()))
-        self.assertTrue(torch.equal(scales_out[:7].cpu(), expected_scales.cpu()))
-        self.assertTrue(
-            torch.equal(values_out[7].cpu(), torch.full((64,), 0xCC, dtype=torch.uint8))
+        assert torch.equal(values_out[:7].cpu(), expected_values.cpu())
+        assert torch.equal(scales_out[:7].cpu(), expected_scales.cpu())
+        assert torch.equal(
+            values_out[7].cpu(), torch.full((64,), 0xCC, dtype=torch.uint8)
         )
-        self.assertTrue(
-            torch.equal(scales_out[7].cpu(), torch.full((4,), 0xDD, dtype=torch.uint8))
+        assert torch.equal(
+            scales_out[7].cpu(), torch.full((4,), 0xDD, dtype=torch.uint8)
         )
 
     def test_csa_indexer_cache_insert_matches_reference(self):
@@ -1765,7 +1760,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             torch.tensor([0, 1], device=device, dtype=torch.int64),
             kv_cache_block_size,
         )
-        self.assertGreater(float(fp8_rows.abs().sum()), 0.0)
+        assert (float(fp8_rows.abs().sum())) > (0.0)
 
     def test_fp8_ds_mla_cache_dequant_and_inv_rope_output_reference(self):
         torch.manual_seed(9012)
@@ -1811,8 +1806,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             head_dim=HEAD_DIM,
             rope_dim=ROPE_DIM,
         )
-        self.assertEqual(float(dequant[2].abs().sum()), 0.0)
-        self.assertGreater(float(dequant[:2].abs().sum()), 0.0)
+        assert (float(dequant[2].abs().sum())) == (0.0)
+        assert (float(dequant[:2].abs().sum())) > (0.0)
 
     def test_indexer_q_prepare_matches_fp4_weight_contract(self):
         torch.manual_seed(9123)
@@ -1825,7 +1820,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         q_fp4, weights_fp4 = _prepare_indexer_q_reference(
             q, positions, cos_sin, weights, 0.25, 3**-0.5, use_fp4=True
         )
-        self.assertEqual(q_fp4.shape, q.shape)
+        assert (q_fp4.shape) == (q.shape)
         rotated = _apply_gptj_rope_with_nope(
             q,
             positions,
@@ -1853,8 +1848,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         q_fp8, weights_fp8 = _prepare_indexer_q_reference(
             q, positions, cos_sin, weights, 0.25, 3**-0.5, use_fp4=False
         )
-        self.assertEqual(q_fp8.shape, q.shape)
-        self.assertGreater(float(weights_fp8.abs().sum()), 0.0)
+        assert (q_fp8.shape) == (q.shape)
+        assert (float(weights_fp8.abs().sum())) > (0.0)
 
     def test_indexer_q_prepare_mxfp4_returns_deepgemm_layout(self):
         torch.manual_seed(9124)
@@ -1874,10 +1869,10 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             3**-0.5,
         )
 
-        self.assertEqual(q_packed.shape, (2, 3, 64))
-        self.assertEqual(q_packed.dtype, torch.uint8)
-        self.assertEqual(q_scales.shape, (2, 3))
-        self.assertEqual(q_scales.dtype, torch.int32)
+        assert (q_packed.shape) == ((2, 3, 64))
+        assert (q_packed.dtype) == (torch.uint8)
+        assert (q_scales.shape) == ((2, 3))
+        assert (q_scales.dtype) == (torch.int32)
         torch.testing.assert_close(
             weights_out.cpu(),
             (weights * 0.25 * (3**-0.5)).cpu(),
@@ -1902,17 +1897,15 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 expected_packed[token_idx, head_idx].copy_(packed)
                 expected_scales[token_idx, head_idx].copy_(scales)
 
-        self.assertTrue(torch.equal(q_packed.cpu(), expected_packed.cpu()))
-        self.assertTrue(
-            torch.equal(
-                q_scales.cpu(),
-                expected_scales.contiguous().view(torch.int32).squeeze(-1).cpu(),
-            )
+        assert torch.equal(q_packed.cpu(), expected_packed.cpu())
+        assert torch.equal(
+            q_scales.cpu(),
+            expected_scales.contiguous().view(torch.int32).squeeze(-1).cpu(),
         )
 
     def test_indexer_q_serial_four_block_is_bitwise_equal_at_production_shape(self):
         if torch.cuda.get_device_capability() != (10, 0):
-            self.skipTest("exact serial-four-block specialization requires SM100")
+            pytest.skip("exact serial-four-block specialization requires SM100")
         torch.manual_seed(9125)
         device = torch.device("cuda")
         num_tokens = 8192
@@ -1944,9 +1937,9 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
         (baseline_packed, baseline_scales), baseline_weights = baseline
         (serial_packed, serial_scales), serial_weights = serial
-        self.assertTrue(torch.equal(serial_packed, baseline_packed))
-        self.assertTrue(torch.equal(serial_scales, baseline_scales))
-        self.assertTrue(torch.equal(serial_weights, baseline_weights))
+        assert torch.equal(serial_packed, baseline_packed)
+        assert torch.equal(serial_scales, baseline_scales)
+        assert torch.equal(serial_weights, baseline_weights)
 
     def test_sparse_prefill_combine_topk_swa_indices_matches_reference(self):
         device = torch.device("cuda")
@@ -2177,23 +2170,19 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
 
-        self.assertEqual(actual.data_ptr(), out_indices.data_ptr())
-        self.assertEqual(actual_lens.data_ptr(), out_lens.data_ptr())
-        self.assertTrue(
-            torch.equal(
-                actual.cpu(),
-                torch.tensor(
-                    [
-                        [706, 707, 708, 709],
-                        [1280, 1281, 1282, -1],
-                    ],
-                    dtype=torch.int32,
-                ),
-            )
+        assert (actual.data_ptr()) == (out_indices.data_ptr())
+        assert (actual_lens.data_ptr()) == (out_lens.data_ptr())
+        assert torch.equal(
+            actual.cpu(),
+            torch.tensor(
+                [
+                    [706, 707, 708, 709],
+                    [1280, 1281, 1282, -1],
+                ],
+                dtype=torch.int32,
+            ),
         )
-        self.assertTrue(
-            torch.equal(actual_lens.cpu(), torch.tensor([4, 3], dtype=torch.int32))
-        )
+        assert torch.equal(actual_lens.cpu(), torch.tensor([4, 3], dtype=torch.int32))
         compact_actual, compact_lens = dsv4_decode_swa_indices_and_lens(
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
@@ -2238,23 +2227,19 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
 
-        self.assertEqual(actual.data_ptr(), out_indices.data_ptr())
-        self.assertEqual(actual_lens.data_ptr(), out_lens.data_ptr())
-        self.assertTrue(
-            torch.equal(
-                actual.cpu(),
-                torch.tensor(
-                    [
-                        [40, 41, 42, -1, -1, -1, -1, -1],
-                        [80, 81, 82, 83, 84, -1, -1, -1],
-                    ],
-                    dtype=torch.int32,
-                ),
-            )
+        assert (actual.data_ptr()) == (out_indices.data_ptr())
+        assert (actual_lens.data_ptr()) == (out_lens.data_ptr())
+        assert torch.equal(
+            actual.cpu(),
+            torch.tensor(
+                [
+                    [40, 41, 42, -1, -1, -1, -1, -1],
+                    [80, 81, 82, 83, 84, -1, -1, -1],
+                ],
+                dtype=torch.int32,
+            ),
         )
-        self.assertTrue(
-            torch.equal(actual_lens.cpu(), torch.tensor([3, 5], dtype=torch.int32))
-        )
+        assert torch.equal(actual_lens.cpu(), torch.tensor([3, 5], dtype=torch.int32))
 
     def test_decode_dense_compressed_indices_masks_invalid_and_compact_pages(self):
         device = torch.device("cuda")
@@ -2283,21 +2268,17 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
 
-        self.assertTrue(
-            torch.equal(
-                actual.cpu(),
-                torch.tensor(
-                    [
-                        [-1, -1, -1, -1, 44, -1, -1, -1],
-                        [-1, -1, -1, -1, -1, -1, -1, -1],
-                    ],
-                    dtype=torch.int32,
-                ),
-            )
+        assert torch.equal(
+            actual.cpu(),
+            torch.tensor(
+                [
+                    [-1, -1, -1, -1, 44, -1, -1, -1],
+                    [-1, -1, -1, -1, -1, -1, -1, -1],
+                ],
+                dtype=torch.int32,
+            ),
         )
-        self.assertTrue(
-            torch.equal(actual_lens.cpu(), torch.tensor([5, 0], dtype=torch.int32))
-        )
+        assert torch.equal(actual_lens.cpu(), torch.tensor([5, 0], dtype=torch.int32))
 
     def test_decode_swa_indices_and_lens_masks_invalid_tokens(self):
         device = torch.device("cuda")
@@ -2326,18 +2307,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
 
-        self.assertTrue(
-            torch.equal(actual_lens.cpu(), torch.tensor([4, 0], dtype=torch.int32))
+        assert torch.equal(actual_lens.cpu(), torch.tensor([4, 0], dtype=torch.int32))
+        assert torch.equal(
+            actual[0].cpu(),
+            torch.tensor([706, 707, 708, 709], dtype=torch.int32),
         )
-        self.assertTrue(
-            torch.equal(
-                actual[0].cpu(),
-                torch.tensor([706, 707, 708, 709], dtype=torch.int32),
-            )
-        )
-        self.assertTrue(
-            torch.equal(actual[1].cpu(), torch.full((4,), -123, dtype=torch.int32))
-        )
+        assert torch.equal(actual[1].cpu(), torch.full((4,), -123, dtype=torch.int32))
 
     def test_compute_global_topk_indices_and_lens_matches_reference(self):
         device = torch.device("cuda")
@@ -2429,17 +2404,13 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
 
-        self.assertTrue(
-            torch.equal(actual_lens.cpu(), torch.tensor([4, 0], dtype=torch.int32))
-        )
+        assert torch.equal(actual_lens.cpu(), torch.tensor([4, 0], dtype=torch.int32))
         torch.testing.assert_close(
             valid_lens.cpu(), torch.tensor([3, 0], dtype=torch.int32), atol=0, rtol=0
         )
-        self.assertTrue(
-            torch.equal(
-                actual[0].cpu(),
-                torch.tensor([40, 41, -1, 45], dtype=torch.int32),
-            )
+        assert torch.equal(
+            actual[0].cpu(),
+            torch.tensor([40, 41, -1, 45], dtype=torch.int32),
         )
 
     def test_compressed_slot_mapping_matches_page_reference(self):
@@ -2467,14 +2438,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
 
-        self.assertEqual(actual.data_ptr(), out.data_ptr())
-        self.assertTrue(
-            torch.equal(
-                actual.cpu(),
-                torch.tensor([-1, -1, 10 * 4 + 1, -1, -1], dtype=torch.int64),
-            )
+        assert (actual.data_ptr()) == (out.data_ptr())
+        assert torch.equal(
+            actual.cpu(),
+            torch.tensor([-1, -1, 10 * 4 + 1, -1, -1], dtype=torch.int64),
         )
-        self.assertTrue(torch.equal(out[5:].cpu(), torch.full((3,), -1)))
+        assert torch.equal(out[5:].cpu(), torch.full((3,), -1))
 
     def test_grouped_compressed_slot_mapping_matches_full_table_reference(self):
         device = torch.device("cuda")
@@ -2505,14 +2474,12 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         )
         torch.cuda.synchronize()
 
-        self.assertEqual(actual.data_ptr(), out.data_ptr())
-        self.assertTrue(
-            torch.equal(
-                actual.cpu(),
-                torch.tensor([-1, -1, 20 * 64 + 1, -1, -1, -1]),
-            )
+        assert (actual.data_ptr()) == (out.data_ptr())
+        assert torch.equal(
+            actual.cpu(),
+            torch.tensor([-1, -1, 20 * 64 + 1, -1, -1, -1]),
         )
-        self.assertTrue(torch.equal(out[6:].cpu(), torch.full((2,), -1)))
+        assert torch.equal(out[6:].cpu(), torch.full((2,), -1))
 
     def test_grouped_compressed_slot_mapping_compact_table_graph_replay(self):
         device = torch.device("cuda")
@@ -2550,13 +2517,11 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         graph.replay()
         torch.cuda.synchronize()
 
-        self.assertTrue(
-            torch.equal(
-                out[:6].cpu(),
-                torch.tensor([-1, -1, 22 * 64 + 2, -1, 30 * 64 + 2, -1]),
-            )
+        assert torch.equal(
+            out[:6].cpu(),
+            torch.tensor([-1, -1, 22 * 64 + 2, -1, 30 * 64 + 2, -1]),
         )
-        self.assertTrue(torch.equal(out[6:].cpu(), torch.full((2,), -1)))
+        assert torch.equal(out[6:].cpu(), torch.full((2,), -1))
 
     def test_group_slot_mapping_matches_reference_and_replay(self):
         device = torch.device("cuda")
@@ -2587,7 +2552,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         expected = torch.tensor(
             [640, 655, 656, 703, 1280, 1343, -1, -1], dtype=torch.int64
         )
-        self.assertTrue(torch.equal(actual.cpu(), expected))
+        assert torch.equal(actual.cpu(), expected)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -2604,15 +2569,13 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
         is_valid_token[2] = False
         graph.replay()
         torch.cuda.synchronize()
-        self.assertTrue(
-            torch.equal(
-                replayed.cpu(),
-                torch.tensor([768, 783, 784, 831, -1, -1, -1, -1]),
-            )
+        assert torch.equal(
+            replayed.cpu(),
+            torch.tensor([768, 783, 784, 831, -1, -1, -1, -1]),
         )
 
     def test_group_slot_mapping_rejects_non_expanding_request_shape(self):
-        with self.assertRaisesRegex(ValueError, "evenly expand"):
+        with pytest.raises((ValueError), match=("evenly expand")):
             dsv4_group_slot_mapping(
                 positions=torch.arange(5, device="cuda", dtype=torch.int64),
                 req_indices=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
@@ -2636,8 +2599,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             is_valid_token=None,
         )
 
-        self.assertEqual(tuple(actual.shape), (0,))
-        self.assertEqual(actual.dtype, torch.int64)
+        assert (tuple(actual.shape)) == ((0,))
+        assert (actual.dtype) == (torch.int64)
 
     def test_validate_active_cache_pages_matches_contract_and_replay(self):
         device = torch.device("cuda")
@@ -2657,8 +2620,8 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             out=out,
         )
         torch.cuda.synchronize()
-        self.assertIs(actual, out)
-        self.assertTrue(bool(actual.item()))
+        assert (actual) is (out)
+        assert bool(actual.item())
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -2670,7 +2633,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
                 max_page_id=7,
                 out=out,
             )
-        self.assertIs(replayed, out)
+        assert (replayed) is (out)
         for mutation in (
             lambda: seq_lens.__setitem__(1, -1),
             lambda: seq_lens.__setitem__(3, 193),
@@ -2690,7 +2653,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             mutation()
             graph.replay()
             torch.cuda.synchronize()
-            self.assertFalse(bool(replayed.item()))
+            assert not (bool(replayed.item()))
 
     def test_sparse_prefill_dequantize_and_gather_matches_reference(self):
         torch.manual_seed(9234)
@@ -2729,7 +2692,7 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
             [[0, 1, -1], [2, 0, -1]], device=device, dtype=torch.int32
         )
         block_table = block_table_storage[:, :2]
-        self.assertEqual(block_table.stride(), (3, 1))
+        assert (block_table.stride()) == ((3, 1))
         block_table_base_offsets = torch.tensor(
             [1, 1], device=device, dtype=torch.int32
         )
@@ -2781,4 +2744,4 @@ class DeepseekV4AttentionOpsTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

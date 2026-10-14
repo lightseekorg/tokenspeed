@@ -35,9 +35,11 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
-import unittest
 from contextlib import closing
+
+import pytest
 
 from tokenspeed.runtime.cache.l3.executor import L3HostStore
 from tokenspeed.runtime.cache.l3.factory import create_kvstore_storage_backend
@@ -48,7 +50,7 @@ def _require_or_skip(reason: str) -> None:
     flag = os.environ.get("MOONCAKE_REQUIRE_MASTER", "").strip().lower()
     if flag in {"1", "true", "yes"}:
         raise RuntimeError(reason)
-    raise unittest.SkipTest(reason)
+    pytest.skip(reason)
 
 
 def _libcudart_dir() -> str | None:
@@ -141,20 +143,20 @@ class _Host:
         return (int(block_id) - 1) * self._page, self._page
 
 
-class WaitTcpTimeoutTest(unittest.TestCase):
+class TestWaitTcpTimeoutTest:
     def test_wait_tcp_requires_timeout(self) -> None:
         param = inspect.signature(_wait_tcp).parameters["timeout_s"]
-        self.assertIs(param.default, inspect.Parameter.empty)
+        assert (param.default) is (inspect.Parameter.empty)
 
 
-class HostGeometryTest(unittest.TestCase):
+class TestHostGeometryTest:
     def test_host_requires_nbytes_and_page(self) -> None:
         signature = inspect.signature(_Host.__init__)
-        self.assertIs(signature.parameters["nbytes"].default, inspect.Parameter.empty)
-        self.assertIs(signature.parameters["page"].default, inspect.Parameter.empty)
+        assert (signature.parameters["nbytes"].default) is (inspect.Parameter.empty)
+        assert (signature.parameters["page"].default) is (inspect.Parameter.empty)
 
 
-class MooncakeMasterLiveTest(unittest.TestCase):
+class TestMooncakeMasterLiveTest:
     master_proc: subprocess.Popen[bytes] | None = None
     master_log = None
     master_addr = ""
@@ -162,7 +164,7 @@ class MooncakeMasterLiveTest(unittest.TestCase):
     _lib_dir: str | None = None
 
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls._lib_dir = _ensure_libcudart()
         try:
             import mooncake
@@ -250,7 +252,7 @@ class MooncakeMasterLiveTest(unittest.TestCase):
             log_file.close()
 
     @classmethod
-    def tearDownClass(cls) -> None:
+    def teardown_class(cls) -> None:
         if cls.started_master:
             cls._stop_master()
 
@@ -275,21 +277,19 @@ class MooncakeMasterLiveTest(unittest.TestCase):
             tp_size=1,
             pp_size=1,
         )
-        self.assertIsInstance(backend, MooncakeKvStore)
+        assert isinstance((backend), (MooncakeKvStore))
         l3 = L3HostStore(backend, host, key_prefix="live", rank=0)
         pages = [(0, 1, "h0", 0)]
-        self.assertEqual(l3.backup(pages), [True])
-        self.assertEqual(l3.exists(pages), [True])
+        assert (l3.backup(pages)) == ([True])
+        assert (l3.exists(pages)) == ([True])
         host.host_buffer[0 : len(payload)] = b"\x00" * len(payload)
-        self.assertEqual(
-            bytes(host.host_buffer[0 : len(payload)]), b"\x00" * len(payload)
-        )
-        self.assertEqual(l3.prefetch(pages), [True])
-        self.assertEqual(bytes(host.host_buffer[0 : len(payload)]), payload)
+        assert (bytes(host.host_buffer[0 : len(payload)])) == (b"\x00" * len(payload))
+        assert (l3.prefetch(pages)) == ([True])
+        assert (bytes(host.host_buffer[0 : len(payload)])) == (payload)
         l3.rotate_namespace()
-        self.assertEqual(l3.exists(pages), [False])
+        assert (l3.exists(pages)) == ([False])
         l3.close()
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

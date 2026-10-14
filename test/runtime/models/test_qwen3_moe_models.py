@@ -1,6 +1,7 @@
 import json
-import unittest
+import sys
 
+import pytest
 import torch
 from torch import nn
 
@@ -42,10 +43,10 @@ def _ep_rank_mapping(rank: int) -> Mapping:
     return mapping
 
 
-class TestQwen3MoeConfig(unittest.TestCase):
+class TestQwen3MoeConfig:
     def test_config_registry(self):
-        self.assertEqual(Qwen3MoeConfig.model_type, "qwen3_moe")
-        self.assertIs(_CONFIG_REGISTRY["qwen3_moe"], Qwen3MoeConfig)
+        assert (Qwen3MoeConfig.model_type) == ("qwen3_moe")
+        assert (_CONFIG_REGISTRY["qwen3_moe"]) is (Qwen3MoeConfig)
 
     def test_get_config_loads_qwen3_30b_a3b_shape(self):
         import tempfile
@@ -84,19 +85,19 @@ class TestQwen3MoeConfig(unittest.TestCase):
 
             config = get_config(tmpdir, trust_remote_code=False)
 
-        self.assertIsInstance(config, Qwen3MoeConfig)
-        self.assertEqual(config.architectures, ["Qwen3MoeForCausalLM"])
-        self.assertEqual(config.num_experts, 128)
-        self.assertEqual(config.num_experts_per_tok, 8)
-        self.assertEqual(config.moe_intermediate_size, 768)
+        assert isinstance((config), (Qwen3MoeConfig))
+        assert (config.architectures) == (["Qwen3MoeForCausalLM"])
+        assert (config.num_experts) == (128)
+        assert (config.num_experts_per_tok) == (8)
+        assert (config.moe_intermediate_size) == (768)
 
     def test_model_registry_resolves_qwen3_moe(self):
         from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
         from tokenspeed.runtime.models.registry import ModelRegistry
 
         cls, arch = ModelRegistry.resolve_model_cls(["Qwen3MoeForCausalLM"])
-        self.assertIs(cls, Qwen3MoeForCausalLM)
-        self.assertEqual(arch, "Qwen3MoeForCausalLM")
+        assert (cls) is (Qwen3MoeForCausalLM)
+        assert (arch) == ("Qwen3MoeForCausalLM")
 
     def test_constructs_sparse_moe_layers_with_comm_manager(self):
         from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
@@ -107,10 +108,10 @@ class TestQwen3MoeConfig(unittest.TestCase):
             mapping=_single_rank_mapping(),
         )
 
-        self.assertIsInstance(model.model.layers[0].mlp, Qwen3_5MoeSparseMoeBlock)
-        self.assertTrue(model.model.layers[0].comm_manager.is_moe)
-        self.assertFalse(model.model.layers[0].comm_manager.prev_is_moe)
-        self.assertTrue(model.model.layers[1].comm_manager.prev_is_moe)
+        assert isinstance((model.model.layers[0].mlp), (Qwen3_5MoeSparseMoeBlock))
+        assert model.model.layers[0].comm_manager.is_moe
+        assert not (model.model.layers[0].comm_manager.prev_is_moe)
+        assert model.model.layers[1].comm_manager.prev_is_moe
 
     def test_loads_unfused_expert_weights_into_moe_layer(self):
         from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
@@ -143,9 +144,9 @@ class TestQwen3MoeConfig(unittest.TestCase):
         params = dict(model.named_parameters())
         w13 = params["model.layers.0.mlp.experts.w13_weight"]
         w2 = params["model.layers.0.mlp.experts.w2_weight"]
-        self.assertEqual(w13[0, :8].mean().item(), 1.0)
-        self.assertEqual(w13[0, 8:].mean().item(), 11.0)
-        self.assertEqual(w2[0].mean().item(), 21.0)
+        assert (w13[0, :8].mean().item()) == (1.0)
+        assert (w13[0, 8:].mean().item()) == (11.0)
+        assert (w2[0].mean().item()) == (21.0)
 
     def test_skips_nonlocal_expert_weights_under_expert_parallelism(self):
         from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
@@ -169,8 +170,8 @@ class TestQwen3MoeConfig(unittest.TestCase):
 
         params = dict(model.named_parameters())
         w2 = params["model.layers.0.mlp.experts.w2_weight"]
-        self.assertEqual(w2.shape[0], 1)
-        self.assertEqual(w2[0].mean().item(), 21.0)
+        assert (w2.shape[0]) == (1)
+        assert (w2[0].mean().item()) == (21.0)
 
     def test_idle_forward_skips_final_norm(self):
         from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
@@ -215,9 +216,9 @@ class TestQwen3MoeConfig(unittest.TestCase):
             ctx=ctx,
         )
 
-        self.assertEqual(hidden_states.shape, (0, 16))
-        self.assertIsNone(residual)
+        assert (hidden_states.shape) == ((0, 16))
+        assert (residual) is None
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

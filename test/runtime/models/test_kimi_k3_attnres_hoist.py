@@ -7,11 +7,12 @@ only where the previous layer sweeps the same block range.
 
 Usage:
     cd test/runtime
-    python3 -m unittest models.test_kimi_k3_attnres_hoist -v
+    python3 -m pytest models/test_kimi_k3_attnres_hoist.py -v
 """
 
-import unittest
+import sys
 
+import pytest
 import torch
 
 from tokenspeed.runtime.models.kimi_k3 import _attnres_mlp_slot, _attnres_scratch
@@ -25,31 +26,37 @@ def _mlp_blocks(layer_id):
     return -(-layer_id // BLOCK) + (1 if layer_id % BLOCK == 0 else 0)
 
 
-class TestAttnResMlpHoist(unittest.TestCase):
+class TestAttnResMlpHoist:
     def test_adjacent_layers_use_different_mlp_slots(self):
         """A layer must not read the slot its own aux branch is writing."""
         for i in range(LAYERS - 1):
-            self.assertNotEqual(_attnres_mlp_slot(i), _attnres_mlp_slot(i + 1))
+            assert (_attnres_mlp_slot(i)) != (_attnres_mlp_slot(i + 1))
 
     def test_mlp_slots_never_take_the_attn_side_slot(self):
         """Slot 1 belongs to the attn-side mix."""
         for i in range(LAYERS):
-            self.assertNotEqual(_attnres_mlp_slot(i), 1)
+            assert (_attnres_mlp_slot(i)) != (1)
 
     def test_hoist_keys_on_block_write_exactly_where_the_range_matches(self):
         """The wiring hoists iff not is_block_write_layer; that must coincide
         with the previous layer sweeping the same block range."""
         for i in range(1, LAYERS):
             same_range = _mlp_blocks(i) == _mlp_blocks(i - 1)
-            self.assertEqual(i % BLOCK != 0, same_range, f"layer {i}")
+            _pytest_first_4 = i % BLOCK != 0
+            _pytest_second_5 = same_range
+            _pytest_msg_6 = f"layer {i}"
+            assert _pytest_first_4 == _pytest_second_5, _pytest_msg_6
 
     def test_scratch_pool_serves_every_slot_without_aliasing(self):
         """Every slot in use must be a distinct buffer."""
         like = torch.zeros(1, 8)
         used = {1} | {_attnres_mlp_slot(i) for i in range(LAYERS)}
         ptrs = {s: _attnres_scratch(like, slot=s)[2].data_ptr() for s in sorted(used)}
-        self.assertEqual(len(set(ptrs.values())), len(ptrs), ptrs)
+        _pytest_first_1 = len(set(ptrs.values()))
+        _pytest_second_2 = len(ptrs)
+        _pytest_msg_3 = ptrs
+        assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
