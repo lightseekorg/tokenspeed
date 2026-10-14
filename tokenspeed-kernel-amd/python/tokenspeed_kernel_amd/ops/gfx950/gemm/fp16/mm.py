@@ -61,6 +61,9 @@ _counter_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 # Per-device [zeroed counters, next free index] handed out to captured
 # launches; see _get_splitk_counters.
 _graph_counter_arenas: dict[int, list] = {}
+# Replaced arenas. Captured graphs keep using their slices on every replay but
+# hold no reference to them, so these must never be freed.
+_retired_graph_counter_arenas: list[torch.Tensor] = []
 _GRAPH_COUNTER_ARENA_SIZE = 1 << 20
 
 
@@ -1842,10 +1845,11 @@ def _get_splitk_counters(device: torch.device, num_tiles: int) -> torch.Tensor:
         return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
 
     # Eager runs (serving warms each graph's forward up before capturing it)
-    # keep a quarter of an arena free for the next capture; captured slices
-    # keep their old arena alive.
+    # keep a quarter of an arena free for the next capture.
     arena = _graph_counter_arenas.get(device_index)
     if arena is None or arena[0].numel() - arena[1] < _GRAPH_COUNTER_ARENA_SIZE // 4:
+        if arena is not None:
+            _retired_graph_counter_arenas.append(arena[0])
         _graph_counter_arenas[device_index] = [
             torch.zeros((_GRAPH_COUNTER_ARENA_SIZE,), dtype=torch.int32, device=device),
             0,

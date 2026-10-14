@@ -31,6 +31,7 @@ if not is_cdna4():
     )
 
 
+import tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm as mm_module  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
     supports_gluon_mm_a16w16_prefill_gfx950,
@@ -394,6 +395,47 @@ def test_decode_gemm_graph_does_not_share_eager_counters() -> None:
         a.copy_(torch.randn_like(a) * 0.25)
         graph.replay()
         torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
+
+
+def test_decode_gemm_graphs_survive_counter_arena_replacement(monkeypatch) -> None:
+    # A small arena fills up after two captures; the next eager call replaces
+    # it while both graphs still bump counters in it on every replay.
+    monkeypatch.setattr(mm_module, "_GRAPH_COUNTER_ARENA_SIZE", 128)
+    monkeypatch.setattr(mm_module, "_graph_counter_arenas", {})
+    monkeypatch.setattr(mm_module, "_retired_graph_counter_arenas", [])
+    torch.manual_seed(0)
+    m, n, k = 4, 896, 7168  # 56 tiles of the split-K router bucket
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    outs = [torch.empty((m, n), device="cuda", dtype=torch.float32) for _ in range(2)]
+
+    stream = torch.cuda.Stream()
+    graphs = [torch.cuda.CUDAGraph() for _ in range(2)]
+    with torch.cuda.stream(stream):
+        for graph, out in zip(graphs, outs, strict=True):
+            launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+            with torch.cuda.graph(graph, stream=stream):
+                launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=out)
+        launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.float32, out=outs[0])
+    stream.synchronize()
+
+    # Fresh allocations on the arena's stream must not land on the counters
+    # the graphs still use.
+    with torch.cuda.stream(stream):
+        fillers = [
+            torch.full((128,), 7, device="cuda", dtype=torch.int32) for _ in range(8)
+        ]
+    stream.synchronize()
+    for _ in range(3):
+        a.copy_(torch.randn_like(a) * 0.25)
+        for graph in graphs:
+            graph.replay()
+        for out in outs:
+            torch.testing.assert_close(
+                out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5
+            )
+    torch.cuda.synchronize()
+    assert all(torch.all(filler == 7) for filler in fillers)
 
 
 def test_decode_gemm_writes_strided_out() -> None:
