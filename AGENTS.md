@@ -64,10 +64,7 @@ When Codex or Claude Code reviews code changes, consult these references for
 the languages involved:
 
 * For C++ changes, consult the
-  [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html) and
-  the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines).
-* For Python changes, consult the
-  [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html).
+  [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines).
 
 ## Design principles
 
