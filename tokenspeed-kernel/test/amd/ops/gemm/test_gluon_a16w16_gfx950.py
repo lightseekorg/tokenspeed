@@ -340,6 +340,8 @@ _DECODE_CASES = [
     pytest.param((20, 1536, 7168), torch.bfloat16, id="shared-gu-splitk"),
     pytest.param((8, 6288, 7168), torch.bfloat16, id="qkvfab-ragged-n"),
     pytest.param((40, 7168, 768), torch.bfloat16, id="shared-dn-ragged-m"),
+    # 16x128 split-K tiles store C through the coalesced row layout.
+    pytest.param((12, 8448, 7168), torch.bfloat16, id="dense-gu-coalesced-store"),
 ]
 
 
@@ -510,3 +512,63 @@ def test_decode_add3_row_count_does_not_recompile() -> None:
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
         for rows in (2, 6, 7, 12, 14, 20, 27, 31):
             run(rows)
+
+
+# Qwen3.8-Flash-Next TP2 decode shapes, each at a ragged row count inside
+# its bucket: split-K over every K tile in flight (32-row MTP fc, indexer),
+# 64-row tiles (router), and split-K with a few buffers.
+_QWEN38_DECODE_CASES = [
+    pytest.param((20, 2560, 3072), id="out-proj"),
+    pytest.param((30, 512, 2560), id="router-all-tiles-in-flight"),
+    pytest.param((50, 512, 2560), id="router-64-row-tile"),
+    pytest.param((3, 640, 2560), id="indexer"),
+    pytest.param((27, 640, 2560), id="indexer-all-tiles-in-flight"),
+    pytest.param((16, 2560, 2560), id="mtp-fc"),
+    pytest.param((21, 2560, 2560), id="mtp-fc-all-tiles-in-flight"),
+]
+
+
+@pytest.mark.parametrize("shape", _QWEN38_DECODE_CASES)
+def test_qwen38_decode_gemm_matches_reference(shape: tuple[int, int, int]) -> None:
+    torch.manual_seed(0)
+    m, n, k = shape
+    assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    for _ in range(2):
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+        out = _decode(a, b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
+
+
+def test_qwen38_decode_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    n, k = 512, 2560
+    a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def run(rows):
+        out = _decode(a[:rows], b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+
+    for rows in (3, 4, 5, 8, 9, 16, 17, 32, 33, 64):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
+            run(rows)
+
+
+def test_medium_coalesced_store_masks_strided_out() -> None:
+    # 128x128 medium tiles store through the coalesced row layout; a padded
+    # row stride must stay inside the output view.
+    torch.manual_seed(0)
+    m, n, k = 768, 3584, 7168
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    backing = torch.full((m, n + 8), 7.0, device="cuda", dtype=torch.bfloat16)
+    out = backing[:, :n]
+
+    actual = launch_gluon_mm_a16w16_medium_gfx950(a, b, torch.bfloat16, out=out)
+
+    assert actual is out
+    torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=_RTOL)
+    assert torch.all(backing[:, n:] == 7.0)
