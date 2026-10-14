@@ -805,7 +805,10 @@ Its responsibilities:
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
-  acquire/contains/pin queries. During prefill, each chunk end queues the
+  acquire/contains/pin queries. The fused scheduler may publish completed
+  immutable prompt pages before the first decode; tail copying stays inside
+  admission (see scheduler.md, "Sharing in-flight prompt prefixes").
+  During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
   admission, or a junction cut) queues its tail and state checkpoint too;
   the candidates are merged into a batched writeback. Ordinary decode

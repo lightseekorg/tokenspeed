@@ -75,6 +75,19 @@ bool holdsHeadOfLine(const Request& request) {
     return request.Is<fsm::Prefilling>();
 }
 
+// Whether a prefix hit may end at any published page: every matched group is
+// prefix-closed. A sliding-window or state group matches only where a
+// publication left its lookback or a state checkpoint -- the writer's newest
+// boundary.
+bool hitsAnyPublishedPage(const CacheCoordinator& coordinator) {
+    for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
+        if (!coordinator.GroupIsPrefixClosed(i) && !coordinator.GroupIsReplayable(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <typename Operation>
 void fillBlockTables(Operation& operation, Request& request, const CacheCoordinator& coordinator,
                      std::span<const std::string> group_ids) {
@@ -181,6 +194,11 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
 
 }  // namespace
 
+std::int32_t Scheduler::probePrefixTokens(const Request& request) const {
+    const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
+    return std::max(std::min(request.PrefillSize() - replay_tokens, request.MaxCachedPrefixTokens()), 0);
+}
+
 Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // Only a first admission probes: a readmission copies the request's own
     // image back and matches nothing.
@@ -200,9 +218,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // may tighten the bound further (RequestSpec::max_cached_prefix_tokens) so
     // the positions it needs logits for are recomputed rather than matched.
     // The bound is in tokens: a hit may end at it exactly.
-    const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
-    const std::int32_t max_cacheable_tokens =
-        std::max(std::min(request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens()), 0);
+    const std::int32_t max_cacheable_tokens = probePrefixTokens(*request);
     // The last token is recomputed, so a page the prompt fills exactly can
     // never be hit -- except on the D role, whose prompt-end state check
     // needs the prompt's last page hashed when the prompt ends on it.
@@ -285,6 +301,9 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                                                   std::int32_t decode_input_tokens,
                                                                   std::vector<PrefetchOperation>& prefetches) {
     AdmissionMatch match = matchPrefixAtAdmission(request);
+    if (waitsForComputedPrefix(feedback, *request, match)) {
+        return FirstChunkOutcome{};
+    }
     // L3 objects beyond the Host hit are fetched into Host BEFORE admission:
     // the request waits (holding only the Host blocks being filled, no Device
     // pages, no slot) and is admitted as an ordinary Host hit once they
@@ -592,7 +611,9 @@ std::optional<Scheduler::PrefillAdmission> Scheduler::schedulePrefillCandidate(
     std::vector<PrefetchOperation>& prefetches) {
     if (request->Is<fsm::Prefilling>()) {
         if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve)) {
-            return PrefillAdmission{.operation = applyEventAndBuildOperation(request, std::move(*event))};
+            PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*event));
+            noteComputedPrefixPages(feedback, *request);
+            return PrefillAdmission{.operation = std::move(operation)};
         }
         return std::nullopt;
     }
@@ -604,6 +625,7 @@ std::optional<Scheduler::PrefillAdmission> Scheduler::schedulePrefillCandidate(
     if (outcome.event) {
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         operation.state_prefix_cached = outcome.state_prefix_cached;
+        noteComputedPrefixPages(feedback, *request);
         return PrefillAdmission{.operation = std::move(operation)};
     }
     return std::nullopt;
@@ -676,14 +698,14 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
 // -- exactly what its next admission would have published -- then writes the
 // progress back. Only what has actually been computed is published (an
 // incomplete prefill has only the chunks it has been through; TokenSize()
-// would publish pages that were never computed). Device-only: the pages reach
-// Host through the image's L2 leg.
-void Scheduler::publishCompletedPrefix(Request& victim) {
+// would publish pages that were never computed). Retraction uses kFinal and
+// reaches Host through the image's L2 leg. Early sharing uses kChunk for an
+// unaligned frontier, keeping its writable tail and state private.
+void Scheduler::publishCompletedPrefix(Request& victim, bool stream_to_host, PublicationPoint point) {
     fsm::CacheProgress cache_progress = victim.CacheProgress();
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
-    RequestProgress progress =
-        AdvanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
+    RequestProgress progress = AdvanceRequestProgress(victim, cache_progress, num_computed_tokens,
+                                                      coordinator_.PrefixGranularity(), stream_to_host, point);
     if (progress.completed_pages) {
         // A publication is a KV-event mutation: the newly hashed pages (decode
         // pages no admission has registered yet) and the tail need their token
@@ -736,7 +758,7 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
     if (snapshot_slots_.AvailableSlots() == 0) {
         return ImageShortfall::kBlobSlot;
     }
-    publishCompletedPrefix(victim);
+    publishCompletedPrefix(victim, /*stream_to_host=*/false, PublicationPoint::kFinal);
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
 
     // The blob slot is shared with the store that exports into it (and later
@@ -1092,6 +1114,83 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     return true;
 }
 
+// A completed prefill publishes its prompt pages when the next round starts
+// instead of at its first decode: outside mixed mode that decode waits
+// behind every prefill. Publish only immutable full pages here: a tail needs
+// the first decode admission's capacity for the owner's private copy. An
+// aligned prompt-end state is safe too: the first decode rotates its live
+// slot before writing. The FIFO data plane orders a hitter after its writer.
+void Scheduler::publishPrefilledPages(std::span<Request* const> candidates) {
+    if (config_.role != Role::kFused || config_.disable_prefix_cache) {
+        return;
+    }
+    const std::int32_t granularity = coordinator_.PrefixGranularity();
+    for (Request* request : candidates) {
+        // A request stays PrefillDone for every round its first decode waits,
+        // but only the first of them has unhashed pages; the rest would copy
+        // its progress to publish nothing.
+        if (request->Is<fsm::PrefillDone>() &&
+            request->NumComputedTokens() / granularity >
+                static_cast<std::int32_t>(request->CacheProgressRef().prefix_hashes.size())) {
+            const PublicationPoint point =
+                request->NumComputedTokens() % granularity == 0 ? PublicationPoint::kFinal : PublicationPoint::kChunk;
+            publishCompletedPrefix(*request, config_.StreamsDeviceCacheToHost(), point);
+        }
+    }
+}
+
+// Records the prompt pages a granted prefill computes, once the grant
+// completes its prompt: those are what publishPrefilledPages makes visible
+// to the next round's probes. An incomplete chunk holds the line, so no new
+// prompt follows it this round; the P role's completed prompt awaits its
+// result instead (PrefillAwaitingResult), publishing too late to be worth
+// waiting for; and without a prefix cache no prompt hits another's pages.
+void Scheduler::noteComputedPrefixPages(AdmissionFeedback& feedback, const Request& request) const {
+    if (config_.role != Role::kFused || !request.Is<fsm::PrefillDone>() || config_.disable_prefix_cache) {
+        return;
+    }
+    // Natural state checkpoints are not synthetic snapshots at an interior
+    // page boundary. A reader must not wait for one that will not be published.
+    if (!hitsAnyPublishedPage(coordinator_) && request.NumComputedTokens() % coordinator_.PrefixGranularity() != 0) {
+        return;
+    }
+    const std::vector<std::string>& hashed = request.CacheProgressRef().prefix_hashes;
+    const std::int32_t first_page = static_cast<std::int32_t>(hashed.size());
+    const std::int32_t end_page = request.NumComputedTokens() / coordinator_.PrefixGranularity();
+    if (end_page <= first_page) {
+        return;
+    }
+    std::vector<std::string> computed = AdvancePrefixHashes(request.FullPrefixPages(false), first_page,
+                                                            hashed.empty() ? std::string{} : hashed.back(), end_page);
+    if (!hitsAnyPublishedPage(coordinator_)) {
+        computed.erase(computed.begin(), computed.end() - 1);
+    }
+    feedback.computed_prefix_pages.insert(std::make_move_iterator(computed.begin()),
+                                          std::make_move_iterator(computed.end()));
+}
+
+// True when a page this prompt would compute, past its hit and within what a
+// probe may claim, is one an earlier grant of this round computes. Page
+// hashes chain, so sharing that page means sharing the whole prefix before
+// it -- the hit, then pages the same writer computes -- and admitting the
+// prompt now would compute them a second time in the same forward. Waiting
+// one round turns them into a hit.
+bool Scheduler::waitsForComputedPrefix(const AdmissionFeedback& feedback, const Request& request,
+                                       const AdmissionMatch& match) const {
+    if (feedback.computed_prefix_pages.empty()) {
+        return false;
+    }
+    const std::size_t probe_pages =
+        std::min(match.candidate_prefix_hashes.size(),
+                 static_cast<std::size_t>(probePrefixTokens(request) / coordinator_.PrefixGranularity()));
+    for (std::size_t i = match.prefix_hashes.size(); i < probe_pages; ++i) {
+        if (feedback.computed_prefix_pages.contains(match.candidate_prefix_hashes[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Local prefill phases shared by the P and fused grammars: resident chunks
 // (they hold pages), then new prompts. One loop per tier so the order is
 // visible.
@@ -1288,6 +1387,7 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
                                                              std::vector<WriteBackOperation>& write_back_operations) {
     // The candidates arrive in submission order (requests_ is the FIFO),
     // identical on every rank -- so within a phase, older requests win.
+    publishPrefilledPages(candidates);
     AdmissionFeedback feedback;
     PlanBuild build{plan};
     build.token_budget = config_.max_scheduled_tokens;

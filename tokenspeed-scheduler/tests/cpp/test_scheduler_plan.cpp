@@ -283,9 +283,14 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock)
     PlanOnce();
 
     std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
-    ASSERT_EQ(removed.size(), 1u);
+    // Early publication adds the completed filler's Stored event. Drain
+    // still orders removals before stores, independently of mutation order.
+    ASSERT_EQ(removed.size(), 2u);
     ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[0]));
     EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes, std::vector<std::uint64_t>{stored_hash});
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(removed[1]));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(removed[1]).token_ids, MakeRequestSpec("filler", 1, 100).tokens);
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
 // A finish whose frontier is not page-aligned publishes the partial page as a
@@ -324,11 +329,14 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFini
     Submit(MakeRequestSpec("replacement", 1, 200));
     PlanOnce();
     std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
-    ASSERT_EQ(removed.size(), 2u);
+    ASSERT_EQ(removed.size(), 3u);
     ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[0]));
     ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed[1]));
     EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[0]).block_hashes, tail.block_hashes);
     EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[1]).block_hashes, page.block_hashes);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(removed[2]));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(removed[2]).token_ids, MakeRequestSpec("filler", 1, 100).tokens);
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
 class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {

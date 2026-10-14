@@ -416,6 +416,23 @@ of the request: a chunk reads slot 0 and writes slot 1, a decode writes slot
 (§1.2). Tests cover small pools that must reject an oversized request instead
 of accepting a request that can never produce a forward.
 
+### 1.5 Sharing in-flight prompt prefixes
+
+On the fused role, a completed prefill publishes its immutable full prompt
+pages at the start of the next round, before waiting for its first decode.
+FIFO execution orders every reader after the writer. An aligned natural
+state checkpoint can be published here too: the first decode rotates its
+live state slot before writing. An unaligned KV tail and its state remain
+private until an admission can fund the owner's copies; no checkpoint is
+invented at an interior page boundary.
+
+A new prompt defers one round when an earlier grant will publish a page
+beyond its current hit and within its replay bound. Waiting is not a capacity
+failure and does not block unrelated prompts. A state or sliding-window
+reader waits only for an aligned final boundary it can actually resume from.
+Prefix-disabled requests and the separate P/D role grammars keep their
+existing paths. Incomplete prefills retain their head-of-line protection.
+
 ## 2. Retraction: when admission fails
 
 `maybeRetractForCapacity` fires when **no prefill made progress** this round

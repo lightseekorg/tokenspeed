@@ -42,6 +42,7 @@
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
 #include "scheduler/operations/cache.h"
+#include "scheduler/operations/progress.h"
 #include "scheduler/request.h"
 #include "scheduler/types.h"
 
@@ -148,10 +149,11 @@ private:
     };
 
     // What the per-request admission layer reports back to the role
-    // grammars. Together with the output ExecutionPlan (where admit()
-    // records fresh pages to zero) this is ALL that layer sees of a
-    // plan-building pass: batch composition lives in PlanBuild, which the
-    // grammars alone hold, so nothing below them can bypass pushOperation.
+    // grammars, and what it remembers of its own earlier grants this round.
+    // Together with the output ExecutionPlan (where admit() records fresh
+    // pages to zero) this is ALL that layer sees of a plan-building pass:
+    // batch composition lives in PlanBuild, which the grammars alone hold,
+    // so nothing below them can bypass pushOperation.
     struct AdmissionFeedback {
         // Set by admit() when the last admission failed for capacity (as
         // opposed to a chunk that aligned to zero tokens). The phases clear
@@ -166,6 +168,10 @@ private:
         // phase order (the blocker first). When the victim turns out to be
         // the blocker itself, the next of these is who its pages serve.
         std::vector<Request*> capacity_blocked;
+        // Content hashes of the prompt pages this round's grants compute
+        // for local prefills that complete their prompts
+        // (noteComputedPrefixPages, waitsForComputedPrefix).
+        std::unordered_set<std::string> computed_prefix_pages;
 
         void NoteCapacityBlocked(Request* request) {
             if (capacity_blocker == nullptr) {
@@ -336,7 +342,8 @@ private:
     // Admission for one prefill-work candidate: a resumed chunk for a
     // Prefilling request, the first chunk (or a prefetch) otherwise. nullopt
     // when admission fails (feedback.admission_failed says whether capacity
-    // was the reason).
+    // was the reason) or the first chunk waits for prompt pages an earlier
+    // grant of this round computes.
     std::optional<PrefillAdmission> schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t token_budget,
                                                              std::int32_t decode_reserve,
@@ -378,9 +385,11 @@ private:
         bool image_fits{false};
     };
     VictimChoice chooseVictim(std::span<Request* const> candidates) const;
-    // The first half of a retraction: publishes the pages the victim completed
-    // since its last admission (see forward.cpp).
-    void publishCompletedPrefix(Request& victim);
+    // Publishes the pages a request completed since its last admission (see
+    // forward.cpp): the first half of a retraction, Device-only, and a
+    // completed prefill's publication at the next round, which streams to
+    // Host as its first decode's admission would.
+    void publishCompletedPrefix(Request& request, bool stream_to_host, PublicationPoint point);
     // Whether the host budgets hold the request's image right now: a blob
     // slot is free and the snapshot pool holds everything the L2 leg would
     // not carry once the retraction has published the request's completed
@@ -425,6 +434,18 @@ private:
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
+
+    // In-flight prefix sharing. A completed prefill publishes its prompt
+    // pages when the next round starts (publishPrefilledPages), so a prompt
+    // that would compute one of the pages this round computes waits one
+    // round and hits it instead of computing it a second time beside the
+    // writer.
+    void publishPrefilledPages(std::span<Request* const> candidates);
+    void noteComputedPrefixPages(AdmissionFeedback& feedback, const Request& request) const;
+    bool waitsForComputedPrefix(const AdmissionFeedback& feedback, const Request& request,
+                                const AdmissionMatch& match) const;
+    // Prompt tokens a prefix probe may claim for this request.
+    std::int32_t probePrefixTokens(const Request& request) const;
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
