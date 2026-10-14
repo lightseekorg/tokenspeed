@@ -56,23 +56,24 @@ TEST(ChunkKeepingFinalWindowTest, NeverLeavesAShortFinalChunk) {
 // full (closed, g=4) + replayable swa (window 8) + replayable tail (window 2):
 // the coordinator's replay window is the largest replayable window, 8.
 std::vector<CacheGroupSpec> ReplayableSpecs() {
-    return {CacheGroupSpec{
-                .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
-            CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
-                           .sliding_window = 8,
-                           .replayable = true,
-                           .cache_blocks_per_lcm_block = 1,
-                           .block_granularity = 4},
-            CacheGroupSpec{.kind = AttnKind::kSlidingWindow,
-                           .sliding_window = 2,
-                           .replayable = true,
-                           .cache_blocks_per_lcm_block = 1,
-                           .block_granularity = 2}};
+    return {
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 8,
+                       .replayable = true,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                       .sliding_window = 2,
+                       .replayable = true,
+                       .cache_blocks_per_lcm_block = 1,
+                       .block_granularity = 2}};
 }
 
 std::vector<CacheGroupSpec> FullOnlySpecs() {
     return {CacheGroupSpec{
-        .kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+        .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
 }
 
 TEST(CoordinatorReplayTest, WindowIsTheLargestDeclaredAndAHitReplaysAtMostAWindow) {
@@ -134,7 +135,7 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     BlockPool state_pool(16, {1, 1});
     const std::vector<CacheGroupSpec> with_state = {
         FullOnlySpecs()[0],
-        CacheGroupSpec{.kind = AttnKind::kMambaState,
+        CacheGroupSpec{.attn_kind = AttnKind::kState,
                        .sliding_window = 0,
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 0},
@@ -164,7 +165,7 @@ TEST(MinPrefillChunkTokensTest, ReservesReplayPlusAWindowOrPage) {
     BlockPool state_pool(16, {1, 1});
     const std::vector<CacheGroupSpec> with_state = {
         FullOnlySpecs()[0],
-        CacheGroupSpec{.kind = AttnKind::kMambaState,
+        CacheGroupSpec{.attn_kind = AttnKind::kState,
                        .sliding_window = 0,
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 0},

@@ -362,13 +362,13 @@ def _selection(
         "topk": topk_ids.shape[1],
         "num_local_experts": w13_weight.shape[0],
         "intermediate_size": (
-            w2_weight.shape[2] * 128
-            if len(w2_weight.shape) == 6
+            w13_weight.shape[1] * 8
+            if len(w13_weight.shape) == 6
             else w2_weight.shape[-1] * 2
         ),
         "shared_size": shared_input.shape[1],
         "output_size": shared_weight.shape[0],
-        "linear_weights": len(w2_weight.shape) != 6,
+        "linear_weights": len(w13_weight.shape) != 6,
         "inputs_contiguous": all(
             tensor.is_contiguous()
             for tensor in (
@@ -457,8 +457,8 @@ def latent_moe_decode_pipeline_available(
         "topk": topk,
         "num_local_experts": w13_weight.shape[0],
         "intermediate_size": (
-            w2_weight.shape[2] * 128
-            if len(w2_weight.shape) == 6
+            w13_weight.shape[1] * 8
+            if len(w13_weight.shape) == 6
             else w2_weight.shape[-1] * 2
         ),
         "shared_size": shared_gate_up_weight.shape[0] // 2,

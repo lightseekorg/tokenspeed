@@ -39,8 +39,7 @@ CacheGroupConfig Full(const std::string& id, std::int32_t block_granularity, std
         .group_id = id,
         .block_granularity = block_granularity,
         .cache_blocks_per_lcm_block = packing,
-        .retention = CacheGroupConfig::Retention::FullHistory,
-        .family = CacheGroupFamily::History,
+        .attn_kind = AttnKind::kFull,
     };
 }
 
@@ -50,9 +49,9 @@ CacheGroupConfig Sliding(const std::string& id, std::int32_t block_granularity, 
         .group_id = id,
         .block_granularity = block_granularity,
         .cache_blocks_per_lcm_block = packing,
-        .retention = CacheGroupConfig::Retention::SlidingWindow,
+        .attn_kind = AttnKind::kSlidingWindow,
         .sliding_window_tokens = window,
-        .family = CacheGroupFamily::History,
+
     };
 }
 
@@ -62,8 +61,7 @@ CacheGroupConfig State(const std::string& id, std::int32_t packing) {
         .group_id = id,
         .block_granularity = 0,
         .cache_blocks_per_lcm_block = packing,
-        .retention = CacheGroupConfig::Retention::FullHistory,
-        .family = CacheGroupFamily::State,
+        .attn_kind = AttnKind::kState,
     };
 }
 
@@ -83,8 +81,8 @@ SchedulerConfig SizingConfig(Role role, std::int32_t prefix_granularity, std::in
     cfg.disable_l2_cache = true;
     for (CacheGroupConfig& group : groups) {
         if (role != Role::kFused) {
-            group.transfer_policy = group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot
-                                                                          : CacheTransferPolicy::FullSuffix;
+            group.transfer_policy = group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot
+                                                                        : CacheTransferPolicy::FullSuffix;
         }
         cfg.cache_groups.push_back(std::move(group));
     }
@@ -174,7 +172,7 @@ TEST(CapacityModelTest, ConcurrentDemandCoversEveryAdmissibleSingleRequest) {
     }
 }
 
-TEST(CapacityModelTest, ConcurrentDemandByRetention) {
+TEST(CapacityModelTest, ConcurrentDemandByKind) {
     SchedulerConfig cfg = SizingConfig(Role::kFused, 64, 8192, /*decode_width=*/4, /*overlap_depth=*/1, false,
                                        {Full("full", 64, 12), State("state", 1), Sliding("swa", 64, 128, 3)});
     cfg.max_batch_size = 16;
@@ -203,8 +201,8 @@ TEST(CapacityModelTest, ConcurrentDemandByRetention) {
     SchedulerConfig prefill = cfg;
     prefill.role = Role::kP;
     for (CacheGroupConfig& group : prefill.cache_groups) {
-        group.transfer_policy = group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot
-                                                                      : CacheTransferPolicy::FullSuffix;
+        group.transfer_policy =
+            group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
     }
     const std::vector<std::int64_t> prefill_pages = CapacityModel{prefill}.ConcurrentGroupPages(65536, 4096);
     EXPECT_EQ(prefill_pages[0], 1024 + 16 * (1 + 1));

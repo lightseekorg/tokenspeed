@@ -114,7 +114,7 @@ pages (`cache-concepts.md`, copy-in).
 once per round (`PrefillReserve`: decode width, whether the round completes
 the prompt, prompt headroom) and turned into each group's page demand by
 `ReservePrefillDemands` — the only writer of `GroupDemand::reserve_tokens`.
-It picks the rule by the group's retention, never by call site:
+It picks the rule by the group's kind, never by call site:
 
 - *Full-history* groups hold the decode slot — the chunk that
   completes the prompt reserves `decode_input_tokens`, so the first decode step
@@ -176,7 +176,7 @@ orders prefills against each other, never a decode behind a prefill.
 
 ### 1.2 State groups: two slots, natural checkpoints
 
-A State group (a recurrent layer's state, `CacheGroupFamily::State`) keeps no
+A State group (a recurrent layer's state, `AttnKind::kState`) keeps no
 history: one block holds the whole state after some prefix, so the group has
 no token span (`block_granularity = 0`) and its table is **two slots**
 whatever the prompt length. Slot 0 is the input checkpoint a forward reads,
@@ -217,7 +217,7 @@ ordinary chunk end or decode step publishes nothing for a State group
 (`CompletedPages::publish_state` is false). The key is the key of the exact
 token count `T`: the chain hash of the last page when `T` is a page multiple,
 otherwise the tail hash `hash@T` the KV groups use — so one key names a
-request's progress across every family (`cache-concepts.md`). A published
+request's progress across every group kind (`cache-concepts.md`). A published
 state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.

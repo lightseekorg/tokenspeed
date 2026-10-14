@@ -54,7 +54,7 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         _assert(groups_[i].Id() == static_cast<std::uint32_t>(i), "cache group id must equal its group index");
         const std::int32_t group_block_granularity = groups_[i].Spec().block_granularity;
-        if (groups_[i].Spec().kind == AttnKind::kMambaState) {
+        if (groups_[i].Spec().attn_kind == AttnKind::kState) {
             _assert(group_block_granularity == 0, "a State group has no token span");
         } else {
             _assert(group_block_granularity > 0 && prefix_granularity_ % group_block_granularity == 0,
@@ -76,7 +76,7 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
         }
         geometry_.emplace_back(group_block_granularity);
         if (spec.replayable) {
-            _assert(spec.kind == AttnKind::kSlidingWindow, "a replayable group must be a sliding window");
+            _assert(spec.attn_kind == AttnKind::kSlidingWindow, "a replayable group must be a sliding window");
             replay_window_tokens_ = std::max(replay_window_tokens_, spec.sliding_window);
         }
         // Every Host copy keeps the bucket of its Device end, so a page-cyclic
@@ -106,7 +106,7 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
 }
 
 bool CacheCoordinator::GroupIsState(std::size_t i) const {
-    return groups_[i].Spec().kind == AttnKind::kMambaState;
+    return groups_[i].Spec().attn_kind == AttnKind::kState;
 }
 
 std::int32_t CacheCoordinator::BlocksPerBoundary(std::int32_t i) const {
@@ -210,7 +210,7 @@ std::int32_t CacheCoordinator::TailBlocksFor(std::int32_t i, std::int32_t tail_t
 
 CacheCoordinator::BlockRange CacheCoordinator::SlidingWindowBlocks(std::int32_t i, std::int32_t boundary_tokens) const {
     const CacheGroupSpec& spec = groups_[static_cast<std::size_t>(i)].Spec();
-    _assert(spec.kind == AttnKind::kSlidingWindow, "only a sliding group has a window behind a boundary");
+    _assert(spec.attn_kind == AttnKind::kSlidingWindow, "only a sliding group has a window behind a boundary");
     const std::int32_t block_granularity = geometry_[static_cast<std::size_t>(i)].BlockGranularity();
     const std::int32_t past_end = (boundary_tokens + block_granularity - 1) / block_granularity;
     const std::int32_t first_row = std::max(0, boundary_tokens - spec.sliding_window + 1);
@@ -1093,7 +1093,7 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     const bool automatically_streams_to_host =
         stream_device_cache_to_host_ &&
-        (groups_[group_index].Spec().kind == AttnKind::kSlidingWindow || stream_completed_to_host);
+        (groups_[group_index].Spec().attn_kind == AttnKind::kSlidingWindow || stream_completed_to_host);
     auto* inserted = [&]() -> std::vector<std::pair<CacheKey, CacheBlockRef>>* {
         if constexpr (Tier == CacheTier::kDevice) {
             return automatically_streams_to_host || cache_mutation_sink_ ? &newly_cached : nullptr;
@@ -1867,11 +1867,11 @@ std::vector<CacheKey> CacheCoordinator::ExpandPrefixKeys(std::span<const std::st
 }
 
 std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
-    switch (spec.kind) {
+    switch (spec.attn_kind) {
         case AttnKind::kFull:
             _assert(spec.block_granularity > 0, "group block_granularity must be > 0");
             return std::make_unique<FullAttnMatcher>();
-        case AttnKind::kMambaState:
+        case AttnKind::kState:
             _assert(spec.block_granularity == 0, "a State group has no token span");
             return std::make_unique<StateMatcher>();
         case AttnKind::kSlidingWindow:
@@ -1897,7 +1897,7 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         const CacheGroupSpec& spec = specs[i];
         const std::uint32_t group_id = static_cast<std::uint32_t>(i);
         _assert(spec.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
-        if (spec.kind == AttnKind::kMambaState) {
+        if (spec.attn_kind == AttnKind::kState) {
             _assert(spec.block_granularity == 0, "a State group has no token span");
         } else {
             _assert(spec.block_granularity > 0 && prefix_granularity % spec.block_granularity == 0,

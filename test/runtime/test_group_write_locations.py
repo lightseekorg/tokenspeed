@@ -151,10 +151,10 @@ class MtpReanchorTest(unittest.TestCase):
         )
         geometry = CacheGroupGeometry(
             granularities={FULL: 4, SWA: 4},
-            families={FULL: "history", SWA: "history"},
+            attn_kinds={FULL: "full_history", SWA: "sliding_window"},
             full_history_group_id=FULL,
             row_geometry={FULL: (4, 1), SWA: (4, 1)},
-            retentions={FULL: ("full_history", None), SWA: ("sliding_window", 4)},
+            windows={FULL: None, SWA: 4},
         )
         router.bind(geometry, leaves)
         router.init_cuda_graph_state(4)

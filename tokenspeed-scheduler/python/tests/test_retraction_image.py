@@ -55,8 +55,7 @@ def _make_config() -> ts.SchedulerConfig:
             group_id="full",
             block_granularity=PAGE,
             total_pages=DEVICE_PAGES,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         )
     ]
     return cfg

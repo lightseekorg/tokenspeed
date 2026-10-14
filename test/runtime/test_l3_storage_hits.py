@@ -368,6 +368,11 @@ def loop_methods():
     namespace = {
         "deque": deque,
         "maybe_control_plane_guard": nullcontext,
+        # The loop labels its scheduler calls for the torch profiler; here
+        # that is a no-op context like the control-plane guard.
+        "torch": SimpleNamespace(
+            profiler=SimpleNamespace(record_function=lambda _name: nullcontext())
+        ),
         "PlannedForward": SimpleNamespace,
         "ngram_inputs_for_forward": lambda *args: None,
         "input_logprob_plan_for_forward": lambda *args: None,

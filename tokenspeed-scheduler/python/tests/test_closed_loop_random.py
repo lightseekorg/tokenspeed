@@ -65,8 +65,7 @@ def _config(
             group_id=HISTORY,
             block_granularity=history_block,
             total_pages=pages * (P // history_block),
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]
@@ -76,9 +75,8 @@ def _config(
                 group_id="sliding",
                 block_granularity=history_block,
                 total_pages=pages * (P // history_block),
-                retention=ts.CacheRetention.SlidingWindow,
+                attn_kind=ts.AttnKind.SlidingWindow,
                 sliding_window_tokens=12,
-                family=ts.CacheGroupFamily.History,
                 transfer_policy=ts.CacheTransferPolicy.FullSuffix,
             )
         )
@@ -87,8 +85,7 @@ def _config(
             group_id=group_id,
             block_granularity=0,
             total_pages=pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.State,
+            attn_kind=ts.AttnKind.State,
             transfer_policy=ts.CacheTransferPolicy.LatestSnapshot,
         )
         for group_id in STATES

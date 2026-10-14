@@ -307,7 +307,7 @@ def _model(specs, packing):
 
 FULL = CacheGroupSpec(
     group_id="full",
-    retention="full_history",
+    attn_kind="full_history",
     rows_per_page=PAGE,
     entry_stride_tokens=1,
     replayable=False,
@@ -315,7 +315,7 @@ FULL = CacheGroupSpec(
 # Never published to L2: every page of it is tail.
 SLIDING = CacheGroupSpec(
     group_id="swa",
-    retention="sliding_window",
+    attn_kind="sliding_window",
     rows_per_page=PAGE,
     entry_stride_tokens=1,
     sliding_window_tokens=512,
@@ -324,9 +324,8 @@ SLIDING = CacheGroupSpec(
 # Publishes its checkpoints: only the live block is tail.
 STATE = CacheGroupSpec(
     group_id="state",
-    retention="full_history",
+    attn_kind="state",
     replayable=False,
-    family="state",
 )
 
 

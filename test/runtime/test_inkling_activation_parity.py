@@ -230,14 +230,14 @@ class _Harness:
         inner.bind(
             CacheGroupGeometry(
                 granularities={gid: PAGE_SIZE for gid in self.attn_groups},
-                families={gid: "history" for gid in self.attn_groups},
+                attn_kinds={gid: "full_history" for gid in self.attn_groups},
                 full_history_group_id=(
                     "full_attention"
                     if "full_attention" in self.attn_groups
                     else self.attn_groups[0]
                 ),
                 row_geometry={gid: (PAGE_SIZE, 1) for gid in self.attn_groups},
-                retentions={gid: ("full_history", None) for gid in self.attn_groups},
+                windows={gid: None for gid in self.attn_groups},
             ),
             leaves,
         )

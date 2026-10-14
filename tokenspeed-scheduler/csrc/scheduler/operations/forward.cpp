@@ -369,7 +369,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         // the window's first block when that is later.
         for (std::size_t i = 0; i < demands.size(); ++i) {
             const CacheGroupConfig& group = config_.cache_groups[i];
-            if (group.Kind() == AttnKind::kSlidingWindow) {
+            if (group.attn_kind == AttnKind::kSlidingWindow) {
                 const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
                 const std::int32_t hit_blocks = (hit_tokens + block_granularity - 1) / block_granularity;
                 const std::int32_t retained_begin =

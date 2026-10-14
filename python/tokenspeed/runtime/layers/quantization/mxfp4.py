@@ -81,12 +81,22 @@ def _is_amd_quark_dynamic_mxfp4(config: Mapping[str, Any]) -> bool:
         return False
     input_tensors = global_quant_config.get("input_tensors") or {}
     weight = global_quant_config.get("weight") or {}
-    return (
+    if not (
         _is_fp4_e8m0_per_group(input_tensors, is_dynamic=True)
         and _is_fp4_e8m0_per_group(weight, is_dynamic=False)
         and str(export.get("pack_method", "")).lower() == "reorder"
         and str(export.get("weight_format", "")).lower() == "real_quantized"
-    )
+    ):
+        return False
+    # Every MXFP4 activation quantizer (dense and MoE) picks scales in
+    # Quark's "even" mode; exports without the field predate other modes.
+    mode = str(input_tensors.get("scale_calculation_mode") or "even").lower()
+    if mode != "even":
+        raise ValueError(
+            "dynamic MXFP4 activations support Quark scale_calculation_mode "
+            f"'even' only, got {mode!r}"
+        )
+    return True
 
 
 def _is_amd_quark_mxfp4_checkpoint(config: dict) -> bool:

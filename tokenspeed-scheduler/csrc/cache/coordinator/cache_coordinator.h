@@ -52,7 +52,7 @@ enum class CacheTier { kDevice, kHost };
 // the tail's blocks are holes.
 inline std::int32_t FirstTailBlockNeeded(const CacheGroupSpec& spec, std::int32_t block_granularity,
                                          std::int32_t tail_tokens) {
-    if (spec.kind != AttnKind::kSlidingWindow) {
+    if (spec.attn_kind != AttnKind::kSlidingWindow) {
         return 0;
     }
     return std::max(0, tail_tokens - spec.sliding_window + 1) / block_granularity;

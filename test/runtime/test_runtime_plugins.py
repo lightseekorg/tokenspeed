@@ -740,15 +740,15 @@ def test_hybrid_kvp_accepts_builtin_groups_and_requires_history() -> None:
     with pytest.raises(ValueError, match="full-history cache group"):
         attention_registry._validate_hybrid_kvp_cache(
             SimpleNamespace(
-                cache_group_specs=tuple(g for g in groups if g.family == "state")
+                cache_group_specs=tuple(g for g in groups if g.attn_kind == "state")
             ),
             kvp_size=8,
         )
 
     window_only = tuple(
         (
-            replace(g, retention="sliding_window", sliding_window_tokens=256)
-            if g.family == "history"
+            replace(g, attn_kind="sliding_window", sliding_window_tokens=256)
+            if g.attn_kind != "state"
             else g
         )
         for g in groups
@@ -759,16 +759,16 @@ def test_hybrid_kvp_accepts_builtin_groups_and_requires_history() -> None:
             kvp_size=8,
         )
 
-    history = next(g for g in groups if g.family == "history")
+    history = next(g for g in groups if g.attn_kind != "state")
     for shard_count in (1, 8):
         window = replace(
             history,
             group_id="window",
-            retention="sliding_window",
+            attn_kind="sliding_window",
             sliding_window_tokens=256,
             shard_count=shard_count,
         )
-        with pytest.raises(ValueError, match="must use full-history retention"):
+        with pytest.raises(ValueError, match="must be a full-history group"):
             attention_registry._validate_hybrid_kvp_cache(
                 SimpleNamespace(cache_group_specs=(*groups, window)),
                 kvp_size=8,

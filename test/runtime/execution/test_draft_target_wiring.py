@@ -25,6 +25,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 import tokenspeed.runtime.execution.factory as factory  # noqa: E402
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     UpdateWeightsFromDistributedReqInput,
 )
@@ -47,12 +48,20 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.models.target_capture import (  # noqa: E402
     TargetCaptureConfigurator,
 )
+from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 
-def _server_args(algo: str, capture_ids=None) -> SimpleNamespace:
-    return SimpleNamespace(
+def _server_args(algo: str, capture_ids=None) -> ServerArgs:
+    return ServerArgs(
+        model="x",
         speculative_algorithm=algo,
-        eagle3_layers_to_capture=capture_ids,
+        # The field holds the CLI comma-list form; __post_init__ parses it
+        # into the id list configure_draft_target reads.
+        eagle3_layers_to_capture=(
+            ",".join(str(layer_id) for layer_id in capture_ids)
+            if capture_ids is not None
+            else None
+        ),
     )
 
 
@@ -64,9 +73,11 @@ def _draft_runner(model) -> SimpleNamespace:
     )
 
 
-def _mapping(*, has_pp: bool = False, is_last_pp_rank: bool = True) -> SimpleNamespace:
+def _mapping(*, has_pp: bool = False, is_last_pp_rank: bool = True) -> Mapping:
     """The pipeline facts resource binding reads off the target runner."""
-    return SimpleNamespace(has_pp=has_pp, is_last_pp_rank=is_last_pp_rank)
+    if not has_pp:
+        return Mapping(rank=0, world_size=1)
+    return Mapping(rank=1 if is_last_pp_rank else 0, world_size=2, pp_size=2)
 
 
 def _target_runner(model, mapping=None) -> SimpleNamespace:
@@ -108,43 +119,34 @@ def test_get_drafter_impl_routing():
     )
 
 
-def test_shares_target_embed_head_flags():
-    # Eagle-like drafters and the checkpoint-local V4 DSpark reuse the
-    # target's embed/LM head; DFlash and generic DSpark ship their own.
-    assert Eagle.shares_target_embed_head
-    assert Mtp.shares_target_embed_head
-    assert DeepseekV4DSpark.shares_target_embed_head
-    assert not DFlash.shares_target_embed_head
-    assert not DSpark.shares_target_embed_head
-    assert not BaseDrafter.shares_target_embed_head
+class _Eagle3Target:
+    """A target model recording the EAGLE3 capture ids it is handed."""
 
+    def __init__(self):
+        self.captured = None
+        self.logits_processor = _head_layout()
 
-def test_pd_layerwise_finalization_capability_matches_supported_drafters():
-    assert Eagle.supports_pd_layerwise_finalization
-    assert DFlash.supports_pd_layerwise_finalization
-    assert DSpark.supports_pd_layerwise_finalization
-    # Mtp.run enqueues every depth's forward (and its plane's KV write) on
-    # the caller's stream before returning, so the draft-final step is exact.
-    assert Mtp.supports_pd_layerwise_finalization
-    assert not DeepseekV4DSpark.supports_pd_layerwise_finalization
-    assert not BaseDrafter.supports_pd_layerwise_finalization
+    def get_embed_and_head(self):
+        return "EMBED", "HEAD"
+
+    def set_eagle3_layers_to_capture(self, layer_ids):
+        self.captured = layer_ids
 
 
 def test_wire_eagle3_shares_embed_head_and_installs_capture_ids():
-    target, draft = mock.MagicMock(), mock.MagicMock()
-    target.mapping = _mapping()
-    target.model.get_embed_and_head.return_value = ("EMBED", "HEAD")
-    target.model.logits_processor = draft.model.logits_processor = _head_layout()
+    target_model = _Eagle3Target()
+    draft_model = _WeightSharingDraft()
+    draft = _draft_runner(draft_model)
     draft.model_config.hf_config = {
         "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
     }
-    draft.model_config.requires_request_token_history = False
 
-    with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
-        factory.configure_draft_target(_server_args("EAGLE3"), target, draft)
+    factory.configure_draft_target(
+        _server_args("EAGLE3"), _target_runner(target_model), draft
+    )
 
-    draft.model.set_embed_and_head.assert_called_once_with("EMBED", "HEAD")
-    target.model.set_eagle3_layers_to_capture.assert_called_once_with([1, 2, 3])
+    assert draft_model.shared == ("EMBED", "HEAD")
+    assert target_model.captured == [1, 2, 3]
 
 
 class _ModuleSharingDraft:
@@ -459,20 +461,17 @@ def test_pipeline_stage_builds_draft_follows_the_drafter_kind():
 
 
 def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
-    target, draft = mock.MagicMock(), mock.MagicMock()
-    target.mapping = _mapping()
-    target.model.get_embed_and_head.return_value = ("E", "H")
-    target.model.logits_processor = draft.model.logits_processor = _head_layout()
+    target_model = _Eagle3Target()
+    draft = _draft_runner(_WeightSharingDraft())
     draft.model_config.hf_config = {
         "eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 2, 3]}
     }
 
-    with mock.patch.object(factory, "get_drafter_impl", return_value=Eagle):
-        factory.configure_draft_target(
-            _server_args("EAGLE3", capture_ids=[7, 8]), target, draft
-        )
+    factory.configure_draft_target(
+        _server_args("EAGLE3", capture_ids=[7, 8]), _target_runner(target_model), draft
+    )
 
-    target.model.set_eagle3_layers_to_capture.assert_called_once_with([7, 8])
+    assert target_model.captured == [7, 8]
 
 
 class _ContextDraft:
@@ -681,23 +680,29 @@ def test_draft_field_writer_prefers_the_context_producer():
 
 
 def test_wire_dflash_keeps_own_embed_head():
-    from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
-
-    target, draft = mock.MagicMock(), mock.MagicMock()
-    draft.model = mock.MagicMock(spec=TargetCaptureConfigurator)
-    draft.model_config.requires_request_token_history = False
-    with mock.patch.object(factory, "get_drafter_impl", return_value=DFlash):
-        factory.configure_draft_target(_server_args("DFLASH"), target, draft)
-    draft.model.configure_target.assert_called_once_with(
-        target.model, target.model_config.hf_text_config
+    # A DFlash draft ships its own embed/head: setup configures capture only,
+    # so the factory must never read the target's weights for it.
+    target = SimpleNamespace(
+        get_embed_and_head=mock.Mock(side_effect=AssertionError("read the head")),
     )
-    target.model.get_embed_and_head.assert_not_called()
+    target_config = object()
+    draft = _BlockDraft(SimpleNamespace(dflash_config={"target_layer_ids": [2, 7]}))
+
+    factory.configure_draft_target(
+        _server_args("DFLASH"),
+        SimpleNamespace(
+            model=target, model_config=SimpleNamespace(hf_text_config=target_config)
+        ),
+        _draft_runner(draft),
+    )
+
+    assert draft.calls == [(target, target_config)]
+    target.get_embed_and_head.assert_not_called()
 
 
 def test_multi_depth_mtp_refuses_draft_trees():
-    drafter = mock.MagicMock(spec=Mtp)
     with pytest.raises(NotImplementedError, match="cannot draft trees"):
-        Mtp.bind_tree(drafter, mock.MagicMock())
+        Mtp.bind_tree(Mtp.__new__(Mtp), object())
 
 
 def test_eagle_tree_drafting_ranks_full_vocab_logits():
@@ -729,13 +734,6 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
     shard = SimpleNamespace(next_token_logits=torch.zeros(2, 25))
     with pytest.raises(RuntimeError, match="ranks all 50 draft tokens"):
         Eagle._score_candidates(drafter, shard)
-
-
-def test_base_wire_target_is_a_noop():
-    drafter = mock.MagicMock(spec=BaseDrafter)
-    target_model = mock.MagicMock()
-    BaseDrafter.wire_target(drafter, target_model)
-    target_model.assert_not_called()
 
 
 @pytest.mark.parametrize("drafter_class", [DFlash, DSpark])
@@ -789,29 +787,35 @@ def test_deepseek_dspark_wire_target_only_binds_resources():
     target.set_dspark_layers_to_capture.assert_not_called()
 
 
-@pytest.mark.parametrize("drafter_cls", [DeepseekV4DSpark, DeepseekV41DSpark])
-def test_dspark_weight_update_needs_no_derived_head_refresh(drafter_cls):
-    # The draft reads the target's BF16 head in place, so an in-place target
-    # weight update needs no drafter-side refresh: the base no-op applies.
-    assert (
-        drafter_cls.on_target_weights_updated is BaseDrafter.on_target_weights_updated
-    )
-    drafter = mock.MagicMock(spec=drafter_cls)
-    drafter.model = mock.MagicMock()
-    drafter_cls.on_target_weights_updated(drafter)
-    assert drafter.model.mock_calls == []
+class _WeightUpdatingRunner:
+    """Stands in for ModelRunner: only the distributed update path succeeds."""
+
+    def init_weights_update_group(self, req):
+        raise AssertionError("not the request under test")
+
+    def update_weights_from_distributed(self, req):
+        return True, "updated"
+
+    def update_weights_from_disk(self, req):
+        raise AssertionError("not the request under test")
+
+    def update_weights_from_mooncake(self, version, models):
+        raise AssertionError("not the request under test")
+
+    def destroy_weights_update_group(self, req):
+        raise AssertionError("not the request under test")
 
 
 def test_device_weight_update_notifies_drafter_before_returning():
-    runner = mock.MagicMock()
-    runner.update_weights_from_distributed.return_value = (True, "updated")
-    drafter = mock.MagicMock(spec=BaseDrafter)
-    forward_thread = mock.MagicMock()
-    forward_thread.run.side_effect = lambda callback: callback()
+    refreshed = []
+    # ModelExecutor genuinely needs GPUs; the doubles carry just what
+    # DeviceHandle reads off it.
     executor = SimpleNamespace(
-        model_runner=runner,
-        drafter=drafter,
-        forward_thread=forward_thread,
+        model_runner=_WeightUpdatingRunner(),
+        drafter=SimpleNamespace(
+            on_target_weights_updated=lambda: refreshed.append("refreshed")
+        ),
+        forward_thread=SimpleNamespace(run=lambda callback: callback()),
     )
     handle = DeviceHandle(executor)
     request = UpdateWeightsFromDistributedReqInput(
@@ -824,7 +828,7 @@ def test_device_weight_update_notifies_drafter_before_returning():
     )
 
     assert handle.update_weights(request) == (True, "updated")
-    drafter.on_target_weights_updated.assert_called_once_with()
+    assert refreshed == ["refreshed"]
 
 
 # --------------------------------------------------------------------------

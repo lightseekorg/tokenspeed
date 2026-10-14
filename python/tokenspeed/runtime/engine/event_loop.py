@@ -1182,7 +1182,10 @@ class EventLoop:
                     self._pause_hooks.paused_idle_step()
                     paused_round = True
                 else:
-                    execution_plan = self.scheduler.next_execution_plan()
+                    with torch.profiler.record_function(
+                        "scheduler.next_execution_plan"
+                    ):
+                        execution_plan = self.scheduler.next_execution_plan()
                     # One snapshot-store op per retraction victim: the plan
                     # read that drives the in-flight accounting also yields
                     # the round's preemption count (0 on rounds without
