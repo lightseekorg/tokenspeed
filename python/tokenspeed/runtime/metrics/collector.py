@@ -191,7 +191,10 @@ def finish_reason_label(finished_reason: dict | BaseFinishReason | None) -> str:
         code = err_type if isinstance(err_type, ABORT_CODE) else ABORT_CODE(err_type)
     except (ValueError, TypeError):
         return "abort"
-    return f"abort:{_ABORT_REASON_LABELS[code]}"
+    # A future ABORT_CODE member without a label entry stays plain "abort",
+    # like an unrecognized err_type; the mapping test guards against drift.
+    label = _ABORT_REASON_LABELS.get(code)
+    return f"abort:{label}" if label is not None else "abort"
 
 
 def stream_label(stream: bool) -> str:
@@ -225,55 +228,6 @@ class RequestFinishStats:
     finish_reason: str = "unknown"
     # The request's streaming flag, exported as the "stream" label.
     stream: bool = False
-
-
-_TIME_PER_OUTPUT_TOKEN_BUCKETS = [
-    0.002,
-    0.005,
-    0.010,
-    0.020,
-    0.030,
-    0.040,
-    0.050,
-    0.060,
-    0.070,
-    0.080,
-    0.090,
-    0.100,
-    0.150,
-    0.200,
-    0.300,
-    0.400,
-    0.600,
-    0.800,
-    1.000,
-    2.000,
-]
-
-_INTER_TOKEN_LATENCY_BUCKETS = [
-    0.002,
-    0.004,
-    0.006,
-    0.008,
-    0.010,
-    0.015,
-    0.020,
-    0.025,
-    0.030,
-    0.035,
-    0.040,
-    0.050,
-    0.075,
-    0.100,
-    0.150,
-    0.200,
-    0.300,
-    0.400,
-    0.500,
-    0.750,
-    1.000,
-    2.000,
-]
 
 
 _TIME_PER_OUTPUT_TOKEN_BUCKETS = [

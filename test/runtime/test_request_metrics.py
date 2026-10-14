@@ -40,6 +40,7 @@ from tokenspeed.runtime.engine.request_types import (
     FINISH_MATCHED_TOKEN,
 )
 from tokenspeed.runtime.metrics.collector import (
+    _ABORT_REASON_LABELS,
     EngineMetrics,
     RequestFinishStats,
     RequestMetrics,
@@ -112,6 +113,7 @@ def test_build_1_2_5_buckets_grid():
 
 
 def test_finish_reason_label_maps_the_bounded_vocabulary():
+    assert set(_ABORT_REASON_LABELS) == set(ABORT_CODE)
     assert finish_reason_label(None) == "unknown"
     assert finish_reason_label({"type": "stop", "matched": 5}) == "stop"
     assert finish_reason_label({"type": "length", "length": 16}) == "length"
