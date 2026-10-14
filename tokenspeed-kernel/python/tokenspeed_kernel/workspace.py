@@ -57,7 +57,9 @@ class _Sessions(threading.local):
 _sessions = _Sessions()
 
 
-def zeroed_state(numel: int, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def zeroed_state(
+    numel: int, *, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
     """Return a zeroed buffer that the caller's launch leaves zeroed again.
 
     Args:

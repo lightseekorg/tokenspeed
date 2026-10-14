@@ -33,6 +33,7 @@ if not is_cdna4():
     )
 
 
+from tokenspeed_kernel.ops.gemm.kimi3 import kimi3_router_projection  # noqa: E402
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
@@ -403,6 +404,17 @@ def test_decode_gemm_graph_replays(session: bool) -> None:
     for _ in range(3):
         a.copy_(torch.randn_like(a) * 0.25)
         graph.replay()
+        torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
+
+
+@pytest.mark.parametrize("m", [4, 16])
+def test_kimi3_router_gluon_decode_matches_reference(m: int) -> None:
+    # The router's split-K decode buckets, through the model-facing op.
+    torch.manual_seed(0)
+    a = torch.randn((m, 7168), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((896, 7168), device="cuda", dtype=torch.bfloat16) * 0.25
+    for _ in range(2):
+        out = kimi3_router_projection(a, b, solution="gluon_decode")
         torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
 
 
