@@ -55,8 +55,8 @@ _owned_arenas: WeakKeyDictionary[object, list[torch.Tensor]] = WeakKeyDictionary
 
 # Slices start on this many bytes.
 _ALIGN = 256
-# A session's arena holds at least this many bytes (1024 slices; a Qwen3.8 TP2
-# decode graph takes 157), or twice the most any earlier session asked for.
+# A session's arena holds at least this many bytes (1024 slices), or twice the
+# most any earlier session asked for.
 # The floor keeps the size independent of capture order: a small graph captured
 # first must not shrink the arena of a larger one after it.
 _MIN_ARENA_BYTES = 256 << 10
