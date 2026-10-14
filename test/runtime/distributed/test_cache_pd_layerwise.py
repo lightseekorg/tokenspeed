@@ -747,6 +747,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
             head_dim=1,
             layer_id=0,
             scaling=1.0,
+            attn_sink=None,
         ),
         token_to_kv_pool=SimpleNamespace(
             quant_method=None,

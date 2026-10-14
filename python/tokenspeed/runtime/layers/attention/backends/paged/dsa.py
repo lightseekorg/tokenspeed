@@ -953,6 +953,13 @@ class DSABackend(PagedAttentionBackend):
             )
         if len(self.kvp_group) > 1:
             raise ValueError("Sharded DSA decode requires global top-k selection")
+        if layer.attn_sink is not None:
+            # The dense MLA leaf cannot apply a learnable sink; silently
+            # dropping it would change the model's output.
+            raise RuntimeError(
+                "DSA dense decode cannot apply the layer's learnable attention "
+                "sink; sink-bearing models must decode through sparse top-k."
+            )
         metadata = self.forward_decode_metadata
         if metadata is not None and metadata.seq_lens_k is not None:
             num_extends = int(metadata.num_extends or 0)
@@ -1095,6 +1102,14 @@ class DSABackend(PagedAttentionBackend):
             return_lse=use_dcp,
             solution=self.kernel_solution,
             slot_order=self.slot_order,
+            # Under DCP the kernel returns per-shard partials and a no-sink LSE
+            # so the sink is applied exactly once, after the combine.
+            # An absent sink keeps the legacy kernel-package call signature.
+            **(
+                {"attn_sink": layer.attn_sink}
+                if not use_dcp and layer.attn_sink is not None
+                else {}
+            ),
         )
         if use_dcp:
             local_output, local_lse = out
@@ -1103,7 +1118,7 @@ class DSABackend(PagedAttentionBackend):
                 local_lse,
                 group=self.kvp_group,
                 rank=self.kvp_rank,
-                sink=None,
+                sink=layer.attn_sink,
                 keep_all_heads=keep_all_heads,
             )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
@@ -1128,6 +1143,11 @@ class DSABackend(PagedAttentionBackend):
     ) -> torch.Tensor:
         """The gathered-buffer arm: per request group, gather the history and
         attend this rank's rows of the group against it."""
+        if layer.attn_sink is not None:
+            raise RuntimeError(
+                "the sharded DSA extend does not apply an attention sink: its "
+                "query carries every head, the layer only its TP-local sinks"
+            )
         meta = self.require_query_shard_metadata()
         if q_view.shape[0] != meta.plan.local_rows:
             raise RuntimeError(
@@ -1318,6 +1338,14 @@ class DSABackend(PagedAttentionBackend):
             return_lse=use_dcp,
             solution=self.kernel_solution,
             slot_order=self.slot_order,
+            # See forward_sparse_prefill: the sink is applied once, by the DCP
+            # combine, whenever the KV is sharded.
+            # An absent sink keeps the legacy kernel-package call signature.
+            **(
+                {"attn_sink": layer.attn_sink}
+                if not use_dcp and layer.attn_sink is not None
+                else {}
+            ),
         )
         if use_dcp:
             local_output, local_lse = out
@@ -1326,7 +1354,7 @@ class DSABackend(PagedAttentionBackend):
                 local_lse,
                 group=self.kvp_group,
                 rank=self.kvp_rank,
-                sink=None,
+                sink=layer.attn_sink,
                 keep_all_heads=keep_all_heads,
             ).to(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype

@@ -150,10 +150,54 @@ remain unchanged. Kernel traits exclude other head counts.
 FlashMLA sparse prefill (regular BF16 KV) and sparse decode (packed FP8 KV)
 also support `return_lse=True`. Both return natural-log LSE `[tokens, heads]`
 and normalize empty rows to zero output / negative-infinite LSE for the shared
-DCP reduction. `topk_lens` masks excluded columns before dispatch, and supplied
-output buffers retain their identity. Decode transposes the vendor's
-`[batch, heads, query]` LSE to token-major order. This does not reinterpret
-regular BF16 KV as packed FP8 or change its Triton decode selection.
+DCP reduction. `topk_lens` masks excluded columns before dispatch. Decode
+transposes the vendor's `[batch, heads, query]` LSE to token-major order. Both
+vendor kernels apply a sink to the output normalization only, so the adapters
+add it to the returned LSE (`logaddexp(lse, sink)`), as the Triton kernels
+report it. A supplied output buffer must be contiguous, hold the result's
+element count and match its dtype; it retains its identity and anything else
+raises. Regular BF16 KV is never reinterpreted as packed FP8.
+
+Decode over regular BF16 KV runs the sparse prefill kernel, one query row per
+token, in two registrations. `flashmla_dense_dsa_decode` takes calls with a
+sink. `flashmla_dense_dsa_partial_decode` takes sinkless calls that return the
+LSE on Hopper: that is how the context-parallel ranks of every DSA model
+produce partials, applying any sink once to the merged result. At the DCP 8
+shapes of HY V4, GLM-5 and DeepSeek V3.2 (16, 64 and 128 gathered heads, 256
+owned columns, batch 1 to 64) it runs 9 to 740 times faster than Triton on H20,
+with matching output and LSE. Blackwell keeps Triton for these calls until they
+are measured there. Sinkless decode without LSE stays on Triton (Hopper) and
+FlashInfer TRT-LLM (Blackwell), because this kernel pads every row's heads to
+its 64-head tile. Context-parallel callers pack each rank's owned slots first
+and pass their count as `topk_lens`, so the kernel walks only those columns.
+
+FlashMLA sparse prefill attends each query row with one CTA per 64 padded
+heads (128 on Blackwell); each CTA walks the row's selected columns serially,
+so a launch with fewer CTAs than SMs (regular-KV decode and verify, short
+prompts) is bound by one row's walk while most SMs idle. Such launches split
+every row's columns into slices that keep the kernel's 128-column alignment,
+run the slices as independent rows and merge them by their LSE; the sink is
+applied once, to the merged softmax. The split count is the largest power of
+two for which the split launch, `rows * ctas_per_row * splits` CTAs, fits one
+wave of the device's SMs and every slice keeps that alignment; launches that
+cannot take two splits stay whole. HY V4 at TP32 runs 2 heads padded to one CTA
+per row. The partials are rounded to BF16 before the FP32 merge, so results
+match a single launch to within that rounding. Because the split count follows
+the launch's row count, results are reproducible run to run but not
+batch-invariant.
+
+Sink decode over a regular BF16 KV cache with at most 16 heads per row runs
+`triton_dsa_split_decode` on Hopper instead. Even split, FlashMLA spends a
+64-head CTA on each row's few heads; the Triton kernel carries them through its
+MMAs padded to 16 in registers. Each row's columns are split as above, but the
+split count only bounds the launch (two programs per SM, at least 64 padded
+columns per split): every program divides the row's live columns
+(`topk_lens`) by that count, so a short context gathers no padding. The
+partials merge the same way, sink applied once to the merged softmax, with the
+same BF16 rounding and the same lack of batch invariance. On H20 at HY V4's
+TP32 decode shapes (2 heads, 1 to 128 rows, 300 to 2048 live columns) it runs
+2.2 to 3.9 times faster than split FlashMLA: one row with 2048 live columns
+takes 10.4 µs against 31.5 µs.
 
 ## Sharded Index-K candidates
 
@@ -177,3 +221,28 @@ owned entries. Empty tiles still write negative-infinite logits, including
 when lengths or ownership change during graph replay. Partially valid tiles
 keep the per-entry mask and global forced-window policy. This avoids redundant
 arithmetic without changing the launch grid, logits capacity or Top-K scan.
+
+
+### Runtime/package compatibility
+
+The runtime omits the `attn_sink` keyword for sinkless kernels, including
+context-parallel partials. An independent runtime upgrade therefore keeps
+the previous call signature for models without sinks. A sink-bearing model
+must use a kernel package that implements the sink API; it must never drop a
+nonempty sink to make an older package accept the call.
+
+A strong sink may underflow every selected key probability. Such a row is
+still nonempty: its LSE includes the sink. Empty-row detection uses the
+selected slots, not the accumulated floating-point key mass, for both dense
+and packed Triton caches.
+
+The split Triton decode distinguishes zero softmax mass from non-finite mass.
+Only a truly empty partial receives the `+inf` LSE sentinel. A live partial
+containing NaN keeps its NaN LSE and propagates through the merge, rather than
+being silently discarded as if the row had selected no keys.
+
+The portable Triton prefill/decode wrappers require a supplied output buffer
+to be contiguous, on the query device, and to have the result's dtype and
+element count (BF16 for an FP8 query). Shape may differ, but the write must
+alias the caller's storage. Invalid buffers are rejected before launch; a
+reshape that silently allocates a temporary is never used for output writes.

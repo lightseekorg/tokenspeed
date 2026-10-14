@@ -1938,6 +1938,50 @@ def _attention_dsa_prefill() -> object:
     )
 
 
+def _attention_dsa_hy_v4(entrypoint: Callable[..., object], sink: bool) -> object:
+    # HY V4 attends over a dense BF16 latent cache with top-2048 slots.
+    q = torch.empty((2, 4, 576), dtype=torch.bfloat16)
+    kv_cache = torch.empty((4096, 576), dtype=torch.bfloat16)
+    topk_slots = torch.empty((2, 2048), dtype=torch.int32)
+    topk_lens = torch.empty((2,), dtype=torch.int32)
+    return entrypoint(
+        q=q,
+        kv_cache=kv_cache,
+        sparse_kv_cache=None,
+        topk_slots=topk_slots,
+        topk_lens=topk_lens,
+        max_seqlen_k=4096,
+        qk_nope_head_dim=192,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        return_lse=False,
+        slot_order="selection",
+        attn_sink=torch.empty((4,), dtype=torch.float32) if sink else None,
+    )
+
+
+def _attention_dsa_dense_partial(qk_nope_head_dim: int, heads: int) -> object:
+    # Context-parallel ranks gather their group's query heads and return
+    # sinkless partials with the LSE over a dense BF16 latent cache.
+    return _attention_dsa_pkg.dsa_decode(
+        q=torch.empty((2, heads, 576), dtype=torch.bfloat16),
+        kv_cache=torch.empty((4096, 576), dtype=torch.bfloat16),
+        sparse_kv_cache=None,
+        topk_slots=torch.empty((2, 2048), dtype=torch.int32),
+        topk_lens=torch.empty((2,), dtype=torch.int32),
+        max_seqlen_k=4096,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=1.0,
+        page_size=64,
+        return_lse=True,
+        slot_order="selection",
+    )
+
+
 def _attention_dsa_prefill_glm53_flash_bf16_dense() -> object:
     q = torch.empty((1, 16, 512), dtype=torch.bfloat16)
     kv_cache = torch.empty((2051, 512), dtype=torch.bfloat16)
@@ -5154,6 +5198,126 @@ _CASES = [
             (128, "flashmla"),
         )
     ],
+    # A sink rules out the DSA kernels that cannot apply one (FlashInfer
+    # TRT-LLM, Gluon); dense-KV FlashMLA decode is registered for sinks and,
+    # on Hopper, for the sinkless partials that context parallelism merges by
+    # LSE.
+    _case(
+        _is_hopper,
+        "hopper",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=False,
+        ),
+        id_suffix="hy-v4",
+    ),
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "attention",
+        "dsa_decode",
+        "flashinfer_trtllm_dsa_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=False,
+        ),
+        id_suffix="hy-v4",
+    ),
+    _case(
+        _is_hopper,
+        "hopper",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_split_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=True,
+        ),
+        id_suffix="hy-v4-sink",
+    ),
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "attention",
+        "dsa_decode",
+        "flashmla_dense_dsa_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=True,
+        ),
+        id_suffix="hy-v4-sink",
+    ),
+    *[
+        _case(
+            _is_hopper,
+            "hopper",
+            "attention",
+            "dsa_decode",
+            "flashmla_dense_dsa_partial_decode",
+            partial(_attention_dsa_dense_partial, qk_nope_head_dim=nope, heads=heads),
+            id_suffix=f"dcp-partial-{model}",
+        )
+        for model, nope, heads in (
+            ("hy-v4", 192, 16),
+            ("glm5", 192, 64),
+            ("dsv32", 128, 128),
+        )
+    ],
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_decode",
+        partial(_attention_dsa_dense_partial, qk_nope_head_dim=128, heads=128),
+        id_suffix="dcp-partial-dsv32",
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=True,
+        ),
+        id_suffix="hy-v4-sink",
+    ),
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "attention",
+        "dsa_prefill",
+        "flashinfer_trtllm_dsa_prefill",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_prefill,
+            sink=False,
+        ),
+        id_suffix="hy-v4",
+    ),
+    _case(
+        _is_hopper_plus_with_flashmla_prefill,
+        "hopper-plus",
+        "attention",
+        "dsa_prefill",
+        "flashmla_dsa_prefill",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_prefill,
+            sink=True,
+        ),
+        id_suffix="hy-v4-sink",
+    ),
     _case(
         _is_hopper,
         "hopper",

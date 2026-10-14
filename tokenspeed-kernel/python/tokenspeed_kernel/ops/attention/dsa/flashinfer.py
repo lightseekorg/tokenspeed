@@ -134,6 +134,9 @@ def _register_flashinfer_trtllm_dsa(
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "topk_layout": frozenset({"global_slots"}),
+            # This backend cannot apply a per-head learnable sink, so it must
+            # stay out of selection whenever the model carries one.
+            "sinks": frozenset({False}),
         },
     )
 
