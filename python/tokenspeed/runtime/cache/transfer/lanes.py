@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import psutil
@@ -76,18 +77,114 @@ def new_cache_stream(priority: int | None):
         return device_module.Stream()
 
 
-def host_memory_share(*, nprocs_per_node: int, headroom_bytes: int) -> int:
+_PROC_SELF_CGROUP = Path("/proc/self/cgroup")
+_CGROUP_MOUNT = Path("/sys/fs/cgroup")
+# A cgroup v1 without a limit reports a value near 2**63 instead of "max".
+_CGROUP_V1_UNLIMITED = 1 << 62
+
+
+def _read_cgroup_int(path: Path) -> int | None:
+    """An integer cgroup file, or None if it is missing or says "max"."""
+    try:
+        value = path.read_text().strip()
+    except OSError:
+        return None
+    return None if value == "max" else int(value)
+
+
+def _cgroup_page_cache(directory: Path, keys: tuple[str, str]) -> int:
+    """File-backed pages charged to the cgroup, which the kernel can reclaim."""
+    try:
+        lines = (directory / "memory.stat").read_text().splitlines()
+    except OSError:
+        return 0
+    stat = dict(line.split() for line in lines)
+    return sum(int(stat.get(key, 0)) for key in keys)
+
+
+def _own_cgroup_dir(controller_root: Path, path: str) -> Path:
+    """This process's directory under ``controller_root``.
+
+    Inside a container the mount is usually the container's own cgroup, so
+    the host-side path from ``/proc/self/cgroup`` does not exist under it.
+    """
+    directory = controller_root / path.lstrip("/")
+    return directory if directory.is_dir() else controller_root
+
+
+def cgroup_memory_headroom() -> tuple[int, str] | None:
+    """Memory this process's cgroups still allow, and the cgroup that binds.
+
+    Takes the tightest limit over this process's memory cgroup and its
+    ancestors (a container, a Slurm job and its step can each set one).
+    Usage counts reclaimable page cache as free, as ``MemAvailable`` does:
+    right after an earlier run the cache alone can fill most of the limit.
+
+    Returns:
+        ``(headroom_bytes, source)``, or None when no memory cgroup limit
+        applies (bare metal, or no limit set).
+    """
+    try:
+        lines = _PROC_SELF_CGROUP.read_text().splitlines()
+    except OSError:
+        return None
+    if (_CGROUP_MOUNT / "cgroup.controllers").exists():
+        paths = [line.split(":", 2)[2] for line in lines if line.startswith("0::")]
+        if not paths:
+            return None
+        version, root = "v2", _CGROUP_MOUNT
+        limit_name, usage_name = "memory.max", "memory.current"
+        cache_keys = ("active_file", "inactive_file")
+    else:
+        paths = [
+            line.split(":", 2)[2]
+            for line in lines
+            if "memory" in line.split(":", 2)[1].split(",")
+        ]
+        if not paths:
+            return None
+        version, root = "v1", _CGROUP_MOUNT / "memory"
+        limit_name, usage_name = "memory.limit_in_bytes", "memory.usage_in_bytes"
+        # The total_ counters include descendants, like usage_in_bytes.
+        cache_keys = ("total_active_file", "total_inactive_file")
+
+    tightest: tuple[int, str] | None = None
+    directory = _own_cgroup_dir(root, paths[0])
+    while True:
+        limit = _read_cgroup_int(directory / limit_name)
+        usage = _read_cgroup_int(directory / usage_name)
+        if limit is not None and limit < _CGROUP_V1_UNLIMITED and usage is not None:
+            usage = max(0, usage - _cgroup_page_cache(directory, cache_keys))
+            headroom = max(0, limit - usage)
+            if tightest is None or headroom < tightest[0]:
+                tightest = (headroom, f"cgroup {version} {directory}")
+        if directory == root or directory.parent == directory:
+            return tightest
+        directory = directory.parent
+
+
+def host_memory_share(*, nprocs_per_node: int, headroom_bytes: int) -> tuple[int, str]:
     """This rank's share of the Host memory its node has available now.
 
     Every rank of a node pins its Host buffers at the same point of startup,
     so one rank may take only an equal share of what the node has available,
-    and each keeps its own headroom.
+    and each keeps its own headroom. What is available is the smaller of the
+    host's free memory and what this process's memory cgroup still allows:
+    inside a container or a Slurm step, psutil reports the whole host.
 
     Args:
         nprocs_per_node: The ranks running on this node.
         headroom_bytes: Host memory each rank leaves available.
+
+    Returns:
+        ``(share_bytes, source)``, where ``source`` names where the available
+        memory was read from, for the sizing log.
     """
-    return psutil.virtual_memory().available // nprocs_per_node - headroom_bytes
+    available, source = psutil.virtual_memory().available, "host (psutil)"
+    cgroup = cgroup_memory_headroom()
+    if cgroup is not None and cgroup[0] < available:
+        available, source = cgroup
+    return available // nprocs_per_node - headroom_bytes, source
 
 
 def pinned_host_bytes(nbytes: int) -> int:
@@ -105,13 +202,16 @@ def largest_pinned_fit(room_bytes: int) -> int:
     return 1 << (room_bytes.bit_length() - 1) if room_bytes > 0 else 0
 
 
-def check_host_memory(requested_bytes: int, *, share_bytes: int, purpose: str) -> None:
+def check_host_memory(
+    requested_bytes: int, *, share_bytes: int, share_source: str, purpose: str
+) -> None:
     """Refuse a pinned allocation larger than this rank's share of the node.
 
     Args:
         requested_bytes: The Host memory the pinned buffers about to be
             allocated take, each counted by ``pinned_host_bytes``.
         share_bytes: This rank's share (``host_memory_share``).
+        share_source: Where the available memory was read from.
         purpose: Names the allocation in the error.
 
     Raises:
@@ -122,7 +222,8 @@ def check_host_memory(requested_bytes: int, *, share_bytes: int, purpose: str) -
             f"Not enough Host memory for {purpose}: requesting "
             f"{requested_bytes / 1e9:.2f} GB pinned (each buffer rounded up to "
             f"a power of two), available {share_bytes / 1e9:.2f} GB (this "
-            "rank's share of the Host memory available on its node)"
+            "rank's share of the Host memory available on its node, from "
+            f"{share_source})"
         )
 
 
