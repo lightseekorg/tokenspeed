@@ -35,6 +35,16 @@ how long the caller may hold each piece:
 | `transfer` | the PD peer's CONTROL face — bootstrap register/abort, event polling — or None outside PD | held by the PD hooks |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
+Encoder facts describe the transferred tensor, independently of the language
+embedding width. A model may declare `get_encoder_output_spec()` as a width and
+dtype pair, including integer dtypes for discrete visual tokens, without a
+loaded vision tower. Without that declaration, the width comes from the language
+config and the dtype from the vision tower's dtype or parameters. The resolved
+width must be positive. The builder resolves this once; admission keeps only
+the resulting values. Converting an encoded payload into language embeddings
+remains model work on the forward thread, after all required items and prefill
+ranks have completed admission.
+
 `build_device_side` builds the device side **complete**, not built-then-wired:
 it constructs the transfer peer from its prepared components and startup
 arguments, and reads the engine's role off the peer once, at construction. An
@@ -169,6 +179,18 @@ reassembly all run on the forward thread — which also puts the reassembly
 broadcasts on the same issuing thread as the model's collectives, restoring
 the cross-rank launch-order guarantee the old non-overlap-loop assumption
 provided.
+
+With pipeline parallelism, only PP0 receives encoder payloads and reserves
+the receive pool. PP0's attention TP group first agrees on completion;
+`PipelineEpdPrefillAdmission` then broadcasts admitted/failed request IDs
+along the pipeline CPU groups. Every stage submits the same requests in
+the same loop iteration, while later stages hold no encoder receiver or
+payload. Decode does not build this admission controller.
+
+The encoder's TP ranks attach every pixel-SHM segment in a received batch
+before any rank submits it to the encode worker. A CPU-group rendezvous
+protects this ownership transition: submission consumes and unlinks SHM
+on both cache hits and misses, so broadcasting handles alone is insufficient.
 
 The symmetric rule holds on the data plane: **the forward thread never
 synchronizes with the device on the per-round path.** Every host

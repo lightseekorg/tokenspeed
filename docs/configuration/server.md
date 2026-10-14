@@ -1069,6 +1069,21 @@ Host pinned buffer (L2 / flat KV)
 Mooncake Store (L3)
 ```
 
+**Sizing.** `--kvstore-size` (gigabytes per rank) wins over
+`--kvstore-ratio` (a multiple of this rank's Device KV, 2 by default).
+Every rank of a node pins its Host buffers at the same point of startup, so
+each rank checks the Host L2 and the retraction snapshot pool against an
+equal share of the Host memory its node has available, less a 10 GiB
+headroom per rank. Each buffer counts at the size it pins: PyTorch's pinned
+allocator rounds every allocation up to a power of two, so a 140 GB L2
+takes 274.88 GB. A ratio size larger than that share is capped to the
+largest L2 every rank's share holds beside its snapshot pool -- the whole
+LCM blocks in the largest power of two that fits, and one size on every
+rank, since the ranks' schedulers mirror each other -- and each rank logs a
+warning with the requested and the capped size. An explicit
+`--kvstore-size` is never shrunk: one that does not fit is refused at
+startup, as is a share without room for a single LCM block.
+
 Each packed Host CacheBlock is one Mooncake object, keyed as
 `{tsl3v1-<sha256>}_{content_hash}|g{group}|o{page_offset}|r{tp_rank}|c0`
 (the trailing `c0` is the retired context-parallel shard id, kept literal so
@@ -1206,6 +1221,19 @@ knobs are required with `--kvstore-storage-backend` and refused without it:
 | `--kvstore-prefetch-timeout-base-s` | The prefetch deadline's base term in seconds (positive). The deadline says when the lane stops starting batches; it does not interrupt a batch in flight. |
 | `--kvstore-prefetch-timeout-per-page-s` | The deadline's per-page term in seconds (0 for a fixed deadline). |
 | `--kvstore-prefetch-batch-pages` | Prefix pages per `batch_get_into` of a prefetch; the fetch stops at the first batch with a missing page (the reference engine uses 128). |
+
+L3 diagnostics are log-based and byte-denominated. `L3HostStore` logs every
+backup (PUT) and prefetch batch (GET) with key counts, successful keys,
+successful payload bytes, and call latency. It logs each `batch_exists`
+probe at debug level; cumulative exists/GET/PUT counters (calls, keys, ok
+keys, ok bytes, total seconds) are kept per store. Above that, the Host
+cache executor logs each completed backup with queue wait separated from
+actual PUT time plus the pending backup pages, bytes, and oldest pending
+age. The backlog includes completed PUTs awaiting their write-back
+acknowledgment. A slow PUT retains Host pages (and Device pages for pinned
+write-backs) until that acknowledgment, delaying admission despite bounded
+pools. Transferred volume is reported as bytes, never as an effective token
+hit rate.
 
 `--kvstore-storage-backend memory` is an in-process dict for tests only.
 CI exercises that Mooncake-compatible contract end-to-end (scheduler

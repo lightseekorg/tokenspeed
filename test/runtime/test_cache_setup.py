@@ -1381,7 +1381,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         enforce_eager=False,
         enable_memory_saver=False,
         gpu_memory_utilization=0.9,
-        mapping=SimpleNamespace(world_size=1, world_group=None),
+        mapping=SimpleNamespace(world_size=1, world_group=None, is_first_pp_rank=True),
     )
     with pytest.raises(_Sized) as sized:
         device.build_device_side(
@@ -1482,7 +1482,10 @@ def test_the_admission_builds_the_pool_the_budget_left_out(
         attn_tp_group=[0],
         pg_manager=None,
     )
-    prefill = SimpleNamespace(disaggregation_mode="prefill")
+    prefill = SimpleNamespace(
+        disaggregation_mode="prefill",
+        mapping=SimpleNamespace(is_first_pp_rank=True),
+    )
     assert sum(registered) == recv_pool.recv_pool_bytes(prefill, True)
     pool = slots * slot_mb << 20 if slots > 0 and slot_mb > 0 else 0
     assert sum(registered) == pool
@@ -1516,7 +1519,7 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
         disaggregation_mode=mode,
         disaggregation_bootstrap_port=0,
         disaggregation_ib_device=None,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1)),
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1), is_first_pp_rank=True),
     )
     facts = SimpleNamespace(device="cpu", hidden=16, num_deepstack=0, dtype=None)
     prefill_admission.make_epd_prefill_admission(
@@ -1524,7 +1527,11 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
         0,
         model_config=SimpleNamespace(is_multimodal=True, is_multimodal_active=active),
         encoder_model_facts=lambda: facts,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=[0])),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(tp_group=[0]),
+            is_first_pp_rank=True,
+            has_pp=False,
+        ),
         attn_tp_rank=0,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
