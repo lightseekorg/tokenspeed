@@ -86,6 +86,14 @@ std::int64_t CapacityModel::protectedTokens() const {
     return static_cast<std::int64_t>(config_.overlap_schedule_depth) * decodeWidth();
 }
 
+std::int64_t CapacityModel::DraftWindowTokens(const SchedulerConfig& config) {
+    // P hands off before its drafter writes past the first window.
+    if (config.role == Role::kP || config.decode_input_tokens <= 1) {
+        return 0;
+    }
+    return config.decode_input_tokens;
+}
+
 std::int64_t CapacityModel::tailHandoverBlocks(std::size_t group_index) const {
     // Blocks a request's table holds beyond its history while a published
     // tail changes hands, one admission long: a hitter copies the tail's
@@ -171,7 +179,7 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
     }
     const std::int64_t live_requests = config_.max_batch_size;
     const std::int64_t decode_width = decodeWidth();
-    const std::int64_t protected_tokens = protectedTokens();
+    const std::int64_t protected_tokens = protectedTokens() + DraftWindowTokens(config_);
     const std::int64_t chunk_tokens = config_.max_scheduled_tokens;
 
     std::vector<std::int64_t> group_pages(groups_.size());
