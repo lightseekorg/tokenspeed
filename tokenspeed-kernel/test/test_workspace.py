@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 
 import pytest
+import tokenspeed_kernel.workspace as workspace
 import torch
 from tokenspeed_kernel.workspace import capture_session, zeroed_state
 
@@ -125,3 +126,30 @@ def test_session_state_never_reuses_memory_freed_earlier_in_the_capture() -> Non
         graph.replay()
         torch.cuda.synchronize()
         assert torch.all(out == 1)
+
+
+def test_session_overflow_zeroes_inside_the_graph(monkeypatch) -> None:
+    # A small earlier peak sizes the arena at its 4 KiB floor; restoring the
+    # peak afterwards keeps later sessions' arenas independent of this test.
+    monkeypatch.setattr(workspace._sessions, "peak_bytes", 1)
+    fits = torch.empty(64, dtype=torch.int32, device=_DEVICE)
+    overflows = torch.empty(2048, dtype=torch.int32, device=_DEVICE)
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        with pytest.warns(UserWarning, match="ran out"):
+            with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+                arena_state = _bump_and_restore(fits)
+                fallback_state = _bump_and_restore(overflows)
+    stream.synchronize()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all(fits == 1) and torch.all(overflows == 1)
+
+    # Only the overflow buffer is zeroed by the graph itself.
+    arena_state.fill_(5)
+    fallback_state.fill_(5)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all(fits == 6) and torch.all(overflows == 1)
