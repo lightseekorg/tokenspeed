@@ -1191,6 +1191,9 @@ def test_projection_discovery_precedes_auto_dispatch(monkeypatch, name):
         "_use_mv",
         lambda *args: events.append(("gemv",)),
     )
+    # mv shares the patched module and runs its own discovery; keep only the
+    # projection's.
+    monkeypatch.setattr(gemm_module, "mv", lambda x, weight, out=None: x @ weight.T)
     x = torch.randn(3, 16, dtype=torch.bfloat16)
     weight = torch.randn(24, 16, dtype=torch.bfloat16)
     if name == "kimi3_mla_qkv_gate_projection":
