@@ -1522,8 +1522,8 @@ def _sbom(gateway_deps, crates=(), parser_deps=()):
     }
 
 
-# smg#2719 links the response-template crate into the gateway crate; the pinned
-# tokenspeed-smg has no such crate.
+# The check looks for the gateway crate's dependency on the response-template
+# crate (added by smg#2719); the pinned tokenspeed-smg has no such crate.
 _SBOM_WITH_TEMPLATES = _sbom(["tool-parser", "smg-response-template"])
 _SBOM_WITHOUT_TEMPLATES = _sbom(["tool-parser"])
 

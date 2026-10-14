@@ -188,8 +188,8 @@ def _gateway_args_with_default_reasoning_parser(
     id; ``passthrough`` returns the text as generated instead. A ``tokenizer``
     whose ``tokenizer_config.json`` declares a ``response_template`` gets no
     default while neither parser is named, if the installed gateway selects
-    parsers from response templates (smg#2719): it then takes both parsers
-    from the template, and any configured name, this default included, turns
+    parsers from response templates: it then takes both parsers from the
+    template, and any configured name, this default included, turns
     the template off. An explicit ``--reasoning-parser passthrough`` still
     does. With an older gateway, which would guess from the model id, the
     default stays.
@@ -410,7 +410,7 @@ def _template_tokenizer(engine_args: list[str], gateway_args: list[str]) -> str 
 def _declares_response_template(tokenizer: str | None) -> bool:
     """Whether ``tokenizer``'s ``tokenizer_config.json`` sets ``response_template``.
 
-    smg reads the same key, and only for a ``tokenizer.json`` tokenizer (not
+    smg would read the same key, and only for a ``tokenizer.json`` tokenizer (not
     tiktoken), so the file must sit beside the config. A template is an
     object; any other value is refused by smg and counts as none here. A Hub
     id is looked up in the local HF cache only, never downloaded here
@@ -436,8 +436,9 @@ def _declares_response_template(tokenizer: str | None) -> bool:
     return isinstance(config.get("response_template"), dict)
 
 
-# smg#2719 adds this crate and makes the gateway crate (``smg``) depend on it to
-# take the parsers from a response template.
+# The check looks for this crate as a direct dependency of the gateway crate
+# (``smg``) in the wheel's SBOM. smg#2719 adds the crate; the smg change that
+# makes the gateway take its parsers from a response template is still to come.
 _SMG_RESPONSE_TEMPLATE_CRATE = "smg-response-template"
 # Distributions that install the ``smg`` package: the bundled build, smg's own.
 _SMG_DISTRIBUTIONS = ("tokenspeed-smg", "smg")
