@@ -268,7 +268,9 @@ def test_dsa_index_candidates_table_width():
         logits = torch.randn(requests.numel(), width, device=DEVICE)
         logits[0, 5] = float("nan")
         expected = logits.clone()
-        ic.mask_index_scores(logits, positions, lengths, causal, page, 3, 5)
+        ic.mask_index_scores(
+            logits, positions, lengths, causal, page, 3, 5, mask_tail=True
+        )
         col = torch.arange(width, device=DEVICE)
         valid = col[None] < lengths
         logical = positions.gather(

@@ -505,7 +505,9 @@ def _dsv4_index_candidates(
         plan=plan,
         index_k_format=index_k_format,
     )
-    mask_index_scores(logits, positions, lengths, causal_lens, page_size, 0, 0)
+    mask_index_scores(
+        logits, positions, lengths, causal_lens, page_size, 0, 0, mask_tail=True
+    )
     offsets = candidate_topk_offsets(logits, topk)
     return gather_index_candidates(offsets, logits, positions, page_size)
 
