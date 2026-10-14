@@ -59,7 +59,7 @@ from tokenspeed_kernel.signature import (
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
 
 __all__ = [
-    "prepare_decode_gemv",
+    "prepare_mv",
     "prepare_dense_bmm",
     "prepare_dense_mm",
     "prepare_grouped_bf16_projection",
@@ -759,7 +759,7 @@ def _prepared_timing(
     )
 
 
-def prepare_decode_gemv(
+def prepare_mv(
     request: BenchmarkRequest,
     platform: PlatformInfo,
 ) -> PreparedBenchmark:

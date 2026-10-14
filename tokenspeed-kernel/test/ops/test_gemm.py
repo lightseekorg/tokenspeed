@@ -242,13 +242,13 @@ def test_gluon_bmm_falls_back_for_fp32_output(device: str, require) -> None:
 
 
 def test_decode_gemv_writes_preallocated_output() -> None:
-    from tokenspeed_kernel.ops.gemm import decode_gemv
+    from tokenspeed_kernel.ops.gemm import mv
 
     x = torch.randn(2, 8)
     weight = torch.randn(4, 8)
     out = torch.empty(2, 4)
 
-    returned = decode_gemv(x, weight, out=out)
+    returned = mv(x, weight, out=out)
 
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out, x @ weight.t())
@@ -313,7 +313,7 @@ def test_linear_attnres_partials_decode_fallback_uses_gemv(monkeypatch) -> None:
     )
     expected = torch.empty(1, 9, dtype=torch.bfloat16)
     gemv = Mock(return_value=expected)
-    monkeypatch.setattr(gemm_api, "decode_gemv", gemv)
+    monkeypatch.setattr(gemm_api, "mv", gemv)
 
     assert not linear_attnres_partials_available(
         hidden,

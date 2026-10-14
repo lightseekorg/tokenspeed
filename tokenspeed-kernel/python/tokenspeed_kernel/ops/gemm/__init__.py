@@ -89,10 +89,10 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
-    # Decode GEMV
-    "decode_gemv",
-    "decode_gemv_weight_split",
-    "use_decode_gemv",
+    # MV: small-M dense projection
+    "mv",
+    "mv_weight_split",
+    "use_mv",
     # Linear AttnRes partials
     "linear_attnres_partials",
     "linear_attnres_partials_available",
@@ -435,7 +435,7 @@ def mm(
         )
 
     # A dense layer's large-M arm reaches mm directly, while small M can
-    # select decode_gemv. Expose those branches at the shared kernel boundary.
+    # select mv. Expose those branches at the shared kernel boundary.
     if (
         override is None
         and alpha is None
@@ -1340,11 +1340,11 @@ def dsv4_linear_fp32(
 
 
 # ===-----------------------------------------------------------------------===#
-# Decode GEMV
+# MV: small-M dense projection
 # ===-----------------------------------------------------------------------===#
 
 
-# BF16 and FP32 decode GEMV dispatch.
+# BF16 and FP32 small-M dense projection dispatch.
 #
 # Eligible small-M BF16 projections use FlashInfer joint runner/tactic selection.
 # The registry keeps the architecture-specific and portable fallbacks, while the
@@ -1361,7 +1361,7 @@ def dsv4_linear_fp32(
 #
 # BF16 activations against an FP32 weight give an FP32 result. Torch widens the
 # activations first. A layer that keeps the weight split from
-# :func:`decode_gemv_weight_split` passes it to :func:`decode_gemv`, and the
+# :func:`mv_weight_split` passes it to :func:`mv`, and the
 # registry can then run the product on BF16 tensor cores
 # (``triton_bf16x3_gemm_fp32``). From 17 to 96 rows, for weights of up to 256
 # rows (a multiple of 4) with K a multiple of 512 up to 8192, the registry runs
@@ -1369,7 +1369,7 @@ def dsv4_linear_fp32(
 # (``gluon_simt_gemm_fp32``).
 
 # Registry signature of each served (x dtype, weight dtype) pair.
-_DECODE_GEMV_SIGNATURES = {
+_MV_SIGNATURES = {
     (x_dtype, weight_dtype): format_signature(
         x=dense_tensor_format(x_dtype),
         weight=dense_tensor_format(weight_dtype),
@@ -1383,7 +1383,7 @@ _DECODE_GEMV_SIGNATURES = {
 
 
 @lru_cache(maxsize=64)
-def _select_decode_gemv(
+def _select_mv(
     m: int,
     n: int,
     k: int,
@@ -1392,7 +1392,7 @@ def _select_decode_gemv(
     weight_dtype: torch.dtype,
     weight_split: bool,
 ):
-    signature = _DECODE_GEMV_SIGNATURES.get((x_dtype, weight_dtype))
+    signature = _MV_SIGNATURES.get((x_dtype, weight_dtype))
     if not on_cuda or signature is None:
         return torch_decode_gemv
 
@@ -1403,7 +1403,7 @@ def _select_decode_gemv(
     traits = {"m": m, "n": n, "k": k, "weight_split": weight_split}
     for spec in reg.get_for_operator(
         "gemm",
-        "decode_gemv",
+        "mv",
         platform=current_platform(),
         format_signature=signature,
     ):
@@ -1414,7 +1414,7 @@ def _select_decode_gemv(
     return torch_decode_gemv
 
 
-def use_decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
+def use_mv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Whether a dense projection should use the specialized decode entry.
 
     Args:
@@ -1445,18 +1445,17 @@ def use_decode_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     platform = current_platform()
     n = weight.shape[0]
     if platform.is_cdna4:
-        return m >= 2 and _select_decode_gemv(
+        return m >= 2 and _select_mv(
             m, n, k, True, x.dtype, weight.dtype, False
         ) is not (torch_decode_gemv)
     if not platform.is_cdna5 or k < 256:
         return False
     return (
-        _select_decode_gemv(m, n, k, True, x.dtype, weight.dtype, False)
-        is not torch_decode_gemv
+        _select_mv(m, n, k, True, x.dtype, weight.dtype, False) is not torch_decode_gemv
     )
 
 
-def decode_gemv(
+def mv(
     x: torch.Tensor,
     weight: torch.Tensor,
     out: torch.Tensor | None = None,
@@ -1474,7 +1473,7 @@ def decode_gemv(
         x: ``[M, K]`` activations.
         weight: ``[N, K]`` weight.
         out: optional ``[M, N]`` destination in the promoted dtype.
-        weight_split: the weight's :func:`decode_gemv_weight_split`, for an
+        weight_split: the weight's :func:`mv_weight_split`, for an
             FP32 weight; ``None`` keeps the kernels that read ``weight``.
 
     Returns:
@@ -1504,7 +1503,7 @@ def decode_gemv(
         return flashinfer_bf16_gemm(x, weight, out)
     if not x.is_contiguous() or not weight.is_contiguous():
         return torch_decode_gemv(x, weight, out)
-    impl = _select_decode_gemv(
+    impl = _select_mv(
         x.shape[0],
         weight.shape[0],
         weight.shape[1],
@@ -1518,11 +1517,11 @@ def decode_gemv(
     return impl(x, weight, out)
 
 
-def decode_gemv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
-    """Split an FP32 weight for the tensor-core path of :func:`decode_gemv`.
+def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
+    """Split an FP32 weight for the tensor-core path of :func:`mv`.
 
     The layer that owns the weight calls this once after loading it and
-    passes the result as ``decode_gemv(..., weight_split=...)``. The split
+    passes the result as ``mv(..., weight_split=...)``. The split
     takes 1.5x the FP32 weight's memory, so it is only made where the
     registration of ``triton_bf16x3_gemm_fp32`` takes this weight on this
     device. The kernel the registry prefers at one row count does not decide
@@ -1538,11 +1537,11 @@ def decode_gemv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     """
     if not weight.is_cuda or weight.ndim != 2 or not weight.is_contiguous():
         return None
-    signature = _DECODE_GEMV_SIGNATURES.get((torch.bfloat16, weight.dtype))
+    signature = _MV_SIGNATURES.get((torch.bfloat16, weight.dtype))
     if signature is None:
         return None
     n, k = weight.shape
-    # _select_decode_gemv()'s filters on the split kernel's own registration, at its
+    # _select_mv()'s filters on the split kernel's own registration, at its
     # first row count.
     traits = {"m": BF16X3_MIN_M, "n": n, "k": k, "weight_split": True}
     reg = KernelRegistry.get()
@@ -1552,7 +1551,7 @@ def decode_gemv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
         and spec_matches_shape_traits(spec, traits)
         for spec in reg.get_for_operator(
             "gemm",
-            "decode_gemv",
+            "mv",
             platform=current_platform(),
             format_signature=signature,
         )
@@ -1837,10 +1836,10 @@ def linear_attnres_partials(
                 out=out,
             )
 
-    # decode_gemv falls back to torch.mm for unlisted shapes, so widening this
+    # mv falls back to torch.mm for unlisted shapes, so widening this
     # gate past M == 1 only adds the measured kernels.
     if tokens <= 8 and hidden_states.is_contiguous() and weight.is_contiguous():
-        projected = decode_gemv(hidden_states, weight)
+        projected = mv(hidden_states, weight)
         if out_was_provided:
             out.copy_(projected)
         else:
@@ -2104,7 +2103,7 @@ def kimi3_latent_projection(
     ``solution='gluon_mediumm'`` forces the middle-M gfx950 kernel, and
     ``solution='gluon_largem'`` forces the large-M gfx950 kernel. ``auto``
     uses their measured gfx950 crossovers for canonical K3 shapes, routes
-    decode batches through the ``decode_gemv`` registry, and retains the
+    decode batches through the ``mv`` registry, and retains the
     vendor GEMM for other shapes and architectures.
     """
 
@@ -2221,8 +2220,8 @@ def kimi3_latent_projection(
             weight,
             out=out,
         )
-    if routed and use_decode_gemv(hidden_states, weight):
-        return decode_gemv(hidden_states, weight, out)
+    if routed and use_mv(hidden_states, weight):
+        return mv(hidden_states, weight, out)
     if out is None:
         return torch.nn.functional.linear(hidden_states, weight)
     return torch.mm(hidden_states, weight.T, out=out)
@@ -2297,11 +2296,7 @@ def kimi3_mla_qkv_gate_projection(
             else (
                 "gluon_largem_gfx1250"
                 if gfx1250_largem
-                else (
-                    "fused"
-                    if m <= 32 or use_decode_gemv(hidden_states, weight)
-                    else "split"
-                )
+                else ("fused" if m <= 32 or use_mv(hidden_states, weight) else "split")
             )
         )
 
@@ -2333,7 +2328,7 @@ def kimi3_mla_qkv_gate_projection(
         return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=packed)
 
     if solution == "fused":
-        packed = decode_gemv(hidden_states, weight)
+        packed = mv(hidden_states, weight)
         qkv, gate = packed.split((qkv_width, output_width - qkv_width), dim=-1)
         return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=packed)
 
@@ -2798,8 +2793,8 @@ def kimi3_shared_situ_projection(
             hidden_states, gate_up_weight, out, beta, linear_beta
         )
 
-    if routed and use_decode_gemv(hidden_states, gate_up_weight):
-        gate_up = decode_gemv(hidden_states, gate_up_weight)
+    if routed and use_mv(hidden_states, gate_up_weight):
+        gate_up = mv(hidden_states, gate_up_weight)
     else:
         gate_up = None
         if routed:
@@ -2931,8 +2926,8 @@ def kimi3_shared_down_projection(
             solution = "gluon_largem_gfx1250"
         else:
             solution = "torch"
-    if routed and use_decode_gemv(hidden_states, weight):
-        return decode_gemv(hidden_states, weight, out)
+    if routed and use_mv(hidden_states, weight):
+        return mv(hidden_states, weight, out)
     if solution == "triton_gemv":
         if not specialized:
             raise ValueError(
@@ -3037,7 +3032,7 @@ def kimi3_qkvfab_projection(
         raise ValueError("weight_scale is only valid with FP8 weights")
     if solution not in {
         "auto",
-        "decode_gemv",
+        "mv",
         "triton_gemv",
         "gluon_wmma_gfx1250",
         "gluon_largem_gfx1250",
@@ -3096,9 +3091,9 @@ def kimi3_qkvfab_projection(
             and supports_gluon_mm_a16w16_prefill_gfx950(m, output_width, input_width)
         ):
             solution = "gluon_largem"
-        elif specialized or use_decode_gemv(hidden_states, weight):
+        elif specialized or use_mv(hidden_states, weight):
             # Let the registry pick per (M, N, K); unlisted shapes hit torch.mm.
-            solution = "decode_gemv"
+            solution = "mv"
         else:
             solution = "torch"
     if solution == "gluon_wmma_gfx1250":
@@ -3126,8 +3121,8 @@ def kimi3_qkvfab_projection(
             weight,
             out=out,
         )
-    if solution == "decode_gemv":
-        result = decode_gemv(hidden_states, weight)
+    if solution == "mv":
+        result = mv(hidden_states, weight)
         if out is None:
             return result
         out.copy_(result)

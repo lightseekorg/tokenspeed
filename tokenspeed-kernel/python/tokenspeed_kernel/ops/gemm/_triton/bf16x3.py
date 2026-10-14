@@ -249,7 +249,7 @@ def triton_bf16x3_gemm_fp32(
 
     The error against an exact product is a few FP32 units of the largest
     output of the row, below that of an FP32 SIMT GEMM over a long K. The
-    registry selects it, through ``decode_gemv(..., weight_split=...)``, from
+    registry selects it, through ``mv(..., weight_split=...)``, from
     17 rows for weights of 256 to 1024 rows that are a multiple of 128, K a
     multiple of 64 from 2048 to 8192. On GB200 it was faster than the FP32
     Torch product at every point of a sweep over weights of 256, 512, 768 and

@@ -190,12 +190,12 @@
       }
     },
     {
-      "id": "kimi_k3.gemm.decode_gemv/triton_rowcta_gemv/tp8-mla_qkv_gate-m1-n3648-k7168-bfloat16",
+      "id": "kimi_k3.gemm.mv/triton_rowcta_gemv/tp8-mla_qkv_gate-m1-n3648-k7168-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "decode_gemv",
+        "mode": "mv",
         "parameters": {
           "M": 1,
           "N": 3648,
@@ -212,12 +212,12 @@
       }
     },
     {
-      "id": "kimi_k3.gemm.decode_gemv/triton_rowcta_gemv/tp8-lm_head-m1-n20480-k7168-bfloat16",
+      "id": "kimi_k3.gemm.mv/triton_rowcta_gemv/tp8-lm_head-m1-n20480-k7168-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "decode_gemv",
+        "mode": "mv",
         "parameters": {
           "M": 1,
           "N": 20480,
@@ -234,12 +234,12 @@
       }
     },
     {
-      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-o_proj-n7168-k1536-bfloat16",
+      "id": "kimi_k3.gemm.mv/gluon_mm_a16w16_decode_gfx950/tp8-o_proj-n7168-k1536-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "decode_gemv",
+        "mode": "mv",
         "parameters": {
           "M": [4, 16, 64],
           "N": 7168,
@@ -256,12 +256,12 @@
       }
     },
     {
-      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-shared_gate_up-n1536-k7168-bfloat16",
+      "id": "kimi_k3.gemm.mv/gluon_mm_a16w16_decode_gfx950/tp8-shared_gate_up-n1536-k7168-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "decode_gemv",
+        "mode": "mv",
         "parameters": {
           "M": [4, 32, 64],
           "N": 1536,
@@ -278,12 +278,12 @@
       }
     },
     {
-      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-latent_up-n7168-k3584-bfloat16",
+      "id": "kimi_k3.gemm.mv/gluon_mm_a16w16_decode_gfx950/tp8-latent_up-n7168-k3584-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "decode_gemv",
+        "mode": "mv",
         "parameters": {
           "M": [2, 8, 32],
           "N": 7168,
@@ -300,12 +300,12 @@
       }
     },
     {
-      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-kda_qkvfab-n6288-k7168-bfloat16",
+      "id": "kimi_k3.gemm.mv/gluon_mm_a16w16_decode_gfx950/tp8-kda_qkvfab-n6288-k7168-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "decode_gemv",
+        "mode": "mv",
         "parameters": {
           "M": [8, 32],
           "N": 6288,
@@ -322,12 +322,12 @@
       }
     },
     {
-      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-mla_qkv_gate-n3648-k7168-bfloat16",
+      "id": "kimi_k3.gemm.mv/gluon_mm_a16w16_decode_gfx950/tp8-mla_qkv_gate-n3648-k7168-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "decode_gemv",
+        "mode": "mv",
         "parameters": {
           "M": [4, 32, 64],
           "N": 3648,
@@ -344,12 +344,12 @@
       }
     },
     {
-      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-shared_down-n7168-k768-bfloat16",
+      "id": "kimi_k3.gemm.mv/gluon_mm_a16w16_decode_gfx950/tp8-shared_down-n7168-k768-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "decode_gemv",
+        "mode": "mv",
         "parameters": {
           "M": [4, 16, 64],
           "N": 7168,
@@ -366,12 +366,12 @@
       }
     },
     {
-      "id": "kimi_k3.gemm.decode_gemv/gluon_mm_a16w16_decode_gfx950/tp8-lm_head-n20480-k7168-bfloat16",
+      "id": "kimi_k3.gemm.mv/gluon_mm_a16w16_decode_gfx950/tp8-lm_head-n20480-k7168-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "decode_gemv",
+        "mode": "mv",
         "parameters": {
           "M": [4, 16],
           "N": 20480,

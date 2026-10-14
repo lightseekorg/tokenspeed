@@ -394,7 +394,7 @@ else:
 
 register_kernel(
     "gemm",
-    "decode_gemv",
+    "mv",
     name="triton_bf16x3_gemm_fp32",
     solution="triton",
     capability=CapabilityRequirement(
@@ -476,7 +476,7 @@ _BF16_FP32_SIG = frozenset(
 
 register_kernel(
     "gemm",
-    "decode_gemv",
+    "mv",
     name="triton_rowcta_gemv",
     solution="triton",
     signatures=_BF16_SIG,
@@ -501,7 +501,7 @@ def _fp32_rowcta_k_fits(m: int, n: int, k: int) -> bool:
 # 16-byte loads), and K past the bounds of _fp32_rowcta_k_fits.
 register_kernel(
     "gemm",
-    "decode_gemv",
+    "mv",
     name="triton_rowcta_gemm_fp32",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),

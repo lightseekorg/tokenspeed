@@ -133,7 +133,7 @@ if platform.is_amd:
 
     @register_kernel(
         "gemm",
-        "decode_gemv",
+        "mv",
         name="gluon_mm_a16w16_decode_gfx950",
         solution="gluon",
         capability=_GFX950_CAPABILITY,
@@ -623,7 +623,7 @@ def _gfx1250_wmma_dense_problem(m: int, n: int, k: int) -> bool:
 
 @register_kernel(
     "gemm",
-    "decode_gemv",
+    "mv",
     name="gluon_wmma_dense_gemv_gfx1250",
     solution="gluon",
     capability=CapabilityRequirement(
@@ -684,7 +684,7 @@ def gluon_wmma_dense_gemv_gfx1250(
 # them.
 register_kernel(
     "gemm",
-    "decode_gemv",
+    "mv",
     name="gluon_simt_gemm_fp32",
     solution="gluon",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),

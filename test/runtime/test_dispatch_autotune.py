@@ -1141,17 +1141,17 @@ def test_decode_gemv_eligibility_preserves_fi_and_cdna5(
     api = _functions(
         KERNEL / "ops/gemm/__init__.py",
         None,
-        ("use_decode_gemv",),
+        ("use_mv",),
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
             flashinfer_joint_bf16_supported=lambda *args: fi,
             current_platform=lambda: SimpleNamespace(is_cdna5=cdna5),
-            _select_decode_gemv=select,
+            _select_mv=select,
             torch_decode_gemv=fallback,
         ),
     )
-    assert api.use_decode_gemv(tensor((m, k)), tensor((7168, k))) is expected
+    assert api.use_mv(tensor((m, k)), tensor((7168, k))) is expected
     if fi and m <= 32:
         select.assert_not_called()
 
@@ -1191,7 +1191,7 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
     api = _functions(
         KERNEL / "ops/gemm/__init__.py",
         None,
-        ("_select_decode_gemv",),
+        ("_select_mv",),
         dict(
             functools=functools,
             KernelRegistry=SimpleNamespace(get=lambda: registry),
@@ -1199,24 +1199,22 @@ def test_decode_gemv_selection_obeys_shape_traits(m, n, k, on_cuda, expected):
             spec_matches_traits=spec_matches_traits,
             spec_matches_shape_traits=spec_matches_shape_traits,
             torch_decode_gemv=fallback,
-            _DECODE_GEMV_SIGNATURES={(torch.bfloat16, torch.bfloat16): signature},
+            _MV_SIGNATURES={(torch.bfloat16, torch.bfloat16): signature},
         ),
     )
-    selected = api._select_decode_gemv(
-        m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False
-    )
+    selected = api._select_mv(m, n, k, on_cuda, torch.bfloat16, torch.bfloat16, False)
     assert selected is (impl if expected else fallback)
     if on_cuda:
         registry.get_for_operator.assert_called_once_with(
-            "gemm", "decode_gemv", platform=platform, format_signature=signature
+            "gemm", "mv", platform=platform, format_signature=signature
         )
     else:
         registry.get_for_operator.assert_not_called()
     # A dtype pair without a registry signature never reaches the registry.
     registry.get_for_operator.reset_mock()
-    assert api._select_decode_gemv(
-        m, n, k, on_cuda, torch.float16, torch.float16, False
-    ) is (fallback)
+    assert api._select_mv(m, n, k, on_cuda, torch.float16, torch.float16, False) is (
+        fallback
+    )
     registry.get_for_operator.assert_not_called()
 
 
@@ -1370,7 +1368,7 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
         dict(
             kernel_mm=mm,
             resolve_kernel_override=resolve_kernel_override,
-            use_decode_gemv=shortcut,
+            use_mv=shortcut,
         ),
     )
     x, weight = object(), object()
@@ -1392,7 +1390,7 @@ def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(serving):
     api = _functions(
         KERNEL / "ops/gemm/__init__.py",
         None,
-        ("use_decode_gemv", "decode_gemv"),
+        ("use_mv", "mv"),
         dict(
             torch=torch,
             BF16_GEMM_MAX_M=32,
@@ -1401,14 +1399,14 @@ def test_serving_sends_joint_bf16_rows_to_a_gemm_that_never_compiles(serving):
             flashinfer_bf16_gemm=joint,
             is_serving=lambda: serving,
             torch_decode_gemv=fallback,
-            _select_decode_gemv=select,
+            _select_mv=select,
         ),
     )
     x = torch.ones(1, 128, dtype=torch.bfloat16)
     w = torch.ones(32, 128, dtype=torch.bfloat16)
-    assert api.use_decode_gemv(x, w) is not serving
+    assert api.use_mv(x, w) is not serving
     used, idle = (fallback, joint) if serving else (joint, fallback)
-    assert api.decode_gemv(x, w) is used.return_value
+    assert api.mv(x, w) is used.return_value
     used.assert_called_once_with(x, w, None)
     idle.assert_not_called()
     select.assert_not_called()

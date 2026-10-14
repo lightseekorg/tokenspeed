@@ -8,7 +8,6 @@ from tokenspeed_kernel.ops.activation import situ_and_mul as kernel_situ_and_mul
 from tokenspeed_kernel.ops.gemm import (
     _use_gluon_largem,
     _use_gluon_mediumm,
-    decode_gemv,
 )
 from tokenspeed_kernel.ops.gemm import (
     kimi3_latent_projection as kernel_kimi3_latent_projection,
@@ -29,7 +28,8 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection as kernel_kimi3_shared_situ_projection,
 )
 from tokenspeed_kernel.ops.gemm import (
-    use_decode_gemv,
+    mv,
+    use_mv,
 )
 from tokenspeed_kernel.ops.moe import _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk
 from utils import is_cdna4
@@ -129,11 +129,9 @@ def test_decode_gemm_routes_measured_k3_shapes(
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
 
-    assert use_decode_gemv(x, w) is expected
+    assert use_mv(x, w) is expected
     if expected:
-        torch.testing.assert_close(
-            decode_gemv(x, w), torch.mm(x, w.T), rtol=2**-7, atol=1e-3
-        )
+        torch.testing.assert_close(mv(x, w), torch.mm(x, w.T), rtol=2**-7, atol=1e-3)
 
 
 @pytest.mark.parametrize("input_size,output_size", [(7168, 3584), (3584, 7168)])

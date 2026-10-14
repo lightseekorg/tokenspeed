@@ -111,7 +111,7 @@ def torch_mm_fp8_scaled(
 
 @register_kernel(
     "gemm",
-    "decode_gemv",
+    "mv",
     name="torch_decode_gemv",
     solution="torch",
     signatures=frozenset(

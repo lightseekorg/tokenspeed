@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""FP32 decode GEMM on CUDA cores for 17 to 96 rows (``decode_gemv``).
+"""FP32 decode GEMM on CUDA cores for 17 to 96 rows (``mv``).
 
 A narrow FP32 projection such as an expert router sees a few dozen rows per
 decode step. Torch serves those rows with an FP32 SGEMM, after an FP32 copy

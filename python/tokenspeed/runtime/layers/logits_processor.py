@@ -24,7 +24,7 @@ import dataclasses
 
 import torch
 from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
-from tokenspeed_kernel.ops.gemm import decode_gemv, use_decode_gemv
+from tokenspeed_kernel.ops.gemm import mv, use_mv
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     DistArgmaxState,
@@ -965,10 +965,8 @@ class LogitsProcessor(nn.Module):
                 )
             else:
                 cast_hidden = hidden_states.to(lm_head.weight.dtype)
-                if current_platform().is_amd and use_decode_gemv(
-                    cast_hidden, lm_head.weight
-                ):
-                    logits = decode_gemv(cast_hidden, lm_head.weight)
+                if current_platform().is_amd and use_mv(cast_hidden, lm_head.weight):
+                    logits = mv(cast_hidden, lm_head.weight)
                 elif self._use_fused_lm_head:
                     logits = _lm_head_matmul(cast_hidden, lm_head.weight)
                 else:
