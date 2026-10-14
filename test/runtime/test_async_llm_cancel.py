@@ -156,6 +156,7 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
                 "meta_info": {"id": obj.rid, "finish_reason": None},
             },
             stream=True,
+            cumulative=False,
         )
         state.event.set()
 

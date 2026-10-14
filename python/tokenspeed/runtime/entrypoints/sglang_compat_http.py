@@ -222,7 +222,7 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
         requested_version = body.get("weight_version")
         if requested_version is not None:
             requested_version = str(requested_version)
-        storage_backend = getattr(llm.server_args, "kvstore_storage_backend", None)
+        storage_backend = llm.server_args.kvstore_storage_backend
         if flush_cache and requested_version is None and storage_backend is not None:
             return {
                 "success": False,
@@ -284,7 +284,7 @@ async def update_weights_from_mooncake(request: Request) -> JSONResponse:
                 ),
             ),
             flush_cache=flush_cache,
-            storage_backend=getattr(llm.server_args, "kvstore_storage_backend", None),
+            storage_backend=llm.server_args.kvstore_storage_backend,
         )
         obj = UpdateWeightsFromMooncakeReqInput(
             version=version,
@@ -508,7 +508,7 @@ async def update_weight_version(request: Request) -> JSONResponse:
         if new_version is None:
             raise ValueError("Missing 'new_version' in request body")
         llm = _llm(request)
-        if getattr(llm.server_args, "kvstore_storage_backend", None) is not None:
+        if llm.server_args.kvstore_storage_backend is not None:
             raise ValueError(
                 "Direct weight-version changes are not supported with L3 storage; "
                 "use /update_weights_from_distributed with an explicit "

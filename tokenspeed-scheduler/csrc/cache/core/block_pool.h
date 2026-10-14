@@ -102,10 +102,6 @@ public:
     std::span<const std::int64_t> FreeSlotsByBucket(std::uint32_t group_id) const noexcept {
         return placement(group_id).free_slots_by_bucket;
     }
-    // Registered shard count, or 0 before registration.
-    std::int32_t NumBuckets(std::uint32_t group_id) const noexcept {
-        return static_cast<std::int32_t>(placement(group_id).parents_by_bucket.size());
-    }
 
     // Fix placement geometry before this group allocates any blocks. Repeated
     // registration is allowed only with the same geometry, including after free.

@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 
 import triton.experimental.gluon as g
-import triton.language as tl
 from lib.tal.host_device import host_device
 from triton.experimental.gluon import language as l
 
@@ -42,9 +41,6 @@ from typing import NamedTuple
 from lib.gemm.rocm.intrinsics import (
     BufferResource,
     _resource_content,
-    amdgcn_ds_swizzle,
-    amdgcn_mov_dpp,
-    amdgcn_shuffle,
     llvm_amdgcn_raw_buffer_load_v4i32,
 )
 from lib.moe.rocm.memory_ops import _load_vector4, _store_vector4
@@ -54,6 +50,7 @@ from lib.moe.rocm.ops.stage1_accumulator_lds import (
 )
 from lib.moe.rocm.quantization import AiterMxFp4Quantization, QuantizeMxFp4
 from lib.tal.device import DeviceTemplate, device_method
+from lib.tal.tensor_ops import group_gather, group_max
 
 
 class Quantized(NamedTuple):
@@ -94,9 +91,7 @@ class MxFp4ActivationQuantizer(DeviceTemplate):
     def Quantize(self, shm, row, col_lane):
         value = _load_vector4(shm + row * self.kTileCols + col_lane * 4)
         max_abs = AiterMxFp4Quantization.MaximumAbs(value)
-        max_abs = self.ReduceMaximum(max_abs, 0x041F)
-        max_abs = self.ReduceMaximum(max_abs, 0x081F)
-        max_abs = self.ReduceMaximum(max_abs, 0x101F)
+        max_abs = group_max(max_abs, 8)
         packed, scale = QuantizeMxFp4((value,), max_abs, AiterMxFp4Quantization, 1)
         return Quantized(packed[0], scale)
 
@@ -122,7 +117,7 @@ class MxFp4ActivationQuantizer(DeviceTemplate):
             + tile_n * (self.kTileCols // 2)
             + col_local // 2
         )
-        partner = amdgcn_mov_dpp(quantized.value.to(l.uint32), 0xB1, 0xF, 0xF, False)
+        partner = group_gather(quantized.value.to(l.uint32), col_lane ^ 1, 4)
         packed = quantized.value.to(l.uint32) | (partner << 16)
         BufferResource.StoreU32(
             workspace,
@@ -132,10 +127,10 @@ class MxFp4ActivationQuantizer(DeviceTemplate):
             kStoreScope | BufferResource.kNTBit,
             valid & ((col_lane & 1) == 0),
         )
-        scale0 = amdgcn_shuffle(quantized.scale, 0, 32)
-        scale1 = amdgcn_shuffle(quantized.scale, 8, 32)
-        scale2 = amdgcn_shuffle(quantized.scale, 16, 32)
-        scale3 = amdgcn_shuffle(quantized.scale, 24, 32)
+        scale0 = group_gather(quantized.scale, 0, 32)
+        scale1 = group_gather(quantized.scale, 8, 32)
+        scale2 = group_gather(quantized.scale, 16, 32)
+        scale3 = group_gather(quantized.scale, 24, 32)
         packed = scale0 | (scale1 << 8) | (scale2 << 16) | (scale3 << 24)
         scale_col = tile_n * (self.kTileCols // 32) + (col_lane // 32) * 4
         scale_offset = MxFp4ActivationLayout.ScaleOffset(
@@ -149,13 +144,6 @@ class MxFp4ActivationQuantizer(DeviceTemplate):
             kStoreScope,
             valid & ((col_lane & 31) == 0),
         )
-
-    @device_method
-    def ReduceMaximum(self, value, kPattern: l.constexpr):
-        bits = value.to(l.uint32, bitcast=True)
-        peer_bits = amdgcn_ds_swizzle(bits, kPattern)
-        peer = peer_bits.to(l.float32, bitcast=True)
-        return l.maximum(value, peer, propagate_nan=tl.PropagateNan.ALL)
 
 
 class Stage2Prefetch(NamedTuple):
@@ -261,8 +249,8 @@ class MxFp4Stage2Input(DeviceTemplate):
         scale4 = wtid >> 4
         shift = scale4 * 8
         return (
-            ((amdgcn_shuffle(loaded, row16) >> shift) & 0xFF)
-            | (((amdgcn_shuffle(loaded, row16 + 16) >> shift) & 0xFF) << 8)
-            | (((amdgcn_shuffle(loaded, row16 + 32) >> shift) & 0xFF) << 16)
-            | (((amdgcn_shuffle(loaded, row16 + 48) >> shift) & 0xFF) << 24)
+            ((group_gather(loaded, row16, 64) >> shift) & 0xFF)
+            | (((group_gather(loaded, row16 + 16, 64) >> shift) & 0xFF) << 8)
+            | (((group_gather(loaded, row16 + 32, 64) >> shift) & 0xFF) << 16)
+            | (((group_gather(loaded, row16 + 48, 64) >> shift) & 0xFF) << 24)
         )

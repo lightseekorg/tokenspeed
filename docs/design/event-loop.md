@@ -78,9 +78,8 @@ plane, where it feeds Principle 3's tail advance.
 Consequences:
 
 * The loop cannot **name** a model runner, backend or KV pool, so it cannot
-  pass one implicitly or mutate one a forward is still using. A test asserts
-  this over the AST of `EventLoop.__init__` — locals included, because a name
-  it can write is a name a later change can keep.
+  pass one implicitly or mutate one a forward is still using. Locals count
+  too: a name it can write is a name a later change can keep.
 * A new device interaction that runs once at startup belongs **inside the
   builder**; it belongs on `DeviceHandle` only when the running loop genuinely
   needs it — the second widens what the loop can do to the GPU mid-flight.
@@ -91,8 +90,7 @@ Consequences:
   stage/drain device half; the commit-side SHM release). A generic "run this
   closure" slot is the hole this whole design closes, so a second KIND of
   user does not join it — it gets its own name.
-  The architecture test pins the exact public operation names, not a numeric
-  size limit. L3 adds named Host-tier operations for the existence probe,
+  L3 adds named Host-tier operations for the existence probe,
   the prefetch lane's progress and completion (the hooks converge them each
   round), namespace and weight-version changes, and cache shutdown. These
   keep the executor and Host buffer hidden; they do not introduce another
@@ -128,8 +126,7 @@ Consequences:
   op). Both are rank-local on the handle. The rebalance may reduce the
   snapshot over the EP group because its ops ride the same-round gate
   (below), unlike the profile's dump.
-  Changing this surface requires updating both this contract and the explicit
-  operation allowlist in `test/runtime/test_device_handle.py`.
+  Changing this surface requires updating this contract.
 * The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing
   per role forced the handle to publish its own internals so the subclasses
   could call back into it — a reference cycle for about a dozen lines of
@@ -470,7 +467,15 @@ For orientation, one iteration of `event_loop`:
    completion event fences the forward thread's default stream here, before
    anything else of the plan is enqueued; an ordinary store's sources are
    pinned by the scheduler until the ACK, so its copy rides the write stream
-   and fences nothing -- then page zeroing (the new owner's sanitization),
+   and fences nothing -- then the plan's Device-to-Device block copies
+   (`pages_to_copy`: a prefix hit's private copy of the block holding its
+   boundary, an owner's move off the block it published at its prompt end;
+   the copy waits on the execution stream and precedes the zeroing because
+   a source may be re-granted and zeroed by this very plan -- or re-granted
+   as another copy's destination, which the arena then writes only after the
+   pairs reading it; a destination is never zeroed; no op id, no ACK), then
+   page zeroing (the new
+   owner's sanitization),
    then L3 prefetches (`PrefetchOp`: Host-lane submissions with no stream
    dependency, nothing in the round reads their pages), then the
    Device-bound copies -- `LoadBackOp` and `RestoreOp`, ordered

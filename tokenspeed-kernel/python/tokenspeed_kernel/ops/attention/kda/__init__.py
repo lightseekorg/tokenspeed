@@ -24,6 +24,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
@@ -39,8 +40,6 @@ from tokenspeed_kernel.signature import (
 )
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
-
-from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
@@ -149,7 +148,6 @@ def kda_paged_prefill(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
     capacity: KdaPrefillCapacity | None,
-    inputs_packed: bool,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -172,8 +170,6 @@ def kda_paged_prefill(
             chunk pipeline's stages).
         capacity: Explicit CuTeDSL graph planning bounds, or None for exact
             live-length planning. Live boundaries retain their normal meaning.
-        inputs_packed: The checkpoint packer produced contiguous Q/K/V and
-            beta with zero padding. Gate padding still requires initialization.
         lower_bound: Optional safe lower bound for log decay.
         override: Optional exact kernel name.
         solution: Optional registered solution name.
@@ -213,7 +209,6 @@ def kda_paged_prefill(
             raise ValueError("KDA capacity planning requires explicit cutedsl_kda")
         capacity.validate(cu_seqlens_cpu, q.shape[1])
         capacity_kwargs["capacity"] = capacity
-        capacity_kwargs["inputs_packed"] = inputs_packed
     kernel = select_kernel(
         "attention",
         "kda_paged_prefill",
@@ -371,46 +366,38 @@ def try_kda_fused_paged_decode(
         raise ValueError("output_gate and norm_weight must be provided together")
     if output_gate is not None and norm_eps is None:
         raise ValueError("norm_eps is required with fused KDA output normalization")
-    if recurrent_layout not in ("k_major", "v_major"):
-        raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
 
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
         v=mixed_qkv,
     )
+    traits = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "conv_kernel_size": conv_weights.shape[-1],
+        "paged_state": True,
+        "recurrent_layout": recurrent_layout,
+    }
     try:
         kernel = select_kernel(
             "attention",
             "kda_fused_paged_decode",
             signature,
-            traits={
-                "num_heads": num_heads,
-                "head_dim": head_dim,
-                "conv_kernel_size": conv_weights.shape[-1],
-                "fused_output_norm": output_gate is not None,
-                "paged_state": True,
-                "recurrent_layout": recurrent_layout,
-            },
+            traits={**traits, "fused_output_norm": output_gate is not None},
             solution=solution,
             override=override,
         )
     except NoKernelFoundError:
         if output_gate is None:
             return None
+        # Fall back to core fusion; the caller applies output normalization.
         try:
             kernel = select_kernel(
                 "attention",
                 "kda_fused_paged_decode",
                 signature,
-                traits={
-                    "num_heads": num_heads,
-                    "head_dim": head_dim,
-                    "conv_kernel_size": conv_weights.shape[-1],
-                    "fused_output_norm": False,
-                    "paged_state": True,
-                    "recurrent_layout": recurrent_layout,
-                },
+                traits={**traits, "fused_output_norm": False},
                 solution=solution,
                 override=override,
             )
@@ -491,11 +478,9 @@ def try_kda_fused_paged_verify(
     supports the current platform.
     """
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
-    if recurrent_layout not in ("k_major", "v_major"):
-        raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
-    split_producers = g_raw is not None or conv_qkv is not None
-    if split_producers and (g_raw is None or conv_qkv is None):
+    if (g_raw is None) != (conv_qkv is None):
         raise ValueError("g_raw and conv_qkv must be provided together")
+    split_producers = g_raw is not None
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -579,9 +564,9 @@ def kda_fused_paged_verify_uses_split_producers(
         "paged_state": True,
         "recurrent_layout": recurrent_layout,
         "store_states": store_states,
+        "num_heads": num_heads,
+        "head_dim": head_dim,
     }
-    traits["num_heads"] = num_heads
-    traits["head_dim"] = head_dim
     try:
         kernel = select_kernel(
             "attention", "kda_fused_paged_verify", signature, traits=traits

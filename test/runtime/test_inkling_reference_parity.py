@@ -20,7 +20,6 @@ Runs on the released config (layer-truncated, experts shrunk; see
 ``inkling_fixtures``) with dummy weights. Requires Blackwell (FA4).
 """
 
-import math
 import os
 import sys
 import unittest

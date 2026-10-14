@@ -77,7 +77,7 @@ class QSAIndexerBackend(AttentionBackend):
     # The indexer's break runs request-shaped writes eagerly and slices padded
     # token rows before building its live QSA layout.
     cuda_graph_support = CudaGraphSupport(prefill_graph=True)
-    cache_consumer_families = frozenset({"history"})
+    cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
     def __init__(self, config: AttnConfig, full_attn_backend: CacheGroupRouter) -> None:
         super().__init__(config, config.component(SoftmaxAttnConfig))

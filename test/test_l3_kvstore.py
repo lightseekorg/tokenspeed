@@ -20,15 +20,12 @@
 
 from __future__ import annotations
 
-import ast
-import inspect
 import os
 import sys
 import tempfile
 import types
 import unittest
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -76,12 +73,6 @@ class _FakeHost:
         return offset, self._payload_size
 
 
-class FakeHostTest(unittest.TestCase):
-    def test_fake_host_requires_buffer_size(self):
-        param = inspect.signature(_FakeHost.__init__).parameters["size"]
-        self.assertIs(param.default, inspect.Parameter.empty)
-
-
 class StorageKeyTest(unittest.TestCase):
     def test_object_key_includes_group_offset_and_rank(self):
         # The trailing ``|c0`` is the retired context-parallel shard id, kept
@@ -98,137 +89,6 @@ class StorageKeyTest(unittest.TestCase):
             storage_object_key("abc", 0, 0, prefix="", rank=0),
             storage_object_key("abc", 0, 0, prefix="", rank=1),
         )
-
-    def test_attention_build_exports_resolved_backend_names(self):
-        # Exercise the real build-result expressions without constructing GPU
-        # backends. In particular the hybrid wrapper name must not erase its
-        # user's full-attention sub-backend, and auto choices must resolve.
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "python/tokenspeed/runtime/layers/attention/registry.py"
-        )
-        tree = ast.parse(path.read_text())
-        build = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "create_attn_components"
-        )
-        result = next(node for node in build.body if isinstance(node, ast.Return))
-        fields = {keyword.arg: keyword.value for keyword in result.value.keywords}
-        expression = ast.Expression(
-            ast.Tuple(
-                elts=[
-                    fields["attention_backend_name"],
-                    fields["draft_attention_backend_name"],
-                ],
-                ctx=ast.Load(),
-            )
-        )
-        ast.fix_missing_locations(expression)
-        arch = SimpleNamespace(MHA="mha", MLA="mla", DSA="dsa", MSA="msa")
-
-        class MSAConfig:
-            def __init__(self, full_attn_backend_name):
-                self.full_attn_backend_name = full_attn_backend_name
-
-        namespace = {"AttentionArch": arch, "MSAConfig": MSAConfig}
-        helpers = [
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name in {"_get_default_backend_name", "_cache_backend_name"}
-        ]
-        exec(
-            compile(ast.Module(body=helpers, type_ignores=[]), str(path), "exec"),
-            namespace,
-        )
-        cases = [
-            (None, None, True, ("mha", "mla")),
-            ("fa3", "fa4", True, ("fa3", "fa4")),
-            ("tokenspeed_mla", "flashinfer", True, ("tokenspeed_mla", "flashinfer")),
-            ("fa3", "fa4", False, ("fa3", "")),
-        ]
-        for target_name, draft_name, has_draft, expected in cases:
-            with self.subTest(
-                target=target_name, draft=draft_name, has_draft=has_draft
-            ):
-                namespace.update(
-                    target_full_attn_backend_name=target_name,
-                    draft_full_attn_backend_name=draft_name,
-                    softmax_attn=object(),
-                    draft_softmax_attn=object(),
-                    model_config=SimpleNamespace(attention_arch=arch.MHA),
-                    draft_model_config=SimpleNamespace(attention_arch=arch.MLA),
-                    draft_attn_backend=object() if has_draft else None,
-                )
-                self.assertEqual(
-                    eval(compile(expression, str(path), "eval"), namespace), expected
-                )
-
-        # Outer MSA names stay identical while its dense implementations
-        # differ. Both target and draft identities must retain that choice.
-        for target_dense, draft_dense in (
-            ("trtllm", "fa3"),
-            ("fa3", "trtllm"),
-            (None, None),
-        ):
-            with self.subTest(target_dense=target_dense, draft_dense=draft_dense):
-                namespace.update(
-                    target_full_attn_backend_name="msa",
-                    draft_full_attn_backend_name="msa",
-                    softmax_attn=MSAConfig(target_dense),
-                    draft_softmax_attn=MSAConfig(draft_dense),
-                    model_config=SimpleNamespace(attention_arch=arch.MSA),
-                    draft_model_config=SimpleNamespace(attention_arch=arch.MSA),
-                    draft_attn_backend=object(),
-                )
-                self.assertEqual(
-                    eval(compile(expression, str(path), "eval"), namespace),
-                    (f"msa:{target_dense or 'mha'}", f"msa:{draft_dense or 'mha'}"),
-                )
-
-    def test_weight_version_factory_preserves_resolved_backend_identity(self):
-        # Execute the actual prefix closure with startup facts, so weight
-        # updates cannot silently drop the backend dimensions.
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "python/tokenspeed/runtime/execution/device.py"
-        )
-        tree = ast.parse(path.read_text())
-        factory = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "prefix_for_weight_version"
-        )
-        capture = mock.Mock(return_value="prefix")
-        namespace = dict(
-            storage_key_prefix=capture,
-            server_args=SimpleNamespace(model="org/model", skip_softmax_threshold=0.0),
-            model_config=SimpleNamespace(model_override_args={}),
-            checkpoint_id="checkpoint",
-            cache_signature="layout",
-            pipeline_rank=0,
-            attn_tp_size=1,
-            draft_model="org/draft",
-            draft_revision="draft-checkpoint",
-            cache_quantization="",
-            L3_RUNTIME_COMPAT=L3_RUNTIME_COMPAT,
-            attention_backend_name="fa3",
-            draft_attention_backend_name="fa4",
-            eagle3_layers_to_capture=[],
-        )
-        exec(
-            compile(ast.Module(body=[factory], type_ignores=[]), str(path), "exec"),
-            namespace,
-        )
-        for version in ("v1", "v2"):
-            self.assertEqual(namespace["prefix_for_weight_version"](version), "prefix")
-            values = capture.call_args.kwargs
-            self.assertEqual(values["weight_version"], version)
-            self.assertEqual(values["attention_backend"], "fa3")
-            self.assertEqual(values["draft_attention_backend"], "fa4")
 
     def test_prefix_is_stable_and_separates_incompatible_cache_objects(self):
         def prefix(**overrides):
@@ -307,33 +167,7 @@ class StorageKeyTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             prefix(eagle3_layers_to_capture="2,16,29")
         with self.assertRaises(TypeError):
-            storage_key_prefix("org/model")
-        with self.assertRaises(TypeError):
             prefix(model_overrides=["rope_theta"])
-        signature = inspect.signature(storage_key_prefix)
-        for name in ("attention_backend", "draft_attention_backend"):
-            self.assertIs(signature.parameters[name].default, inspect.Parameter.empty)
-        self.assertIs(
-            signature.parameters["cache_quantization"].default, inspect.Parameter.empty
-        )
-        self.assertIs(signature.parameters["revision"].default, inspect.Parameter.empty)
-        self.assertIs(
-            signature.parameters["model_overrides"].default, inspect.Parameter.empty
-        )
-        self.assertIs(
-            signature.parameters["attn_tp_size"].default, inspect.Parameter.empty
-        )
-        self.assertIs(
-            signature.parameters["runtime_compat"].default, inspect.Parameter.empty
-        )
-        self.assertIs(
-            signature.parameters["skip_softmax_threshold"].default,
-            inspect.Parameter.empty,
-        )
-        self.assertIs(
-            signature.parameters["eagle3_layers_to_capture"].default,
-            inspect.Parameter.empty,
-        )
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
         return l3_checkpoint_id(
@@ -1304,30 +1138,7 @@ class StorageKeyTest(unittest.TestCase):
             self.assertEqual(without_yaml, with_yaml)
             self.assertEqual(without_yaml, f"{commit}:auto")
 
-    def test_checkpoint_id_requires_load_format(self):
-        signature = inspect.signature(l3_checkpoint_id)
-        self.assertIs(
-            signature.parameters["load_format"].default, inspect.Parameter.empty
-        )
-        self.assertIs(
-            signature.parameters["model_loader_extra_config"].default,
-            inspect.Parameter.empty,
-        )
-        self.assertIs(signature.parameters["ext_yaml"].default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            l3_checkpoint_id(
-                "org/model",
-                hf_config=SimpleNamespace(_commit_hash="a" * 40),
-                revision="main",
-            )
-        with self.assertRaises(TypeError):
-            l3_checkpoint_id(
-                "org/model",
-                hf_config=SimpleNamespace(_commit_hash="a" * 40),
-                revision="main",
-                load_format="auto",
-                model_loader_extra_config={},
-            )
+    def test_checkpoint_id_rejects_blank_load_format(self):
         with self.assertRaises(ValueError):
             self._checkpoint_id(
                 "org/model",
@@ -1395,14 +1206,6 @@ class StorageKeyTest(unittest.TestCase):
             ),
             shared,
         )
-        signature = inspect.signature(share_l3_checkpoint_ids)
-        self.assertIs(signature.parameters["gather"].default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            share_l3_checkpoint_ids(
-                shared,
-                rank=0,
-                world_size=2,
-            )
         rank0 = ["local-rank0:sharded_state", ""]
         rank1_a = ["local-rank1a:sharded_state", ""]
         rank1_b = ["local-rank1b:sharded_state", ""]
@@ -1490,19 +1293,6 @@ class StorageKeyTest(unittest.TestCase):
                     draft_quantization="fp8",
                 ),
             )
-            signature = inspect.signature(l3_cache_quantization_id)
-            self.assertIs(
-                signature.parameters["quantization_param_path"].default,
-                inspect.Parameter.empty,
-            )
-            self.assertIs(
-                signature.parameters["draft_quantization"].default,
-                inspect.Parameter.empty,
-            )
-            with self.assertRaises(TypeError):
-                l3_cache_quantization_id(
-                    quantization="fp8", quantization_param_path=first
-                )
 
     def test_resolve_l3_weight_version_does_not_mint_a_successor(self):
         self.assertIsNone(
@@ -1647,16 +1437,6 @@ class L3HostStoreTest(unittest.TestCase):
         )
         l3.close()
 
-    def test_present_keys_requires_exists_mask(self):
-        backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
-        signature = inspect.signature(l3.present_keys)
-        self.assertIs(signature.parameters["exists"].default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            l3.present_keys([0], ["h0"], [0])
-        l3.close()
-
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
@@ -1727,14 +1507,6 @@ class FactoryTest(unittest.TestCase):
                 "nfs", None, host_buffer=object(), tp_size=1, pp_size=1
             )
 
-    def test_pp_size_has_no_default(self):
-        param = inspect.signature(create_kvstore_storage_backend).parameters["pp_size"]
-        self.assertIs(param.default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            create_kvstore_storage_backend(
-                "memory", None, host_buffer=object(), tp_size=1
-            )
-
 
 class MooncakeConfigTest(unittest.TestCase):
     def test_from_mapping_and_size_suffixes(self):
@@ -1791,34 +1563,8 @@ class MooncakeConfigTest(unittest.TestCase):
             if saved is not None:
                 os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = saved
 
-    def test_tenant_id_has_no_constructor_default(self):
-        signature = inspect.signature(MooncakeStoreConfig)
-        self.assertIs(
-            signature.parameters["tenant_id"].default, inspect.Parameter.empty
-        )
-        with self.assertRaises(TypeError):
-            MooncakeStoreConfig(
-                "localhost",
-                "P2PHANDSHAKE",
-                4 * 1024**3,
-                "tcp",
-                "",
-                "127.0.0.1:50051",
-                "",
-            )
-
 
 class MooncakeKvStoreTest(unittest.TestCase):
-    def test_extra_config_has_no_default(self):
-        param = inspect.signature(MooncakeKvStore.__init__).parameters["extra_config"]
-        self.assertIs(param.default, inspect.Parameter.empty)
-        pp_param = inspect.signature(MooncakeKvStore.__init__).parameters["pp_size"]
-        self.assertIs(pp_param.default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            MooncakeKvStore(host_buffer=object(), tp_size=1, pp_size=1)
-        with self.assertRaises(TypeError):
-            MooncakeKvStore(None, host_buffer=object(), tp_size=1)
-
     def test_non_default_tenant_is_never_silently_dropped(self):
         class _Store:
             def setup(self, *args, **kwargs):

@@ -99,7 +99,7 @@ def _layout(
                 offset=state_offset,
                 stride=page_stride_bytes,
             ),
-            family="state",
+            attn_kind="state",
         ),
         capacity=capacity,
         page_bytes=physical_page_bytes,
@@ -128,13 +128,14 @@ def _typed_layout(
     )
 
 
-def _op(*, state_page: int = 6, spec_candidate_ids=((),)):
+def _op(*, state_page: int = 6, spec_candidate_ids=((),), state_prefix_cached=False):
     tables = {
         "history": np.asarray([[1, 2, 3]], dtype=np.int32),
-        "state": np.asarray([[4, 5, state_page]], dtype=np.int32),
+        # The D lands the prompt-end state in its live slot; slot 0 is null.
+        "state": np.asarray([[0, state_page, -1]], dtype=np.int32),
     }
     # The remote-decode op is self-contained: the scheduler stamps the
-    # bootstrap token and drafter candidates onto its rows.
+    # bootstrap token, drafter candidates and the state-hit flag onto its rows.
     return make_operation(
         tables,
         request_ids=["request-0"],
@@ -144,6 +145,7 @@ def _op(*, state_page: int = 6, spec_candidate_ids=((),)):
         num_extends=lambda: 1,
         decode_input_ids=[42],
         spec_candidate_ids=[list(ids) for ids in spec_candidate_ids],
+        state_prefix_cached=[state_prefix_cached],
     )
 
 
@@ -504,6 +506,10 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
             plan=layout.plan,
             cache_group_specs=layout.group_specs,
             contract_binding=lambda: buffer,
+            field_address=lambda name: (
+                buffer.data_ptr() + layout.plan.field_page_byte_offset(name, 0)
+            ),
+            registration_regions=lambda: ((buffer.data_ptr(), buffer.nbytes),),
         ),
     )
 
@@ -530,7 +536,13 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
     assert kv_args.kv_data_ptr == buffer.data_ptr()
     assert kv_args.ib_device == "mlx5_0"
     assert kv_args.gpu_id == 0
-    assert kv_args.cache_layout == layout
+    assert kv_args.cache_layout.plan == layout.plan
+    assert kv_args.cache_layout.group_specs == layout.group_specs
+    assert kv_args.cache_layout.transfer_schema == layout.transfer_schema
+    for field in layout.plan.fields:
+        assert kv_args.cache_layout.field_address(
+            buffer.data_ptr(), field.field_id
+        ) == buffer.data_ptr() + layout.plan.field_page_byte_offset(field.field_id, 0)
     assert kv_args.cache_producer_schedule.fields_by_step == (
         ("layer.0.kv",),
         ("layer.1.state",),
@@ -594,7 +606,7 @@ def test_terminal_events_clear_transport_room_state(
 
     assert len(decode.generate_events()) == 1
     assert decode.pop_remote_cache_slot("request") == 7
-    assert decode.pop_remote_cached_tokens("request") == max(2, remote_hits)
+    assert decode.pop_remote_cached_tokens("request") == remote_hits
     assert decode.pop_remote_bootstrap_logprob("request") == -0.25
     assert decode.pop_remote_spec_candidate_ids("request") == (7, [1])
     assert decode._admissions == {}
@@ -656,7 +668,18 @@ def test_decode_publishes_manifest_through_contract_receiver() -> None:
     args, kwargs = calls[0]
     assert args == ()
     assert kwargs["block_manifest"].groups[0].block_ids == (2, 3)
-    assert executor._admissions == {"request-0": (7, 2)}
+    assert kwargs["block_manifest"].groups[1].block_ids == (6,)
+    assert kwargs["block_manifest"].state_prefix_cached is False
+    assert executor._admissions == {"request-0": 7}
+
+    # A D-local state hit at the prompt end: the manifest carries the flag
+    # and no state block for the P to fill.
+    calls.clear()
+    executor.receivers = {"request-0": receiver}
+    executor._cache_prefill(_op(state_prefix_cached=True))
+    manifest = calls[0][1]["block_manifest"]
+    assert manifest.state_prefix_cached is True
+    assert manifest.groups[1].block_ids == ()
 
 
 def test_prefill_submits_manifest_through_contract_sender() -> None:
@@ -826,7 +849,10 @@ def test_shared_manager_executes_strided_cache_tp_fragment() -> None:
     ]
 
 
-def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
+@pytest.mark.parametrize("physical_addresses", [False, True])
+def test_transfer_blocks_for_many_pages_match_the_per_page_geometry(
+    physical_addresses,
+) -> None:
     # Two fields and hundreds of pages: the generator resolves each field's
     # geometry once and expands pages in bulk, so check it against the plain
     # per-page formula in both the whole-field and the fragment path.
@@ -843,6 +869,23 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
 
     source_layout = two_field_layout(700)
     destination_layout = two_field_layout(900)
+    if physical_addresses:
+        # Mixed arenas advertise each field's landing address independently
+        # of the logical plane offsets and the endpoint's registration base.
+        source_layout = replace(
+            source_layout,
+            field_addresses={
+                field.field_id: 0x100000 * (i + 1)
+                for i, field in enumerate(source_layout.plan.fields)
+            },
+        )
+        destination_layout = replace(
+            destination_layout,
+            field_addresses={
+                field.field_id: 0x1000000 * (i + 1)
+                for i, field in enumerate(destination_layout.plan.fields)
+            },
+        )
     pages = 300
     src_pages = tuple(range(1, 2 * pages, 2))
     dst_pages = tuple(range(899, 899 - 2 * pages, -2))
@@ -852,7 +895,7 @@ def test_transfer_blocks_for_many_pages_match_the_per_page_geometry() -> None:
     def field_pages(layout, ptr, field_id, page_ids):
         segment = next(f for f in layout.plan.fields if f.field_id == field_id)
         return [
-            ptr + layout.plan.field_page_byte_offset(field_id, page)
+            layout.field_address(ptr, field_id) + page * segment.page_stride_bytes
             for page in page_ids
         ], segment.payload_bytes
 
@@ -1291,6 +1334,7 @@ def test_fallback_write_batches_expanded_row_sges(
 
 
 def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> None:
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
     from tokenspeed.runtime.pd.base.status import TransferPoll
 
     source_manifest = _single_group_block_manifest("history", (1,))
@@ -1321,7 +1365,7 @@ def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> 
             (endpoint, port, room, status, rank, kwargs)
         )
     )
-    manager.kv_transfer_metrics = None
+    manager.kv_transfer_metrics = KVTransferMetrics({}, enabled=False)
     manager.topology = _topology()
 
     with pytest.raises(_StopWorker):
@@ -1747,10 +1791,20 @@ def test_kvp_pd_copies_logical_history_between_independently_allocated_pages(
         destination_tables
     )
     src_manifest = build_cache_block_manifest(
-        source_op, layout=source, request_row=0, prefix_len=2, prompt_len=9
+        source_op,
+        layout=source,
+        request_row=0,
+        prefix_len=2,
+        prompt_len=9,
+        state_prefix_cached=False,
     )
     dst_manifest = build_cache_block_manifest(
-        destination_op, layout=destination, request_row=0, prefix_len=2, prompt_len=9
+        destination_op,
+        layout=destination,
+        request_row=0,
+        prefix_len=2,
+        prompt_len=9,
+        state_prefix_cached=False,
     )
     validate_cache_manifest(src_manifest, layout=source, peer="source")
     validate_cache_manifest(dst_manifest, layout=destination, peer="destination")
@@ -1805,6 +1859,7 @@ def test_kvp_pd_copies_logical_history_between_independently_allocated_pages(
                         prompt_len=9,
                         chunk_start=chunk[0],
                         chunk_end=chunk[1],
+                        state_prefix_cached=False,
                     )
                 )
                 copies = manager._cache_transfer_blocks(
@@ -1888,6 +1943,7 @@ def test_kvp_pd_manifest_preserves_virtual_ids_and_checks_virtual_bounds():
         request_row=0,
         prefix_len=0,
         prompt_len=1,
+        state_prefix_cached=False,
     )
     validate_cache_manifest(manifest, layout=restored, peer="decode")
     assert manifest.groups[0].block_ids[0] >= restored.plan.group("kv").page_count
@@ -1899,6 +1955,7 @@ def test_kvp_pd_manifest_preserves_virtual_ids_and_checks_virtual_bounds():
             request_row=0,
             prefix_len=0,
             prompt_len=1,
+            state_prefix_cached=False,
         )
 
 
@@ -2157,3 +2214,45 @@ def test_every_sharded_prefill_rank_serves_every_decode_rank() -> None:
                 ),
             )
         )
+
+
+def test_bootstrap_layout_excludes_rank_local_field_addresses():
+    from dataclasses import replace
+
+    from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVBootstrapServer
+    from tokenspeed.runtime.pd.mooncake.entities import KVArgs
+
+    layout = _layout()
+    names = tuple(f.field_id for f in layout.plan.fields)
+    bootstrap = object.__new__(MooncakeKVBootstrapServer)
+    bootstrap.prefill_cache_layout_wire = None
+    bootstrap.prefill_cache_fields_by_stage = None
+    wires = []
+    for rank in range(2):
+        bound = replace(
+            layout,
+            field_addresses={
+                name: 0x1000 * (rank + 1) + i * 128 for i, name in enumerate(names)
+            },
+        )
+        args = KVArgs(
+            engine_rank=rank,
+            kv_data_ptr=0x1000,
+            ib_device="",
+            gpu_id=rank,
+            cache_layout=bound,
+            cache_fields_by_stage=(names,),
+        )
+        wire = args.wire_layout.to_wire_bytes().decode("ascii")
+        wires.append(wire)
+        bootstrap._ingest_put_extra(
+            {
+                "cache_layout": wire,
+                "cache_fields_by_stage": [list(names)],
+                "pp_size": 1,
+            }
+        )
+        # Endpoint registration still retains this rank's actual landing addresses.
+        assert args.cache_layout.field_addresses == bound.field_addresses
+        assert args.wire_layout.field_addresses is None
+    assert wires[0] == wires[1]

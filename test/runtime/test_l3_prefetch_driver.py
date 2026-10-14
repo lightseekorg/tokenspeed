@@ -77,8 +77,7 @@ def _scheduler() -> ts.Scheduler:
             group_id="history",
             block_granularity=PAGE,
             total_pages=64 + 1,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         )
     ]
     return ts.Scheduler(

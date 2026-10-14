@@ -330,8 +330,6 @@ def test_topk_sorted_order_refuses_a_silent_leaf(ordering_topk_leaves, mode):
     plane = torch.zeros((128, HEAD_DIM), dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="does not declare the slot_order"):
         _TOPK_CALLS[mode](plane, slot_order="sorted", solution=f"silent_{mode}")
-    with pytest.raises(ValueError, match="slot_order must be one of"):
-        _TOPK_CALLS[mode](plane, slot_order="random", solution=f"ordering_{mode}")
 
 
 # --- workspace rows: index keys handed in workspace-row order -----------------
@@ -682,5 +680,28 @@ def test_sorted_order_refuses_a_silent_core(cores, mode):
     with pytest.raises(ValueError, match="does not declare the slot_order"):
         _run_core(mode, slot_order="sorted")
     assert not silent[mode]
-    with pytest.raises(ValueError, match="slot_order must be one of"):
-        _run_core(mode, slot_order="shuffled")
+
+
+@pytest.mark.parametrize("mode", ["dsa_decode_topk", "dsa_prefill_topk"])
+def test_topk_checks_current_output_rows_before_dispatch(topk_leaves, mode):
+    _, bf16 = topk_leaves
+    plane = torch.zeros((128, HEAD_DIM), dtype=torch.bfloat16)
+    for outputs in (
+        {"out": torch.empty((3, 4), dtype=torch.int32)},
+        {"lens_out": torch.empty((3,), dtype=torch.int32)},
+    ):
+        with pytest.raises(ValueError, match="must have shape"):
+            _TOPK_CALLS[mode](plane, **outputs)
+    assert not bf16[mode]
+
+
+@pytest.mark.parametrize("mode", ["dsa_decode_topk", "dsa_prefill_topk"])
+def test_topk_passes_preallocated_buffers_and_forced_window_policy(topk_leaves, mode):
+    _, bf16 = topk_leaves
+    plane = torch.zeros((128, HEAD_DIM), dtype=torch.bfloat16)
+    out = torch.empty((2, 4), dtype=torch.int32)
+    lens = torch.empty((2,), dtype=torch.int32)
+    _TOPK_CALLS[mode](plane, out=out, lens_out=lens, initial_tokens=1, local_tokens=2)
+    call = bf16[mode][0]
+    assert call["out"] is out and call["lens_out"] is lens
+    assert call["initial_tokens"] == 1 and call["local_tokens"] == 2

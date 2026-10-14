@@ -39,7 +39,7 @@ from tokenspeed_kernel.ops.residual import (
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.registry import KernelRegistry
-from utils import assert_no_triton_compile
+from utils import assert_no_triton_compile, is_cdna4
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="a CUDA/ROCm device is required"
@@ -805,6 +805,8 @@ def test_hc_mix_has_only_fused_and_general_implementations() -> None:
     expected = {"triton_hyperconnection_mix"}
     if cute_fused._AVAILABLE:
         expected.add("cute_fused_hyperconnection_mix")
+    if current_platform().is_amd:
+        expected.add("gluon_hyperconnection_mix_gfx950")
     kernels = KernelRegistry.get().list_kernels("residual", "hyperconnection_mix")
     assert {kernel.name for kernel in kernels} == expected
 
@@ -826,7 +828,14 @@ def test_unsupported_fused_contract_uses_general_fallback(monkeypatch, reason) -
     capture = ShapeCapture.get()
     capture.enabled = True
     actual = _mix(values, override=None, projection_scale=1.0, weights_independent=True)
-    assert capture._records[-1].kernel_name == "triton_hyperconnection_mix"
+    # GFX950 serves contiguous 16-bit decode batches with its own two-launch
+    # mix; every other platform or contract takes the GEMM-plus-epilogue path.
+    gfx950_mix = reason in ("capacity", "unavailable") and is_cdna4()
+    assert capture._records[-1].kernel_name == (
+        "gluon_hyperconnection_mix_gfx950"
+        if gfx950_mix
+        else "triton_hyperconnection_mix"
+    )
     _assert_mix_close(actual, values, 1.0, 0.04)
 
 

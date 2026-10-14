@@ -126,18 +126,15 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.models.deepseek_v4 import (
-    DeepseekV4ForCausalLM,
-    DeepseekV4MLP,
-    DeepseekV4MoE,
-)
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
     is_engram_embed_checkpoint_name,
     resolve_engram_host_layout,
 )
+from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP, DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
+from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -1738,8 +1735,10 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
-        return DeepseekV4ForCausalLM.get_model_config_for_expert_location(
-            config.text_config
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.n_routed_experts,
+            num_groups=getattr(config.text_config, "n_group", 0),
         )
 
     def resolve_model(self, config, mapping, quant_config, prefix):

@@ -49,7 +49,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from tokenspeed.runtime.models.deepseek_v4_dspark import DeepseekV4DSparkModel
 from tokenspeed.runtime.models.deepseek_v4_dspark_ops.heads import DSparkVanillaMarkov
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
@@ -214,7 +213,30 @@ class _WindowAttention:
 
 
 class DeepseekV41DSparkModel(DeepseekV41Model):
-    local_base_logits = DeepseekV4DSparkModel.local_base_logits
+    def local_base_logits(
+        self,
+        hidden_states: torch.Tensor,
+        head: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute public FP32 base logits from the local vocabulary shard.
+
+        ``head`` is the target's BF16 shard shared with the draft. BF16
+        products are exact in FP32, so accumulating them in FP32 reproduces
+        the reference's FP32 head GEMM up to summation order without keeping
+        an FP32 copy of the head.
+        """
+
+        if head.ndim != 2 or head.dtype != hidden_states.dtype:
+            raise ValueError(
+                "DSpark base logits need a rank-2 head in the hidden dtype; got "
+                f"{tuple(head.shape)} {head.dtype} for {hidden_states.dtype}."
+            )
+        flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+        if flat.is_cuda:
+            logits = torch.mm(flat, head.T, out_dtype=torch.float32)
+        else:
+            logits = flat.float() @ head.float().T
+        return logits.view(*hidden_states.shape[:-1], head.shape[0])
 
     def __init__(self, config, mapping, quant_config, prefix):
         if mapping.attn.dp_size != 1 or mapping.pp_size != 1:

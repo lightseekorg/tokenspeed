@@ -100,23 +100,16 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
     return decode(std::move(state));
 }
 
-template <typename State>
-Finished FinishEvent::finish(State&& state) {
-    _assert(coordinator_ != nullptr, "FinishEvent requires a cache coordinator");
-    FreeRequest(*coordinator_, state.resources.block_tables);
-    return Finished{};
+Finishing FinishEvent::operator()(PrefillDone&& state) {
+    return Finishing{std::move(state.resources)};
 }
 
-Finished FinishEvent::operator()(PrefillDone&& state) {
-    return finish(std::move(state));
+Finishing FinishEvent::operator()(PrefillAwaitingResult&& state) {
+    return Finishing{std::move(state.resources)};
 }
 
-Finished FinishEvent::operator()(PrefillAwaitingResult&& state) {
-    return finish(std::move(state));
-}
-
-Finished FinishEvent::operator()(Decoding&& state) {
-    return finish(std::move(state));
+Finishing FinishEvent::operator()(Decoding&& state) {
+    return Finishing{std::move(state.resources)};
 }
 
 Finished FinishEvent::operator()(Retracted&&) {
@@ -124,7 +117,16 @@ Finished FinishEvent::operator()(Retracted&&) {
 }
 
 Finished FinishEvent::operator()(Restoring&& state) {
-    return finish(std::move(state));
+    _assert(coordinator_ != nullptr, "FinishEvent requires a cache coordinator");
+    FreeRequest(*coordinator_, state.resources.block_tables);
+    return Finished{};
+}
+
+Finished ReleaseEvent::operator()(Finishing&& state) {
+    _assert(coordinator_ != nullptr, "ReleaseEvent requires a cache coordinator");
+    _assert(state.resources.results_in_flight == 0, "a request is released only once its forwards have landed");
+    FreeRequest(*coordinator_, state.resources.block_tables);
+    return Finished{};
 }
 
 Finished AbortEvent::operator()(Bootstrapping&&) {
@@ -163,6 +165,10 @@ Finished AbortEvent::operator()(PrefillAwaitingResult&& state) {
 }
 
 Finished AbortEvent::operator()(Decoding&& state) {
+    return abortForward(std::move(state));
+}
+
+Finished AbortEvent::operator()(Finishing&& state) {
     return abortForward(std::move(state));
 }
 

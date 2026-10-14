@@ -48,13 +48,13 @@ _pcs = _load_cache_spec()
 
 
 class FakeGroupSpec:
-    def __init__(self, family: str):
-        self.family = family
+    def __init__(self, attn_kind: str):
+        self.attn_kind = attn_kind
 
 
 class FakeContract:
-    def __init__(self, *families: str):
-        self.group_specs = tuple(FakeGroupSpec(f) for f in families)
+    def __init__(self, *attn_kinds: str):
+        self.group_specs = tuple(FakeGroupSpec(k) for k in attn_kinds)
 
 
 class FakePool:
@@ -64,41 +64,41 @@ class FakePool:
 
 
 class HistoryBackend:
-    cache_consumer_families = frozenset({"history"})
+    cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
+
+
+class FullOnlyBackend:
+    cache_consumer_attn_kinds = frozenset({"full_history"})
 
 
 class HybridBackend:
-    cache_consumer_families = frozenset({"history", "state"})
+    cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window", "state"})
 
 
 class ValidateSchedulerConfigTest(unittest.TestCase):
-    def test_covered_families_pass(self):
+    def test_covered_kinds_pass(self):
         _pcs.validate_scheduler_config(
             attn_backend=HistoryBackend(),
-            kv_pool=FakePool(FakeContract("history")),
+            kv_pool=FakePool(FakeContract("full_history", "sliding_window")),
         )
         _pcs.validate_scheduler_config(
             attn_backend=HybridBackend(),
-            kv_pool=FakePool(FakeContract("history", "state")),
+            kv_pool=FakePool(FakeContract("full_history", "state")),
         )
 
-    def test_missing_family_rejected(self):
+    def test_missing_kind_rejected(self):
         # A hybrid pool's state group has no consumer in a history-only
         # backend; its tables would go unread.
         with self.assertRaisesRegex(RuntimeError, r"missing \['state'\]"):
             _pcs.validate_scheduler_config(
                 attn_backend=HistoryBackend(),
-                kv_pool=FakePool(FakeContract("history", "state")),
+                kv_pool=FakePool(FakeContract("full_history", "state")),
             )
-
-    def test_backend_without_declared_families_rejected(self):
-        class UndeclaredBackend:
-            pass
-
-        with self.assertRaisesRegex(RuntimeError, "consumer families"):
+        # A backend that reads only full-history rows cannot serve a window.
+        with self.assertRaisesRegex(RuntimeError, r"missing \['sliding_window'\]"):
             _pcs.validate_scheduler_config(
-                attn_backend=UndeclaredBackend(),
-                kv_pool=FakePool(FakeContract("history")),
+                attn_backend=FullOnlyBackend(),
+                kv_pool=FakePool(FakeContract("full_history", "sliding_window")),
             )
 
 

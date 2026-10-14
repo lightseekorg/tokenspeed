@@ -92,19 +92,9 @@ def _segment(
     )
 
 
-def _group(
-    group_id,
-    family,
-    *segments,
-    retention="full_history",
-    sliding_window_tokens: int | None = None,
-):
+def _group(group_id, attn_kind, *segments, sliding_window_tokens: int | None = None):
     return make_group(
-        group_id,
-        *segments,
-        family=family,
-        retention=retention,
-        window=sliding_window_tokens,
+        group_id, *segments, attn_kind=attn_kind, window=sliding_window_tokens
     )
 
 
@@ -112,7 +102,7 @@ def _grouped_groups():
     return (
         _group(
             "history",
-            "history",
+            "full_history",
             _segment("layer.0.kv", producer_step=0, page_zero_offset=0),
         ),
         _group(
@@ -141,8 +131,8 @@ def test_group_aware_two_chunk_history_and_state_selection() -> None:
     layout = _grouped_layout()
     tables = {
         "history": np.asarray([[1, 2, 3, 4]], dtype=np.int32),
-        "state-a": np.asarray([[5, 6, 7, 8]], dtype=np.int32),
-        "state-b": np.asarray([[9, 10, 11, 12]], dtype=np.int32),
+        "state-a": np.asarray([[5, 8, -1, -1]], dtype=np.int32),
+        "state-b": np.asarray([[0, 12, -1, -1]], dtype=np.int32),
     }
     operation = SimpleNamespace(block_tables_arrays=lambda: tables)
     first = build_cache_layerwise_block_selection(
@@ -153,6 +143,7 @@ def test_group_aware_two_chunk_history_and_state_selection() -> None:
         prompt_len=7,
         chunk_start=0,
         chunk_end=4,
+        state_prefix_cached=False,
     )
     assert first.groups == (
         CachePDLayerwiseGroupSelection((2,), (0,)),
@@ -167,11 +158,28 @@ def test_group_aware_two_chunk_history_and_state_selection() -> None:
         prompt_len=7,
         chunk_start=4,
         chunk_end=7,
+        state_prefix_cached=False,
     )
+    # The final chunk sends each state group's live slot: the prompt-end state.
     assert final.groups == (
         CachePDLayerwiseGroupSelection((3, 4), (1, 2)),
         CachePDLayerwiseGroupSelection((8,), (0,)),
         CachePDLayerwiseGroupSelection((12,), (0,)),
+    )
+    cached = build_cache_layerwise_block_selection(
+        operation,
+        layout=layout,
+        request_row=0,
+        prefix_len=2,
+        prompt_len=7,
+        chunk_start=4,
+        chunk_end=7,
+        state_prefix_cached=True,
+    )
+    assert cached.groups == (
+        CachePDLayerwiseGroupSelection((3, 4), (1, 2)),
+        CachePDLayerwiseGroupSelection((), ()),
+        CachePDLayerwiseGroupSelection((), ()),
     )
 
 
@@ -325,7 +333,7 @@ def _ordinary_layerwise_group():
             "layer.4.v", producer_step=4, page_zero_offset=96, page_stride_bytes=128
         ),
     )
-    return _group("history", "history", *segments)
+    return _group("history", "full_history", *segments)
 
 
 def _ordinary_layerwise_layout() -> CacheTransferContract:
@@ -339,7 +347,7 @@ def _ordinary_layerwise_layout() -> CacheTransferContract:
 def _draft_final_group():
     return _group(
         "history",
-        "history",
+        "full_history",
         _segment(
             "layer.0.kv",
             producer_step=0,
@@ -464,7 +472,7 @@ def _heterogeneous_groups(*, destination: bool):
     return (
         _group(
             "history",
-            "history",
+            "full_history",
             _segment("layer.0.latent", producer_step=0, page_zero_offset=0),
         ),
         _group(
@@ -547,6 +555,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
 
 
 def _layerwise_fanout_context():
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     layout = _ordinary_layerwise_layout()
@@ -580,7 +589,7 @@ def _layerwise_fanout_context():
         for rank, request in enumerate(requests)
     }
     manager.layerwise_debug = False
-    manager.kv_transfer_metrics = None
+    manager.kv_transfer_metrics = KVTransferMetrics({}, enabled=False)
     manager.session_failures = defaultdict(int)
     return manager, requests
 

@@ -20,7 +20,7 @@
 
 """Attention head TP over the query shards of a prefill engine, on CPU over gloo.
 
-Four ranks, attention TP 4 with ``--prefill-context-parallel-size 4`` and
+Four ranks, attention TP 4 with ``--query-context-parallel-size 4`` and
 ``--attn-head-tp-size 4``: the head group is the shard group. The reference
 is the same mapping without head TP -- head-replicated q_b / kv_b / o_proj,
 QCP's default -- so the exchanges, the shard row tables, the prologue's

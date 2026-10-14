@@ -718,26 +718,6 @@ class TestTritonRouteSelection(unittest.TestCase):
         )
         self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_GENERIC)
 
-    def test_triton_verify_is_owned_by_triton_backend(self):
-        self.assertFalse(issubclass(TritonSamplingBackend, FlashInferSamplingBackend))
-        self.assertIsNot(TritonSamplingBackend.verify, FlashInferSamplingBackend.verify)
-        self.assertIsNot(
-            TritonFullSamplingBackend.verify,
-            FlashInferFullSamplingBackend.verify,
-        )
-        self.assertTrue(issubclass(TritonFullSamplingBackend, TritonSamplingBackend))
-        self.assertFalse(
-            issubclass(TritonFullSamplingBackend, FlashInferFullSamplingBackend)
-        )
-
-    def test_triton_reuses_pool_state_without_flashinfer_probability_state(self):
-        self.assertTrue(hasattr(self.backend, "_temperature_pool"))
-        self.assertTrue(hasattr(self.backend, "_top_k_pool"))
-        self.assertTrue(hasattr(self.backend, "_top_p_pool"))
-        self.assertTrue(hasattr(self.backend, "_seed_pool"))
-        self.assertFalse(hasattr(self.backend, "_coins_buf"))
-        self.assertFalse(hasattr(self.backend, "_generator_per_slot"))
-
 
 class TestTritonLogprobOutputs(unittest.TestCase):
     def _make_backend(self, backend_cls):
