@@ -58,14 +58,6 @@ people and average people is more than tenfold.
   commit any formatter changes it makes.
 * When creating commits, perform sign off on behalf of the author.
 
-## Code review
-
-When Codex or Claude Code reviews code changes, consult these references for
-the languages involved:
-
-* For C++ changes, consult the
-  [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines).
-
 ## Design principles
 
 TokenSpeed values one scheduling path and one execution path. Prefill/decode
