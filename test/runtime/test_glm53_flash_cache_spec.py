@@ -287,7 +287,7 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
     # linear-attention state group holds its fixed per-request working set.
     assert pages[FULL_ATTENTION] == 131_072 // 64 + 16
     state_ids = [
-        spec.group_id for spec in recipe._group_specs if spec.family == "state"
+        spec.group_id for spec in recipe._group_specs if spec.attn_kind == "state"
     ]
     assert state_ids and all(pages[gid] == 16 * 4 for gid in state_ids)
     expected = sum(-(-pages[gid] // packing[gid]) for gid in pages)

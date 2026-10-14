@@ -39,11 +39,11 @@ from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
 
 
-def _pool(tag, *, family="history"):
+def _pool(tag, *, attn_kind="full_history"):
     return SimpleNamespace(
         arena=SimpleNamespace(
             runtime_contract=SimpleNamespace(
-                tag=tag, group_specs=(SimpleNamespace(family=family),)
+                tag=tag, group_specs=(SimpleNamespace(attn_kind=attn_kind),)
             ),
             cache_group_specs=(f"{tag} spec",),
             cache_group_page_counts={f"{tag} group": 3},
@@ -54,7 +54,7 @@ def _pool(tag, *, family="history"):
 class _Holder:
     """A backend, drafter or context producer; logs what it is handed."""
 
-    cache_consumer_families = ("history",)
+    cache_consumer_attn_kinds = ("full_history", "sliding_window")
 
     def __init__(self, name, log, pool=None):
         self.name, self.log, self.token_to_kv_pool = name, log, pool
@@ -167,7 +167,7 @@ def test_a_rebind_republishes_every_holder_onto_the_new_pools(monkeypatch, with_
 def test_a_rebind_to_an_unconsumable_pool_fails_where_it_happens(monkeypatch):
     executor = _executor(monkeypatch, [], with_draft=False)
     with pytest.raises(RuntimeError, match="missing"):
-        executor.set_cache_pool(_pool("real", family="state"), None)
+        executor.set_cache_pool(_pool("real", attn_kind="state"), None)
 
 
 @pytest.mark.parametrize("spec_algo", ["DFLASH", "DSPARK"])

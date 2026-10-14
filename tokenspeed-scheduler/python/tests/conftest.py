@@ -37,11 +37,8 @@ def _make_k3_config() -> "ts.SchedulerConfig":
                 cfg.prefix_granularity if group_id == K3_HISTORY_GROUP else 0
             ),
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=(
-                ts.CacheGroupFamily.History
-                if group_id == K3_HISTORY_GROUP
-                else ts.CacheGroupFamily.State
+            attn_kind=(
+                ts.AttnKind.Full if group_id == K3_HISTORY_GROUP else ts.AttnKind.State
             ),
         )
         for group_id in K3_GROUP_IDS

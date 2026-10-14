@@ -1253,7 +1253,7 @@ def test_recipe_exact_geometry_capacity_and_dispatch():
     assert dict(layout.group_packing) == dict(V41_CACHE_FORMATS["v41"].group_packing)
     specs = {s.group_id: s for s, _ in recipe.groups()}
     assert [specs[g].block_granularity for g in V41_GROUP_GEOMETRY] == [64, 128, 64, 2]
-    assert all(s.family == "history" for s in specs.values())
+    assert all(s.attn_kind != "state" for s in specs.values())
     assert specs[SWA].sliding_window_tokens == 128
     assert specs[TAIL].sliding_window_tokens == 2
     payload = {

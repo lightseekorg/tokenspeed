@@ -34,14 +34,14 @@ class TestInklingCacheContract(unittest.TestCase):
         )
 
         class HistoryBackend:
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
         backend.inner = HistoryBackend()
 
         self.assertEqual(
-            backend.cache_consumer_families,
-            frozenset({"history", "state"}),
+            backend.cache_consumer_attn_kinds,
+            frozenset({"full_history", "sliding_window", "state"}),
         )
 
     def test_remote_restore_pending_is_consumed_once_and_cleared_on_reuse(self):

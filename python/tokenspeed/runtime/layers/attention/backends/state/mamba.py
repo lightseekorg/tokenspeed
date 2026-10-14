@@ -265,12 +265,12 @@ _StateLayerGeometry = tuple[
 class MambaAttnBackend(AttentionBackend):
     """Attention backend for Mamba/GDN linear attention layers."""
 
-    # This backend consumes state-family tables (two slots per request, see
-    # ``state.checkpoint``); history-family groups belong to the
+    # This backend consumes state tables (two slots per request, see
+    # ``state.checkpoint``); history groups belong to the
     # full-attention sub-backend. The hybrid wrapper unions the sub-backends'
     # declarations, so a Kimi-K3 contract (history + state) is covered once
     # both consumers exist.
-    cache_consumer_families = frozenset({"state"})
+    cache_consumer_attn_kinds = frozenset({"state"})
     _verify_reads_committed_recurrent_state: bool = False
     _verify_packed_qkv_views: bool = False
     _decode_packed_qkv_views: bool = False
@@ -352,12 +352,12 @@ class MambaAttnBackend(AttentionBackend):
         state_specs = tuple(
             spec
             for spec in contract.group_specs
-            if spec.group_id in claimed_groups and spec.family == "state"
+            if spec.group_id in claimed_groups and spec.attn_kind == "state"
         )
         state_group_ids = tuple(spec.group_id for spec in state_specs)
         if not state_group_ids or set(state_group_ids) != claimed_groups:
             raise RuntimeError(
-                "MambaAttnBackend requires a state-family group for every recurrent layer"
+                "MambaAttnBackend requires a state group for every recurrent layer"
             )
         layer_geometry = tuple(
             (
@@ -458,9 +458,7 @@ class MambaAttnBackend(AttentionBackend):
         try:
             return self.kv_pool.state_group_by_layer[layer_id]
         except KeyError as exc:
-            raise RuntimeError(
-                f"layer {layer_id} has no state-family cache group"
-            ) from exc
+            raise RuntimeError(f"layer {layer_id} has no state cache group") from exc
 
     def _state_components(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         return (

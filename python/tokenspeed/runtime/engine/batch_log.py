@@ -213,7 +213,7 @@ class BatchLogger:
         self._last_decode_tic = now
 
     def _log_cache_state_group_pages(self) -> None:
-        """Append per-group page usage for state-family groups, at DEBUG.
+        """Append per-group page usage for state groups, at DEBUG.
 
         Recurrent/conv state groups are sized separately from the KV groups,
         so the decode line's single page ratio does not show when one of them

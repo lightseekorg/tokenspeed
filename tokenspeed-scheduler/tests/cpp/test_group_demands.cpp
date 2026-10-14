@@ -35,14 +35,13 @@
 namespace tokenspeed::test {
 namespace {
 
-CacheGroupConfig Group(const char* id, CacheGroupConfig::Retention retention, CacheGroupFamily family) {
+CacheGroupConfig Group(const char* id, AttnKind kind) {
     CacheGroupConfig group;
     group.group_id = id;
-    group.block_granularity = family == CacheGroupFamily::State ? 0 : 4;
+    group.block_granularity = kind == AttnKind::kState ? 0 : 4;
     group.total_pages = 8;
-    group.retention = retention;
-    group.family = family;
-    if (retention == CacheGroupConfig::Retention::SlidingWindow) {
+    group.attn_kind = kind;
+    if (kind == AttnKind::kSlidingWindow) {
         group.sliding_window_tokens = 8;
     }
     return group;
@@ -50,8 +49,8 @@ CacheGroupConfig Group(const char* id, CacheGroupConfig::Retention retention, Ca
 
 TEST(MakeGroupDemandsTest, HistoryGroupsTakeThePrototypeAndStateGroupsTheStep) {
     const std::vector<CacheGroupConfig> groups = {
-        Group("full", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-        Group("state", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+        Group("full", AttnKind::kFull),
+        Group("state", AttnKind::kState),
     };
     std::vector<BlockTable> tables(2);
     const std::vector<GroupDemand> demands =
@@ -66,11 +65,11 @@ TEST(MakeGroupDemandsTest, HistoryGroupsTakeThePrototypeAndStateGroupsTheStep) {
     EXPECT_EQ(demands[1].reserve_tokens, 0) << "a State group's slots hold no token reserve";
 }
 
-TEST(ReservePrefillDemandsTest, EachRetentionHoldsItsOwnShareOfTheRound) {
+TEST(ReservePrefillDemandsTest, EachKindHoldsItsOwnShareOfTheRound) {
     const std::vector<CacheGroupConfig> groups = {
-        Group("full", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History),
-        Group("swa", CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History),
-        Group("state", CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),
+        Group("full", AttnKind::kFull),
+        Group("swa", AttnKind::kSlidingWindow),
+        Group("state", AttnKind::kState),
     };
     std::vector<BlockTable> tables(3);
     // A first chunk that does not complete the prompt: full history prepays

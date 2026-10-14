@@ -101,10 +101,10 @@ class _RouterCase(_TorchCase):
         router.bind(
             CacheGroupGeometry(
                 granularities={FULL: 2},
-                families={FULL: "history"},
+                attn_kinds={FULL: "full_history"},
                 full_history_group_id=FULL,
                 row_geometry={FULL: (2, 1)},
-                retentions={FULL: ("full_history", None)},
+                windows={FULL: None},
             ),
             {FULL: leaf},
         )

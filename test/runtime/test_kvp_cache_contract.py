@@ -82,11 +82,10 @@ register_cuda_ci(
 def _full_history_spec(group_id: str, *, shard_count: int) -> CacheGroupSpec:
     return CacheGroupSpec(
         group_id=group_id,
-        retention="full_history",
+        attn_kind="full_history",
         rows_per_page=64,
         entry_stride_tokens=4,
         sliding_window_tokens=None,
-        family="history",
         shard_count=shard_count,
         replayable=False,
     )
@@ -419,7 +418,7 @@ class RecipeDeclarationTest(unittest.TestCase):
                 self.assertIn(V4_INDEXER_KV_GROUP_ID, by_id)
                 self.assertEqual(by_id[V4_INDEXER_KV_GROUP_ID].shard_count, kvp_size)
                 self.assertEqual(
-                    by_id[V4_INDEXER_KV_GROUP_ID].retention, "full_history"
+                    by_id[V4_INDEXER_KV_GROUP_ID].attn_kind, "full_history"
                 )
                 for spec in specs:
                     expected = (

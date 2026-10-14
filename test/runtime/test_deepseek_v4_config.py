@@ -866,7 +866,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeBackend:
             draft_block_decode = False
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def refresh_decode_metadata(self, *args, **kwargs):
                 captured["args"] = args
@@ -949,7 +949,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeBackend:
             draft_block_decode = False
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
                 self.key = key
@@ -1005,7 +1005,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeBackend:
             draft_block_decode = False
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
                 self.key = key
@@ -1027,11 +1027,11 @@ class TestDeepseekV4Config(unittest.TestCase):
             draft_seq_lens_buf=torch.zeros(1, dtype=torch.int32),
         )
         wrapper.token_to_kv_pool = _fake_pool(
-            SimpleNamespace(group_id="v4.swa_kv", family="history"),
-            SimpleNamespace(group_id="v4.state", family="state"),
+            SimpleNamespace(group_id="v4.swa_kv", attn_kind="full_history"),
+            SimpleNamespace(group_id="v4.state", attn_kind="state"),
         )
         wrapper.draft_token_to_kv_pool = _fake_pool(
-            SimpleNamespace(group_id="v4.swa_kv", family="history"),
+            SimpleNamespace(group_id="v4.swa_kv", attn_kind="full_history"),
         )
 
         wrapper._init_forward_metadata(
@@ -1057,7 +1057,7 @@ class TestDeepseekV4Config(unittest.TestCase):
 
         class FakeBackend:
             draft_block_decode = False
-            cache_consumer_families = frozenset({"history"})
+            cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
                 self.key = key
@@ -2215,8 +2215,8 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         pool, _ = _make_planned_deepseek_v4_pool(layout, config)
 
-        self.assertEqual(
-            {spec.family for spec in pool.arena.cache_group_specs}, {"history"}
+        self.assertTrue(
+            all(spec.attn_kind != "state" for spec in pool.arena.cache_group_specs)
         )
         with self.assertRaisesRegex(ValueError, "more than one history"):
             derive_history_groups_by_layer(

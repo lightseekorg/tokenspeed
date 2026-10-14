@@ -55,15 +55,13 @@ def _scheduler(ts, make_config):
             group_id="history",
             block_granularity=PAGE,
             total_pages=65,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.History,
+            attn_kind=ts.AttnKind.Full,
         ),
         ts.CacheGroupConfig(
             group_id="linear_attention",
             block_granularity=0,
             total_pages=65,
-            retention=ts.CacheRetention.FullHistory,
-            family=ts.CacheGroupFamily.State,
+            attn_kind=ts.AttnKind.State,
         ),
     ]
     return ts.Scheduler(

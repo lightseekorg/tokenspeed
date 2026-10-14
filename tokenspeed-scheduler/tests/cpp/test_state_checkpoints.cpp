@@ -64,8 +64,7 @@ protected:
                 .group_id = id,
                 .block_granularity = is_state ? 0 : kP,
                 .total_pages = cfg.device_allocator.total_pages,
-                .retention = CacheGroupConfig::Retention::FullHistory,
-                .family = is_state ? CacheGroupFamily::State : CacheGroupFamily::History,
+                .attn_kind = is_state ? AttnKind::kState : AttnKind::kFull,
             });
         }
         SetTestSnapshotPool(cfg);

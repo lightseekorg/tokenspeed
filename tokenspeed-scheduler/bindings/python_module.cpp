@@ -95,13 +95,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("D", tokenspeed::Role::kD)
         .value("Fused", tokenspeed::Role::kFused);
 
-    nb::enum_<tokenspeed::CacheGroupConfig::Retention>(m, "CacheRetention")
-        .value("FullHistory", tokenspeed::CacheGroupConfig::Retention::FullHistory)
-        .value("SlidingWindow", tokenspeed::CacheGroupConfig::Retention::SlidingWindow);
-
-    nb::enum_<tokenspeed::CacheGroupFamily>(m, "CacheGroupFamily")
-        .value("History", tokenspeed::CacheGroupFamily::History)
-        .value("State", tokenspeed::CacheGroupFamily::State);
+    nb::enum_<tokenspeed::AttnKind>(m, "AttnKind")
+        .value("Full", tokenspeed::AttnKind::kFull)
+        .value("SlidingWindow", tokenspeed::AttnKind::kSlidingWindow)
+        .value("State", tokenspeed::AttnKind::kState);
 
     nb::enum_<tokenspeed::CacheTransferPolicy>(m, "CacheTransferPolicy")
         .value("Unspecified", tokenspeed::CacheTransferPolicy::Unspecified)
@@ -113,20 +110,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(
             "__init__",
             [](tokenspeed::CacheGroupConfig* self, std::string group_id, std::int32_t block_granularity,
-               std::int32_t total_pages, tokenspeed::CacheGroupConfig::Retention retention,
-               std::optional<std::int32_t> sliding_window_tokens, tokenspeed::CacheGroupFamily family,
-               std::int32_t cache_blocks_per_lcm_block, tokenspeed::CacheTransferPolicy transfer_policy,
-               std::int32_t shard_count, bool replayable) {
+               std::int32_t total_pages, tokenspeed::AttnKind attn_kind,
+               std::optional<std::int32_t> sliding_window_tokens, std::int32_t cache_blocks_per_lcm_block,
+               tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable) {
                 new (self) tokenspeed::CacheGroupConfig{
                     std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
-                    retention,           sliding_window_tokens, replayable,  family,
-                    transfer_policy,     shard_count,
+                    attn_kind,           sliding_window_tokens, replayable,  transfer_policy,
+                    shard_count,
                 };
             },
-            nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"),
-            nb::arg("retention") = tokenspeed::CacheGroupConfig::Retention::FullHistory,
-            nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
-            nb::arg("cache_blocks_per_lcm_block") = 1,
+            nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"), nb::arg("attn_kind"),
+            nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
             nb::arg("replayable") = false)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
@@ -134,10 +128,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
         .def_rw("cache_blocks_per_lcm_block", &tokenspeed::CacheGroupConfig::cache_blocks_per_lcm_block)
         .def_rw("shard_count", &tokenspeed::CacheGroupConfig::shard_count)
-        .def_rw("retention", &tokenspeed::CacheGroupConfig::retention)
+        .def_rw("attn_kind", &tokenspeed::CacheGroupConfig::attn_kind)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
-        .def_rw("family", &tokenspeed::CacheGroupConfig::family)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 

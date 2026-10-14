@@ -23,9 +23,8 @@
 import pytest
 from tokenspeed_scheduler import (
     PD,
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     CacheTransferPolicy,
     ExecutionEvent,
     ForwardEvent,
@@ -47,8 +46,7 @@ def make_scheduler() -> Scheduler:
             group_id="full_attention",
             block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     return Scheduler(cfg)
@@ -101,8 +99,7 @@ def test_pd_counters_follow_request_state():
             block_granularity=16,
             total_pages=64,
             transfer_policy=CacheTransferPolicy.FullSuffix,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     scheduler = Scheduler(cfg)
@@ -142,8 +139,7 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
             block_granularity=2,
             total_pages=17,
             transfer_policy=CacheTransferPolicy.FullSuffix,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     scheduler = Scheduler(cfg)
@@ -184,8 +180,7 @@ def test_prefill_role_hands_off_without_the_draft_window():
             block_granularity=1,
             total_pages=7,
             transfer_policy=CacheTransferPolicy.FullSuffix,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     scheduler = Scheduler(cfg)
@@ -225,25 +220,22 @@ def test_remote_admission_lands_the_state_in_slot_one_and_decodes_in_place(
             group_id="history",
             block_granularity=4,
             total_pages=128,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
             transfer_policy=CacheTransferPolicy.FullSuffix,
         ),
         CacheGroupConfig(
             group_id="state",
             block_granularity=0,
             total_pages=128,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.State,
+            attn_kind=AttnKind.State,
             transfer_policy=CacheTransferPolicy.LatestSnapshot,
         ),
         CacheGroupConfig(
             group_id="recent",
             block_granularity=1,
             total_pages=128,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=2,
-            family=CacheGroupFamily.History,
             transfer_policy=CacheTransferPolicy.FullSuffix,
         ),
     ]
