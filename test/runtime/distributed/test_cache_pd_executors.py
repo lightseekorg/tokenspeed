@@ -1334,6 +1334,7 @@ def test_fallback_write_batches_expanded_row_sges(
 
 
 def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> None:
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
     from tokenspeed.runtime.pd.base.status import TransferPoll
 
     source_manifest = _single_group_block_manifest("history", (1,))
@@ -1364,7 +1365,7 @@ def test_transfer_worker_completes_real_heterogeneous_fanout_before_status() -> 
             (endpoint, port, room, status, rank, kwargs)
         )
     )
-    manager.kv_transfer_metrics = None
+    manager.kv_transfer_metrics = KVTransferMetrics({}, enabled=False)
     manager.topology = _topology()
 
     with pytest.raises(_StopWorker):

@@ -667,15 +667,87 @@ class RequestMetrics:
 
 
 class KVTransferMetrics:
+    """PD KV transfer metrics, recorded by the transfer managers.
 
-    def __init__(self, labels: dict[str, str], metrics_reporters: list[str]) -> None:
-        pass
+    Lives on every PD engine (prefill and decode roles each record their own
+    view); series from the node's transfer processes aggregate in Prometheus
+    multiprocess mode.
+    """
 
-    def record_kv_transfer_timeout(self) -> None:
-        return
+    def __init__(
+        self,
+        labels: dict[str, str],
+        *,
+        enabled: bool,
+        registry=None,
+    ) -> None:
+        self.enabled = enabled
+        self.labels = labels
+
+        if self.enabled:
+            self._init_prometheus(labels, registry=registry)
+
+    def _init_prometheus(self, labels: dict[str, str], *, registry=None) -> None:
+        from prometheus_client import Counter, Histogram
+
+        labelnames = list(labels.keys())
+        kw = {"registry": registry} if registry is not None else {}
+        self.kv_transfer_latency_seconds = Histogram(
+            name="tokenspeed:kv_transfer_latency_seconds",
+            documentation="Wall time of one KV cache transfer send to a peer.",
+            labelnames=labelnames,
+            buckets=[
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.02,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+                2.0,
+                5.0,
+                10.0,
+                30.0,
+                60.0,
+            ],
+            **kw,
+        )
+        # `stage` is the bounded TransferPoll state the request was stuck in:
+        # "bootstrapping" (prefill never received the cache manifest) or
+        # "waiting_for_input" (decode never received the transfer-done signal).
+        self.kv_transfer_timeouts = Counter(
+            name="tokenspeed:kv_transfer_timeouts",
+            documentation="KV transfers that timed out, by transfer stage.",
+            labelnames=[*labelnames, "stage"],
+            **kw,
+        )
+        self.kv_transfer_failures = Counter(
+            name="tokenspeed:kv_transfer_failures",
+            documentation=(
+                "KV transfers aborted on failure: send failures on the prefill "
+                "node, and rooms failed on prefill-node loss on the decode node. "
+                "Timeouts are counted separately."
+            ),
+            labelnames=labelnames,
+            **kw,
+        )
+
+    def record_kv_transfer_timeout(self, stage: str) -> None:
+        if not self.enabled:
+            return
+        self.kv_transfer_timeouts.labels(**self.labels, stage=stage).inc()
 
     def record_kv_transfer_failure(self) -> None:
-        return
+        if not self.enabled:
+            return
+        self.kv_transfer_failures.labels(**self.labels).inc()
 
     def observe_kv_transfer_latency(self, transfer_time_seconds: float) -> None:
-        return
+        if not self.enabled:
+            return
+        self.kv_transfer_latency_seconds.labels(**self.labels).observe(
+            transfer_time_seconds
+        )

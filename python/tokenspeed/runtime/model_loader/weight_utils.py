@@ -788,6 +788,41 @@ def _find_sub_byte_dtype(hf_weights_files: list[str]) -> str | None:
     return None
 
 
+def safetensors_tensor_shapes(
+    hf_weights_files: list[str],
+) -> dict[str, tuple[int, ...]]:
+    """Return each tensor's shape as the shards' headers declare it.
+
+    Reads only each shard's length-prefixed JSON header, never tensor data,
+    so a caller can refuse a checkpoint before loading any of it. A shard
+    whose header will not parse, or whose file is shorter than the data its
+    header declares (truncated, or still being written), raises ``ValueError``.
+    """
+    shapes: dict[str, tuple[int, ...]] = {}
+    for path in hf_weights_files:
+        try:
+            with open(path, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                if header_len > _MAX_SAFETENSORS_HEADER_BYTES:
+                    raise ValueError(f"header claims {header_len} bytes")
+                header = json.loads(f.read(header_len))
+            if not isinstance(header, dict):
+                raise ValueError("header is not a JSON object")
+            data_end = 0
+            for name, meta in header.items():
+                if name == "__metadata__":
+                    continue
+                shapes[name] = tuple(int(dim) for dim in meta["shape"])
+                data_end = max(data_end, int(meta["data_offsets"][1]))
+            declared = 8 + header_len + data_end
+            on_disk = os.path.getsize(path)
+            if on_disk < declared:
+                raise ValueError(f"{on_disk} bytes on disk, header declares {declared}")
+        except (OSError, ValueError, LookupError, TypeError, struct.error) as e:
+            raise ValueError(f"{path}: unreadable safetensors shard ({e})") from e
+    return shapes
+
+
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     *,

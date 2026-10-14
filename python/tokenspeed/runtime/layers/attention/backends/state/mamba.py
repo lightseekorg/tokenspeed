@@ -152,8 +152,16 @@ def _prepare_gdn_decode_state_path(
     Until that kernel supports a padding mask, route BF16 state through
     Triton and keep ``-1`` unchanged.
     """
-    solution = "triton" if ssm_states.dtype == torch.bfloat16 else None
-    return initial_state_indices, output_state_indices, solution
+    return (
+        initial_state_indices,
+        output_state_indices,
+        gdn_decode_solution(ssm_states.dtype),
+    )
+
+
+def gdn_decode_solution(ssm_dtype: torch.dtype) -> str | None:
+    """The GDN decode/verify solution forced for a state dtype (see above)."""
+    return "triton" if ssm_dtype == torch.bfloat16 else None
 
 
 def _build_cu_extend_seq_lens_cpu(
@@ -2041,12 +2049,20 @@ class MambaAttnBackend(AttentionBackend):
         b_b = b.view(batch_size, draft_token_num, -1)
 
         intermediate_states = None
+        output_state = None
         if self.replay_ssm:
             initial_state = ssm_comp
             initial_indices = state_in_blocks[:batch_size]
             output_state_indices = None
             if self._tree_node_states is not None:
                 intermediate_states = self._tree_node_states[:batch_size]
+        elif self._verify_reads_committed_recurrent_state:
+            # Read the committed page in place and stage each position's state
+            # in the scratch: no seed copy of the committed state.
+            initial_state = ssm_comp
+            initial_indices = state_in_blocks[:batch_size]
+            output_state_indices = output_indices
+            output_state = ssm_scratch
         else:
             initial_state = ssm_scratch
             initial_indices = self._verify_scratch_base_rows(
@@ -2074,6 +2090,7 @@ class MambaAttnBackend(AttentionBackend):
             initial_state_indices=mtp_initial_indices,
             use_qk_l2norm=True,
             output_state_indices=mtp_output_indices,
+            output_state=output_state,
             intermediate_states_buffer=intermediate_states,
             tree_ancestors=self._verify_ancestors(
                 batch_size, draft_token_num, num_value_heads

@@ -72,6 +72,8 @@ import tokenspeed_kernel.ops.attention.mla as _attention_mla_pkg
 import tokenspeed_kernel.ops.attention.mla.cuda as _attention_flash_mla
 import tokenspeed_kernel.ops.attention.mla.gluon as _attention_gluon_mla
 import tokenspeed_kernel.ops.attention.mla.triton as _attention_triton_mla
+import tokenspeed_kernel.ops.attention.qsa.gluon as _attention_gluon_qsa
+import tokenspeed_kernel.ops.attention.qsa.triton as _attention_triton_qsa
 import tokenspeed_kernel.ops.attention.rmha as _attention_rmha_pkg
 import tokenspeed_kernel.ops.attention.rmha.cuda as _attention_cuda_rmha
 import tokenspeed_kernel.ops.attention.rmha.gluon as _attention_gluon_rmha
@@ -182,6 +184,7 @@ _ATTENTION_GLUON_MODULES = [
     _attention_gluon_dsv41,
     _attention_gluon_kda,
     _attention_gluon_mha,
+    _attention_gluon_qsa,
     _attention_gluon_mla,
     _attention_gluon_rmha,
 ]
@@ -206,6 +209,7 @@ _RELOAD_MODULES = [
     *_ATTENTION_GLUON_MODULES,
     _attention_triton_mha,
     _attention_triton_mla,
+    _attention_triton_qsa,
     _attention_triton_kpool,
     _attention_triton_rel_mha,
     _attention_triton_merge_state,
@@ -3516,6 +3520,123 @@ def test_gfx950_softmax_topk_selects_gluon(
     assert gluon_spec.priority == Priority.SPECIALIZED
     assert set(selected.values()) == {"gluon_softmax_topk_gfx950"}
     assert too_many_experts.name == "torch_softmax_topk"
+
+
+def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        return select_kernel(*args, **kwargs).name
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+
+def test_qsa_sparse_attention_selects_gluon_on_gfx950(
+    mi350_platform: PlatformInfo,
+    mi450_platform: PlatformInfo,
+) -> None:
+    gluon_spec = KernelRegistry.get().get_by_name("gluon_qsa_sparse_attention_gfx950")
+    if gluon_spec is None:
+        pytest.skip("gfx950 Gluon QSA sparse attention is unavailable")
+
+    def select(platform, is_decode, cache_dtype):
+        return _select_on(
+            platform,
+            "attention",
+            "qsa_sparse_attention",
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                k_cache=dense_tensor_format(cache_dtype),
+                v_cache=dense_tensor_format(cache_dtype),
+            ),
+            # Qwen3.8-Flash-Next TP2: MTP verify rows, or ragged prefill rows.
+            traits={
+                "batch_size": 16,
+                "q_len": 4 if is_decode else 1,
+                "num_q_heads": 12,
+                "num_kv_heads": 1,
+                "head_dim": 256,
+                "value_head_dim": 256,
+                "selected_width": 2051,
+                "is_decode": is_decode,
+            },
+        )
+
+    shapes = [
+        (is_decode, cache_dtype)
+        for is_decode in (True, False)
+        for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    ]
+    assert gluon_spec.priority == Priority.SPECIALIZED
+    assert {select(mi350_platform, *shape) for shape in shapes} == {
+        "gluon_qsa_sparse_attention_gfx950"
+    }
+    assert {select(mi450_platform, *shape) for shape in shapes} == {
+        "triton_qsa_sparse_attention"
+    }
+
+
+def test_qsa_indexer_selects_gluon_on_gfx950(
+    mi350_platform: PlatformInfo,
+    mi450_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    gluon_specs = [
+        registry.get_by_name(name)
+        for name in (
+            "gluon_qsa_block_scores_gfx950",
+            "gluon_qsa_block_topk_select_gfx950",
+        )
+    ]
+    if None in gluon_specs:
+        pytest.skip("gfx950 Gluon QSA indexer kernels are unavailable")
+
+    def select(platform):
+        scores = _select_on(
+            platform,
+            "attention",
+            "qsa_block_scores",
+            format_signature(
+                query=dense_tensor_format(torch.bfloat16),
+                key_cache=dense_tensor_format(torch.bfloat16),
+            ),
+            # Qwen3.8-Flash-Next: 4 index heads of 128, top-2048 blocks.
+            traits={"num_heads": 4, "head_dim": 128},
+        )
+        topk = _select_on(
+            platform,
+            "attention",
+            "qsa_block_topk_select",
+            format_signature(logits=dense_tensor_format(torch.float32)),
+            traits={"topk": 2048},
+        )
+        stream = _select_on(
+            platform,
+            "attention",
+            "qsa_block_topk_stream",
+            format_signature(
+                query=dense_tensor_format(torch.bfloat16),
+                key_cache=dense_tensor_format(torch.bfloat16),
+            ),
+            traits={"num_heads": 4, "head_dim": 128},
+        )
+        return scores, topk, stream
+
+    assert all(spec.priority == Priority.SPECIALIZED for spec in gluon_specs)
+    # Streaming top-k has only the portable implementation.
+    assert select(mi350_platform) == (
+        "gluon_qsa_block_scores_gfx950",
+        "gluon_qsa_block_topk_select_gfx950",
+        "triton_qsa_block_topk_stream",
+    )
+    assert select(mi450_platform) == (
+        "triton_qsa_block_scores",
+        "triton_qsa_block_topk_select",
+        "triton_qsa_block_topk_stream",
+    )
 
 
 def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(

@@ -171,6 +171,7 @@ def _fused_gdn_decode_update_kernel(
     b,
     o,
     h0_source,
+    ht_dest,
     h0_indices,
     output_state_indices,
     intermediate_states_buffer,
@@ -207,19 +208,21 @@ def _fused_gdn_decode_update_kernel(
     contract); h0_indices ([B]) selects each batch entry's read row, ``-1``
     skipped (state contribution treated as zero -- mirrors flashinfer's
     float32 legacy decode path; output for that batch entry is undefined).
+    ``ht_dest`` is the K-last pool both output-state index forms address; it
+    may be ``h0_source`` itself.
 
     T=1 is a plain decode step; T>1 is an MTP verify step. Three independent,
     mutually-exclusive-by-convention state-output mechanisms:
     - HAS_OUTPUT_STATE_INDICES: after the LAST processed step, write to the
-      single row ``output_state_indices[i_n]`` (``[B]``-shaped; T=1 decode's
-      dual-index paging remap).
+      single ``ht_dest`` row ``output_state_indices[i_n]`` (``[B]``-shaped;
+      T=1 decode's dual-index paging remap).
     - CACHE_INTERMEDIATE_STATES: after EVERY step (every branch point under
       HAS_TREE), write to the batch-scoped
       ``intermediate_states_buffer[i_n, step]`` (``[B, T, HV, V, K]``,
       K-last -- matches flashinfer's MTP intermediate-state-buffer convention).
     - HAS_PER_TOKEN_OUTPUT_STATE_INDICES: after EVERY step, write directly to
-      the pool row ``per_token_output_state_indices[i_n, step]`` (``[B, T]``),
-      matching FlashInfer 0.6.15's ``ssm_state_indices`` contract.
+      the ``ht_dest`` row ``per_token_output_state_indices[i_n, step]``
+      (``[B, T]``), matching FlashInfer 0.6.15's ``ssm_state_indices`` contract.
     DISABLE_STATE_UPDATE additionally gates a final write-back to
     ``h0_indices[i_n]`` (the read row) when neither of the above applies.
 
@@ -328,18 +331,24 @@ def _fused_gdn_decode_update_kernel(
                             + o_k[:, None]
                         )
                         b_h = tl.load(p_parent, mask=mask_h, other=0).to(tl.float32)
-                else:
-                    row = tl.where(
-                        parent < 0,
-                        idx,
-                        tl.load(
-                            per_token_output_state_indices
-                            + i_n * T
-                            + tl.maximum(parent, 0)
-                        ).to(tl.int64),
-                    )
+                elif parent < 0:
                     p_parent = (
                         h0_source
+                        + idx * HV * V * K
+                        + i_hv * V * K
+                        + o_v[None, :] * K
+                        + o_k[:, None]
+                    )
+                    b_h = tl.load(p_parent, mask=mask_h & (idx >= 0), other=0).to(
+                        tl.float32
+                    )
+                else:
+                    # Non-root parents were written to the destination pool.
+                    row = tl.load(per_token_output_state_indices + i_n * T + parent).to(
+                        tl.int64
+                    )
+                    p_parent = (
+                        ht_dest
                         + row * HV * V * K
                         + i_hv * V * K
                         + o_v[None, :] * K
@@ -391,7 +400,7 @@ def _fused_gdn_decode_update_kernel(
             )
             if out_idx >= 0:
                 p_step_out = (
-                    h0_source
+                    ht_dest
                     + out_idx * HV * V * K
                     + i_hv * V * K
                     + o_v[None, :] * K
@@ -414,7 +423,7 @@ def _fused_gdn_decode_update_kernel(
         out_idx = tl.load(output_state_indices + i_n).to(tl.int64)
         if out_idx >= 0:
             p_out = (
-                h0_source
+                ht_dest
                 + out_idx * HV * V * K
                 + i_hv * V * K
                 + o_v[None, :] * K
@@ -444,6 +453,7 @@ def _launch_fused_gdn_decode_update(
     b: torch.Tensor,
     initial_state: torch.Tensor,
     initial_state_indices: torch.Tensor,
+    output_state: torch.Tensor | None,
     scale: float | None,
     use_qk_l2norm: bool,
     disable_state_update: bool,
@@ -455,7 +465,8 @@ def _launch_fused_gdn_decode_update(
     """Shared launcher for the ``gdn_decode_step`` (T=1) / ``gdn_decode_mtp``
     (T>1) Triton fallback kernels. q/k: [B, T, H, K]; v: [B, T, HV, V]; a/b:
     [B, T, HV]; initial_state is the K-last [pool_size, HV, V, K] SSM state
-    pool (the shared runtime contract -- see module docstring).
+    pool (the shared runtime contract -- see module docstring); output_state
+    is the K-last pool the output-state indices address (None: initial_state).
     """
     enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
@@ -463,6 +474,12 @@ def _launch_fused_gdn_decode_update(
     V = v.shape[3]
     if scale is None:
         scale = K**-0.5
+    # The kernel addresses output rows densely (row * HV * V * K).
+    if output_state is not None and not output_state.is_contiguous():
+        raise ValueError(
+            "Triton GDN decode requires a contiguous output_state, got strides "
+            f"{output_state.stride()}"
+        )
 
     o = q.new_empty(B, T, HV, V)
 
@@ -486,6 +503,7 @@ def _launch_fused_gdn_decode_update(
         b=b,
         o=o,
         h0_source=initial_state,
+        ht_dest=initial_state if output_state is None else output_state,
         h0_indices=initial_state_indices,
         output_state_indices=output_state_indices,
         intermediate_states_buffer=intermediate_states_buffer,
@@ -560,6 +578,7 @@ def triton_gdn_decode_step(
         b=b,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        output_state=None,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
         disable_state_update=False,
@@ -859,6 +878,10 @@ def _launch_gdn_tree_verify_chunked(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
+    traits={
+        "separate_output_state": frozenset({False, True}),
+        "strided_qkv": frozenset({False, True}),
+    },
 )
 def triton_gdn_decode_mtp(
     q: torch.Tensor,
@@ -876,6 +899,7 @@ def triton_gdn_decode_mtp(
     use_qk_l2norm: bool = True,
     intermediate_states_buffer: torch.Tensor | None = None,
     output_state_indices: torch.Tensor | None = None,
+    output_state: torch.Tensor | None = None,
     tree_ancestors: torch.Tensor | None,
     replay_payload: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -918,6 +942,7 @@ def triton_gdn_decode_mtp(
         b=b,
         initial_state=initial_state,
         initial_state_indices=initial_state_indices,
+        output_state=output_state,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
         disable_state_update=disable_state_update,

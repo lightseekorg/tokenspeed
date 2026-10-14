@@ -54,7 +54,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.expert_mesh import (  # noqa: E4
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_gemm import (  # noqa: E402
     _A,
-    _MMA,
     _SHARED,
     _a_offsets,
     _assemble_fragment,

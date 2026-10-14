@@ -905,7 +905,9 @@ class IsSchedulerPausedReqOutput(BaseReq, kw_only=True):
 # isinstance chain in the control-request handler). The in-engine RL control app
 # refuses the others up front instead of forwarding a request the scheduler
 # cannot handle, and advertises this set to gateways as `rl.update_from`.
-SUPPORTED_WEIGHT_UPDATE_SOURCES: frozenset[str] = frozenset({"distributed", "mooncake"})
+SUPPORTED_WEIGHT_UPDATE_SOURCES: frozenset[str] = frozenset(
+    {"distributed", "mooncake", "disk"}
+)
 
 
 class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
@@ -915,6 +917,8 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     load_format: str | None = None
     # Optional: update the weight version after a successful load.
     weight_version: str | None = None
+    # Drop cached KV before loading: it was computed under the old weights.
+    flush_cache: bool = True
 
 
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
