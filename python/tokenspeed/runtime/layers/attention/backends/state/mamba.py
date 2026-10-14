@@ -66,6 +66,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     copy_state_rows,
     state_verify_commit_rows,
 )
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -2357,6 +2358,11 @@ class MambaAttnBackend(AttentionBackend):
                 head_v=head_v_dim,
             )
         else:
+            valid_tokens = (
+                query_start_loc[-1:]
+                if current_platform().is_hopper and not is_target_verify
+                else None
+            )
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 num_q_heads=num_heads,
@@ -2366,6 +2372,7 @@ class MambaAttnBackend(AttentionBackend):
                 head_k=head_k_dim,
                 head_v=head_v_dim,
                 replay=replay_inputs,
+                valid_tokens=valid_tokens,
             )
 
         if is_target_verify:
