@@ -752,6 +752,16 @@ def test_the_unscaled_linear_runs_a_vendor_gemm_with_unit_scales(
     assert torch.equal(out, exact.to(torch.bfloat16))
 
 
+def test_the_unscaled_linear_rejects_a_kn_contiguous_weight():
+    """Selection keys the weight layout on stride(-1) == 1, which no vendor
+    per-tensor FP8 GEMM accepts: a KN-contiguous weight would quietly run the
+    Triton GEMM with unit scales instead of raising."""
+    codes, _ = _fp8_checkpoint(3, 16)
+    weight, _ = _fp8_checkpoint(8, 16)
+    with pytest.raises(ValueError, match="a transposed weight has"):
+        w8a8.fp8_unscaled_linear(codes, weight.t().contiguous(), torch.ones(1))
+
+
 def test_dequantization_rounds_the_exact_product_once():
     """1.125 times 15087843 * 2**-24 lies just below the BF16 midpoint
     1 + 3 * 2**-8; rounded once it is 1 + 2**-7 (through FP32, 1 + 2**-6)."""

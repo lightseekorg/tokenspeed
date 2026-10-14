@@ -57,9 +57,9 @@ def _rmsnorm_kernel(
     ROUND_RESIDUAL_SUM_BF16: tl.constexpr,
     SCALE_INPUTS_BF16: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
-    fp8_out_ptr=None,
-    fp8_scale_ptr=None,
-    TOKEN_FP8_OUT: tl.constexpr = False,
+    fp8_out_ptr,
+    fp8_scale_ptr,
+    TOKEN_FP8_OUT: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
@@ -339,13 +339,8 @@ def rmsnorm(
                 f"{codes.dtype} {tuple(codes.shape)} and {scales.dtype} "
                 f"{tuple(scales.shape)}"
             )
-        token_fp8_kwargs = {
-            "fp8_out_ptr": codes,
-            "fp8_scale_ptr": scales,
-            "TOKEN_FP8_OUT": True,
-        }
     else:
-        token_fp8_kwargs = {}
+        codes, scales = None, None
     block = triton.next_power_of_2(hidden_size)
     enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     launch_kwargs = (
@@ -367,7 +362,9 @@ def rmsnorm(
         ROUND_RESIDUAL_SUM_BF16=round_residual_sum_bf16,
         SCALE_INPUTS_BF16=scale_inputs,
         ENABLE_PDL=enable_pdl,
-        **token_fp8_kwargs,
+        fp8_out_ptr=codes,
+        fp8_scale_ptr=scales,
+        TOKEN_FP8_OUT=token_fp8_out is not None,
         **launch_kwargs,
     )
     if residual is None:

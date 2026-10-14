@@ -153,7 +153,24 @@ def fp8_unscaled_linear(
 
     Returns:
         ``[M, N]`` BF16 ``codes @ weight``.
+
+    Raises:
+        ValueError: ``weight`` is KN-contiguous instead of a transposed
+            ``[N, K]``.
     """
+    # GEMM selection keys the weight layout on ``B.stride(-1) == 1``, and every
+    # vendor per-tensor FP8 GEMM declares ``b_inner_stride_one: False``. A
+    # KN-contiguous weight would select the Triton GEMM run with unit scales
+    # instead, slower than the scaled GEMM it replaces while the caller still
+    # pays the consumer that applies the scales.
+    if weight.stride(-1) == 1:
+        raise ValueError(
+            "weight must be a [K, N] view of a contiguous [N, K] FP8 weight "
+            f"(a transposed weight has stride(-1) != 1), got shape "
+            f"{tuple(weight.shape)} stride {weight.stride()}: no vendor "
+            "per-tensor FP8 GEMM takes a KN-contiguous weight"
+        )
+
     from tokenspeed_kernel.ops.gemm import mm
 
     return mm(

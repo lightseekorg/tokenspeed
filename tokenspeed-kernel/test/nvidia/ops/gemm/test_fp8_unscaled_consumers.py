@@ -34,6 +34,7 @@ scaled GEMM's own output rounding is.
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.activation import triton as activation_triton
 from tokenspeed_kernel.ops.activation.triton import (
     silu_and_mul,
     silu_and_mul_fp8_dequant,
@@ -44,7 +45,7 @@ from tokenspeed_kernel.ops.quantization.triton import (
     dequantize_unscaled_fp8,
     fp8_quantize_per_token,
 )
-from utils import kernel_supported
+from utils import assert_no_triton_compile, kernel_supported
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -143,3 +144,19 @@ def test_silu_and_mul_dequantizes_then_quantizes_per_token(m, width):
         f"M={m} I={width}: rel vs FP64 unscaled path {ours:.5f} scaled path {base:.5f}"
     )
     assert ours <= 1.1 * base + 1e-3
+
+
+def test_row_counts_do_not_recompile():
+    """One compiled binary serves every row count: the width and the strides
+    are runtime arguments and only the grid follows M."""
+    width, k = 2048, 4096
+    w8, w_scales = _weight(2 * width, k, seed=40)
+
+    def run(m):
+        a8, a_scales = fp8_quantize_per_token(_rows(m, k, seed=40 + m))
+        silu_and_mul_fp8_dequant(_unscaled(a8, w8), a_scales, w_scales)
+
+    run(1)
+    with assert_no_triton_compile(activation_triton._silu_and_mul_fp8_dequant_kernel):
+        for m in (7, 16, 64):
+            run(m)
