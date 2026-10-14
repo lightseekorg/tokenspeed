@@ -25,6 +25,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MIN_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    _qkv_rows_strided,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
@@ -32,6 +33,29 @@ from tokenspeed_kernel.ops.attention.gdn import (
 )
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+def test_strided_qkv_trait_spares_packed_rows(batch: int):
+    """Sections of one dense q|k|v row (the dense decode path's split) keep
+    kernels without strided reads eligible; views into a wider projection
+    row do not, from batch 2 on."""
+    heads, value_heads, dim = 2, 4, 8
+    widths = [heads * dim, heads * dim, value_heads * dim]
+
+    def split(rows: torch.Tensor):
+        q, k, v = rows[:, : sum(widths)].split(widths, dim=-1)
+        return (
+            q.view(batch, 1, heads, dim),
+            k.view(batch, 1, heads, dim),
+            v.view(batch, 1, value_heads, dim),
+        )
+
+    packed = split(torch.empty(batch, sum(widths)))
+    projection = split(torch.empty(batch, sum(widths) + value_heads * dim))
+    assert not _qkv_rows_strided(*packed)
+    assert _qkv_rows_strided(*projection) == (batch > 1)
+    assert not _qkv_rows_strided(*(t.contiguous() for t in projection))
 
 
 def test_pack_gdn_projection_copies_the_row_strided_views(device: str):

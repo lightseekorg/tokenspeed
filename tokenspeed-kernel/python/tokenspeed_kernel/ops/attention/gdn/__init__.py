@@ -279,6 +279,27 @@ def gdn_chunk_prefill(
         )
 
 
+def _qkv_rows_strided(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Whether q/k/v rows lie farther apart than one packed q|k|v row.
+
+    Contiguous tensors, and the sections of one dense ``[..., q | k | v]``
+    row split apart (as the dense decode path hands them over), are not
+    strided; views into a wider projection row are.
+    """
+    width = sum(t.shape[-2] * t.shape[-1] for t in (q, k, v))
+    for t in (q, k, v):
+        if t.is_contiguous():
+            continue
+        if t.stride(-1) != 1 or t.stride(-2) != t.shape[-1]:
+            return True
+        row = width
+        for dim in reversed(range(t.ndim - 2)):
+            if t.shape[dim] != 1 and t.stride(dim) != row:
+                return True
+            row *= t.shape[dim]
+    return False
+
+
 def gdn_decode_step(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -302,9 +323,10 @@ def gdn_decode_step(
         q: Query tensor shaped ``[B, 1, num_q_heads, head_dim]``.
         k: Key tensor shaped ``[B, 1, num_q_heads, head_dim]``.
         v: Value tensor shaped ``[B, 1, num_v_heads, head_v_dim]``.
-            q/k/v may be row-strided views with contiguous heads, which only
-            kernels declaring the ``strided_qkv`` trait accept (see
-            ``gdn_decode_supports``).
+            q/k/v may be sections of one packed ``q | k | v`` row. Rows
+            spaced wider (views into a projection row; heads stay
+            contiguous) only reach kernels declaring the ``strided_qkv``
+            trait (see ``gdn_decode_supports``).
         A_log: Floating-point log decay parameter shaped ``[num_v_heads]``.
             Backends that require FP32 normalize it internally.
         a: Input-dependent decay shaped ``[B, 1, num_v_heads]``.
@@ -330,7 +352,7 @@ def gdn_decode_step(
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
     traits = {"head_dim": head_dim}
-    if not all(t.is_contiguous() for t in (q, k, v)):
+    if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
     kernel = select_kernel(
         "attention",
@@ -560,7 +582,7 @@ def gdn_decode_mtp(
     traits = {"head_dim": head_dim}
     if output_state is not None:
         traits["separate_output_state"] = True
-    if not all(t.is_contiguous() for t in (q, k, v)):
+    if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
     kernel = select_kernel(
         "attention",
@@ -671,8 +693,9 @@ def gdn_decode_supports(
         dtype: q/k/v dtype.
         head_dim: Key head dimension.
         trait: ``"separate_output_state"`` (an ``output_state`` pool) or
-            ``"strided_qkv"`` (non-contiguous q/k/v views with contiguous
-            heads; such kernels read a/b by stride too).
+            ``"strided_qkv"`` (q/k/v rows spaced wider than one packed
+            ``q | k | v`` row, with contiguous heads; such kernels read a/b by
+            stride too).
         solution: The solution the caller forces, or ``None``.
 
     Returns:
