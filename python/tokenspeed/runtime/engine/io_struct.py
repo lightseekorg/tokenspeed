@@ -692,6 +692,11 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
     # logprobs are off (see stream_output).
     output_token_logprobs_val: list[list[float]]
     output_token_logprobs_idx: list[list[int]]
+    # The top-k alternatives (``top_logprobs_num``). Per-request lists in a
+    # frame where some request asked for top-k, and [] for the whole frame
+    # otherwise -- the shape the token-id columns below always have. Read
+    # them through LogprobsProcessor._row, which returns [] for a request
+    # the frame has no entry for.
     input_top_logprobs_val: list[list]
     input_top_logprobs_idx: list[list]
     output_top_logprobs_val: list[list]

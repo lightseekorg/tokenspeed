@@ -1444,7 +1444,7 @@ class ModelExecutor:
         layout = ctx.output_layout
         num_prefill_outputs = layout.num_prefill_outputs
         # Eager prefills only: 0 in every captured graph.
-        sampled_top_k = getattr(ctx, "sampled_top_k", 0)
+        sampled_top_k = ctx.sampled_top_k
 
         if num_decodes == 0 and num_prefill_outputs == num_extends:
             sampled = self.sampling_backend.sample(

@@ -90,6 +90,10 @@ class Output:
     hidden_states: torch.Tensor | None = None
     logits_layout_plan: object = None
     input_token_logprobs: torch.Tensor | None = None
+    input_top_logprobs_val: torch.Tensor | None = None
+    input_top_logprobs_idx: torch.Tensor | None = None
+    sampled_top_logprobs_val: torch.Tensor | None = None
+    sampled_top_logprobs_idx: torch.Tensor | None = None
 
 
 class SharedBufferSampler:
@@ -163,6 +167,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
         num_extends=e,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(e, p, d, width),
+        sampled_top_k=0,
     )
     pool_indices = torch.tensor([17, 3, 11, 5, 13])[: e + d]
     cache_lengths = torch.arange(32)
@@ -534,6 +539,7 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
             if decode
             else ForwardOutputLayout(2, 2, 0, 1)
         ),
+        sampled_top_k=0,
     )
     tokens, lengths = sample(
         executor, Output(torch.eye(2)), info, ctx, torch.zeros(2, 1, dtype=torch.int32)

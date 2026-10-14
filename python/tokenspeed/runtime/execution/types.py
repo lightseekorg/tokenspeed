@@ -206,19 +206,11 @@ class ForwardLogprobs:
     def of(cls, logits_output: Any) -> ForwardLogprobs | None:
         """The forward's logprobs from its ``LogitsProcessorOutput``."""
         logprobs = cls(
-            input_token_logprobs=getattr(logits_output, "input_token_logprobs", None),
-            input_top_logprobs_val=getattr(
-                logits_output, "input_top_logprobs_val", None
-            ),
-            input_top_logprobs_idx=getattr(
-                logits_output, "input_top_logprobs_idx", None
-            ),
-            output_top_logprobs_val=getattr(
-                logits_output, "sampled_top_logprobs_val", None
-            ),
-            output_top_logprobs_idx=getattr(
-                logits_output, "sampled_top_logprobs_idx", None
-            ),
+            input_token_logprobs=logits_output.input_token_logprobs,
+            input_top_logprobs_val=logits_output.input_top_logprobs_val,
+            input_top_logprobs_idx=logits_output.input_top_logprobs_idx,
+            output_top_logprobs_val=logits_output.sampled_top_logprobs_val,
+            output_top_logprobs_idx=logits_output.sampled_top_logprobs_idx,
         )
         return None if logprobs.is_empty() else logprobs
 

@@ -239,17 +239,16 @@ class InputProcessor:
                 "are computed for the prompt and the token a prefill samples, "
                 "not for decode steps."
             )
-        if getattr(server_args, "logprob_order", "torch") != "torch":
+        if server_args.logprob_order != "torch":
             raise ValueError(
                 "top_logprobs_num > 0 needs --logprob-order torch, not "
                 f"{server_args.logprob_order}."
             )
-        mapping = getattr(server_args, "mapping", None)
-        if mapping is not None and mapping.has_pp:
+        if server_args.mapping is not None and server_args.mapping.has_pp:
             raise ValueError(
                 "top_logprobs_num > 0 is not supported with pipeline parallelism."
             )
-        if getattr(server_args, "disaggregation_mode", "null") != "null":
+        if server_args.disaggregation_mode != "null":
             raise ValueError(
                 "top_logprobs_num > 0 is not supported with disaggregated "
                 "prefill and decode."

@@ -850,10 +850,7 @@ class OutputProcesser:
         # The prefill rows' sampled-token alternatives, in prefill output
         # order: extend slot i's rows start where its tokens do (``pt``).
         output_top_val_list = output_top_idx_list = None
-        if (
-            getattr(model_execution_results, "output_top_logprobs_val", None)
-            is not None
-        ):
+        if model_execution_results.output_top_logprobs_val is not None:
             output_top_val_list = (
                 model_execution_results.output_top_logprobs_val.tolist()
             )
@@ -1154,7 +1151,7 @@ class OutputProcesser:
                 f"{plan.num_rows}"
             )
         top_values = top_ids = None
-        if getattr(model_execution_results, "input_top_logprobs_val", None) is not None:
+        if model_execution_results.input_top_logprobs_val is not None:
             top_values = model_execution_results.input_top_logprobs_val.tolist()
             top_ids = model_execution_results.input_top_logprobs_idx.tolist()
         cursor = 0

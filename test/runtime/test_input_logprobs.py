@@ -116,7 +116,12 @@ def _input_processor(
             enable_prefix_caching=True,
             enable_output_logprobs=enable_output_logprobs,
             language_model_only=False,
-            **{"disaggregation_mode": "null", **server_args},
+            **{
+                "logprob_order": "torch",
+                "mapping": None,
+                "disaggregation_mode": "null",
+                **server_args,
+            },
         ),
         model_config=SimpleNamespace(
             vocab_size=32000, is_multimodal=False, is_multimodal_active=False
