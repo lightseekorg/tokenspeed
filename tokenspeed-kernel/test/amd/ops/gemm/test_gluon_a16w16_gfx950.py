@@ -498,11 +498,10 @@ _QWEN38_DECODE_CASES = [
     pytest.param((5, 324, 10240), id="hc-down-splitk-small-m"),
     pytest.param((13, 10240, 320), id="hc-up-all-tiles-in-flight"),
     pytest.param((50, 10240, 320), id="hc-up-64-row-tile"),
-    pytest.param((64, 2560, 3072), id="out-proj"),
+    pytest.param((20, 2560, 3072), id="out-proj"),
     pytest.param((30, 512, 2560), id="router"),
     pytest.param((3, 640, 2560), id="indexer"),
     pytest.param((16, 2560, 2560), id="mtp-fc"),
-    pytest.param((11, 8240, 2560), id="gdn-in-proj-ragged-n"),
 ]
 
 
@@ -516,15 +515,6 @@ def test_qwen38_decode_gemm_matches_reference(shape: tuple[int, int, int]) -> No
         a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
         out = launch_gluon_mm_a16w16_decode_gfx950(a, b, torch.bfloat16)
         torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
-
-
-def test_qwen38_decode_keeps_hipblaslt_for_wide_projections() -> None:
-    # The fused GDN and attention input projections stream 34-42 MB of
-    # weight; hipBLASLt keeps the row counts where it runs as fast.
-    assert supports_gluon_mm_a16w16_decode_gfx950(16, 8240, 2560)
-    assert not supports_gluon_mm_a16w16_decode_gfx950(64, 8240, 2560)
-    assert supports_gluon_mm_a16w16_decode_gfx950(4, 6656, 2560)
-    assert not supports_gluon_mm_a16w16_decode_gfx950(16, 6656, 2560)
 
 
 def test_qwen38_decode_row_count_does_not_recompile() -> None:

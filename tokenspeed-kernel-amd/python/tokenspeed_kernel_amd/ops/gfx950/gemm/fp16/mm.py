@@ -1674,8 +1674,8 @@ def launch_gluon_mm_a16w16_medium_gfx950(
     return C
 
 
-# Cold-cache rocprofv3 sweeps on gfx950 at Kimi K3 TP8 and Qwen3.8-Flash-Next
-# TP2 decode shapes, keyed by (N, K) and then by M bucket: a call uses the
+# Cold-cache sweeps on gfx950 at Kimi K3 TP8 and Qwen3.8-Flash-Next TP2 decode
+# shapes (Qwen3.8 checked as HIP-graph replays, as served), keyed by (N, K) and then by M bucket: a call uses the
 # config of the smallest bucket covering its M, so M stays a runtime argument
 # within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M, WARPS_N,
 # NUM_BUFFERS, SPLIT_K, NUM_XCDS); NUM_BUFFERS above three holds every K tile of
@@ -1801,30 +1801,13 @@ _DECODE_CONFIGS: dict[
         32: (32, 64, 64, 1, 4, 5, 1, 1),
         64: (64, 64, 64, 4, 1, 5, 1, 1),
     },
-    # Fused Gated DeltaNet q/k/v/z/b/a input projection; hipBLASLt streams the
-    # 42 MB weight as fast from 32 rows.
-    (8240, 2560): {
-        4: (16, 64, 256, 1, 4, 3, 1, 1),
-        8: (16, 64, 256, 1, 4, 3, 1, 1),
-        16: (16, 64, 256, 1, 4, 3, 1, 1),
-    },
-    # Attention q/gate/k/v projection.
-    (6656, 2560): {
-        4: (16, 64, 128, 1, 4, 3, 2, 1),
-        32: (32, 32, 256, 2, 2, 3, 1, 1),
-    },
     # Gated DeltaNet out_proj and attention o_proj.
     (2560, 3072): {
-        4: (16, 64, 128, 1, 4, 6, 4, 1),
-        8: (16, 64, 256, 1, 4, 3, 4, 1),
         16: (16, 64, 256, 1, 4, 3, 4, 1),
         32: (32, 32, 64, 2, 2, 6, 8, 1),
-        64: (32, 32, 256, 2, 2, 3, 1, 8),
     },
     # MTP embedding and hidden-state fc.
     (2560, 2560): {
-        4: (16, 64, 128, 1, 4, 5, 4, 1),
-        8: (16, 64, 128, 1, 4, 5, 4, 1),
         16: (16, 64, 256, 1, 4, 2, 5, 8),
         32: (32, 32, 64, 2, 2, 8, 5, 1),
         64: (32, 32, 256, 2, 2, 3, 1, 1),
