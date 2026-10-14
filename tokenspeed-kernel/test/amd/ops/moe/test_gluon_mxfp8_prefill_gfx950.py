@@ -1287,10 +1287,6 @@ def test_n16_joint_decode_retains_raw_bank_arithmetic(joint_bank, m):
 )
 def test_n16_a16_cell_tiles_tails_and_strided_output(m, d, i):
     module, raw = _module(2, d, i, 4)
-    if i == 128:
-        with pytest.raises(ValueError, match="D and I divisible by 256"):
-            preprocess_n16_mxfp4_weights(module)
-        return
     preprocess_n16_mxfp4_weights(module)
     generator = torch.Generator(device="cuda").manual_seed(853)
     x = (
@@ -1318,6 +1314,11 @@ def test_n16_a16_cell_tiles_tails_and_strided_output(m, d, i):
             routed_out=out,
         )
 
+    if i == 128:
+        # The N16 bank accepts I % 64; the SiTU decode tiles I by 256.
+        with pytest.raises(ValueError, match="divisible by 256"):
+            decode(_bank(module), output)
+        return
     actual = decode(_bank(module), output)
     assert actual is output
     # The unchanged linear path cannot upcast its minimum packed-K128 tile.

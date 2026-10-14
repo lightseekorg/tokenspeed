@@ -1102,6 +1102,54 @@ Both GEMMs overlap loads with matrix computation using double-buffered shared
 memory. Phased operand loading and scheduling barriers limit live registers;
 compiler-inserted shared-memory barriers provide inter-wave synchronization.
 
+### gfx950 dynamic-MXFP4 (A4W4) SiLU experts
+
+`gluon_mxfp4_a4w4_moe_apply_gfx950` serves MXFP4 checkpoints whose experts
+quantize activations to MXFP4 at runtime (`internal_activation_dtype="mxfp4"`,
+for example Quark MXFP4) with precomputed top-k and SiLU (or unclamped
+standard SwiGLU) on gfx950. It replaces the portable Triton path there.
+
+#### Contract
+
+- BF16 input `[M, H]` with `H % 512 == 0`; intermediate `I % 64 == 0`.
+- Weights use the N16 bank of `moe/mxfp4/n16_weights.py`, shared with the
+  MXFP8 SiTU pipelines: each 16-row group stores its K bytes as 64-byte
+  chunks laid out as 1 KiB blocks in MFMA lane order, so a wave reads a
+  weight fragment with one contiguous load; W13 alternates gate and up
+  groups and packs the gate/up scales of two 128-K steps into one 32-bit
+  word. W2 rows ending in a half chunk are stored flat without padding.
+  Wrapped `weight_loader`s keep checkpoint updates working.
+- Numerics follow the Triton path bit for bit up to FP32 accumulation order:
+  per-32 E8M0 scale in Quark's "even" mode (amax rounded to a power of two,
+  minus E2M1's emax of 2, as the dense MXFP4 activation quantizer), saturating
+  E2M1 round-to-nearest-even,
+  gate/up/SiLU/product rounded to BF16 before requantizing the intermediate,
+  BF16 per-route outputs summed in FP32 slot order. Expert ids outside
+  `[0, E)` contribute zero.
+
+#### Algorithm
+
+Four launches: activation quantization (scales stored lane-quad-major so a
+lane fetches four K steps' scales with one load), the gate/up GEMM with fused
+SiLU-and-mul and MXFP4 requantization in sorted-route order, the down GEMM
+writing BF16 per-route rows, and the slot-order combine. Up to 1024 routes,
+one extra program of the quantization launch sorts the routes into expert
+blocks (atomic per-expert cursors; order within a block does not matter);
+larger route sets run the block-aligned `gluon_moe_sorting` first. Both GEMMs
+are `e2m1 x e2m1` scaled 16x16x128 MFMAs that load weights straight into
+registers.
+
+Block height follows the average routes per expert: 16 rows up to 4 routes
+per expert (decode, including the 64-row MTP verify batches), 32 rows up to
+48, otherwise 64. Decode blocks stream each touched expert's weights once and
+load activations directly, keeping one 256-K step in flight. Larger blocks
+stage gathered activations through an LDS ring with async copies shared by
+the N-direction waves, keep each block's programs on one XCD so activations
+and an expert's weights are reused from L2, and redistribute the down GEMM
+output through LDS so each scattered route row is stored as one contiguous
+run; at 8K tokens that BF16 per-route write and its combine read dominate the
+second GEMM.
+
 ### gfx1250 MXFP4 experts
 
 On gfx1250, the MoE API selects Gluon kernels with FP8 activations and MXFP4
