@@ -23,9 +23,8 @@
 import pytest
 from tokenspeed_scheduler import (
     PD,
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     CacheTransferPolicy,
     ExecutionEvent,
     ForwardEvent,
@@ -47,8 +46,7 @@ def make_scheduler() -> Scheduler:
             group_id="full_attention",
             block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     return Scheduler(cfg)
@@ -101,8 +99,7 @@ def test_pd_counters_follow_request_state():
             block_granularity=16,
             total_pages=64,
             transfer_policy=CacheTransferPolicy.FullSuffix,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     scheduler = Scheduler(cfg)
@@ -142,8 +139,7 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
             block_granularity=2,
             total_pages=17,
             transfer_policy=CacheTransferPolicy.FullSuffix,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
         )
     ]
     scheduler = Scheduler(cfg)
@@ -162,6 +158,43 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
     completing_chunk = scheduler.next_execution_plan().forward[0]
     assert list(completing_chunk.input_lengths) == [4]
     assert held_pages(completing_chunk) == 6, "tokens 0..7 plus a 3-token window"
+
+
+def test_prefill_role_hands_off_without_the_draft_window():
+    """The P role never verifies locally, so its handoff holds only the first
+    verify window: a pool sized for the prompt and that window still hands off."""
+    cfg = SchedulerConfig()
+    cfg.role = SchedulerConfig.Role.P
+    cfg.prefix_granularity = 1
+    cfg.max_scheduled_tokens = 8
+    cfg.max_batch_size = 1
+    # Page 0 plus the two-token prompt and its four-token window.
+    cfg.num_device_pages = 7
+    cfg.num_snapshot_pages = 1  # the P role never retracts
+    cfg.disable_l2_cache = True
+    cfg.disable_prefix_cache = True
+    cfg.decode_input_tokens = 4
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="history",
+            block_granularity=1,
+            total_pages=7,
+            transfer_policy=CacheTransferPolicy.FullSuffix,
+            attn_kind=AttnKind.Full,
+        )
+    ]
+    scheduler = Scheduler(cfg)
+    spec = make_spec("p", [1, 2])
+    spec.max_new_tokens = 8
+    scheduler.submit_requests([spec])
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("p")))
+    assert scheduler.next_execution_plan().forward[0].request_ids == ["p"]
+    result = ForwardEvent.ExtendResult()
+    result.request_id = "p"
+    result.tokens = [3]
+    scheduler.advance(ExecutionEvent().add_event(result))
+    handoff = scheduler.next_execution_plan().remote_decode
+    assert handoff is not None and list(handoff.request_ids) == ["p"]
 
 
 @pytest.mark.parametrize("decode_input_tokens", [1, 4])
@@ -187,25 +220,22 @@ def test_remote_admission_lands_the_state_in_slot_one_and_decodes_in_place(
             group_id="history",
             block_granularity=4,
             total_pages=128,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.History,
+            attn_kind=AttnKind.Full,
             transfer_policy=CacheTransferPolicy.FullSuffix,
         ),
         CacheGroupConfig(
             group_id="state",
             block_granularity=0,
             total_pages=128,
-            retention=CacheRetention.FullHistory,
-            family=CacheGroupFamily.State,
+            attn_kind=AttnKind.State,
             transfer_policy=CacheTransferPolicy.LatestSnapshot,
         ),
         CacheGroupConfig(
             group_id="recent",
             block_granularity=1,
             total_pages=128,
-            retention=CacheRetention.SlidingWindow,
+            attn_kind=AttnKind.SlidingWindow,
             sliding_window_tokens=2,
-            family=CacheGroupFamily.History,
             transfer_policy=CacheTransferPolicy.FullSuffix,
         ),
     ]

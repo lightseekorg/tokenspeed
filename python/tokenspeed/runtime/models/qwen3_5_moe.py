@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -206,6 +207,13 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj.interleave_linear_and_gate = (
             self._use_nvfp4_gemm_swiglu_nvfp4_quant
         )
+        # Dynamic-activation MXFP4 projections fuse SiLU-and-mul into the
+        # gate_up GEMM epilogue; down_proj quantizes that output on load.
+        self._use_mxfp4_swiglu = isinstance(
+            self.gate_up_proj.quant_method, Mxfp4LinearMethod
+        ) and isinstance(self.down_proj.quant_method, Mxfp4LinearMethod)
+        if self._use_mxfp4_swiglu:
+            self.gate_up_proj.quant_method.enable_swiglu(self.gate_up_proj)
 
     def _uses_deep_gemm_fp8_mlp(self) -> bool:
         """Whether both projections can consume packed UE8M0 activations."""
@@ -243,6 +251,10 @@ class Qwen3_5MoeMLP(nn.Module):
                 self.down_proj.input_scale_inv,
             )
             x, _ = self.down_proj((x_fp4, x_scale))
+            return x
+        if self._use_mxfp4_swiglu:
+            x = self.gate_up_proj.quant_method.apply_swiglu(self.gate_up_proj, x)
+            x, _ = self.down_proj(x)
             return x
         gate_up, _ = self.gate_up_proj(x if x_nvfp4 is None else x_nvfp4)
         if self._uses_deep_gemm_fp8_mlp():

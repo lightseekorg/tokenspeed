@@ -1,12 +1,9 @@
-import ast
-import inspect
 import unittest
-from collections import deque
-from pathlib import Path
 from unittest import mock
 
 import torch
 
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
@@ -19,44 +16,53 @@ from tokenspeed.runtime.engine.scheduler_control_client import (
     combined_flush_cache_output,
 )
 from tokenspeed.runtime.entrypoints.engine import Engine
+from tokenspeed.runtime.utils.server_args import ServerArgs
+
+
+def _real_handler(server_args, *, can_clear_cache_fn, clear_cache_fn=None, device):
+    """Construct a real RequestHandler for unit tests.
+
+    Only the two collaborators the test host genuinely lacks are patched out:
+    the tokenizer load (no checkpoint on disk) and the gloo process-group
+    lookup (no distributed runtime). Tests override the replica group fields
+    afterwards to emulate multi-rank topologies.
+    """
+    # ServerArgs leaves the mapping rank-less; the launcher assigns it per
+    # rank (see entrypoints/engine.py), so the single rank here takes 0.
+    server_args.mapping.rank = 0
+    with (
+        mock.patch(
+            "tokenspeed.runtime.engine.request_handler.get_tokenizer",
+            return_value=None,
+        ),
+        mock.patch.object(
+            process_group_manager, "get_process_group", return_value=None
+        ),
+    ):
+        return RequestHandler(
+            server_args,
+            hf_eos_token_id=0,
+            max_req_len=2048,
+            vocab_size=32000,
+            recv_func=mock.Mock(),
+            send_func=mock.Mock(),
+            can_clear_cache_fn=can_clear_cache_fn,
+            clear_cache_fn=clear_cache_fn,
+            tokenizer_kwargs={},
+            device=device,
+        )
 
 
 class TestRequestHandlerFlushCache(unittest.TestCase):
     def _handler(self, can_clear, clear_result):
-        handler = RequestHandler.__new__(RequestHandler)
-        handler.send_func = mock.Mock()
-        handler.can_clear_cache_fn = mock.Mock(return_value=can_clear)
-        handler.clear_cache_fn = mock.Mock(return_value=clear_result)
-        handler.clear_l1_cache_fn = mock.Mock(return_value=not clear_result)
-        handler._replica_tp_size = 1
-        handler._replica_tp_cpu_group = None
-        handler.pp_size = 1
-        handler.pp_cpu_group = None
-        handler.attn_dp_size = 1
-        handler.attn_dp_cpu_group = None
-        handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
-        handler._pending_weight_ops = deque()
-        handler._pending_internal_ops = deque()
-        handler._internal_op_completer = None
-        handler._device = mock.Mock()
-        handler._device.delete_l3_namespace.return_value = True
-        return handler
-
-    def test_flush_reduce_doubles_require_op_and_group(self):
-        tree = ast.parse(Path(__file__).read_text())
-        found = False
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.FunctionDef) or node.name != "fake_all_reduce":
-                continue
-            found = True
-            defaults = dict(
-                zip((arg.arg for arg in node.args.kwonlyargs), node.args.kw_defaults)
-            )
-            self.assertEqual(node.args.defaults, [])
-            self.assertIsNone(defaults["op"])
-            self.assertIsNone(defaults["group"])
-        self.assertTrue(found)
+        device = mock.Mock()
+        device.delete_l3_namespace.return_value = True
+        return _real_handler(
+            ServerArgs(model="x"),
+            can_clear_cache_fn=mock.Mock(return_value=can_clear),
+            clear_cache_fn=mock.Mock(return_value=clear_result),
+            device=device,
+        )
 
     def test_returns_scheduler_clear_result(self):
         for success in (True, False):
@@ -68,7 +74,6 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
                 handler.can_clear_cache_fn.assert_called_once_with()
                 handler._device.delete_l3_namespace.assert_called_once_with()
                 handler.clear_cache_fn.assert_called_once_with()
-                handler.clear_l1_cache_fn.assert_not_called()
                 output = handler.send_func.send_pyobj.call_args.args[0]
                 self.assertEqual(output.success, success)
 
@@ -265,26 +270,13 @@ class TestRequestHandlerFlushCache(unittest.TestCase):
 
 class TestRequestHandlerL3WeightVersion(unittest.TestCase):
     def _handler(self):
-        handler = RequestHandler.__new__(RequestHandler)
-        handler.send_func = mock.Mock()
-        handler.server_args = mock.Mock(
-            weight_version="v1", kvstore_storage_backend=None
+        device = mock.Mock()
+        device.delete_l3_namespace.return_value = True
+        return _real_handler(
+            ServerArgs(model="x", weight_version="v1"),
+            can_clear_cache_fn=mock.Mock(return_value=True),
+            device=device,
         )
-        handler._device = mock.Mock()
-        handler._replica_tp_size = 1
-        handler._replica_tp_cpu_group = None
-        handler.pp_size = 1
-        handler.pp_cpu_group = None
-        handler.attn_dp_size = 1
-        handler.attn_dp_cpu_group = None
-        handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-        handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
-        handler._pending_weight_ops = deque()
-        handler._pending_internal_ops = deque()
-        handler._internal_op_completer = None
-        handler.can_clear_cache_fn = mock.Mock(return_value=True)
-        handler._device.delete_l3_namespace.return_value = True
-        return handler
 
     def test_successful_update_flushes_then_rebuilds_l3_prefix(self):
         handler = self._handler()
@@ -452,12 +444,6 @@ class TestRequestHandlerL3WeightVersion(unittest.TestCase):
         output = handler.send_func.send_pyobj.call_args.args[0]
         self.assertFalse(output.success)
         self.assertIn("cache flush failed", output.message)
-
-    def test_can_clear_cache_fn_is_required(self):
-        param = inspect.signature(RequestHandler.__init__).parameters[
-            "can_clear_cache_fn"
-        ]
-        self.assertIs(param.default, inspect.Parameter.empty)
 
     def test_l3_flush_without_version_is_rejected(self):
         handler = self._handler()
@@ -708,10 +694,6 @@ class TestEngineStampsL3Version(unittest.TestCase):
         self.assertEqual(engine.server_args.weight_version, "v1")
 
     def test_weight_version_has_no_default(self):
-        param = inspect.signature(Engine.update_weights_from_distributed).parameters[
-            "weight_version"
-        ]
-        self.assertIs(param.default, inspect.Parameter.empty)
         engine = self._engine(storage_backend="memory")
         with self.assertRaises(TypeError):
             engine.update_weights_from_distributed(

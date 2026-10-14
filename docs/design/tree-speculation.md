@@ -129,13 +129,20 @@ chain's draft steps (`(S - 1) * K <= N`, checked in `server_args`). Their K/V
 are valid only while the round drafts its tree. The target's verify overwrites
 the window.
 
-Known limitation, shared with the chain drafter: the decode reservation
-guarantees pages only through the verify window (`vc + N`), and draft writes
-reach past it (lanes up to `frontier + (S - 1) * K - 1`, chain steps up to
-`frontier + S - 2`). A position past the allocated extent resolves to the
-dummy slot, and attention reads it through page 0. This costs draft acceptance
-only. The next verify rewrites target KV. The fix is a draft headroom in the
-scheduler's decode reservation.
+Draft writes reach past the verify window: lanes up to
+`frontier + (S - 1) * K - 1`, chain steps up to `frontier + S - 2`. Both stay
+inside the next verify window (`(S - 1) * K <= N` and `S - 1 <= N`), so a
+speculative decode on a decoding role reserves one more verify window behind
+its own, from the first decode on (the prefill role hands off before drafting
+past its first window). That window stops at the request's token limit (prompt
+plus `max_new_tokens`), which admission may have prepaid in full, so it never
+demands a page past that limit. A request without a declared budget reserves
+no such window: admission validated only its first verify window. Known
+limitation: within `N` tokens of the
+limit some draft writes (chain steps, block drafters and tree lanes alike)
+still land past it. A position past the allocated extent resolves to the dummy
+slot, and attention reads it through page 0. This costs draft acceptance
+only. The next verify rewrites target KV.
 
 Lane attention is the same cascade with `R = K` over the draft paged cache:
 every lane row sees the accepted frontier and, inside the window, only its

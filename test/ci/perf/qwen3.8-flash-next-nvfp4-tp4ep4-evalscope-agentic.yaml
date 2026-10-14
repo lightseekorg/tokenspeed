@@ -6,7 +6,10 @@ triggers:
   - manual
 runner:
   labels:
-    - gb200-4gpu-perf
+    - slurm-gb300-4gpu
+slurm:
+  nodes: 1
+  gpus_per_node: 4
 env:
   CI: "true"
 install:
@@ -28,3 +31,14 @@ perf:
     "$SWEEP_DIR"
 report:
   github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Output Throughput (tok/min/gpu)].
+# Initial targets use the four-GPU SM103 measurements in #2216, converted
+# from system-wide output tok/s to tok/min/GPU.
+perf_reference:
+  1:  [691.82, 7789.35]
+  2:  [595.52, 13069.65]
+  4:  [436.44, 17306.10]
+  8:  [285.27, 23041.65]
+  16: [177.00, 29504.25]
+  32: [106.70, 36064.35]

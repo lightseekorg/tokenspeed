@@ -44,8 +44,7 @@ def _full(group_id: str, block_granularity: int, packing: int) -> "ts.CacheGroup
         group_id=group_id,
         block_granularity=block_granularity,
         total_pages=0,
-        retention=ts.CacheRetention.FullHistory,
-        family=ts.CacheGroupFamily.History,
+        attn_kind=ts.AttnKind.Full,
         cache_blocks_per_lcm_block=packing,
     )
 
@@ -57,9 +56,8 @@ def _sliding(
         group_id=group_id,
         block_granularity=block_granularity,
         total_pages=0,
-        retention=ts.CacheRetention.SlidingWindow,
+        attn_kind=ts.AttnKind.SlidingWindow,
         sliding_window_tokens=window,
-        family=ts.CacheGroupFamily.History,
         cache_blocks_per_lcm_block=packing,
     )
 
@@ -70,8 +68,7 @@ def _state(group_id: str, packing: int) -> "ts.CacheGroupConfig":
         group_id=group_id,
         block_granularity=0,
         total_pages=0,
-        retention=ts.CacheRetention.FullHistory,
-        family=ts.CacheGroupFamily.State,
+        attn_kind=ts.AttnKind.State,
         cache_blocks_per_lcm_block=packing,
     )
 
@@ -113,6 +110,36 @@ def test_reports_group_pages_in_config_order() -> None:
     # A model outlives the config it was built from.
     del cfg
     assert model.max_single_request_tokens(usable_lcm_blocks=100) > 0
+
+
+@pytest.mark.parametrize("overlap_schedule_depth", [0, 1])
+def test_speculative_requests_hold_the_next_verify_window(
+    overlap_schedule_depth: int,
+) -> None:
+    """A speculative decode also holds the next verify window its draft steps
+    write, on every role that decodes; the prefill role never decodes."""
+
+    def pages(role, decode_input_tokens: int) -> int:
+        cfg = _sizing_config(
+            role=role,
+            prefix_granularity=1,
+            max_scheduled_tokens=64,
+            max_batch_size=2,
+            decode_input_tokens=decode_input_tokens,
+            overlap_schedule_depth=overlap_schedule_depth,
+            groups=[_full("full", 1, 1)],
+        )
+        # The PD roles transfer the full suffix.
+        cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
+        model = ts.CapacityModel(cfg)
+        return model.concurrent_group_pages(max_total_tokens=100, max_context_len=50)[0]
+
+    roles = ts.SchedulerConfig.Role
+    # Dense history plus, per live request, the protected in-flight window and the next one.
+    assert pages(roles.Fused, 4) == 100 + 2 * (overlap_schedule_depth + 1) * 4
+    assert pages(roles.D, 4) == 100 + 2 * (overlap_schedule_depth + 1) * 4
+    assert pages(roles.Fused, 1) == 100 + 2 * overlap_schedule_depth
+    assert pages(roles.P, 4) == 100
 
 
 def test_rejects_unsized_pool_only_in_the_scheduler() -> None:

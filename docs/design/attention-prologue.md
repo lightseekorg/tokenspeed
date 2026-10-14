@@ -290,7 +290,7 @@ returns per-head keys and values.
 | Solution | Kernel | Covers |
 | --- | --- | --- |
 | `triton` | one launch that also assembles the query | absorbed, dense cache, full write, up to 32768 token-heads |
-| `composite` | `embedding.rope` or `embedding.rope_mla`, then the latent store | everything on AMD and NVIDIA; its latent store needs `kv_lora_rank` a multiple of 256 below 512 written rows and a power of two above (every in-tree MLA model uses 512); the only solution of the store-less form (`cache=None`, trait `store=False`), whose returned latent `latent_store(latent, kv_lora_rank=, cache=)` writes into a native cache |
+| `composite` | `embedding.rope` or `embedding.rope_mla`, then the latent store | everything on AMD and NVIDIA; Ascend BF16 native absorbed and expanded writes; its latent store needs `kv_lora_rank` a multiple of 256 below 512 written rows and a power of two above (every in-tree MLA model uses 512); the only solution of the store-less form (`cache=None`, trait `store=False`), whose returned latent `latent_store(latent, kv_lora_rank=, cache=)` writes into a native cache |
 
 ## Adding a fused kernel
 

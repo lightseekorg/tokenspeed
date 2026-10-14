@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.attention.prologue import MRope, RopeStyle, Rotary
 from tokenspeed_kernel.ops.embedding import apply_rope
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -1356,6 +1357,7 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
+                device="npu" if current_platform().is_npu else "cuda",
                 ramp_device=yarn_ramp_mask_device,
                 **extra_kwargs,
             )

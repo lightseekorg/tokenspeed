@@ -92,6 +92,9 @@ public:
     // SUBMITTED prompt, which no retraction or restore changes.
     std::int32_t GeneratedTokens() const { return std::max(0, TokenSize() - submitted_prompt_size_); }
     std::int32_t RemainingNewTokens() const { return std::max(0, max_new_tokens_ - GeneratedTokens()); }
+    bool HasDeclaredBudget() const { return max_new_tokens_ > 0; }
+    // The submitted prompt plus the declared budget.
+    std::int64_t TokenLimit() const { return std::int64_t{submitted_prompt_size_} + max_new_tokens_; }
     bool HasGeneratedOutput() const { return GeneratedTokens() > 0; }
     // The budget that was still open when the current admission was granted:
     // stamped by the admission events (a first chunk, a restore), frozen for

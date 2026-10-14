@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.compile_monitor import CompileStats
 
+from tokenspeed.runtime.engine.request_types import ABORT_CODE, BaseFinishReason
 from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
@@ -152,6 +153,70 @@ class TimeStats:
             return self.RequestType.INVALID
 
 
+# Stable snake_case strings for the bounded ABORT_CODE enum, used in the
+# finish_reason label (never the unbounded abort message).
+_ABORT_REASON_LABELS = {
+    ABORT_CODE.TransferFailed: "transfer_failed",
+    ABORT_CODE.UnknownError: "unknown_error",
+    ABORT_CODE.NumericalError: "numerical_error",
+    ABORT_CODE.CapacityAbort: "capacity_abort",
+}
+
+
+def finish_reason_label(finished_reason: dict | BaseFinishReason | None) -> str:
+    """Map a finish reason to its bounded ``finish_reason`` label value.
+
+    Accepts the wire form (``BaseFinishReason.to_json()`` dicts) and the
+    object form alike. The label carries the bounded taxonomy only: the
+    type (``stop`` / ``length`` / ``abort``) and, for aborts, the bounded
+    ``ABORT_CODE`` subclass as ``abort:<code>``. An abort with an
+    unrecognized or missing ``err_type`` stays plain ``abort``; an
+    unrecognized form maps to ``unknown``. Unbounded payloads (abort
+    message, matched stop string/token) never become labels.
+    """
+    if finished_reason is None:
+        return "unknown"
+    reason = (
+        finished_reason
+        if isinstance(finished_reason, dict)
+        else finished_reason.to_json()
+    )
+    reason_type = reason.get("type")
+    if reason_type in ("stop", "length"):
+        return reason_type
+    if reason_type != "abort":
+        return "unknown"
+    err_type = reason.get("err_type")
+    try:
+        code = err_type if isinstance(err_type, ABORT_CODE) else ABORT_CODE(err_type)
+    except (ValueError, TypeError):
+        return "abort"
+    # A future ABORT_CODE member without a label entry stays plain "abort",
+    # like an unrecognized err_type; the mapping test guards against drift.
+    label = _ABORT_REASON_LABELS.get(code)
+    return f"abort:{label}" if label is not None else "abort"
+
+
+def stream_label(stream: bool) -> str:
+    """The ``stream`` label value for a request's streaming flag."""
+    return "true" if stream else "false"
+
+
+def build_1_2_5_buckets(max_value: int) -> list[float]:
+    """A 1-2-5 exponential bucket grid: 1, 2, 5 scaled by increasing powers
+    of ten, capped at ``max_value`` (e.g. 100 -> 1, 2, 5, 10, 20, 50, 100)."""
+    exponent = 0
+    buckets: list[float] = []
+    while True:
+        for m in (1, 2, 5):
+            value = m * 10**exponent
+            if value <= max_value:
+                buckets.append(float(value))
+            else:
+                return buckets
+        exponent += 1
+
+
 @dataclass
 class RequestFinishStats:
     prompt_tokens: int
@@ -159,6 +224,10 @@ class RequestFinishStats:
     e2e_latency: float
     cached_prompt_tokens: int = 0
     finished_ok: bool = True
+    # Bounded finish-reason label value (``finish_reason_label``).
+    finish_reason: str = "unknown"
+    # The request's streaming flag, exported as the "stream" label.
+    stream: bool = False
 
 
 _TIME_PER_OUTPUT_TOKEN_BUCKETS = [
@@ -334,6 +403,23 @@ class EngineMetrics:
             labelnames=labelnames,
             **kw,
         )
+        # Exported as tokenspeed:num_preemptions_total.
+        self.num_preemptions = Counter(
+            name="tokenspeed:num_preemptions",
+            documentation=(
+                "Requests preempted by a capacity retraction: the scheduler "
+                "suspended a resident request (its pages imaged to the Host "
+                "snapshot pool; it later resumes by restore, nothing is "
+                "recomputed) to free Device pages for a blocked admission. "
+                "One increment per retraction victim per round, counted from "
+                "the plan's snapshot-store ops; forced retractions from "
+                "--debug-force-retraction-interval count too. A retraction "
+                "whose victim cannot be imaged aborts it instead — see "
+                "tokenspeed:num_capacity_aborted_requests."
+            ),
+            labelnames=labelnames,
+            **kw,
+        )
         # Request-latency bucket grid: 0.3 s to 7680 s.
         self.request_queue_time_seconds = Histogram(
             name="tokenspeed:request_queue_time_seconds",
@@ -445,6 +531,12 @@ class EngineMetrics:
             return
         self.num_capacity_aborted_requests.labels(**self.labels).inc()
 
+    def record_preemptions(self, count: int) -> None:
+        """Increment by the round's retraction count (plan snapshot ops)."""
+        if not self.enabled or count <= 0:
+            return
+        self.num_preemptions.labels(**self.labels).inc(count)
+
     def observe_request_queue_time(self, queue_time: float) -> None:
         if not self.enabled:
             return
@@ -457,19 +549,28 @@ class RequestMetrics:
         labels: dict[str, str],
         *,
         enabled: bool,
+        max_model_len: int,
         registry=None,
     ) -> None:
         self.enabled = enabled
         self.labels = labels
 
         if self.enabled:
-            self._init_prometheus(labels, registry=registry)
+            self._init_prometheus(
+                labels, max_model_len=max_model_len, registry=registry
+            )
 
-    def _init_prometheus(self, labels: dict[str, str], *, registry=None) -> None:
+    def _init_prometheus(
+        self, labels: dict[str, str], *, max_model_len: int, registry=None
+    ) -> None:
         # We need to import prometheus_client after setting the env variable PROMETHEUS_MULTIPROC_DIR
         from prometheus_client import Counter, Histogram
 
         labelnames = list(labels.keys())
+        # Per-request enrichment: counters additionally carry finish_reason
+        # and stream; histograms carry stream only.
+        finish_labelnames = [*labelnames, "finish_reason", "stream"]
+        stream_labelnames = [*labelnames, "stream"]
         kw = {"registry": registry} if registry is not None else {}
 
         self.prompt_tokens_total = Counter(
@@ -486,19 +587,19 @@ class RequestMetrics:
             **kw,
         )
 
-        # vLLM has no direct equivalent; tokenspeed-only Counter that tracks
-        # every finished request regardless of finish reason.
+        # tokenspeed-only Counter that tracks every finished request
+        # regardless of finish reason.
         self.num_requests_total = Counter(
             name="tokenspeed:num_requests",
             documentation="Number of requests processed.",
-            labelnames=labelnames,
+            labelnames=finish_labelnames,
             **kw,
         )
 
         self.request_success_total = Counter(
             name="tokenspeed:request_success",
             documentation="Requests that finished without an abort-style finish.",
-            labelnames=labelnames,
+            labelnames=finish_labelnames,
             **kw,
         )
 
@@ -506,7 +607,11 @@ class RequestMetrics:
             name="tokenspeed:prefix_cache_hits",
             documentation=(
                 "Prompt tokens served from prefix cache. Hit ratio = "
-                "prefix_cache_hits_total / prompt_tokens_total."
+                "prefix_cache_hits_total / prompt_tokens_total. This is the "
+                "cached leg of the cached/uncached split: cached tokens = "
+                "tokenspeed:prefix_cache_hits_total, uncached tokens = "
+                "tokenspeed:prompt_tokens_total - "
+                "tokenspeed:prefix_cache_hits_total."
             ),
             labelnames=labelnames,
             **kw,
@@ -515,7 +620,7 @@ class RequestMetrics:
         self.histogram_time_to_first_token = Histogram(
             name="tokenspeed:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
-            labelnames=labelnames,
+            labelnames=stream_labelnames,
             buckets=[
                 0.1,
                 0.3,
@@ -579,7 +684,7 @@ class RequestMetrics:
         self.histogram_e2e_request_latency = Histogram(
             name="tokenspeed:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
-            labelnames=labelnames,
+            labelnames=stream_labelnames,
             buckets=[
                 0.1,
                 0.2,
@@ -605,29 +710,67 @@ class RequestMetrics:
             **kw,
         )
 
+        # Per-request token distributions at request finish, on a 1-2-5
+        # bucket grid capped at the model's max length.
+        request_token_buckets = build_1_2_5_buckets(max_model_len)
+        self.histogram_request_prompt_tokens = Histogram(
+            name="tokenspeed:request_prompt_tokens",
+            documentation=(
+                "Histogram of per-request prompt token counts at request "
+                "finish (1-2-5 bucket grid capped at the model's max length)."
+            ),
+            labelnames=stream_labelnames,
+            buckets=request_token_buckets,
+            **kw,
+        )
+        self.histogram_request_generation_tokens = Histogram(
+            name="tokenspeed:request_generation_tokens",
+            documentation=(
+                "Histogram of per-request generation token counts at request "
+                "finish (1-2-5 bucket grid capped at the model's max length)."
+            ),
+            labelnames=stream_labelnames,
+            buckets=request_token_buckets,
+            **kw,
+        )
+
     def record_request_finish(self, stats: RequestFinishStats) -> None:
         if not self.enabled:
             return
         self.prompt_tokens_total.labels(**self.labels).inc(stats.prompt_tokens)
         self.generation_tokens_total.labels(**self.labels).inc(stats.generation_tokens)
-        self.num_requests_total.labels(**self.labels).inc(1)
+        finish_labels = {
+            **self.labels,
+            "finish_reason": stats.finish_reason,
+            "stream": stream_label(stats.stream),
+        }
+        self.num_requests_total.labels(**finish_labels).inc(1)
         self.prefix_cache_hits_total.labels(**self.labels).inc(
             stats.cached_prompt_tokens
         )
         if stats.finished_ok:
-            self.request_success_total.labels(**self.labels).inc(1)
-        self.histogram_e2e_request_latency.labels(**self.labels).observe(
+            self.request_success_total.labels(**finish_labels).inc(1)
+        stream_labels = {**self.labels, "stream": stream_label(stats.stream)}
+        self.histogram_e2e_request_latency.labels(**stream_labels).observe(
             stats.e2e_latency
+        )
+        self.histogram_request_prompt_tokens.labels(**stream_labels).observe(
+            stats.prompt_tokens
+        )
+        self.histogram_request_generation_tokens.labels(**stream_labels).observe(
+            stats.generation_tokens
         )
         if stats.generation_tokens >= 1:
             self.histogram_time_per_output_token.labels(**self.labels).observe(
                 stats.e2e_latency / stats.generation_tokens
             )
 
-    def observe_time_to_first_token(self, value: float) -> None:
+    def observe_time_to_first_token(self, value: float, *, stream: bool) -> None:
         if not self.enabled:
             return
-        self.histogram_time_to_first_token.labels(**self.labels).observe(value)
+        self.histogram_time_to_first_token.labels(
+            **self.labels, stream=stream_label(stream)
+        ).observe(value)
 
     def observe_decode_time_per_output_token(self, value: float) -> None:
         if not self.enabled:

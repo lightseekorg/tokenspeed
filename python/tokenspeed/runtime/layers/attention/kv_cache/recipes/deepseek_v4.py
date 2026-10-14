@@ -72,11 +72,10 @@ def v4_swa_kv_spec(hf_config) -> CacheGroupSpec:
     """SWA kv: per-token KV rows retained over a sliding window."""
     return CacheGroupSpec(
         group_id=V4_SWA_KV_GROUP_ID,
-        retention="sliding_window",
+        attn_kind="sliding_window",
         rows_per_page=V4_KERNEL_BLOCK_ROWS,
         entry_stride_tokens=1,
         sliding_window_tokens=_resolve_sliding_window(hf_config),
-        family="history",
         replayable=False,
     )
 
@@ -93,11 +92,10 @@ def v4_compressor_state_spec(ratio: int) -> CacheGroupSpec:
     _check_ratio(ratio)
     return CacheGroupSpec(
         group_id=v4_compressor_state_group_id(ratio),
-        retention="sliding_window",
+        attn_kind="sliding_window",
         rows_per_page=V4_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio],
         entry_stride_tokens=1,
         sliding_window_tokens=V4_COMPRESSOR_STATE_WINDOW_TOKENS[ratio],
-        family="history",
         replayable=False,
     )
 
@@ -107,11 +105,10 @@ def v4_compressed_kv_spec(ratio: int) -> CacheGroupSpec:
     _check_ratio(ratio)
     return CacheGroupSpec(
         group_id=v4_compressed_kv_group_id(ratio),
-        retention="full_history",
+        attn_kind="full_history",
         rows_per_page=v4_compressed_rows_per_page(ratio),
         entry_stride_tokens=ratio,
         sliding_window_tokens=None,
-        family="history",
         replayable=False,
     )
 
@@ -120,11 +117,10 @@ def v4_indexer_kv_spec() -> CacheGroupSpec:
     """Indexer K: an independent full-history chain over the ratio-4 layers."""
     return CacheGroupSpec(
         group_id=V4_INDEXER_KV_GROUP_ID,
-        retention="full_history",
+        attn_kind="full_history",
         rows_per_page=v4_compressed_rows_per_page(4),
         entry_stride_tokens=4,
         sliding_window_tokens=None,
-        family="history",
         replayable=False,
     )
 
@@ -133,11 +129,10 @@ def v4_indexer_state_spec() -> CacheGroupSpec:
     """Indexer compressor input tail: raw-token rows over the ratio-4 window."""
     return CacheGroupSpec(
         group_id=V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
-        retention="sliding_window",
+        attn_kind="sliding_window",
         rows_per_page=V4_COMPRESSOR_STATE_ROWS_PER_PAGE[4],
         entry_stride_tokens=1,
         sliding_window_tokens=V4_COMPRESSOR_STATE_WINDOW_TOKENS[4],
-        family="history",
         replayable=False,
     )
 

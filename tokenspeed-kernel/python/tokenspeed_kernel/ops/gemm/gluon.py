@@ -25,6 +25,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.gemm import KIMI3_HIDDEN_SIZE, KIMI3_QKVFAB_SIZE
 from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
+from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -369,6 +370,98 @@ else:
 
 
 # ===-----------------------------------------------------------------------===#
+# MXFP4 linear with dynamic MXFP4 activations: Gluon (AMD gfx950)
+# ===-----------------------------------------------------------------------===#
+
+
+if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import (
+        launch_gluon_mxfp4_linear_gfx950 as _mxfp4_linear_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import (
+        launch_gluon_mxfp4_swiglu_linear_gfx950 as _mxfp4_swiglu_linear_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp4 import (
+        preshuffle_mxfp4_weight as _preshuffle_mxfp4_weight,
+    )
+
+    # Packed E2M1 weight in 16x16 MFMA-tile order (preshuffle_mxfp4_weight).
+    MXFP4_LINEAR_MFMA_LAYOUT = "mfma_16x16"
+    # The kernels address the weight with 32-bit buffer offsets.
+    _MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS = 2**31 - 1
+
+    def prepare_mxfp4_linear_mfma_weight(weight: torch.Tensor) -> torch.Tensor:
+        """Reorder a checkpoint ``[N, K/2]`` MXFP4 weight for the gfx950 kernels."""
+        return _preshuffle_mxfp4_weight(weight)
+
+    @register_kernel(
+        "gemm",
+        "mxfp4_linear",
+        name="gluon_mxfp4_linear_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=MXFP4_LINEAR_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "n_align": frozenset({16}),
+            "k_align": frozenset({64}),
+            "weight_elements_max": frozenset({_MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS}),
+            "weight_layout": frozenset({MXFP4_LINEAR_MFMA_LAYOUT}),
+        },
+    )
+    def gluon_mxfp4_linear_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        *,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``mxfp4(x) @ W.T`` with in-kernel activation quantization."""
+        return _mxfp4_linear_impl(x, weight, weight_scale, out=out)
+
+    @register_kernel(
+        "gemm",
+        "mxfp4_swiglu_linear",
+        name="gluon_mxfp4_swiglu_linear_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=MXFP4_LINEAR_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "n_align": frozenset({32}),
+            "k_align": frozenset({64}),
+            "weight_elements_max": frozenset({_MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS}),
+            "weight_layout": frozenset({MXFP4_LINEAR_MFMA_LAYOUT}),
+        },
+    )
+    def gluon_mxfp4_swiglu_linear_gfx950(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        *,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """``silu(gate) * up`` of ``mxfp4(x) @ W.T`` fused into one GEMM."""
+        return _mxfp4_swiglu_linear_impl(x, weight, weight_scale, out=out)
+
+else:
+    MXFP4_LINEAR_MFMA_LAYOUT = None
+
+    def prepare_mxfp4_linear_mfma_weight(weight):
+        raise ImportError(
+            "prepare_mxfp4_linear_mfma_weight requires tokenspeed-kernel-amd"
+        )
+
+    def gluon_mxfp4_linear_gfx950(*args, **kwargs):
+        raise ImportError("gluon_mxfp4_linear_gfx950 requires tokenspeed-kernel-amd")
+
+    def gluon_mxfp4_swiglu_linear_gfx950(*args, **kwargs):
+        raise ImportError(
+            "gluon_mxfp4_swiglu_linear_gfx950 requires tokenspeed-kernel-amd"
+        )
+
+
+# ===-----------------------------------------------------------------------===#
 # MXFP8 and FP8 block-scale: Gluon (AMD gfx1250)
 # ===-----------------------------------------------------------------------===#
 
@@ -709,6 +802,10 @@ register_kernel(
 
 
 __all__ = [
+    "MXFP4_LINEAR_MFMA_LAYOUT",
+    "gluon_mxfp4_linear_gfx950",
+    "gluon_mxfp4_swiglu_linear_gfx950",
+    "prepare_mxfp4_linear_mfma_weight",
     "gluon_mm_a16w16_prefill_gfx950",
     "gluon_mm_mxfp8_gfx950",
     "gluon_mm_mxfp8_decode_gfx950",

@@ -20,8 +20,12 @@ people and average people is more than tenfold.
 
 ## Code changes
 
-* Add tests for the changed code. Don't be excessive--avoid checking trivial
-  details or exceptions.
+* Add tests for the changed code. A unit test must fail only when the code
+  under test is wrong: test behavior through real classes, not structure
+  (symbol existence, hierarchies, signatures, source text), mock call
+  choreography, or third-party packages. Avoid mocks and `SimpleNamespace`
+  unless definitely required; mock only what the test environment genuinely
+  lacks: GPUs, process groups, network, model weights.
 * Update docs for the changed code. Use concise comments to explain code
   where it might be tricky for humans to understand. Leave project/component
   level (design) docs focusing on high-level picture. Put suitable docs at

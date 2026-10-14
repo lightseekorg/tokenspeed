@@ -114,7 +114,7 @@ pages (`cache-concepts.md`, copy-in).
 once per round (`PrefillReserve`: decode width, whether the round completes
 the prompt, prompt headroom) and turned into each group's page demand by
 `ReservePrefillDemands` — the only writer of `GroupDemand::reserve_tokens`.
-It picks the rule by the group's retention, never by call site:
+It picks the rule by the group's kind, never by call site:
 
 - *Full-history* groups hold the decode slot — the chunk that
   completes the prompt reserves `decode_input_tokens`, so the first decode step
@@ -176,7 +176,7 @@ orders prefills against each other, never a decode behind a prefill.
 
 ### 1.2 State groups: two slots, natural checkpoints
 
-A State group (a recurrent layer's state, `CacheGroupFamily::State`) keeps no
+A State group (a recurrent layer's state, `AttnKind::kState`) keeps no
 history: one block holds the whole state after some prefix, so the group has
 no token span (`block_granularity = 0`) and its table is **two slots**
 whatever the prompt length. Slot 0 is the input checkpoint a forward reads,
@@ -217,7 +217,7 @@ ordinary chunk end or decode step publishes nothing for a State group
 (`CompletedPages::publish_state` is false). The key is the key of the exact
 token count `T`: the chain hash of the last page when `T` is a page multiple,
 otherwise the tail hash `hash@T` the KV groups use — so one key names a
-request's progress across every family (`cache-concepts.md`). A published
+request's progress across every group kind (`cache-concepts.md`). A published
 state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.
@@ -368,6 +368,8 @@ recipes size a pool from the same model before the arena is allocated
 demand at `max_batch_size` live requests), and then lets the `Scheduler`
 bound requests against the pool they sized. The per-request working set —
 `decode_width + overlap_schedule_depth * decode_width` protected tokens, the
+next verify window a speculative decode's draft steps write on the roles that
+decode (`DraftWindowTokens`, which `scheduleDecode` reserves from), the
 two slots of a State group (`kStateSlots`), the most blocks a sliding
 window can need behind a boundary (one more than behind a page-aligned one,
 `SlidingWindowBlocks`) — exists in that one file; neither side restates it. The two answers are tied by an
@@ -380,7 +382,7 @@ Per group, `ConcurrentGroupPages` charges: a State group two slots per live
 request (the working set does not grow with history); a prefix-closed history
 group `ceil(T / g)` dense pages plus,
 per request, `ceil((g - 1 + protected) / g)` for the unaligned tail and the
-protected tokens that may spill past it; a sliding group, per request,
+protected tokens (the draft window included) that may spill past it; a sliding group, per request,
 `ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
 pages, plus one in-flight prefill chunk behind its lookback (or, on the
 decode role, the landing bound `min(dense, lookback + window)` per request).
@@ -400,7 +402,10 @@ needing a copy), the owner publishes nothing at that point instead of
 waiting (§1).
 
 Speculative decode admission grows from the committed token frontier plus the verify
-spans still in flight and the span being scheduled. Already reserved slots
+spans still in flight, the span being scheduled and the next span, which the
+draft steps write; that last span stops at the request's token limit, so it
+stays inside the admission limit, a request without a declared budget reserves
+none, and the capacity model charges it per live request. Already reserved slots
 cover that extent first. A prefill interruption must not charge the same
 speculative slots again when decode resumes; otherwise rejected draft tokens
 accumulate in the logical tables beyond the context-length bound.

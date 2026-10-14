@@ -217,6 +217,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 self.enable_metrics
                 and "prometheus" in (server_args.metrics_reporters or [])
             ),
+            # Caps the request-token histogram grids (the 1-2-5 series).
+            max_model_len=self.context_len,
         )
 
         self.output_processor = OutputProcessor(self)

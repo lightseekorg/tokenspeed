@@ -231,7 +231,7 @@ private:
             }
         }
         if (completed_ != nullptr && completed_->owner_continues && completed_->tail &&
-            groups_[i].Spec().kind != AttnKind::kMambaState && !groups_[i].Spec().replayable) {
+            groups_[i].Spec().attn_kind != AttnKind::kState && !groups_[i].Spec().replayable) {
             blocks += (completed_->tail->tail_tokens + block_granularity - 1) / block_granularity;
         }
         return blocks;

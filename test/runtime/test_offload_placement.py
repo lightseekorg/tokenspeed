@@ -55,7 +55,7 @@ from tokenspeed.runtime.pd.cache_protocol import (
 def test_segmented_host_device_contract_and_budget(prefix_granularity):
     group = CacheGroupSpec(
         group_id="full_attention",
-        retention="full_history",
+        attn_kind="full_history",
         rows_per_page=8,
         entry_stride_tokens=1,
         transfer_policy="full_suffix",

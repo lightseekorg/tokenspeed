@@ -155,6 +155,17 @@ output buffers retain their identity. Decode transposes the vendor's
 `[batch, heads, query]` LSE to token-major order. This does not reinterpret
 regular BF16 KV as packed FP8 or change its Triton decode selection.
 
+## Runtime backend selection
+
+The runtime selects DSA with `--attention-backend dsa`, or automatically from
+the DSA architecture. The same name resolves to `AscendDSABackend` on Ascend
+and `DSABackend` on GPU platforms. The Ascend implementation owns its device
+metadata and operator adaptation; model projections and indexer selection
+parameters remain model-owned. Its current constraints are BF16 KV and index
+keys, 128-token kernel pages, target verification of at most eight tokens,
+and no draft-model attention. Target verification can still consume draft
+candidates. These constraints are checked by the Ascend backend.
+
 ## Sharded Index-K candidates
 
 `dsa_index_candidates` scores a bounded query tile against rank-local Index-K

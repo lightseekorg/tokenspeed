@@ -127,15 +127,42 @@ class EncoderModelFacts:
 
     Attributes:
         device: The engine's device.
-        hidden: Model hidden width.
+        hidden: Encoder output width, independent of the language hidden width.
         num_deepstack: Number of deepstack embeddings, 0 when unsupported.
-        dtype: The vision tower's dtype.
+        dtype: Encoder output dtype, which may be integer for discrete tokens.
     """
 
     device: Any
     hidden: int
     num_deepstack: int
     dtype: Any
+
+    @classmethod
+    def from_model(cls, model: Any, *, device: Any) -> EncoderModelFacts:
+        output_spec = getattr(model, "get_encoder_output_spec", None)
+        if output_spec is not None:
+            hidden, dtype = output_spec()
+        else:
+            hidden = model.config.hidden_size
+            vision = next(
+                module
+                for module in (
+                    getattr(model, name, None)
+                    for name in ("visual", "vision_tower", "vision")
+                )
+                if module is not None
+            )
+            dtype = getattr(vision, "dtype", None)
+            if dtype is None:
+                dtype = next(vision.parameters()).dtype
+        if hidden <= 0:
+            raise ValueError("Encoder output width must be positive")
+        return cls(
+            device=device,
+            hidden=hidden,
+            num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
+            dtype=dtype,
+        )
 
 
 @dataclass(frozen=True)
@@ -172,7 +199,7 @@ class DeviceSpecs:
             rows (the PD decode role, whose prefill node returns them) or its
             LM head scores every prompt row on this rank (no row narrowing,
             no pipeline split). The ingress refuses such requests otherwise.
-        cache_state_group_ids: Group ids of the state-family cache groups,
+        cache_state_group_ids: Group ids of the state cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
         num_host_pages: The L2 host tier's page count (incl. the null page),
@@ -1458,6 +1485,9 @@ def build_device_side(
     )
     if server_args.enable_kvstore or not snapshot_pool.disabled:
         from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
 
         host_cache_executor = HostCacheExecutor(
             views.token_to_kv_pool,
@@ -1470,6 +1500,12 @@ def build_device_side(
             io_backend=server_args.kvstore_io_backend,
             attn_tp_rank=attn_tp_rank,
             kvp_rank=server_args.mapping.attn.kvp_rank,
+            nprocs_per_node=server_args.mapping.nprocs_per_node,
+            world_cpu_group=(
+                pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+                if server_args.mapping.world_size > 1
+                else None
+            ),
         )
     elif attn_tp_rank == 0:
         # With an executor the line comes from its resolved sizing.
@@ -1634,7 +1670,7 @@ def build_device_side(
         cache_state_group_ids=tuple(
             str(spec.group_id)
             for spec in views.token_to_kv_pool.arena.cache_group_specs
-            if spec.family == "state"
+            if spec.attn_kind == "state"
         ),
         num_host_pages=(
             host_cache_executor.num_host_pages if host_cache_executor is not None else 0
@@ -1657,24 +1693,7 @@ def build_device_side(
     )
 
     def encoder_model_facts() -> EncoderModelFacts:
-        model = target.model
-        vision = next(
-            module
-            for module in (
-                getattr(model, name, None)
-                for name in ("visual", "vision_tower", "vision")
-            )
-            if module is not None
-        )
-        dtype = getattr(vision, "dtype", None)
-        if dtype is None:
-            dtype = next(vision.parameters()).dtype
-        return EncoderModelFacts(
-            device=executor.device,
-            hidden=model.config.hidden_size,
-            num_deepstack=getattr(model, "num_deepstack_embeddings", 0),
-            dtype=dtype,
-        )
+        return EncoderModelFacts.from_model(target.model, device=executor.device)
 
     return DeviceBuild(
         specs=specs,

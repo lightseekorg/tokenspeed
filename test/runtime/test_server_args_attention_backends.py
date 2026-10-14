@@ -4,6 +4,10 @@ Guards against the bug where --drafter-attention-backend rejected valid main-mod
 backends (e.g. trtllm_mla) because its argparse `choices` was a narrower subset
 of --attention-backend's. Both flags are now validated against one backend
 registry after plugin discovery, so they accept exactly the same names.
+
+Also covers the cache-producer identity the resolved names produce: the
+helper-level resolution and the AttentionBuild fields the real builder exports
+for L3 namespacing.
 """
 
 import os
@@ -16,17 +20,26 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 import argparse
+import json
 import pickle
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed_kernel.platform import current_platform
+
+from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
 from tokenspeed.runtime.layers.attention import registry
 from tokenspeed.runtime.layers.attention.backends.state import kda
 from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
+from tokenspeed.runtime.layers.attention.registry import (
+    _cache_backend_name,
+    _get_default_backend_name,
+)
 from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
 
 
@@ -344,38 +357,26 @@ class TestAttentionBackendChoices(unittest.TestCase):
             )
 
     def test_mha_config_propagates_speculative_settings(self):
-        server_args = SimpleNamespace(
-            device="cuda",
+        # world_size=2 resolves mapping.attn.tp_size=2; spec_context_pad
+        # derives from the speculative widths (3 overshoot spans * 4 tokens).
+        server_args = ServerArgs(
+            model="x",
+            world_size=2,
             attention_backend=None,
             drafter_attention_backend=None,
             attn_tp_size=None,
-            mapping=SimpleNamespace(
-                attn=SimpleNamespace(
-                    tp_size=2,
-                    dp_size=1,
-                    kvp_size=1,
-                    kvp_rank=0,
-                    kvp_group=(0,),
-                    qcp_size=1,
-                    qcp_rank=0,
-                    qcp_group=(0,),
-                )
-            ),
             kv_cache_dtype="auto",
             max_num_seqs=8,
             data_parallel_size=None,
             prefix_granularity=64,
-            kernel_page_size=None,
-            max_cudagraph_capture_size=4,
-            chunked_prefill_size=8192,
             disaggregation_mode="null",
             kv_cache_quant_method="none",
             speculative_algorithm="EAGLE3",
             speculative_num_steps=3,
             speculative_num_draft_tokens=4,
-            spec_context_pad=12,  # 3 overshoot spans * 4 draft tokens
             skip_softmax_threshold=0.0,
         )
+        server_args.mapping.rank = 0
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(),
             context_len=4096,
@@ -391,6 +392,253 @@ class TestAttentionBackendChoices(unittest.TestCase):
         self.assertEqual(config.speculative_num_steps, 3)
         self.assertEqual(config.speculative_num_draft_tokens, 4)
         self.assertEqual(config.context_len, 4108)
+
+
+class _GpuBackendStandIn:
+    """Stands in for GPU backend construction, injected through the
+    ``reuse_*_backend`` seam of ``create_attn_components``."""
+
+    def __init__(self):
+        self.cache_pool = None
+
+    def set_cache_pool(self, pool):
+        self.cache_pool = pool
+
+
+class TestCacheBackendIdentity(unittest.TestCase):
+    """The cache-producer identity the runtime exports for L3 namespacing:
+    auto choices must resolve, the MSA hybrid wrapper must keep its dense
+    sub-backend, and a build without a draft must export an empty draft
+    identity."""
+
+    def test_attention_build_exports_resolved_backend_names(self):
+        # The AttentionBuild identity is what _cache_backend_name returns at
+        # the build site: an unset (auto) request resolves to the
+        # architecture's default, and the draft identity is empty when no
+        # draft backend was built.
+        def mha_config():
+            return MHAConfig(
+                num_attention_heads=1, num_kv_heads=1, head_dim=1, attn_tp_size=1
+            )
+
+        def msa_config(dense_name):
+            return MSAConfig(
+                num_attention_heads=1,
+                num_kv_heads=1,
+                head_dim=1,
+                attn_tp_size=1,
+                full_attn_backend_name=dense_name,
+            )
+
+        cases = [
+            (None, None, True, ("mha", "mla")),
+            ("fa3", "fa4", True, ("fa3", "fa4")),
+            ("tokenspeed_mla", "flashinfer", True, ("tokenspeed_mla", "flashinfer")),
+            ("fa3", "fa4", False, ("fa3", "")),
+        ]
+        for target_name, draft_name, has_draft, expected in cases:
+            with self.subTest(
+                target=target_name, draft=draft_name, has_draft=has_draft
+            ):
+                target = _cache_backend_name(
+                    mha_config(), target_name, AttentionArch.MHA
+                )
+                draft = (
+                    _cache_backend_name(mha_config(), draft_name, AttentionArch.MLA)
+                    if has_draft
+                    else ""
+                )
+                self.assertEqual((target, draft), expected)
+
+        # Auto resolution is the architecture default.
+        self.assertEqual(_get_default_backend_name(AttentionArch.MHA), "mha")
+        self.assertEqual(_get_default_backend_name(AttentionArch.MLA), "mla")
+        self.assertEqual(_get_default_backend_name(AttentionArch.MSA), "msa")
+
+        # Outer MSA names stay identical while its dense implementations
+        # differ. Both target and draft identities must retain that choice.
+        for target_dense, draft_dense in (
+            ("trtllm", "fa3"),
+            ("fa3", "trtllm"),
+            (None, None),
+        ):
+            with self.subTest(target_dense=target_dense, draft_dense=draft_dense):
+                target = _cache_backend_name(
+                    msa_config(target_dense), "msa", AttentionArch.MSA
+                )
+                draft = _cache_backend_name(
+                    msa_config(draft_dense), "msa", AttentionArch.MSA
+                )
+                self.assertEqual(
+                    (target, draft),
+                    (f"msa:{target_dense or 'mha'}", f"msa:{draft_dense or 'mha'}"),
+                )
+
+    _LLAMA_CONFIG = {
+        "model_type": "llama",
+        "architectures": ["LlamaForCausalLM"],
+        "dtype": "bfloat16",
+        "vocab_size": 32000,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "max_position_embeddings": 512,
+    }
+
+    _MINIMAX_M3_CONFIG = {
+        "model_type": "minimax_m3_vl",
+        "architectures": ["MiniMaxM3SparseForConditionalGeneration"],
+        "dtype": "bfloat16",
+        "text_config": {
+            "vocab_size": 32000,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "max_position_embeddings": 512,
+            "layer_types": ["full_attention", "minimax_m3_sparse"],
+            "index_head_dim": 16,
+            "index_n_heads": 2,
+            "index_topk_blocks": 4,
+            "index_init_blocks": 1,
+            "index_local_blocks": 4,
+        },
+    }
+
+    def _runtime(self, directory, *, attention_backend, drafter_attention_backend):
+        args = ServerArgs(
+            model=directory,
+            device="cpu",
+            dtype="bfloat16",
+            trust_remote_code=False,
+            revision=None,
+            max_model_len=512,
+            attention_backend=attention_backend,
+            drafter_attention_backend=drafter_attention_backend,
+            prefix_granularity=64,
+            load_format="auto",
+            speculative_algorithm=None,
+            world_size=1,
+            attn_tp_size=None,
+            data_parallel_size=None,
+            pipeline_parallel_size=1,
+            max_num_seqs=2,
+            chunked_prefill_size=384,
+            max_total_tokens=512,
+            kv_cache_quant_method="none",
+            disaggregation_mode="null",
+            enforce_eager=True,
+            disable_prefill_graph=True,
+            seed=0,
+        )
+        args.mapping.rank = 0
+        model = ModelConfig(
+            model_path=args.model,
+            trust_remote_code=args.trust_remote_code,
+            revision=args.revision,
+            context_length=args.max_model_len,
+            model_override_args="{}",
+            dtype=args.dtype,
+            quantization=args.quantization,
+            override_config_file=None,
+            is_draft_worker=False,
+            server_args=args,
+        )
+        return args, model
+
+    def _build(self, args, model, *, draft_model=None):
+        # The real builder end to end on CPU arenas; only the GPU backend
+        # construction is substituted, through the designed reuse seam.
+        target = _GpuBackendStandIn()
+        draft = _GpuBackendStandIn() if draft_model is not None else None
+        build = registry.create_attn_components(
+            args,
+            model,
+            gpu_id=0,
+            rank=0,
+            gpu_memory=0,
+            draft_model_config=draft_model,
+            graph_reserve_bytes=0,
+            post_profile_bytes=0,
+            probe_batch_rows=None,
+            profiled_cache_bytes=64 * 1024 * 1024,
+            reuse_target_backend=target,
+            reuse_draft_backend=draft,
+        )
+        return build, target, draft
+
+    def _write_config(self, directory, raw):
+        with open(f"{directory}/config.json", "w", encoding="utf-8") as handle:
+            json.dump(raw, handle)
+
+    def test_create_attn_components_resolves_auto_and_empty_draft(self):
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_config(directory, self._LLAMA_CONFIG)
+            args, model = self._runtime(
+                directory, attention_backend=None, drafter_attention_backend=None
+            )
+            build, target, _ = self._build(args, model)
+
+        self.assertEqual(build.attention_backend_name, "mha")
+        self.assertEqual(build.draft_attention_backend_name, "")
+        self.assertIs(build.attn_backend, target)
+        self.assertIsNone(build.draft_attn_backend)
+        self.assertIs(target.cache_pool, build.token_to_kv_pool)
+
+    def test_create_attn_components_keeps_explicit_target_and_draft_names(self):
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_config(directory, self._LLAMA_CONFIG)
+            args, model = self._runtime(
+                directory,
+                attention_backend="fa3",
+                drafter_attention_backend="fa4",
+            )
+            build, target, draft = self._build(args, model, draft_model=model)
+
+        self.assertEqual(build.attention_backend_name, "fa3")
+        self.assertEqual(build.draft_attention_backend_name, "fa4")
+        self.assertIs(build.attn_backend, target)
+        self.assertIs(build.draft_attn_backend, draft)
+        self.assertIs(draft.cache_pool, build.draft_token_to_kv_pool)
+
+    @unittest.skipUnless(
+        current_platform().is_nvidia,
+        "the trtllm backend registers only on NVIDIA (backends/__init__.py)",
+    )
+    def test_create_attn_components_keeps_msa_dense_sub_backend(self):
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_config(directory, self._MINIMAX_M3_CONFIG)
+            args, model = self._runtime(
+                directory,
+                attention_backend="trtllm",
+                drafter_attention_backend="fa3",
+            )
+            build, _, _ = self._build(args, model, draft_model=model)
+        self.assertEqual(build.attention_backend_name, "msa:trtllm")
+        self.assertEqual(build.draft_attention_backend_name, "msa:fa3")
+
+    def test_create_attn_components_msa_auto_names_dense_default(self):
+        import tokenspeed.runtime.layers.attention.backends  # noqa: F401
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._write_config(directory, self._MINIMAX_M3_CONFIG)
+            args, model = self._runtime(
+                directory, attention_backend=None, drafter_attention_backend=None
+            )
+            build, _, _ = self._build(args, model, draft_model=model)
+        self.assertEqual(build.attention_backend_name, "msa:mha")
+        self.assertEqual(build.draft_attention_backend_name, "msa:mha")
 
 
 class TestKdaBackendPolicy(unittest.TestCase):

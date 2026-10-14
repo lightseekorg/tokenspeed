@@ -205,7 +205,12 @@ class LinearBase(torch.nn.Module):
                 # remain unquantized unless the checkpoint stores dense MXFP4.
                 self.quant_method = UnquantizedLinearMethod()
         elif isinstance(quant_config, CompressedTensorsConfig):
-            self.quant_method = quant_config.get_quant_method(self, prefix)
+            self.scheme = quant_config.get_scheme(self, prefix)
+            self.quant_method = (
+                quant_config.get_linear_method()
+                if self.scheme is not None
+                else UnquantizedLinearMethod()
+            )
         elif isinstance(quant_config, ModelOptMixedConfig):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         else:

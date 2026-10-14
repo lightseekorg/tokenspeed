@@ -39,6 +39,8 @@ owns only a sparse subset of the routed experts.
 | `moe_sorting.py` | Block-aligned expert sort feeding the package prefill stages. |
 | `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths: route-direct warp decode reads linear or gdot128 weights, while the contiguous-EP grouped GEMM reads linear weights. |
 | `latent_shared_decode.py` | Latent shared-expert decode entry. |
+| `n16_weights.py` | N16 expert bank shared by the N16 pipelines (`mxfp4_gemm.py`, `prefill_mxfp8.py` / `mxfp8_gemm.py`, N16 `situ_decode.py`): lane-ordered 1 KiB blocks of 64-byte K chunks per 16-row group, word-packed scales, checkpoint-update loaders. |
+| `mxfp4_gemm.py` | Dynamic-MXFP4-activation (A4W4) SiLU experts on N16 weights, the E2M1 counterpart of `mxfp8_gemm.py`: quantization with a fused decode route sort, gate/up GEMM with fused SiLU-and-mul and MXFP4 requantization, down GEMM, slot-order combine (all batch sizes). |
 | `quantize_gluon.py` | Leaf Gluon helpers for MXFP4/MXFP8 tile quantization and CDNA4 scale stores shared by staged and fused kernels. |
 | `scale_layout.py` | Single source of truth for the CDNA4 MXFP4 scale swizzle (constants, swizzle/predicate/allocator helpers). Leaf module: torch only. |
 | `scale.py` | Activation-scale gather into sorted-route order for the package stages. |

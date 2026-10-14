@@ -38,7 +38,7 @@ class _ContractPool:
         contract = SimpleNamespace(
             prefix_granularity=64,
             group_specs=tuple(
-                SimpleNamespace(group_id=group_id, family="state")
+                SimpleNamespace(group_id=group_id, attn_kind="state")
                 for group_id in dict.fromkeys(
                     group_id for group_id, _, _ in components.values()
                 )
