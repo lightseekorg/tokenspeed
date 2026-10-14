@@ -1526,9 +1526,8 @@ if platform.is_amd:
             raise ValueError("gfx950 A4W4 Gluon MoE cannot defer finalization")
         if topk_weights is None or topk_ids is None:
             raise ValueError("gfx950 A4W4 Gluon MoE requires precomputed top-k")
-        if getattr(w, "swiglu_arg", None) is not None and (
-            w.swiglu_arg.alpha not in (None, 1.0) or w.swiglu_arg.limit is not None
-        ):
+        # The kernels compute SiLU(gate) * up: alpha 1, no clamp (limit 0), beta 0.
+        if _swiglu_args(w) != (1.0, 0.0, 0.0):
             raise ValueError("gfx950 A4W4 Gluon MoE supports only standard SiLU")
         return launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
             # Quantization reads rows by stride; only the inner stride must be 1.
