@@ -383,7 +383,7 @@ class DeepseekV4DSpark(BaseDrafter):
         graph = torch.cuda.CUDAGraph()
         # Own pool: target prefill and decode graphs must not recycle these
         # intermediates, including any pointers memoized by quantized GEMMs.
-        with capture_session(graph), observer, torch.cuda.graph(graph, stream=stream):
+        with observer, capture_session(graph), torch.cuda.graph(graph, stream=stream):
             run_once()
         graph.replay()
         torch.cuda.synchronize(self.device)

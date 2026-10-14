@@ -650,7 +650,7 @@ class ForwardStepRunner:
         global global_graph_memory_pool
         graph_kwargs = {"auto_dispatch_capture": True} if self.device == "npu" else {}
         # The kernel state captured launches need lives as long as the graph.
-        with capture_session(graph), observer, self.device_module.graph(
+        with observer, capture_session(graph), self.device_module.graph(
             graph,
             pool=global_graph_memory_pool,
             stream=self.stream,
