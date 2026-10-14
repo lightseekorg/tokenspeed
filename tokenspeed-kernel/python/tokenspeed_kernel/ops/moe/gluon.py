@@ -241,10 +241,12 @@ if platform.is_amd:
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({False}),
             "supports_all_to_all_ep": frozenset({False}),
-            # Stage 1 prefill tiles I_r at BLOCK_N=128. The optional warp-decode
+            # Stage 1 tiles I_r at BLOCK_N=64 or 128. The optional warp-decode
             # shortcut still needs I_r % 256 == 0 and is gated inside the AMD
             # entry point.
-            "ispp_alignment": frozenset({128}),
+            "ispp_alignment": frozenset({64}),
+            # Stage 2 tiles the hidden size at BLOCK_N=256.
+            "hidden_alignment": frozenset({256}),
             "internal_activation_dtype": frozenset({"input"}),
             "supports_bias": frozenset({False}),
         },

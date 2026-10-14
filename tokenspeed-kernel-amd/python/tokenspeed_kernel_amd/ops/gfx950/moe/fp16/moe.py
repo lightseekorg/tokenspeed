@@ -185,6 +185,7 @@ def gluon_bf16_moe(
             inter,
             topk,
             BLOCK_M=block_m,
+            BLOCK_N=128 if I_r % 128 == 0 else 64,
             split_k=split_k,
         )
 

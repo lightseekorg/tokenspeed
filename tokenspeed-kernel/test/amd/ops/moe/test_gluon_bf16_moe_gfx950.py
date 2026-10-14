@@ -54,28 +54,29 @@ def _routing_softmax_topk(logits: torch.Tensor, topk: int):
 def _torch_moe_ref(hidden, w1, w2, topk_ids, topk_weights) -> torch.Tensor:
     """Golden fp32 MoE FFN: y[t] = sum_s w * (silu(h@wg) * (h@wu)) @ wd."""
     hf, w1f, w2f = hidden.float(), w1.float(), w2.float()
+    i_r = w2.shape[2]
     ids, wts = topk_ids.cpu(), topk_weights.float().cpu()
     out = torch.zeros(hidden.shape[0], D, dtype=torch.float32, device=hidden.device)
     for t in range(hidden.shape[0]):
         for s in range(TOPK):
             e = int(ids[t, s])
             g = hf[t] @ w1f[e].T
-            inter = torch.nn.functional.silu(g[:I_R]) * g[I_R:]
+            inter = torch.nn.functional.silu(g[:i_r]) * g[i_r:]
             out[t] += float(wts[t, s]) * (inter @ w2f[e].T)
     return out
 
 
-def _build(num_tokens: int, seed: int = 0):
+def _build(num_tokens: int, seed: int = 0, i_r: int = I_R):
     g = torch.Generator(device="cuda").manual_seed(seed)
     hidden = torch.randn(
         num_tokens, D, dtype=torch.bfloat16, device="cuda", generator=g
     )
     # Scale weights down so the fp32 reference stays in a comparable range.
     w1 = (
-        torch.randn(E, 2 * I_R, D, dtype=torch.bfloat16, device="cuda", generator=g)
+        torch.randn(E, 2 * i_r, D, dtype=torch.bfloat16, device="cuda", generator=g)
         * 0.05
     )
-    w2 = torch.randn(E, D, I_R, dtype=torch.bfloat16, device="cuda", generator=g) * 0.05
+    w2 = torch.randn(E, D, i_r, dtype=torch.bfloat16, device="cuda", generator=g) * 0.05
     logits = torch.randn(num_tokens, E, dtype=torch.float32, device="cuda", generator=g)
     topk_ids, topk_weights = _routing_softmax_topk(logits, TOPK)
     return hidden, w1, w2, topk_ids, topk_weights
@@ -329,6 +330,19 @@ def test_small_route_production_alignment_graph_replay() -> None:
 def test_fp16_weight_moe_matches_fp32_reference(num_tokens):
     """End-to-end output matches the fp32 oracle (auto decode/prefill path)."""
     hidden, w1, w2, topk_ids, topk_weights = _build(num_tokens)
+    out = gluon_bf16_moe(hidden, w1, w2, topk_ids, topk_weights)
+    torch.cuda.synchronize()
+    ref = _torch_moe_ref(hidden, w1, w2, topk_ids, topk_weights)
+    peak = ref.abs().max().item()
+    max_abs = (out.float() - ref).abs().max().item()
+    assert max_abs <= REL_TOL * peak + 1e-2, f"max_abs={max_abs}, peak={peak}"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16, 64, 256])
+def test_fp16_weight_moe_64_aligned_intermediate_matches_fp32_reference(num_tokens):
+    """An intermediate size that is a multiple of 64 but not 128 (a TP shard
+    such as 640 / 2) runs on both the decode and prefill paths."""
+    hidden, w1, w2, topk_ids, topk_weights = _build(num_tokens, i_r=320)
     out = gluon_bf16_moe(hidden, w1, w2, topk_ids, topk_weights)
     torch.cuda.synchronize()
     ref = _torch_moe_ref(hidden, w1, w2, topk_ids, topk_weights)
