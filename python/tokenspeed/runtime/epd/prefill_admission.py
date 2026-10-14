@@ -1117,10 +1117,10 @@ class PipelineEpdPrefillAdmission:
         self._local = local_admission
         self._pp_ranks = tuple(pp_ranks)
         self._pp_cpu_group = pp_cpu_group
-        self._pending: set[int] = set()
+        self._pending: set[str] = set()
         self.receives_embeddings = local_admission is not None
 
-    def stage(self, request_id, mm_items) -> None:
+    def stage(self, request_id: str, mm_items) -> None:
         if self._local is not None:
             self._local.stage(request_id, mm_items)
         self._pending.add(request_id)
