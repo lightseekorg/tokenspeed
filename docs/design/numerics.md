@@ -69,8 +69,10 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               extra traffic). A ring reduction chunks
 │   │                               by message size, so its per-element order
 │   │                               is run-stable but not batch-size-
-│   │                               invariant. Gathers move data and keep the
-│   │                               multicast kernels. The route reads only
+│   │                               invariant. MAX/MIN all-reduces are exact
+│   │                               in any order and stay on NCCL. Gathers
+│   │                               move data and keep the multicast
+│   │                               kernels. The route reads only
 │   │                               static properties of the call site (group,
 │   │                               dtype, rank, width), never the row count,
 │   │                               so a site cannot change route with the

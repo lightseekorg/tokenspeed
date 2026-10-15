@@ -393,6 +393,13 @@ class AutoBackend(CommBackend):
     def _all_reduce_one(self, tensor: torch.Tensor, group: Group, op) -> torch.Tensor:
         """All-reduce a single tensor along the route ``route`` picked for it."""
         route = self.route(Collective.ALL_REDUCE, tensor, group)
+        if route in (Route.ORDERED_FOLD, Route.MULTIMEM) and op in (
+            torch.distributed.ReduceOp.MAX,
+            torch.distributed.ReduceOp.MIN,
+        ):
+            # Max and min are exact in any reduction order, so NCCL already
+            # gives the batch-invariant result the fold exists for.
+            return self._nccl.all_reduce(tensor, group, op=op)
         if route is Route.ORDERED_FOLD:
             return self._ordered_fold_all_reduce(tensor, group, op)
         if route is Route.MULTIMEM:

@@ -553,13 +553,17 @@ def test_batch_invariant_all_reduce_dispatches_to_the_multimem_backend(
     assert routing._rsag.multimem_all_reduce.call_count == 2
 
 
-def test_batch_invariant_all_reduce_refuses_non_sum(routing, monkeypatch):
+def test_batch_invariant_all_reduce_refuses_order_dependent_non_sum(
+    routing, monkeypatch
+):
+    # MAX and MIN are exact in any order and take NCCL; a floating-point
+    # product depends on the order and has no batch-invariant route.
     _switches(monkeypatch, force=False, invariant=True)
     with pytest.raises(ValueError, match="SUM"):
         routing.all_reduce(
             torch.ones(4, 16, dtype=torch.bfloat16),
             GROUP,
-            op=torch.distributed.ReduceOp.MAX,
+            op=torch.distributed.ReduceOp.PRODUCT,
         )
 
 

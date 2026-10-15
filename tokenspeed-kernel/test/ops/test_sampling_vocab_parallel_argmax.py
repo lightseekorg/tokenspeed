@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.sampling import argmax
 from tokenspeed_kernel.ops.sampling.triton.vocab_parallel_argmax import (
     _argmax_key_index_kernel,
     _pack_argmax_key_kernel,
@@ -94,3 +95,18 @@ def test_row_count_does_not_recompile() -> None:
                 logits[:rows], vocab_offset=2048, out=keys[:rows]
             )
             argmax_key_index(keys[:rows], out=index[:rows])
+
+
+def test_nan_rows_follow_the_argmax_of_the_gathered_row() -> None:
+    shard_width = 512
+    logits = torch.randn(3, 2 * shard_width, device="cuda", dtype=torch.bfloat16)
+    # NaN on the second shard only, after the first shard's maximum.
+    logits[0, shard_width + 7] = float("nan")
+    # Negative NaN on the first shard only.
+    logits[1, 5] = -float("nan")
+    # NaN everywhere.
+    logits[2] = float("nan")
+
+    actual = _sharded_argmax(logits, num_shards=2)
+
+    torch.testing.assert_close(actual.long(), argmax(logits).long(), rtol=0, atol=0)

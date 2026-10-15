@@ -23,7 +23,8 @@
 Each rank packs its shard's row maximum and global index into one int64 key
 that orders like ``(value, -index)``, so an all-reduce MAX of the keys picks
 the global maximum with ties toward the lowest index, as ``argmax`` over the
-gathered row would.
+gathered row would. NaN follows the local ``argmax``: a NaN it picks outranks
+every number, and a row it reports as ``-1`` on every shard decodes to ``-1``.
 """
 
 from __future__ import annotations
@@ -47,10 +48,16 @@ def _pack_argmax_key_kernel(
     index = tl.load(index_ptr + row).to(tl.int64)
     safe_index = tl.maximum(index, 0)
     # Adding +0.0 turns -0.0 into +0.0 so signed zeros tie as in argmax.
-    value = tl.load(logits_ptr + row * stride_m + safe_index).to(tl.float32) + 0.0
+    value = (
+        tl.load(logits_ptr + row.to(tl.int64) * stride_m + safe_index).to(tl.float32)
+        + 0.0
+    )
     bits = value.to(tl.int32, bitcast=True)
     # Flip the magnitude bits of negatives so int32 order matches float order.
-    ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
+    ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+    # A local argmax that picks NaN ranks it above every number, as
+    # torch.argmax does; any NaN sign bit is ignored.
+    ordered = tl.where(value != value, 0x7FFFFFFF, ordered).to(tl.int64)
     key = (ordered << 32) | (0xFFFFFFFF - (safe_index + vocab_offset))
     # The local argmax returns -1 for an all-NaN row; it never wins.
     key = tl.where(index < 0, -0x7FFFFFFFFFFFFFFF - 1, key)
@@ -61,7 +68,10 @@ def _pack_argmax_key_kernel(
 def _argmax_key_index_kernel(key_ptr, out_ptr):
     row = tl.program_id(0)
     key = tl.load(key_ptr + row)
-    index = 0xFFFFFFFF - (key & 0xFFFFFFFF)
+    # An all-NaN row keeps the sentinel on every rank; report -1 like argmax.
+    index = tl.where(
+        key == -0x7FFFFFFFFFFFFFFF - 1, -1, 0xFFFFFFFF - (key & 0xFFFFFFFF)
+    )
     tl.store(out_ptr + row, index.to(out_ptr.dtype.element_ty))
 
 
@@ -97,6 +107,9 @@ def vocab_parallel_argmax_keys(
 
 def argmax_key_index(keys: torch.Tensor, *, out: torch.Tensor) -> torch.Tensor:
     """Decode the global vocabulary index from reduced argmax keys.
+
+    Rows that are NaN on every shard decode to ``-1``, the ``argmax``
+    sentinel.
 
     Args:
         keys: ``[M]`` int64 keys after the cross-rank MAX reduction.
