@@ -853,6 +853,7 @@ def prepare_grouped_bf16_projection(
         "n": N,
         "k": K,
         "a_inner_stride_one": x.stride(-1) == 1,
+        "b_contiguous": weight.is_contiguous(),
         "b_inner_stride_one": weight.stride(-1) == 1,
         "is_cuda": x.is_cuda,
     }
