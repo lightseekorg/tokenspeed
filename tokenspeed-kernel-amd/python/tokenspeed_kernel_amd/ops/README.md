@@ -400,6 +400,46 @@ to the large-M kernel once those tiles alone exceed the CUs. Split partials are
 FP32 and the shared reduction sums them in split order, so results are
 deterministic.
 
+### gfx1250 dense BF16 large-M projection
+
+`gluon_mm_a16w16_largem_gfx1250` runs the K3 BF16 prefill projections.
+
+#### Contract
+
+- The operation computes `A @ B.T` from contiguous BF16 `[M, K]` and `[N, K]`
+  on one device, with `M >= 512` and `(K, N)` one of the fixed K3 shapes
+  (`use_gluon_largem_gfx1250`); K is a multiple of 128. Output is a
+  contiguous BF16 `[M, N]`.
+- Any M and N are accepted inside that contract; ragged edges are clipped
+  in-kernel. The row count is a runtime argument that does not specialize
+  the compile.
+
+#### Algorithm
+
+From 4096 rows and 1536 columns, `_wmma_tdm_dense_largem_pingpong_kernel`
+computes a `256 x 256` tile on eight waves, two per SIMD, in 128-wide K steps
+through a double-buffered TDM pipeline. Each K step is two half-K rounds of
+`warp_pipeline_stage` pairs, so one wave's TDM issue and LDS reads overlap the
+other wave's WMMA on the same SIMD. A and B use partitioned padded LDS layouts
+so paired waves read different LDS partitions. TDM descriptors are bounded at
+the real M and N, which zero-fills loads past the edge; the tile is staged in
+the dead operand LDS and written by one clipped TDM store. Workgroups get
+contiguous tile runs per XCD (eight on MI450), grouped four row tiles per
+column sweep, so tiles sharing operands share an L2.
+
+The 256-wide tile leaves a partial last wave when the tile count is not a
+multiple of 256 (896 tiles for `N = 7168`, 800 for `N = 6288`); that tail is
+the main remaining gap to the WMMA peak. Split-K of the tail tiles with FP32
+partials merged in-kernel measured slower, because the partial round trip
+cost more than the tail it removed.
+
+The general BF16 GEMM's large-M route (`_launch_largem`) shares this
+selection: from 4096 rows, at least 1536 columns and a contiguous output it
+runs the ping-pong kernel, in FP32 or BF16. Anything else keeps
+`_wmma_tdm_dense_largem_kernel` and its earlier tile choice (`128 x 128` on
+four warps below 12288 rows), whose masked stores also accept a row-strided
+output.
+
 ### gfx1250 MXFP8 large-M projection
 
 `gluon_mm_mxfp8_ue8m0_largem_gfx1250` covers DeepSeek V4.1 MXFP8 projections
@@ -426,42 +466,6 @@ there are fewer than 64 `128 x 128` tiles and at least 16 K tiles. Split
 partials are FP32 and use the dense BF16 GEMM's reduction.
 
 ## Attention
-
-### gfx1250 dense BF16 large-M projection
-
-`gluon_mm_a16w16_largem_gfx1250` runs the K3 BF16 prefill projections.
-
-#### Contract
-
-- The operation computes `A @ B.T` from contiguous BF16 `[M, K]` and `[N, K]`
-  on one device, with `M >= 512` and `(K, N)` one of the fixed K3 shapes
-  (`use_gluon_largem_gfx1250`); K is a multiple of 128. Output is a
-  contiguous BF16 `[M, N]`.
-- Any M and N are accepted inside that contract; ragged edges are clipped
-  in-kernel. The row count is a runtime argument that does not specialize
-  the compile.
-
-#### Algorithm
-
-From 4096 rows, `_wmma_tdm_dense_largem_pingpong_kernel` computes a
-`256 x 256` tile on eight waves, two per SIMD, in 128-wide K steps through a
-double-buffered TDM pipeline. Each K step is two half-K rounds of
-`warp_pipeline_stage` pairs, so one wave's TDM issue and LDS reads overlap the
-other wave's WMMA on the same SIMD. A and B use partitioned padded LDS layouts
-so paired waves read different LDS partitions. TDM descriptors are bounded at
-the real M and N, which zero-fills loads past the edge; the tile is staged in
-the dead operand LDS and written by one clipped TDM store. Workgroups get
-contiguous tile runs per XCD (eight on MI450), grouped four row tiles per
-column sweep, so tiles sharing operands share an L2.
-
-The 256-wide tile leaves a partial last wave when the tile count is not a
-multiple of 256 (896 tiles for `N = 7168`, 800 for `N = 6288`); that tail is
-the main remaining gap to the WMMA peak. Split-K of the tail tiles with FP32
-partials merged in-kernel measured slower, because the partial round trip
-cost more than the tail it removed.
-
-Below 4096 rows the 256-wide grid underfills the device, so
-`_wmma_tdm_dense_largem_kernel` runs `128 x 128` tiles on four warps.
 
 ### gfx1250 standard-cache DSA and KPool scoring
 

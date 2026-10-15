@@ -30,6 +30,7 @@ if not is_cdna5():
 from tokenspeed_kernel import compile_monitor
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
     _wmma_tdm_dense_largem_pingpong_kernel,
+    gluon_mm_a16w16_gfx1250,
     gluon_mm_a16w16_largem_gfx1250,
 )
 
@@ -84,3 +85,20 @@ def test_largem_pingpong_compiles_under_compile_monitor():
     finally:
         compile_monitor.uninstall_compile_monitor()
     torch.testing.assert_close(actual, a @ b.T, atol=1e-2, rtol=1e-2)
+
+
+def test_largem_pingpong_fp32_output_row_strided_a():
+    # The general BF16 GEMM reaches the ping-pong kernel too: FP32 output and
+    # activations with a row stride wider than K.
+    m, n, k = 4160, 1536, 1024
+    torch.manual_seed(4160)
+    storage = torch.randn(m, 2 * k, device="cuda", dtype=torch.bfloat16)
+    a = storage[:, k:]
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    _wmma_tdm_dense_largem_pingpong_kernel.device_caches.clear()
+    actual = gluon_mm_a16w16_gfx1250(a, b, torch.float32)
+    # The FP32-output specialization was compiled, so this shape ran here.
+    assert _wmma_tdm_dense_largem_pingpong_kernel.device_caches
+    assert actual.dtype == torch.float32
+    expected = a.double() @ b.double().T
+    torch.testing.assert_close(actual.double(), expected, atol=2e-4, rtol=2e-4)
