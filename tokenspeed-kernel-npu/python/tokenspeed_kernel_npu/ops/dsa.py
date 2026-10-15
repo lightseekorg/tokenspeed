@@ -260,6 +260,21 @@ class AscendDSAKernels:
 
         The existing rank-major ABI also represents a single rank. SFAD writes
         head-major FP32 output directly; no context-parallel collective is used.
+
+        Args:
+            query: Packed latent/rotary Q, [tokens, heads, 576].
+            key: Paged packed KV cache in PA_BSND layout.
+            indices: Selected sparse token positions for each query row.
+            valid_chunks: Per-query scheduling hints for the native sparse scan.
+            q_ends: Cumulative query ends, one per request.
+            kv_lengths: Visible KV lengths, one per request.
+            table: Request-to-cache block table.
+            scale: Attention softmax scale.
+            head_major_output: Whether to retain the native head-major layout.
+
+        Returns:
+            Attention in query dtype: [heads, tokens, 512] when head-major,
+            otherwise contiguous [tokens, heads * 512].
         """
         heads = query.shape[1]
         if not 1 <= heads <= 64:
@@ -294,6 +309,26 @@ class AscendDSAKernels:
         if head_major_output:
             return output
         return output.transpose(0, 1).contiguous().flatten(1)
+
+    @staticmethod
+    def project_value(attention, weight):
+        """Project head-major attention directly into token-major values.
+
+        Args:
+            attention: Contiguous [heads, tokens, latent] absorbed attention.
+            weight: Contiguous [heads, latent, value_dim] in attention dtype.
+
+        Returns:
+            Contiguous [tokens, heads * value_dim] in attention dtype.
+        """
+        return torch_npu.npu_transpose_batchmatmul(
+            attention,
+            weight,
+            perm_x1=[0, 1, 2],
+            perm_x2=[0, 1, 2],
+            perm_y=[1, 0, 2],
+            batch_split_factor=1,
+        ).flatten(1)
 
     def attention_partial(
         self,
