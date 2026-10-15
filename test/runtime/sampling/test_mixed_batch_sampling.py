@@ -50,6 +50,8 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
@@ -358,7 +360,8 @@ def test_explicit_top_k_one_pins_seed():
 def test_mixed_round_takes_fused_argmax_ids():
     """When the logits processor already reduced the argmax (sharded logits
     plus ``next_token_ids``), both arms of a mixed round sample those ids,
-    each from its own rows, not the shard's local argmax."""
+    each from its own rows, not the shard's local argmax. Use the real forward
+    context so sampling sees the same optional logprob state as serving."""
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
@@ -396,11 +399,16 @@ def test_mixed_round_takes_fused_argmax_ids():
         valid_cache_lengths=torch.zeros(POOL + 1, dtype=torch.int32, device="cuda"),
         device="cuda",
     )
-    ctx = SimpleNamespace(
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
         output_layout=ForwardOutputLayout(num_extends, num_extends, num_decodes, n),
         num_extends=num_extends,
         bs=bs,
+        input_num_tokens=rows,
+        forward_mode=ForwardMode.MIXED,
         decode_input_ids=None,
+        sampled_top_k=0,
     )
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.sampling_backend = backend
