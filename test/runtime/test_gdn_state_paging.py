@@ -732,9 +732,7 @@ class TestVerifyCommitGPUTest:
                                 "aten::stack",
                             }.intersection(e.name for e in events)
                         )
-                        assert not (
-                            any("elementwise" in name for name in gpu_kernels)
-                        )
+                        assert not any("elementwise" in name for name in gpu_kernels)
                     source_rows = [1, 6, 11][:live_bs]
                     for layer, group in layer_groups.items():
                         for kind, name in enumerate(("conv_state", "recurrent_state")):
