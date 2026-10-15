@@ -595,6 +595,12 @@ def get_device(device_id: int | None = None) -> str:
     raise RuntimeError("No accelerator (CUDA/ROCm) is available.")
 
 
+# Marks the elided middle of a long list. A sentinel, not the string "...",
+# so elements are never compared with ``==`` (an ndarray element would make
+# that comparison ambiguous) and a real "..." element is still shown.
+_ELIDED = object()
+
+
 def dataclass_to_string_truncated(
     data, max_length=2048, skip_names: set[str] | None = None
 ):
@@ -618,13 +624,13 @@ def dataclass_to_string_truncated(
         # tensors in full) and propagate skip_names.
         if len(data) > max_length:
             half_length = max_length // 2
-            shown = list(data[:half_length]) + ["..."] + list(data[-half_length:])
+            shown = list(data[:half_length]) + [_ELIDED] + list(data[-half_length:])
         else:
             shown = data
         inner = ", ".join(
             (
                 "..."
-                if x == "..."
+                if x is _ELIDED
                 else dataclass_to_string_truncated(x, max_length, skip_names)
             )
             for x in shown
