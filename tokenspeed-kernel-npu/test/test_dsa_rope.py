@@ -31,11 +31,11 @@ from tokenspeed_kernel_npu.ops.dsa import (
 )
 
 
-@pytest.mark.parametrize("rows", [1, 8, 64, 65])
-@pytest.mark.parametrize("heads", [1, 8, 64])
+@pytest.mark.parametrize("rows", [1, 8, 64, 65, 128, 256, 257, 512, 513, 1024, 1025])
+@pytest.mark.parametrize("heads", [1, 4, 8, 16, 32, 64])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("strided", [False, True])
-def test_fused_rope_matches_cann(rows, heads, dtype, strided):
+def test_rope_matches_cann(rows, heads, dtype, strided):
     torch.npu.set_device(0)
     torch.manual_seed(421)
     shape = (rows, 128) if heads == 1 else (rows, heads, 128)
@@ -62,17 +62,25 @@ def test_fused_rope_matches_cann(rows, heads, dtype, strided):
     assert torch.equal(actual[..., 64:], x[..., 64:])
 
 
-def test_rope_graph_reads_updated_positions():
-    x = torch.randn(64, 64, 128, dtype=torch.bfloat16, device="npu")
-    table = torch.randn(8192, 64, dtype=torch.bfloat16, device="npu")
-    positions = torch.arange(64, device="npu")
+@pytest.mark.parametrize("rows", [64, 1024])
+@pytest.mark.parametrize("heads", [1, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("strided", [False, True])
+def test_rope_graph_reads_updated_positions(rows, heads, dtype, strided):
+    shape = (rows, 128) if heads == 1 else (rows, heads, 128)
+    base = torch.randn(
+        (*shape[:-1], 256 if strided else 128), dtype=dtype, device="npu"
+    )
+    x = base[..., :128]
+    table = torch.randn(8192, 64, dtype=dtype, device="npu")
+    positions = torch.arange(rows, device="npu")
     for _ in range(3):
         interleave_rope(x, positions, table, rope_dim=64)
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         actual = interleave_rope(x, positions, table, rope_dim=64)
     for offset in (0, 127, 4096):
-        positions.copy_(torch.arange(64, device="npu") + offset)
+        positions.copy_(torch.arange(rows, device="npu") + offset)
         graph.replay()
         reference = _composite_interleave_rope(x, positions, table, rope_dim=64)
         assert torch.equal(actual, reference)
@@ -94,3 +102,21 @@ def test_rope_preserves_empty_and_shaped_positions():
         positions = torch.arange(rows, device="npu").reshape(rows, 1)
         expected = _composite_interleave_rope(x, positions, table, rope_dim=64)
         assert torch.equal(interleave_rope(x, positions, table, rope_dim=64), expected)
+
+
+@pytest.mark.parametrize("rows", [64, 1024])
+@pytest.mark.parametrize("heads", [1, 4, 8, 16, 32, 64])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("strided", [False, True])
+def test_rope_framework_dispatch(rows, heads, dtype, strided):
+    from tokenspeed_kernel.ops.attention.dsa import dsa_interleave_rope
+
+    shape = (rows, 128) if heads == 1 else (rows, heads, 128)
+    base = torch.randn(
+        (*shape[:-1], 256 if strided else 128), dtype=dtype, device="npu"
+    )
+    x = base[..., :128]
+    table = torch.randn(8192, 64, dtype=dtype, device="npu")
+    positions = torch.arange(rows, device="npu")
+    expected = _composite_interleave_rope(x, positions, table, rope_dim=64)
+    assert torch.equal(dsa_interleave_rope(x, positions, table, rope_dim=64), expected)

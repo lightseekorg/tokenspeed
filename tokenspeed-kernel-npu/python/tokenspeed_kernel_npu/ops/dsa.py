@@ -123,7 +123,7 @@ def interleave_rope(x, positions, table, *, rope_dim):
         or positions.stride(0) != 1
         or x.stride(-1) != 1
         or table.stride(-1) != 1
-        or (x.ndim == 3 and x.shape[1] not in (1, 8, 64))
+        or (x.ndim == 3 and x.shape[1] not in (1, 4, 8, 16, 32, 64))
     ):
         return _composite_interleave_rope(x, positions, table, rope_dim=rope_dim)
     if positions.numel() != x.shape[0]:
@@ -132,6 +132,11 @@ def interleave_rope(x, positions, table, *, rope_dim):
         raise ValueError("DSA RoPE needs a [positions, rope_dim] trigonometric table")
     rows = x.shape[0]
     heads = 1 if x.ndim == 2 else x.shape[1]
+    # One program per token becomes costly for many rows with few heads.
+    # Keep the ranges that improve both full-core and half-core measurements.
+    max_tokens = 1024 if heads == 64 else 512 if heads >= 8 else 256
+    if rows > max_tokens:
+        return _composite_interleave_rope(x, positions, table, rope_dim=rope_dim)
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if rows == 0:
         return out
