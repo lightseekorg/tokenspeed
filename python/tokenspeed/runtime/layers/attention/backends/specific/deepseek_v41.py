@@ -49,6 +49,8 @@ from typing import NamedTuple
 
 import torch
 
+from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
+
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -59,6 +61,10 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
+from tokenspeed.runtime.layers.attention.dcp.comm import (
+    combine_attention_partials,
+    gather_query_heads,
+)
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
@@ -72,7 +78,10 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_SWA_GROUP_ID,
     v41_table_widths,
 )
-from tokenspeed.runtime.layers.attention.deepseek_v41_kvp import gather_paged_history
+from tokenspeed.runtime.layers.attention.deepseek_v41_kvp import (
+    gather_decode_history,
+    gather_paged_history,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
     DeepseekV41CachePool,
@@ -239,10 +248,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self.kvp_group = config.kvp_group
         if self.kvp_size > 1:
             self.cuda_graph_support = CudaGraphSupport(
-                decode_graph=False, prefill_graph=False
+                decode_graph=True, prefill_graph=False
             )
         self._kvp_tables_cpu: Mapping[str, torch.Tensor] = {}
-        self._kvp_decode_spans: tuple[V41PrefillSpan, ...] = ()
         if config.is_draft:
             raise NotImplementedError("V4.1 FlatKV implements target attention only")
         if config.kernel_page_size not in (None, 64):
@@ -318,7 +326,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._kvp_tables_cpu = {}
-        self._kvp_decode_spans = ()
         self.forward_metadata = None
         self.forward_prefill_metadata = None
         self.forward_decode_metadata = None
@@ -427,31 +434,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         for_graph_replay: bool,
         **kwargs,
     ) -> None:
-        if self.kvp_size > 1:
-            if (
-                (for_graph_replay and actual_bs > 0)
-                or self.spec_num_tokens != 1
-                or kwargs.get("num_extends", 0)
-            ):
-                raise NotImplementedError(
-                    "V4.1 KVP decode requires eager, non-speculative pure decode"
-                )
-            # Correctness-first materialization needs host ownership counts.
-            # Snapshot once per refresh, never once per layer or history row.
-            # Eager startup also uses capture initialization with no live
-            # requests. It needs metadata, but no history or host snapshot.
-            self._kvp_tables_cpu = {}
-            lengths = []
-            if actual_bs:
-                with allow_host_sync("V4.1 eager KVP decode history planning"):
-                    self._kvp_tables_cpu = {
-                        gid: table.cpu() for gid, table in block_tables.items()
-                    }
-                    lengths = seq_lens[:actual_bs].cpu().tolist()
-            self._kvp_decode_spans = tuple(
-                V41PrefillSpan(i, i, length - 1, 1, max(0, length - 128))
-                for i, length in enumerate(lengths)
-            )
+        if self.kvp_size > 1 and kwargs.get("num_extends", 0):
+            raise NotImplementedError("V4.1 KVP does not support mixed decode batches")
         # The target runner omits num_extends on pure decode; mixed/draft
         # refresh callers can name the leading extend window explicitly.
         num_extends = kwargs.pop("num_extends", 0)
@@ -1327,8 +1311,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise NotImplementedError(
                     "V4.1 KVP decode requires canonical query rows"
                 )
-            spans = self._kvp_decode_spans
-        if window is not None or kvp_decode:
+            width = self.spec_num_tokens
+            spans = tuple(
+                V41PrefillSpan(i, i * width, 0, width, 0)
+                for i in range(metadata.seq_lens.numel())
+            )
+        if window is not None:
             visible_bound = max(
                 ((span.prefix + span.count) // ratio for span in spans),
                 default=0,
@@ -1410,7 +1398,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ]
         for start, stop, span in windows:
             scoring_cache = index_cache
-            if self.kvp_size > 1:
+            if kvp_decode:
+                scoring_cache = gather_decode_history(
+                    index_cache,
+                    table[span.request],
+                    metadata.seq_lens[span.request] // ratio,
+                    placement=self._kvp_placement(self._owner_group(owner)),
+                )
+            elif self.kvp_size > 1:
                 # All owners gather, including ranks with no queries in this request.
                 scoring_cache = self._gather_kvp_history(
                     index_cache,
@@ -1428,7 +1423,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     .clamp_min(0)
                     .to(torch.int32)
                 )
-                width = max(1, ((span.prefix + span.count) // ratio + 63) // 64)
+                width = (
+                    table.shape[1] if kvp_decode
+                    else max(1, ((span.prefix + span.count) // ratio + 63) // 64)
+                )
                 if self.kvp_size > 1:
                     row = torch.arange(
                         1, width + 1, device=self.device, dtype=table.dtype
@@ -1437,6 +1435,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     row = table[span.request : span.request + 1, :width]
                     row = row.masked_fill(row <= 0, -1)
                 tile_table = row.expand(stop - start, -1)
+                if kvp_decode:
+                    # Broadcast tables select dense scoring; decode/verify needs
+                    # paged Full and candidate-only sparse Reindex scoring.
+                    tile_table = tile_table.contiguous()
             else:
                 from tokenspeed_kernel.ops.attention.dsv41 import selection_table
 
@@ -1808,42 +1810,48 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 else self.window_slots(V41_SWA_GROUP_ID, positions, request_indices)
             )
             if self.kvp_size > 1 and owner >= 0:
-                # Keep the existing paged decode kernel. Only global history
-                # addresses change from virtual pages to request-local pages.
-                record = self.sparse_topk.decode
-                selected_rows = self._selection_rows(record, positions, request_indices)
-                logical = record.logical_rows[selected_rows.clamp_min(0)]
-                compact_slots = (logical + 64).masked_fill(
-                    (selected_rows[:, None] < 0) | (global_slots < 0), -1
+                # Indexer selections remain global; only KV reads are owner-local.
+                local_slots, owned = resolve_cache_slots(
+                    global_slots, self._kvp_placement(self._owner_group(owner))
                 )
-                out = torch.zeros_like(q)
-                for span in self._kvp_decode_spans:
-                    rows = slice(span.offset, span.offset + span.count)
-                    history = self._gather_kvp_history(
-                        global_cache,
-                        owner,
-                        span.request,
-                        (span.prefix + span.count) // self.spec.compress_ratios[owner],
-                        forward_mode,
-                    )
-                    out[rows] = dsv41.selected_attention(
-                        q[rows],
-                        cache,
-                        swa_slots[rows],
-                        swa_lens[rows],
-                        history,
-                        compact_slots[rows],
-                        global_lens[rows],
-                        attn_sink,
-                        softmax_scale,
-                        None,
-                        256,
-                        dsv41.new_attention_schedule(),
-                        None,
-                        None,
-                    )
-                    del history
-                return out
+                local_slots, local_counts = dsv41.compact_slots(
+                    local_slots.masked_fill(~owned, -1), global_lens
+                )
+                local_swa_lens = (
+                    swa_lens if self.kvp_rank == 0 else torch.zeros_like(swa_lens)
+                )
+                # rope_pad_query pads decode heads; never communicate padding.
+                heads = self.spec.num_attention_heads // self.spec.attn_tp_size
+                query = gather_query_heads(q[:, :heads], self.kvp_group)
+                lse = torch.empty(query.shape[:2], dtype=torch.float32, device=q.device)
+                partial = dsv41.selected_attention(
+                    query,
+                    cache,
+                    swa_slots,
+                    local_swa_lens,
+                    global_cache,
+                    local_slots,
+                    local_counts,
+                    None,
+                    softmax_scale,
+                    None,
+                    256,
+                    self._decode_schedule(local_swa_lens, local_counts),
+                    None,
+                    None,
+                    lse=lse,
+                )
+                partial, lse = normalize_dcp_partials(
+                    partial, lse, local_swa_lens, local_counts
+                )
+                return combine_attention_partials(
+                    partial,
+                    lse,
+                    group=self.kvp_group,
+                    rank=self.kvp_rank,
+                    sink=attn_sink[:heads],
+                    keep_all_heads=False,
+                )
             return dsv41.selected_attention(
                 q,
                 cache,

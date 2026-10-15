@@ -275,14 +275,8 @@ class AttnConfig:
                 # cache allocation. The composite name is not a capability.
                 pass
             elif softmax.backend_name == "deepseek_v41":
-                if (
-                    self.speculative_num_steps > 0
-                    or self.speculative_num_draft_tokens > 1
-                    or self.is_draft
-                ):
-                    raise ValueError(
-                        "V4.1 KVP supports target prefill without speculation only"
-                    )
+                if self.is_draft:
+                    raise ValueError("V4.1 KVP requires the target attention backend")
             elif softmax.backend_name != "deepseek_v4":
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "

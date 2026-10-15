@@ -22,6 +22,8 @@
 
 import torch
 
+from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
 from tokenspeed.runtime.layers.attention.dcp.cache import (
     gather_history_rows,
     plan_history_gather,
@@ -73,4 +75,35 @@ def gather_paged_history(
     # Page zero is never selected; padding is masked by visible lengths.
     result = cache.new_zeros((pages + 1, 64, cache.shape[-1]))
     gather_history_rows(plan, local, out=result[1:].view(-1, cache.shape[-1]))
+    return result
+
+
+def gather_decode_history(
+    cache: torch.Tensor,
+    table: torch.Tensor,
+    visible_rows: torch.Tensor,
+    *,
+    placement: CachePlacement,
+) -> torch.Tensor:
+    """Reconstruct packed pages with fixed shapes for decode/verify graph replay.
+
+    The device scalar bounds visible pages; the table capacity fixes allocation
+    and communication size. Each byte has exactly one owner. Unsigned MAX with
+    zero-filled nonowners transports bytes exactly, including page-local scales,
+    without floating-point arithmetic or host ownership counts. Page zero stays
+    reserved. Callers still mask each query by its own causal row count.
+    """
+    from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+
+    if cache.ndim != 3 or cache.shape[1] != 64 or cache.dtype != torch.uint8:
+        raise ValueError("V4.1 history requires uint8 [pages, 64, row_bytes]")
+    if table.ndim != 1 or visible_rows.numel() != 1 or placement.block_granularity != 64:
+        raise ValueError("V4.1 decode history requires a page table and scalar length")
+    slots, owned = resolve_cache_slots(table.long() * 64, placement)
+    active = owned & (torch.arange(table.numel(), device=table.device) * 64 < visible_rows)
+    pages = cache[(slots // 64).clamp_min(0)]
+    pages = pages.masked_fill(~active[:, None, None], 0)
+    pages = all_reduce(pages.contiguous(), placement.group, op=torch.distributed.ReduceOp.MAX)
+    result = cache.new_zeros((table.numel() + 1, 64, cache.shape[-1]))
+    result[1:].copy_(pages)
     return result
