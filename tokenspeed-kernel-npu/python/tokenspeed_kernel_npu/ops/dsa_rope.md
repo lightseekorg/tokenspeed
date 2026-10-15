@@ -9,11 +9,14 @@ registers both BF16 and FP16; FP32 retains the CANN path.
 Products and additions compute separately in FP32 (no FMA
 contraction), then round once to the output dtype. The tail is copied exactly.
 This rotates indexer keys; it does not write the attention KV cache.
+Inputs outside the fused kernel's metadata requirements fall back to the
+original composition, preserving its accepted inputs and error handling.
 
 Tests compare against both CANN and an independent CPU FP32 formula, including
 token/head strides, empty inputs, fallback layouts and graph-updated positions.
-All 363 NPU tests pass: 264 CANN/CPU comparisons, 48 graph-update cases,
-48 public-framework dispatch cases and 3 empty/fallback cases.
+Tests cover 264 CANN/CPU comparisons, 48 graph-update cases,
+48 public-framework dispatch cases and 15 empty/fallback cases, including
+metadata layouts accepted by the original composition.
 The measured token counts are T = 1/8/64/65/128/256/512/1024. H = 1 represents
 2D keys; H = 4/8/16/32/64 covers local query head counts for total head counts
 32 or 64 with TP1/2/4/8, without requiring the caller to shard heads.

@@ -104,6 +104,28 @@ def test_rope_preserves_empty_and_shaped_positions():
         assert torch.equal(interleave_rope(x, positions, table, rope_dim=64), expected)
 
 
+@pytest.mark.parametrize("table_shape", [(), (64,), (8, 32), (8, 64)])
+@pytest.mark.parametrize("position_count", [0, 1])
+def test_rope_empty_preserves_composite_metadata(table_shape, position_count):
+    x = torch.empty(0, 8, 128, dtype=torch.bfloat16, device="npu")
+    positions = torch.zeros(position_count, dtype=torch.int64, device="npu")
+    table = torch.empty(table_shape, dtype=x.dtype, device="npu")
+    expected = _composite_interleave_rope(x, positions, table, rope_dim=64)
+    assert torch.equal(interleave_rope(x, positions, table, rope_dim=64), expected)
+
+
+@pytest.mark.parametrize("table_width", [32, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_rope_preserves_composite_table_reshape(table_width, dtype):
+    rows = 8
+    x = torch.randn(rows, 8, 128, dtype=dtype, device="npu")
+    table = torch.randn(256, table_width, dtype=dtype, device="npu")
+    # The original composition reshapes gathered table elements into rotary rows.
+    positions = torch.arange(rows * 64 // table_width, device="npu")
+    expected = _composite_interleave_rope(x, positions, table, rope_dim=64)
+    assert torch.equal(interleave_rope(x, positions, table, rope_dim=64), expected)
+
+
 @pytest.mark.parametrize("rows", [64, 1024])
 @pytest.mark.parametrize("heads", [1, 4, 8, 16, 32, 64])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

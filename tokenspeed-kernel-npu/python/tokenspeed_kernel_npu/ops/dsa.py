@@ -111,7 +111,7 @@ def _interleave_rope_fused(
     )
 
 
-def interleave_rope(x, positions, table, *, rope_dim):
+def _can_fuse_interleave_rope(x, positions, table, *, rope_dim):
     # Specialize the measured decode layouts. Other geometries/strides keep
     # the existing CANN path rather than relying on unsupported UB tiling.
     if (
@@ -121,22 +121,24 @@ def interleave_rope(x, positions, table, *, rope_dim):
         or x.dtype not in (torch.bfloat16, torch.float16)
         or positions.ndim != 1
         or positions.stride(0) != 1
+        or positions.numel() != x.shape[0]
         or x.stride(-1) != 1
+        or table.ndim != 2
+        or table.shape[1] != rope_dim
         or table.stride(-1) != 1
         or (x.ndim == 3 and x.shape[1] not in (1, 4, 8, 16, 32, 64))
     ):
-        return _composite_interleave_rope(x, positions, table, rope_dim=rope_dim)
-    if positions.numel() != x.shape[0]:
-        raise ValueError("DSA RoPE needs one position per token row")
-    if table.ndim != 2 or table.shape[1] != rope_dim:
-        raise ValueError("DSA RoPE needs a [positions, rope_dim] trigonometric table")
-    rows = x.shape[0]
+        return False
     heads = 1 if x.ndim == 2 else x.shape[1]
     # One program per token becomes costly for many rows with few heads.
     # Keep the ranges that improve both full-core and half-core measurements.
     max_tokens = 1024 if heads == 64 else 512 if heads >= 8 else 256
-    if rows > max_tokens:
-        return _composite_interleave_rope(x, positions, table, rope_dim=rope_dim)
+    return x.shape[0] <= max_tokens
+
+
+def _launch_fused_interleave_rope(x, positions, table):
+    rows = x.shape[0]
+    heads = 1 if x.ndim == 2 else x.shape[1]
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
     if rows == 0:
         return out
@@ -157,6 +159,13 @@ def interleave_rope(x, positions, table, *, rope_dim):
         enable_fp_fusion=False,
     )
     return out
+
+
+def interleave_rope(x, positions, table, *, rope_dim):
+    if _can_fuse_interleave_rope(x, positions, table, rope_dim=rope_dim):
+        return _launch_fused_interleave_rope(x, positions, table)
+    else:
+        return _composite_interleave_rope(x, positions, table, rope_dim=rope_dim)
 
 
 class AscendDSAKernels:
