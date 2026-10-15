@@ -189,6 +189,7 @@ def test_context_builds_the_heap_on_the_requested_gpu(monkeypatch):
         ctx._build_device_context = lambda: contexts.append(ctx.device)
         return ctx
 
+    monkeypatch.delenv("IRIS_ALLOCATOR", raising=False)
     monkeypatch.setattr(module, "set_device", switched.append)
     monkeypatch.setattr(module, "SymmetricHeap", lambda *args: args)
     monkeypatch.setattr(_iris.iris, "iris", build)

@@ -22,7 +22,8 @@
 
 Wraps NCCL and optional low-latency GPU backends. CUDA IPC and symmetric-memory
 backends are only selected for node-local groups; groups spanning nodes fall
-back to NCCL. ``AutoBackend.route`` is the one place that decides which
+back to NCCL, except on gfx1250, whose Iris heap maps peers on other hosts in
+one fabric domain. ``AutoBackend.route`` is the one place that decides which
 implementation serves a collective; every public method asks it first.
 """
 
