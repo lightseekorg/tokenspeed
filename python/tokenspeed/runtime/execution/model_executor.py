@@ -633,6 +633,14 @@ class ModelExecutor:
             )
         else:
             self.drafter = None
+        if (
+            self._pp_is_last_stage
+            and self.sampling_backend.reads_only_argmax()
+            and config.grammar_backend == "none"
+        ):
+            # The sampler reads only each row's argmax, so the target head can
+            # reduce it across vocabulary shards instead of gathering logits.
+            self.model_runner.model.logits_processor.fuse_argmax()
         self._simulated_accept_length = parse_simulated_accept_length(
             envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
             spec_algorithm=config.spec_algo,
@@ -1469,10 +1477,14 @@ class ModelExecutor:
             else None
         )
         logits = logits_output.next_token_logits
+        token_ids = logits_output.next_token_ids
         token_parts, length_parts, logprob_parts = [], [], []
 
         if num_prefill_outputs:
-            prefill_out = LogitsProcessorOutput(next_token_logits=logits[prefill])
+            prefill_out = LogitsProcessorOutput(
+                next_token_logits=logits[prefill],
+                next_token_ids=None if token_ids is None else token_ids[prefill],
+            )
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
                 _with_prefill_sample_offsets(
@@ -1501,7 +1513,12 @@ class ModelExecutor:
                 )
             )
         if num_decodes:
-            decode_out = LogitsProcessorOutput(next_token_logits=logits[decode_outputs])
+            decode_out = LogitsProcessorOutput(
+                next_token_logits=logits[decode_outputs],
+                next_token_ids=(
+                    None if token_ids is None else token_ids[decode_outputs]
+                ),
+            )
             tokens, lengths = self.sampling_backend.verify(
                 decode_out,
                 _sampling_info_for_requests(

@@ -1505,6 +1505,14 @@ class InklingTextModel(nn.Module):
         return hidden_states, None
 
 
+class _InklingLogitsProcessor(LogitsProcessor):
+    """Keeps full-vocabulary logits: the model masks its padded vocabulary
+    columns after this processor runs, so a fused argmax could pick one."""
+
+    def fuse_argmax(self) -> None:
+        return None
+
+
 class InklingForConditionalGeneration(nn.Module):
     """Inkling top-level model (text decoder + optional audio/vision towers)."""
 
@@ -1589,7 +1597,7 @@ class InklingForConditionalGeneration(nn.Module):
             prefix=add_prefix("lm_head", prefix),
         )
         # All-gather vocab-sharded logits before sampling; do_argmax would bypass the pad masking below.
-        self.logits_processor = LogitsProcessor(
+        self.logits_processor = _InklingLogitsProcessor(
             text_config,
             skip_all_gather=mapping.attn.has_dp,
             tp_rank=mapping.attn.tp_rank,

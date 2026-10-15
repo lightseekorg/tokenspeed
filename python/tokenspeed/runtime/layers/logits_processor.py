@@ -396,6 +396,18 @@ class LogitsProcessor(nn.Module):
         """
         self.do_argmax = False
 
+    def fuse_argmax(self) -> None:
+        """Emit ``next_token_ids`` from every forward, as draft models do.
+
+        For a target model whose sampler reads only each row's argmax (greedy
+        sampling without logprobs or grammar masks). Under tensor parallelism
+        the argmax is then reduced across the vocabulary shards, and
+        ``next_token_logits`` stays this rank's shard instead of the gathered
+        vocabulary. Call once after construction and before the first forward.
+        Returns None.
+        """
+        self.do_argmax = True
+
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
             not runtime.enabled

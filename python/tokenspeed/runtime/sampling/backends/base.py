@@ -341,6 +341,12 @@ class SamplingBackend(ABC):
         tree verify, as agreed across TP ranks."""
         return self._accept_index_buf[: bs * num_nodes].view(bs, num_nodes)
 
+    def reads_only_argmax(self) -> bool:
+        """Whether ``sample`` and ``verify`` need nothing of the target logits
+        but each row's argmax, which they then take from
+        ``LogitsProcessorOutput.next_token_ids``."""
+        return False
+
     def configure_dp_sampling(self, runtime: DpSamplingRuntimeConfig) -> None:
         """Configure optional DP sampling state.
 
