@@ -35,8 +35,9 @@ import os
 import sys
 import threading
 import time
-import unittest
 from types import SimpleNamespace
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -62,6 +63,10 @@ KEY = ("json", SCHEMA)
 
 
 class _Grammar(BaseGrammarObject):
+    @property
+    def memory_size_bytes(self) -> int:
+        return 0
+
     def copy(self):
         return self
 
@@ -118,12 +123,12 @@ def _admit(manager: GrammarManager, deadline: float = 5.0) -> RequestState:
     return state
 
 
-class TestCompileFailureStatus(unittest.TestCase):
+class TestCompileFailureStatus:
     def _assert_abort(self, state: RequestState, status: int | None, text: str):
         reason = state.finished_reason.to_json()
-        self.assertEqual(reason["type"], "abort")
-        self.assertEqual(reason.get("status_code"), status)
-        self.assertIn(text, reason["message"])
+        assert (reason["type"]) == ("abort")
+        assert (reason.get("status_code")) == (status)
+        assert (text) in (reason["message"])
 
     def test_compile_failure_from_the_future_is_bad_request(self):
         manager = _manager(_Backend(InvalidGrammarObject("bad schema")))
@@ -137,14 +142,14 @@ class TestCompileFailureStatus(unittest.TestCase):
         manager = _manager(_Backend(InvalidGrammarObject("bad schema")))
         _admit(manager)
         state = _state()
-        self.assertTrue(manager.process_req_with_grammar(state))
+        assert manager.process_req_with_grammar(state)
         self._assert_abort(state, 400, "bad schema")
 
     def test_cached_transient_timeout_keeps_no_status(self):
         backend = _Backend(_Grammar())
         backend.record_compile_timeout(KEY, "timed out", ttl_secs=60, max_retries=1)
         state = _state()
-        self.assertTrue(_manager(backend).process_req_with_grammar(state))
+        assert _manager(backend).process_req_with_grammar(state)
         self._assert_abort(state, None, "timed out")
 
     def test_given_up_timeout_is_bad_request(self):
@@ -152,7 +157,7 @@ class TestCompileFailureStatus(unittest.TestCase):
         for _ in range(2):
             backend.record_compile_timeout(KEY, "timed out", ttl_secs=60, max_retries=1)
         state = _state()
-        self.assertTrue(_manager(backend).process_req_with_grammar(state))
+        assert _manager(backend).process_req_with_grammar(state)
         self._assert_abort(state, 400, "gave up after")
 
     def test_compile_timeout_keeps_no_status(self):
@@ -165,9 +170,9 @@ class TestCompileFailureStatus(unittest.TestCase):
 
     def test_valid_grammar_is_admitted(self):
         state = _admit(_manager(_Backend(_Grammar())))
-        self.assertFalse(state.finished)
-        self.assertIsInstance(state.grammar, _Grammar)
+        assert not (state.finished)
+        assert isinstance((state.grammar), (_Grammar))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

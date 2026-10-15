@@ -139,7 +139,7 @@ TEST(CacheOperationTest, EveryTierTransferPairsBlocksOfEqualResidue) {
     BlockPool device_pool{2, {2}};
     BlockPool host_pool{2, {2}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 2,
         .block_granularity = 2,
         .shard_count = 2,
@@ -230,8 +230,7 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
             .group_id = "full",
             .block_granularity = 2,
             .total_pages = 4,
-            .retention = CacheGroupConfig::Retention::FullHistory,
-            .family = CacheGroupFamily::History,
+            .attn_kind = AttnKind::kFull,
             .transfer_policy = CacheTransferPolicy::FullSuffix,
         });
         SetTestSnapshotPool(config);
@@ -262,8 +261,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
             .group_id = "full",
             .block_granularity = 2,
             .total_pages = 9,
-            .retention = CacheGroupConfig::Retention::FullHistory,
-            .family = CacheGroupFamily::History,
+            .attn_kind = AttnKind::kFull,
             .transfer_policy = CacheTransferPolicy::FullSuffix,
         });
         SetTestSnapshotPool(config);
@@ -280,7 +278,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     BlockPool device_pool{2, {1}};
     BlockPool host_pool{1, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -315,7 +313,7 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     BlockPool device_pool{1, {1}};
     BlockPool host_pool{1, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -357,7 +355,7 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     BlockPool device_pool{2, {1}};
     BlockPool host_pool{1, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -403,7 +401,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     BlockPool device_pool{2, {1}};
     BlockPool host_pool{1, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -433,12 +431,12 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
     BlockPool host_pool{1, {2, 1}};
     const std::array specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull,
+            .attn_kind = AttnKind::kFull,
             .cache_blocks_per_lcm_block = 2,
             .block_granularity = 2,
         },
         CacheGroupSpec{
-            .kind = AttnKind::kFull,
+            .attn_kind = AttnKind::kFull,
             .cache_blocks_per_lcm_block = 1,
             .block_granularity = 2,
         },
@@ -494,7 +492,7 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
 TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRequest) {
     BlockPool device_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -528,8 +526,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
         .group_id = "full",
         .block_granularity = 2,
         .total_pages = 4,
-        .retention = CacheGroupConfig::Retention::FullHistory,
-        .family = CacheGroupFamily::History,
+        .attn_kind = AttnKind::kFull,
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
     SetTestSnapshotPool(config);
@@ -556,8 +553,7 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
         .group_id = "full",
         .block_granularity = 2,
         .total_pages = 5,
-        .retention = CacheGroupConfig::Retention::FullHistory,
-        .family = CacheGroupFamily::History,
+        .attn_kind = AttnKind::kFull,
         .transfer_policy = CacheTransferPolicy::FullSuffix,
     });
     SetTestSnapshotPool(config);
@@ -582,7 +578,7 @@ TEST(CacheOperationTest, StateCheckpointStreamsOnlyWhenPublished) {
         SCOPED_TRACE(static_cast<int>(guard));
         BlockPool pool(2, {1});
         BlockPool host_pool(2, {1});
-        const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 0}};
+        const std::array specs{CacheGroupSpec{.attn_kind = AttnKind::kState, .block_granularity = 0}};
         auto coordinator =
             MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr, true);
         TierTransferManager transfers(coordinator);
@@ -614,7 +610,7 @@ TEST(CacheOperationTest, StateCheckpointStreamsOnlyWhenPublished) {
 TEST(CacheOperationTest, HostRestoredStateCheckpointRemainsCachedAfterLoadAckAndWorkingRelease) {
     BlockPool pool(1, {1});
     BlockPool host_pool(1, {1});
-    const std::array specs{CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 0}};
+    const std::array specs{CacheGroupSpec{.attn_kind = AttnKind::kState, .block_granularity = 0}};
     auto coordinator =
         MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr, false);
     TierTransferManager transfers(coordinator);
@@ -657,8 +653,7 @@ TEST(CacheOperationTest, L3StorageRequiresHostCache) {
         .group_id = "full",
         .block_granularity = 2,
         .total_pages = 4,
-        .retention = CacheGroupConfig::Retention::FullHistory,
-        .family = CacheGroupFamily::History,
+        .attn_kind = AttnKind::kFull,
     });
     SetTestSnapshotPool(config);
     EXPECT_THROW(Scheduler{std::move(config)}, std::invalid_argument);
@@ -677,8 +672,7 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
         .group_id = "full",
         .block_granularity = 2,
         .total_pages = 4,
-        .retention = CacheGroupConfig::Retention::FullHistory,
-        .family = CacheGroupFamily::History,
+        .attn_kind = AttnKind::kFull,
     });
     SetTestSnapshotPool(config);
     EXPECT_NO_THROW(Scheduler{std::move(config)});
@@ -690,7 +684,7 @@ TEST(CacheOperationTest, L3StorageHitsPlanAPrefetchNotAnAdmission) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -734,7 +728,7 @@ TEST(CacheOperationTest, APrefetchThatLandsNothingPublishesNothing) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -770,7 +764,7 @@ TEST(CacheOperationTest, AMalformedPrefetchAckIsIgnoredAndTheOpStaysInFlight) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -806,7 +800,7 @@ TEST(CacheOperationTest, APrefetchBelowTheThresholdEvictsNothing) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -853,7 +847,7 @@ TEST(CacheOperationTest, ALandedPrefetchPublishesHostEntriesTheAdmissionThenLoad
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -911,7 +905,7 @@ TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -948,7 +942,7 @@ TEST(CacheOperationTest, L3StorageMissCanBeUnregistered) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -970,7 +964,7 @@ TEST(CacheOperationTest, L3UnregisterPrunesStorageKeyOrder) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -997,12 +991,12 @@ TEST(CacheOperationTest, APrefetchPageIsPlannedForEveryGroupOrNotAtAll) {
     BlockPool host_pool{1, {1, 1}};
     const std::array specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull,
+            .attn_kind = AttnKind::kFull,
             .cache_blocks_per_lcm_block = 1,
             .block_granularity = 2,
         },
         CacheGroupSpec{
-            .kind = AttnKind::kFull,
+            .attn_kind = AttnKind::kFull,
             .cache_blocks_per_lcm_block = 1,
             .block_granularity = 2,
         },
@@ -1029,7 +1023,7 @@ TEST(CacheOperationTest, ExpandPrefixKeysCoversGroupsAndOffsets) {
     BlockPool device_pool{4, {1}};
     BlockPool host_pool{4, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -1065,7 +1059,7 @@ TEST(CacheOperationTest, L3KeySurvivesHostEvictionAndPrefetches) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -1109,7 +1103,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowIsBoundedToHostCapacity) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -1146,7 +1140,7 @@ TEST(CacheOperationTest, L3StorageKeyShadowEvictsProtectedSuffixToKeepPrefix) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -1178,12 +1172,12 @@ TEST(CacheOperationTest, L3StorageKeyShadowKeepsSharedPrefixAcrossGroups) {
     BlockPool host_pool{2, {1, 1}};
     const std::array specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull,
+            .attn_kind = AttnKind::kFull,
             .cache_blocks_per_lcm_block = 1,
             .block_granularity = 2,
         },
         CacheGroupSpec{
-            .kind = AttnKind::kFull,
+            .attn_kind = AttnKind::kFull,
             .cache_blocks_per_lcm_block = 1,
             .block_granularity = 2,
         },
@@ -1210,7 +1204,7 @@ TEST(CacheOperationTest, APrefetchTruncatesAtTheFirstPageTheHostPoolCannotTake) 
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -1246,7 +1240,7 @@ TEST(CacheOperationTest, ATruncatedSlidingWindowPrefetchIsNoHitAtAdmission) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kSlidingWindow,
+        .attn_kind = AttnKind::kSlidingWindow,
         // Resuming needs ceil((window - 1) / block_granularity) == 2 pages.
         .sliding_window = 5,
         .cache_blocks_per_lcm_block = 1,
@@ -1294,7 +1288,7 @@ TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -1331,7 +1325,7 @@ TEST(CacheOperationTest, APrefetchPageNeedsEveryRowOfItsFinerGroup) {
     BlockPool device_pool{8, {1}};
     BlockPool host_pool{2, {1}};
     const std::array specs{CacheGroupSpec{
-        .kind = AttnKind::kFull,
+        .attn_kind = AttnKind::kFull,
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 2,
     }};
@@ -1359,12 +1353,12 @@ TEST(CacheOperationTest, APrefetchPageCountsEveryGroupsRows) {
     BlockPool host_pool{3, {1, 1}};
     const std::array specs{
         CacheGroupSpec{
-            .kind = AttnKind::kFull,
+            .attn_kind = AttnKind::kFull,
             .cache_blocks_per_lcm_block = 1,
             .block_granularity = 2,
         },
         CacheGroupSpec{
-            .kind = AttnKind::kFull,
+            .attn_kind = AttnKind::kFull,
             .cache_blocks_per_lcm_block = 1,
             .block_granularity = 4,
         },

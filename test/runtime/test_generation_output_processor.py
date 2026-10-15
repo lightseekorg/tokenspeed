@@ -88,6 +88,10 @@ class _ExecutionResult:
     next_input_ids = None
     input_token_logprobs = None
     input_logprob_plan = None
+    input_top_logprobs_val = None
+    input_top_logprobs_idx = None
+    output_top_logprobs_val = None
+    output_top_logprobs_idx = None
 
 
 def _state(input_ids: list[int], *, computed_length: int = 0) -> RequestState:
@@ -645,6 +649,10 @@ class _PrefillExecutionResult:
     next_input_ids = torch.tensor([[101, 102, 103]], dtype=torch.int32)
     input_token_logprobs = None
     input_logprob_plan = None
+    input_top_logprobs_val = None
+    input_top_logprobs_idx = None
+    output_top_logprobs_val = None
+    output_top_logprobs_idx = None
 
 
 class _EmptyPrefillExecutionResult(_PrefillExecutionResult):

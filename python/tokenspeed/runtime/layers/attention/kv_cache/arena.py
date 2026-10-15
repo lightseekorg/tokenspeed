@@ -288,7 +288,7 @@ class CacheArena:
             and field.field_id in self.offload_config.field_ids
         ):
             token_rows = spec.rows_per_page
-        if spec.family == "state" or field.shape[0] != token_rows:
+        if spec.attn_kind == "state" or field.shape[0] != token_rows:
             return pages
         return pages.view(-1, *field.shape[1:])
 

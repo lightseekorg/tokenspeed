@@ -27,11 +27,9 @@ import torch
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+from tokenspeed_kernel.ops.moe.flashinfer import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
     TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT,
-)
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant import (
     TRTLLM_UNQUANT_ISPP_ALIGNMENT,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -50,6 +48,9 @@ from tokenspeed.runtime.layers.moe.utils import (
     get_moe_backend,
 )
 from tokenspeed.runtime.layers.moe.weights import create_layer_weights
+from tokenspeed.runtime.layers.moe.weights.fp8_channel import (
+    check_fp8_channel_scales,
+)
 from tokenspeed.runtime.layers.moe.weights.loaders import round_up
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -234,7 +235,7 @@ class MoELayer(torch.nn.Module):
             # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
             # ispp_alignment={TRTLLM_UNQUANT_ISPP_ALIGNMENT}: 64, or 128 when
             # the installed FlashInfer launcher cannot be relaxed or built
-            # (ops/moe/flashinfer/trtllm_unquant.py); without padding
+            # (ops/moe/flashinfer.py); without padding
             # moe_plan does not select them for a misaligned intermediate
             # size. Other activations keep 128. The padded tail rows/columns
             # stay zero (create_dense_weight_pair zero-initializes) and
@@ -463,6 +464,8 @@ class MoELayer(torch.nn.Module):
         if self._weights_processed:
             return
 
+        if self._quant_kind == "fp8_channel":
+            check_fp8_channel_scales(module, self.prefix)
         kernel_moe_process_weights(self.plan, module)
         self._weights_processed = True
 

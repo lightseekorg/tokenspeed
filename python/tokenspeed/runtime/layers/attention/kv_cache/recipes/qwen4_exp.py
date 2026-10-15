@@ -248,9 +248,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 (
                     CacheGroupSpec(
                         group_id=QWEN4_EXP_PLE_CACHE_GROUP,
-                        retention="full_history",
+                        attn_kind="state",
                         sliding_window_tokens=None,
-                        family="state",
                         replayable=False,
                     ),
                     ple_fields,
@@ -260,11 +259,10 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         if qsa_compressed_fields:
             qsa_spec = CacheGroupSpec(
                 group_id=QWEN4_EXP_QSA_CACHE_GROUP,
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
                 entry_stride_tokens=self._qsa_compress_ratio,
                 sliding_window_tokens=None,
-                family="history",
                 replayable=False,
             )
             # Raw block ids require exactly one model/kernel page per block.
@@ -286,11 +284,10 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 (
                     CacheGroupSpec(
                         group_id=QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
-                        retention="sliding_window",
+                        attn_kind="sliding_window",
                         rows_per_page=QWEN4_EXP_QSA_RECENT_ROWS_PER_PAGE,
                         entry_stride_tokens=1,
                         sliding_window_tokens=self._qsa_compress_ratio,
-                        family="history",
                         replayable=False,
                     ),
                     qsa_recent_fields,

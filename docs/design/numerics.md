@@ -69,8 +69,10 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               extra traffic). A ring reduction chunks
 │   │                               by message size, so its per-element order
 │   │                               is run-stable but not batch-size-
-│   │                               invariant. Gathers move data and keep the
-│   │                               multicast kernels. The route reads only
+│   │                               invariant. MAX/MIN all-reduces are exact
+│   │                               in any order and stay on NCCL. Gathers
+│   │                               move data and keep the multicast
+│   │                               kernels. The route reads only
 │   │                               static properties of the call site (group,
 │   │                               dtype, rank, width), never the row count,
 │   │                               so a site cannot change route with the
@@ -415,6 +417,13 @@ a rollout. The `dtype=float32` form widens bf16 logits inside the kernel (an
 exact conversion) instead of materializing an fp32 copy of the `[rows, vocab]`
 tensor first; because both paths go through the one function, whatever
 rounding the kernel applies is applied to both.
+
+Top-k alternatives (`top_logprobs_num`, `torch` order only) follow the same
+rule: `top_token_logprobs`, beside it, takes a row's `top_k` largest entries
+of that fp32 log-softmax for the prompt rows and the prefill-sampled rows
+alike, so an alternative's value is the token's gathered logprob and, at the
+same `top_k`, a position's alternatives do not depend on which consumer
+scored it.
 
 The TP gather differs in one respect that is not numerics: the sampled rows
 may take the multicast all-gather, whose result is a view of the group's

@@ -8,8 +8,9 @@ import os
 import subprocess
 import sys
 import time
-import unittest
 from pathlib import Path
+
+import pytest
 
 # /test on sys.path so "ci_system.ci_register" resolves from test/ci_system/.
 sys.path.insert(
@@ -119,16 +120,16 @@ def _wait_for_server(timeout: int = SERVER_LAUNCH_TIMEOUT) -> bool:
     return False
 
 
-class TestQwen35VlmE2E(unittest.TestCase):
+class TestQwen35VlmE2E:
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         try:
             from tokenspeed_kernel.platform import current_platform
         except Exception as exc:  # noqa: BLE001
-            raise unittest.SkipTest(f"TokenSpeed kernel deps unavailable: {exc}")
+            pytest.skip(f"TokenSpeed kernel deps unavailable: {exc}")
 
         if not current_platform().is_blackwell:
-            raise unittest.SkipTest("Qwen3.5 FP8 VLM requires NVIDIA Blackwell")
+            pytest.skip("Qwen3.5 FP8 VLM requires NVIDIA Blackwell")
 
     def test_image_chat_completion(self):
         import requests
@@ -142,7 +143,8 @@ class TestQwen35VlmE2E(unittest.TestCase):
                     if log_path.exists()
                     else ""
                 )
-                self.fail(f"server did not become ready; log tail:\n{tail}")
+                _pytest_msg_3 = f"server did not become ready; log tail:\n{tail}"
+                assert False, _pytest_msg_3
 
             payload = {
                 "model": SERVED_MODEL_NAME,
@@ -180,8 +182,10 @@ class TestQwen35VlmE2E(unittest.TestCase):
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"].get("content") or ""
-            self.assertTrue(content.strip(), f"empty VLM response: {data}")
-            self.assertGreater(data.get("usage", {}).get("prompt_tokens", 0), 0)
+            _pytest_expr_1 = content.strip()
+            _pytest_msg_2 = f"empty VLM response: {data}"
+            assert _pytest_expr_1, _pytest_msg_2
+            assert (data.get("usage", {}).get("prompt_tokens", 0)) > (0)
         finally:
             from tokenspeed.runtime.utils.process import kill_process_tree
 
@@ -195,4 +199,4 @@ class TestQwen35VlmE2E(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

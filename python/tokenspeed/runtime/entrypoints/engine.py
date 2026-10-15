@@ -31,6 +31,7 @@ This file implements python APIs for the inference engine.
 # ruff: noqa: E402
 import asyncio
 import atexit
+import contextlib
 import copy
 import dataclasses
 import multiprocessing as mp
@@ -39,9 +40,6 @@ import signal
 import sys
 import threading
 from collections.abc import AsyncIterator, Iterator
-
-import zmq
-import zmq.asyncio
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
@@ -74,8 +72,6 @@ from tokenspeed.runtime.engine.io_struct import (
     RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
-    RpcReqInput,
-    RpcReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
@@ -95,7 +91,11 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.launcher import interface_for_host
-from tokenspeed.runtime.utils.process import kill_process_tree
+from tokenspeed.runtime.utils.process import (
+    kill_process_tree,
+    receive_ready_messages,
+    start_process_with_ready_pipe,
+)
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from tokenspeed.version import __version__
@@ -501,25 +501,6 @@ class Engine(EngineBase):
         """Return whether any GPU memory is currently released (data-plane sleep)."""
         return self.llm.run(self.tokenizer_manager.is_sleeping())
 
-    """
-    Execute an RPC call on all scheduler processes.
-    """
-
-    def collective_rpc(self, method: str, **kwargs):
-        obj = RpcReqInput(method=method, parameters=kwargs)
-        self.send_to_rpc.send_pyobj(obj)
-        recv_req = self.send_to_rpc.recv_pyobj(zmq.BLOCKY)
-        if not isinstance(recv_req, RpcReqOutput):
-            raise TypeError(f"Expected RpcReqOutput, got {type(recv_req).__name__}.")
-        if not recv_req.success:
-            raise RuntimeError(recv_req.message)
-
-    def save_remote_model(self, **kwargs):
-        self.collective_rpc("save_remote_model", **kwargs)
-
-    def save_sharded_model(self, **kwargs):
-        self.collective_rpc("save_sharded_model", **kwargs)
-
 
 def _set_socket_interface(server_args: ServerArgs):
     """Point gloo and NCCL at the interface that reaches the head node.
@@ -645,37 +626,28 @@ def _launch_subprocesses(
             rank_server_args.mapping = copy.deepcopy(server_args.mapping)
             rank_server_args.mapping.rank = rank
 
-            reader, writer = mp.Pipe(duplex=False)
-
-            proc = mp.Process(
-                target=run_event_loop,
-                args=(
-                    rank_server_args,
-                    port_args,
-                    writer,
-                ),
+            proc, reader = start_process_with_ready_pipe(
+                run_event_loop,
+                (rank_server_args, port_args),
+                memory_saver_adapter.configure_subprocess(),
             )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
     else:
         # Launch the data parallel controller
-        reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_readers = [reader]
-        proc = mp.Process(
-            target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
+        proc, reader = start_process_with_ready_pipe(
+            run_data_parallel_controller_process,
+            (server_args, port_args),
+            contextlib.nullcontext(),
         )
-        proc.start()
+        scheduler_pipe_readers = [reader]
         scheduler_procs.append(proc)
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 
-        for reader in scheduler_pipe_readers:
-            data = reader.recv()
+        for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
                 raise RuntimeError(
                     "Initialization failed. Please see the error messages above."
@@ -707,18 +679,7 @@ def _launch_subprocesses(
 
     # Wait for the model to finish loading
     scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i!s} scheduler is dead. Please check if there are relevant "
-                "logs.",
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode!s}")
-            raise
-
+    for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
         if data["status"] != "ready":
             raise RuntimeError(
                 "Initialization failed. Please see the error messages above."
@@ -807,37 +768,24 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             rank_server_args.mapping = copy.deepcopy(server_args.mapping)
             rank_server_args.mapping.rank = rank
 
-            reader, writer = mp.Pipe(duplex=False)
-            proc = mp.Process(
-                target=run_event_loop,
-                args=(rank_server_args, port_args, writer),
+            proc, reader = start_process_with_ready_pipe(
+                run_event_loop,
+                (rank_server_args, port_args),
+                memory_saver_adapter.configure_subprocess(),
             )
-            with memory_saver_adapter.configure_subprocess():
-                proc.start()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
     else:
-        reader, writer = mp.Pipe(duplex=False)
-        scheduler_pipe_readers.append(reader)
-        proc = mp.Process(
-            target=run_data_parallel_controller_process,
-            args=(server_args, port_args, writer),
+        proc, reader = start_process_with_ready_pipe(
+            run_data_parallel_controller_process,
+            (server_args, port_args),
+            contextlib.nullcontext(),
         )
-        proc.start()
+        scheduler_pipe_readers.append(reader)
         scheduler_procs.append(proc)
 
     try:
-        for i, reader in enumerate(scheduler_pipe_readers):
-            try:
-                data = reader.recv()
-            except EOFError:
-                logger.error(
-                    f"Rank {i!s} scheduler is dead. Please check if there are "
-                    "relevant logs.",
-                )
-                scheduler_procs[i].join()
-                logger.error(f"Exit code: {scheduler_procs[i].exitcode!s}")
-                raise
+        for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
                 raise RuntimeError(
                     "Scheduler initialization failed. See the error messages above."

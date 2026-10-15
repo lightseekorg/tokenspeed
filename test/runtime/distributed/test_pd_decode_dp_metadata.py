@@ -30,8 +30,6 @@ whether its batch has tokens.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
 import torch.distributed
 

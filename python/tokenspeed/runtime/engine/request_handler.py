@@ -120,6 +120,7 @@ _WEIGHT_OPS: tuple[tuple[type, type], ...] = (
     (DestroyWeightsUpdateGroupReqInput, DestroyWeightsUpdateGroupReqOutput),
     (UpdateWeightsFromMooncakeReqInput, UpdateWeightsFromMooncakeReqOutput),
     (RebalanceExpertsReqInput, RebalanceExpertsReqOutput),
+    (UpdateWeightFromDiskReqInput, UpdateWeightFromDiskReqOutput),
 )
 _WEIGHT_OP_CODES: dict[type, int] = {
     req_type: code for code, (req_type, _) in enumerate(_WEIGHT_OPS, start=1)
@@ -130,6 +131,7 @@ _WEIGHT_OP_OUTPUTS: dict[type, type] = dict(_WEIGHT_OPS)
 _WEIGHT_LOAD_OPS = (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
+    UpdateWeightFromDiskReqInput,
 )
 # Internal control ops: the online expert rebalance's steps, enqueued by the
 # engine itself at rank-identical rounds (``enqueue_internal_op``) and
@@ -328,8 +330,12 @@ class RequestHandler:
             [(ProfileReq, self.profile)]
         )
 
+        # The grammar ends on the ids the engine stops on.
         self.grammar_manager = GrammarManager(
-            self.server_args, self.tokenizer, self.vocab_size
+            self.server_args,
+            self.tokenizer,
+            self.vocab_size,
+            stop_token_ids=self.hf_eos_token_id,
         )
 
         self.init_profiler()
@@ -430,25 +436,16 @@ class RequestHandler:
                     )
                 else:
                     self._pending_weight_ops.append(recv_req)
-            # The in-engine RL control app refuses these two sources up front
+            # The in-engine RL control app refuses this source up front
             # (SUPPORTED_WEIGHT_UPDATE_SOURCES in io_struct, also advertised to
-            # gateways as rl.update_from); keep that set in step with the load
-            # branches above.
+            # gateways as rl.update_from); keep that set in step with
+            # _WEIGHT_LOAD_OPS.
             elif isinstance(recv_req, UpdateWeightsFromTensorReqInput):
                 self.send_func.send_pyobj(
                     UpdateWeightsFromTensorReqOutput(
                         success=False,
                         message="update_weights_from_tensor is not supported on "
                         "this engine",
-                    )
-                )
-            elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
-                self.send_func.send_pyobj(
-                    UpdateWeightFromDiskReqOutput(
-                        success=False,
-                        message="update_weights_from_disk is not supported on "
-                        "this engine",
-                        num_paused_requests=0,
                     )
                 )
             else:
@@ -501,7 +498,7 @@ class RequestHandler:
         objects remain and can be restored for incompatible weights.
         """
 
-        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        storage_backend = self.server_args.kvstore_storage_backend
         if (
             storage_backend is None
             or not recv_req.flush_cache
@@ -520,7 +517,7 @@ class RequestHandler:
         as if they belonged to the new weights.
         """
 
-        storage_backend = getattr(self.server_args, "kvstore_storage_backend", None)
+        storage_backend = self.server_args.kvstore_storage_backend
         if storage_backend is None or recv_req.flush_cache:
             return True, ""
         version = resolve_l3_weight_version(
@@ -760,7 +757,7 @@ class RequestHandler:
             self.server_args.weight_version,
             _requested_weight_version(recv_req),
             flush_cache=recv_req.flush_cache,
-            storage_backend=getattr(self.server_args, "kvstore_storage_backend", None),
+            storage_backend=self.server_args.kvstore_storage_backend,
         )
         if version is None:
             return True, msg

@@ -10,9 +10,9 @@ same device".
 
 import os
 import sys
-import unittest
 from unittest import mock
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -28,17 +28,17 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 from tokenspeed.runtime.models.llama_eagle3 import LlamaForCausalLMEagle3
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "needs a GPU to place the weight on")
-class TestEagle3D2TDevice(unittest.TestCase):
+@pytest.mark.skipif(
+    (not torch.cuda.is_available()), reason=("needs a GPU to place the weight on")
+)
+class TestEagle3D2TDevice:
     D2T = torch.tensor([5, 7, 9], dtype=torch.long)
 
     def _assert_hot_token_id(self, model):
         # loaded_weight + arange(3) == [5, 8, 11]
-        self.assertEqual(model.hot_token_id.device.type, "cuda")
-        self.assertTrue(
-            torch.equal(
-                model.hot_token_id.cpu(), torch.tensor([5, 8, 11], dtype=torch.long)
-            )
+        assert (model.hot_token_id.device.type) == ("cuda")
+        assert torch.equal(
+            model.hot_token_id.cpu(), torch.tensor([5, 8, 11], dtype=torch.long)
         )
 
     def test_llama_eagle3_places_hot_token_id_on_the_weight_device(self):
@@ -64,4 +64,4 @@ class TestEagle3D2TDevice(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -6,8 +6,9 @@ import os
 import pathlib
 import sys
 import types
-import unittest
 from collections.abc import Mapping
+
+import pytest
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,61 +28,17 @@ _KV_CACHE_DIR = (
 _RECIPE_DIR = _KV_CACHE_DIR / "recipes"
 
 
-def _load(module_name: str, path: pathlib.Path):
-    spec = importlib.util.spec_from_file_location(module_name, path)
+@pytest.fixture(scope="class", autouse=True)
+def cache_plan_module(request):
+    module_name = "tokenspeed.runtime.layers.attention.kv_cache.recipes.plan"
+    spec = importlib.util.spec_from_file_location(module_name, _RECIPE_DIR / "plan.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_cache_modules():
-    for package_name in (
-        "tokenspeed",
-        "tokenspeed.runtime",
-        "tokenspeed.runtime.configs",
-        "tokenspeed.runtime.layers",
-        "tokenspeed.runtime.layers.attention",
-        "tokenspeed.runtime.layers.attention.kv_cache",
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes",
-    ):
-        sys.modules.setdefault(package_name, types.ModuleType(package_name))
-    # The V4 recipe imports the kernel-page registry by its real name;
-    # register it from its file path before the recipe loads.
-    _load(
-        "tokenspeed.runtime.layers.attention.kernel_page_sizes",
-        _KV_CACHE_DIR.parent / "kernel_page_sizes.py",
-    )
-    plan = _load(
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes.plan",
-        _RECIPE_DIR / "plan.py",
-    )
-    _load(
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes",
-        _RECIPE_DIR / "__init__.py",
-    )
-    recipes = {}
-    for recipe in (
-        "deepseek_v4",
-        "ordinary",
-        "inkling",
-        "kimi_k3",
-        "qwen35",
-    ):
-        recipes[recipe] = _load(
-            f"tokenspeed.runtime.layers.attention.kv_cache.recipes.{recipe}",
-            _RECIPE_DIR / f"{recipe}.py",
-        )
-    layouts = types.SimpleNamespace(
-        **{
-            name: getattr(module, name)
-            for module in recipes.values()
-            for name in dir(module)
-            if name.endswith("_cache_fields")
-        }
-    )
-    return plan, layouts
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, module_name, module)
+        spec.loader.exec_module(module)
+        request.cls.plan_module = module
+        yield
 
 
 def _tagged_field(group_id, field_id, plane_id, shape, dtype, **kwargs):
@@ -104,17 +61,11 @@ def _group(group_id: str, *fields, **spec_kwargs):
     Row geometry defaults so a byte-layout test need not restate scheduler
     semantics; ``rows_per_page`` is the group's CacheBlock token span.
     """
-    # A duck-typed spec: the planner reads only ``spec.group_id``, and this
-    # module loads its subject by file path -- importing the real spec module
-    # here would shadow it in sys.modules for every later test.
+    # A duck-typed spec: the planner reads only spec.group_id.
     return types.SimpleNamespace(group_id=group_id, **spec_kwargs), tuple(fields)
 
 
-class CacheMemoryPlanTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.plan_module, cls.layouts_module = _load_cache_modules()
-
+class TestCacheMemoryPlanTest:
     def _plan_fields(
         self,
         fields,
@@ -173,8 +124,8 @@ class CacheMemoryPlanTest(unittest.TestCase):
             "kvconv_checkpoint_buffers",
             "hiddenconv_checkpoint_buffer",
         }
-        self.assertTrue(conv_methods.isdisjoint(generic_methods))
-        self.assertTrue(conv_methods.issubset(inkling_methods))
+        assert conv_methods.isdisjoint(generic_methods)
+        assert conv_methods.issubset(inkling_methods)
 
     def test_recipes_and_memory_plan_do_not_own_pd_metadata(self):
         pd_fields = {
@@ -189,7 +140,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             self.plan_module.CacheFieldLayout,
             self.plan_module.CacheMemoryPlan,
         ):
-            self.assertTrue(pd_fields.isdisjoint(plan_type.__dataclass_fields__))
+            assert pd_fields.isdisjoint(plan_type.__dataclass_fields__)
 
         for path in _RECIPE_DIR.glob("*.py"):
             module = ast.parse(path.read_text())
@@ -203,14 +154,13 @@ class CacheMemoryPlanTest(unittest.TestCase):
                 if isinstance(node, ast.Import)
                 for alias in node.names
             }
-            self.assertFalse(
-                any(
-                    imported.startswith("tokenspeed.runtime.pd")
-                    or imported.startswith("tokenspeed.runtime.cache.transfer")
-                    for imported in imports
-                ),
-                path.name,
+            _pytest_expr_6 = any(
+                imported.startswith("tokenspeed.runtime.pd")
+                or imported.startswith("tokenspeed.runtime.cache.transfer")
+                for imported in imports
             )
+            _pytest_msg_7 = path.name
+            assert not _pytest_expr_6, _pytest_msg_7
 
     def test_cache_pool_factory_is_separate_from_setup(self):
         setup_module = ast.parse((_RECIPE_DIR / "setup.py").read_text())
@@ -224,8 +174,8 @@ class CacheMemoryPlanTest(unittest.TestCase):
             for node in factory_module.body
             if isinstance(node, ast.FunctionDef)
         }
-        self.assertNotIn("create_cache_pool", setup_functions)
-        self.assertIn("create_cache_pool", factory_functions)
+        assert ("create_cache_pool") not in (setup_functions)
+        assert ("create_cache_pool") in (factory_functions)
 
     def test_registry_only_orchestrates_cache_construction(self):
         registry_path = _KV_CACHE_DIR.parent / "registry.py"
@@ -241,9 +191,9 @@ class CacheMemoryPlanTest(unittest.TestCase):
             for node in ast.walk(create_components)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
-        self.assertNotIn("create_cache_pool", called_names)
-        self.assertNotIn("pack", called_names)
-        self.assertNotIn("profile_max_num_pages", called_names)
+        assert ("create_cache_pool") not in (called_names)
+        assert ("pack") not in (called_names)
+        assert ("profile_max_num_pages") not in (called_names)
 
     def test_planner_expresses_byte_ratio_as_per_group_packing(self):
         field = _tagged_field
@@ -268,15 +218,9 @@ class CacheMemoryPlanTest(unittest.TestCase):
             alignment=256,
         )
 
-        self.assertEqual(plan.prefix_granularity, 128)
-        self.assertEqual(
-            plan.group("history").cache_blocks_per_lcm_block,
-            1,
-        )
-        self.assertEqual(
-            plan.group("state").cache_blocks_per_lcm_block,
-            8,
-        )
+        assert (plan.prefix_granularity) == (128)
+        assert (plan.group("history").cache_blocks_per_lcm_block) == (1)
+        assert (plan.group("state").cache_blocks_per_lcm_block) == (8)
 
     def test_layout_is_capacity_independent(self):
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -297,16 +241,14 @@ class CacheMemoryPlanTest(unittest.TestCase):
         small = layout.bind(2)
         large = layout.bind(5)
 
-        self.assertEqual(small.lcm_block_bytes, large.lcm_block_bytes)
-        self.assertEqual(
-            [field.page_stride_bytes for field in small.fields],
-            [field.page_stride_bytes for field in large.fields],
+        assert (small.lcm_block_bytes) == (large.lcm_block_bytes)
+        assert ([field.page_stride_bytes for field in small.fields]) == (
+            [field.page_stride_bytes for field in large.fields]
         )
-        self.assertEqual(small.group("full").page_count, 3)
-        self.assertEqual(large.group("full").page_count, 6)
-        self.assertNotEqual(
-            small.planes[1].arena_offset_bytes,
-            large.planes[1].arena_offset_bytes,
+        assert (small.group("full").page_count) == (3)
+        assert (large.group("full").page_count) == (6)
+        assert (small.planes[1].arena_offset_bytes) != (
+            large.planes[1].arena_offset_bytes
         )
 
     def test_flexible_field_preserves_required_page_stride_alignment(self):
@@ -339,8 +281,8 @@ class CacheMemoryPlanTest(unittest.TestCase):
         )
 
         compressed = plan.field("compressed.kv")
-        self.assertGreater(compressed.page_stride_bytes, compressed.payload_bytes)
-        self.assertEqual(compressed.page_stride_bytes % 576, 0)
+        assert (compressed.page_stride_bytes) > (compressed.payload_bytes)
+        assert (compressed.page_stride_bytes % 576) == (0)
 
     def test_layout_constructors_derive_sizes_from_geometry(self):
         group = self.plan_module.CacheGroupLayout(
@@ -365,8 +307,8 @@ class CacheMemoryPlanTest(unittest.TestCase):
             fields=(field,),
         )
 
-        self.assertEqual(field.payload_bytes, 256)
-        self.assertEqual(plan.arena_bytes, 5120)
+        assert (field.payload_bytes) == (256)
+        assert (plan.arena_bytes) == (5120)
 
     def test_duplicate_field_ids_are_rejected(self):
         field = _tagged_field
@@ -375,7 +317,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             field("b", "duplicate", "plane.b", (16,), "bfloat16"),
         )
 
-        with self.assertRaisesRegex(ValueError, "field ids must be unique"):
+        with pytest.raises((ValueError), match=("field ids must be unique")):
             self._plan_fields(
                 fields,
                 prefix_granularity=16,
@@ -397,11 +339,11 @@ class CacheMemoryPlanTest(unittest.TestCase):
             alignment=256,
         )
 
-        self.assertEqual(plan.num_lcm_blocks, 7)
-        self.assertEqual(plan.group("history").cache_blocks_per_lcm_block, 1)
-        self.assertEqual(plan.group("state").cache_blocks_per_lcm_block, 4)
-        self.assertEqual(plan.group("history").page_count, 8)
-        self.assertEqual(plan.group("state").page_count, 29)
+        assert (plan.num_lcm_blocks) == (7)
+        assert (plan.group("history").cache_blocks_per_lcm_block) == (1)
+        assert (plan.group("state").cache_blocks_per_lcm_block) == (4)
+        assert (plan.group("history").page_count) == (8)
+        assert (plan.group("state").page_count) == (29)
 
     def test_explicit_packing_is_bounded_by_page_ids_not_a_magic_count(self):
         field = _tagged_field
@@ -412,11 +354,8 @@ class CacheMemoryPlanTest(unittest.TestCase):
             cache_blocks_per_lcm_block={"history": 256},
         )
 
-        self.assertEqual(
-            plan.group("history").cache_blocks_per_lcm_block,
-            256,
-        )
-        self.assertEqual(plan.group("history").page_count, 513)
+        assert (plan.group("history").cache_blocks_per_lcm_block) == (256)
+        assert (plan.group("history").page_count) == (513)
 
     def test_automatic_packing_keeps_large_exact_byte_ratio(self):
         field = _tagged_field
@@ -429,20 +368,17 @@ class CacheMemoryPlanTest(unittest.TestCase):
             num_lcm_blocks=2,
         )
 
-        self.assertEqual(
-            plan.group("history").cache_blocks_per_lcm_block,
-            256,
-        )
-        self.assertEqual(plan.group("state").cache_blocks_per_lcm_block, 1)
+        assert (plan.group("history").cache_blocks_per_lcm_block) == (256)
+        assert (plan.group("state").cache_blocks_per_lcm_block) == (1)
 
-    def test_fixed_parent_count_must_be_a_positive_integer(self):
+    def test_fixed_parent_count_must_be_a_positive_integer(self, subtests):
         field = _tagged_field
         fields = (field("history", "history.k", "plane.k", (128, 8), "bfloat16"),)
 
         for count in (0, -1, True, 1.5, "2"):
             with (
-                self.subTest(count=count),
-                self.assertRaisesRegex(ValueError, "positive integer"),
+                subtests.test(count=count),
+                pytest.raises((ValueError), match=("positive integer")),
             ):
                 self._plan_fields(
                     fields,
@@ -457,7 +393,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             field("state", "state.ssm", "plane.s", (128, 2), "bfloat16"),
         )
 
-        with self.assertRaisesRegex(ValueError, "outside the plan"):
+        with pytest.raises((ValueError), match=("outside the plan")):
             self._plan_fields(
                 fields,
                 prefix_granularity=128,
@@ -488,23 +424,20 @@ class CacheMemoryPlanTest(unittest.TestCase):
             max_padding_fraction=1.0,
             cache_blocks_per_lcm_block={"history": history_count},
         )
-        self.assertEqual(
-            pinned.group("history").cache_blocks_per_lcm_block, history_count
-        )
+        assert (pinned.group("history").cache_blocks_per_lcm_block) == (history_count)
         # The unnamed group packs exactly as the fully-unpinned solve does.
-        self.assertEqual(
-            pinned.group("state").cache_blocks_per_lcm_block,
-            unpinned.group("state").cache_blocks_per_lcm_block,
+        assert (pinned.group("state").cache_blocks_per_lcm_block) == (
+            unpinned.group("state").cache_blocks_per_lcm_block
         )
 
-    def test_explicit_packing_rejects_invalid_count(self):
+    def test_explicit_packing_rejects_invalid_count(self, subtests):
         field = _tagged_field
         fields = (field("history", "history.k", "plane.k", (128, 8), "bfloat16"),)
 
         for count in (0, -1, True, 1.5, "2"):
             with (
-                self.subTest(count=count),
-                self.assertRaisesRegex(ValueError, "packing"),
+                subtests.test(count=count),
+                pytest.raises((ValueError), match=("packing")),
             ):
                 self._plan_fields(
                     fields,
@@ -520,7 +453,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             field("state", "state.ssm", "plane.shared", (128, 3), "bfloat16"),
         )
 
-        with self.assertRaisesRegex(ValueError, "needs page stride"):
+        with pytest.raises((ValueError), match=("needs page stride")):
             self._plan_fields(
                 fields,
                 prefix_granularity=128,
@@ -529,7 +462,7 @@ class CacheMemoryPlanTest(unittest.TestCase):
             )
 
 
-class CapacityReportTest(unittest.TestCase):
+class TestCapacityReportTest:
     """Per-group capacity in its own unit; binding admission = min."""
 
     def _mixed_plan(self):
@@ -562,18 +495,18 @@ class CapacityReportTest(unittest.TestCase):
             max_num_seqs=32,
         )
         state = report["state"]
-        self.assertEqual(state["unit"], "requests")
+        assert (state["unit"]) == ("requests")
         state_pages = 100 * plan.group("state").cache_blocks_per_lcm_block
-        self.assertEqual(state["supported_requests"], state_pages // 2)
+        assert (state["supported_requests"]) == (state_pages // 2)
 
         swa = report["swa"]
-        self.assertEqual(swa["unit"], "tokens")
+        assert (swa["unit"]) == ("tokens")
         swa_tokens = 100 * plan.group("swa").cache_blocks_per_lcm_block * 128
-        self.assertEqual(swa["supported_requests"], swa_tokens // 512)
+        assert (swa["supported_requests"]) == (swa_tokens // 512)
 
         history = report["history"]
-        self.assertIsNone(history["supported_requests"])
-        self.assertEqual(history["dead_bytes"], 0)
+        assert (history["supported_requests"]) is None
+        assert (history["dead_bytes"]) == (0)
 
     def test_window_group_dead_bytes_bounded_by_demand(self):
         plan = self._mixed_plan()
@@ -585,14 +518,14 @@ class CapacityReportTest(unittest.TestCase):
         # 4 requests x 512-token windows is the whole active demand; the
         # rest of the group's rows are stranded by the static slab split.
         swa_tokens = 100 * plan.group("swa").cache_blocks_per_lcm_block * 128
-        self.assertGreater(swa["dead_bytes"], 0)
+        assert (swa["dead_bytes"]) > (0)
         demand_tokens = 4 * 512
         field_bytes = 128 * 8 * 2
         expected = (swa_tokens - demand_tokens) // 128 * field_bytes
-        self.assertEqual(swa["dead_bytes"], expected)
+        assert (swa["dead_bytes"]) == (expected)
 
 
-class ContinuationLayerFieldsTest(CacheMemoryPlanTest):
+class TestContinuationLayerFieldsTest(TestCacheMemoryPlanTest):
     """One-big-model merged solve: draft fields join as continuation layers
     (renumbered after the target's), sharing group ids and packing."""
 
@@ -615,15 +548,14 @@ class ContinuationLayerFieldsTest(CacheMemoryPlanTest):
         plan = merged.bind(2)
         # One group, one packing, one page-id space; the draft layer is
         # just layer 2 of the one big model.
-        self.assertEqual(dict(merged.group_packing), {"history": 1})
-        self.assertEqual(
-            plan.field("layer.2.kv").page_stride_bytes,
-            plan.field("layer.0.kv").page_stride_bytes,
+        assert (dict(merged.group_packing)) == ({"history": 1})
+        assert (plan.field("layer.2.kv").page_stride_bytes) == (
+            plan.field("layer.0.kv").page_stride_bytes
         )
-        self.assertEqual(len(plan.planes), 3)
+        assert (len(plan.planes)) == (3)
 
 
-class BindingUtilizationTest(CacheMemoryPlanTest):
+class TestBindingUtilizationTest(TestCacheMemoryPlanTest):
     """util(g) = K_g x group_bytes / parent_bytes — the binding-hole metric.
 
     Aliased slabs are sized by their widest tenant; a narrower group's
@@ -653,7 +585,16 @@ class BindingUtilizationTest(CacheMemoryPlanTest):
             max_padding_fraction=2.0,
         )
         report = plan.capacity_report()
-        self.assertAlmostEqual(report["wide"]["binding_utilization"], 1.0)
-        self.assertAlmostEqual(
-            report["narrow"]["binding_utilization"], 100 / 256, places=3
+        _pytest_first_1 = report["wide"]["binding_utilization"]
+        _pytest_second_2 = 1.0
+        assert (
+            _pytest_first_1 == _pytest_second_2
+            or round(abs(_pytest_first_1 - _pytest_second_2), 7) == 0
+        )
+        _pytest_first_3 = report["narrow"]["binding_utilization"]
+        _pytest_second_4 = 100 / 256
+        _pytest_places_5 = 3
+        assert (
+            _pytest_first_3 == _pytest_second_4
+            or round(abs(_pytest_first_3 - _pytest_second_4), _pytest_places_5) == 0
         )

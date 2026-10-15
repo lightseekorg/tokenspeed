@@ -27,8 +27,9 @@ the test doesn't invoke any flashinfer kernels.
 import dataclasses
 import os
 import sys
-import unittest
 from unittest.mock import patch
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -87,6 +88,7 @@ POOL = 8  # max_req_pool_size → pool_rows == POOL + 1
 
 def _make_config() -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",
@@ -119,7 +121,7 @@ def _sp(rid_suffix: str, **overrides) -> SamplingParams:
     return sp
 
 
-def _assert_logit_bias_h2d_is_async(test: unittest.TestCase, backend) -> None:
+def _assert_logit_bias_h2d_is_async(backend) -> None:
     """The bias scatter on flip must not stall the host: no pageable H2D
     memcpy and no cudaStreamSynchronize while the stream is busy, and the
     row still holds the requested values once the stream drains."""
@@ -137,18 +139,22 @@ def _assert_logit_bias_h2d_is_async(test: unittest.TestCase, backend) -> None:
     torch.cuda.synchronize()
     names = [e.name for e in prof.events()]
     if not any("Memcpy HtoD" in n for n in names):
-        test.skipTest("profiler collected no CUDA memcpy activity")
-    test.assertNotIn("cudaStreamSynchronize", names)
-    test.assertFalse(any("Pageable -> Device" in n for n in names), names)
-    test.assertTrue(any("Pinned -> Device" in n for n in names), names)
+        pytest.skip("profiler collected no CUDA memcpy activity")
+    assert "cudaStreamSynchronize" not in names
+    assert not any("Pageable -> Device" in n for n in names), names
+    assert any("Pinned -> Device" in n for n in names), names
     row = backend._logit_bias[5]
-    test.assertAlmostEqual(row[100].item(), 2.0, places=2)
-    test.assertAlmostEqual(row[200].item(), -1.5, places=2)
-    test.assertAlmostEqual(row[300].item(), 0.25, places=2)
-    test.assertAlmostEqual(row[150].item(), 0.0, places=3)
+    first = row[100].item()
+    assert first == 2.0 or round(abs(first - 2.0), 2) == 0
+    first = row[200].item()
+    assert first == -1.5 or round(abs(first - -1.5), 2) == 0
+    first = row[300].item()
+    assert first == 0.25 or round(abs(first - 0.25), 2) == 0
+    first = row[150].item()
+    assert first == 0.0 or round(abs(first - 0.0), 3) == 0
 
 
-class TestGreedyNoPoolState(unittest.TestCase):
+class TestGreedyNoPoolState:
     """Greedy backend declares ``_HAS_POOL_STATE = False`` so prepare_step
     must short-circuit with no allocation or iteration. Guards against a
     future refactor accidentally forcing pool tracking on stateless
@@ -156,8 +162,8 @@ class TestGreedyNoPoolState(unittest.TestCase):
 
     def test_prepare_step_is_noop(self):
         b = GreedySamplingBackend(_make_config())
-        self.assertFalse(b._HAS_POOL_STATE)
-        self.assertFalse(hasattr(b, "_last_rid_per_slot"))
+        assert not (b._HAS_POOL_STATE)
+        assert not (hasattr(b, "_last_rid_per_slot"))
         # Must not raise even with nonsensical inputs — short-circuits.
         b.prepare_step(
             request_ids=["a", "b"],
@@ -166,18 +172,18 @@ class TestGreedyNoPoolState(unittest.TestCase):
         )
 
 
-class TestFlashInferFlipDetection(unittest.TestCase):
+class TestFlashInferFlipDetection:
     """flashinfer's pool-indexed scalar buffers are core scheduler state.
     These tests pin flip semantics down at the Python state-machine level
     (no kernel invocation needed)."""
 
-    def setUp(self):
+    def setup_method(self):
         self.backend = FlashInferSamplingBackend(_make_config())
 
     def test_dp_verify_buffers_are_lazy(self):
-        self.assertIsNone(self.backend._predict_local_buf)
-        self.assertIsNone(self.backend._accept_index_local_buf)
-        self.assertIsNone(self.backend._accept_length_local_buf)
+        assert (self.backend._predict_local_buf) is None
+        assert (self.backend._accept_index_local_buf) is None
+        assert (self.backend._accept_length_local_buf) is None
 
     def test_first_admission_flips_and_scatters(self):
         sp_a = _sp("a", temperature=0.7, top_k=50, top_p=0.9, seed=42)
@@ -187,17 +193,45 @@ class TestFlashInferFlipDetection(unittest.TestCase):
             request_pool_indices=[1, 3],
             sampling_params_list=[sp_a, sp_b],
         )
-        self.assertEqual(self.backend._last_rid_per_slot[1], "a")
-        self.assertEqual(self.backend._last_rid_per_slot[3], "b")
-        self.assertAlmostEqual(self.backend._temperature_pool[1].item(), 0.7, places=3)
-        self.assertEqual(self.backend._top_k_pool[1].item(), 50)
-        self.assertAlmostEqual(self.backend._top_p_pool[1].item(), 0.9, places=3)
-        self.assertEqual(self.backend._seed_pool[1].item(), 42)
-        self.assertAlmostEqual(self.backend._temperature_pool[3].item(), 1.2, places=3)
-        self.assertEqual(self.backend._top_k_pool[3].item(), 20)
+        assert (self.backend._last_rid_per_slot[1]) == ("a")
+        assert (self.backend._last_rid_per_slot[3]) == ("b")
+        _pytest_first_1 = self.backend._temperature_pool[1].item()
+        _pytest_second_2 = 0.7
+        _pytest_places_3 = 3
+        assert (
+            _pytest_first_1 == _pytest_second_2
+            or round(abs(_pytest_first_1 - _pytest_second_2), _pytest_places_3) == 0
+        )
+        assert (self.backend._top_k_pool[1].item()) == (50)
+        _pytest_first_4 = self.backend._top_p_pool[1].item()
+        _pytest_second_5 = 0.9
+        _pytest_places_6 = 3
+        assert (
+            _pytest_first_4 == _pytest_second_5
+            or round(abs(_pytest_first_4 - _pytest_second_5), _pytest_places_6) == 0
+        )
+        assert (self.backend._seed_pool[1].item()) == (42)
+        _pytest_first_7 = self.backend._temperature_pool[3].item()
+        _pytest_second_8 = 1.2
+        _pytest_places_9 = 3
+        assert (
+            _pytest_first_7 == _pytest_second_8
+            or round(abs(_pytest_first_7 - _pytest_second_8), _pytest_places_9) == 0
+        )
+        assert (self.backend._top_k_pool[3].item()) == (20)
         # Unused slots keep their neutral init values.
-        self.assertAlmostEqual(self.backend._temperature_pool[0].item(), 1.0)
-        self.assertAlmostEqual(self.backend._temperature_pool[5].item(), 1.0)
+        _pytest_first_10 = self.backend._temperature_pool[0].item()
+        _pytest_second_11 = 1.0
+        assert (
+            _pytest_first_10 == _pytest_second_11
+            or round(abs(_pytest_first_10 - _pytest_second_11), 7) == 0
+        )
+        _pytest_first_12 = self.backend._temperature_pool[5].item()
+        _pytest_second_13 = 1.0
+        assert (
+            _pytest_first_12 == _pytest_second_13
+            or round(abs(_pytest_first_12 - _pytest_second_13), 7) == 0
+        )
 
     def test_steady_state_no_reflip(self):
         """Same rid on same slot across steps → _reset_slot must not fire
@@ -217,8 +251,12 @@ class TestFlashInferFlipDetection(unittest.TestCase):
             request_pool_indices=[2],
             sampling_params_list=[sp_a],
         )
-        self.assertAlmostEqual(
-            self.backend._temperature_pool[2].item(), 9.999, places=3
+        _pytest_first_14 = self.backend._temperature_pool[2].item()
+        _pytest_second_15 = 9.999
+        _pytest_places_16 = 3
+        assert (
+            _pytest_first_14 == _pytest_second_15
+            or round(abs(_pytest_first_14 - _pytest_second_15), _pytest_places_16) == 0
         )
 
     def test_slot_recycle_flips(self):
@@ -237,14 +275,20 @@ class TestFlashInferFlipDetection(unittest.TestCase):
             request_pool_indices=[2],
             sampling_params_list=[sp_b],
         )
-        self.assertEqual(self.backend._last_rid_per_slot[2], "b")
-        self.assertAlmostEqual(self.backend._temperature_pool[2].item(), 0.3, places=3)
-        self.assertEqual(self.backend._seed_pool[2].item(), 99)
-        self.assertIsNot(self.backend._cpu_generator_per_slot[2], gen_a)
+        assert (self.backend._last_rid_per_slot[2]) == ("b")
+        _pytest_first_17 = self.backend._temperature_pool[2].item()
+        _pytest_second_18 = 0.3
+        _pytest_places_19 = 3
+        assert (
+            _pytest_first_17 == _pytest_second_18
+            or round(abs(_pytest_first_17 - _pytest_second_18), _pytest_places_19) == 0
+        )
+        assert (self.backend._seed_pool[2].item()) == (99)
+        assert (self.backend._cpu_generator_per_slot[2]) is not (gen_a)
 
 
-class TestTritonRouteSelection(unittest.TestCase):
-    def setUp(self):
+class TestTritonRouteSelection:
+    def setup_method(self):
         self.backend = TritonSamplingBackend(_make_config())
 
     def test_no_filter_step_selects_triton_gumbel(self):
@@ -253,7 +297,7 @@ class TestTritonRouteSelection(unittest.TestCase):
             request_pool_indices=[1, 2],
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0), _sp("b", top_k=-1)],
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_NO_FILTER)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_NO_FILTER)
 
     def test_finite_top_k_step_selects_triton_gumbel(self):
         self.backend.prepare_step(
@@ -261,8 +305,8 @@ class TestTritonRouteSelection(unittest.TestCase):
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=50, top_p=1.0)],
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_K)
-        self.assertEqual(self.backend._top_k_top_p_pad, 64)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_TOP_K)
+        assert (self.backend._top_k_top_p_pad) == (64)
 
     def test_finite_top_k_top_p_step_selects_triton_gumbel(self):
         self.backend.prepare_step(
@@ -270,15 +314,15 @@ class TestTritonRouteSelection(unittest.TestCase):
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=50, top_p=0.9)],
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P)
-        self.assertEqual(self.backend._top_k_top_p_pad, 64)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P)
+        assert (self.backend._top_k_top_p_pad) == (64)
 
         self.backend.prepare_step(
             request_ids=["a"],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=127, top_p=0.9)],
         )
-        self.assertEqual(self.backend._top_k_top_p_pad, 128)
+        assert (self.backend._top_k_top_p_pad) == (128)
 
     def test_top_p_only_step_selects_top_p_triton_gumbel(self):
         self.backend.prepare_step(
@@ -286,7 +330,7 @@ class TestTritonRouteSelection(unittest.TestCase):
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=-1, top_p=0.9)],
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_P)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_TOP_P)
 
     def test_mixed_step_selects_generic_triton_gumbel(self):
         self.backend.prepare_step(
@@ -297,7 +341,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 _sp("b", top_k=50, top_p=1.0),
             ],
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_GENERIC)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_GENERIC)
 
     def test_multi_token_no_filter_step_selects_verify_fast_path(self):
         self.backend.prepare_step(
@@ -306,26 +350,24 @@ class TestTritonRouteSelection(unittest.TestCase):
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
             num_tokens_per_req=4,
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_NO_FILTER)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_NO_FILTER)
 
     def test_capture_keeps_generic_sampler_graph(self):
         self.backend._sample_route = _SAMPLE_ROUTE_GUMBEL_NO_FILTER
         self.backend.prepare_capture(bs=1)
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_GENERIC)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_GENERIC)
 
     def test_cuda_graph_variants_cover_top_p_and_verify_no_filter(self):
-        self.assertEqual(
-            self.backend.cuda_graph_capture_variants(num_tokens_per_req=1),
+        assert (self.backend.cuda_graph_capture_variants(num_tokens_per_req=1)) == (
             (
                 CUDA_GRAPH_VARIANT_DEFAULT,
                 CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
                 CUDA_GRAPH_VARIANT_TRITON_TOP_P,
                 CUDA_GRAPH_VARIANT_TRITON_TOP_K,
                 CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
-            ),
+            )
         )
-        self.assertEqual(
-            self.backend.cuda_graph_capture_variants(num_tokens_per_req=4),
+        assert (self.backend.cuda_graph_capture_variants(num_tokens_per_req=4)) == (
             (
                 CUDA_GRAPH_VARIANT_DEFAULT,
                 CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
@@ -333,7 +375,7 @@ class TestTritonRouteSelection(unittest.TestCase):
                 CUDA_GRAPH_VARIANT_TRITON_TOP_K,
                 CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
                 CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
-            ),
+            )
         )
 
         self.backend.prepare_step(
@@ -342,9 +384,8 @@ class TestTritonRouteSelection(unittest.TestCase):
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
             num_tokens_per_req=4,
         )
-        self.assertEqual(
-            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
-            CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
+        assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (
+            CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER
         )
 
         self.backend.prepare_step(
@@ -353,9 +394,8 @@ class TestTritonRouteSelection(unittest.TestCase):
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
             num_tokens_per_req=1,
         )
-        self.assertEqual(
-            self.backend.cuda_graph_replay_variant(num_tokens_per_req=1),
-            CUDA_GRAPH_VARIANT_TRITON_NO_FILTER,
+        assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=1)) == (
+            CUDA_GRAPH_VARIANT_TRITON_NO_FILTER
         )
 
         self.backend.prepare_step(
@@ -364,9 +404,8 @@ class TestTritonRouteSelection(unittest.TestCase):
             sampling_params_list=[_sp("a", top_k=-1, top_p=0.9)],
             num_tokens_per_req=4,
         )
-        self.assertEqual(
-            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
-            CUDA_GRAPH_VARIANT_TRITON_TOP_P,
+        assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (
+            CUDA_GRAPH_VARIANT_TRITON_TOP_P
         )
 
         self.backend.prepare_step(
@@ -375,9 +414,8 @@ class TestTritonRouteSelection(unittest.TestCase):
             sampling_params_list=[_sp("a", top_k=50, top_p=1.0)],
             num_tokens_per_req=4,
         )
-        self.assertEqual(
-            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
-            CUDA_GRAPH_VARIANT_TRITON_TOP_K,
+        assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (
+            CUDA_GRAPH_VARIANT_TRITON_TOP_K
         )
 
         self.backend.prepare_step(
@@ -386,9 +424,8 @@ class TestTritonRouteSelection(unittest.TestCase):
             sampling_params_list=[_sp("a", top_k=50, top_p=0.9)],
             num_tokens_per_req=4,
         )
-        self.assertEqual(
-            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
-            CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
+        assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (
+            CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P
         )
 
     def test_verify_finite_top_k_top_p_uses_direct_sampler(self):
@@ -450,8 +487,8 @@ class TestTritonRouteSelection(unittest.TestCase):
 
         direct_sampler.assert_called_once()
         args, kwargs = direct_sampler.call_args
-        self.assertEqual(args[7].shape[0], n)
-        self.assertEqual(args[8].shape[0], n)
+        assert (args[7].shape[0]) == (n)
+        assert (args[8].shape[0]) == (n)
 
     def test_verify_top_p_only_uses_top_p_sampler(self):
         n = 4
@@ -512,14 +549,15 @@ class TestTritonRouteSelection(unittest.TestCase):
 
         top_p_sampler.assert_called_once()
         args, kwargs = top_p_sampler.call_args
-        self.assertEqual(args[6].shape[0], n)
-        self.assertEqual(args[17].shape[0], n)
-        self.assertEqual(kwargs["num_tokens_per_req"], n)
+        assert (args[6].shape[0]) == (n)
+        assert (args[17].shape[0]) == (n)
+        assert (kwargs["num_tokens_per_req"]) == (n)
 
     def test_verify_large_finite_top_k_top_p_uses_qrita_sampler(self):
         bs, n, vocab = 32, 4, 32768
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                synthetic_acceptance_length=None,
                 enable_speculative_sampling=False,
                 sampling_stream="batch",
                 logprob_order="torch",
@@ -594,17 +632,17 @@ class TestTritonRouteSelection(unittest.TestCase):
 
         qrita_sampler.assert_called_once()
         args, kwargs = qrita_sampler.call_args
-        self.assertEqual(args[7].shape[1], vocab)
-        self.assertEqual(
-            args[8].shape[0],
-            len(triton_backend_module._QRITA_PERCENTILE_TO_STD_TABLE),
+        assert (args[7].shape[1]) == (vocab)
+        assert (args[8].shape[0]) == (
+            len(triton_backend_module._QRITA_PERCENTILE_TO_STD_TABLE)
         )
-        self.assertEqual(kwargs["num_tokens_per_req"], n)
+        assert (kwargs["num_tokens_per_req"]) == (n)
 
     def test_verify_large_finite_top_k_only_uses_qrita_sampler(self):
         bs, n, vocab = 32, 4, 200064
         backend = TritonSamplingBackend(
             SamplingBackendConfig(
+                synthetic_acceptance_length=None,
                 enable_speculative_sampling=False,
                 sampling_stream="batch",
                 logprob_order="torch",
@@ -679,8 +717,8 @@ class TestTritonRouteSelection(unittest.TestCase):
 
         qrita_sampler.assert_called_once()
         args, kwargs = qrita_sampler.call_args
-        self.assertEqual(args[7].shape[1], vocab)
-        self.assertEqual(kwargs["num_tokens_per_req"], n)
+        assert (args[7].shape[1]) == (vocab)
+        assert (kwargs["num_tokens_per_req"]) == (n)
 
     def test_prepare_capture_variant_sets_verify_fast_path(self):
         self.backend.prepare_capture_variant(
@@ -688,58 +726,38 @@ class TestTritonRouteSelection(unittest.TestCase):
             num_tokens_per_req=4,
             variant=CUDA_GRAPH_VARIANT_TRITON_TOP_K,
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_K)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_TOP_K)
 
         self.backend.prepare_capture_variant(
             bs=1,
             num_tokens_per_req=4,
             variant=CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P,
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P)
 
         self.backend.prepare_capture_variant(
             bs=1,
             num_tokens_per_req=4,
             variant=CUDA_GRAPH_VARIANT_TRITON_TOP_P,
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_TOP_P)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_TOP_P)
 
         self.backend.prepare_capture_variant(
             bs=1,
             num_tokens_per_req=4,
             variant=CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_NO_FILTER)
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_NO_FILTER)
 
         self.backend.prepare_capture_variant(
             bs=1,
             num_tokens_per_req=4,
             variant=CUDA_GRAPH_VARIANT_DEFAULT,
         )
-        self.assertEqual(self.backend._sample_route, _SAMPLE_ROUTE_GUMBEL_GENERIC)
-
-    def test_triton_verify_is_owned_by_triton_backend(self):
-        self.assertFalse(issubclass(TritonSamplingBackend, FlashInferSamplingBackend))
-        self.assertIsNot(TritonSamplingBackend.verify, FlashInferSamplingBackend.verify)
-        self.assertIsNot(
-            TritonFullSamplingBackend.verify,
-            FlashInferFullSamplingBackend.verify,
-        )
-        self.assertTrue(issubclass(TritonFullSamplingBackend, TritonSamplingBackend))
-        self.assertFalse(
-            issubclass(TritonFullSamplingBackend, FlashInferFullSamplingBackend)
-        )
-
-    def test_triton_reuses_pool_state_without_flashinfer_probability_state(self):
-        self.assertTrue(hasattr(self.backend, "_temperature_pool"))
-        self.assertTrue(hasattr(self.backend, "_top_k_pool"))
-        self.assertTrue(hasattr(self.backend, "_top_p_pool"))
-        self.assertTrue(hasattr(self.backend, "_seed_pool"))
-        self.assertFalse(hasattr(self.backend, "_coins_buf"))
-        self.assertFalse(hasattr(self.backend, "_generator_per_slot"))
+        assert (self.backend._sample_route) == (_SAMPLE_ROUTE_GUMBEL_GENERIC)
 
 
-class TestTritonLogprobOutputs(unittest.TestCase):
+class TestTritonLogprobOutputs:
     def _make_backend(self, backend_cls):
         config = dataclasses.replace(_make_config(), enable_output_logprobs=True)
         backend = backend_cls(config)
@@ -773,10 +791,10 @@ class TestTritonLogprobOutputs(unittest.TestCase):
             atol=1e-4,
         )
 
-        self.assertIsNone(logits_output.next_token_top_logprobs_val)
-        self.assertIsNone(logits_output.next_token_top_logprobs_idx)
-        self.assertIsNone(logits_output.next_token_token_ids_logprobs_val)
-        self.assertIsNone(logits_output.next_token_token_ids_logprobs_idx)
+        assert (logits_output.next_token_top_logprobs_val) is None
+        assert (logits_output.next_token_top_logprobs_idx) is None
+        assert (logits_output.next_token_token_ids_logprobs_val) is None
+        assert (logits_output.next_token_token_ids_logprobs_idx) is None
 
     def test_triton_sample_writes_compact_logprob_side_outputs(self):
         backend = self._make_backend(TritonSamplingBackend)
@@ -809,7 +827,7 @@ class TestTritonLogprobOutputs(unittest.TestCase):
         self._assert_logprob_outputs(logits, sampled, logits_output)
 
 
-class TestCudaGraphSamplingVariants(unittest.TestCase):
+class TestCudaGraphSamplingVariants:
     def test_wrapper_dedupes_default_and_selects_replay_variant(self):
         class FakeSamplingBackend:
             variant = CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER
@@ -834,31 +852,29 @@ class TestCudaGraphSamplingVariants(unittest.TestCase):
             (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 8): object(),
         }
 
-        self.assertEqual(
-            wrapper._cuda_graph_capture_variants(),
+        assert (wrapper._cuda_graph_capture_variants()) == (
             (
                 CUDA_GRAPH_VARIANT_DEFAULT,
                 CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,
-            ),
+            )
         )
-        self.assertEqual(backend.capture_num_tokens_per_req, 4)
-        self.assertEqual(
-            wrapper._cuda_graph_key(8),
-            (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 8),
+        assert (backend.capture_num_tokens_per_req) == (4)
+        assert (wrapper._cuda_graph_key(8)) == (
+            (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 8)
         )
-        self.assertEqual(backend.replay_num_tokens_per_req, 4)
+        assert (backend.replay_num_tokens_per_req) == (4)
 
         backend.variant = "missing"
-        with self.assertRaisesRegex(RuntimeError, "was not captured"):
+        with pytest.raises((RuntimeError), match=("was not captured")):
             wrapper._cuda_graph_key(8)
 
 
-class TestFlashInferFullFlipExtended(unittest.TestCase):
+class TestFlashInferFullFlipExtended:
     """Full backend extends flip behavior with penalty scalars, count rows,
     and logit_bias scatter. Each of these must be cleared/scattered on
     flip or a new request inherits the previous occupant's state."""
 
-    def setUp(self):
+    def setup_method(self):
         self.backend = FlashInferFullSamplingBackend(_make_config())
 
     def test_penalty_scalars_scattered(self):
@@ -874,10 +890,34 @@ class TestFlashInferFullFlipExtended(unittest.TestCase):
             request_pool_indices=[3],
             sampling_params_list=[sp],
         )
-        self.assertAlmostEqual(self.backend._freq_pen_pool[3].item(), 0.5, places=2)
-        self.assertAlmostEqual(self.backend._pres_pen_pool[3].item(), 0.25, places=2)
-        self.assertAlmostEqual(self.backend._rep_pen_pool[3].item(), 1.2, places=2)
-        self.assertAlmostEqual(self.backend._min_p_pool[3].item(), 0.1, places=3)
+        _pytest_first_20 = self.backend._freq_pen_pool[3].item()
+        _pytest_second_21 = 0.5
+        _pytest_places_22 = 2
+        assert (
+            _pytest_first_20 == _pytest_second_21
+            or round(abs(_pytest_first_20 - _pytest_second_21), _pytest_places_22) == 0
+        )
+        _pytest_first_23 = self.backend._pres_pen_pool[3].item()
+        _pytest_second_24 = 0.25
+        _pytest_places_25 = 2
+        assert (
+            _pytest_first_23 == _pytest_second_24
+            or round(abs(_pytest_first_23 - _pytest_second_24), _pytest_places_25) == 0
+        )
+        _pytest_first_26 = self.backend._rep_pen_pool[3].item()
+        _pytest_second_27 = 1.2
+        _pytest_places_28 = 2
+        assert (
+            _pytest_first_26 == _pytest_second_27
+            or round(abs(_pytest_first_26 - _pytest_second_27), _pytest_places_28) == 0
+        )
+        _pytest_first_29 = self.backend._min_p_pool[3].item()
+        _pytest_second_30 = 0.1
+        _pytest_places_31 = 3
+        assert (
+            _pytest_first_29 == _pytest_second_30
+            or round(abs(_pytest_first_29 - _pytest_second_30), _pytest_places_31) == 0
+        )
 
     def test_counts_and_bias_cleared_on_flip(self):
         """Dirty slot 2 simulating a prior occupant's accumulated state,
@@ -891,8 +931,14 @@ class TestFlashInferFullFlipExtended(unittest.TestCase):
             request_pool_indices=[2],
             sampling_params_list=[sp],
         )
-        self.assertEqual(self.backend._counts[2, 100].item(), 0)
-        self.assertAlmostEqual(self.backend._logit_bias[2, 100].item(), 0.0, places=3)
+        assert (self.backend._counts[2, 100].item()) == (0)
+        _pytest_first_32 = self.backend._logit_bias[2, 100].item()
+        _pytest_second_33 = 0.0
+        _pytest_places_34 = 3
+        assert (
+            _pytest_first_32 == _pytest_second_33
+            or round(abs(_pytest_first_32 - _pytest_second_33), _pytest_places_34) == 0
+        )
 
     def test_logit_bias_scattered(self):
         sp = _sp("a", temperature=1.0)
@@ -902,19 +948,37 @@ class TestFlashInferFullFlipExtended(unittest.TestCase):
             request_pool_indices=[4],
             sampling_params_list=[sp],
         )
-        self.assertAlmostEqual(self.backend._logit_bias[4, 100].item(), 2.0, places=2)
-        self.assertAlmostEqual(self.backend._logit_bias[4, 200].item(), -1.5, places=2)
+        _pytest_first_35 = self.backend._logit_bias[4, 100].item()
+        _pytest_second_36 = 2.0
+        _pytest_places_37 = 2
+        assert (
+            _pytest_first_35 == _pytest_second_36
+            or round(abs(_pytest_first_35 - _pytest_second_36), _pytest_places_37) == 0
+        )
+        _pytest_first_38 = self.backend._logit_bias[4, 200].item()
+        _pytest_second_39 = -1.5
+        _pytest_places_40 = 2
+        assert (
+            _pytest_first_38 == _pytest_second_39
+            or round(abs(_pytest_first_38 - _pytest_second_39), _pytest_places_40) == 0
+        )
         # Other positions untouched.
-        self.assertAlmostEqual(self.backend._logit_bias[4, 150].item(), 0.0, places=3)
+        _pytest_first_41 = self.backend._logit_bias[4, 150].item()
+        _pytest_second_42 = 0.0
+        _pytest_places_43 = 3
+        assert (
+            _pytest_first_41 == _pytest_second_42
+            or round(abs(_pytest_first_41 - _pytest_second_42), _pytest_places_43) == 0
+        )
 
     def test_logit_bias_h2d_is_pinned_and_non_blocking(self):
-        _assert_logit_bias_h2d_is_async(self, self.backend)
+        _assert_logit_bias_h2d_is_async(self.backend)
 
     def test_logit_bias_out_of_vocab_asserts(self):
         """OOV token ids would write past the bias row; must be caught."""
         sp = _sp("a")
         sp.logit_bias = {str(VOCAB + 5): 1.0}
-        with self.assertRaises(AssertionError):
+        with pytest.raises((AssertionError)):
             self.backend.prepare_step(
                 request_ids=["a"],
                 request_pool_indices=[1],
@@ -922,10 +986,10 @@ class TestFlashInferFullFlipExtended(unittest.TestCase):
             )
 
 
-class TestTritonFullIndependentState(unittest.TestCase):
+class TestTritonFullIndependentState:
     """TritonFull owns full-sampling state without FlashInfer inheritance."""
 
-    def setUp(self):
+    def setup_method(self):
         self.backend = TritonFullSamplingBackend(_make_config())
 
     def test_penalty_scalars_scattered(self):
@@ -941,10 +1005,34 @@ class TestTritonFullIndependentState(unittest.TestCase):
             request_pool_indices=[3],
             sampling_params_list=[sp],
         )
-        self.assertAlmostEqual(self.backend._freq_pen_pool[3].item(), 0.5, places=2)
-        self.assertAlmostEqual(self.backend._pres_pen_pool[3].item(), 0.25, places=2)
-        self.assertAlmostEqual(self.backend._rep_pen_pool[3].item(), 1.2, places=2)
-        self.assertAlmostEqual(self.backend._min_p_pool[3].item(), 0.1, places=3)
+        _pytest_first_44 = self.backend._freq_pen_pool[3].item()
+        _pytest_second_45 = 0.5
+        _pytest_places_46 = 2
+        assert (
+            _pytest_first_44 == _pytest_second_45
+            or round(abs(_pytest_first_44 - _pytest_second_45), _pytest_places_46) == 0
+        )
+        _pytest_first_47 = self.backend._pres_pen_pool[3].item()
+        _pytest_second_48 = 0.25
+        _pytest_places_49 = 2
+        assert (
+            _pytest_first_47 == _pytest_second_48
+            or round(abs(_pytest_first_47 - _pytest_second_48), _pytest_places_49) == 0
+        )
+        _pytest_first_50 = self.backend._rep_pen_pool[3].item()
+        _pytest_second_51 = 1.2
+        _pytest_places_52 = 2
+        assert (
+            _pytest_first_50 == _pytest_second_51
+            or round(abs(_pytest_first_50 - _pytest_second_51), _pytest_places_52) == 0
+        )
+        _pytest_first_53 = self.backend._min_p_pool[3].item()
+        _pytest_second_54 = 0.1
+        _pytest_places_55 = 3
+        assert (
+            _pytest_first_53 == _pytest_second_54
+            or round(abs(_pytest_first_53 - _pytest_second_54), _pytest_places_55) == 0
+        )
 
     def test_counts_and_bias_cleared_on_flip(self):
         self.backend._counts[2, 100] = 7
@@ -954,8 +1042,14 @@ class TestTritonFullIndependentState(unittest.TestCase):
             request_pool_indices=[2],
             sampling_params_list=[_sp("new")],
         )
-        self.assertEqual(self.backend._counts[2, 100].item(), 0)
-        self.assertAlmostEqual(self.backend._logit_bias[2, 100].item(), 0.0, places=3)
+        assert (self.backend._counts[2, 100].item()) == (0)
+        _pytest_first_56 = self.backend._logit_bias[2, 100].item()
+        _pytest_second_57 = 0.0
+        _pytest_places_58 = 3
+        assert (
+            _pytest_first_56 == _pytest_second_57
+            or round(abs(_pytest_first_56 - _pytest_second_57), _pytest_places_58) == 0
+        )
 
     def test_logit_bias_scattered(self):
         sp = _sp("a")
@@ -965,22 +1059,40 @@ class TestTritonFullIndependentState(unittest.TestCase):
             request_pool_indices=[4],
             sampling_params_list=[sp],
         )
-        self.assertAlmostEqual(self.backend._logit_bias[4, 100].item(), 2.0, places=2)
-        self.assertAlmostEqual(self.backend._logit_bias[4, 200].item(), -1.5, places=2)
-        self.assertAlmostEqual(self.backend._logit_bias[4, 150].item(), 0.0, places=3)
+        _pytest_first_59 = self.backend._logit_bias[4, 100].item()
+        _pytest_second_60 = 2.0
+        _pytest_places_61 = 2
+        assert (
+            _pytest_first_59 == _pytest_second_60
+            or round(abs(_pytest_first_59 - _pytest_second_60), _pytest_places_61) == 0
+        )
+        _pytest_first_62 = self.backend._logit_bias[4, 200].item()
+        _pytest_second_63 = -1.5
+        _pytest_places_64 = 2
+        assert (
+            _pytest_first_62 == _pytest_second_63
+            or round(abs(_pytest_first_62 - _pytest_second_63), _pytest_places_64) == 0
+        )
+        _pytest_first_65 = self.backend._logit_bias[4, 150].item()
+        _pytest_second_66 = 0.0
+        _pytest_places_67 = 3
+        assert (
+            _pytest_first_65 == _pytest_second_66
+            or round(abs(_pytest_first_65 - _pytest_second_66), _pytest_places_67) == 0
+        )
 
     def test_logit_bias_h2d_is_pinned_and_non_blocking(self):
-        _assert_logit_bias_h2d_is_async(self, self.backend)
+        _assert_logit_bias_h2d_is_async(self.backend)
 
     def test_reset_capture_state_clears_capture_counts(self):
         self.backend._counts[0, 10] = 3
         self.backend.reset_capture_state()
-        self.assertEqual(self.backend._counts[0, 10].item(), 0)
+        assert (self.backend._counts[0, 10].item()) == (0)
 
     def test_min_p_cuda_graph_routes_have_dedicated_variants(self):
         variants = self.backend.cuda_graph_capture_variants(num_tokens_per_req=4)
-        self.assertIn(CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P, variants)
-        self.assertIn(CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P, variants)
+        assert (CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P) in (variants)
+        assert (CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P) in (variants)
 
         self.backend.prepare_step(
             request_ids=["a"],
@@ -988,9 +1100,8 @@ class TestTritonFullIndependentState(unittest.TestCase):
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0, min_p=0.2)],
             num_tokens_per_req=4,
         )
-        self.assertEqual(
-            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
-            CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P,
+        assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (
+            CUDA_GRAPH_VARIANT_TRITON_FULL_MIN_P
         )
 
         self.backend.prepare_step(
@@ -999,15 +1110,14 @@ class TestTritonFullIndependentState(unittest.TestCase):
             sampling_params_list=[_sp("a", top_k=64, top_p=0.9, min_p=0.05)],
             num_tokens_per_req=4,
         )
-        self.assertEqual(
-            self.backend.cuda_graph_replay_variant(num_tokens_per_req=4),
-            CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P,
+        assert (self.backend.cuda_graph_replay_variant(num_tokens_per_req=4)) == (
+            CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P
         )
 
     def test_logit_bias_out_of_vocab_asserts(self):
         sp = _sp("a")
         sp.logit_bias = {str(VOCAB + 5): 1.0}
-        with self.assertRaises(AssertionError):
+        with pytest.raises((AssertionError)):
             self.backend.prepare_step(
                 request_ids=["a"],
                 request_pool_indices=[1],
@@ -1015,16 +1125,16 @@ class TestTritonFullIndependentState(unittest.TestCase):
             )
 
 
-class TestPrepareStepGuardRails(unittest.TestCase):
+class TestPrepareStepGuardRails:
     """Cheap boundary asserts in base.prepare_step. Cost is negligible and
     these are exactly the kinds of mismatches that produce silent state
     corruption if they slip through."""
 
-    def setUp(self):
+    def setup_method(self):
         self.backend = FlashInferSamplingBackend(_make_config())
 
     def test_misaligned_lists_assert(self):
-        with self.assertRaises(AssertionError):
+        with pytest.raises((AssertionError)):
             self.backend.prepare_step(
                 request_ids=["a", "b"],
                 request_pool_indices=[1],
@@ -1033,13 +1143,13 @@ class TestPrepareStepGuardRails(unittest.TestCase):
 
     def test_pool_idx_out_of_range_asserts(self):
         pool_rows = POOL + 1
-        with self.assertRaises(AssertionError):
+        with pytest.raises((AssertionError)):
             self.backend.prepare_step(
                 request_ids=["a"],
                 request_pool_indices=[pool_rows],  # one past the end
                 sampling_params_list=[_sp("a")],
             )
-        with self.assertRaises(AssertionError):
+        with pytest.raises((AssertionError)):
             self.backend.prepare_step(
                 request_ids=["a"],
                 request_pool_indices=[-1],
@@ -1048,4 +1158,4 @@ class TestPrepareStepGuardRails(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

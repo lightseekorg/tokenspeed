@@ -52,7 +52,7 @@ enum class CacheTier { kDevice, kHost };
 // the tail's blocks are holes.
 inline std::int32_t FirstTailBlockNeeded(const CacheGroupSpec& spec, std::int32_t block_granularity,
                                          std::int32_t tail_tokens) {
-    if (spec.kind != AttnKind::kSlidingWindow) {
+    if (spec.attn_kind != AttnKind::kSlidingWindow) {
         return 0;
     }
     return std::max(0, tail_tokens - spec.sliding_window + 1) / block_granularity;
@@ -108,7 +108,6 @@ public:
 
     GroupAllocator& Allocator(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Allocator(); }
     const GroupAllocator& Allocator(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Allocator(); }
-    AttnKind GroupKind(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Spec().kind; }
     PrefixCacheIndex& GroupPrefixIndex(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Index(); }
     const PrefixCacheIndex& GroupPrefixIndex(std::int32_t i) const {
         return groups_[static_cast<std::size_t>(i)].Index();
@@ -117,9 +116,6 @@ public:
     // Match-policy and geometry views for scheduling code, in logical page
     // units. The managers are token-free; every token -> page conversion goes
     // through the per-group GroupGeometry held here.
-    bool GroupIsPrefixClosed(std::int32_t i) const {
-        return groups_[static_cast<std::size_t>(i)].Matcher().IsPrefixClosed();
-    }
     std::int32_t GroupBlockGranularity(std::int32_t i) const {
         return geometry_[static_cast<std::size_t>(i)].BlockGranularity();
     }

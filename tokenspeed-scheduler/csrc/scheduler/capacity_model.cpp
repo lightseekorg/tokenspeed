@@ -56,7 +56,7 @@ CapacityModel::CapacityModel(const SchedulerConfig& config) : config_{config} {
         // more than behind a page-aligned T when its first row falls inside a
         // block.
         const std::int64_t window_blocks =
-            specs[i].kind == AttnKind::kSlidingWindow && specs[i].sliding_window > 1
+            specs[i].attn_kind == AttnKind::kSlidingWindow && specs[i].sliding_window > 1
                 ? (static_cast<std::int64_t>(specs[i].sliding_window) - 1 + 2 * (specs[i].block_granularity - 1)) /
                       specs[i].block_granularity
                 : 0;
@@ -84,6 +84,14 @@ std::int64_t CapacityModel::protectedTokens() const {
         return 0;
     }
     return static_cast<std::int64_t>(config_.overlap_schedule_depth) * decodeWidth();
+}
+
+std::int64_t CapacityModel::DraftWindowTokens(const SchedulerConfig& config) {
+    // P hands off before its drafter writes past the first window.
+    if (config.role == Role::kP || config.decode_input_tokens <= 1) {
+        return 0;
+    }
+    return config.decode_input_tokens;
 }
 
 std::int64_t CapacityModel::tailHandoverBlocks(std::size_t group_index) const {
@@ -119,7 +127,7 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
     std::vector<std::int64_t> group_pages(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const CacheGroupConfig& group = config_.cache_groups[i];
-        if (group.Kind() == AttnKind::kMambaState) {
+        if (group.attn_kind == AttnKind::kState) {
             // Two slots on every role and in every phase: the checkpoint the
             // next forward reads and the block it writes.
             group_pages[i] = token_limit == 0 ? 0 : kStateSlots;
@@ -171,13 +179,13 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
     }
     const std::int64_t live_requests = config_.max_batch_size;
     const std::int64_t decode_width = decodeWidth();
-    const std::int64_t protected_tokens = protectedTokens();
+    const std::int64_t protected_tokens = protectedTokens() + DraftWindowTokens(config_);
     const std::int64_t chunk_tokens = config_.max_scheduled_tokens;
 
     std::vector<std::int64_t> group_pages(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const CacheGroupConfig& group = config_.cache_groups[i];
-        if (group.Kind() == AttnKind::kMambaState) {
+        if (group.attn_kind == AttnKind::kState) {
             // A State group's working set is two slots per live request,
             // whatever history the request carries.
             group_pages[i] = live_requests * kStateSlots;

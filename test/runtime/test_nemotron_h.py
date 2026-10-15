@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.moe.loader import (
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.nvfp4 import create_nvfp4_weight_pair
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 register_cuda_ci(
     est_time=60,
@@ -95,9 +96,8 @@ def test_cache_layers_are_the_mamba_and_attention_blocks_in_order():
 def test_mamba2_component_maps_ssd_geometry_onto_the_linear_fields():
     config = _config()
     model_config = SimpleNamespace(hf_text_config=config)
-    server_args = SimpleNamespace(
-        mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=2))
-    )
+    # world_size=2 resolves mapping.linear_attn.tp_size=2.
+    server_args = ServerArgs(model="x", world_size=2)
     mamba2 = Mamba2Config.generate(server_args, model_config)
     assert mamba2.layer_ids == (0, 2, 3)
     assert mamba2.chunk_size == 128
@@ -111,9 +111,7 @@ def test_mamba2_component_maps_ssd_geometry_onto_the_linear_fields():
 def test_mamba2_component_reads_a_1e30_dt_bound_as_unbounded():
     config = _config(time_step_limit=(0.0, 1e30))
     model_config = SimpleNamespace(hf_text_config=config)
-    server_args = SimpleNamespace(
-        mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=1))
-    )
+    server_args = ServerArgs(model="x")
     assert Mamba2Config.generate(server_args, model_config).dt_limit == (
         0.0,
         float("inf"),
@@ -358,9 +356,6 @@ def test_mamba2_seams_match_the_sequential_recurrence():
         D=D,
         a=step_dt,
         b=None,
-        output_gate=None,
-        norm_weight=None,
-        norm_eps=None,
         **_UNUSED,
     )
     assert decoded.shape == (1, 3, heads, head_dim)
@@ -906,9 +901,6 @@ def test_mamba2_decode_reads_the_projection_view_in_place():
         D=torch.ones(heads, device="cuda"),
         a=dt,
         b=None,
-        output_gate=None,
-        norm_weight=None,
-        norm_eps=None,
         **_UNUSED,
     )
     pools = [torch.zeros(4, heads, head_dim, d_state, device="cuda") for _ in range(2)]
@@ -995,6 +987,7 @@ def test_mamba2_verify_scan_continues_each_request_from_its_committed_state(repl
         batch_size=batch,
         draft_token_num=steps,
         seq_len=rows,
+        replay_payload=None,
         **_UNUSED,
     )
     assert out.shape == (1, rows, heads, head_dim)

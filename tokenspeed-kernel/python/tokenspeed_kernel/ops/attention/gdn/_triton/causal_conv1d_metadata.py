@@ -93,11 +93,14 @@ class CausalConv1dPrefillMetadata:
     Ordinary maps belong to one forward. Capacity maps belong to the graph
     owner and are refreshed in consumer-stream order before the next replay.
     Frozen fields prevent rebinding, not mutation of the tensors' contents.
+    Exact prefill maps also retain host boundaries for registered kernels that
+    plan from sequence lengths without reading device data back to the host.
     """
 
     batch_indices: torch.Tensor
     chunk_offsets: torch.Tensor
     block_m: int
+    cu_seqlens_cpu: torch.Tensor | None = None
 
 
 def build_causal_conv1d_capacity_metadata(
@@ -164,7 +167,8 @@ def build_causal_conv1d_prefill_metadata(
         block_m: Tokens per convolution program; also used by the consumer.
 
     Returns:
-        Two exactly sized int32 device index arrays and their block size.
+        Two exactly sized int32 device index arrays, their block size, and
+        host int64 sequence boundaries.
         Storage belongs to this forward, not a mutable cross-forward cache.
         Empty requests produce no programs. CUDA/HIP uses one Triton launch
         with no index-table initialization or H2D; CPU provides a reference.
@@ -194,8 +198,14 @@ def build_causal_conv1d_prefill_metadata(
     indices = torch.empty(
         (2, num_programs), dtype=torch.int32, device=query_start_loc.device
     )
+    cu_seqlens_cpu = torch.empty(len(lengths) + 1, dtype=torch.int64)
+    cu_seqlens_cpu[0] = 0
+    cu_seqlens_cpu[1:] = torch.cumsum(seq_lens_cpu.to(torch.int64), dim=0)
     metadata = CausalConv1dPrefillMetadata(
-        batch_indices=indices[0], chunk_offsets=indices[1], block_m=block_m
+        batch_indices=indices[0],
+        chunk_offsets=indices[1],
+        block_m=block_m,
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
     if num_programs == 0:
         return metadata

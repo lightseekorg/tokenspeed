@@ -8,7 +8,8 @@ sconv parity, shapes) are added alongside the model implementation.
 
 import os
 import sys
-import unittest
+
+import pytest
 
 from tokenspeed.runtime.configs.inkling_config import (
     InklingConvStream,
@@ -46,32 +47,31 @@ register_cuda_ci(
 )
 
 if not has_blackwell():
-    raise unittest.SkipTest("Inkling module tests require an NVIDIA Blackwell GPU")
+    pytest.skip(
+        "Inkling module tests require an NVIDIA Blackwell GPU", allow_module_level=True
+    )
 
 
-class TestInklingConfigRegistry(unittest.TestCase):
+class TestInklingConfigRegistry:
     def test_config_registry(self):
-        self.assertIs(_CONFIG_REGISTRY["inkling_mm_model"], InklingMMConfig)
-        self.assertIs(_CONFIG_REGISTRY["inkling_model"], InklingModelConfig)
+        assert (_CONFIG_REGISTRY["inkling_mm_model"]) is (InklingMMConfig)
+        assert (_CONFIG_REGISTRY["inkling_model"]) is (InklingModelConfig)
 
     def test_get_config_loads_hub_snapshot(self):
         config = get_config(INKLING_NVFP4, trust_remote_code=False, revision=None)
-        self.assertIsInstance(config, InklingMMConfig)
+        assert isinstance((config), (InklingMMConfig))
         text = config.get_text_config()
-        self.assertEqual(text.num_hidden_layers, 66)
+        assert (text.num_hidden_layers) == (66)
         # Full attention every 6th layer; the rest sliding.
-        self.assertEqual(text.global_attention_layer_ids, list(range(5, 66, 6)))
-        self.assertEqual(
-            text.swa_attention_layer_ids,
-            [i for i in range(66) if i % 6 != 5],
-        )
+        assert (text.global_attention_layer_ids) == (list(range(5, 66, 6)))
+        assert (text.swa_attention_layer_ids) == ([i for i in range(66) if i % 6 != 5])
 
     def test_truncated_config_keeps_all_layer_kinds(self):
         text = load_inkling_config().get_text_config()
-        self.assertEqual(text.num_hidden_layers, NUM_TEST_LAYERS)
-        self.assertEqual(text.dense_mlp_idx, 2)  # dense layers present
-        self.assertEqual(text.swa_attention_layer_ids, [0, 1, 2, 3, 4])
-        self.assertEqual(text.global_attention_layer_ids, [5])
+        assert (text.num_hidden_layers) == (NUM_TEST_LAYERS)
+        assert (text.dense_mlp_idx) == (2)  # dense layers present
+        assert (text.swa_attention_layer_ids) == ([0, 1, 2, 3, 4])
+        assert (text.global_attention_layer_ids) == ([5])
 
     def test_scheduler_blindness(self):
         """The engine enables mamba scheduling off attribute presence alone
@@ -86,33 +86,34 @@ class TestInklingConfigRegistry(unittest.TestCase):
                 "linear_layer_ids",
                 "full_attention_layer_ids",
             ):
-                self.assertFalse(
-                    hasattr(obj, attr),
+                _pytest_expr_1 = hasattr(obj, attr)
+                _pytest_msg_2 = (
                     f"{type(obj).__name__}.{attr} present: engages hybrid/"
-                    "mamba engine paths; Inkling must look like dense GQA.",
+                    "mamba engine paths; Inkling must look like dense GQA."
                 )
+                assert not _pytest_expr_1, _pytest_msg_2
 
     def test_kv_head_uniformization(self):
         text = load_inkling_config().get_text_config()
-        self.assertEqual(text.ckpt_num_key_value_heads, 8)
-        self.assertEqual(text.swa_num_key_value_heads, 16)
-        self.assertEqual(text.num_key_value_heads, 16)
+        assert (text.ckpt_num_key_value_heads) == (8)
+        assert (text.swa_num_key_value_heads) == (16)
+        assert (text.num_key_value_heads) == (16)
 
     def test_vocab_semantics(self):
         text = load_inkling_config().get_text_config()
-        self.assertEqual(text.vocab_size, 200058)  # unpadded, for reporting
-        self.assertEqual(text.padded_vocab_size, 201024)  # module shapes
+        assert (text.vocab_size) == (200058)  # unpadded, for reporting
+        assert (text.padded_vocab_size) == (201024)  # module shapes
 
     def test_conv_stream_layout(self):
         text = load_inkling_config().get_text_config()
         layout = inkling_conv_stream_layout(text, attn_tp_size=1)
         kv_dim = text.num_key_value_heads * text.head_dim  # uniform kv width
         h = text.hidden_size
-        self.assertEqual(layout[InklingConvStream.K], (0, kv_dim))
-        self.assertEqual(layout[InklingConvStream.V], (kv_dim, kv_dim))
-        self.assertEqual(layout[InklingConvStream.ATTN], (2 * kv_dim, h))
-        self.assertEqual(layout[InklingConvStream.MLP], (2 * kv_dim + h, h))
-        self.assertEqual(inkling_conv_total_dim(text, 1), 2 * kv_dim + 2 * h)
+        assert (layout[InklingConvStream.K]) == ((0, kv_dim))
+        assert (layout[InklingConvStream.V]) == ((kv_dim, kv_dim))
+        assert (layout[InklingConvStream.ATTN]) == ((2 * kv_dim, h))
+        assert (layout[InklingConvStream.MLP]) == ((2 * kv_dim + h, h))
+        assert (inkling_conv_total_dim(text, 1)) == (2 * kv_dim + 2 * h)
 
     def test_cache_layer_types_sliding_subgroups(self):
         """Cache-group labels: sliding layers split round-robin into
@@ -123,29 +124,26 @@ class TestInklingConfigRegistry(unittest.TestCase):
         validates layer_types against ALLOWED_LAYER_TYPES, which rejects
         sub-group labels."""
         text = load_inkling_config().get_text_config()
-        self.assertEqual(
-            text.cache_layer_types,
-            [f"sliding_attention_{k}" for k in range(5)] + ["full_attention"],
+        assert (text.cache_layer_types) == (
+            [f"sliding_attention_{k}" for k in range(5)] + ["full_attention"]
         )
         # Full depth: 66 layers -> 5 sub-groups of 11 sliding + 11 full.
         full = load_inkling_config(num_layers=None).get_text_config()
         full_ids = list(range(5, 66, 6))
         lt = full.cache_layer_types
-        self.assertEqual(
-            [i for i, t in enumerate(lt) if t == "full_attention"], full_ids
-        )
-        self.assertEqual(lt.count("full_attention"), 11)
+        assert ([i for i, t in enumerate(lt) if t == "full_attention"]) == (full_ids)
+        assert (lt.count("full_attention")) == (11)
         for k in range(5):
-            self.assertEqual(lt.count(f"sliding_attention_{k}"), 11)
+            assert (lt.count(f"sliding_attention_{k}")) == (11)
         # Draft (nextn) shape: local_layer_ids=[] -> all full, indexable
         # by draft layer_id.
         draft = InklingModelConfig(num_hidden_layers=4, local_layer_ids=[])
-        self.assertEqual(draft.cache_layer_types, ["full_attention"] * 4)
+        assert (draft.cache_layer_types) == (["full_attention"] * 4)
 
     def test_local_layer_ids_validation(self):
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             InklingModelConfig(num_hidden_layers=4, local_layer_ids=[0, 9])
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             InklingModelConfig(num_hidden_layers=4, local_layer_ids=[0, 0])
 
 
@@ -166,10 +164,11 @@ def _reference_gate(x, weight, bias, n_routed, n_shared, top_k, route_scale):
     return w[:, :top_k], ids, w[:, top_k:]
 
 
-@unittest.skipUnless(
-    __import__("torch").cuda.is_available(), "fused gate kernel needs CUDA"
+@pytest.mark.skipif(
+    not (__import__("torch").cuda.is_available()),
+    reason=("fused gate kernel needs CUDA"),
 )
-class TestInklingGate(unittest.TestCase):
+class TestInklingGate:
     def test_gate_math_matches_reference(self):
         import torch
 
@@ -184,7 +183,7 @@ class TestInklingGate(unittest.TestCase):
             gate = InklingGate(text).cuda()
         finally:
             torch.set_default_dtype(torch.float32)
-        self.assertTrue(gate.use_dsv3_router_gemm)
+        assert gate.use_dsv3_router_gemm
         with torch.no_grad():
             gate.weight.normal_(0, 0.5)
             gate.bias.normal_(0, 0.1)
@@ -204,7 +203,7 @@ class TestInklingGate(unittest.TestCase):
             text.route_scale,
         )
         weights, gammas, ids = weights.cpu(), gammas.cpu(), ids.cpu()
-        self.assertTrue(torch.equal(ids.long(), ref_ids))
+        assert torch.equal(ids.long(), ref_ids)
         torch.testing.assert_close(weights, ref_w, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(gammas, ref_g, atol=1e-5, rtol=1e-5)
         # Weights across selected-routed + shared sum to route_scale.
@@ -214,10 +213,11 @@ class TestInklingGate(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(
-    __import__("torch").cuda.is_available(), "SiluAndMul kernel needs CUDA"
+@pytest.mark.skipif(
+    not (__import__("torch").cuda.is_available()),
+    reason=("SiluAndMul kernel needs CUDA"),
 )
-class TestInklingSharedExperts(unittest.TestCase):
+class TestInklingSharedExperts:
     def test_deferred_matches_finalized(self):
         """do_finalize=False returns un-weighted [S, T, H]; weighting it with
         the gammas must reproduce the finalized [T, H] output."""
@@ -242,8 +242,8 @@ class TestInklingSharedExperts(unittest.TestCase):
 
         finalized = mod(x, gammas)
         deferred = mod(x, do_finalize=False)
-        self.assertEqual(
-            tuple(deferred.shape), (text.n_shared_experts, 37, text.hidden_size)
+        assert (tuple(deferred.shape)) == (
+            (text.n_shared_experts, 37, text.hidden_size)
         )
         manual = torch.einsum("sth,ts->th", deferred.float(), gammas.float())
         # The finalized branch folds gammas into bf16 intermediates BEFORE the
@@ -254,4 +254,4 @@ class TestInklingSharedExperts(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

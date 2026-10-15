@@ -766,10 +766,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
 
             for req, registration, blocks, started_at in prepared:
                 ret = self._transfer_data(req.mooncake_session_id, blocks, packer)
-                if self.kv_transfer_metrics:
-                    self.kv_transfer_metrics.observe_kv_transfer_latency(
-                        time.monotonic() - started_at
-                    )
                 if ret != 0:
                     with self.session_lock:
                         self.session_failures[req.mooncake_session_id] += 1
@@ -783,6 +779,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                         f"{registration.endpoint}:{registration.dst_port}",
                     )
                     return False
+                self.kv_transfer_metrics.observe_kv_transfer_latency(
+                    time.monotonic() - started_at
+                )
 
         if not kv_chunk.is_last:
             return True
@@ -878,6 +877,15 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         the client gets an error instead of hanging. A room whose decode has not
         pre-allocated yet is only marked Failed locally (no endpoint to notify).
         """
+        # One failure counts once: a room already Failed (or already recorded,
+        # e.g. after a sender-side timeout) must not be re-incremented when
+        # later chunks of the same room funnel back here.
+        already_counted = self.room_status(room) == TransferPoll.Failed
+        if not already_counted:
+            with self.failure_lock:
+                already_counted = room in self.failure_records
+        if not already_counted:
+            self.kv_transfer_metrics.record_kv_transfer_failure()
         self.record_failure(room, reason)
         self.update_status(room, TransferPoll.Failed)
         for req in list(self.transfer_infos.get(room, {}).values()):
@@ -987,10 +995,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                             "Mooncake transfer failed for "
                             f"{registration.endpoint}:{registration.dst_port}"
                         )
-                    if self.kv_transfer_metrics:
-                        self.kv_transfer_metrics.observe_kv_transfer_latency(
-                            time.monotonic() - started_at
-                        )
+                    self.kv_transfer_metrics.observe_kv_transfer_latency(
+                        time.monotonic() - started_at
+                    )
 
                 if not kv_chunk.is_last:
                     continue

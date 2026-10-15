@@ -97,17 +97,16 @@ protected:
             .group_id = "full",
             .block_granularity = 2,  // two blocks per prefix page
             .total_pages = cfg.device_allocator.total_pages,
-            .retention = CacheGroupConfig::Retention::FullHistory,
-            .family = CacheGroupFamily::History,
+            .attn_kind = AttnKind::kFull,
         });
         if (WithSlidingGroup()) {
             cfg.cache_groups.push_back(CacheGroupConfig{
                 .group_id = "swa",
                 .block_granularity = kP,
                 .total_pages = cfg.device_allocator.total_pages,
-                .retention = CacheGroupConfig::Retention::SlidingWindow,
+                .attn_kind = AttnKind::kSlidingWindow,
                 .sliding_window_tokens = 5,
-                .family = CacheGroupFamily::History,
+
             });
         }
         SetTestSnapshotPool(cfg);
@@ -304,17 +303,16 @@ protected:
             .block_granularity = BlockGranularity(),
             .total_pages = 1 + 256 * (kP / BlockGranularity()),
             .cache_blocks_per_lcm_block = kP / BlockGranularity(),
-            .retention = CacheGroupConfig::Retention::FullHistory,
-            .family = CacheGroupFamily::History,
+            .attn_kind = AttnKind::kFull,
         });
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "sliding",
             .block_granularity = BlockGranularity(),
             .total_pages = 1 + 256 * (kP / BlockGranularity()),
             .cache_blocks_per_lcm_block = kP / BlockGranularity(),
-            .retention = CacheGroupConfig::Retention::SlidingWindow,
+            .attn_kind = AttnKind::kSlidingWindow,
             .sliding_window_tokens = 128,
-            .family = CacheGroupFamily::History,
+
         });
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -447,16 +445,15 @@ protected:
             .group_id = "full",
             .block_granularity = kP,
             .total_pages = cfg.device_allocator.total_pages,
-            .retention = CacheGroupConfig::Retention::FullHistory,
-            .family = CacheGroupFamily::History,
+            .attn_kind = AttnKind::kFull,
         });
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "sliding",
             .block_granularity = kP,
             .total_pages = cfg.device_allocator.total_pages,
-            .retention = CacheGroupConfig::Retention::SlidingWindow,
+            .attn_kind = AttnKind::kSlidingWindow,
             .sliding_window_tokens = 2 * kP,
-            .family = CacheGroupFamily::History,
+
         });
         SetTestSnapshotPool(cfg);
         return cfg;

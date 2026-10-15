@@ -190,7 +190,12 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         merge_oov=lambda *_args: None,
     )
     executor._run_target_forward = lambda *_args: SimpleNamespace(
-        next_token_logprobs=None, input_token_logprobs=None
+        next_token_logprobs=None,
+        input_token_logprobs=None,
+        input_top_logprobs_val=None,
+        input_top_logprobs_idx=None,
+        sampled_top_logprobs_val=None,
+        sampled_top_logprobs_idx=None,
     )
     executor._run_sampling = lambda *_args: (
         torch.tensor([3], dtype=torch.int32),
@@ -285,6 +290,7 @@ def test_non_spec_decode_routes_through_verify():
     executor.input_buffers = SimpleNamespace(
         input_ids_buf=torch.arange(8, dtype=torch.int32),
         force_single_token_verify_buf=torch.zeros(8, dtype=torch.bool),
+        input_lengths_buf=torch.ones(8, dtype=torch.int32),
     )
     executor.sampling_backend = SimpleNamespace(
         sample=lambda *_a, **_k: calls.append("sample") or (None, None),
@@ -302,6 +308,7 @@ def test_non_spec_decode_routes_through_verify():
         input_num_tokens=3,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(0, 0, 3, 1),
+        sampled_top_k=0,
     )
     candidates = executor._decode_candidates(ctx)
     assert candidates.shape == (3, 1)
@@ -318,9 +325,15 @@ def test_non_spec_decode_routes_through_verify():
         input_num_tokens=6,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(2, 2, 0, 1),
+        sampled_top_k=0,
     )
     assert executor._decode_candidates(ctx2) is None
-    executor._run_sampling(object(), object(), ctx2, None)
+    executor._run_sampling(
+        object(),
+        SimpleNamespace(valid_cache_lengths=None, req_pool_indices=None),
+        ctx2,
+        None,
+    )
     assert calls == ["sample"]
 
 

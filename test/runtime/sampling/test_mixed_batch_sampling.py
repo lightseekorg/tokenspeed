@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -94,6 +95,7 @@ def test_verify_reads_decode_rows_own_coins():
     )
 
     config = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",
@@ -177,6 +179,7 @@ def test_mixed_round_preserves_prefill_outputs():
     )
 
     config = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",
@@ -224,10 +227,14 @@ def test_mixed_round_preserves_prefill_outputs():
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None
+    ctx.sampled_top_k = 0
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.sampling_backend = backend
     executor._simulated_accept_length = None
+    executor.input_buffers = SimpleNamespace(
+        input_lengths_buf=torch.ones(MAX_BS, dtype=torch.int32, device="cuda")
+    )
     executor._apply_force_single_token_verify = lambda accept, off, cnt, ids: accept
 
     out_tokens, out_accept = ModelExecutor._run_sampling(
@@ -254,6 +261,7 @@ def test_mixed_round_preserves_prefill_logprobs():
     from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
 
     config = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",
@@ -308,10 +316,14 @@ def test_mixed_round_preserves_prefill_logprobs():
     ctx.num_extends = num_extends
     ctx.bs = bs
     ctx.decode_input_ids = None
+    ctx.sampled_top_k = 0
 
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.sampling_backend = backend
     executor._simulated_accept_length = None
+    executor.input_buffers = SimpleNamespace(
+        input_lengths_buf=torch.ones(MAX_BS, dtype=torch.int32, device="cuda")
+    )
     executor._apply_force_single_token_verify = lambda accept, off, cnt, ids: accept
 
     logits_output = LogitsProcessorOutput(next_token_logits=logits)
@@ -340,6 +352,76 @@ def test_explicit_top_k_one_pins_seed():
     stochastic = SamplingParams(temperature=0.7, top_k=50)
     stochastic.verify(VOCAB)
     assert stochastic.seed != 0 or stochastic.seed is None
+
+
+@requires_cuda
+def test_mixed_round_takes_fused_argmax_ids():
+    """When the logits processor already reduced the argmax (sharded logits
+    plus ``next_token_ids``), both arms of a mixed round sample those ids,
+    each from its own rows, not the shard's local argmax."""
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
+
+    config = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
+        enable_speculative_sampling=False,
+        sampling_stream="batch",
+        logprob_order="torch",
+        max_bs=MAX_BS,
+        max_draft_tokens_per_req=MAX_N,
+        max_req_pool_size=POOL,
+        vocab_size=VOCAB,
+        device="cuda",
+        enable_output_logprobs=False,
+        enable_nan_detection=False,
+    )
+    backend = GreedySamplingBackend(config)
+    assert backend.reads_only_argmax()
+
+    num_extends, num_decodes, n = 2, 2, 2
+    bs = num_extends + num_decodes
+    rows = num_extends + num_decodes * n
+    # This rank's vocabulary shard argmaxes to column 0 in every row.
+    shard = torch.full((rows, VOCAB // 2), -10.0, device="cuda")
+    shard[:, 0] = 10.0
+    # Global ids: prefill rows 5, 6; decode rows (7, 8) and (9, 10).
+    ids = torch.arange(5, 5 + rows, device="cuda")
+    # Decode drafts: request 0 proposes the target's first token, request 1
+    # misses.
+    candidates = torch.tensor([[3, 7], [4, 0]], device="cuda", dtype=torch.int64)
+
+    info = SamplingBatchInfo(
+        req_pool_indices=torch.arange(bs, device="cuda"),
+        valid_cache_lengths=torch.zeros(POOL + 1, dtype=torch.int32, device="cuda"),
+        device="cuda",
+    )
+    ctx = SimpleNamespace(
+        output_layout=ForwardOutputLayout(num_extends, num_extends, num_decodes, n),
+        num_extends=num_extends,
+        bs=bs,
+        decode_input_ids=None,
+    )
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.sampling_backend = backend
+    executor._simulated_accept_length = None
+    executor.input_buffers = SimpleNamespace(
+        input_lengths_buf=torch.ones(MAX_BS, dtype=torch.int32, device="cuda")
+    )
+    executor._apply_force_single_token_verify = lambda accept, off, cnt, ids: accept
+
+    out_tokens, out_accept = ModelExecutor._run_sampling(
+        executor,
+        LogitsProcessorOutput(next_token_logits=shard, next_token_ids=ids),
+        info,
+        ctx,
+        candidates=candidates,
+    )
+    torch.cuda.synchronize()
+    assert out_tokens[:num_extends].tolist() == [5, 6]
+    # Request 0 accepts its draft 7 and takes the bonus 8; request 1 takes 9.
+    assert out_tokens[num_extends : num_extends + 3].tolist() == [7, 8, 9]
+    assert out_accept.tolist() == [1, 1, 2, 1]
 
 
 if __name__ == "__main__":

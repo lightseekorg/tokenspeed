@@ -36,7 +36,7 @@ ISPP = 256
 def _runtime_reason() -> str | None:
     if not torch.cuda.is_available():
         return "requires CUDA"
-    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant  # noqa: F401
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
     from tokenspeed_kernel.platform import current_platform
     from tokenspeed_kernel.registry import KernelRegistry
 
@@ -91,7 +91,7 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 @requires_relu2
 @pytest.mark.parametrize("num_tokens", [1, 37])
 def test_bf16_relu2_routed_moe_matches_reference(num_tokens):
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_unquant_relu2_moe_weights,
         flashinfer_trtllm_unquant_relu2_routed_moe_apply,
     )
@@ -128,7 +128,7 @@ def test_bf16_relu2_routed_moe_matches_reference(num_tokens):
 def test_bf16_relu2_kernel_routing_matches_sigmoid_bias_top22(num_tokens):
     """Nemotron-H routing: 512 experts, sigmoid + correction bias, one group, top-22, scale 5."""
     from flashinfer.fused_moe import RoutingMethodType
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_unquant_relu2_moe_apply,
         flashinfer_trtllm_unquant_relu2_moe_weights,
     )

@@ -162,8 +162,8 @@ env:
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[fp32-15-1536-4096-4]
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[ue8m0-16-1792-5120-5]
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_tdm_fusion_selection[fp32-16-2048-7168-1-0]
-    tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-gluon_mm_mxfp8_ue8m0_gfx1250]
-    tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-True-gluon_mm_fp8_blockscale_gfx1250]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-1-gluon_mm_mxfp8_ue8m0_gfx1250]
+    tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-True-1-gluon_mm_fp8_blockscale_gfx1250]
   ROCM_NIGHTLY_INDEX: https://nightly.repo.amd.com/rocm/whl-next/
   # The PyTorch nightly requires this exact ROCm SDK build.
   ROCM_SDK_VERSION: 10.2.0a20261010

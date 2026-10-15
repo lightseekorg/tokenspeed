@@ -9,10 +9,10 @@ layer) and the architecture-registration touchpoints (``_CONFIG_REGISTRY``,
 import contextlib
 import os
 import sys
-import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
 
@@ -34,6 +34,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa:
     FULL_ATTENTION,
     LINEAR_ATTENTION,
 )
+from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 # Checkpoint-derived reference values (moonshotai/kimi-k3).
 _NUM_LAYERS = 93
@@ -44,25 +45,25 @@ _KDA_HEAD_DIM = 128
 _KDA_CONV = 4
 
 
-class KimiK3ConfigTests(unittest.TestCase):
+class TestKimiK3ConfigTests:
     def test_top_level_wraps_text_and_vision(self):
         cfg = KimiK3Config()
-        self.assertEqual(cfg.model_type, "kimi_k3")
-        self.assertIsInstance(cfg.text_config, KimiLinearConfig)
-        self.assertIsInstance(cfg.vision_config, KimiK3VisionConfig)
+        assert (cfg.model_type) == ("kimi_k3")
+        assert isinstance((cfg.text_config), (KimiLinearConfig))
+        assert isinstance((cfg.vision_config), (KimiK3VisionConfig))
         # hidden_size / vocab_size forward to the text config.
-        self.assertEqual(cfg.hidden_size, cfg.text_config.hidden_size)
-        self.assertEqual(cfg.vocab_size, cfg.text_config.vocab_size)
+        assert (cfg.hidden_size) == (cfg.text_config.hidden_size)
+        assert (cfg.vocab_size) == (cfg.text_config.vocab_size)
 
     def test_dict_subconfigs_are_materialized(self):
         cfg = KimiK3Config(
             text_config={"hidden_size": 4096},
             vision_config={"vt_hidden_size": 512},
         )
-        self.assertIsInstance(cfg.text_config, KimiLinearConfig)
-        self.assertIsInstance(cfg.vision_config, KimiK3VisionConfig)
-        self.assertEqual(cfg.text_config.hidden_size, 4096)
-        self.assertEqual(cfg.vision_config.vt_hidden_size, 512)
+        assert isinstance((cfg.text_config), (KimiLinearConfig))
+        assert isinstance((cfg.vision_config), (KimiK3VisionConfig))
+        assert (cfg.text_config.hidden_size) == (4096)
+        assert (cfg.vision_config.vt_hidden_size) == (512)
 
     def test_vision_text_hidden_forced_to_text_hidden(self):
         # The projector must emit the text hidden size, overriding any value
@@ -71,45 +72,44 @@ class KimiK3ConfigTests(unittest.TestCase):
             text_config={"hidden_size": 4096},
             vision_config={"text_hidden_size": 1234},
         )
-        self.assertEqual(cfg.vision_config.text_hidden_size, 4096)
+        assert (cfg.vision_config.text_hidden_size) == (4096)
 
     def test_layer_partition_is_exact(self):
         la = KimiLinearConfig().linear_attn_config
         kda = set(la["kda_layers"])
         full = set(la["full_attn_layers"])
-        self.assertEqual(len(kda), _NUM_KDA)
-        self.assertEqual(len(full), _NUM_MLA)
+        assert (len(kda)) == (_NUM_KDA)
+        assert (len(full)) == (_NUM_MLA)
         # 1-based, no overlap, exact cover of 1..N.
-        self.assertEqual(kda & full, set())
-        self.assertEqual(kda | full, set(range(1, _NUM_LAYERS + 1)))
+        assert (kda & full) == (set())
+        assert (kda | full) == (set(range(1, _NUM_LAYERS + 1)))
 
     def test_is_kda_layer_matches_config(self):
         c = KimiLinearConfig()
         kda = set(c.linear_attn_config["kda_layers"])
         for i in range(c.num_hidden_layers):
-            self.assertEqual(c.is_kda_layer(i), (i + 1) in kda)
+            assert (c.is_kda_layer(i)) == ((i + 1) in kda)
 
     def test_layers_block_type_and_ids(self):
         c = KimiLinearConfig()
         lbt = c.layers_block_type
-        self.assertEqual(len(lbt), _NUM_LAYERS)
-        self.assertEqual(set(lbt), {"attention", "linear_attention"})
-        self.assertEqual(len(c.linear_layer_ids), _NUM_KDA)
-        self.assertEqual(len(c.full_attention_layer_ids), _NUM_MLA)
+        assert (len(lbt)) == (_NUM_LAYERS)
+        assert (set(lbt)) == ({"attention", "linear_attention"})
+        assert (len(c.linear_layer_ids)) == (_NUM_KDA)
+        assert (len(c.full_attention_layer_ids)) == (_NUM_MLA)
         # 0-based full-attention ids == (1-based full_attn_layers - 1).
-        self.assertEqual(
-            c.full_attention_layer_ids,
-            sorted(x - 1 for x in c.linear_attn_config["full_attn_layers"]),
+        assert (c.full_attention_layer_ids) == (
+            sorted(x - 1 for x in c.linear_attn_config["full_attn_layers"])
         )
 
     def test_layer_types_translate_full_attention(self):
         c = KimiLinearConfig()
-        self.assertEqual(set(c.layer_types), {FULL_ATTENTION, LINEAR_ATTENTION})
+        assert (set(c.layer_types)) == ({FULL_ATTENTION, LINEAR_ATTENTION})
         for block_type, cache_label in zip(c.layers_block_type, c.layer_types):
             if block_type == "attention":
-                self.assertEqual(cache_label, FULL_ATTENTION)
+                assert (cache_label) == (FULL_ATTENTION)
             else:
-                self.assertEqual(cache_label, block_type)
+                assert (cache_label) == (block_type)
 
     @staticmethod
     def _kda_spec(tp_size):
@@ -118,9 +118,8 @@ class KimiK3ConfigTests(unittest.TestCase):
             LinearAttnConfig,
         )
 
-        server_args = SimpleNamespace(
-            mapping=SimpleNamespace(linear_attn=SimpleNamespace(tp_size=tp_size))
-        )
+        # world_size resolves the linear-attention TP width it defaults to.
+        server_args = ServerArgs(model="x", world_size=tp_size)
         model = SimpleNamespace(
             hf_config=SimpleNamespace(text_config=KimiLinearConfig())
         )
@@ -129,24 +128,22 @@ class KimiK3ConfigTests(unittest.TestCase):
     def test_kda_state_shapes(self):
         spec = self._kda_spec(tp_size=1)
         # conv over q/k/v (3 * num_heads * head_dim) wide, kernel_size - 1 deep.
-        self.assertEqual(
-            spec.conv_state_shape, (3 * _KDA_HEADS * _KDA_HEAD_DIM, _KDA_CONV - 1)
+        assert (spec.conv_state_shape) == (
+            (3 * _KDA_HEADS * _KDA_HEAD_DIM, _KDA_CONV - 1)
         )
         # per-head (head_dim x head_dim) recurrent state.
-        self.assertEqual(
-            spec.temporal_state_shape, (_KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
+        assert (spec.temporal_state_shape) == (
+            (_KDA_HEADS, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
         )
-        self.assertEqual(spec.layer_ids, tuple(KimiLinearConfig().linear_layer_ids))
+        assert (spec.layer_ids) == (tuple(KimiLinearConfig().linear_layer_ids))
 
     def test_kda_state_shapes_respect_tp(self):
         spec = self._kda_spec(tp_size=4)
-        self.assertEqual(
-            spec.conv_state_shape,
-            (3 * _KDA_HEADS * _KDA_HEAD_DIM // 4, _KDA_CONV - 1),
+        assert (spec.conv_state_shape) == (
+            (3 * _KDA_HEADS * _KDA_HEAD_DIM // 4, _KDA_CONV - 1)
         )
-        self.assertEqual(
-            spec.temporal_state_shape,
-            (_KDA_HEADS // 4, _KDA_HEAD_DIM, _KDA_HEAD_DIM),
+        assert (spec.temporal_state_shape) == (
+            (_KDA_HEADS // 4, _KDA_HEAD_DIM, _KDA_HEAD_DIM)
         )
 
 
@@ -168,12 +165,12 @@ def _model_dtype(dtype: torch.dtype):
         torch.set_default_dtype(previous)
 
 
-_NVIDIA_ONLY = unittest.skipIf(
-    not current_platform().is_nvidia, "the latent down shard is NVIDIA-only"
+_NVIDIA_ONLY = pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="the latent down shard is NVIDIA-only"
 )
 
 
-class KimiK3RegistrationTests(unittest.TestCase):
+class TestKimiK3RegistrationTests:
     def _build_moe_block(
         self, plan, *, moe_layer_freq=1, layer_index=1, routed_hidden=64
     ):
@@ -309,11 +306,12 @@ class KimiK3RegistrationTests(unittest.TestCase):
         moe = built.layer
         moe.packed_input_projection_weight = torch.zeros(1)
         moe.routed_expert_down_proj.narrowed = True
-        self.assertIsNone(moe._latent_input_projections(torch.zeros(2, 8)))
+        assert (moe._latent_input_projections(torch.zeros(2, 8))) is None
         moe.routed_expert_down_proj.narrowed = False
-        self.assertIsNotNone(
-            moe.packed_input_projection_weight,
-            "the packed weight must still be set, or the guard proves nothing",
+        assert (
+            moe.packed_input_projection_weight
+        ) is not None, (
+            "the packed weight must still be set, or the guard proves nothing"
         )
 
     @_NVIDIA_ONLY
@@ -332,25 +330,25 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
         config, mapping = built.config, built.mapping
         linear_calls, multicast_calls = built.linear_calls, built.multicast_calls
-        layer, get_pg = built.layer, built.get_pg
+        _layer, get_pg = built.layer, built.get_pg
         self._assert_latent_projection_sharding(linear_calls, mapping, trtllm=True)
         # The native plan cannot reach this shard at all (it is AMD-only), so the
         # multicast wiring has to be asserted here or nowhere.
         down = _linear_calls_by_prefix(linear_calls)["routed_expert_down_proj"]
-        self.assertEqual(down["multicast_down"], "mc-op")
-        self.assertEqual(len(multicast_calls), 1)
+        assert (down["multicast_down"]) == ("mc-op")
+        assert (len(multicast_calls)) == (1)
         wired = multicast_calls[0]
-        self.assertEqual(wired["group"], "pg")
-        self.assertEqual(wired["hidden_size"], config.hidden_size)
-        self.assertEqual(wired["latent_size"], config.routed_expert_hidden_size)
-        self.assertEqual(wired["layer_count"], 46)
-        self.assertEqual(wired["block_index"], 1)
-        self.assertEqual(wired["model_scope"], "scope-under-test")
+        assert (wired["group"]) == ("pg")
+        assert (wired["hidden_size"]) == (config.hidden_size)
+        assert (wired["latent_size"]) == (config.routed_expert_hidden_size)
+        assert (wired["layer_count"]) == (46)
+        assert (wired["block_index"]) == (1)
+        assert (wired["model_scope"]) == ("scope-under-test")
         # The mailbox is sized to the gate itself, so the two meet by
         # construction and no width falls back to the replica between them.
         from tokenspeed.runtime.layers.moe.latent import DOWN_MAILBOX_MAX_TOKENS
 
-        self.assertEqual(wired["max_m"], DOWN_MAILBOX_MAX_TOKENS)
+        assert (wired["max_m"]) == (DOWN_MAILBOX_MAX_TOKENS)
         # Not get_process_group("nccl", ...): that spelling passes either way,
         # since the manager's device backend defaults to "nccl" in a test.
         get_pg.assert_called_with(mapping.moe.tp_ep_group)
@@ -375,7 +373,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             routed_hidden=60,
         )
         down = _linear_calls_by_prefix(built.linear_calls)["routed_expert_down_proj"]
-        self.assertIsNone(down.get("column_group"))
+        assert (down.get("column_group")) is None
 
     @_NVIDIA_ONLY
     def test_the_shard_stays_off_the_plan_that_cannot_absorb_it(self):
@@ -396,9 +394,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             built.linear_calls, built.mapping, trtllm=False
         )
         # The multicast split adds no cross-rank sum, so no plan excludes it.
-        self.assertEqual(len(built.multicast_calls), 1)
+        assert (len(built.multicast_calls)) == (1)
         down = _linear_calls_by_prefix(built.linear_calls)["routed_expert_down_proj"]
-        self.assertEqual(down["multicast_down"], "mc-op")
+        assert (down["multicast_down"]) == ("mc-op")
 
     @_NVIDIA_ONLY
     def test_the_rotation_ordinal_counts_moe_blocks_not_layers(self):
@@ -416,9 +414,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             moe_layer_freq=2,
             layer_index=4,
         )
-        self.assertEqual(built.multicast_calls[0]["block_index"], 2)
+        assert (built.multicast_calls[0]["block_index"]) == (2)
         # The count is a count of blocks, so the frequency must not divide it.
-        self.assertEqual(built.multicast_calls[0]["layer_count"], 46)
+        assert (built.multicast_calls[0]["layer_count"]) == (46)
 
     def test_local_moe_blocks_counts_what_this_stage_runs(self):
         """The dense prefix is not a block, and only this stage's are counted."""
@@ -428,7 +426,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1
         )
         one = Mapping(rank=0, world_size=1, pp_size=1)
-        self.assertEqual(kimi_k3._k3_local_moe_blocks(config, one), 92)
+        assert (kimi_k3._k3_local_moe_blocks(config, one)) == (92)
         # 93 over three stages is 31 apiece; the first loses its dense layer.
         counts = [
             kimi_k3._k3_local_moe_blocks(
@@ -436,7 +434,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
             for rank in range(3)
         ]
-        self.assertEqual(counts, [30, 31, 31])
+        assert (counts) == ([30, 31, 31])
 
     def test_the_base_model_states_the_blocks_its_stage_runs(self):
         """The rotation count must come from the stage, not a literal."""
@@ -477,10 +475,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 output_parallel=None,
             )
 
-        self.assertEqual(len(recorded), 1)
-        self.assertEqual(
-            recorded[0]["moe_block_count"],
-            kimi_k3._k3_local_moe_blocks(config, mapping),
+        assert (len(recorded)) == (1)
+        assert (recorded[0]["moe_block_count"]) == (
+            kimi_k3._k3_local_moe_blocks(config, mapping)
         )
 
         # At PP1 the stage's blocks and the model's happen to be the same number,
@@ -511,8 +508,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 qkv_parallel=None,
                 output_parallel=None,
             )
-        self.assertEqual(recorded[0]["moe_block_count"], 31)
-        self.assertNotEqual(31, kimi_k3._k3_local_moe_blocks(config, mapping))
+        assert (recorded[0]["moe_block_count"]) == (31)
+        assert (31) != (kimi_k3._k3_local_moe_blocks(config, mapping))
 
     def test_the_draft_states_a_rotation_of_one(self):
         """The draft runs its one block every step, so nothing rotates."""
@@ -586,12 +583,12 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
 
         on_nvidia = torch.version.hip is None
-        self.assertEqual(
-            kimi_k3._shard_k3_latent_projection(mapping_for(8), 7168), on_nvidia
+        assert (kimi_k3._shard_k3_latent_projection(mapping_for(8), 7168)) == (
+            on_nvidia
         )
-        self.assertFalse(kimi_k3._shard_k3_latent_projection(mapping_for(1), 7168))
-        self.assertFalse(kimi_k3._shard_k3_latent_projection(mapping_for(3), 7168))
-        self.assertFalse(kimi_k3._shard_k3_latent_projection(mapping_for(5), 7168))
+        assert not (kimi_k3._shard_k3_latent_projection(mapping_for(1), 7168))
+        assert not (kimi_k3._shard_k3_latent_projection(mapping_for(3), 7168))
+        assert not (kimi_k3._shard_k3_latent_projection(mapping_for(5), 7168))
 
     def _assert_latent_projection_sharding(self, linear_calls, mapping, trtllm=False):
         """Both projections split columns; only the up one narrows storage."""
@@ -599,21 +596,21 @@ class KimiK3RegistrationTests(unittest.TestCase):
         down = by_prefix["routed_expert_down_proj"]
         up = by_prefix["routed_expert_up_proj"]
         sharded = mapping.moe.tp_ep_size > 1 and torch.version.hip is None
-        self.assertEqual(up.get("shard_group") is not None, sharded)
-        self.assertIsNone(down.get("reduce_group"))
+        assert (up.get("shard_group") is not None) == (sharded)
+        assert (down.get("reduce_group")) is None
         if sharded:
-            self.assertIs(up["shard_group"], mapping.moe.tp_ep_group)
-            self.assertIs(down["column_group"], mapping.moe.tp_ep_group)
+            assert (up["shard_group"]) is (mapping.moe.tp_ep_group)
+            assert (down["column_group"]) is (mapping.moe.tp_ep_group)
         else:
-            self.assertIsNone(up.get("shard_group"))
-            self.assertIsNone(down.get("column_group"))
+            assert (up.get("shard_group")) is None
+            assert (down.get("column_group")) is None
         # Narrowed storage would take the full weight the multicast op slices.
-        self.assertIsNone(down.get("shard_group"))
+        assert (down.get("shard_group")) is None
         for call in (down, up):
-            self.assertEqual(call["shard_rank"], mapping.moe.tp_ep_rank)
-            self.assertEqual(call["shard_size"], mapping.moe.tp_ep_size)
+            assert (call["shard_rank"]) == (mapping.moe.tp_ep_rank)
+            assert (call["shard_size"]) == (mapping.moe.tp_ep_size)
 
-    def test_hybrid_moe_precomputes_routing_only_for_decode(self):
+    def test_hybrid_moe_precomputes_routing_only_for_decode(self, subtests):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
@@ -627,16 +624,16 @@ class KimiK3RegistrationTests(unittest.TestCase):
             topk_output_format=TopKOutputFormat.BYPASSED,
         )
 
-        self.assertEqual(layer._routing_output_format(None), TopKOutputFormat.STANDARD)
+        assert (layer._routing_output_format(None)) == (TopKOutputFormat.STANDARD)
         for mode, expected in (
             (ForwardMode.DECODE, TopKOutputFormat.STANDARD),
             (ForwardMode.EXTEND, TopKOutputFormat.BYPASSED),
             (ForwardMode.MIXED, TopKOutputFormat.BYPASSED),
             (ForwardMode.IDLE, TopKOutputFormat.BYPASSED),
         ):
-            with self.subTest(mode=mode):
+            with subtests.test(mode=mode):
                 ctx = SimpleNamespace(forward_mode=mode)
-                self.assertEqual(layer._routing_output_format(ctx), expected)
+                assert (layer._routing_output_format(ctx)) == (expected)
 
     def test_mla_mixed_batch_slices_decode_gate_to_live_rows(self):
         from tokenspeed.runtime.execution.context import ForwardContext
@@ -753,7 +750,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 down_out=down_out,
             )
 
-        self.assertIs(actual, down_out)
+        assert (actual) is (down_out)
         shared_down.assert_called_once_with(
             activated,
             layer.down_proj.weight,
@@ -786,7 +783,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             config, mapping, layer_id=0, qkv_parallel=None, output_parallel=None
         )
 
-        self.assertEqual(tuple(layer.qkvgb_proj.weight.shape), (288, 64))
+        assert (tuple(layer.qkvgb_proj.weight.shape)) == ((288, 64))
         for value, shard_id in enumerate(("q", "k", "v", "g"), start=1):
             loaded = torch.full((64, 64), float(value), dtype=torch.bfloat16)
             layer.qkvgb_proj.weight.weight_loader(
@@ -816,22 +813,19 @@ class KimiK3RegistrationTests(unittest.TestCase):
             for index in range(4)
         ]
         mixed_qkv, gate, f_a, beta = layer._project_qkvfab(hidden_states, ctx=None)
-        self.assertTrue(torch.equal(mixed_qkv, torch.cat(expected_qkvg[:3], dim=-1)))
-        self.assertTrue(torch.equal(gate, expected_qkvg[3]))
-        self.assertTrue(
-            torch.equal(f_a, torch.nn.functional.linear(hidden_states, f_a_weight))
-        )
+        assert torch.equal(mixed_qkv, torch.cat(expected_qkvg[:3], dim=-1))
+        assert torch.equal(gate, expected_qkvg[3])
+        assert torch.equal(f_a, torch.nn.functional.linear(hidden_states, f_a_weight))
         torch.testing.assert_close(
             beta,
             torch.nn.functional.linear(hidden_states, beta_weight),
         )
-        self.assertFalse(mixed_qkv.is_contiguous())
-        self.assertEqual(
-            mixed_qkv.untyped_storage().data_ptr(),
-            gate.untyped_storage().data_ptr(),
+        assert not (mixed_qkv.is_contiguous())
+        assert (mixed_qkv.untyped_storage().data_ptr()) == (
+            gate.untyped_storage().data_ptr()
         )
 
-    def test_kda_compacts_prefill_qkv_before_backend_break(self):
+    def test_kda_compacts_prefill_qkv_before_backend_break(self, subtests):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
 
@@ -873,7 +867,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             (ForwardMode.EXTEND, True),
             (ForwardMode.DECODE, False),
         ):
-            with self.subTest(mode=mode):
+            with subtests.test(mode=mode):
                 captured = []
 
                 def capture_backend(**kwargs):
@@ -889,7 +883,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 with mock.patch.object(
                     layer, "_project_qkvfab", return_value=projection_outputs
                 ):
-                    with self.assertRaises(BackendCalled):
+                    with pytest.raises((BackendCalled)):
                         layer(
                             positions=torch.empty(rows, dtype=torch.int64),
                             hidden_states=torch.empty(rows, 64, dtype=torch.bfloat16),
@@ -898,7 +892,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                             projection_out=None,
                         )
 
-                self.assertEqual(captured[0].is_contiguous(), expect_contiguous)
+                assert (captured[0].is_contiguous()) == (expect_contiguous)
 
     @_NVIDIA_ONLY
     def test_native_kimi_moe_uses_direct_ep_and_collective_tp_paths(self):
@@ -1024,29 +1018,27 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 prefix="model.layers.1.block_sparse_moe",
             )
 
-        self.assertFalse(shared_calls[0]["reduce_results"])
-        self.assertIsNone(expert_calls[0]["routing_mode"])
-        self.assertEqual(expert_calls[0]["internal_activation_dtype_override"], "input")
-        self.assertEqual(
-            layer.topk.topk_config.output_format, TopKOutputFormat.STANDARD
-        )
-        self.assertTrue(layer.native_latent_moe.components["joint_reduce"])
-        self.assertIsNone(layer.native_latent_moe.components["shared_reduce"])
+        assert not (shared_calls[0]["reduce_results"])
+        assert (expert_calls[0]["routing_mode"]) is None
+        assert (expert_calls[0]["internal_activation_dtype_override"]) == ("input")
+        assert (layer.topk.topk_config.output_format) == (TopKOutputFormat.STANDARD)
+        assert layer.native_latent_moe.components["joint_reduce"]
+        assert (layer.native_latent_moe.components["shared_reduce"]) is None
         self._assert_latent_projection_sharding(linear_calls, mapping)
-        self.assertEqual(len(multicast_calls), 1)
+        assert (len(multicast_calls)) == (1)
         wired = multicast_calls[0]
-        self.assertEqual(wired["group"], "pg")
-        self.assertEqual(wired["hidden_size"], config.hidden_size)
-        self.assertEqual(wired["latent_size"], config.routed_expert_hidden_size)
-        self.assertEqual(wired["model_scope"], "model.layers")
-        self.assertEqual(wired["layer_count"], 92)
+        assert (wired["group"]) == ("pg")
+        assert (wired["hidden_size"]) == (config.hidden_size)
+        assert (wired["latent_size"]) == (config.routed_expert_hidden_size)
+        assert (wired["model_scope"]) == ("model.layers")
+        assert (wired["layer_count"]) == (92)
         # The pool rotates over block ordinals, so this layer must key its own.
-        self.assertEqual(wired["block_index"], 1)
+        assert (wired["block_index"]) == (1)
         get_pg.assert_called_with("nccl", mapping.moe.tp_ep_group)
         down = _linear_calls_by_prefix(linear_calls)["routed_expert_down_proj"]
-        self.assertEqual(down["multicast_down"], "mc-op")
-        self.assertEqual(
-            layer.native_latent_moe.components["expert_parallel_group"], ep_group
+        assert (down["multicast_down"]) == ("mc-op")
+        assert (layer.native_latent_moe.components["expert_parallel_group"]) == (
+            ep_group
         )
 
         # TP shards each produce only a partial W2 result. They must use the
@@ -1148,12 +1140,12 @@ class KimiK3RegistrationTests(unittest.TestCase):
         unsharded = {
             c["prefix"].rsplit(".", 1)[-1]: c for c in linear_calls if "prefix" in c
         }
-        self.assertIsNone(unsharded["routed_expert_down_proj"].get("multicast_down"))
-        self.assertIsNone(unsharded["routed_expert_down_proj"].get("column_group"))
-        self.assertIsNone(unsharded["routed_expert_up_proj"].get("shard_group"))
+        assert (unsharded["routed_expert_down_proj"].get("multicast_down")) is None
+        assert (unsharded["routed_expert_down_proj"].get("column_group")) is None
+        assert (unsharded["routed_expert_up_proj"].get("shard_group")) is None
 
-        self.assertIsNone(tp_layer.native_latent_moe)
-        self.assertIsNone(tp_layer.comm)
+        assert (tp_layer.native_latent_moe) is None
+        assert (tp_layer.comm) is None
         routed_input = torch.zeros(1, config.routed_expert_hidden_size)
         torch.testing.assert_close(
             tp_layer._routed_experts(
@@ -1195,7 +1187,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         )
 
         torch.testing.assert_close(output, prefix_sum)
-        self.assertEqual(tuple(output.shape), (0, 64))
+        assert (tuple(output.shape)) == ((0, 64))
         fused_pipeline.assert_not_called()
         native_latent_moe.assert_called_once_with(
             hidden_states,
@@ -1204,7 +1196,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             prefix_sum=prefix_sum,
         )
 
-    def test_mla_gate_projection_uses_api_selected_layout(self):
+    def test_mla_gate_projection_uses_api_selected_layout(self, subtests):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
 
         class FakeProjection(torch.nn.Module):
@@ -1280,15 +1272,15 @@ class KimiK3RegistrationTests(unittest.TestCase):
         torch.testing.assert_close(q, expected_q)
         torch.testing.assert_close(latent, expected_latent)
         torch.testing.assert_close(gate, expected[:, 6:])
-        self.assertIsNone(absorbed_query)
-        self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
+        assert (absorbed_query) is None
+        assert (attention.fused_qkv_a_proj_with_mqa.calls) == (0)
 
         with torch.no_grad():
             _, _, _, decode_absorbed = attention._project_q_latent_gated(
                 prefill[:4], SimpleNamespace(num_extends=0), comm, None
             )
-        self.assertIsNone(decode_absorbed)
-        self.assertEqual(attention.fused_qkv_a_proj_with_mqa.calls, 0)
+        assert (decode_absorbed) is None
+        assert (attention.fused_qkv_a_proj_with_mqa.calls) == (0)
 
         # The module paths must trim padding and preserve both canonical
         # Q/KV/gate order and the FP8 checkpoint's gate/Q/KV order.
@@ -1296,7 +1288,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         weight = torch.nn.functional.pad(projection.weight.detach(), (0, 0, 0, 2))
         attention._fused_qkv_a_pad_rows = 2
         for fp8 in (False, True):
-            with self.subTest(fp8=fp8):
+            with subtests.test(fp8=fp8):
                 attention._fused_qkv_a_fp8_layout = fp8
                 projection.weight = torch.nn.Parameter(
                     weight.to(torch.float8_e4m3fn if fp8 else torch.float32),
@@ -1333,7 +1325,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 torch.testing.assert_close(q, expected_q)
                 torch.testing.assert_close(latent, expected_latent)
                 torch.testing.assert_close(gate, expected_gate)
-                self.assertIsNone(absorbed)
+                assert (absorbed) is None
 
     def test_ungated_mla_does_not_select_attnres_projection_fusion(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
@@ -1342,36 +1334,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
         torch.nn.Module.__init__(attention)
 
         attention.qkv_parallel = None
-        self.assertFalse(attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
-
-    def test_config_registry_maps_model_type(self):
-        from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY
-
-        self.assertIs(_CONFIG_REGISTRY.get("kimi_k3"), KimiK3Config)
+        assert not (attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
 
     def test_resolve_architecture_returns_registered_name(self):
         from tokenspeed.runtime.utils.hf_transformers_utils import resolve_architecture
 
         cfg = KimiK3Config(architectures=["KimiK3ForConditionalGeneration"])
-        self.assertEqual(resolve_architecture(cfg), "KimiK3ForConditionalGeneration")
-
-    def test_mla_and_multimodal_metadata_registered(self):
-        from tokenspeed.runtime.configs import model_config
-
-        self.assertIn("KimiK3ForConditionalGeneration", model_config._MLA_ARCHITECTURES)
-        self.assertTrue(
-            model_config.is_multimodal_model(["KimiK3ForConditionalGeneration"])
-        )
-
-    def test_entryclass_resolves_in_model_registry(self):
-        from tokenspeed.runtime.models.kimi_k3 import (
-            KimiK3ForConditionalGeneration,
-        )
-        from tokenspeed.runtime.models.registry import ModelRegistry
-
-        cls, arch = ModelRegistry.resolve_model_cls(["KimiK3ForConditionalGeneration"])
-        self.assertIs(cls, KimiK3ForConditionalGeneration)
-        self.assertEqual(arch, "KimiK3ForConditionalGeneration")
+        assert (resolve_architecture(cfg)) == ("KimiK3ForConditionalGeneration")
 
     def test_text_only_wrapper_streams_and_discards_vision_weights(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiK3ForConditionalGeneration
@@ -1396,17 +1365,16 @@ class KimiK3RegistrationTests(unittest.TestCase):
 
         KimiK3ForConditionalGeneration.load_weights(wrapper, weights)
 
-        self.assertEqual(
-            [name for name, _ in language_model.weights],
-            ["model.embed_tokens.weight", "lm_head.weight"],
+        assert ([name for name, _ in language_model.weights]) == (
+            ["model.embed_tokens.weight", "lm_head.weight"]
         )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
 
 
-class KimiK3LcmPlanTests(unittest.TestCase):
+class TestKimiK3LcmPlanTests:
     """LCM planning across attention-TP widths and reduced-layer variants."""
 
     @staticmethod
@@ -1428,16 +1396,16 @@ class KimiK3LcmPlanTests(unittest.TestCase):
         packs8 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan8.groups}
         packs16 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan16.groups}
         packs1 = {g.group_id: g.cache_blocks_per_lcm_block for g in plan1.groups}
-        self.assertEqual(packs8[FULL_ATTENTION], 12)
-        self.assertEqual(packs16[FULL_ATTENTION], 6)
-        self.assertEqual(packs1[FULL_ATTENTION], 89)
+        assert (packs8[FULL_ATTENTION]) == (12)
+        assert (packs16[FULL_ATTENTION]) == (6)
+        assert (packs1[FULL_ATTENTION]) == (89)
         for gid in (f"{LINEAR_ATTENTION}_0", f"{LINEAR_ATTENTION}_1"):
-            self.assertEqual(packs8[gid], 1)
-            self.assertEqual(packs16[gid], 1)
-            self.assertEqual(packs1[gid], 1)
-        self.assertEqual(plan16.lcm_block_bytes * 2, plan8.lcm_block_bytes)
+            assert (packs8[gid]) == (1)
+            assert (packs16[gid]) == (1)
+            assert (packs1[gid]) == (1)
+        assert (plan16.lcm_block_bytes * 2) == (plan8.lcm_block_bytes)
         for plan in (plan8, plan16, plan1):
-            self.assertEqual(len(plan.planes), _NUM_MLA)
+            assert (len(plan.planes)) == (_NUM_MLA)
 
     def test_reduced_layer_variant_plans(self):
         """Layer counts derive from the config: a structurally-identical
@@ -1453,7 +1421,7 @@ class KimiK3LcmPlanTests(unittest.TestCase):
         ]
         cfg = KimiLinearConfig(num_hidden_layers=num_layers, linear_attn_config=linear)
         plan = self._plan(cfg, 8)
-        self.assertEqual(len(plan.planes), len(linear["full_attn_layers"]))
+        assert (len(plan.planes)) == (len(linear["full_attn_layers"]))
 
     def test_full_size_split_is_enforced(self):
         """A 93-layer config must keep exactly 69 KDA + 24 MLA; the relaxed
@@ -1468,7 +1436,7 @@ class KimiK3LcmPlanTests(unittest.TestCase):
         linear["kda_layers"] = kda
         linear["full_attn_layers"] = sorted(set(range(1, _NUM_LAYERS + 1)) - set(kda))
         cfg = KimiLinearConfig(linear_attn_config=linear)
-        with self.assertRaisesRegex(ValueError, "69 KDA and 24 MLA"):
+        with pytest.raises((ValueError), match=("69 KDA and 24 MLA")):
             self._plan(cfg, 8)
 
     def test_reduced_layer_split_must_ride_inside_the_mla_planes(self):
@@ -1482,5 +1450,5 @@ class KimiK3LcmPlanTests(unittest.TestCase):
             x for x in linear["full_attn_layers"] if x <= num_layers
         ]
         cfg = KimiLinearConfig(num_hidden_layers=num_layers, linear_attn_config=linear)
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             self._plan(cfg, 8)

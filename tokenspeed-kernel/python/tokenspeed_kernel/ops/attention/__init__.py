@@ -131,6 +131,7 @@ def attn_merge_state(
 
 
 # Backend registration (side-effect imports)
+import tokenspeed_kernel.ops.attention.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
 

@@ -38,11 +38,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from runtime.cache_pd_test_utils import block_manifest as make_block_manifest
-from runtime.cache_pd_test_utils import group as make_group  # noqa: E402
-from runtime.cache_pd_test_utils import layout as make_layout
-from runtime.cache_pd_test_utils import producer_schedule as make_producer_schedule
-from runtime.cache_pd_test_utils import segment as make_segment
+from test.runtime.cache_pd_test_utils import block_manifest as make_block_manifest
+from test.runtime.cache_pd_test_utils import group as make_group  # noqa: E402
+from test.runtime.cache_pd_test_utils import layout as make_layout
+from test.runtime.cache_pd_test_utils import producer_schedule as make_producer_schedule
+from test.runtime.cache_pd_test_utils import segment as make_segment
 
 from tokenspeed.runtime.pd.base.status import TransferPoll  # noqa: E402
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
@@ -92,19 +92,9 @@ def _segment(
     )
 
 
-def _group(
-    group_id,
-    family,
-    *segments,
-    retention="full_history",
-    sliding_window_tokens: int | None = None,
-):
+def _group(group_id, attn_kind, *segments, sliding_window_tokens: int | None = None):
     return make_group(
-        group_id,
-        *segments,
-        family=family,
-        retention=retention,
-        window=sliding_window_tokens,
+        group_id, *segments, attn_kind=attn_kind, window=sliding_window_tokens
     )
 
 
@@ -112,7 +102,7 @@ def _grouped_groups():
     return (
         _group(
             "history",
-            "history",
+            "full_history",
             _segment("layer.0.kv", producer_step=0, page_zero_offset=0),
         ),
         _group(
@@ -343,7 +333,7 @@ def _ordinary_layerwise_group():
             "layer.4.v", producer_step=4, page_zero_offset=96, page_stride_bytes=128
         ),
     )
-    return _group("history", "history", *segments)
+    return _group("history", "full_history", *segments)
 
 
 def _ordinary_layerwise_layout() -> CacheTransferContract:
@@ -357,7 +347,7 @@ def _ordinary_layerwise_layout() -> CacheTransferContract:
 def _draft_final_group():
     return _group(
         "history",
-        "history",
+        "full_history",
         _segment(
             "layer.0.kv",
             producer_step=0,
@@ -482,7 +472,7 @@ def _heterogeneous_groups(*, destination: bool):
     return (
         _group(
             "history",
-            "history",
+            "full_history",
             _segment("layer.0.latent", producer_step=0, page_zero_offset=0),
         ),
         _group(
@@ -565,6 +555,7 @@ def test_heterogeneous_zero_edge_interval_does_not_fall_back_to_identity() -> No
 
 
 def _layerwise_fanout_context():
+    from tokenspeed.runtime.metrics.collector import KVTransferMetrics
     from tokenspeed.runtime.pd.mooncake.prefill import MooncakeKVManagerPrefill
 
     layout = _ordinary_layerwise_layout()
@@ -598,7 +589,7 @@ def _layerwise_fanout_context():
         for rank, request in enumerate(requests)
     }
     manager.layerwise_debug = False
-    manager.kv_transfer_metrics = None
+    manager.kv_transfer_metrics = KVTransferMetrics({}, enabled=False)
     manager.session_failures = defaultdict(int)
     return manager, requests
 

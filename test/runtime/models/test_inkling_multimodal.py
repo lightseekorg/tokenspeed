@@ -24,8 +24,8 @@ Run:
 
 import os
 import sys
-import unittest
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -100,31 +100,28 @@ def _naive_hmlp_forward(encoder, x: torch.Tensor) -> torch.Tensor:
     return x.reshape(num_patches, -1)
 
 
-class TestInklingPlanOutScales(unittest.TestCase):
+class TestInklingPlanOutScales:
     def test_tiny_fixture_schedule(self):
         from tokenspeed.runtime.models.inkling import inkling_plan_out_scales
 
-        self.assertEqual(
-            inkling_plan_out_scales(1, 4, 1, 3), [(1, 1, 1, 3), (1, 4, 4, 64)]
-        )
+        assert (inkling_plan_out_scales(1, 4, 1, 3)) == ([(1, 1, 1, 3), (1, 4, 4, 64)])
 
     def test_real_config_schedule(self):
         # Cross-checked against the reference scipy implementation.
         from tokenspeed.runtime.models.inkling import inkling_plan_out_scales
 
-        self.assertEqual(
-            inkling_plan_out_scales(2, 40, 4, 3),
+        assert (inkling_plan_out_scales(2, 40, 4, 3)) == (
             [
                 (1, 1, 1, 3),
                 (1, 5, 5, 128),
                 (1, 10, 10, 320),
                 (1, 40, 40, 4800),
                 (2, 40, 40, 9600),
-            ],
+            ]
         )
 
 
-class TestInklingMultimodalConfig(unittest.TestCase):
+class TestInklingMultimodalConfig:
     def test_arch_flags(self):
         from tokenspeed.runtime.configs.model_config import (
             is_audio_model,
@@ -132,9 +129,9 @@ class TestInklingMultimodalConfig(unittest.TestCase):
         )
 
         arch = ["InklingForConditionalGeneration"]
-        self.assertTrue(is_multimodal_model(arch))
-        self.assertTrue(is_audio_model(arch))
-        self.assertFalse(is_audio_model(["Qwen3_5ForConditionalGeneration"]))
+        assert is_multimodal_model(arch)
+        assert is_audio_model(arch)
+        assert not (is_audio_model(["Qwen3_5ForConditionalGeneration"]))
 
     def test_placeholder_token_ids(self):
         from tokenspeed.runtime.configs.inkling_config import (
@@ -143,38 +140,29 @@ class TestInklingMultimodalConfig(unittest.TestCase):
         )
 
         cfg = load_inkling_config()
-        self.assertEqual(
-            cfg.image_placeholder_token_id, INKLING_IMAGE_PLACEHOLDER_TOKEN_ID
-        )
-        self.assertEqual(
-            cfg.audio_placeholder_token_id, INKLING_AUDIO_PLACEHOLDER_TOKEN_ID
-        )
-        self.assertEqual(cfg.eos_token_id, INKLING_MODEL_END_SAMPLING_TOKEN_ID)
-        self.assertEqual(
-            cfg.text_config.eos_token_id, INKLING_MODEL_END_SAMPLING_TOKEN_ID
-        )
+        assert (cfg.image_placeholder_token_id) == (INKLING_IMAGE_PLACEHOLDER_TOKEN_ID)
+        assert (cfg.audio_placeholder_token_id) == (INKLING_AUDIO_PLACEHOLDER_TOKEN_ID)
+        assert (cfg.eos_token_id) == (INKLING_MODEL_END_SAMPLING_TOKEN_ID)
+        assert (cfg.text_config.eos_token_id) == (INKLING_MODEL_END_SAMPLING_TOKEN_ID)
         # Checkpoint soft-placeholder IDs also give the text-only MTP draft
         # safe, modality-specific embeddings for media feature positions.
         default = InklingMMConfig()
-        self.assertEqual(
-            default.image_placeholder_token_id,
-            INKLING_IMAGE_PLACEHOLDER_TOKEN_ID,
+        assert (default.image_placeholder_token_id) == (
+            INKLING_IMAGE_PLACEHOLDER_TOKEN_ID
         )
-        self.assertEqual(
-            default.audio_placeholder_token_id,
-            INKLING_AUDIO_PLACEHOLDER_TOKEN_ID,
+        assert (default.audio_placeholder_token_id) == (
+            INKLING_AUDIO_PLACEHOLDER_TOKEN_ID
         )
-        self.assertEqual(default.eos_token_id, INKLING_MODEL_END_SAMPLING_TOKEN_ID)
-        self.assertEqual(
-            default.text_config.eos_token_id,
-            INKLING_MODEL_END_SAMPLING_TOKEN_ID,
+        assert (default.eos_token_id) == (INKLING_MODEL_END_SAMPLING_TOKEN_ID)
+        assert (default.text_config.eos_token_id) == (
+            INKLING_MODEL_END_SAMPLING_TOKEN_ID
         )
-        self.assertIsNone(default.audio_config.decoder_dmodel)
-        self.assertIsNone(default.vision_config.decoder_dmodel)
-        self.assertEqual(default.audio_config.dmel_min_value, -7.0)
-        self.assertEqual(default.audio_config.audio_rms_norm_floor, 0.01)
+        assert (default.audio_config.decoder_dmodel) is None
+        assert (default.vision_config.decoder_dmodel) is None
+        assert (default.audio_config.dmel_min_value) == (-7.0)
+        assert (default.audio_config.audio_rms_norm_floor) == (0.01)
         # Transport placeholder IDs must remain valid unsigned token IDs.
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             InklingMMConfig(image_placeholder_token_id=-1)
 
     def test_mrope_is_noop_for_tml(self):
@@ -196,12 +184,14 @@ class TestInklingMultimodalConfig(unittest.TestCase):
         positions, delta = compute_mrope_positions(
             cfg, [7, INKLING_IMAGE_PLACEHOLDER_TOKEN_ID] * 2, [item]
         )
-        self.assertIsNone(positions)
-        self.assertIsNone(delta)
+        assert (positions) is None
+        assert (delta) is None
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "runtime RMSNorm kernels need CUDA")
-class TestInklingAudioTower(unittest.TestCase):
+@pytest.mark.skipif(
+    not (torch.cuda.is_available()), reason=("runtime RMSNorm kernels need CUDA")
+)
+class TestInklingAudioTower:
     def test_matches_reference(self):
         from tokenspeed.runtime.models.inkling import InklingAudioTower
 
@@ -212,7 +202,7 @@ class TestInklingAudioTower(unittest.TestCase):
 
         dmel = torch.randint(0, vocab, (13, n_bins), device="cuda")
         out = tower(dmel)
-        self.assertEqual(out.shape, (13, cfg.decoder_dmodel))
+        assert (out.shape) == ((13, cfg.decoder_dmodel))
 
         # Hand-rolled reference: per-bin offset indexing + sum over bins.
         emb = tower.encoder.weight
@@ -232,7 +222,7 @@ class TestInklingAudioTower(unittest.TestCase):
         cfg = load_inkling_config().audio_config
         cfg.use_audio_norm = False
         tower = InklingAudioTower(cfg).cuda()
-        self.assertIsNone(tower.final_norm)
+        assert (tower.final_norm) is None
         dmel = torch.randint(0, cfg.mel_vocab_size, (3, cfg.n_mel_bins), device="cuda")
         emb = tower.encoder.weight
         ref = torch.stack(
@@ -284,17 +274,20 @@ class TestInklingAudioTower(unittest.TestCase):
         out_bytes = out.numel() * out.element_size()
         unfused_bytes = out_bytes * cfg.n_mel_bins
         # Generous ceiling: comfortably above the fused path, far below unfused.
-        self.assertLess(
-            peak,
-            out_bytes * 8,
+        _pytest_a_1 = peak
+        _pytest_b_2 = out_bytes * 8
+        _pytest_msg_3 = (
             f"peak {peak / 2**20:.1f} MB suggests the unfused lookup+sum is "
             f"back (unfused would be ~{unfused_bytes / 2**20:.1f} MB, output is "
-            f"{out_bytes / 2**20:.1f} MB)",
+            f"{out_bytes / 2**20:.1f} MB)"
         )
+        assert _pytest_a_1 < _pytest_b_2, _pytest_msg_3
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "runtime RMSNorm kernels need CUDA")
-class TestInklingHMLPPatchEncoder(unittest.TestCase):
+@pytest.mark.skipif(
+    not (torch.cuda.is_available()), reason=("runtime RMSNorm kernels need CUDA")
+)
+class TestInklingHMLPPatchEncoder:
     def test_released_config_shape_and_parity(self):
         from tokenspeed.runtime.models.inkling import InklingHMLPPatchEncoder
 
@@ -310,7 +303,7 @@ class TestInklingHMLPPatchEncoder(unittest.TestCase):
             device="cuda",
         )
         out = enc(x)
-        self.assertEqual(out.shape, (9, cfg.decoder_dmodel))
+        assert (out.shape) == ((9, cfg.decoder_dmodel))
         torch.testing.assert_close(
             out, _naive_hmlp_forward(enc, x), atol=1e-3, rtol=1e-3
         )
@@ -334,14 +327,16 @@ class TestInklingHMLPPatchEncoder(unittest.TestCase):
         enc = InklingHMLPPatchEncoder(cfg).cuda()
         x = torch.randn(3, 2, 40, 40, 3, device="cuda")
         out = enc(x)
-        self.assertEqual(out.shape, (3, 512))
+        assert (out.shape) == ((3, 512))
         torch.testing.assert_close(
             out, _naive_hmlp_forward(enc, x), atol=1e-3, rtol=1e-3
         )
 
 
-@unittest.skipUnless(_has_blackwell(), "Inkling e2e needs a Blackwell GPU (FA4)")
-class TestInklingMultimodalE2E(unittest.TestCase):
+@pytest.mark.skipif(
+    not (_has_blackwell()), reason=("Inkling e2e needs a Blackwell GPU (FA4)")
+)
+class TestInklingMultimodalE2E:
     """Engine-only e2e with synthetic features (no gateway).
 
     Mirrors the SMG servicer's precomputed-multimodal entry point:
@@ -353,7 +348,7 @@ class TestInklingMultimodalE2E(unittest.TestCase):
     AUDIO_TOKENS = 6
 
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         from tokenspeed.runtime.entrypoints.engine import Engine
 
         # Released config (towers on), layer-truncated + expert-shrunk via
@@ -379,7 +374,7 @@ class TestInklingMultimodalE2E(unittest.TestCase):
         )
 
     @classmethod
-    def tearDownClass(cls):
+    def teardown_class(cls):
         cls.engine.shutdown()
 
     # -- helpers ----------------------------------------------------------
@@ -424,12 +419,12 @@ class TestInklingMultimodalE2E(unittest.TestCase):
         )
         out = self.engine.llm.generate(obj)
         meta = out["meta_info"]
-        self.assertEqual(meta["completion_tokens"], max_new_tokens)
+        assert (meta["completion_tokens"]) == (max_new_tokens)
         logprobs = [pair[0] for pair in meta["output_token_logprobs"]]
         output_ids = [pair[1] for pair in meta["output_token_logprobs"]]
         for token_id in output_ids:
             # padded-vocab mask still active
-            self.assertLess(token_id, self.text.unpadded_vocab_size)
+            assert (token_id) < (self.text.unpadded_vocab_size)
         return output_ids, logprobs
 
     @classmethod
@@ -481,16 +476,15 @@ class TestInklingMultimodalE2E(unittest.TestCase):
         )
 
         # Same feature => deterministic.
-        self.assertEqual(a_ids, a2_ids)
-        self.assertEqual(a_lp, a2_lp)
+        assert (a_ids) == (a2_ids)
+        assert (a_lp) == (a2_lp)
         # The splice must reach the LM (with vs without differs). Image
         # feature CONTENT is not assertable under dummy weights — the deep
         # hMLP contracts inputs below bf16 visibility; the audio A-vs-B
         # check covers content observability.
-        self.assertTrue(
-            a_ids != base_ids or a_lp != base_lp,
-            "image feature did not change the model output",
-        )
+        assert (
+            a_ids != base_ids or a_lp != base_lp
+        ), "image feature did not change the model output"
 
     def test_audio_feature_replaces_placeholder_embeddings(self):
         ids, start = self._audio_prompt(self.AUDIO_TOKENS)
@@ -506,16 +500,14 @@ class TestInklingMultimodalE2E(unittest.TestCase):
             ids, [self._audio_item(4, self.AUDIO_TOKENS, start)]
         )
 
-        self.assertEqual(a_ids, a2_ids)
-        self.assertEqual(a_lp, a2_lp)
-        self.assertTrue(
-            a_ids != base_ids or a_lp != base_lp,
-            "audio feature did not change the model output",
-        )
-        self.assertTrue(
-            a_ids != b_ids or a_lp != b_lp,
-            "different audio features produced identical outputs",
-        )
+        assert (a_ids) == (a2_ids)
+        assert (a_lp) == (a2_lp)
+        assert (
+            a_ids != base_ids or a_lp != base_lp
+        ), "audio feature did not change the model output"
+        assert (
+            a_ids != b_ids or a_lp != b_lp
+        ), "different audio features produced identical outputs"
 
     def test_mixed_image_and_audio_request(self):
         """Interior image run + trailing audio run in one request: both
@@ -536,16 +528,15 @@ class TestInklingMultimodalE2E(unittest.TestCase):
             self._audio_item(6, self.AUDIO_TOKENS, aud_start),
         ]
         a_ids, a_lp = self._generate(ids, items)
-        self.assertEqual(len(a_ids), 8)
+        assert (len(a_ids)) == (8)
         items_b = [
             self._image_item(5, self.IMAGE_TOKENS, img_start),
             self._audio_item(7, self.AUDIO_TOKENS, aud_start),
         ]
         b_ids, b_lp = self._generate(ids, items_b)
-        self.assertTrue(
-            a_ids != b_ids or a_lp != b_lp,
-            "changing the trailing audio feature did not change the output",
-        )
+        assert (
+            a_ids != b_ids or a_lp != b_lp
+        ), "changing the trailing audio feature did not change the output"
 
     def test_text_only_prompt_still_works(self):
         # Plain text through the same engine (no precomputed mm): the
@@ -555,8 +546,8 @@ class TestInklingMultimodalE2E(unittest.TestCase):
             sampling_params={"temperature": 0.0, "max_new_tokens": 8},
         )
         result = out if isinstance(out, dict) else out[0]
-        self.assertEqual(result["meta_info"]["completion_tokens"], 8)
+        assert (result["meta_info"]["completion_tokens"]) == (8)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

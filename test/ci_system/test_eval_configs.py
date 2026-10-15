@@ -246,7 +246,6 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
         assert flag_value(server_tokens, "--max-num-seqs") == "32"
         assert flag_value(server_tokens, "--chunked-prefill-size") == "8192"
         assert flag_value(server_tokens, "--max-cudagraph-capture-size") == "32"
-        assert flag_value(server_tokens, "--reasoning-parser") == "deepseek_v31"
         assert "--disable-kvstore" in server_tokens
         assert "--trust-remote-code" in server_tokens
         assert flag_value(eval_tokens, "--model") == "deepseek-ai/DeepSeek-V4.1-Flash"

@@ -224,7 +224,17 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # extend_seq_lens_cpu holds those new-token counts in either case.
         max_seq_len_q = int(extend_seq_lens_cpu[:prefill_bs].max().item())
 
-        if extend_with_prefix and bool(extend_prefix_lens_cpu[:prefill_bs].any()):
+        if prefill_bs > num_extends:
+            # A target MIXED round: each decode request after the extend
+            # requests queries only its spec_num_tokens new rows (1 without
+            # speculation) at the end of its cache, as in a decode step.
+            q_lens = seq_lens.new_full((prefill_bs,), self.spec_num_tokens)
+            q_lens[:num_extends] = extend_seq_lens[:num_extends]
+            cu_seqlens_q = torch.nn.functional.pad(
+                torch.cumsum(q_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            max_seq_len_q = max(max_seq_len_q, self.spec_num_tokens)
+        elif extend_with_prefix and bool(extend_prefix_lens_cpu[:prefill_bs].any()):
             extend_lens = seq_lens[:prefill_bs] - extend_prefix_lens[:prefill_bs]
             cu_seqlens_q = torch.nn.functional.pad(
                 torch.cumsum(extend_lens, dim=0, dtype=torch.int32), (1, 0)

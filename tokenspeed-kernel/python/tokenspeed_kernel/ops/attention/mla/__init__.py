@@ -42,6 +42,24 @@ from tokenspeed_kernel.signature import (
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 
+def mla_prolog_available() -> bool:
+    """Whether the optional Ascend Lite MLA prolog is available."""
+    if not current_platform().is_npu:
+        return False
+    from tokenspeed_kernel_npu.ops.mla_prolog import mla_prolog_available as available
+
+    return available()
+
+
+def mla_prolog(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run the Ascend Lite MLA prolog when its input is eligible."""
+    if not current_platform().is_npu:
+        raise NotImplementedError("Lite MLA prolog is only available on Ascend")
+    from tokenspeed_kernel_npu.ops.mla_prolog import mla_prolog as npu_mla_prolog
+
+    return npu_mla_prolog(*args, **kwargs)
+
+
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
 
@@ -534,23 +552,19 @@ def _mla_normalize_project_query_fallback(
         eps=eps,
     )
     if platform.is_cdna5 and query.shape[0] > 1:
-        from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250
-        from tokenspeed_kernel.ops.gemm.triton_gemv import use_decode_gemv
+        from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250, mm
 
         if (
             _try_gluon_largem_gfx1250(query_norm, projection_weight, out=out)
             is not None
         ):
             return
-        if not use_decode_gemv(query_norm, projection_weight):
-            from tokenspeed_kernel.ops.gemm import mm
+        mm(query_norm, projection_weight, out=out)
+        return
 
-            mm(query_norm, projection_weight, out=out)
-            return
+    from tokenspeed_kernel.ops.gemm import mv
 
-    from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
-    decode_gemv(query_norm, projection_weight, out=out)
+    mv(query_norm, projection_weight, out=out)
 
 
 def mla_prefill_traits(
@@ -613,6 +627,9 @@ def mla_prefill(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    window_left: int = -1,
+    query_start_offsets: torch.Tensor | None = None,
 ) -> AttentionResult:
     """MLA prefill/cross-attention from explicit, non-cached Q/K/V tensors.
 
@@ -645,6 +662,13 @@ def mla_prefill(
         return_lse: Whether to also return natural-log log-sum-exp values with
             shape [total_q, num_q_heads]. Required when partial attention states
             will be merged.
+        window_left: Number of historical positions visible per query, or -1
+            for full history. Zero permits only the current position.
+        query_start_offsets: Optional contiguous int32/int64 [batch] tensor on
+            the query device. Entry i is the first query's position relative to
+            the first key in sequence i. Prefix replay chunks need these offsets
+            because their keys end before the query suffix. None aligns queries
+            to the end of the KV sequence, with the offset clamped at zero.
         out: Optional output tensor with shape [total_q, num_q_heads, v_head_dim].
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
@@ -656,6 +680,26 @@ def mla_prefill(
     # Problem sizes are read from shapes so selection never syncs and also
     # works under graph capture.
     batch_size = cu_seqlens_q.shape[0] - 1
+    if window_left < -1:
+        raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
+    if query_start_offsets is not None and (
+        query_start_offsets.shape != (batch_size,)
+        or query_start_offsets.dtype not in (torch.int32, torch.int64)
+        or query_start_offsets.device != q.device
+        or query_start_offsets.stride(0) != 1
+    ):
+        raise ValueError(
+            "query_start_offsets must be a contiguous int32/int64 [batch] tensor "
+            "on the query device"
+        )
+    features = set()
+    extra_kwargs = {}
+    if window_left >= 0:
+        features.add("sliding_window")
+        extra_kwargs["window_left"] = window_left
+    if query_start_offsets is not None:
+        features.add("query_start_offsets")
+        extra_kwargs["query_start_offsets"] = query_start_offsets
     traits = mla_prefill_traits(
         batch_size=batch_size,
         total_kv=k.shape[0],
@@ -671,6 +715,7 @@ def mla_prefill(
         "mla_prefill",
         signature,
         traits=traits,
+        features=frozenset(features),
         solution=solution,
         override=override,
     )
@@ -715,6 +760,7 @@ def mla_prefill(
             logit_cap=logit_cap,
             return_lse=return_lse,
             out=out,
+            **extra_kwargs,
         )
 
 
@@ -1286,6 +1332,9 @@ import tokenspeed_kernel.ops.attention.mla.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.tokenspeed_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.gluon  # noqa: E402,F401
+
+if current_platform().is_npu:
+    import tokenspeed_kernel.ops.attention.mla.ascend  # noqa: E402,F401
 
 # isort: on
 

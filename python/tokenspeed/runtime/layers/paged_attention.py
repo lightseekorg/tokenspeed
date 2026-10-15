@@ -408,7 +408,7 @@ class PagedAttention(nn.Module):
 
 class _CacheGroupSpecLike(Protocol):
     group_id: str
-    retention: str
+    attn_kind: str
     sliding_window_tokens: int | None
 
 
@@ -447,7 +447,7 @@ def bind_cache_groups(model: nn.Module, cache_pool: _CacheViewLike) -> None:
         if group_id is None:
             raise ValueError(
                 f"{model_name}: attention layer {name!r} (layer_id="
-                f"{module.layer_id}) has no history-family cache group in the "
+                f"{module.layer_id}) has no history cache group in the "
                 f"pool's plan (planned layers: {sorted(group_by_layer)})."
             )
         _check_visibility_within_retention(model_name, name, module, specs[group_id])
@@ -457,7 +457,7 @@ def bind_cache_groups(model: nn.Module, cache_pool: _CacheViewLike) -> None:
 def _check_visibility_within_retention(
     model_name: str, name: str, layer: PagedAttention, spec: _CacheGroupSpecLike
 ) -> None:
-    if spec.retention != "sliding_window":
+    if spec.attn_kind != "sliding_window":
         return
     window_left = layer.sliding_window_size
     retained = spec.sliding_window_tokens
@@ -498,7 +498,7 @@ def check_block_drafter_storage(
         if not isinstance(module, PagedAttention):
             continue
         group_id = module.group_id
-        if group_id not in target_groups or specs[group_id].retention != "full_history":
+        if group_id not in target_groups or specs[group_id].attn_kind != "full_history":
             raise ValueError(
                 f"{model_name}: block drafter layer {name!r} (layer_id="
                 f"{module.layer_id}) rides cache group {group_id!r}, but a block "
