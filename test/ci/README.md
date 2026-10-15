@@ -650,7 +650,7 @@ with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.2 by image digest.
 When upgrading, keep the FlashInfer Python requirement, release cubin checksum,
 and runner JIT-cache version aligned. FlashInfer 0.7.2 also requires
-cuDNN frontend 1.30.0 or newer and splits its JIT cache into provider packages.
+cuDNN frontend 1.31.0 or newer and splits its JIT cache into provider packages.
 GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
 index and checks their installed versions again after dependency installation.
 
