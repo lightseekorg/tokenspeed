@@ -20,7 +20,8 @@ import graph currently requires a CUDA-capable environment
 
 import os
 import sys
-import unittest
+
+import pytest
 
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,7 +33,7 @@ from tokenspeed.runtime.engine.async_llm import AsyncLLM  # noqa: E402
 from tokenspeed.runtime.engine.protocol import EngineClient  # noqa: E402
 
 
-class TestAsyncLLMSatisfiesEngineClient(unittest.TestCase):
+class TestAsyncLLMSatisfiesEngineClient:
     """D.3 invariant: ``AsyncLLM`` inherits ``EngineClient`` explicitly.
 
     MRO membership check keeps this test purely structural — no
@@ -43,16 +44,17 @@ class TestAsyncLLMSatisfiesEngineClient(unittest.TestCase):
 
     def test_async_llm_mro_contains_engine_client(self) -> None:
         mro_names = [cls.__name__ for cls in AsyncLLM.__mro__]
-        self.assertIn(
-            EngineClient,
-            AsyncLLM.__mro__,
+        _pytest_member_1 = EngineClient
+        _pytest_container_2 = AsyncLLM.__mro__
+        _pytest_msg_3 = (
             "AsyncLLM must explicitly inherit EngineClient so the "
             "OpenAI serving layer's EngineClient-typed callsites stay "
             "structurally sound. If this fails, check AsyncLLM's base "
             "class declaration in runtime/engine/async_llm.py. "
-            f"Current MRO: {mro_names}",
+            f"Current MRO: {mro_names}"
         )
+        assert _pytest_member_1 in _pytest_container_2, _pytest_msg_3
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))

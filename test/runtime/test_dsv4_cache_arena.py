@@ -25,9 +25,10 @@ with KVP4 using the same model, concurrency, indexer format and per-rank budget.
 """
 
 import sys
-import unittest
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
@@ -81,23 +82,21 @@ def _recipe(degree, fp4):
     )
 
 
-class Dsv4CacheArenaBenefitTest(unittest.TestCase):
-    def test_kvp_increases_capacity_with_the_same_cache_budget(self):
+class TestDsv4CacheArenaBenefitTest:
+    def test_kvp_increases_capacity_with_the_same_cache_budget(self, subtests):
         for fp4 in (False, True):
-            with self.subTest(fp4=fp4):
+            with subtests.test(fp4=fp4):
                 tp_recipe = _recipe(degree=1, fp4=fp4)
                 kvp_recipe = _recipe(degree=4, fp4=fp4)
-                self.assertEqual(
-                    tp_recipe.cache_budget_bytes, kvp_recipe.cache_budget_bytes
-                )
+                assert (tp_recipe.cache_budget_bytes) == (kvp_recipe.cache_budget_bytes)
                 tp = tp_recipe.setup().spec
                 kvp = kvp_recipe.setup().spec
                 for spec in (tp, kvp):
-                    self.assertGreater(spec.token_capacity, 0)
-                    self.assertLessEqual(
-                        spec.memory_plan.arena_bytes, tp_recipe.cache_budget_bytes
+                    assert (spec.token_capacity) > (0)
+                    assert (spec.memory_plan.arena_bytes) <= (
+                        tp_recipe.cache_budget_bytes
                     )
-                self.assertGreater(kvp.token_capacity, tp.token_capacity)
+                assert (kvp.token_capacity) > (tp.token_capacity)
                 print(
                     f"indexer={'FP4' if fp4 else 'FP8'} "
                     f"budget_bytes={tp_recipe.cache_budget_bytes} "
@@ -110,4 +109,4 @@ class Dsv4CacheArenaBenefitTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -3,13 +3,15 @@ Usage:
 
 To test a specific model:
 1. Add it to ALL_OTHER_MODELS
-2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels.test_others`
+2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m pytest test/runtime/models/test_generation_models.py::TestGenerationModels::test_others`
 """
 
 import os
 
 # CI Registration (parsed via AST, runtime no-op)
 import sys
+
+import pytest
 
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,7 +25,6 @@ import dataclasses
 import multiprocessing as mp
 import os
 import sys
-import unittest
 from typing import List
 
 import torch
@@ -131,10 +132,10 @@ QUALITY_CHECKS = [
 ]
 
 
-class TestGenerationModels(unittest.TestCase):
+class TestGenerationModels:
 
     @classmethod
-    def setUpClass(cls):
+    def setup_class(cls):
         mp.set_start_method("spawn", force=True)
 
     def assert_close_logits_and_output_strs(
@@ -186,11 +187,10 @@ class TestGenerationModels(unittest.TestCase):
                 expected = expected_by_prompt.get(prompt)
                 if expected is None:
                     continue
-                self.assertIn(
-                    expected,
-                    output,
-                    f"Expected {expected!r} in output for prompt {prompt!r}, got {output!r}",
-                )
+                _pytest_member_1 = expected
+                _pytest_container_2 = output
+                _pytest_msg_3 = f"Expected {expected!r} in output for prompt {prompt!r}, got {output!r}"
+                assert _pytest_member_1 in _pytest_container_2, _pytest_msg_3
 
     def test_ci_models(self):
         for model_case in CI_MODELS:
@@ -228,4 +228,4 @@ class TestGenerationModels(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
