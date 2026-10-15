@@ -26,7 +26,8 @@ import signal
 import sys
 import threading
 import time
-import unittest
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -62,23 +63,22 @@ def _never_ready(writer):
     time.sleep(_TIMEOUT_S * 10)
 
 
-class TestReadyPipe(unittest.TestCase):
-    def test_ready_message_reaches_parent(self) -> None:
-        proc, reader = self._start(_report_ready, (7,))
-        self.assertTrue(reader.poll(_TIMEOUT_S))
-        self.assertEqual(reader.recv(), {"status": "ready", "value": 7})
+class TestReadyPipe:
+    def test_ready_message_reaches_parent(self, start_process) -> None:
+        proc, reader = start_process(_report_ready, (7,))
+        assert reader.poll(_TIMEOUT_S)
+        assert reader.recv() == {"status": "ready", "value": 7}
 
     def test_killed_child_raises_eof_instead_of_blocking(self) -> None:
         proc, reader = start_process_with_ready_pipe(
             _die_before_ready, (), contextlib.nullcontext()
         )
         proc.join(_TIMEOUT_S)
-        self.assertEqual(proc.exitcode, -signal.SIGKILL)
-        self.assertTrue(
-            reader.poll(_TIMEOUT_S),
-            "recv() would block: the parent still holds the write end",
+        assert proc.exitcode == -signal.SIGKILL
+        assert reader.poll(_TIMEOUT_S), (
+            "recv() would block: the parent still holds the write end"
         )
-        with self.assertRaises(EOFError):
+        with pytest.raises(EOFError):
             reader.recv()
 
     def _receive_or_fail(self, started):
@@ -96,37 +96,37 @@ class TestReadyPipe(unittest.TestCase):
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         thread.join(_TIMEOUT_S)
-        self.assertFalse(thread.is_alive(), "receive_ready_messages hung")
+        assert not thread.is_alive(), "receive_ready_messages hung"
         return result
 
-    def _start(self, target, args=()):
-        proc, reader = start_process_with_ready_pipe(
-            target, args, contextlib.nullcontext()
-        )
-        self.addCleanup(proc.kill)
-        return proc, reader
+    @pytest.fixture
+    def start_process(self, request):
+        def start(target, args=()):
+            proc, reader = start_process_with_ready_pipe(
+                target, args, contextlib.nullcontext()
+            )
+            request.addfinalizer(proc.kill)
+            return proc, reader
 
-    def test_receive_returns_messages_in_reader_order(self) -> None:
-        started = [self._start(_report_ready, (value,)) for value in (1, 2)]
+        return start
+
+    def test_receive_returns_messages_in_reader_order(self, start_process) -> None:
+        started = [start_process(_report_ready, (value,)) for value in (1, 2)]
         messages = self._receive_or_fail(started)["messages"]
-        self.assertEqual([m["value"] for m in messages], [1, 2])
+        assert [m["value"] for m in messages] == [1, 2]
 
-    def test_receive_fails_when_another_rank_dies(self) -> None:
+    def test_receive_fails_when_another_rank_dies(self, start_process) -> None:
         # Rank 0 stays alive without reporting; rank 1 is killed. Waiting on
         # rank 0's pipe alone would hang.
-        started = [self._start(_never_ready), self._start(_die_before_ready)]
-        self.assertIn(
-            "Scheduler process 1", str(self._receive_or_fail(started)["error"])
-        )
+        started = [start_process(_never_ready), start_process(_die_before_ready)]
+        assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
 
-    def test_receive_fails_when_a_reported_rank_dies(self) -> None:
+    def test_receive_fails_when_a_reported_rank_dies(self, start_process) -> None:
         # Rank 1 reports and then dies while rank 0 is still loading: only
         # its process exit, not its pipe, shows it.
-        started = [self._start(_never_ready), self._start(_report_then_die)]
-        self.assertIn(
-            "Scheduler process 1", str(self._receive_or_fail(started)["error"])
-        )
+        started = [start_process(_never_ready), start_process(_report_then_die)]
+        assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
