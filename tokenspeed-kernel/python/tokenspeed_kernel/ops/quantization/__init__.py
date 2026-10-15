@@ -540,7 +540,8 @@ def quantize_fp8_with_gate(
     Args:
         x: BF16 rows [tokens, channels], with channels divisible by 128.
         gate: BF16 sigmoid logits with the same shape; rows may be strided.
-        norm_weight: Per-head [128] RMSNorm weight, or None to apply only gating.
+        norm_weight: Per-head [head_dim] RMSNorm weight, or None for gating only.
+            Its length must divide channels; FP8 groups remain 128 elements.
         eps: RMSNorm epsilon; unused when norm_weight is None.
         enable_pdl: Enable the producer/consumer programmatic-launch dependency.
 

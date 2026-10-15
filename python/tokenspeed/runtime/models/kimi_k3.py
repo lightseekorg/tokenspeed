@@ -1584,7 +1584,7 @@ class KimiLinearKDA(nn.Module):
         )
 
         core_out = core_out.reshape(num_tokens, hn * hd)
-        if self.head_dim == 128 and self.o_proj.supports_fp8_group128_input:
+        if self.o_proj.supports_fp8_group128_input:
             values, scales = quantize_fp8_with_gate(
                 core_out,
                 out_gate,
