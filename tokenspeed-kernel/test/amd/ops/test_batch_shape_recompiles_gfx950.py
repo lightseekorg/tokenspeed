@@ -374,9 +374,6 @@ def test_kda_fused_decode_batch_size():
             beta_logits=rows[:, 4 * width + head_dim :],
             A_log=torch.zeros(heads, device=DEVICE),
             dt_bias=torch.zeros(width, device=DEVICE),
-            output_gate=rows[:, 3 * width : 4 * width],
-            norm_weight=torch.ones(head_dim, device=DEVICE).bfloat16(),
-            norm_eps=1e-6,
             state_pool=state_pool,
             read_indices=torch.arange(batch, device=DEVICE, dtype=torch.int32),
             write_indices=torch.arange(
