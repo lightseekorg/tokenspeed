@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip(
@@ -33,6 +33,10 @@ if not is_cdna4():
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import gluon_bf16_moe  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (  # noqa: E402
     moe_align_block_size_device,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_fused import (  # noqa: E402
+    _fused_align_kernel,
+    moe_align_block_size_fused,
 )
 
 # DeepSeek-V3 TP=8 MoE reference shape.
@@ -452,3 +456,17 @@ def test_fp16_weight_moe_prefill_ep_filters_nonlocal_routes() -> None:
     peak = expected.abs().max().item()
     max_abs = (actual.float() - expected).abs().max().item()
     assert max_abs <= REL_TOL * peak + 1e-2, f"max_abs={max_abs}, peak={peak}"
+
+
+def test_decode_align_batch_size_does_not_recompile() -> None:
+    """Token counts inside one power-of-two route bucket share a compile."""
+    topk_ids = torch.randint(0, E, (32, TOPK), dtype=torch.int32, device="cuda")
+    topk_weights = torch.rand(32, TOPK, device="cuda")
+    # 9..15 tokens route 72..120 slots at top-8, all in the 128-slot bucket.
+    # Warm the route count with and without the divisible-by-16
+    # specialization.
+    for tokens in (9, 10):
+        moe_align_block_size_fused(topk_ids[:tokens], topk_weights[:tokens], E, 32)
+    with assert_no_triton_compile(_fused_align_kernel):
+        for tokens in (11, 12, 13, 15):
+            moe_align_block_size_fused(topk_ids[:tokens], topk_weights[:tokens], E, 32)
