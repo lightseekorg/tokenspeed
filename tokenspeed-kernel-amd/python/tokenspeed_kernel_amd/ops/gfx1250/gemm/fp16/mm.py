@@ -33,6 +33,9 @@ _LARGEM_WIDE_M = 4096
 _LARGEM_BLOCK_K = 128
 _LARGEM_PINGPONG_GROUP_M = 4
 _LARGEM_PINGPONG_MIN_N = 1536
+# A 2 x 2 CTA cluster multicasts each A and B panel to two CTAs, halving
+# their L2 reads; it measured best across the K3 shapes, ragged ones included.
+_LARGEM_PINGPONG_CLUSTER = (2, 2)
 # MI450 has eight XCDs, each with its own L2; workgroups are dispatched
 # round-robin over them.
 _LARGEM_NUM_XCDS = 8
@@ -1226,14 +1229,15 @@ def _wmma_tdm_dense_largem_kernel(
 def _wmma_tdm_dense_largem_pingpong_launch_metadata(grid, kernel, args):
     """Report useful FLOPs and the issued A/B tile reads plus the BF16 store."""
     m, n, k = args["M"], args["N"], args["K"]
-    block_m, block_n = args["BLOCK_M"], args["BLOCK_N"]
+    block_m, block_n = 256 * args["CTA_M"], 256 * args["CTA_N"]
     elem = args["a_ptr"].element_size()
     grid_m = triton.cdiv(m, block_m)
     grid_n = triton.cdiv(n, block_n)
     return {
         "name": f"{kernel.name} [M={m}, N={n}, K={k}]",
         "flops16": 2 * m * n * k,
-        # Every output tile streams its full A row panel and B column panel.
+        # Every cluster streams its A row panel and B column panel once; the
+        # multicast hands each to all of the cluster's CTAs.
         "bytes": (grid_n * m + grid_m * n) * k * elem + m * n * elem,
     }
 
@@ -1273,6 +1277,7 @@ def _largem_pingpong_consume(
     DOT_B: gl.constexpr,
     BLOCK_K: gl.constexpr,
     REFILL: gl.constexpr,
+    CLUSTER: gl.constexpr,
 ):
     # One K tile in two half-K steps. The two waves sharing a SIMD alternate
     # between stage0 (TDM issue + LDS reads) and stage1 (WMMA), so one wave's
@@ -1307,14 +1312,32 @@ def _largem_pingpong_consume(
             b_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
                 b_desc, add_offsets=[0, BLOCK_K]
             )
+        if CLUSTER:
+            # Keep the cluster's CTAs within one K tile of each other so
+            # each multicast refill finds every destination slot free.
+            gl.amd.cdna5.cluster.arrive()
     with gl.amd.warp_pipeline_stage("stage1"):
         acc = gl.amd.cdna5.wmma(a, b, acc)
+        if CLUSTER:
+            gl.amd.cdna5.cluster.wait()
     return a_desc, b_desc, acc
 
 
 @gluon.constexpr_function
-def _largem_pingpong_layouts(block_m, block_n, block_k, num_warps):
-    """Partitioned LDS layouts and the matching WMMA layout for one tile."""
+def _largem_pingpong_layouts(cta_m, cta_n, block_k, num_warps):
+    """LDS and WMMA layouts for a ``cta_m x cta_n`` cluster of 256 x 256 tiles.
+
+    The layouts span the whole cluster tile, and their CGA part places each
+    CTA's 256 x 256 slice, so one TDM load multicasts an A row panel to the
+    CTAs of a cluster row and a B column panel to those of a cluster column.
+    """
+    tile = 256
+    block_m, block_n = cta_m * tile, cta_n * tile
+    # CTA-id bits walk M first, then N; the same bases as
+    # make_cga_layout([cta_m, cta_n], [cta_m, cta_n], [0, 1]).
+    cga = [[1 << i, 0] for i in range(cta_m.bit_length() - 1)] + [
+        [0, 1 << i] for i in range(cta_n.bit_length() - 1)
+    ]
     padded_a = gl.PaddedSharedLayout.with_identity_for(
         [[block_k, 8]], [block_m, block_k], [1, 0]
     )
@@ -1323,7 +1346,7 @@ def _largem_pingpong_layouts(block_m, block_n, block_k, num_warps):
     )
     # Splitting the A rows and B columns across the two LDS partitions lets
     # paired waves read different partitions in the same instruction.
-    shared_a, shared_b, wmma_layout = gl.amd.cdna5.make_partitioned_dot_layouts(
+    _, _, local = gl.amd.cdna5.make_partitioned_dot_layouts(
         block_m,
         block_n,
         padded_a,
@@ -1332,10 +1355,35 @@ def _largem_pingpong_layouts(block_m, block_n, block_k, num_warps):
         [16, 16, 32],
         a_transposed=False,
         b_transposed=True,
+        slice_m=tile,
+        slice_n=tile,
+        transposed=True,
+    )
+    wmma_layout = gl.amd.AMDWMMALayout(
+        3, local.transposed, local.warp_bases, local.reg_bases, local.instr_shape, cga
+    )
+    cga_a = gl.DotOperandLayout(0, wmma_layout, 8).cga_layout
+    # B sits in LDS as [N, K], so its CGA bases swap the operand's (K, N).
+    cga_b = [[x[1], x[0]] for x in gl.DotOperandLayout(1, wmma_layout, 8).cga_layout]
+    shared_a, shared_b, _ = gl.amd.cdna5.make_partitioned_dot_layouts(
+        tile,
+        tile,
+        gl.PaddedSharedLayout.with_identity_for(
+            [[block_k, 8]], [block_m, block_k], [1, 0], cga_a
+        ),
+        gl.PaddedSharedLayout.with_identity_for(
+            [[block_k, 8]], [block_n, block_k], [1, 0], cga_b
+        ),
+        num_warps,
+        [16, 16, 32],
+        a_transposed=False,
+        b_transposed=True,
+        slice_m=tile,
+        slice_n=tile,
         transposed=True,
     )
     shared_out = gl.PaddedSharedLayout.with_identity_for(
-        [[block_n, 8]], [block_m, block_n], [1, 0]
+        [[tile, 8]], [block_m, block_n], [1, 0], cga
     )
     return shared_a, shared_b, shared_out, wmma_layout
 
@@ -1356,8 +1404,8 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
     M,
     N,
     K,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
+    CTA_M: gl.constexpr,
+    CTA_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     GROUP_M: gl.constexpr,
     NUM_XCDS: gl.constexpr,
@@ -1365,14 +1413,21 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
     """Eight-wave ping-pong BF16 CDNA5 GEMM for wide large-M projections.
 
     Computes ``out = A @ B.T`` for unit-inner-stride A ``[M, K]``, B ``[N, K]``
-    and out ``[M, N]``; K must be a multiple of BLOCK_K. Ragged M and N edges
-    are handled by bounding the TDM descriptors at the real M and N, which
-    zero-fills the loads past the edge and clips the TDM store.
+    and out ``[M, N]``; K must be a multiple of BLOCK_K. Each program is a
+    ``CTA_M x CTA_N`` cluster of CTAs, one 256 x 256 output tile each, that
+    share A and B panels through TDM multicast. Ragged M and N edges are
+    handled by bounding the TDM descriptors at the real M and N, which
+    zero-fills the loads past the edge and clips the TDM store; CTAs wholly
+    past the edge still run the loop, so every cluster barrier completes.
     """
     gl.static_assert(gl.num_warps() == 8, "ping-pong needs two waves per SIMD")
+    gl.static_assert(gl.num_ctas() == CTA_M * CTA_N, "one CTA per cluster tile")
+    BLOCK_M: gl.constexpr = CTA_M * 256
+    BLOCK_N: gl.constexpr = CTA_N * 256
+    CLUSTER: gl.constexpr = CTA_M * CTA_N > 1
     # Built here rather than passed in: layout objects are not valid launch
     # arguments for the JIT hooks (compile monitor) that serialize them.
-    layouts: gl.constexpr = _largem_pingpong_layouts(BLOCK_M, BLOCK_N, BLOCK_K, 8)
+    layouts: gl.constexpr = _largem_pingpong_layouts(CTA_M, CTA_N, BLOCK_K, 8)
     SHARED_A: gl.constexpr = layouts[0]
     SHARED_B: gl.constexpr = layouts[1]
     SHARED_OUT: gl.constexpr = layouts[2]
@@ -1431,6 +1486,7 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
             dot_b,
             BLOCK_K,
             True,
+            CLUSTER,
         )
     a_desc, b_desc, acc = _largem_pingpong_consume(
         a_smem,
@@ -1444,6 +1500,7 @@ def _wmma_tdm_dense_largem_pingpong_kernel(
         dot_b,
         BLOCK_K,
         False,
+        CLUSTER,
     )
 
     # The operand buffers are dead here, so the output staging tile reuses
@@ -1525,8 +1582,8 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
     # The ping-pong kernel writes its tile with one TDM store, so it needs a
     # contiguous output; narrower outputs leave its 256-wide grid underfilled.
     if m >= _LARGEM_WIDE_M and n >= _LARGEM_PINGPONG_MIN_N and out.is_contiguous():
-        block_m = block_n = 256
-        grid = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
+        cta_m, cta_n = _LARGEM_PINGPONG_CLUSTER
+        grid = triton.cdiv(m, 256 * cta_m) * triton.cdiv(n, 256 * cta_n)
         _wmma_tdm_dense_largem_pingpong_kernel[(grid,)](
             A,
             B,
@@ -1537,13 +1594,14 @@ def _launch_largem(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> None:
             m,
             n,
             k,
-            BLOCK_M=block_m,
-            BLOCK_N=block_n,
+            CTA_M=cta_m,
+            CTA_N=cta_n,
             BLOCK_K=_LARGEM_BLOCK_K,
             GROUP_M=_LARGEM_PINGPONG_GROUP_M,
             NUM_XCDS=_LARGEM_NUM_XCDS,
             num_warps=8,
             waves_per_eu=2,
+            num_ctas=cta_m * cta_n,
         )
         return
 

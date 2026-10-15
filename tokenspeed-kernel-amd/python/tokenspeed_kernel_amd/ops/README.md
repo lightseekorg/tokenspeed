@@ -423,9 +423,21 @@ through a double-buffered TDM pipeline. Each K step is two half-K rounds of
 other wave's WMMA on the same SIMD. A and B use partitioned padded LDS layouts
 so paired waves read different LDS partitions. TDM descriptors are bounded at
 the real M and N, which zero-fills loads past the edge; the tile is staged in
-the dead operand LDS and written by one clipped TDM store. Workgroups get
-contiguous tile runs per XCD (eight on MI450), grouped four row tiles per
-column sweep, so tiles sharing operands share an L2.
+the dead operand LDS and written by one clipped TDM store.
+
+Each program is a `2 x 2` CTA cluster. The A, B and output layouts carry a CGA
+part placing each CTA's `256 x 256` slice, so one TDM load multicasts an A row
+panel to both CTAs of a cluster row and a B panel to both of a cluster column,
+halving operand reads from L2. Every CTA joins a cluster arrive/wait per K
+tile, which keeps the cluster within one tile so each multicast refill finds
+its slot free. Edge clusters run whole: CTAs past M or N load zeros and store
+nothing, so the barriers always complete. The cluster bought 2 to 8% on the K3
+shapes over single CTAs; `4 x 4` and `4 x 1` were no better overall, and
+`2 x 2` pads at most one tile row or column. Unrolling the K loop by two to
+make the LDS slots static, as the upstream CDNA5 warp-pipeline example does,
+changed nothing. Clusters get contiguous runs per XCD (eight on MI450),
+grouped four cluster rows per column sweep, so clusters sharing operands
+share an L2.
 
 The 256-wide tile leaves a partial last wave when the tile count is not a
 multiple of 256 (896 tiles for `N = 7168`, 800 for `N = 6288`); that tail is
