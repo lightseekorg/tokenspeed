@@ -27,11 +27,9 @@ import torch
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_nvfp4 import (
+from tokenspeed_kernel.ops.moe.flashinfer import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
     TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT,
-)
-from tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant import (
     TRTLLM_UNQUANT_ISPP_ALIGNMENT,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -199,6 +197,16 @@ class MoELayer(torch.nn.Module):
         self._normalize_topk_weights = routing_config.get(
             "normalize_topk_weights", True
         )
+        # Route with the DeepSeekV3 correction bias added in FP32, in the
+        # kernel when it can, otherwise with TokenSpeed's top-k.
+        self._fp32_correction_bias = bool(
+            routing_config.get("fp32_correction_bias", False)
+        )
+        if (
+            self._fp32_correction_bias
+            and self._routing_method_type != RoutingMethodType.DeepSeekV3
+        ):
+            raise ValueError("fp32_correction_bias requires DeepSeekV3 routing")
 
         # Quantization config. ignored_layers (compressed-tensors) keys the MoE
         # block; exclude_modules (ModelOpt) keys the fused experts.
@@ -224,7 +232,7 @@ class MoELayer(torch.nn.Module):
             # The flashinfer_trtllm unquant kernels (SiLU/SwiGLU) declare
             # ispp_alignment={TRTLLM_UNQUANT_ISPP_ALIGNMENT}: 64, or 128 when
             # the installed FlashInfer launcher cannot be relaxed or built
-            # (ops/moe/flashinfer/trtllm_unquant.py); without padding
+            # (ops/moe/flashinfer.py); without padding
             # moe_plan does not select them for a misaligned intermediate
             # size. Other activations keep 128. The padded tail rows/columns
             # stay zero (create_dense_weight_pair zero-initializes) and
@@ -399,6 +407,7 @@ class MoELayer(torch.nn.Module):
             # trade exactly that away.
             fast_math=global_server_args_dict["numerics"] not in BITWISE_ENVELOPES,
             combine_order=combine_order,
+            fp32_correction_bias=self._fp32_correction_bias,
         )
 
         create_layer_weights(

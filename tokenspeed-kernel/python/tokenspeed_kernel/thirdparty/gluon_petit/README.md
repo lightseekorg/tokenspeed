@@ -18,7 +18,7 @@ SwiGLU) and DeepSeek V4 (EP8, 384 experts, top-6, 7168x3072, bias-free SiLU).
 The HIP VMM binding is compiled on first use through
 `torch.utils.cpp_extension`, so a ROCm development environment is required.
 
-The TokenSpeed adapter lives in `tokenspeed_kernel.ops.moe.gluon.petit` and
+The TokenSpeed adapter lives in `tokenspeed_kernel.ops.moe.gluon` and
 registers this runtime as the `gluon` solution with `gluon_petit_*` function
 and kernel registration names. The serving options are `--moe-backend gluon_petit`
 and `--all2all-backend gluon_petit`; the runtime maps the MoE backend to `gluon`
@@ -57,9 +57,23 @@ not require other waves to participate in a reduction. The thread compiler
 and its scalar stage ABI are removed. Matrix tiles use `amd.cdna4.mfma_scaled` with explicit operand and scale
 layouts. The per-wave register contract and K accumulation order are preserved.
 
+Prefix sums, subgroup gathers, quantization maxima, and packed scale-byte
+transposes use Gluon tensor operations. Their group axes fit within a wave,
+so they do not introduce shared-memory communication or cross-wave barriers.
+Ballot and read-first-lane remain explicit in polling and scheduling; instruction
+scheduling, memory completion, and low-precision conversion retain their native
+contracts.
+
 Partial scale loads suppress inactive lanes at the instruction: an out-of-range
 buffer address alone still writes zeros to LDS and can overwrite valid scales.
 The barrier utilities document publication scope and payload acquire semantics.
+
+Buffer resource methods call the LLVM adapter directly. The four-word load
+helper is shared with callers that need a tuple of register values rather than
+the array layout returned by `BufferResource.Load`. Buffer loads retain their
+instruction-level predication for LDS writes. Tensor refactors may change
+assembly; validate numerical behavior and use repeated full-path benchmark
+comparisons to guard performance.
 
 ## Validation
 

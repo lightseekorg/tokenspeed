@@ -64,8 +64,8 @@ class TestControlEndpointHelpers(unittest.TestCase):
         caps = rl_control.capabilities()
         self.assertEqual(caps["rl.pause_modes"], "wait,abort,keep")
         # Derived from the scheduler's dispatcher, which implements the
-        # distributed and Mooncake load paths; disk and tensor answer 501.
-        self.assertEqual(caps["rl.update_from"], "distributed,mooncake")
+        # disk, distributed and Mooncake load paths; tensor answers 501.
+        self.assertEqual(caps["rl.update_from"], "disk,distributed,mooncake")
         for key in (
             "rl.abort",
             "rl.flush_cache",
@@ -73,7 +73,6 @@ class TestControlEndpointHelpers(unittest.TestCase):
             "rl.reports_weight_version",
         ):
             self.assertEqual(caps[key], "true")
-        self.assertNotIn("disk", caps["rl.update_from"])
         self.assertNotIn("tensor", caps["rl.update_from"])
 
     def test_advertisement_carries_url_and_capabilities(self):
@@ -183,8 +182,9 @@ class TestRouteSemantics(unittest.TestCase):
             "/init_weights_update_group",
             "/update_weights_from_distributed",
             "/update_weights_from_mooncake",
-            # /update_weights_from_{disk,tensor} answer 501 before the body is
-            # read; see TestUnsupportedWeightUpdateSources.
+            "/update_weights_from_disk",
+            # /update_weights_from_tensor answers 501 before the body is read;
+            # see TestUnsupportedWeightUpdateSources.
             "/abort_request",
             "/update_weight_version",
         ):
@@ -254,19 +254,18 @@ class TestUnsupportedWeightUpdateSources(unittest.TestCase):
         llm = FakeLLM()
         return llm, TestClient(build_sglang_compat_app(llm))
 
-    def test_disk_is_501_and_forwards_nothing(self):
+    def test_disk_reaches_the_engine(self):
         llm, client = self._client()
         resp = client.post(
             "/update_weights_from_disk",
             json={"model_path": "/tmp/model", "weight_version": "v9"},
         )
-        self.assertEqual(resp.status_code, 501)
-        body = resp.json()
-        self.assertFalse(body["success"])
-        self.assertIn("update_weights_from_disk", body["message"])
-        self.assertIn("distributed", body["message"])
-        self.assertEqual(llm.updates, [])
-        self.assertEqual(llm.server_args.weight_version, "default")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            [type(obj).__name__ for obj in llm.updates],
+            ["UpdateWeightFromDiskReqInput"],
+        )
+        self.assertEqual(llm.server_args.weight_version, "v9")
 
     def test_tensor_is_501_and_forwards_nothing(self):
         llm, client = self._client()
@@ -302,21 +301,32 @@ class TestUnsupportedWeightUpdateSources(unittest.TestCase):
         self.assertEqual(len(llm.updates), 1)
 
     def test_guard_follows_the_scheduler_constant(self):
-        # Data-driven, not hard-coded: widen the supported set and the disk
-        # route reaches the engine again.
+        # Data-driven, not hard-coded: narrow the supported set and the disk
+        # route is refused; widen it and the tensor route reaches the engine.
         llm, client = self._client()
         with mock.patch.object(
             sglang_compat_http,
             "SUPPORTED_WEIGHT_UPDATE_SOURCES",
-            frozenset({"disk", "distributed"}),
+            frozenset({"distributed"}),
         ):
             resp = client.post(
                 "/update_weights_from_disk", json={"model_path": "/tmp/model"}
             )
+        self.assertEqual(resp.status_code, 501)
+        self.assertEqual(llm.updates, [])
+        with mock.patch.object(
+            sglang_compat_http,
+            "SUPPORTED_WEIGHT_UPDATE_SOURCES",
+            frozenset({"tensor", "distributed"}),
+        ):
+            resp = client.post(
+                "/update_weights_from_tensor",
+                json={"serialized_named_tensors": [], "flush_cache": False},
+            )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(
             [type(obj).__name__ for obj in llm.updates],
-            ["UpdateWeightFromDiskReqInput"],
+            ["UpdateWeightsFromTensorReqInput"],
         )
 
 

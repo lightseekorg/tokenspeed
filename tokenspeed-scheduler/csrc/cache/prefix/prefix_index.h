@@ -92,8 +92,6 @@ public:
     PrefixCacheIndex(PrefixCacheIndex&&) = default;
     PrefixCacheIndex& operator=(PrefixCacheIndex&&) = default;
 
-    std::uint32_t GroupId() const noexcept { return group_id_; }
-
     // Registers block_ref under key. If key already has a canonical block,
     // block_ref is replaced with a reference to that block.
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,

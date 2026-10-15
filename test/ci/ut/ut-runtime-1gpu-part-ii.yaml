@@ -1,0 +1,19 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-runtime-1gpu-part-ii
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi355-1gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 test/runtime/run_ci_suite.py --device cuda --suite runtime-1gpu --timeout-per-file 600 --auto-partition-id 1 --auto-partition-size 2
+report:
+  github_step_summary: true

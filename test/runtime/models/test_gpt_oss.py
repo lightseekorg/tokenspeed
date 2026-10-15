@@ -20,7 +20,6 @@ import subprocess
 import sys
 import time
 import unittest
-from typing import Optional
 
 import requests
 

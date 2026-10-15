@@ -33,10 +33,38 @@ from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroup
 from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     decode_write_locations,
     extend_write_locations,
+    window_write_locations,
 )
 
 FULL = "full_attention"
 SWA = "sliding_attention"
+
+
+class WindowWriteLocationsTest(unittest.TestCase):
+
+    def test_window_writes_its_slots_from_its_start(self):
+        # Pages [3, 5, 0] (P=4): windows inside, across, over the hole, past the table and at the int32 limit.
+        tables = torch.tensor([3, 5, 0], dtype=torch.int32).expand(2, 5, 3).contiguous()
+        page_sizes = torch.tensor([4, 4], dtype=torch.int32)
+        starts = torch.tensor([0, 2, 6, 10, 2**31 - 2], dtype=torch.int32)
+        expected = {
+            1: [12, 14, 22, 0, 0],
+            4: [12, 13, 14, 15, 14, 15, 20, 21, 22, 23] + [0] * 10,
+        }
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        for device in devices:
+            for n, slots in expected.items():
+                out = torch.full((2, 24), -7, dtype=torch.int32, device=device)
+                window_write_locations(
+                    tables.to(device),
+                    page_sizes.to(device),
+                    starts.to(device),
+                    out,
+                    5,
+                    n,
+                )
+                self.assertEqual(out[:, : 5 * n].tolist(), [slots, slots], (device, n))
+                self.assertTrue(bool((out[:, 5 * n :] == -7).all()), (device, n))
 
 
 class HoleOverflowRoutingTest(unittest.TestCase):
@@ -151,10 +179,10 @@ class MtpReanchorTest(unittest.TestCase):
         )
         geometry = CacheGroupGeometry(
             granularities={FULL: 4, SWA: 4},
-            families={FULL: "history", SWA: "history"},
+            attn_kinds={FULL: "full_history", SWA: "sliding_window"},
             full_history_group_id=FULL,
             row_geometry={FULL: (4, 1), SWA: (4, 1)},
-            retentions={FULL: ("full_history", None), SWA: ("sliding_window", 4)},
+            windows={FULL: None, SWA: 4},
         )
         router.bind(geometry, leaves)
         router.init_cuda_graph_state(4)

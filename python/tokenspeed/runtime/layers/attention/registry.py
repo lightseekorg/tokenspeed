@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
 from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
     is_deepseek_v4,
@@ -40,6 +41,9 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
     DeepseekV41Config,
     is_deepseek_v41_config,
+)
+from tokenspeed.runtime.layers.attention.configs.dots3_note import (
+    Dots3NoteAttentionConfig,
 )
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (
@@ -172,12 +176,12 @@ def _resolve_heterogeneous_draft_family(
 
 
 def _arena_allocated_bytes(arena) -> int:
-    """Bytes this model's cache actually occupies: the one arena allocation.
+    """Device bytes this model's cache owner actually occupies.
 
     Summing a pool's per-layer view sizes would answer a different question
     (and double-count aliased views), so read the owner directly.
     """
-    return int(arena.buffer.nbytes)
+    return int(arena.allocated_device_bytes)
 
 
 def _cache_storage_report(
@@ -211,20 +215,26 @@ def _cache_storage_report(
     # both models' layers.
     arena_bytes = _arena_allocated_bytes(arena)
     allocated_cache_bytes = arena_bytes + fixed_workspace_bytes
-    if allocated_cache_bytes > configured_cache_bytes:
+    storage = arena.storage_plan
+    planned_peak_bytes = allocated_cache_bytes + storage.temporary_workspace_bytes
+    if planned_peak_bytes > configured_cache_bytes:
         raise RuntimeError(
-            "allocated cache storage exceeds its profiled budget: "
-            f"{allocated_cache_bytes} > {configured_cache_bytes}"
+            "planned cache storage exceeds its profiled budget: "
+            f"{planned_peak_bytes} > {configured_cache_bytes}"
         )
     return {
         "configured_cache_bytes": int(configured_cache_bytes),
         "allocated_cache_bytes": allocated_cache_bytes,
+        "planned_peak_cache_bytes": planned_peak_bytes,
         "physical_token_capacity": physical_token_capacity,
         "capacity_source": "lcm_geometry",
         "geometry": geometry
         | {
             "arena_bytes": arena_bytes,
+            "host_history_bytes": arena.allocated_host_bytes,
             "fixed_workspace_bytes": fixed_workspace_bytes,
+            "offload_persistent_workspace_bytes": storage.persistent_workspace_bytes,
+            "offload_temporary_workspace_bytes": storage.temporary_workspace_bytes,
         },
     }
 
@@ -278,6 +288,7 @@ _HYBRID_GDN_ARCHITECTURES = {
 _HYBRID_MAMBA2_ARCHITECTURES = {
     "NemotronHForCausalLM",
     "NemotronHForCausalLMNextN",
+    "NemotronH_Nano_Omni_Reasoning_V3",
 }
 # Hybrid linear-attention models whose full-attention layers are MLA (not MHA)
 # and whose linear layers are KDA (per-channel gated delta rule), not GDN.
@@ -434,15 +445,6 @@ def _apply_backend_overrides(
     ``_create_attn_config`` call. The user's pre-override choice survives
     as ``profile.requested_backend``.
     """
-    if (
-        draft is not None
-        and "K3DSparkModel" in draft.architectures
-        and server_args.kv_parallel_size > 1
-    ):
-        raise ValueError(
-            "K3 DSpark does not support KVP (--kv-parallel-size > 1): context "
-            "KV injection does not translate virtual slots or mask nonowner writes"
-        )
     if "DeepseekV41ForCausalLM" in target.architectures:
         server_args.attention_backend = "deepseek_v41"
     elif target.is_deepseek_v4:
@@ -541,6 +543,8 @@ def _resolve_cache_family(
     """The one dispatch from family facts (plus built config) to the recipe."""
     if profile.model_profile is not None:
         return profile.model_profile.cache_family
+    if config.component(Dots3NoteAttentionConfig) is not None:
+        return "dots3_note"
     if config.component(DeepseekV41Config) is not None:
         return "deepseek_v41"
     if profile.is_deepseek_v4:
@@ -609,7 +613,7 @@ def create_paged_router(
     """Build the CacheGroupRouter for one side's paged attention.
 
     The router builds one ``PagedAttentionBackend`` leaf per paged
-    (history-family) cache group of the pool view bound later via
+    (history) cache group of the pool view bound later via
     ``set_cache_pool``; each leaf's kernel page size resolves from the
     config override, the leaf class default, or the group's own block
     granularity (``PagedAttentionBackend.resolve_kernel_page_size``).
@@ -619,6 +623,14 @@ def create_paged_router(
     )
 
     spec = config.component(SoftmaxAttnConfig)
+    if isinstance(spec, Dots3NoteAttentionConfig):
+        from tokenspeed.runtime.layers.attention.backends.dots3_note import (
+            create_dots3_note_router,
+        )
+
+        if backend_name not in (None, "dsa"):
+            raise ValueError("dots3-note requires the DSA/SWA paged router")
+        return create_dots3_note_router(config)
     name = backend_name if backend_name is not None else spec.backend_name
     if name == "hybrid_linear_attn":
         # The composite sentinel _apply_backend_overrides writes into
@@ -700,11 +712,12 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    config_cls = (
-        DeepseekV41Config
-        if is_deepseek_v41_config(model_config.hf_config)
-        else _CONFIG_CLS[arch]
-    )
+    if isinstance(model_config.hf_config, Dots3NoteConfig):
+        config_cls = Dots3NoteAttentionConfig
+    elif is_deepseek_v41_config(model_config.hf_config):
+        config_cls = DeepseekV41Config
+    else:
+        config_cls = _CONFIG_CLS[arch]
     config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
@@ -1148,9 +1161,18 @@ def _narrow_spec_for_pp(
     retains the complete plan separately for the PD wire contract.
     """
     stage_start, stage_end = ownership.resident_cache_window
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
+        plan_cache_storage,
+    )
+
+    memory_plan = spec.memory_plan.narrow_to_layers(stage_start, stage_end)
+    offload = None if spec.storage_plan is None else spec.storage_plan.offload
     return dataclasses.replace(
         spec,
-        memory_plan=spec.memory_plan.narrow_to_layers(stage_start, stage_end),
+        memory_plan=memory_plan,
+        storage_plan=plan_cache_storage(
+            memory_plan, spec.cache_group_specs, offload=offload
+        ),
     )
 
 
@@ -1167,21 +1189,18 @@ def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
 def _validate_hybrid_kvp_cache(spec: CachePoolSpec, *, kvp_size: int) -> None:
     """Validate declared storage, independent of recipe name or inheritance."""
     groups = spec.cache_group_specs
-    if not any(
-        group.family == "history" and group.retention == "full_history"
-        for group in groups
-    ):
+    if not any(group.attn_kind == "full_history" for group in groups):
         raise ValueError("Hybrid MLA KVP requires a full-history cache group")
     for group in groups:
-        if group.family == "history" and group.retention != "full_history":
+        if group.attn_kind == "sliding_window":
             raise ValueError(
                 f"Hybrid MLA KVP cache group {group.group_id!r} "
-                "must use full-history retention"
+                "must be a full-history group"
             )
-        expected = kvp_size if group.family == "history" else 1
+        expected = kvp_size if group.attn_kind != "state" else 1
         if group.shard_count != expected:
             raise ValueError(
-                f"Hybrid MLA KVP cache group {group.group_id!r} ({group.family}) "
+                f"Hybrid MLA KVP cache group {group.group_id!r} ({group.attn_kind}) "
                 f"requires shard_count={expected}, got {group.shard_count}"
             )
 

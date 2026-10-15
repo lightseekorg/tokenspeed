@@ -62,6 +62,7 @@ class ModelProfile:
             keeps the server default, or None to keep that default.
         request_token_history: Whether the model reads each request's
             committed token history (``ForwardContext.request_token_history``).
+        is_multimodal: Whether this checkpoint has an active-capable media encoder.
         tokenizer_kwargs: Extra keyword arguments for the model's tokenizer.
         attention_instances_per_layer: Attention modules per decoder layer:
             1 for the ordinary stack, 2 for paired layouts (two attention
@@ -81,6 +82,7 @@ class ModelProfile:
     default_attention_backend: str | None
     default_prefix_granularity: int | None
     request_token_history: bool
+    is_multimodal: bool
     tokenizer_kwargs: Mapping[str, object]
     attention_instances_per_layer: int
     numerics_envelopes: frozenset[str]

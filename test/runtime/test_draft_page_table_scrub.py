@@ -61,10 +61,10 @@ def _draft_router(rows: int = 8) -> CacheGroupRouter:
     router.bind(
         CacheGroupGeometry(
             granularities={FULL: 128},
-            families={FULL: "history"},
+            attn_kinds={FULL: "full_history"},
             full_history_group_id=FULL,
             row_geometry={FULL: (128, 1)},
-            retentions={FULL: ("full_history", None)},
+            windows={FULL: None},
         ),
         {FULL: _Leaf()},
     )
@@ -155,6 +155,9 @@ class IdleReplayScrubTest(unittest.TestCase):
                 vocab_size=32,
             ),
             device="cpu",
+            device_module=torch.cpu,
+            default_stream=torch.cpu.current_stream(),
+            execution_stream=torch.cpu.Stream(),
             config=SimpleNamespace(output_length=1),
             capturable_grammar=None,
             forward_step=_Step(),

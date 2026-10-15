@@ -126,18 +126,15 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 from tokenspeed.runtime.model_loader.utils import set_default_torch_dtype
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.models.deepseek_v4 import (
-    DeepseekV4ForCausalLM,
-    DeepseekV4MLP,
-    DeepseekV4MoE,
-)
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
     is_engram_embed_checkpoint_name,
     resolve_engram_host_layout,
 )
+from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MLP, DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
+from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -155,6 +152,14 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 _ROPE_TABLES = WeakValueDictionary()
+
+
+# Kernels implementing the reference 1x32 rounding below, bit for bit.
+_V41_FP8_QUANTIZER = (
+    "gluon_quantize_fp8_group32_ue8m0_gfx950"
+    if current_platform().is_cdna4
+    else "triton_quantize_fp8_group32_ue8m0"
+)
 
 
 def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -175,7 +180,7 @@ def v41_quantize_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             group_size=32,
             scale_encoding="ue8m0",
             enable_pdl=False,
-            override="triton_quantize_fp8_group32_ue8m0",
+            override=_V41_FP8_QUANTIZER,
             solution=None,
         )
     grouped = x.float().unflatten(-1, (-1, 32))
@@ -537,9 +542,9 @@ def v41_hc_pre(x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     """Collapse copies with the PREVIOUS sublayer's pre-mix, accumulating FP32."""
     if not x.is_cuda:
         return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
-    from tokenspeed_kernel.ops.residual.triton import mhc_apply_pre
+    from tokenspeed_kernel.ops.residual import mhc_apply_pre
 
-    return mhc_apply_pre(x, pre_mix)
+    return mhc_apply_pre(x, pre_mix, norm_weight=None, norm_eps=None)
 
 
 def v41_hc_post(
@@ -557,11 +562,11 @@ def v41_hc_post(
 def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     if not x.is_cuda:
         return _norm(v41_hc_pre(x, pre), norm)
-    from tokenspeed_kernel.ops.residual.triton import mhc_pre_layer_norm_hc4
+    from tokenspeed_kernel.ops.residual import mhc_apply_pre
 
-    out = x.new_empty((x.shape[0], x.shape[-1]))
-    mhc_pre_layer_norm_hc4(pre, x, norm.weight, out, eps=norm.variance_epsilon)
-    return out
+    return mhc_apply_pre(
+        x, pre, norm_weight=norm.weight, norm_eps=norm.variance_epsilon
+    )
 
 
 class DeepseekV41Compressor(nn.Module):
@@ -1730,8 +1735,10 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
-        return DeepseekV4ForCausalLM.get_model_config_for_expert_location(
-            config.text_config
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.n_routed_experts,
+            num_groups=getattr(config.text_config, "n_group", 0),
         )
 
     def resolve_model(self, config, mapping, quant_config, prefix):

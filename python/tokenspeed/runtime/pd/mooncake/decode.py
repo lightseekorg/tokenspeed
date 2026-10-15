@@ -330,16 +330,23 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
         # Report the requests associated with the failed bootstrap addr and mark their status as TransferPoll.Failed
         affected_rooms = []
         for room in possible_affected_rooms:
-            if (
-                room in self.request_status
-                and self.check_status(room) != TransferPoll.Success
-            ):
-                self.record_failure(
-                    room,
-                    f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
-                )
-                self.update_status(room, TransferPoll.Failed)
-                affected_rooms.append(room)
+            # One failure counts once: skip rooms that already succeeded,
+            # already failed (the prefill counted those on its side), or were
+            # already recorded here (e.g. after a receiver-side timeout).
+            status = self.room_status(room)
+            if status is None or status in (TransferPoll.Success, TransferPoll.Failed):
+                continue
+            with self.failure_lock:
+                already_counted = room in self.failure_records
+            if already_counted:
+                continue
+            self.record_failure(
+                room,
+                f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
+            )
+            self.kv_transfer_metrics.record_kv_transfer_failure()
+            self.update_status(room, TransferPoll.Failed)
+            affected_rooms.append(room)
         logger.error(
             "Losing connection with prefill instance (bootstrap_addr: "
             f"{failed_bootstrap_addr!s}), affected {len(affected_rooms)!s} requests",

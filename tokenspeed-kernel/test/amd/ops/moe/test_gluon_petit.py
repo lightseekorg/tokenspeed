@@ -24,7 +24,7 @@ from unittest import mock
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import moe_plan
-from tokenspeed_kernel.ops.moe.gluon.petit import (
+from tokenspeed_kernel.ops.moe.gluon import (
     _DSV4_PROFILE,
     _GPT_OSS_120B_PROFILE,
     _KIMI_K3_PROFILE,
@@ -232,15 +232,15 @@ def test_weight_preprocessor_repacks_and_releases_source_parameters() -> None:
     )
     with (
         mock.patch(
-            "tokenspeed_kernel.ops.moe.gluon.petit._validate_layer",
+            "tokenspeed_kernel.ops.moe.gluon._validate_layer",
             return_value=profile,
         ),
-        mock.patch("tokenspeed_kernel.ops.moe.gluon.petit._get_workspace"),
+        mock.patch("tokenspeed_kernel.ops.moe.gluon._get_workspace"),
         mock.patch(
-            "tokenspeed_kernel.ops.moe.gluon.petit._import_petit_kernel",
+            "tokenspeed_kernel.ops.moe.gluon._import_petit_kernel",
             return_value=petit_kernel,
         ),
-        mock.patch("tokenspeed_kernel.ops.moe.gluon.petit.torch.cuda.empty_cache"),
+        mock.patch("tokenspeed_kernel.ops.moe.gluon.torch.cuda.empty_cache"),
     ):
         gluon_petit_mxfp4_megamoe_weights(plan={}, w=module)
 
@@ -295,7 +295,7 @@ def test_apply_keeps_zero_token_rank_in_collective() -> None:
     x = torch.empty((0, profile.model_dim), dtype=torch.bfloat16)
 
     with mock.patch(
-        "tokenspeed_kernel.ops.moe.gluon.petit._get_workspace",
+        "tokenspeed_kernel.ops.moe.gluon._get_workspace",
         return_value=workspace,
     ):
         output = gluon_petit_mxfp4_megamoe_apply(

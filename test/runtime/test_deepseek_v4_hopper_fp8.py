@@ -20,11 +20,9 @@
 
 """DeepSeek V4-Flash Hopper (SM90) FP8 paths.
 
-Covers the pieces added for running V4-Flash on SM90 without FP4 tensor
-cores: the FP8 indexer query prep + paged gather, the BF16->block-FP8
-weight quantization used when a checkpoint ships ``attn.wo_a`` unquantized,
-and the shared-workspace plain all-reduce admission gates (lamport dtype
-sentinel, integer dtypes, hidden alignment, device, and empty inputs).
+Covers the FP8 indexer query prep + paged gather and the shared-workspace
+plain all-reduce admission gates (lamport dtype sentinel, integer dtypes,
+hidden alignment, device, and empty inputs).
 """
 
 from __future__ import annotations
@@ -44,7 +42,6 @@ from tokenspeed.runtime.layers.attention.deepseek_v4_ops import (
     gather_paged_indexer_fp8_cache,
     read_deepseek_v4_indexer_fp8_cache,
 )
-from tokenspeed.runtime.models.deepseek_v4 import DeepseekV4ForCausalLM
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
@@ -219,29 +216,6 @@ class TestPrepareIndexerQFp8(unittest.TestCase):
         )
         self.assertEqual(q_fp8.shape, (0, 64, INDEX_HEAD_DIM))
         self.assertEqual(weights_out.shape, (0, 64))
-
-
-class TestBlockQuantFp8Weight(unittest.TestCase):
-    def test_round_trip_within_fp8_error(self):
-        torch.manual_seed(0)
-        weight = torch.randn(256, 384, dtype=torch.bfloat16) * 3.0
-        qweight, scale_inv = DeepseekV4ForCausalLM._block_quant_fp8_weight(weight)
-        self.assertEqual(qweight.dtype, torch.float8_e4m3fn)
-        self.assertEqual(qweight.shape, weight.shape)
-        self.assertEqual(scale_inv.shape, (2, 3))
-
-        expanded = scale_inv.repeat_interleave(128, 0)[:256]
-        expanded = expanded.repeat_interleave(128, 1)[:, :384]
-        dequant = qweight.float() * expanded
-        rel_err = (dequant - weight.float()).abs().max() / weight.float().abs().max()
-        self.assertLess(float(rel_err), 0.05)
-
-    def test_non_multiple_of_block(self):
-        torch.manual_seed(0)
-        weight = torch.randn(130, 200, dtype=torch.bfloat16)
-        qweight, scale_inv = DeepseekV4ForCausalLM._block_quant_fp8_weight(weight)
-        self.assertEqual(qweight.shape, (130, 200))
-        self.assertEqual(scale_inv.shape, (2, 2))
 
 
 def _nvidia_cuda_available() -> bool:

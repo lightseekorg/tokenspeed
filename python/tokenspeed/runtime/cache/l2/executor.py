@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from enum import Enum
@@ -84,8 +85,11 @@ from tokenspeed.runtime.cache.transfer.lanes import (
     HostTransferLane,
     build_transfer_geometry,
     check_host_memory,
+    host_memory_share,
+    largest_pinned_fit,
     load_stream_priority,
     new_cache_stream,
+    pinned_host_bytes,
 )
 from tokenspeed.runtime.cache.transfer.layout import combine_cache_transfer_layouts
 from tokenspeed.runtime.cache.transfer.ops import (
@@ -132,6 +136,72 @@ class _Ack(NamedTuple):
     backup_pages: list[StoragePage]
 
 
+class _BackupTicket(NamedTuple):
+    """One L3 backup queued on the single-worker pool, with queue timing.
+
+    ``enqueued_at`` anchors the queue wait; a retry re-enqueues with a fresh
+    timestamp so the first attempt's PUT time is not charged to the queue.
+    """
+
+    future: Future
+    op_ids: list[int]
+    pages: list[StoragePage]
+    enqueued_at: float
+    payload_bytes: int
+
+
+class _BackupCompletion(NamedTuple):
+    """One finished backup attempt's timing, kept for diagnostics."""
+
+    pages: int
+    payload_bytes: int
+    queue_seconds: float
+    put_seconds: float
+    failed: bool
+
+
+class L3BackupBacklog(NamedTuple):
+    """Point-in-time pending backup queue state.
+
+    A slow PUT retains Host pages (and Device pages for pinned write-backs)
+    until the ACK; ``pending_pages`` / ``pending_bytes`` /
+    ``oldest_pending_seconds`` make that admission pressure visible.
+    """
+
+    pending_tasks: int
+    pending_pages: int
+    pending_bytes: int
+    oldest_pending_seconds: float
+
+
+class _BackupStats:
+    """Cumulative L3 backup diagnostics, mutated under the executor's lock.
+
+    ``recent`` keeps the last few completions (oldest first) so tests and
+    operators can attribute queue wait vs. PUT time to individual backups
+    without parsing logs.
+    """
+
+    def __init__(self) -> None:
+        self.completed = 0
+        self.failed = 0
+        self.retried = 0
+        self.completed_bytes = 0
+        self.queue_seconds = 0.0
+        self.put_seconds = 0.0
+        self.recent: deque[_BackupCompletion] = deque(maxlen=128)
+
+    def record(self, completion: _BackupCompletion) -> None:
+        if completion.failed:
+            self.failed += 1
+        else:
+            self.completed += 1
+            self.completed_bytes += completion.payload_bytes
+        self.queue_seconds += completion.queue_seconds
+        self.put_seconds += completion.put_seconds
+        self.recent.append(completion)
+
+
 class _PrefetchJob:
     """One in-flight L3 prefetch on the lane: the op, its pages by prefix page,
     and the future that resolves to the pages landed (a prefix length). A
@@ -165,6 +235,17 @@ def _num_host_lcm_blocks(
     return count
 
 
+def _min_over_ranks(value: int, cpu_group) -> int:
+    """``value``'s minimum over the gloo ``cpu_group``; ``value`` without one."""
+    if cpu_group is None:
+        return value
+    tensor = torch.tensor(value, dtype=torch.int64)
+    torch.distributed.all_reduce(
+        tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
+    )
+    return int(tensor.item())
+
+
 def allocate_blob_arena(rows: int, nbytes: int) -> torch.Tensor:
     """The pinned ``[rows, nbytes]`` uint8 slot-state arena."""
     return torch.empty((rows, nbytes), dtype=torch.uint8, pin_memory=nbytes > 0)
@@ -186,6 +267,8 @@ class HostCacheExecutor:
         io_backend: str,
         attn_tp_rank: int,
         kvp_rank: int,
+        nprocs_per_node: int,
+        world_cpu_group,
     ):
         """
         Args:
@@ -197,9 +280,11 @@ class HostCacheExecutor:
                 ``LoadBackOp`` are refused and a retraction image lives
                 wholly in the snapshot pool.
             host_ratio: L2 LCM blocks as a multiple of the Device's, when
-                ``host_size_gb`` is 0.
+                ``host_size_gb`` is 0; capped to what fits in every rank's
+                share of its node's Host memory.
             host_size_gb: L2 size in decimal gigabytes; overrides the ratio
-                when positive.
+                when positive and is never capped: one that does not fit is
+                refused.
             snapshot_pool: The retraction snapshot pool's knobs as
                 ``ServerArgs`` resolved them, sized here against this
                 rank's layout (``resolve_retraction_pool``); a disabled
@@ -214,6 +299,11 @@ class HostCacheExecutor:
             attn_tp_rank: Attention-TP rank; rank 0 logs.
             kvp_rank: This rank in the KVP subgroup; selects the blocks it
                 owns of a sharded group (the identity for replicated groups).
+            nprocs_per_node: The ranks on this node. They all pin their Host
+                tiers here at once, so each checks against an equal share
+                of the Host memory the node has available.
+            world_cpu_group: The gloo group of every rank, over which the L2
+                size is agreed; None with a single rank.
         """
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -247,7 +337,6 @@ class HostCacheExecutor:
                 host_ratio=host_ratio,
                 host_size_gb=host_size_gb,
             )
-        l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # --- retraction snapshot pool -----------------------------------------
         self.snapshot_sizing = resolve_retraction_pool(
             snapshot_pool,
@@ -265,11 +354,42 @@ class HostCacheExecutor:
             self.blob_bytes = self._slot_state.nbytes
         self.max_retracted_requests = self.snapshot_sizing.max_retracted_requests
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
-        arena_bytes = self.max_retracted_requests * self.blob_bytes
-        # Both tiers count against the one headroom check.
+        arena_bytes = (self.max_retracted_requests + 1) * self.blob_bytes
+        share_bytes = host_memory_share(
+            nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
+        )
+        # Each buffer takes the power of two its pinned allocation rounds to.
+        pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
+            arena_bytes
+        )
+        # The L2 blocks every rank's share holds beside the pool. Agreeing on
+        # it is also a barrier: no rank pins before every rank read its share.
+        fitting_l2_blocks = _min_over_ranks(
+            largest_pinned_fit(share_bytes - pool_pinned_bytes) // host_lcm_block_bytes,
+            world_cpu_group,
+        )
+        if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
+            # Only the ratio's size shrinks, to one size on every rank: the
+            # mirrored schedulers share one Host page count. An explicit
+            # --kvstore-size that does not fit is refused below instead.
+            logger.warning(
+                "Capped the compact Host L2 from "
+                f"{host_lcm_blocks * host_lcm_block_bytes / 1e9:.2f} GB to "
+                f"{fitting_l2_blocks * host_lcm_block_bytes / 1e9:.2f} GB per "
+                "rank, the most every rank's share of its node holds: "
+                f"--kvstore-ratio {host_ratio} asks for more. The "
+                f"{nprocs_per_node} ranks of a node pin Host memory together, "
+                "and each pinned buffer takes a power of two; this rank's share "
+                f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
+                "memory over its ranks, less "
+                f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
+            )
+            host_lcm_blocks = fitting_l2_blocks
+        l2_bytes = host_lcm_blocks * host_lcm_block_bytes
+        # Both tiers count against the one check, at the sizes they pin.
         check_host_memory(
-            l2_bytes + snapshot_bytes + arena_bytes,
-            headroom_bytes=_HOST_MEM_HEADROOM_BYTES,
+            pinned_host_bytes(l2_bytes) + pool_pinned_bytes,
+            share_bytes=share_bytes,
             purpose="the compact Host cache",
         )
 
@@ -317,8 +437,9 @@ class HostCacheExecutor:
                 rank=kvp_rank,
             )
             # One row per retracted request, indexed by the op's snapshot_slot.
+            # The scheduler numbers slots from 1, like request-pool indices.
             self.blob_arena = allocate_blob_arena(
-                self.max_retracted_requests, self.blob_bytes
+                self.max_retracted_requests + 1, self.blob_bytes
             )
         if l2_tier:
             logger.info(
@@ -407,7 +528,8 @@ class HostCacheExecutor:
         self._ack_lock = threading.Lock()
         self._load_poisoned = False
         self._ready_load_acks: list[int] = []
-        self._backup_futures: list[tuple[Future, list[int], list[StoragePage]]] = []
+        self._backup_futures: list[_BackupTicket] = []
+        self._backup_stats = _BackupStats()
         self._backup_poll_failed = False
         self._l3_workers: ThreadPoolExecutor | None = None
         # The L3 prefetch lane (one thread: the gets are prefix-ordered RPCs)
@@ -501,8 +623,8 @@ class HostCacheExecutor:
     def _wait_l3_backups(self) -> None:
         with self._ack_lock:
             inflight = list(self._backup_futures)
-        for future, _op_ids, _pages in inflight:
-            future.result()
+        for ticket in inflight:
+            ticket.future.result()
 
     def _wait_l3_prefetches(self) -> None:
         """Block until every in-flight prefetch has left the lane.
@@ -1016,10 +1138,10 @@ class HostCacheExecutor:
                 f"{type(op).__name__} {op.op_id} needs the retraction snapshot pool, "
                 "which --retraction-snapshot-ratio 0 removed"
             )
-        if not 0 <= int(op.snapshot_slot) < self.max_retracted_requests:
+        if not 1 <= int(op.snapshot_slot) <= self.max_retracted_requests:
             raise IndexError(
                 f"snapshot slot {op.snapshot_slot} outside "
-                f"[0, {self.max_retracted_requests}) for op {op.op_id}"
+                f"[1, {self.max_retracted_requests}] for op {op.op_id}"
             )
 
     def _append_snapshot_store(
@@ -1528,22 +1650,126 @@ class HostCacheExecutor:
         if workers is None:
             workers = ThreadPoolExecutor(max_workers=1, thread_name_prefix="l3-backup")
             self._l3_workers = workers
-        future = workers.submit(self._backup_to_storage, list(ack.backup_pages))
+        ticket = self._submit_backup(
+            workers,
+            op_ids=list(ack.op_ids),
+            pages=list(ack.backup_pages),
+            payload_bytes=self._backup_payload_bytes(ack.backup_pages),
+        )
         with self._ack_lock:
-            self._backup_futures.append(
-                (future, list(ack.op_ids), list(ack.backup_pages))
+            self._backup_futures.append(ticket)
+
+    def _backup_payload_bytes(self, pages: Sequence[StoragePage]) -> int:
+        """Total Host payload bytes covered by a backup, for backlog gauges.
+
+        Runs on the control plane inside ``poll_results``: this is pure
+        arithmetic on the scheduler-owned page geometry (no I/O), so it
+        cannot block the round.
+        """
+        total = 0
+        for group_id, host_block_id, _content_hash, _page_offset in pages:
+            _offset, size = self.host_storage.host_block_range(
+                int(group_id), int(host_block_id)
             )
+            total += int(size)
+        return total
+
+    def _submit_backup(
+        self,
+        workers: ThreadPoolExecutor,
+        *,
+        op_ids: list[int],
+        pages: list[StoragePage],
+        payload_bytes: int,
+    ) -> _BackupTicket:
+        enqueued_at = time.monotonic()
+        future = workers.submit(
+            self._run_backup_ticket,
+            pages=pages,
+            enqueued_at=enqueued_at,
+            payload_bytes=payload_bytes,
+        )
+        return _BackupTicket(
+            future=future,
+            op_ids=op_ids,
+            pages=pages,
+            enqueued_at=enqueued_at,
+            payload_bytes=payload_bytes,
+        )
+
+    def _run_backup_ticket(
+        self, *, pages: list[StoragePage], enqueued_at: float, payload_bytes: int
+    ) -> None:
+        """Worker entry: run the PUT and record queue wait vs. transfer time."""
+        started = time.monotonic()
+        failed = True
+        try:
+            self._backup_to_storage(pages)
+            failed = False
+        finally:
+            completion = _BackupCompletion(
+                pages=len(pages),
+                payload_bytes=payload_bytes,
+                queue_seconds=max(started - enqueued_at, 0.0),
+                put_seconds=max(time.monotonic() - started, 0.0),
+                failed=failed,
+            )
+            self._record_backup_completion(completion)
+
+    def _record_backup_completion(self, completion: _BackupCompletion) -> None:
+        with self._ack_lock:
+            self._backup_stats.record(completion)
+            # The completing ticket still sits in ``_backup_futures`` until the
+            # control plane collects it, so this backlog counts it: its pages
+            # stay pinned until the WriteBackDone is actually emitted.
+            backlog = self._backup_backlog_locked(now=time.monotonic())
+        if completion.failed:
+            # ``_collect_finished_backups`` logs the failure and the retry.
+            return
+        logger.info(
+            f"[L3] backup done pages={completion.pages} "
+            f"bytes={completion.payload_bytes} "
+            f"queue_ms={completion.queue_seconds * 1e3:.2f} "
+            f"put_ms={completion.put_seconds * 1e3:.2f} "
+            f"pending_pages={backlog.pending_pages} "
+            f"pending_bytes={backlog.pending_bytes} "
+            f"oldest_pending_ms={backlog.oldest_pending_seconds * 1e3:.1f}"
+        )
+
+    def _backup_backlog_locked(self, *, now: float) -> L3BackupBacklog:
+        pending_pages = 0
+        pending_bytes = 0
+        oldest: float | None = None
+        for ticket in self._backup_futures:
+            pending_pages += len(ticket.pages)
+            pending_bytes += ticket.payload_bytes
+            oldest = (
+                ticket.enqueued_at
+                if oldest is None
+                else min(oldest, ticket.enqueued_at)
+            )
+        return L3BackupBacklog(
+            pending_tasks=len(self._backup_futures),
+            pending_pages=pending_pages,
+            pending_bytes=pending_bytes,
+            oldest_pending_seconds=(0.0 if oldest is None else max(now - oldest, 0.0)),
+        )
+
+    def l3_backup_backlog(self) -> L3BackupBacklog:
+        """Snapshot of pending L3 backup pages/bytes and oldest queue wait."""
+        with self._ack_lock:
+            return self._backup_backlog_locked(now=time.monotonic())
 
     def _collect_finished_backups(self, results: list) -> None:
         with self._ack_lock:
             inflight = list(self._backup_futures)
             self._backup_futures = []
-        still: list[tuple[Future, list[int], list[StoragePage]]] = []
-        for future, op_ids, pages in inflight:
-            if not future.done():
-                still.append((future, op_ids, pages))
+        still: list[_BackupTicket] = []
+        for ticket in inflight:
+            if not ticket.future.done():
+                still.append(ticket)
                 continue
-            failed = future.exception()
+            failed = ticket.future.exception()
             if failed is not None:
                 logger.error(
                     "L3 backup failed; retrying and reporting a rank-local "
@@ -1553,14 +1779,21 @@ class HostCacheExecutor:
                 self._backup_poll_failed = True
                 workers = self._l3_workers
                 if workers is not None:
+                    with self._ack_lock:
+                        self._backup_stats.retried += 1
                     still.append(
-                        (workers.submit(self._backup_to_storage, pages), op_ids, pages)
+                        self._submit_backup(
+                            workers,
+                            op_ids=ticket.op_ids,
+                            pages=ticket.pages,
+                            payload_bytes=ticket.payload_bytes,
+                        )
                     )
                 else:
-                    still.append((future, op_ids, pages))
+                    still.append(ticket)
                 continue
-            future.result()
-            results.extend(self._write_done(op_id) for op_id in op_ids)
+            ticket.future.result()
+            results.extend(self._write_done(op_id) for op_id in ticket.op_ids)
         with self._ack_lock:
             self._backup_futures.extend(still)
 
@@ -1616,8 +1849,8 @@ class HostCacheExecutor:
         for ack in pending:
             if ack.kind is _AckKind.WRITE_BACK:
                 self._backup_to_storage(ack.backup_pages)
-        for future, _op_ids, _pages in inflight:
-            future.result()
+        for ticket in inflight:
+            ticket.future.result()
         workers = self._l3_workers
         if workers is not None:
             workers.shutdown(wait=True)

@@ -64,14 +64,17 @@ from tokenspeed.runtime.configs import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
+from tokenspeed.runtime.configs.dots3_note_config import Dots3NoteConfig
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashConfig
 from tokenspeed.runtime.configs.nemotron_h_config import NemotronHConfig
+from tokenspeed.runtime.configs.nemotron_omni_config import NemotronHOmniConfig
 from tokenspeed.runtime.utils import lru_cache_frozenset
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 logger = logging.getLogger(__name__)
 
 _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
+    Dots3NoteConfig.model_type: Dots3NoteConfig,
     Qwen2Config.model_type: Qwen2Config,
     Qwen3Config.model_type: Qwen3Config,
     Qwen3MoeConfig.model_type: Qwen3MoeConfig,
@@ -93,6 +96,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     InklingMMConfig.model_type: InklingMMConfig,
     Glm53FlashConfig.model_type: Glm53FlashConfig,
     NemotronHConfig.model_type: NemotronHConfig,
+    NemotronHOmniConfig.model_type: NemotronHOmniConfig,
     "glm5_next": Glm53FlashConfig,
 }
 
@@ -474,6 +478,9 @@ def get_config(
         else:
             config.architectures[0] += "NextN"
 
+    if text_config.architectures == ["Dots3NoteForCausalLMNextN"]:
+        config = text_config = text_config.for_mtp()
+
     if text_config.architectures == ["LlamaForCausalLMNextN"]:
         text_config.num_hidden_layers = 1
 
@@ -507,12 +514,26 @@ def get_config(
         "Qwen3ASRForConditionalGeneration",
         "Qwen3ASRConfig",
         "MiniMaxM3SparseForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
+        "NemotronHOmniConfig",
     ]:
         if config is text_config:
             return config
         config.text_config = text_config
         return config
 
+    # Plugin VLMs own their composite config just like the built-in wrappers.
+    # Keep model-specific configuration out of this architecture allowlist.
+    from tokenspeed.runtime.plugins.registry import registered_model
+
+    entry = registered_model(resolve_architecture(config))
+    if entry is not None:
+        if entry.cls.model_profile(config).is_multimodal:
+            return config
+        # A composite checkpoint can register a text-only draft. Keep its
+        # selected entry architecture when returning the language config.
+        if config is not text_config:
+            text_config.architectures = list(config.architectures)
     return text_config
 
 

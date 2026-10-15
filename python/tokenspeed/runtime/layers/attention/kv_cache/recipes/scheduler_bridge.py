@@ -35,9 +35,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from tokenspeed_scheduler import (
+    AttnKind,
     CacheGroupConfig,
-    CacheGroupFamily,
-    CacheRetention,
     CacheTransferPolicy,
     CapacityModel,
     SchedulerConfig,
@@ -46,13 +45,10 @@ from tokenspeed_scheduler import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 
 # Spec vocabulary -> scheduler enum.
-_RETENTION_MAP = {
-    "full_history": CacheRetention.FullHistory,
-    "sliding_window": CacheRetention.SlidingWindow,
-}
-_FAMILY_MAP = {
-    "history": CacheGroupFamily.History,
-    "state": CacheGroupFamily.State,
+_ATTN_KIND_MAP = {
+    "full_history": AttnKind.Full,
+    "sliding_window": AttnKind.SlidingWindow,
+    "state": AttnKind.State,
 }
 _TRANSFER_POLICY_MAP = {
     "full_suffix": CacheTransferPolicy.FullSuffix,
@@ -90,29 +86,25 @@ def cache_group_config(
             ``spec.shard_count``).
 
     Raises:
-        ValueError: A retention, family or transfer policy the scheduler has
-            no enum for.
+        ValueError: A kind or transfer policy the scheduler has no enum for.
     """
-    retention = _RETENTION_MAP.get(spec.retention)
-    if retention is None:
+    attn_kind = _ATTN_KIND_MAP.get(spec.attn_kind)
+    if attn_kind is None:
         raise ValueError(
-            f"cache_group_config: unsupported retention {spec.retention!r} "
+            f"cache_group_config: unsupported kind {spec.attn_kind!r} "
             f"for group {spec.group_id!r}"
         )
-    family = _FAMILY_MAP.get(spec.family)
-    if family is None:
-        raise ValueError(
-            f"cache_group_config: unsupported family {spec.family!r} "
-            f"for group {spec.group_id!r}"
-        )
-    # The declaration shape (row geometry or state checkpoint) stops here:
-    # the scheduler only learns how many tokens one block-table slot spans.
+    # The row-geometry shape stops here: the scheduler only learns how many
+    # tokens one block-table slot of a history group spans. A state group's
+    # blocks cover no span; the scheduler reads 0 as "no span" and rejects
+    # anything else for a State group.
     kwargs = dict(
         group_id=spec.group_id,
-        block_granularity=int(spec.block_granularity),
+        block_granularity=(
+            int(spec.block_granularity) if spec.attn_kind != "state" else 0
+        ),
         total_pages=int(total_pages),
-        retention=retention,
-        family=family,
+        attn_kind=attn_kind,
         cache_blocks_per_lcm_block=int(cache_blocks_per_lcm_block),
         shard_count=spec.shard_count,
     )
@@ -124,12 +116,7 @@ def cache_group_config(
                 f"{spec.transfer_policy!r} for group {spec.group_id!r}"
             )
         kwargs["transfer_policy"] = mapped_policy
-    if spec.retention == "sliding_window":
-        if spec.sliding_window_tokens is None or spec.sliding_window_tokens <= 0:
-            raise ValueError(
-                f"cache_group_config: sliding group {spec.group_id!r} needs a "
-                "positive sliding_window_tokens"
-            )
+    if spec.attn_kind == "sliding_window":
         kwargs["sliding_window_tokens"] = int(spec.sliding_window_tokens)
     # Always stated, False included: a group silently left cached when its
     # recipe declared it replayable would change what the prefix hit means.

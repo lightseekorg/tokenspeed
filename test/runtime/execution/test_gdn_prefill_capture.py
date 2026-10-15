@@ -22,7 +22,7 @@
 
 import os
 import sys
-from dataclasses import fields, replace
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -45,7 +45,6 @@ from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E402
     MambaForwardMetadata,
-    _build_prefill_checkpoint_batch,
 )
 from tokenspeed.runtime.layers.attention.configs.linear_attn import (  # noqa: E402
     LinearAttnConfig,
@@ -100,17 +99,13 @@ def _backend():
     )
     backend = GdnAttnBackend(config, spec)
     backend.cache_pool = object()
-    backend._prefix_granularity = 128
     return backend
 
 
-def _source(lengths, prefixes, page_shift, *, checkpoint_states):
+def _source(lengths, prefixes, page_shift):
     lengths = torch.tensor(lengths)
     host = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
     bounds = host.to(device="cuda", dtype=torch.int32)
-    checkpoint = _build_prefill_checkpoint_batch(
-        lengths, torch.tensor(prefixes), lengths.numel(), 128, "cuda"
-    )
     pages = torch.arange(lengths.numel(), device="cuda", dtype=torch.int32)
     pages = pages + page_shift
     from tokenspeed_kernel.ops.attention.gdn.triton import (
@@ -120,7 +115,7 @@ def _source(lengths, prefixes, page_shift, *, checkpoint_states):
 
     return MambaForwardMetadata(
         query_start_loc=bounds,
-        scan_query_start_loc=bounds,
+        scan_query_start_loc=bounds.clone(),
         query_start_loc_int64=bounds.long(),
         extend_seq_lens_cpu=lengths,
         cu_extend_seq_lens_cpu=host,
@@ -132,10 +127,6 @@ def _source(lengths, prefixes, page_shift, *, checkpoint_states):
             )
         },
         state_out_blocks_by_group={"state": pages},
-        state_checkpoint_blocks_by_group=(
-            {"state": pages + checkpoint_states} if checkpoint is not None else None
-        ),
-        prefill_checkpoint_batch=checkpoint,
         conv_prefill_metadata=build_causal_conv1d_prefill_metadata(
             bounds, lengths, CAUSAL_CONV1D_BLOCK_M
         ),
@@ -154,7 +145,7 @@ def test_uncaptured_shapes_keep_the_scheduler_metadata():
     backend = _backend()
     if not backend.admits_prefill_graph(512, 1, ForwardMode.EXTEND):
         pytest.skip("the selected GDN scan is not graph-capturable here")
-    source = _source([300], [0], 2, checkpoint_states=4)
+    source = _source([300], [0], 2)
     backend.forward_metadata = source
     assert backend.prepare_prefill_metadata(512, 1, ForwardMode.EXTEND, capture=False)
     assert backend.forward_metadata is source
@@ -183,11 +174,6 @@ def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size):
         backend.forward_metadata.state_out_blocks_by_group["state"],
         conv,
         states,
-    )
-    backend._layer_prefill_checkpoint_blocks = lambda layer_id: (
-        backend.forward_metadata.state_checkpoint_blocks_by_group["state"]
-        if backend.forward_metadata.state_checkpoint_blocks_by_group is not None
-        else None
     )
     kwargs = dict(
         conv_weights=torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16)
@@ -228,24 +214,21 @@ def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size):
         states.copy_(initial_states)
 
     def live(lengths, prefixes, page_shift):
-        return _source(lengths, prefixes, page_shift, checkpoint_states=4)
+        return _source(lengths, prefixes, page_shift)
 
+    # Prefix hits end at arbitrary tokens; a resumed row reads block 1.
     cases = []
-    for checkpoint_count in range(batch_size + 1):
+    for resumed in range(batch_size + 1):
         for tail_lengths, prefix in [([837, 325, 197, 197], 0), ([70] * 4, 127)]:
-            lengths = tail_lengths[:checkpoint_count] + [128] * (
-                batch_size - checkpoint_count
-            )
-            prefixes = [prefix] * checkpoint_count + [0] * (
-                batch_size - checkpoint_count
-            )
+            lengths = tail_lengths[:resumed] + [128] * (batch_size - resumed)
+            prefixes = [prefix] * resumed + [0] * (batch_size - resumed)
             cases.extend([(lengths, prefixes), (lengths[::-1], prefixes[::-1])])
     if batch_size == 1:
-        cases.extend([([837], [50304]), ([769], [0]), ([1023], [128]), ([2047], [0])])
+        cases.extend([([837], [50303]), ([769], [0]), ([1023], [129]), ([2047], [0])])
     if batch_size == 4:
         for actual_bs in (3, 1, 2, 3):
-            cases.append(([64 + i for i in range(actual_bs)], [50304] * actual_bs))
-            cases.append(([837] + [128] * (actual_bs - 1), [50304] * actual_bs))
+            cases.append(([64 + i for i in range(actual_bs)], [50303] * actual_bs))
+            cases.append(([837] + [128] * (actual_bs - 1), [50303] * actual_bs))
     cases.append(([1] * batch_size, [0] * batch_size))
 
     owner = object.__new__(PrefillGraph)
@@ -282,12 +265,15 @@ def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size):
     capture, captured = owner._captures[bucket, batch_size]
     output = captured.hidden_states
     assert capture.num_segments == 1
-    fixed = backend._prefill_metadata[bucket, batch_size].prefill_checkpoint_batch
-    addresses = {
-        field.name: getattr(fixed, field.name).data_ptr()
-        for field in fields(fixed)
-        if isinstance(getattr(fixed, field.name), torch.Tensor)
+    fixed = backend._prefill_metadata[bucket, batch_size]
+    retained = {
+        "query_start_loc": fixed.query_start_loc,
+        "scan_query_start_loc": fixed.scan_query_start_loc,
+        "query_start_loc_int64": fixed.query_start_loc_int64,
+        "state_in": fixed.state_in_blocks_by_group["state"],
+        "state_out": fixed.state_out_blocks_by_group["state"],
     }
+    addresses = {name: tensor.data_ptr() for name, tensor in retained.items()}
     for index, (lengths, prefixes) in enumerate(cases * 2):
         tokens = sum(lengths)
         source = live(lengths, prefixes, 2 + index % 2)
@@ -309,7 +295,7 @@ def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size):
         reset()
         capture.replay(valid_rows=tokens)
         assert addresses == {
-            name: getattr(fixed, name).data_ptr() for name in addresses
+            name: tensor.data_ptr() for name, tensor in retained.items()
         }
         torch.testing.assert_close(output[:tokens], eager, rtol=0, atol=0)
         torch.testing.assert_close(conv, eager_conv, rtol=0, atol=0)

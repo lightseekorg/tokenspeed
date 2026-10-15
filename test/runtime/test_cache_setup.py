@@ -187,73 +187,6 @@ def _mha_config() -> AttnConfig:
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
 
 
-def test_deepseek_v4_mtp_reads_window_from_cache_group():
-    from tokenspeed.runtime.layers.attention import registry
-    from tokenspeed.runtime.utils.server_args import ServerArgs
-
-    args = ServerArgs(
-        model="x",
-        device="cpu",
-        prefix_granularity=256,
-        max_num_seqs=2,
-        chunked_prefill_size=256,
-        speculative_algorithm="EAGLE",
-        speculative_num_steps=3,
-        speculative_num_draft_tokens=4,
-        attention_use_fp4_indexer_cache=False,
-    )
-    args.mapping.rank = 0
-    model_fields = dict(
-        model_profile=None,
-        attention_arch=registry.AttentionArch.MLA,
-        dtype=torch.bfloat16,
-        context_len=512,
-        num_attention_heads=64,
-        num_key_value_heads=1,
-        head_dim=512,
-        kv_lora_rank=512,
-        qk_nope_head_dim=448,
-        qk_rope_head_dim=64,
-        v_head_dim=512,
-        scaling=512**-0.5,
-    )
-    hf_fields = dict(
-        compress_ratios=(1, 4, 1),
-        head_dim=512,
-        qk_rope_head_dim=64,
-        index_head_dim=128,
-        sliding_window=256,
-    )
-    target = SimpleNamespace(
-        **model_fields,
-        num_attention_layers=2,
-        hf_config=SimpleNamespace(**hf_fields, architectures=["DeepseekV4ForCausalLM"]),
-    )
-    draft = SimpleNamespace(
-        **model_fields,
-        num_attention_layers=1,
-        hf_config=SimpleNamespace(
-            **hf_fields, architectures=["DeepseekV4ForCausalLMNextN"]
-        ),
-    )
-    build = registry.create_attn_components(
-        args,
-        target,
-        gpu_id=0,
-        rank=0,
-        gpu_memory=0,
-        draft_model_config=draft,
-        graph_reserve_bytes=0,
-        post_profile_bytes=0,
-        probe_batch_rows=1,
-        profiled_cache_bytes=32 << 20,
-        reuse_target_backend=None,
-        reuse_draft_backend=None,
-    )
-    assert build.attn_backend._swa_window_tokens() == 256
-    assert build.draft_attn_backend._swa_window_tokens() == 256
-
-
 @pytest.mark.parametrize(
     "is_draft,width,num_layers,layerwise,ring_rows",
     [(False, 1, 3, True, 4), (True, 4, 1, False, 7)],
@@ -365,7 +298,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
         **kwargs,
     ) -> None:
         super().__init__(
-            server_args=SimpleNamespace(max_total_tokens=None),
+            server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
             model_config=None,
             attn_config=_ns_config(
                 prefix_granularity=4,
@@ -418,10 +351,8 @@ class _SyntheticHybridRecipe(CacheRecipe):
             (
                 CacheGroupSpec(
                     group_id=self._extra_state_group,
-                    retention="full_history",
+                    attn_kind="state",
                     sliding_window_tokens=None,
-                    family="state",
-                    checkpoint_granularity=self.prefix_granularity,
                     replayable=False,
                 ),
                 (CacheFieldSpec("layer.0.state", "slot.0", (128,), "uint8"),),
@@ -503,6 +434,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         **_model_wide_kwargs(),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         prefix_granularity=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
@@ -601,6 +533,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         components=(replace(target_spec, cache_layer_types=(FULL_ATTENTION,)),),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=draft_tokens,
@@ -666,6 +599,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         else None
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         block_size=64,
         max_total_tokens=None,
         speculative_num_draft_tokens=width,
@@ -742,7 +676,7 @@ def test_ordinary_mha_reserves_null_parent_within_cache_budget(
         sliding_window_tokens=512,
     )
     attn_config = replace(attn_config, components=(mha,))
-    server_args = SimpleNamespace(max_total_tokens=None)
+    server_args = SimpleNamespace(kv_offload_config=None, max_total_tokens=None)
 
     setup = prepare_cache_setup(
         family="mha",
@@ -782,7 +716,7 @@ def test_ordinary_mla_reserves_null_parent_within_cache_budget() -> None:
         hf_config=SimpleNamespace(),
     )
     attn_config = _mla_config()
-    server_args = SimpleNamespace(max_total_tokens=None)
+    server_args = SimpleNamespace(kv_offload_config=None, max_total_tokens=None)
 
     setup = prepare_cache_setup(
         family="mla",
@@ -828,7 +762,7 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
 
     setup = prepare_cache_setup(
         family=family,
-        server_args=SimpleNamespace(max_total_tokens=None),
+        server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
         model_config=model_config,
         attn_config=target_attn_config,
         draft_model_config=draft_model_config,
@@ -986,6 +920,7 @@ def test_deepseek_v4_draft_pd_is_rejected_for_an_ordinary_target(
         lambda config: getattr(config, "is_deepseek_v4", False),
     )
     server_args = SimpleNamespace(
+        kv_offload_config=None,
         attention_backend=None,
         drafter_attention_backend=None,
         disaggregation_mode="prefill",
@@ -1081,9 +1016,8 @@ def test_hybrid_draft_only_sliding_group_packs_by_ratio() -> None:
 def test_union_contract_flows_draft_groups_to_scheduler_config() -> None:
     """No new contract: the one spec publishes draft-only
     groups as ordinary groups; pool publication and the scheduler config
-    conversion carry them with their natural retention — the C++ side
-    instantiates its existing SwaManager for them, no draft concept
-    anywhere."""
+    conversion carry them with their own kind -- the C++ side treats them as
+    any sliding-window group, no draft concept anywhere."""
     from test.runtime.cache_pool_test_utils import MinimalCacheView
 
     import torch
@@ -1174,7 +1108,8 @@ def test_qwen_mtp_padding_allowance_tracks_draft_planes() -> None:
             "linear_attention",
             "full_attention",
         ) * full_attention_layers
-        recipe.draft_attn_config = object() if draft_layers else None
+        recipe.attn_config = _mha_config()
+        recipe.draft_attn_config = _mha_config() if draft_layers else None
         recipe.draft_model_config = SimpleNamespace(num_attention_layers=draft_layers)
         return QwenGDNRecipe.max_padding_fraction.fget(recipe)
 
@@ -1187,6 +1122,144 @@ def test_qwen_mtp_padding_allowance_tracks_draft_planes() -> None:
             )
             < 1e-9
         )
+
+
+def _qwen_gdn_setup(
+    full_attention_layers: int,
+    *,
+    gdn_layers_per_block: int = 3,
+    target_kv_dtype: torch.dtype = torch.bfloat16,
+    draft_kv_heads: int | None = None,
+):
+    """Plan Qwen3.5 blocks of GDN layers and one attention layer; an SSM state is one bf16 K page."""
+    labels = (
+        (LINEAR_ATTENTION,) * gdn_layers_per_block + (FULL_ATTENTION,)
+    ) * full_attention_layers
+    target_spec = MHAConfig(
+        backend_name="fa2",
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=128,
+        attn_tp_size=1,
+        cache_layer_types=labels,
+    )
+    components = (target_spec,)
+    if gdn_layers_per_block:
+        components += (
+            LinearAttnConfig(
+                num_k_heads=8,
+                num_v_heads=8,
+                head_k_dim=32,
+                head_v_dim=32,
+                conv_kernel_size=4,
+                layer_ids=tuple(
+                    layer_id
+                    for layer_id, label in enumerate(labels)
+                    if label == LINEAR_ATTENTION
+                ),
+                tp_size=1,
+            ),
+        )
+    attn_config = AttnConfig(
+        components=components,
+        **_model_wide_kwargs(
+            kv_cache_dtype=target_kv_dtype, prefix_granularity=128, kernel_page_size=128
+        ),
+    )
+    draft_attn_config = None
+    if draft_kv_heads is not None:
+        draft_spec = replace(
+            target_spec,
+            num_attention_heads=draft_kv_heads,
+            num_kv_heads=draft_kv_heads,
+            cache_layer_types=(FULL_ATTENTION,),
+        )
+        draft_attn_config = replace(
+            attn_config, components=(draft_spec,), kv_cache_dtype=torch.bfloat16
+        )
+    return prepare_cache_setup(
+        family="qwen_gdn",
+        server_args=SimpleNamespace(
+            kv_offload_config=None,
+            block_size=64,
+            max_total_tokens=None,
+            speculative_num_draft_tokens=3,
+            speculative_eagle_topk=1,
+            enable_replay_ssm=False,
+        ),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(text_config=SimpleNamespace()),
+        ),
+        attn_config=attn_config,
+        draft_model_config=SimpleNamespace(
+            num_attention_layers=int(draft_kv_heads is not None)
+        ),
+        draft_attn_config=draft_attn_config,
+        cache_budget_bytes=1 << 28,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+
+def _page_padding(memory_plan) -> dict[str, int]:
+    """Bytes of each group's page that none of its fields use."""
+    payload = {}
+    for field in memory_plan.fields:
+        payload[field.group_id] = payload.get(field.group_id, 0) + field.payload_bytes
+    return {
+        group.group_id: memory_plan.lcm_block_bytes // group.cache_blocks_per_lcm_block
+        - payload[group.group_id]
+        for group in memory_plan.groups
+    }
+
+
+@pytest.mark.parametrize(
+    "draft_kv_heads,target_kv_dtype",
+    [(4, torch.bfloat16), (1, torch.float8_e4m3fn)],
+)
+def test_qwen_recipe_plans_a_draft_layer_wider_than_a_target_attention_layer(
+    draft_kv_heads, target_kv_dtype
+) -> None:
+    """GDN groups pad over a draft layer's K/V planes wider in bytes than a target attention layer's."""
+    # More KV heads, or bf16 over an FP8 target: wider in bytes than a target attention layer.
+    setup = _qwen_gdn_setup(
+        2, target_kv_dtype=target_kv_dtype, draft_kv_heads=draft_kv_heads
+    )
+
+    fields_by_id = {field.field_id: field for field in setup.spec.memory_plan.fields}
+    assert fields_by_id["layer.3.k"].shape == (128, 1, 128)
+    assert fields_by_id["layer.8.k"].shape == (128, draft_kv_heads, 128)
+    assert fields_by_id["layer.8.k"].dtype == "bfloat16"
+    assert fields_by_id["layer.8.k"].group_id == FULL_ATTENTION
+    assert setup.spec.token_capacity > 0
+
+
+def test_qwen_state_blocks_carry_no_attention_planes() -> None:
+    """A GDN state block holds its SSM states and conv windows only; KV pages pad by the conv windows."""
+    plan = _qwen_gdn_setup(2, gdn_layers_per_block=2).spec.memory_plan
+    conv_bytes = {
+        field.payload_bytes for field in plan.fields if field.field_id.endswith(".conv")
+    }.pop()
+
+    # Two attention layers' K and V span four SSM states: all four GDN layers share one page.
+    assert _page_padding(plan) == {
+        FULL_ATTENTION: 4 * conv_bytes,
+        "linear_attention_0": 0,
+    }
+
+
+def test_qwen_mtp_draft_layer_fills_state_segments() -> None:
+    """An MTP layer of a target attention layer's bytes takes segments the state layers fill too."""
+    plan = _qwen_gdn_setup(2, draft_kv_heads=1).spec.memory_plan
+    fields = {field.field_id: field for field in plan.fields}
+    state_planes = {
+        field.plane_id for field in plan.fields if field.field_id.endswith(".ssm")
+    }
+
+    assert fields["layer.8.k"].group_id == FULL_ATTENTION
+    assert {fields["layer.8.k"].plane_id, fields["layer.8.v"].plane_id} <= state_planes
+    assert _page_padding(plan)["linear_attention_0"] == 0
 
 
 def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
@@ -1226,7 +1299,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         (None, "tokenspeed_mla", None),
         ("trtllm_mla", None, "does not support MLA DCP"),
         (None, "trtllm_mla", r"\(DCP decode\) currently requires"),
-        (None, "flashmla", "does not yet support speculation"),
+        (None, "flashmla", None),
     ],
 )
 def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
@@ -1286,8 +1359,8 @@ def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
     def profile(**kwargs):
         config = kwargs["attn_config"]
         assert config.component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
-        assert (
-            built_draft[0].component(SoftmaxAttnConfig).backend_name == "tokenspeed_mla"
+        assert built_draft[0].component(SoftmaxAttnConfig).backend_name == (
+            draft_backend or "tokenspeed_mla"
         )
         raise ReadyForAllocation
 
@@ -1332,8 +1405,8 @@ def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(
         assert args.drafter_attention_backend == draft_backend
 
 
-@pytest.mark.parametrize("degree", [1, 2])
-def test_kimi_dspark_rejects_sharded_context_writes(degree):
+@pytest.mark.parametrize("degree", [1, 2, 8])
+def test_kimi_dspark_preserves_backend_with_kvp(degree):
     from tokenspeed.runtime.layers.attention import registry
 
     def side(architecture):
@@ -1352,12 +1425,9 @@ def test_kimi_dspark_rejects_sharded_context_writes(degree):
     )
     target = side("KimiK3ForConditionalGeneration")
     draft = side("K3DSparkModel")
-    if degree > 1:
-        with pytest.raises(ValueError, match="K3 DSpark does not support KVP"):
-            registry._apply_backend_overrides(args, target, draft)
-    else:
-        registry._apply_backend_overrides(args, target, draft)
-        assert args.drafter_attention_backend == "tokenspeed_mla"
+    registry._apply_backend_overrides(args, target, draft)
+    assert args.attention_backend == registry.HYBRID_LINEAR_ATTN_BACKEND
+    assert args.drafter_attention_backend == "tokenspeed_mla"
 
 
 class _Sized(Exception):
@@ -1450,7 +1520,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
         enforce_eager=False,
         enable_memory_saver=False,
         gpu_memory_utilization=0.9,
-        mapping=SimpleNamespace(world_size=1, world_group=None),
+        mapping=SimpleNamespace(world_size=1, world_group=None, is_first_pp_rank=True),
     )
     with pytest.raises(_Sized) as sized:
         device.build_device_side(
@@ -1551,7 +1621,10 @@ def test_the_admission_builds_the_pool_the_budget_left_out(
         attn_tp_group=[0],
         pg_manager=None,
     )
-    prefill = SimpleNamespace(disaggregation_mode="prefill")
+    prefill = SimpleNamespace(
+        disaggregation_mode="prefill",
+        mapping=SimpleNamespace(is_first_pp_rank=True),
+    )
     assert sum(registered) == recv_pool.recv_pool_bytes(prefill, True)
     pool = slots * slot_mb << 20 if slots > 0 and slot_mb > 0 else 0
     assert sum(registered) == pool
@@ -1585,7 +1658,7 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
         disaggregation_mode=mode,
         disaggregation_bootstrap_port=0,
         disaggregation_ib_device=None,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1)),
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1), is_first_pp_rank=True),
     )
     facts = SimpleNamespace(device="cpu", hidden=16, num_deepstack=0, dtype=None)
     prefill_admission.make_epd_prefill_admission(
@@ -1593,7 +1666,11 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
         0,
         model_config=SimpleNamespace(is_multimodal=True, is_multimodal_active=active),
         encoder_model_facts=lambda: facts,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=[0])),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(tp_group=[0]),
+            is_first_pp_rank=True,
+            has_pp=False,
+        ),
         attn_tp_rank=0,
         attn_tp_size=1,
         attn_tp_cpu_group=None,

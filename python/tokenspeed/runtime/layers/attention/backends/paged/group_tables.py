@@ -52,6 +52,7 @@ import torch
 from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     decode_write_locations,
     extend_write_locations,
+    window_write_locations,
 )
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -338,6 +339,19 @@ class GroupTableStacks:
         stack and the live ``seq_lens`` (one launch for every group)."""
         decode_write_locations(
             self.tables, self.page_sizes, seq_lens, self.decode_locs, bs, tokens_per_req
+        )
+
+    def compute_window_locations(
+        self, bs: int, window_starts: torch.Tensor, tokens_per_req: int
+    ) -> None:
+        """:meth:`compute_decode_locations` of the windows starting at ``window_starts``."""
+        window_write_locations(
+            self.tables,
+            self.page_sizes,
+            window_starts,
+            self.decode_locs,
+            bs,
+            tokens_per_req,
         )
 
     def extend_locations(

@@ -63,7 +63,7 @@ def collect(sweep_dir: Path):
             if not summary_path.is_file():
                 continue
             s = json.loads(summary_path.read_text())
-            tpot_ms = s["TPOT (ms)"]
+            tpot_ms = s["Avg TPOT (ms)"]
             decode_tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
             tps_gpu = s["Total Throughput (tok/s)"] / n_gpus
             rows.append(

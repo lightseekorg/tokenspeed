@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import time
 
+import torch.distributed as dist
 import zmq
 
 from tokenspeed.runtime.cache.embedding_cache import (
@@ -58,6 +59,37 @@ from tokenspeed.runtime.utils.env import envs, global_server_args_dict_update
 from tokenspeed.runtime.utils.jit_compile_check import mark_jit_compile_serving
 
 logger = get_colorful_logger(__name__)
+
+
+def _submit_encode_requests(
+    worker: EncodeWorker,
+    requests: list[object],
+    *,
+    tp_cpu_group: dist.ProcessGroup | None,
+) -> None:
+    encode_requests = []
+    for request in requests:
+        if isinstance(request, EncodeRequest):
+            encode_requests.append(request)
+        else:
+            logger.warning(
+                f"encode loop ignoring unsupported scheduler message "
+                f"{type(request).__name__}"
+            )
+    handles = [
+        item.feature_shm
+        for request in encode_requests
+        for item in request.items
+        if item.feature_shm is not None
+    ]
+    for handle in handles:
+        handle.attach()
+    if handles and tp_cpu_group is not None:
+        # submit() consumes and unlinks pixels even on an embedding-cache hit.
+        # Every TP peer must open all segments before any peer may unlink them.
+        dist.barrier(group=tp_cpu_group)
+    for request in encode_requests:
+        worker.submit(request)
 
 
 # Vision-embedding cache capacity. L1 lives in GPU VRAM; the optional L2 lives in
@@ -284,18 +316,7 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
                 new_reqs, attn_global_rank, tp_cpu_group, src=attn_tp_src_rank
             )
 
-        for request in new_reqs:
-            # The encode loop only speaks EncodeRequest and has no reply channel
-            # for scheduler control queries (pause state, flush, ...). A stray
-            # control message used to reach worker.submit and take the whole
-            # loop down on a missing attribute; drop it and say so instead.
-            if not isinstance(request, EncodeRequest):
-                logger.warning(
-                    f"encode loop ignoring unsupported scheduler message "
-                    f"{type(request).__name__}",
-                )
-                continue
-            worker.submit(request)
+        _submit_encode_requests(worker, new_reqs, tp_cpu_group=tp_cpu_group)
         drained = len(new_reqs) > 0
 
         # Encode + ship one scheduler batch. step() returns 0 when idle. All ranks

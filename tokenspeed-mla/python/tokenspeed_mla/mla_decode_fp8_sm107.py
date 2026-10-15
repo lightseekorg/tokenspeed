@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""MLA decode with FP8 input and FP8 output for SM107, written in CuTe DSL.
+"""MLA decode with FP8 input and FP8/BF16 output for SM107, written in CuTe DSL.
 
 Based on FlashInfer PR #6177:
 https://github.com/flashinfer-ai/flashinfer/pull/6177
@@ -136,8 +136,8 @@ def _store_empty_output(
     thread = tidx % threads
     for offset in range(thread, rows * 512, threads):
         if first_row + offset // 512 < valid_rows:
-            mO[first_row + offset // 512, offset % 512, tile, batch] = (
-                cutlass.Float8E4M3FN(0.0)
+            mO[first_row + offset // 512, offset % 512, tile, batch] = mO.element_type(
+                0.0
             )
     if thread < rows and first_row + thread < valid_rows:
         mLSE[first_row + thread, tile, batch] = -cutlass.Float32.inf
@@ -4358,7 +4358,7 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         """Merge split-KV partials with vector loads issued ahead of the LSE work.
 
         One CTA owns a real packed query row. Partials already include
-        output_scale; the reducer combines them in FP32 before the FP8 store.
+        output_scale; the reducer combines them in FP32 before the output store.
         """
         bidx, _, batch = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -4509,35 +4509,22 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         :type K: int
         :param mma_qk_tiler_mn: MLA tiling parameters
         :type mma_qk_tiler_mn: tuple
-        :param max_active_blocks: Maximum number of active blocks
+        :param max_active_blocks: CTAs that fit in full 4-CTA clusters
         :type max_active_blocks: int
         :return: Split_kv value
         :rtype: int
         """
         k_tiles = ceil_div(K, mma_qk_tiler_mn[1])
-        # A work item needs four CTAs, including two 2-CTA fallback pairs.
-        # Splitting an already full grid adds workspace traffic without
-        # improving occupancy for the long-context workloads this targets.
-        clusters = max(1, max_active_blocks // 4)
+        # Budget four CTAs per work item and reserve 1/16 of the full clusters
+        # to reduce tail work on slower 2-CTA fallback pairs. Prefer one wave
+        # to limit partial-output traffic and reduction work. Some shapes
+        # benefit from more splits; the wrapper preserves min_split_kv.
+        clusters = max_active_blocks // 4
         work_items = B * S
-        if work_items >= clusters or k_tiles <= 1:
+        target = clusters - clusters // 16
+        if work_items >= target or k_tiles <= 1:
             return 1
-
-        # Consider up to two waves: e.g. 32 query tiles on 52 cluster slots
-        # benefit from three splits (96 items), whereas six splits are enough
-        # for eight query tiles. Charge each wave 16 K tiles for pipeline
-        # fill/drain and partial-output traffic, so a slightly fuller second
-        # wave does not win solely on its shorter inner loop.
-        limit = min(32, k_tiles, 2 * clusters // work_items)
-        best_split, best_cost = 1, math.inf
-        for candidate in range(1, limit + 1):
-            tiles_per_split = ceil_div(k_tiles, candidate)
-            splits = ceil_div(k_tiles, tiles_per_split)
-            waves = ceil_div(work_items * splits, clusters)
-            cost = waves * (tiles_per_split + 16)
-            if cost < best_cost:
-                best_split, best_cost = splits, cost
-        return best_split
+        return min(k_tiles, target // work_items)
 
     @cute.jit
     def get_k_tile_count(
@@ -5627,11 +5614,12 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         first_mask_tile_idx = (
             common_params.K - mask_seq_len_q + 1
         ) // self.mma_qk_tiler[1]
-        # Auto FP16 keeps the group-final tile in the existing masked tail.
+        # Keep each group's final tile in the existing masked tail for both
+        # softmax precisions in the mixed-cluster kernel.
         # Its mask is also valid for a complete tile (all predicates pass),
         # so the hot full-tile body can specialize away local-final handling
         # without adding another softmax body or dropping any causal checks.
-        static_nonfinal = self.force_branch == "auto" and self.use_fp16_softmax
+        static_nonfinal = self.force_branch == "auto"
         full_tile_reserve = 1 if cutlass.const_expr(static_nonfinal) else 0
         while k_tile_count > full_tile_reserve and k_index < first_mask_tile_idx:
             (
@@ -7343,7 +7331,10 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
         """
         if latent_dim != 512 or rope_dim != 64:
             return False
-        if in_dtype != cutlass.Float8E4M3FN or out_dtype != cutlass.Float8E4M3FN:
+        if in_dtype != cutlass.Float8E4M3FN or out_dtype not in (
+            cutlass.Float8E4M3FN,
+            cutlass.BFloat16,
+        ):
             return False
         if num_heads <= 0 or seq_len_q <= 0:
             return False
@@ -8353,7 +8344,7 @@ class _MixedFallbackBase(_Sm107FallbackBlackwellBase):
             return False
         if in_dtype not in [cutlass.Float8E4M3FN]:
             return False
-        if out_dtype not in [cutlass.Float8E4M3FN]:
+        if out_dtype not in [cutlass.Float8E4M3FN, cutlass.BFloat16]:
             return False
         if acc_dtype != cutlass.Float32 or lse_dtype != cutlass.Float32:
             return False

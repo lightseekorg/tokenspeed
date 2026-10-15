@@ -33,10 +33,13 @@ from tokenspeed_kernel.ops.attention.dsa.cuda import (
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     triton_topk_from_logits,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _is_nvidia = current_platform().is_nvidia
 _PERSISTENT_TOPK_WORKSPACE_BYTES = 1024 * 1024
+LOG2E = math.log2(math.e)
 
 
 @triton.jit
@@ -1697,7 +1700,7 @@ def _qwen4_exp_qsa_score_blocks_kernel(
     )
 
 
-def _qwen4_exp_qsa_block_topk_stream(
+def triton_qsa_block_topk_stream(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -1707,7 +1710,7 @@ def _qwen4_exp_qsa_block_topk_stream(
     page_size: int,
     block_topk: int,
     max_partial_bytes: int,
-    enable_pdl: bool = True,
+    enable_pdl: bool,
 ) -> torch.Tensor:
     """Fused streaming path: score tiles and fold them into a running top-k.
 
@@ -1838,7 +1841,7 @@ def _qwen4_exp_qsa_block_topk_stream(
     return selected
 
 
-def _qwen4_exp_qsa_block_topk_logits(
+def triton_qsa_block_scores(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -1846,26 +1849,15 @@ def _qwen4_exp_qsa_block_topk_logits(
     complete_blocks: torch.Tensor,
     *,
     page_size: int,
-    block_topk: int,
     queries_per_request: int | None,
-    persistent_topk_workspace: torch.Tensor | None,
     enable_pdl: bool,
 ) -> torch.Tensor:
-    """Materialized path: score every block to FP32, then radix-select.
-
-    Writes the ``[rows, num_blocks]`` score matrix (blocks at or beyond
-    ``complete_blocks`` are ``-inf``). On NVIDIA, a valid caller-owned
-    workspace routes selection through the length-aware persistent CUDA radix
-    kernel; ``complete_blocks`` prevents the selector from rescanning
-    graph-padded columns. Other platforms and direct callers without a
-    workspace retain the portable Triton top-k fallback. Callers bound the
-    score matrix via the routing heuristic in ``qwen4_exp_qsa_block_topk``.
-    """
+    """Portable QSA block scoring; see ``qsa_block_scores``."""
 
     rows = query.shape[0]
     num_blocks = page_table.shape[1] * page_size
-    logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
     use_pdl = _is_nvidia and enable_pdl
+    logits = torch.empty((rows, num_blocks), dtype=torch.float32, device=query.device)
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     block_h = triton.next_power_of_2(query.shape[1])
     # Long uniform runs reuse K across 32 queries. With four index heads this
@@ -1908,123 +1900,96 @@ def _qwen4_exp_qsa_block_topk_logits(
         num_stages=2,
         **pdl_kwargs,
     )
+    return logits
+
+
+def triton_qsa_block_topk_select(
+    logits: torch.Tensor,
+    topk: int,
+    *,
+    lengths: torch.Tensor,
+    persistent_workspace: torch.Tensor | None,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Portable QSA block top-k selection; see ``qsa_block_topk_select``.
+
+    On NVIDIA, a valid caller-owned workspace routes selection through the
+    length-aware persistent CUDA radix kernel; ``lengths`` keeps it from
+    rescanning graph-padded columns. Otherwise the Triton top-k runs.
+    """
+
     if (
         _is_nvidia
-        and persistent_topk_workspace is not None
-        and block_topk in (512, 1024, 2048)
-        and persistent_topk_workspace.is_cuda
-        and persistent_topk_workspace.device == logits.device
-        and persistent_topk_workspace.dtype == torch.uint8
-        and persistent_topk_workspace.numel() >= _PERSISTENT_TOPK_WORKSPACE_BYTES
+        and persistent_workspace is not None
+        and topk in (512, 1024, 2048)
+        and persistent_workspace.is_cuda
+        and persistent_workspace.device == logits.device
+        and persistent_workspace.dtype == torch.uint8
+        and persistent_workspace.numel() >= _PERSISTENT_TOPK_WORKSPACE_BYTES
         and has_ragged_decode_topk()
     ):
         selected = torch.empty(
-            (rows, block_topk), dtype=torch.int32, device=query.device
+            (logits.shape[0], topk), dtype=torch.int32, device=logits.device
         )
         ragged_decode_topk(
             logits,
             selected,
-            block_topk,
-            lengths=complete_blocks,
-            workspace=persistent_topk_workspace,
-            max_seq_len=num_blocks,
+            topk,
+            lengths=lengths,
+            workspace=persistent_workspace,
+            max_seq_len=logits.shape[1],
         )
         return selected
-    return triton_topk_from_logits(logits, block_topk, enable_pdl=use_pdl)
+    return triton_topk_from_logits(logits, topk, enable_pdl=_is_nvidia and enable_pdl)
 
 
-def qwen4_exp_qsa_block_topk(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    request_indices: torch.Tensor,
-    complete_blocks: torch.Tensor,
-    *,
-    page_size: int,
-    block_topk: int,
-    queries_per_request: int | None,
-    max_partial_bytes: int,
-    solution: str,
-    persistent_topk_workspace: torch.Tensor | None,
-    enable_pdl: bool,
-) -> torch.Tensor:
-    """Select the highest-scoring compressed blocks for each query row.
+_FP32_SCORES = format_signature(logits=dense_tensor_format(torch.float32))
 
-    Args:
-        query: Query tensor shaped ``[rows, heads, head_dim]``.
-        key_cache: Flattened compressed keys shaped ``[slots, 1, head_dim]``.
-        page_table: Raw compressed-cache block ids shaped ``[requests, max_pages]``,
-            with holes and padding normalized to zero; one entry per logical page.
-        request_indices: Owning request id per query row.
-        complete_blocks: Fully compressed block counts shaped ``[rows]``.
-        page_size: Compressed-cache rows covered by one logical page.
-        block_topk: Blocks selected per row; must be a power of two and at
-            least 64.
-        queries_per_request: Uniform number of consecutive query rows per
-            request, or None for ragged/mixed layouts. A positive width must
-            divide ``rows``; the caller guarantees that each width-sized run
-            has one owning request. Logits scoring shares K tiles within these
-            runs while preserving each row's complete-block frontier.
-        max_partial_bytes: Memory budget for the partial top-k buffers
-            (``stream`` solution only).
-        solution: ``"stream"`` fuses scoring and selection without
-            materializing scores; ``"logits"`` materializes the
-            ``[rows, num_blocks]`` FP32 scores and radix-selects them.
-        persistent_topk_workspace: Optional caller-owned CUDA uint8 workspace
-            of at least 1 MiB. The ``"logits"`` solution uses it for the
-            length-aware persistent radix top-k when that kernel is available;
-            otherwise selection falls back to portable Triton.
-        enable_pdl: Wait for query/cache/metadata producers and release
-            successor setup early between scoring and selection on NVIDIA GPUs.
+register_kernel(
+    "attention",
+    "qsa_block_scores",
+    name="triton_qsa_block_scores",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                query=dense_tensor_format(dtype),
+                key_cache=dense_tensor_format(dtype),
+            )
+            for dtype in (torch.bfloat16, torch.float16, torch.float32)
+        }
+    ),
+    priority=Priority.PORTABLE,
+)(triton_qsa_block_scores)
 
-    Returns:
-        Int32 block ids shaped ``[rows, block_topk]``; invalid entries are
-        ``-1``.
-    """
+register_kernel(
+    "attention",
+    "qsa_block_topk_stream",
+    name="triton_qsa_block_topk_stream",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                query=dense_tensor_format(dtype),
+                key_cache=dense_tensor_format(dtype),
+            )
+            for dtype in (torch.bfloat16, torch.float16, torch.float32)
+        }
+    ),
+    priority=Priority.PORTABLE,
+)(triton_qsa_block_topk_stream)
 
-    if query.ndim != 3 or key_cache.ndim != 3:
-        raise ValueError("Qwen4-Exp QSA block top-k expects rank-three tensors")
-    if block_topk < 64 or (block_topk & (block_topk - 1)):
-        raise ValueError("Qwen4-Exp QSA block top-k needs a power-of-two topk >= 64")
-    if solution not in ("stream", "logits"):
-        raise ValueError(
-            "Qwen4-Exp QSA block top-k solution must be 'stream' or 'logits', "
-            f"got {solution!r}"
-        )
-    rows = query.shape[0]
-    if queries_per_request is not None and (
-        queries_per_request < 1 or rows % queries_per_request
-    ):
-        raise ValueError("QSA queries_per_request must be positive and divide rows")
-    num_blocks = page_table.shape[1] * page_size
-    if rows == 0 or num_blocks == 0:
-        return torch.full(
-            (rows, block_topk), -1, dtype=torch.int32, device=query.device
-        )
-    if solution == "logits":
-        return _qwen4_exp_qsa_block_topk_logits(
-            query,
-            key_cache,
-            page_table,
-            request_indices,
-            complete_blocks,
-            page_size=page_size,
-            block_topk=block_topk,
-            queries_per_request=queries_per_request,
-            persistent_topk_workspace=persistent_topk_workspace,
-            enable_pdl=enable_pdl,
-        )
-    return _qwen4_exp_qsa_block_topk_stream(
-        query,
-        key_cache,
-        page_table,
-        request_indices,
-        complete_blocks,
-        page_size=page_size,
-        block_topk=block_topk,
-        max_partial_bytes=max_partial_bytes,
-        enable_pdl=enable_pdl,
-    )
+register_kernel(
+    "attention",
+    "qsa_block_topk_select",
+    name="triton_qsa_block_topk_select",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset({_FP32_SCORES}),
+    priority=Priority.PORTABLE,
+)(triton_qsa_block_topk_select)
 
 
 @triton.jit
@@ -2163,10 +2128,284 @@ def qwen4_exp_qsa_selected_slots(
     return output
 
 
+# ===-----------------------------------------------------------------------===#
+# Sparse attention over selected slots
+# ===-----------------------------------------------------------------------===#
+
+# Selected slots attended per inner-loop step.
+_SPARSE_BLOCK_N = 32
+# Target number of (row, kv_head, split) programs. Small decode batches split
+# each row's selected slots across programs and merge the partials afterwards.
+_SPARSE_TARGET_PROGRAMS = 512
+_SPARSE_MAX_SPLITS = 16
+
+
+@triton.jit
+def _triton_qsa_sparse_attention_kernel(
+    q,
+    k_cache,
+    v_cache,
+    selected_slots,
+    output,
+    partial_out,
+    partial_lse,
+    scale_log2,
+    k_scale,
+    v_scale,
+    width,
+    split_len,
+    num_splits,
+    stride_q_n,
+    stride_q_h,
+    stride_k_n,
+    stride_k_h,
+    stride_v_n,
+    stride_v_h,
+    stride_s_n,
+    stride_o_n,
+    stride_o_h,
+    GROUP: tl.constexpr,
+    GROUP_PAD: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLIT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split = tl.program_id(2)
+
+    heads = tl.arange(0, GROUP_PAD)
+    head_mask = heads < GROUP
+    q_heads = kv_head * GROUP + heads
+    d = tl.arange(0, HEAD_DIM)
+    dv = tl.arange(0, VALUE_DIM)
+    q_tile = tl.load(
+        q + row * stride_q_n + q_heads[:, None] * stride_q_h + d[None, :],
+        mask=head_mask[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.full([GROUP_PAD], float("-inf"), tl.float32)
+    l_i = tl.zeros([GROUP_PAD], tl.float32)
+    acc = tl.zeros([GROUP_PAD, VALUE_DIM], tl.float32)
+    start = split * split_len
+    end = tl.minimum(start + split_len, width)
+    for block_start in range(start, end, BLOCK_N):
+        cols = block_start + tl.arange(0, BLOCK_N)
+        slots = tl.load(
+            selected_slots + row * stride_s_n + cols, mask=cols < end, other=-1
+        ).to(tl.int64)
+        valid = slots > 0
+        # Slot 0 may hold NaN padding; slot 1 is the finite masked-read target.
+        slots = tl.where(valid, slots, 1)
+        keys = tl.load(
+            k_cache + slots[:, None] * stride_k_n + kv_head * stride_k_h + d[None, :]
+        ).to(q_tile.dtype)
+        scores = tl.dot(q_tile, tl.trans(keys)) * (scale_log2 * k_scale)
+        scores = tl.where(valid[None, :], scores, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        # Rows with no valid slot so far keep m = -inf; avoid -inf - -inf.
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = tl.exp2(m_i - m_safe)
+        p = tl.exp2(scores - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        values = tl.load(
+            v_cache + slots[:, None] * stride_v_n + kv_head * stride_v_h + dv[None, :]
+        ).to(q_tile.dtype)
+        acc = acc * alpha[:, None] + tl.dot(p.to(q_tile.dtype), values)
+        m_i = m_new
+
+    # Rows without any valid slot produce zeros.
+    out = acc * (v_scale / tl.where(l_i > 0, l_i, 1.0))[:, None]
+    if SPLIT:
+        part = (row * GROUP * tl.num_programs(1) + q_heads) * num_splits + split
+        tl.store(
+            partial_out + part[:, None] * VALUE_DIM + dv[None, :],
+            out,
+            mask=head_mask[:, None],
+        )
+        # Base-2 log-sum-exp; -inf marks a split without valid slots.
+        lse = tl.where(l_i > 0, m_i + tl.log2(l_i), float("-inf"))
+        tl.store(partial_lse + part, lse, mask=head_mask)
+    else:
+        tl.store(
+            output + row * stride_o_n + q_heads[:, None] * stride_o_h + dv[None, :],
+            out.to(output.dtype.element_ty),
+            mask=head_mask[:, None],
+        )
+
+
+@triton.jit
+def _triton_qsa_sparse_attention_merge_kernel(
+    partial_out,
+    partial_lse,
+    output,
+    num_splits,
+    stride_o_n,
+    stride_o_h,
+    NUM_HEADS: tl.constexpr,
+    VALUE_DIM: tl.constexpr,
+):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    dv = tl.arange(0, VALUE_DIM)
+    base = (row * NUM_HEADS + head) * num_splits
+    lse_max = float("-inf")
+    for split in range(num_splits):
+        lse_max = tl.maximum(lse_max, tl.load(partial_lse + base + split))
+    lse_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    total = 0.0
+    acc = tl.zeros([VALUE_DIM], tl.float32)
+    for split in range(num_splits):
+        # Splits without valid slots carry lse = -inf and weigh zero.
+        weight = tl.exp2(tl.load(partial_lse + base + split) - lse_max)
+        total += weight
+        acc += weight * tl.load(partial_out + (base + split) * VALUE_DIM + dv)
+    acc = acc / tl.where(total > 0, total, 1.0)
+    tl.store(
+        output + row * stride_o_n + head * stride_o_h + dv,
+        acc.to(output.dtype.element_ty),
+    )
+
+
+def _scalar_descale(scale: float | torch.Tensor | None, name: str) -> float:
+    if scale is None:
+        return 1.0
+    if isinstance(scale, torch.Tensor):
+        raise TypeError(f"Triton QSA sparse attention expects a float {name}")
+    return float(scale)
+
+
+def triton_qsa_sparse_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    *,
+    scale: float,
+    max_seqlen_q: int,
+    metadata_capacity_rows: int | None,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
+) -> torch.Tensor:
+    """Portable QSA sparse attention; see ``qsa_sparse_attention``.
+
+    Every query row attends independently to its own selected slots, so
+    ``max_seqlen_q`` does not change the computation, and this kernel keeps no
+    metadata workspace sized by ``metadata_capacity_rows``.
+    """
+
+    del max_seqlen_q, metadata_capacity_rows
+    rows, num_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[1]
+    value_dim = v_cache.shape[-1]
+    width = selected_slots.shape[1]
+    if num_heads % num_kv_heads:
+        raise ValueError("QSA query heads must be a multiple of KV heads")
+    if q.stride(-1) != 1 or k_cache.stride(-1) != 1 or v_cache.stride(-1) != 1:
+        raise ValueError("QSA Q/K/V head dimensions must be contiguous")
+    if selected_slots.stride(-1) != 1:
+        raise ValueError("QSA selected slots must be contiguous per row")
+    group = num_heads // num_kv_heads
+    output = q.new_empty((rows, num_heads, value_dim))
+
+    programs = rows * num_kv_heads
+    max_splits = min(_SPARSE_MAX_SPLITS, triton.cdiv(width, _SPARSE_BLOCK_N))
+    num_splits = max(1, min(max_splits, triton.cdiv(_SPARSE_TARGET_PROGRAMS, programs)))
+    split_len = triton.cdiv(triton.cdiv(width, num_splits), _SPARSE_BLOCK_N)
+    split_len *= _SPARSE_BLOCK_N
+    num_splits = triton.cdiv(width, split_len)
+    use_split = num_splits > 1
+    if use_split:
+        partial_out = torch.empty(
+            (rows, num_heads, num_splits, value_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        partial_lse = torch.empty(
+            (rows, num_heads, num_splits), dtype=torch.float32, device=q.device
+        )
+    else:
+        partial_out = partial_lse = output
+    _triton_qsa_sparse_attention_kernel[(rows, num_kv_heads, num_splits)](
+        q,
+        k_cache,
+        v_cache,
+        selected_slots,
+        output,
+        partial_out,
+        partial_lse,
+        scale * LOG2E,
+        _scalar_descale(k_scale, "k_scale"),
+        _scalar_descale(v_scale, "v_scale"),
+        width,
+        split_len,
+        num_splits,
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        selected_slots.stride(0),
+        output.stride(0),
+        output.stride(1),
+        GROUP=group,
+        GROUP_PAD=max(16, triton.next_power_of_2(group)),
+        HEAD_DIM=head_dim,
+        VALUE_DIM=value_dim,
+        BLOCK_N=_SPARSE_BLOCK_N,
+        SPLIT=use_split,
+        num_warps=4,
+        num_stages=1,
+    )
+    if use_split:
+        _triton_qsa_sparse_attention_merge_kernel[(rows, num_heads)](
+            partial_out,
+            partial_lse,
+            output,
+            num_splits,
+            output.stride(0),
+            output.stride(1),
+            NUM_HEADS=num_heads,
+            VALUE_DIM=value_dim,
+            num_warps=1,
+        )
+    return output
+
+
+register_kernel(
+    "attention",
+    "qsa_sparse_attention",
+    name="triton_qsa_sparse_attention",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                k_cache=dense_tensor_format(cache_dtype),
+                v_cache=dense_tensor_format(cache_dtype),
+            )
+            for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        }
+    ),
+    traits={
+        "head_dim": frozenset({64, 128, 256}),
+        "value_head_dim": frozenset({64, 128, 256}),
+    },
+    priority=Priority.PORTABLE,
+)(triton_qsa_sparse_attention)
+
+
 __all__ = [
-    "qwen4_exp_qsa_block_topk",
     "qwen4_exp_qsa_compress_and_store",
     "qwen4_exp_qsa_prepare_metadata",
     "qwen4_exp_qsa_recent_write",
     "qwen4_exp_qsa_selected_slots",
+    "triton_qsa_block_scores",
+    "triton_qsa_block_topk_select",
+    "triton_qsa_block_topk_stream",
+    "triton_qsa_sparse_attention",
 ]

@@ -190,5 +190,28 @@ def test_conv_compiles_once_across_prefill_shapes():
     assert compiles.call_count == 0
 
 
+def test_conv_reads_a_wide_view_past_int32_offsets():
+    """Token offsets times a projection-wide row stride pass int32 within one
+    long sequence; the view convolves like its dense copy."""
+    torch.manual_seed(5)
+    channels, row_stride = 16, 1 << 16
+    length = (1 << 31) // row_stride + 4 * CAUSAL_CONV1D_BLOCK_M
+    lens = torch.tensor([length], dtype=torch.int32)
+    bounds = torch.tensor([0, length], dtype=torch.int32, device="cuda")
+    metadata = build_causal_conv1d_prefill_metadata(bounds, lens, CAUSAL_CONV1D_BLOCK_M)
+    projection = torch.empty(length, row_stride, dtype=torch.bfloat16, device="cuda")
+    wide = projection[:, :channels].normal_()
+    weight = torch.randn(channels, 4, dtype=torch.bfloat16, device="cuda") * 0.1
+    indices = torch.ones(1, dtype=torch.int32, device="cuda")
+    history = torch.zeros(1, dtype=torch.bool, device="cuda")
+    results = []
+    for x in (wide.T, wide.contiguous().T):
+        state = torch.zeros(2, channels, 3, dtype=torch.bfloat16, device="cuda")
+        out = _conv(x, weight, state, bounds, indices, history, metadata)
+        results.append((out, state))
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

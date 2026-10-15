@@ -24,6 +24,9 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes.compresse
 from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     CompressedTensorsW8A8Fp8,
 )
+from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_int8 import (
+    CompressedTensorsW8A8Int8,
+)
 from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsWNA16,
@@ -32,6 +35,7 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.schemes.compresse
 __all__ = [
     "CompressedTensorsScheme",
     "CompressedTensorsW8A8Fp8",
+    "CompressedTensorsW8A8Int8",
     "CompressedTensorsWNA16",
     "WNA16_SUPPORTED_BITS",
 ]

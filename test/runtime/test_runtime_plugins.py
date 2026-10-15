@@ -58,6 +58,7 @@ def _profile(**overrides) -> ModelProfile:
         default_attention_backend="mla",
         default_prefix_granularity=64,
         request_token_history=True,
+        is_multimodal=False,
         tokenizer_kwargs={"fix_mistral_regex": True},
         attention_instances_per_layer=1,
         numerics_envelopes=frozenset({"auto"}),
@@ -82,6 +83,36 @@ class FixtureConfig(PretrainedConfig):
     def __init__(self, fixture_linear_layers: bool = True, **kwargs) -> None:
         self.fixture_linear_layers = fixture_linear_layers
         super().__init__(**kwargs)
+
+
+def test_plugin_multimodal_config_is_retained(isolated, tmp_path):
+    class VisionFixture(FixtureForCausalLM):
+        @classmethod
+        def model_profile(cls, hf_config):
+            return _profile(is_multimodal=True)
+
+    class VisionConfig(PretrainedConfig):
+        model_type = "fixture_vision"
+
+        def __init__(self, text_config=None, **kwargs):
+            self.text_config = PretrainedConfig(
+                **(
+                    text_config
+                    or {"num_attention_heads": 2, "architectures": ["FixtureText"]}
+                )
+            )
+            kwargs["architectures"] = ["VisionFixture"]
+            super().__init__(**kwargs)
+
+    registry.register_model(VisionFixture)
+    registry.register_config(VisionConfig, model_type="fixture_vision")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "fixture_vision", "architectures": ["FixtureText"]})
+    )
+    config = hf_transformers_utils.get_config(str(tmp_path), trust_remote_code=False)
+    assert isinstance(config, VisionConfig)
+    resolved = registry.resolve_model_profile(config.architectures, config)
+    assert resolved is not None and resolved[1].is_multimodal
 
 
 class _Dist:
@@ -644,6 +675,7 @@ def test_attention_instances_per_layer_has_no_fallback() -> None:
         default_attention_backend=None,
         default_prefix_granularity=None,
         request_token_history=False,
+        is_multimodal=False,
         tokenizer_kwargs={},
     )
     with pytest.raises(TypeError, match="attention_instances_per_layer"):
@@ -738,15 +770,15 @@ def test_hybrid_kvp_accepts_builtin_groups_and_requires_history() -> None:
     with pytest.raises(ValueError, match="full-history cache group"):
         attention_registry._validate_hybrid_kvp_cache(
             SimpleNamespace(
-                cache_group_specs=tuple(g for g in groups if g.family == "state")
+                cache_group_specs=tuple(g for g in groups if g.attn_kind == "state")
             ),
             kvp_size=8,
         )
 
     window_only = tuple(
         (
-            replace(g, retention="sliding_window", sliding_window_tokens=256)
-            if g.family == "history"
+            replace(g, attn_kind="sliding_window", sliding_window_tokens=256)
+            if g.attn_kind != "state"
             else g
         )
         for g in groups
@@ -757,16 +789,16 @@ def test_hybrid_kvp_accepts_builtin_groups_and_requires_history() -> None:
             kvp_size=8,
         )
 
-    history = next(g for g in groups if g.family == "history")
+    history = next(g for g in groups if g.attn_kind != "state")
     for shard_count in (1, 8):
         window = replace(
             history,
             group_id="window",
-            retention="sliding_window",
+            attn_kind="sliding_window",
             sliding_window_tokens=256,
             shard_count=shard_count,
         )
-        with pytest.raises(ValueError, match="must use full-history retention"):
+        with pytest.raises(ValueError, match="must be a full-history group"):
             attention_registry._validate_hybrid_kvp_cache(
                 SimpleNamespace(cache_group_specs=(*groups, window)),
                 kvp_size=8,

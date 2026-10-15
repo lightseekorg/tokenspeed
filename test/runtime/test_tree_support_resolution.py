@@ -83,12 +83,13 @@ def _mla(cls, kv_cache_dtype=torch.bfloat16, kvp_size=1):
     return leaf
 
 
-def _router(*leaves, retention="full_history", entry_stride=1):
+def _router(*leaves, attn_kind="full_history", entry_stride=1):
     router = object.__new__(CacheGroupRouter)
     router.leaves = {str(gid): leaf for gid, leaf in enumerate(leaves)}
     router._geometry = CacheGroupGeometry(
+        attn_kinds={gid: attn_kind for gid in router.leaves},
         row_geometry={gid: (64, entry_stride) for gid in router.leaves},
-        retentions={gid: (retention, None) for gid in router.leaves},
+        windows={gid: None for gid in router.leaves},
     )
     return router
 
@@ -154,7 +155,7 @@ def test_draft_with_linear_layers_is_refused():
         (lambda: _router(MHAAttnBackend.__new__(MHAAttnBackend)), "MHAAttnBackend"),
         (lambda: _router(_trtllm(torch.float8_e5m2)), "kv_cache_dtype"),
         (
-            lambda: _router(_trtllm(), _trtllm(), retention="sliding_window"),
+            lambda: _router(_trtllm(), _trtllm(), attn_kind="sliding_window"),
             "one row per token; 0, 1 slide",
         ),
         (

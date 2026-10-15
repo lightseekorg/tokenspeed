@@ -71,7 +71,7 @@ logger = logging.getLogger(__name__)
 def cache_hooks_armed(*, enable_kvstore: bool, max_retracted_requests: int) -> bool:
     """Whether the engine can emit cache ops, so the hooks must poll for them.
 
-    Armed hooks poll completions and run a gloo all-reduce on every round, so
+    Armed hooks poll completions and run a gloo all-reduce while a cache op is open, so
     they are armed only for an engine that can emit cache ops: one with the
     Host L2 tier (write-backs, load-backs) or with a retraction snapshot pool
     (the scheduler retracts by snapshot store and resumes by restore).
@@ -114,6 +114,8 @@ class CacheOpHooks:
         # collectives in poll_ready_events entirely when nothing is in flight
         # — but only after every cache-owning rank agrees the replica is idle.
         self._num_inflight = 0
+        # Uncommitted tickets: equal on every rank (same plans, same intersections).
+        self._num_open = 0
         replica_groups = []
         if attn_tp_size > 1 and attn_tp_cpu_group is not None:
             replica_groups.append((attn_tp_size, attn_tp_cpu_group))
@@ -121,7 +123,7 @@ class CacheOpHooks:
             replica_groups.append((pp_size, pp_cpu_group))
         self._replica_groups = replica_groups
 
-    def count_plan_ops(self, execution_plan) -> None:
+    def count_plan_ops(self, execution_plan) -> int:
         """Count the cache ops this plan will put in flight.
 
         ``DeviceHandle.execute`` submits them, from the same plan (write-backs
@@ -133,22 +135,40 @@ class CacheOpHooks:
         own. Call this with the SAME plan and only when ``execute`` will run:
         a plan counted but never submitted leaves ops in flight forever.
 
+        Returns:
+            The number of ``SnapshotOp`` requests in the plan — one per
+            request the scheduler retracted this round (a victim's image
+            store is the retraction signal; see docs/design/scheduler.md §2).
+            The event loop feeds it to the preemption counter. 0 when the
+            hooks are not armed: without cache ops there is no snapshot
+            pool, and without a pool a capacity block aborts instead of
+            retracting.
+
         Raises:
             TypeError: The plan carries a cache op kind the runtime cannot run.
         """
         if self._device is None:
-            return
+            return 0
+        num_snapshot_ops = 0
         for op in cache_ops_from_plan(execution_plan):
             if isinstance(op, (SnapshotOp, RestoreOp, PrefetchOp)):
                 self._num_inflight += 1
+                self._num_open += 1
+                if isinstance(op, SnapshotOp):
+                    num_snapshot_ops += 1
             else:
                 self._num_inflight += len(op.op_ids)
+                self._num_open += len(op.op_ids)
+        return num_snapshot_ops
 
     def poll_ready_events(self) -> list:
         """Poll completed cache ops and return their rank-synchronized
         scheduler events. Returns an empty list when there is nothing ready.
         """
         if self._device is None:
+            return []
+        if self._num_open == 0:
+            # No rank has a ticket in flight or a completion to commit.
             return []
         cache_results = self._device.poll_cache_results()
         self._num_inflight -= len(cache_results)
@@ -184,6 +204,7 @@ class CacheOpHooks:
             return []
 
         ready_payloads = self._pop_ready_payloads()
+        self._num_open -= len(ready_payloads)
         if not ready_payloads:
             return []
         logger.debug(

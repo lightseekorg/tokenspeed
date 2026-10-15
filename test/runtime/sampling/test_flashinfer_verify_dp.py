@@ -127,6 +127,7 @@ def _build_backend(
     )
 
     cfg = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         enable_speculative_sampling=False,
         sampling_stream="batch",
         logprob_order="torch",

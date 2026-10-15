@@ -51,6 +51,7 @@ from tokenspeed.runtime.utils.hf_transformers_utils import (
 from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
+    count_dspark_stages,
     read_checkpoint_block_size,
     resolve_block_widths,
     validate_block_widths,
@@ -112,6 +113,7 @@ _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
 _CACHE_LAYER_VIEW_ARCHITECTURES = frozenset(
     {
         "NemotronHForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     }
 )
 
@@ -286,12 +288,32 @@ def configure_mla_attention(model_config, server_args: ServerArgs) -> None:
         model_config.scaling = model_config.scaling * mscale * mscale
 
 
+def configure_dots3_note_attention(model_config, server_args: ServerArgs) -> None:
+    """Configure the mixed DSA/SWA target or its SWA-only MTP draft."""
+    is_mtp = resolve_architecture(model_config.hf_config) == "Dots3NoteForCausalLMNextN"
+    _apply_attention_defaults(
+        server_args,
+        name="dots3-note",
+        default_backend="mla" if is_mtp else "dsa",
+        default_prefix_granularity=None,
+        is_draft_worker=is_mtp,
+    )
+    configure = configure_mla_attention if is_mtp else configure_dsa_attention
+    configure(model_config, server_args)
+
+
 def configure_minimax_m3_attention(model_config, server_args: ServerArgs) -> None:
     del server_args  # the geometry follows the checkpoint alone
     model_config.attention_arch = AttentionArch.MSA
 
 
 _ATTENTION_FAMILY_SPECS = (
+    _AttentionFamilySpec(
+        name="dots3-note",
+        architectures=frozenset({"Dots3NoteForCausalLM", "Dots3NoteForCausalLMNextN"}),
+        configure=configure_dots3_note_attention,
+        default_prefix_granularity=128,
+    ),
     _AttentionFamilySpec(
         name="DeepSeek V4.1",
         architectures=frozenset(
@@ -548,11 +570,6 @@ class ModelConfig:
             and resolve_architecture(self.hf_config)
             in ("DeepseekV4ForCausalLMDSpark", "DeepseekV41ForCausalLMDSpark")
         ):
-            from tokenspeed.runtime.models.deepseek_v4_dspark import (
-                DEFAULT_DSPARK_WINDOW_SIZE,
-                count_dspark_stages,
-            )
-
             if self.spec_block_size is None:
                 raise ValueError(
                     "DSPARK same-checkpoint decoding requires the checkpoint to "
@@ -562,7 +579,7 @@ class ModelConfig:
                 getattr(
                     self.hf_text_config,
                     "dspark_window_size",
-                    DEFAULT_DSPARK_WINDOW_SIZE,
+                    128,
                 )
             )
             if dspark_window_size <= 0:
@@ -612,7 +629,11 @@ class ModelConfig:
 
         # Check model type
         self.is_generation = is_generation_model(self.hf_config.architectures)
-        self.is_multimodal = is_multimodal_model(self.hf_config.architectures)
+        self.is_multimodal = (
+            self.model_profile.is_multimodal
+            if self.model_profile is not None
+            else is_multimodal_model(self.hf_config.architectures)
+        )
         self.is_multimodal_gen = is_multimodal_gen_model(self.hf_config.architectures)
         self.is_image_gen = is_image_gen_model(self.hf_config.architectures)
         self.is_audio_model = is_audio_model(self.hf_config.architectures)
@@ -1025,6 +1046,7 @@ def is_generation_model(model_architectures: list[str]):
 
 def is_multimodal_model(model_architectures: list[str] | None):
     multimodal_architectures = {
+        "Dots3NoteForCausalLM",
         "DeepseekV41ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
@@ -1036,6 +1058,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     }
     return any(arch in multimodal_architectures for arch in model_architectures or [])
 
@@ -1050,9 +1073,11 @@ def is_image_gen_model(model_architectures: list[str]):
 
 def is_audio_model(model_architectures: list[str] | None):
     audio_architectures = {
+        "Dots3NoteForCausalLM",
         "InklingForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
     }
     return any(arch in audio_architectures for arch in model_architectures or [])
 

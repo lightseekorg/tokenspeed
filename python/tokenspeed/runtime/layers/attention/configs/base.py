@@ -139,8 +139,8 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     # the cache recipes; empty -> single full-history group. A layer's
     # compute mask lives on its PagedAttention (sliding_window_size).
     cache_layer_types: tuple[str, ...] = ()
-    # Retention window for per-layer cache recipes. Families that declare
-    # whole groups, such as DeepSeek V4, put their windows on those groups.
+    # Sliding window for per-layer cache recipes. Recipes that declare whole
+    # groups, such as DeepSeek V4, put their windows on those groups.
     sliding_window_tokens: int | tuple[int | None, ...] | None = None
 
     @classmethod
@@ -248,26 +248,16 @@ class AttnConfig:
             if softmax.backend_name == "flashmla":
                 if torch.device(self.device).type != "cuda":
                     raise ValueError("FlashMLA DCP decode requires CUDA")
-                if (
-                    self.speculative_num_steps > 0
-                    or self.speculative_num_draft_tokens > 1
-                    or self.is_draft
-                ):
-                    raise ValueError(
-                        "FlashMLA DCP decode does not yet support speculation"
-                    )
             elif softmax.backend_name == "tokenspeed_mla":
                 pass
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
-                if torch.device(self.device).type != "cuda":
-                    raise ValueError("GPU DSA DCP decode requires CUDA")
-                if (
-                    self.speculative_num_steps > 0
-                    or self.speculative_num_draft_tokens > 1
-                    or self.is_draft
-                ):
+                device_type = torch.device(self.device).type
+                if device_type not in ("cuda", "npu"):
+                    raise ValueError("DSA DCP decode requires CUDA or Ascend NPU")
+                if device_type == "cuda" and self.draft_block_decode:
                     raise ValueError(
-                        "GPU DSA DCP decode does not yet support speculation"
+                        "GPU DSA DCP decode does not yet support non-causal "
+                        "block drafts"
                     )
             elif softmax.backend_name == "hybrid_linear_attn":
                 # The registry resolves the user's full-attention leaf after
@@ -277,7 +267,7 @@ class AttnConfig:
             elif softmax.backend_name != "deepseek_v4":
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "
-                    "DeepSeek V4, GPU DSA, FlashMLA or CuTe MLA attention"
+                    "DeepSeek V4, DSA, FlashMLA or CuTe MLA attention"
                 )
             else:
                 platform = current_platform()

@@ -155,6 +155,17 @@ output buffers retain their identity. Decode transposes the vendor's
 `[batch, heads, query]` LSE to token-major order. This does not reinterpret
 regular BF16 KV as packed FP8 or change its Triton decode selection.
 
+## Runtime backend selection
+
+The runtime selects DSA with `--attention-backend dsa`, or automatically from
+the DSA architecture. The same name resolves to `AscendDSABackend` on Ascend
+and `DSABackend` on GPU platforms. The Ascend implementation owns its device
+metadata and operator adaptation; model projections and indexer selection
+parameters remain model-owned. Its current constraints are BF16 KV and index
+keys, 128-token kernel pages, target verification of at most eight tokens,
+and no draft-model attention. Target verification can still consume draft
+candidates. These constraints are checked by the Ascend backend.
+
 ## Sharded Index-K candidates
 
 `dsa_index_candidates` scores a bounded query tile against rank-local Index-K
@@ -162,6 +173,9 @@ for prefill and decode. Inputs are a position-preserving page table (`-1` for
 absent pages), request IDs and global causal lengths. Outputs are global logical
 offsets and FP32 scores: invalid candidates use `-1`/`-inf`, and forced
 initial/local candidates use `+inf`. Cross-rank merging belongs to runtime DCP.
+Runtime setup validates a positive power-of-two candidate count when the KVP
+group has multiple ranks, using the cache-parallel topology (`kvp_group` /
+`kvp_size`). Single-rank selection keeps its existing top-k choices.
 
 DeepGEMM compacts owned, causally visible pages and maps results back to global
 offsets, masking padding and handling partial tails and empty shards. Query

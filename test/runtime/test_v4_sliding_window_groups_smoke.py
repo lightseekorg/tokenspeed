@@ -33,6 +33,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     capacity_model,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_TABLE_SLOTS,
     CacheGroupSpec,
     compute_max_logical_pages_for_capture,
 )
@@ -125,7 +126,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             specs = [
                 CacheGroupSpec(
                     group_id="full",
-                    retention="full_history",
+                    attn_kind="full_history",
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=None,
@@ -133,7 +134,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                 ),
                 CacheGroupSpec(
                     group_id="sliding",
-                    retention="sliding_window",
+                    attn_kind="sliding_window",
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=3 * raw_per_page + 1,
@@ -185,7 +186,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             raw_per_page = rows_per_page * entry_stride_tokens
             full = CacheGroupSpec(
                 group_id="full",
-                retention="full_history",
+                attn_kind="full_history",
                 rows_per_page=rows_per_page,
                 entry_stride_tokens=entry_stride_tokens,
                 sliding_window_tokens=None,
@@ -194,7 +195,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             window = 3 * raw_per_page + 1
             sliding = CacheGroupSpec(
                 group_id="sliding",
-                retention="sliding_window",
+                attn_kind="sliding_window",
                 rows_per_page=rows_per_page,
                 entry_stride_tokens=entry_stride_tokens,
                 sliding_window_tokens=window,
@@ -246,7 +247,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             for window in (3 * raw_per_page, 3 * raw_per_page + 1):
                 spec = CacheGroupSpec(
                     group_id="sliding",
-                    retention="sliding_window",
+                    attn_kind="sliding_window",
                     rows_per_page=rows_per_page,
                     entry_stride_tokens=entry_stride_tokens,
                     sliding_window_tokens=window,
@@ -281,10 +282,34 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                                     capture_pages, conservative_pages
                                 )
 
+    def test_state_capture_width_is_the_two_slots_whatever_the_context(self):
+        state = CacheGroupSpec(
+            group_id="state",
+            attn_kind="state",
+            sliding_window_tokens=None,
+            replayable=False,
+        )
+        for context_len in (0, 1, 4096, 1 << 20):
+            for verify_width in (1, 8):
+                for overlap_depth in (0, 1):
+                    self.assertEqual(
+                        compute_max_logical_pages_for_capture(
+                            state,
+                            max_context_len=context_len,
+                            max_tokens_per_req=verify_width,
+                            overlap_schedule_depth=overlap_depth,
+                        ),
+                        STATE_TABLE_SLOTS,
+                    )
+        with self.assertRaises(ValueError):
+            compute_max_logical_pages_for_capture(
+                state, max_context_len=8, max_tokens_per_req=0
+            )
+
     def test_overlap_sizing_rejects_invalid_runtime_parameters(self):
         spec = CacheGroupSpec(
             group_id="full",
-            retention="full_history",
+            attn_kind="full_history",
             rows_per_page=4,
             entry_stride_tokens=1,
             sliding_window_tokens=None,
@@ -333,36 +358,19 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     },
                 )
 
-        # Non-positive row geometry is rejected at spec construction now.
-        with (
-            self.subTest(group="bad-rows"),
-            self.assertRaisesRegex(ValueError, "rows_per_page"),
-        ):
-            CacheGroupSpec("bad-rows", "full_history", 0, 1, None, replayable=False)
-
+        # Bad row geometry, a non-positive window and an unknown kind are all
+        # rejected at spec construction.
         invalid_specs = (
-            (
-                CacheGroupSpec(
-                    "bad-window", "sliding_window", 4, 1, 0, replayable=False
-                ),
-                "sliding_window_tokens",
-            ),
-            (
-                CacheGroupSpec(
-                    "bad-retention", "unknown", 4, 1, None, replayable=False
-                ),
-                "unsupported retention",
-            ),
+            (("bad-rows", "full_history", 0, 1, None), "rows_per_page"),
+            (("bad-window", "sliding_window", 4, 1, 0), "sliding_window_tokens"),
+            (("bad-kind", "unknown", 4, 1, None), "unknown cache-group kind"),
         )
-        for invalid_spec, message in invalid_specs:
+        for args, message in invalid_specs:
             with (
-                self.subTest(group=invalid_spec.group_id),
+                self.subTest(group=args[0]),
                 self.assertRaisesRegex(ValueError, message),
             ):
-                compute_max_logical_pages_for_capture(
-                    invalid_spec,
-                    max_context_len=8,
-                )
+                CacheGroupSpec(*args, replayable=False)
 
     def test_overlap_schedule_enablement_truth_table(self):
         from tokenspeed.runtime.engine.scheduler_utils import (
@@ -390,7 +398,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         specs = [
             CacheGroupSpec(
                 group_id="sliding",
-                retention="sliding_window",
+                attn_kind="sliding_window",
                 rows_per_page=4,
                 entry_stride_tokens=1,
                 sliding_window_tokens=8,
@@ -410,13 +418,19 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         )
 
         # Each request retains its 7-token window plus the decode token at any
-        # page alignment; one chunk in flight -- capped by the total -- adds its
-        # rows behind the resumable-boundary lookback.
+        # page alignment, and with the prefix cache on hands its partial page
+        # to the cache at the prompt end while continuing on a fresh one (one
+        # more block per request, ceil((P - 1) / g), within the lookback); one
+        # chunk in flight -- capped by the total -- adds its rows behind the
+        # resumable-boundary lookback, which spans the most blocks a window can
+        # cover at any alignment: ceil((W - 1 + g - 1) / g).
         resident_pages = 10 * math.ceil((7 + 1 + 3) / 4)
-        lookback_pages = math.ceil(7 / 4)
+        lookback_pages = math.ceil((7 + 3) / 4)
+        handover_pages = 10 * min(math.ceil((4 - 1) / 4), lookback_pages)
         scheduled_pages = math.ceil(20 / 4)
         self.assertEqual(
-            pages["sliding"], resident_pages + lookback_pages + scheduled_pages
+            pages["sliding"],
+            resident_pages + handover_pages + lookback_pages + scheduled_pages,
         )
 
     def test_page_counts_positive_finite_and_under_total_times_live(self):
@@ -460,32 +474,25 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
     def test_every_v4_group_is_token_history(self):
         # V4 stores rows of tokens everywhere -- the SWA window and the
         # compressor tails are windows, not recurrent-state checkpoints -- so
-        # the whole pool is history family and the scheduler sees no snapshot
+        # the whole pool holds token rows and the scheduler sees no snapshot
         # group to place sparsely or align chunks for.
         specs = build_v4_cache_specs(
             SimpleNamespace(sliding_window=128),
             layer_ratio=(1, 4, 128),
         )
-        self.assertEqual({spec.family for spec in specs}, {"history"})
-        self.assertTrue(all(spec.checkpoint_granularity is None for spec in specs))
-        retentions = {spec.group_id: spec.retention for spec in specs}
-        self.assertEqual(retentions["v4.swa_kv"], "sliding_window")
-        self.assertEqual(retentions["v4.c4a.compressor_state"], "sliding_window")
-        self.assertEqual(
-            retentions["v4.c4a.indexer_compressor_state"], "sliding_window"
-        )
-        self.assertEqual(retentions["v4.c4a.compressed_kv"], "full_history")
+        kinds = {spec.group_id: spec.attn_kind for spec in specs}
+        self.assertEqual(kinds["v4.swa_kv"], "sliding_window")
+        self.assertEqual(kinds["v4.c4a.compressor_state"], "sliding_window")
+        self.assertEqual(kinds["v4.c4a.indexer_compressor_state"], "sliding_window")
+        self.assertEqual(kinds["v4.c4a.compressed_kv"], "full_history")
 
     def test_v4_groups_cross_the_bridge_into_a_live_scheduler(self):
         # The whole V4 set arrives at the C++ scheduler as History groups,
-        # passes SchedulerConfig::Validate (which refuses a sliding State
-        # group) and builds a scheduler; with no snapshot group there is no
-        # state grain for the prefill chunk to align to.
+        # passes SchedulerConfig::Validate and builds a scheduler.
         try:
-            from tokenspeed_scheduler import CacheGroupFamily, Scheduler
+            from tokenspeed_scheduler import AttnKind, Scheduler
 
             from tokenspeed.runtime.engine.scheduler_utils import (
-                aligned_max_scheduled_tokens,
                 make_config,
                 pool_to_cache_groups,
             )
@@ -518,7 +525,9 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         pool = SimpleNamespace(arena=SimpleNamespace(runtime_contract=contract))
         groups = pool_to_cache_groups(pool)
 
-        self.assertEqual({g.family for g in groups}, {CacheGroupFamily.History})
+        self.assertEqual(
+            {g.attn_kind for g in groups}, {AttnKind.Full, AttnKind.SlidingWindow}
+        )
         config = make_config(
             num_device_pages=num_device_pages,
             max_scheduled_tokens=1024,
@@ -534,7 +543,6 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             cache_groups=groups,
         )
         Scheduler(config)
-        self.assertEqual(aligned_max_scheduled_tokens(8192, groups), 8192)
 
     def test_c4_state_window_is_the_kernel_read_window(self):
         """The ratio-4 compress kernel reads eight positions (two groups) when a

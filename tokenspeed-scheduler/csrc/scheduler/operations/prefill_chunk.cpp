@@ -26,26 +26,6 @@
 
 namespace tokenspeed {
 
-std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
-                               std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens) {
-    _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
-    _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
-    std::int32_t chunk_size = std::min(unscheduled, token_budget);
-    if (promotion_boundary_tokens > first_pos) {
-        chunk_size = std::min(chunk_size, promotion_boundary_tokens - first_pos);
-    }
-    if (chunk_size == unscheduled) {
-        return chunk_size;
-    }
-
-    const std::int32_t prefix_page_offset = first_pos % prefix_granularity;
-    if (prefix_page_offset != 0) {
-        const std::int32_t tokens_to_boundary = prefix_granularity - prefix_page_offset;
-        return token_budget >= tokens_to_boundary ? tokens_to_boundary : 0;
-    }
-    return chunk_size - chunk_size % prefix_granularity;
-}
-
 std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t unscheduled,
                                      std::int32_t replay_window) {
     _assert(0 <= prefill_tokens && prefill_tokens <= unscheduled, "a chunk cannot exceed the unscheduled prompt");
@@ -58,8 +38,8 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 }
 
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
-                                std::int32_t unscheduled, std::int32_t token_budget,
-                                std::int32_t promotion_boundary_tokens) {
+                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens) {
+    _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
     // The re-fed window of a hit rides in the same forward, so it comes out of
     // the budget before any new token; with nothing left the request waits.
     const std::int32_t budget = token_budget - (resumes_hit ? coordinator.ReplayTokens(first_pos) : 0);
@@ -68,33 +48,27 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
     }
     const std::int32_t plain = std::min(budget, unscheduled);
     std::int32_t prefill_tokens = plain;
-    if (coordinator.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
-        prefill_tokens = AlignPrefillChunk(first_pos, unscheduled, budget, coordinator.PrefixGranularity(),
-                                           promotion_boundary_tokens);
-        if (prefill_tokens == 0) {
-            return 0;
-        }
+    if (junction_tokens > first_pos) {
+        prefill_tokens = std::min(prefill_tokens, junction_tokens - first_pos);
     }
     const std::int32_t window = coordinator.ReplayWindowTokens();
     const std::int32_t kept = ChunkKeepingFinalWindow(prefill_tokens, unscheduled, window);
     if (kept > 0 || prefill_tokens == plain) {
         return kept;
     }
-    // Alignment stopped the chunk at a promotion boundary that lies inside the
-    // prompt's final window, where no chunk end satisfies both rules and the
-    // request would wait forever. The boundary is a reuse opportunity, not an
-    // invariant: pass it (the closed group recomputes the promoted pages) and
-    // size the chunk from the plain budget under the window rule alone.
+    // The junction lies inside the prompt's final window, where no chunk end
+    // satisfies both rules and the request would wait forever. The junction
+    // is a reuse opportunity, not an invariant: pass it and size the chunk
+    // from the plain budget under the window rule alone.
     return ChunkKeepingFinalWindow(plain, unscheduled, window);
 }
 
 std::int32_t MinPrefillChunkTokens(const CacheCoordinator& coordinator) {
     // A hit chunk re-feeds up to one replay window and then still needs room
-    // to advance: every new token when fewer than a window remain, or one
-    // prefix page when a promotion boundary aligns it.
+    // to carry the prompt's final window whole, or at least a prefix page of
+    // new tokens when the window is smaller than a page.
     const std::int32_t window = coordinator.ReplayWindowTokens();
-    const std::int32_t replay_reserve = window > 0 ? window + std::max(window, coordinator.PrefixGranularity()) : 0;
-    return std::max(coordinator.HasMambaStateGroup() ? coordinator.PrefixGranularity() : 0, replay_reserve);
+    return window > 0 ? window + std::max(window, coordinator.PrefixGranularity()) : 0;
 }
 
 }  // namespace tokenspeed

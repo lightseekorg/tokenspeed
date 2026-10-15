@@ -66,6 +66,17 @@ def test_amd_quark_dynamic_mxfp4_metadata_selects_mxfp4(monkeypatch) -> None:
     assert quant_config.group_size == 32
 
 
+def test_amd_quark_dynamic_mxfp4_requires_even_activation_scales(monkeypatch) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
+    even = _fp4_e8m0_per_group(is_dynamic=True) | {"scale_calculation_mode": "even"}
+    quant_config = Mxfp4Config.from_config(_amd_quark_mxfp4_config(even))
+    assert quant_config.use_dynamic_mxfp4_activations is True
+
+    ceil = even | {"scale_calculation_mode": "ceil"}
+    with pytest.raises(ValueError, match="scale_calculation_mode"):
+        Mxfp4Config.from_config(_amd_quark_mxfp4_config(ceil))
+
+
 def test_amd_quark_metadata_is_not_promoted_on_non_amd(monkeypatch) -> None:
     _mock_platform(monkeypatch, is_amd=False)
     config = _amd_quark_mxfp4_config(_fp4_e8m0_per_group(is_dynamic=True))
@@ -115,6 +126,21 @@ def test_amd_quark_excludes_match_runtime_layer_names(monkeypatch) -> None:
         "model.layers.0.mlp.experts.0.gate_proj",
         ignored_layers,
     )
+
+
+def test_amd_quark_excludes_match_fused_qwen4_exp_ple_kv_proj(monkeypatch) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
+    config = _amd_quark_mxfp4_config(
+        _fp4_e8m0_per_group(is_dynamic=True),
+        exclude=[
+            "model.language_model.layers.2.ple.key_proj",
+            "model.language_model.layers.2.ple.value_proj",
+        ],
+    )
+
+    ignored_layers = Mxfp4Config.from_config(config).ignored_layers
+    assert should_ignore_quant_layer("model.layers.2.ple.kv_proj", ignored_layers)
+    assert not should_ignore_quant_layer("model.layers.5.ple.kv_proj", ignored_layers)
 
 
 def test_incomplete_amd_quark_metadata_is_not_promoted(monkeypatch) -> None:

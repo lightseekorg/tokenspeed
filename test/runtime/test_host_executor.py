@@ -95,6 +95,9 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.HostTransferLane = Mock
     lanes.build_transfer_geometry = Mock()
     lanes.check_host_memory = Mock()
+    lanes.host_memory_share = Mock(return_value=10**12)
+    lanes.largest_pinned_fit = Mock(side_effect=lambda room_bytes: max(room_bytes, 0))
+    lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
     lanes.load_stream_priority = Mock(return_value=None)
     lanes.new_cache_stream = Mock()
     scheduler = ModuleType("tokenspeed_scheduler")
@@ -876,7 +879,9 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._prefetch_acks = []
         executor._backup_futures = []
+        executor._backup_stats = executor_module._BackupStats()
         executor._l3_workers = None
+        executor.host_storage.host_block_range = lambda group_index, block_id: (0, 64)
         executor.l3_store = Mock()
         executor._write_done = lambda op_id: op_id
         started = [threading.Event(), threading.Event()]
@@ -954,7 +959,7 @@ class GroupAwareWireTest(unittest.TestCase):
             self.assertEqual(poll_until_ready(), [12])
             self.assertEqual(executor.poll_results(), [])
             self.assertEqual(
-                [op_ids for _, op_ids, _ in executor._backup_futures], [[11]]
+                [ticket.op_ids for ticket in executor._backup_futures], [[11]]
             )
 
             release[1].set()
@@ -1257,6 +1262,8 @@ class GroupAwareWireTest(unittest.TestCase):
                 io_backend="kernel",
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
 
         build_geometry.assert_called_once_with(
@@ -1355,6 +1362,8 @@ class GroupAwareWireTest(unittest.TestCase):
                         io_backend=io_backend,
                         attn_tp_rank=0,
                         kvp_rank=0,
+                        nprocs_per_node=1,
+                        world_cpu_group=None,
                     )
                     self.assertIsNone(executor._transfer_geometry.device_rows)
                     executor._transfer_geometry.bind.assert_not_called()
@@ -1582,6 +1591,222 @@ class GroupAwareWireTest(unittest.TestCase):
         tracker.begin_load.assert_called_once_with()
 
 
+class HostMemoryShareTest(unittest.TestCase):
+    """The ranks of a node pin their Host tiers at once: each sizes them
+    against an equal share of the Host memory the node has available, every
+    buffer at the power of two its pinned allocation rounds up to."""
+
+    GB = 10**9
+    BLOCK_BYTES = 10**6  # one Host LCM block
+    # --kvstore-ratio 2 over a ~139 GB Device KV: 277.95 GB of L2 per rank.
+    LARGE_POOL_BLOCKS = 138_975
+
+    def setUp(self):
+        try:
+            self.executor_module = import_module("tokenspeed.runtime.cache.l2.executor")
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+        self.headroom = self.executor_module._HOST_MEM_HEADROOM_BYTES
+
+    def _fitting_blocks(self, available_gb, nprocs_per_node):
+        """The L2 blocks in the largest power of two of a rank's share."""
+        share = int(available_gb * self.GB) // nprocs_per_node - self.headroom
+        return (1 << (share.bit_length() - 1)) // self.BLOCK_BYTES
+
+    def _build(
+        self,
+        *,
+        available_gb,
+        nprocs_per_node,
+        device_lcm_blocks,
+        host_size_gb=0,
+        world_cpu_group=None,
+    ):
+        """An L2-only executor at --kvstore-ratio 2 and its mocked logger."""
+        executor_module = self.executor_module
+        lanes_module = _lanes_module()
+        field = SimpleNamespace(
+            field_id="field",
+            device_buffer_index=0,
+            device_block_zero_offset_bytes=0,
+            block_stride_bytes=16,
+            payload_bytes=16,
+        )
+        pool = Mock()
+        pool.cache_transfer_layout.return_value = SimpleNamespace(
+            num_lcm_blocks=device_lcm_blocks,
+            buffers=(SimpleNamespace(device=SimpleNamespace(type="cuda")),),
+            groups=(
+                SimpleNamespace(
+                    group_id="group", cache_blocks_per_lcm_block=1, fields=(field,)
+                ),
+            ),
+            consumers=(("field",),),
+        )
+        pool.arena.runtime_contract = SimpleNamespace(
+            group_specs=(SimpleNamespace(group_id="group", shard_count=1),),
+            virtual_block_counts={"group": 1 + device_lcm_blocks},
+        )
+        storage = SimpleNamespace(
+            host_cache_block_bytes=(self.BLOCK_BYTES,),
+            host_field_offsets=((0,),),
+            host_lcm_block_bytes=self.BLOCK_BYTES,
+            num_host_lcm_blocks=0,
+            host_buffer="host",
+        )
+        tracker = Mock()
+        tracker.event_sets = [object()]
+        logger = Mock()
+        available = SimpleNamespace(available=int(available_gb * self.GB))
+        with (
+            patch.object(
+                executor_module,
+                "compute_host_lcm_block_bytes",
+                return_value=self.BLOCK_BYTES,
+            ),
+            patch.object(executor_module, "HostCacheStorage", return_value=storage),
+            patch.object(lanes_module.psutil, "virtual_memory", return_value=available),
+            patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
+            patch.object(executor_module, "new_cache_stream", return_value="stream"),
+            patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(
+                lanes_module,
+                "build_host_transfer_geometry",
+                return_value=SimpleNamespace(device_rows=None, bind=Mock()),
+            ),
+            patch.object(executor_module, "logger", logger),
+        ):
+            executor = executor_module.HostCacheExecutor(
+                pool,
+                l2_tier=True,
+                host_ratio=2.0,
+                host_size_gb=host_size_gb,
+                snapshot_pool=NO_POOL,
+                slot_state_exporters=None,
+                io_backend="direct",
+                attn_tp_rank=0,
+                kvp_rank=0,
+                nprocs_per_node=nprocs_per_node,
+                world_cpu_group=world_cpu_group,
+            )
+        return executor, logger
+
+    def test_four_ranks_cap_an_over_committed_ratio_l2_to_the_node(self):
+        # 4 x 277.95 GB of L2 does not fit a node with 956 GB available, and
+        # neither does an L2 of the whole 228.26 GB share: it pins 274.88 GB.
+        executor, logger = self._build(
+            available_gb=956,
+            nprocs_per_node=4,
+            device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+        )
+        l2_blocks = executor.num_host_pages - 1
+        self.assertEqual(l2_blocks, self._fitting_blocks(956, 4))
+        self.assertEqual(l2_blocks, 2**37 // self.BLOCK_BYTES)
+        pinned = _lanes_module().pinned_host_bytes(l2_blocks * self.BLOCK_BYTES)
+        self.assertLessEqual(4 * (pinned + self.headroom), 956 * self.GB)
+        logger.warning.assert_called_once()
+        message = logger.warning.call_args.args[0]
+        self.assertIn("from 277.95 GB to 137.44 GB", message)
+        self.assertIn("--kvstore-ratio 2.0", message)
+
+    def test_an_explicit_size_that_does_not_fit_the_node_is_refused(self):
+        # 278 GB and 200 GB pin 549.76 GB and 274.88 GB: neither fits the
+        # 228.26 GB share of 4 ranks on 956 GB.
+        for host_size_gb in (278, 200):
+            with (
+                self.subTest(host_size_gb=host_size_gb),
+                self.assertRaisesRegex(ValueError, "Not enough Host memory"),
+            ):
+                self._build(
+                    available_gb=956,
+                    nprocs_per_node=4,
+                    device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                    host_size_gb=host_size_gb,
+                )
+        # One whose pinned size fits the node's share is kept as asked.
+        executor, logger = self._build(
+            available_gb=956,
+            nprocs_per_node=4,
+            device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+            host_size_gb=128,
+        )
+        self.assertEqual(executor.num_host_pages - 1, 128_000)
+        logger.warning.assert_not_called()
+
+    def test_a_single_rank_and_a_small_pool_keep_the_ratio_size(self):
+        for nprocs_per_node, device_lcm_blocks in (
+            (1, self.LARGE_POOL_BLOCKS),  # 277.95 GB pins 549.76 GB of 956
+            (4, 50_760),  # 4 x 101.52 GB pin 4 x 137.44 GB
+        ):
+            with self.subTest(nprocs_per_node=nprocs_per_node):
+                executor, logger = self._build(
+                    available_gb=956,
+                    nprocs_per_node=nprocs_per_node,
+                    device_lcm_blocks=device_lcm_blocks,
+                )
+                self.assertEqual(executor.num_host_pages - 1, 2 * device_lcm_blocks)
+                logger.warning.assert_not_called()
+
+    def test_no_room_for_one_block_is_refused_not_capped_to_nothing(self):
+        with self.assertRaisesRegex(ValueError, "Not enough Host memory"):
+            self._build(
+                available_gb=4 * self.headroom / self.GB,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+            )
+
+    def test_every_rank_takes_the_l2_size_the_smallest_share_holds(self):
+        # A peer node has 500 GB available: every rank takes what it holds,
+        # and the agreement runs before any rank pins, explicit size or not.
+        torch = import_module("torch")
+        group = object()
+        peer_blocks = self._fitting_blocks(500, 4)
+        self.assertLess(peer_blocks, self._fitting_blocks(956, 4))
+
+        def all_reduce(tensor, *, op, group):
+            self.assertIs(op, torch.distributed.ReduceOp.MIN)
+            tensor.fill_(min(int(tensor.item()), peer_blocks))
+
+        with patch.object(
+            torch.distributed, "all_reduce", side_effect=all_reduce
+        ) as reduce:
+            executor, _ = self._build(
+                available_gb=956,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                world_cpu_group=group,
+            )
+            self.assertEqual(executor.num_host_pages - 1, peer_blocks)
+            explicit, _ = self._build(
+                available_gb=956,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                host_size_gb=128,
+                world_cpu_group=group,
+            )
+            self.assertEqual(explicit.num_host_pages - 1, 128_000)
+        self.assertEqual(reduce.call_count, 2)
+        self.assertTrue(all(c.kwargs["group"] is group for c in reduce.call_args_list))
+
+    def test_a_pinned_buffer_takes_the_power_of_two_it_rounds_up_to(self):
+        lanes_module = _lanes_module()
+        pinned = lanes_module.pinned_host_bytes
+        fit = lanes_module.largest_pinned_fit
+        self.assertEqual(pinned(0), 0)
+        self.assertEqual(pinned(1), 1)
+        self.assertEqual(pinned(2**37), 2**37)
+        self.assertEqual(pinned(2**37 + 1), 2**38)
+        self.assertEqual(pinned(228_260 * self.BLOCK_BYTES), 2**38)
+        self.assertEqual(fit(-1), 0)
+        self.assertEqual(fit(0), 0)
+        self.assertEqual(fit(2**38 - 1), 2**37)
+        self.assertEqual(fit(2**38), 2**38)
+        for room in (1, 3, 2**37 - 1, 228_260 * self.BLOCK_BYTES):
+            self.assertLessEqual(pinned(fit(room)), room)
+            self.assertGreater(pinned(fit(room) + 1), room)
+
+
 class L3FlatKvExecutorTest(unittest.TestCase):
     def test_wait_l3_backups_snapshots_under_lock_and_waits_outside(self):
         module = _load_executor_module_without_triton(force_isolated=True)
@@ -1602,7 +1827,17 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         future.result.side_effect = completed
         executor = SimpleNamespace(
             _ack_lock=lock,
-            _backup_futures=PendingBackups([(future, [7], [(0, 1, "h0", 0)])]),
+            _backup_futures=PendingBackups(
+                [
+                    module._BackupTicket(
+                        future=future,
+                        op_ids=[7],
+                        pages=[(0, 1, "h0", 0)],
+                        enqueued_at=0.0,
+                        payload_bytes=64,
+                    )
+                ]
+            ),
         )
         module.HostCacheExecutor._wait_l3_backups(executor)
         self.assertEqual(observed, ["done"])
@@ -1610,6 +1845,63 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "backup failed"):
             module.HostCacheExecutor._wait_l3_backups(executor)
         self.assertFalse(lock.locked())
+
+    def test_shutdown_waits_for_backup_tickets_and_only_backs_up_write_acks(self):
+        module = _load_executor_module_without_triton(force_isolated=True)
+        executor = module.HostCacheExecutor.__new__(module.HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._completions = Mock()
+        executor._completions.drop_all.return_value = [
+            module._Ack(kind=module._AckKind.SNAPSHOT, op_ids=[6], backup_pages=[]),
+            module._Ack(
+                kind=module._AckKind.WRITE_BACK,
+                op_ids=[7],
+                backup_pages=[(0, 1, "h0", 0)],
+            ),
+        ]
+        future = Mock()
+        executor._backup_futures = [
+            module._BackupTicket(
+                future=future,
+                op_ids=[8],
+                pages=[(0, 2, "h1", 0)],
+                enqueued_at=0.0,
+                payload_bytes=64,
+            )
+        ]
+        executor._l3_workers = Mock()
+        workers = executor._l3_workers
+        executor._l3_prefetch_lane = Mock()
+        prefetch_lane = executor._l3_prefetch_lane
+        executor._prefetch_jobs = {9: Mock()}
+        executor._prefetch_acks = [(9, 1)]
+        executor._backup_to_storage = Mock()
+        executor.l3_store = Mock()
+
+        executor.shutdown()
+
+        executor._backup_to_storage.assert_called_once_with([(0, 1, "h0", 0)])
+        future.result.assert_called_once_with()
+        workers.shutdown.assert_called_once_with(wait=True)
+        prefetch_lane.shutdown.assert_called_once_with(wait=True)
+        self.assertEqual(executor._backup_futures, [])
+        self.assertEqual(executor._prefetch_jobs, {})
+        self.assertEqual(executor._prefetch_acks, [])
+        self.assertIsNone(executor._l3_workers)
+        self.assertIsNone(executor._l3_prefetch_lane)
+        executor.l3_store.close.assert_called_once_with()
+
+    def test_backup_ticket_requires_timing_fields(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import _BackupTicket
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        signature = inspect.signature(_BackupTicket)
+        for name in ("future", "op_ids", "pages", "enqueued_at", "payload_bytes"):
+            self.assertIs(signature.parameters[name].default, inspect.Parameter.empty)
+        with self.assertRaises(TypeError):
+            _BackupTicket(Mock(), [7], [(0, 1, "h0", 0)])
 
     def test_storage_pages_list_the_kept_hashed_rows_by_local_host_id(self):
         try:
@@ -1636,49 +1928,13 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             [(1, 2, "h1", 1)],
         )
 
-    def test_ack_requires_backup_pages(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import (
-                HostCacheExecutor,
-                _Ack,
-                _AckKind,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        signature = inspect.signature(_Ack)
-        self.assertIs(
-            signature.parameters["backup_pages"].default, inspect.Parameter.empty
-        )
-        with self.assertRaises(TypeError):
-            _Ack(_AckKind.WRITE_BACK, [1])
-        start_writing = inspect.signature(HostCacheExecutor._start_writing)
-        self.assertIs(
-            start_writing.parameters["backup_pages"].default, inspect.Parameter.empty
-        )
-        with self.assertRaises(TypeError):
-            HostCacheExecutor._start_writing(object(), [7], [(0, 1, 1)])
-
-    def test_l2_constructor_does_not_attach_l3_from_optional_storage(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        signature = inspect.signature(HostCacheExecutor.__init__)
-        self.assertNotIn("storage_backend", signature.parameters)
-        self.assertNotIn("storage_key_prefix", signature.parameters)
-        self.assertNotIn("storage_rank", signature.parameters)
-        self.assertIs(
-            signature.parameters["attn_tp_rank"].default, inspect.Parameter.empty
-        )
-
     def test_poll_results_backs_up_host_pages_asynchronously(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import (
                 HostCacheExecutor,
                 _Ack,
                 _AckKind,
+                _BackupStats,
             )
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
@@ -1700,7 +1956,11 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._prefetch_acks = []
         executor._backup_futures = []
+        executor._backup_stats = _BackupStats()
         executor._l3_workers = None
+        executor.host_storage = SimpleNamespace(
+            host_block_range=lambda group_index, block_id: (0, 64)
+        )
         executor.l3_store = Mock()
         executor.l3_store.backup.side_effect = backup
         finish = Mock()
@@ -1718,6 +1978,14 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         self.assertEqual(first, [])
         self.assertTrue(started.wait(timeout=2))
         executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
+        # While the PUT is gated the backlog reports the pending page, its
+        # payload bytes, and a growing oldest-pending age.
+        time.sleep(0.05)
+        backlog = executor.l3_backup_backlog()
+        self.assertEqual(backlog.pending_tasks, 1)
+        self.assertEqual(backlog.pending_pages, 1)
+        self.assertEqual(backlog.pending_bytes, 64)
+        self.assertGreaterEqual(backlog.oldest_pending_seconds, 0.04)
         release.set()
         deadline = time.monotonic() + 2
         second = []
@@ -1729,6 +1997,23 @@ class L3FlatKvExecutorTest(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(len(second), 1)
             self.assertEqual(int(second[0].op_id), 7)
+            # The WriteBackDone lands only after the PUT completed, and the
+            # diagnostics carry the payload bytes and the queue/PUT split.
+            stats = executor._backup_stats
+            self.assertEqual(stats.completed, 1)
+            self.assertEqual(stats.failed, 0)
+            self.assertEqual(stats.completed_bytes, 64)
+            self.assertEqual(len(stats.recent), 1)
+            completion = stats.recent[0]
+            self.assertEqual(completion.pages, 1)
+            self.assertEqual(completion.payload_bytes, 64)
+            self.assertFalse(completion.failed)
+            self.assertGreaterEqual(completion.put_seconds, 0.04)
+            backlog = executor.l3_backup_backlog()
+            self.assertEqual(backlog.pending_tasks, 0)
+            self.assertEqual(backlog.pending_pages, 0)
+            self.assertEqual(backlog.pending_bytes, 0)
+            self.assertEqual(backlog.oldest_pending_seconds, 0.0)
         finally:
             workers = executor._l3_workers
             if workers is not None:
@@ -1740,6 +2025,7 @@ class L3FlatKvExecutorTest(unittest.TestCase):
                 HostCacheExecutor,
                 _Ack,
                 _AckKind,
+                _BackupStats,
             )
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
@@ -1751,8 +2037,12 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._prefetch_acks = []
         executor._backup_futures = []
+        executor._backup_stats = _BackupStats()
         executor._backup_poll_failed = False
         executor._l3_workers = None
+        executor.host_storage = SimpleNamespace(
+            host_block_range=lambda group_index, block_id: (0, 64)
+        )
         executor.l3_store = Mock()
         executor.l3_store.backup.return_value = [False]
         finish = Mock()
@@ -1783,6 +2073,118 @@ class L3FlatKvExecutorTest(unittest.TestCase):
             if workers is not None:
                 workers.shutdown(wait=True)
         self.assertTrue(failed)
+        # Every failed attempt is recorded with its timing; the retry keeps
+        # the ticket pending instead of acknowledging the write-back.
+        stats = executor._backup_stats
+        self.assertGreaterEqual(stats.failed, 1)
+        self.assertGreaterEqual(stats.retried, 1)
+        self.assertEqual(stats.completed, 0)
+        self.assertTrue(all(entry.failed for entry in stats.recent))
+        backlog = executor.l3_backup_backlog()
+        self.assertGreaterEqual(backlog.pending_tasks, 1)
+        self.assertGreaterEqual(backlog.pending_pages, 1)
+
+    def test_backup_diagnostics_separate_queue_wait_from_put_time(self):
+        try:
+            from tokenspeed.runtime.cache.l2.executor import (
+                HostCacheExecutor,
+                _Ack,
+                _AckKind,
+                _BackupStats,
+            )
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs runtime dependencies: {exc}")
+
+        first_put_started = threading.Event()
+        release_first_put = threading.Event()
+        put_calls = 0
+        put_lock = threading.Lock()
+
+        def backup(pages):
+            nonlocal put_calls
+            with put_lock:
+                put_calls += 1
+                index = put_calls
+            if index == 1:
+                first_put_started.set()
+                if not release_first_put.wait(timeout=10):
+                    raise TimeoutError("first L3 PUT was not released")
+            return [True] * len(pages)
+
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._ack_lock = threading.Lock()
+        executor._completions = CompletionQueue()
+        executor._ready_load_acks = []
+        executor._prefetch_acks = []
+        executor._backup_futures = []
+        executor._backup_stats = _BackupStats()
+        executor._backup_poll_failed = False
+        executor._l3_workers = None
+        executor.host_storage = SimpleNamespace(
+            host_block_range=lambda group_index, block_id: (0, 64)
+        )
+        executor.l3_store = Mock()
+        executor.l3_store.backup.side_effect = backup
+        finish = Mock()
+        finish.query.return_value = True
+
+        def queue_ack(op_id, page):
+            executor._completions.push(
+                finish,
+                _Ack(
+                    kind=_AckKind.WRITE_BACK,
+                    op_ids=[op_id],
+                    backup_pages=[page],
+                ),
+            )
+            self.assertEqual(executor.poll_results(), [])
+
+        try:
+            # The single backup worker picks up the first ticket and blocks
+            # inside its PUT.
+            queue_ack(7, (0, 1, "h0", 0))
+            self.assertTrue(first_put_started.wait(timeout=10))
+
+            # The second ticket queues behind the busy worker; while PUT 1 is
+            # still gated, both are pending and the backlog reflects them.
+            queue_ack(8, (0, 2, "h1", 0))
+            time.sleep(0.15)
+            backlog = executor.l3_backup_backlog()
+            self.assertEqual(backlog.pending_tasks, 2)
+            self.assertEqual(backlog.pending_pages, 2)
+            self.assertEqual(backlog.pending_bytes, 128)
+            self.assertGreaterEqual(backlog.oldest_pending_seconds, 0.1)
+
+            # Release PUT 1; PUT 2 then runs without its own gate.
+            release_first_put.set()
+            events = []
+            deadline = time.monotonic() + 10
+            while len(events) < 2 and time.monotonic() < deadline:
+                events.extend(executor.poll_results())
+                if len(events) < 2:
+                    time.sleep(0.005)
+            self.assertEqual([int(event.op_id) for event in events], [7, 8])
+
+            stats = executor._backup_stats
+            self.assertEqual(stats.completed, 2)
+            self.assertEqual(stats.failed, 0)
+            self.assertEqual(stats.completed_bytes, 128)
+            completions = list(stats.recent)
+            self.assertEqual(len(completions), 2)
+            first, second = completions
+            # PUT 1 held the worker: its time is PUT time, not queue wait.
+            self.assertGreaterEqual(first.put_seconds, 0.1)
+            self.assertLess(first.queue_seconds, first.put_seconds)
+            # PUT 2 spent that hold queued; its own PUT ran unimpeded.
+            self.assertGreaterEqual(second.queue_seconds, 0.1)
+            self.assertLess(second.put_seconds, second.queue_seconds)
+            self.assertFalse(executor.consume_backup_poll_failure())
+        finally:
+            release_first_put.set()
+            workers = executor._l3_workers
+            if workers is not None:
+                workers.shutdown(wait=True)
 
     def test_load_with_every_row_owned_elsewhere_acks_without_h2d(self):
         try:
@@ -1899,6 +2301,8 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 io_backend=io_backend,
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
         self.addCleanup(executor.shutdown)
         return executor, pool, draft_pool

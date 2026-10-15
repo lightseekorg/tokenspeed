@@ -1,18 +1,10 @@
-from types import SimpleNamespace
-
-from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.distributed_initializer import DistributedConfig
 from tokenspeed.runtime.utils import server_args as server_args_module
-from tokenspeed.runtime.utils.server_args import PortArgs
+from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
 
 def test_resolved_dist_init_addr_moves_with_busy_control_port(monkeypatch):
-    args = SimpleNamespace(
-        port=8051,
-        mapping=SimpleNamespace(nnodes=1, has_attn_dp=False),
-        dist_init_addr=None,
-        node_rank=0,
-    )
+    args = ServerArgs(model="x", port=8051)
     monkeypatch.setattr(server_args_module.random, "randint", lambda _low, _high: 500)
     monkeypatch.setattr(
         server_args_module,
@@ -26,16 +18,8 @@ def test_resolved_dist_init_addr_moves_with_busy_control_port(monkeypatch):
 
 
 def test_distributed_config_uses_resolved_dist_init_addr():
-    mapping = Mapping(rank=0, world_size=1, nprocs_per_node=1)
-    args = SimpleNamespace(
-        device="cuda",
-        mapping=mapping,
-        dist_init_addr="127.0.0.1:8284",
-        distributed_timeout_seconds=None,
-        force_deterministic_rsag=False,
-        batch_invariant_collectives=False,
-        emulate_rank_zero=False,
-    )
+    args = ServerArgs(model="x", dist_init_addr="127.0.0.1:8284")
+    args.mapping.rank = 0
     port_args = PortArgs(
         tokenizer_ipc_name="tcp://127.0.0.1:8295",
         scheduler_input_ipc_name="tcp://127.0.0.1:8299",

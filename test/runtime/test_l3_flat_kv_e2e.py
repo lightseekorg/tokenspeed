@@ -97,6 +97,10 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
         )
 
         class SyntheticPool:
+            def __init__(self):
+                self.load_tracker = None
+                self.arena = None
+
             def cache_transfer_layout(self):
                 return layout
 
@@ -130,6 +134,8 @@ class L3FlatKvRoundTripTest(unittest.TestCase):
                 io_backend="direct",
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
         store = self.MemoryKvStore()
         executor.attach_l3_storage(
