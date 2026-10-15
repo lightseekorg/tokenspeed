@@ -21,7 +21,7 @@
 """MIXED-batch sampling seams: sample-then-verify over shared buffers.
 
 A MIXED round samples its prefill rows and verifies its decode rows through
-the SAME backend, back to back (``ModelExecutor._run_sampling``). Two seams
+the SAME backend, back to back (``ModelExecutor._sample_and_verify``). Two seams
 this file pins:
 
 * Both calls land outputs in the backend's packed output region, so the
@@ -237,12 +237,12 @@ def test_mixed_round_preserves_prefill_outputs():
     )
     executor._apply_force_single_token_verify = lambda accept, off, cnt, ids: accept
 
-    out_tokens, out_accept = ModelExecutor._run_sampling(
+    out_tokens, out_accept = ModelExecutor._sample_and_verify(
         executor,
         LogitsProcessorOutput(next_token_logits=logits),
         info,
         ctx,
-        candidates=candidates,
+        candidates,
     )
     torch.cuda.synchronize()
     # Prefill rows keep their own argmaxes (rows 0..1 -> tokens 1, 2);
@@ -327,8 +327,8 @@ def test_mixed_round_preserves_prefill_logprobs():
     executor._apply_force_single_token_verify = lambda accept, off, cnt, ids: accept
 
     logits_output = LogitsProcessorOutput(next_token_logits=logits)
-    out_tokens, _ = ModelExecutor._run_sampling(
-        executor, logits_output, info, ctx, candidates=candidates
+    out_tokens, _ = ModelExecutor._sample_and_verify(
+        executor, logits_output, info, ctx, candidates
     )
     torch.cuda.synchronize()
     assert out_tokens[:num_extends].tolist() == [1, 2]

@@ -239,9 +239,11 @@ accepted width at the request's first stop token and its token limit
 (`RuntimeStates.apply_stop_conditions`, the stop set the finish check reads),
 before the commit, the frontier or the drafter reads it, and marks the slot
 stopped. A decode the overlap schedule already dispatched behind that round
-runs the request as a padding row -- both slots `-1`
+runs the request as a padding row—both slots `-1`
 (`RuntimeStates.masked_state_tables`): it reads the zero state, writes
-nothing, and keeps no token. The finish checkpoint is thus the state before
+nothing, and keeps no token. (Pipeline parallelism serves only the prefill
+role, which neither decodes nor overlaps, so its stages, which do not sample,
+never run a forward behind a stopped request.) The finish checkpoint is thus the state before
 the stop token under every schedule ([Scheduler
 §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)); a finish
 dispatched as a rotating first decode publishes at the prompt end, where the

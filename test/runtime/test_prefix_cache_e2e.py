@@ -294,7 +294,8 @@ class TestTokenLevelPrefixHits:
     hits the reference's prompt end exactly; ``X[:-37]`` ends inside the last
     page before any publication point and finds no state below it; a next
     turn hits the reference's finish, which settled after its last forward
-    landed and so covers every token the reference sampled.
+    landed and covers every token the reference sampled but the one it ended
+    on.
     """
 
     STEPS = 24
@@ -375,13 +376,14 @@ class TestTokenLevelPrefixHits:
                     assert (warm) == (cold)
 
                     # A next turn -- X, the reference's whole continuation and
-                    # more -- hits its finish checkpoint: the frontier the
-                    # last forward landed, the final sampled token included,
-                    # for KV and state groups alike.
+                    # more -- hits its finish checkpoint: the state and KV
+                    # before the token the request ended on (its last, which
+                    # reached the token budget), whatever the schedule, for KV
+                    # and state groups alike.
                     _, cached = _greedy_ids(
                         engine, prefix + cold + suffix, 1, bypass_cache=False
                     )
-                    assert (cached) == (len(prefix) + len(cold))
+                    assert (cached) == (len(prefix) + len(cold) - 1)
                 finally:
                     engine.shutdown()
 

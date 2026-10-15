@@ -36,6 +36,8 @@ request without history reads no block at all, whatever its row holds.
 A padding row (``-1`` in both slots: a graph padding row, or a request the
 device stopped while a forward behind it was already dispatched) reads the
 zero state and writes nothing; every state kernel skips negative blocks.
+The debug checks below cannot tell such a row from one corrupted to
+``(-1, -1)``, so they skip it.
 """
 
 from __future__ import annotations

@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from http import HTTPStatus
+
 import pytest
 import torch
 
@@ -27,11 +29,13 @@ from tokenspeed.runtime.engine.generation_output_processor import (
     OutputProcesser,
     RequestState,
 )
+from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.request_stats import (
     NOOP_STATS,
     RequestStats,
     RequestStatsTracker,
 )
+from tokenspeed.runtime.execution.types import MAX_STOP_TOKEN_IDS
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
@@ -1063,11 +1067,6 @@ def test_a_live_decode_that_keeps_no_token_is_an_error():
 
 
 def test_a_request_with_more_stop_tokens_than_the_device_table_is_refused():
-    from http import HTTPStatus
-
-    from tokenspeed.runtime.engine.request_handler import RequestHandler
-    from tokenspeed.runtime.execution.types import MAX_STOP_TOKEN_IDS
-
     def state(num_ids):
         return RequestState(
             prompt_input_ids=[1],
@@ -1089,3 +1088,41 @@ def test_a_request_with_more_stop_tokens_than_the_device_table_is_refused():
     reason = refused.finished_reason.to_json()
     assert reason["status_code"] == HTTPStatus.BAD_REQUEST
     assert f"at most {MAX_STOP_TOKEN_IDS - 2} other" in reason["message"]
+
+
+def test_a_row_behind_a_stopped_request_reads_its_own_token():
+    """A request the device stopped keeps no token, but its decode row still
+    holds its stored token: the next row's token is at the next position, so
+    a live request never takes its neighbour's token (and so never misses
+    its own stop token)."""
+
+    class _TwoDecodes:
+        request_ids = ["stopped", "live"]
+        request_pool_indices = [1, 2]
+        input_lengths = [1, 1]
+        prefill_lengths = []
+        extend_prefix_lens = []
+        extend_replay_lens = []
+
+        def num_extends(self):
+            return 0
+
+    class _Result(_ExecutionResult):
+        output_tokens = torch.tensor([11, 22], dtype=torch.int32)
+        output_lengths = torch.tensor([0, 1], dtype=torch.int32)
+
+    processor = OutputProcesser(_Sender(), attn_tp_rank=0, metrics=_Metrics())
+    live = _state([5, 6, 7], computed_length=3)
+    processor.rid_to_state["live"] = live
+
+    events = processor.post_process_forward_op(
+        _TwoDecodes(), _Result(), is_prefill_instance=False
+    )
+
+    extends = {
+        event.request_id: list(event.tokens)
+        for event in events
+        if type(event).__name__ == "ExtendResult"
+    }
+    assert extends == {"stopped": [], "live": [22]}
+    assert live.output_ids == [22]

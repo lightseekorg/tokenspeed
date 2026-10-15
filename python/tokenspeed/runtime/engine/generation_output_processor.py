@@ -893,8 +893,11 @@ class OutputProcesser:
                 if output_top_val_list is not None and not is_decode_slot
                 else None
             )
-            if self.spec_num_tokens is not None and is_decode_slot:
-                pt += self.spec_num_tokens
+            # A decode row stores its whole verify window (one token without
+            # speculation) however many it keeps -- none for a request the
+            # device stopped; a prefill row stores the one token it samples.
+            if is_decode_slot:
+                pt += self.spec_num_tokens if self.spec_num_tokens is not None else 1
             else:
                 pt += output_length
 
@@ -1077,6 +1080,8 @@ class OutputProcesser:
             # (a stop string, a grammar, an abort) still consumed the whole
             # round on the device: the scheduler gets every kept token, so
             # the frontier it publishes is the state and KV the device holds.
+            # A NaN abort keeps one sanitized token instead; it is safe because
+            # an abort releases the pages without publishing them.
             reported_ids = (
                 model_output_ids if len(new_ids) < len(model_output_ids) else new_ids
             )

@@ -106,10 +106,16 @@ def _apply_stop_conditions_kernel(
     # budget, nothing once the request has stopped.
     accepted = tl.load(accept_lengths_ptr + rows, mask=row_mask, other=0).to(tl.int32)
     first_stop = tl.min(
-        tl.where(is_stop & (columns[None, :] < accepted[:, None]), columns[None, :], WIDTH_PAD),
+        tl.where(
+            is_stop & (columns[None, :] < accepted[:, None]),
+            columns[None, :],
+            WIDTH_PAD,
+        ),
         axis=1,
     )
-    budget = limits - valid - 1
+    # A live request always has room for one more token; the floor keeps a
+    # broken invariant from walking the cache length backwards.
+    budget = tl.maximum(limits - valid - 1, 0)
     kept = tl.minimum(tl.minimum(accepted, first_stop + 1), budget)
     already_stopped = tl.load(stopped_ptr + slots, mask=live, other=0) != 0
     decode_stops = already_stopped | (first_stop < kept) | (kept >= budget)
@@ -136,6 +142,10 @@ def _apply_stop_conditions_torch(
     decode_width: int,
     padding_index: int,
 ) -> None:
+    """Scalar reference of the kernel, for devices without it (and the
+    kernel's parity tests): cut each decode row's accepted width at its stop
+    conditions and record ``stopped``, in place, as ``apply_stop_conditions``
+    documents."""
     for row in range(req_pool_indices.shape[0]):
         slot = int(req_pool_indices[row])
         if slot == padding_index:
@@ -160,7 +170,9 @@ def _apply_stop_conditions_torch(
         first_stop = next(
             (j for j, token in enumerate(window) if token in stop_ids), decode_width
         )
-        budget = limit - valid - 1
+        budget = max(limit - valid - 1, 0)
+        # The kernel's no-stop sentinel is its padded width; any value at
+        # least ``accepted`` gives the same ``kept`` and stop decision.
         kept = min(accepted, first_stop + 1, budget)
         if bool(stopped[slot]):
             accept_lengths[row] = 0

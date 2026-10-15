@@ -176,7 +176,7 @@ def test_decode_verify_keeps_simulated_widths_and_drafts_in_the_sampler_buffers(
     )
     candidates = _candidates(3)
 
-    tokens, lengths = executor._run_sampling(object(), object(), ctx, candidates)
+    tokens, lengths = executor._sample_and_verify(object(), object(), ctx, candidates)
     expected = simulated_accept_lengths(cache_lengths[pool], _scaled("2.7")).tolist()
     assert expected == [3, 3, 1]
     assert lengths.tolist() == expected
@@ -187,7 +187,7 @@ def test_decode_verify_keeps_simulated_widths_and_drafts_in_the_sampler_buffers(
     # Rows the scheduler forces to one token keep verify's token.
     executor.input_buffers.force_single_token_verify_buf[1] = True
     ctx.decode_input_ids = [-1, 9, -1]
-    tokens, lengths = executor._run_sampling(object(), object(), ctx, candidates)
+    tokens, lengths = executor._sample_and_verify(object(), object(), ctx, candidates)
     forced = [expected[0], 1, expected[2]]
     assert lengths.tolist() == forced
     assert _emitted(tokens, forced) == _accepted_drafts(candidates, forced)
@@ -208,7 +208,7 @@ def test_mixed_round_simulates_only_its_decode_rows():
     info = SamplingBatchInfo(req_pool_indices=torch.tensor(pool), device="cpu")
     candidates = _candidates(2)
 
-    tokens, lengths = executor._run_sampling(logits, info, ctx, candidates)
+    tokens, lengths = executor._sample_and_verify(logits, info, ctx, candidates)
     decode = simulated_accept_lengths(cache_lengths[pool[2:]], _scaled("2.7")).tolist()
     assert decode == [3, 2]
     assert lengths.tolist() == [1, 1, *decode]

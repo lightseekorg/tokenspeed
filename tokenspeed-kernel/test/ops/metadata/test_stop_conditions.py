@@ -23,6 +23,10 @@
 import pytest
 import torch
 from tokenspeed_kernel.ops.metadata import apply_stop_conditions
+from tokenspeed_kernel.ops.metadata.stop_conditions import (
+    _apply_stop_conditions_kernel,
+)
+from utils import assert_no_triton_compile
 
 _STOP_IDS = 16
 _STOP = 7
@@ -121,8 +125,9 @@ def test_only_a_prompt_completing_extend_row_stops():
     assert stopped[1:4].tolist() == [False, True, True]
 
 
-if not torch.cuda.is_available():
-    pytest.skip("CUDA required for the kernel parity tests", allow_module_level=True)
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the kernel runs on CUDA"
+)
 
 
 def _random_batch(batch, extends, outputs, width, pool, seed):
@@ -145,6 +150,7 @@ def _random_batch(batch, extends, outputs, width, pool, seed):
     return slots, tokens, accepts, inputs, prompts, (valid, stop_ids, limits, stopped)
 
 
+@requires_cuda
 @pytest.mark.parametrize(
     ("batch", "extends", "outputs", "width"),
     ((9, 0, 0, 4), (12, 5, 3, 3), (6, 6, 6, 1), (1, 0, 0, 1), (200, 70, 70, 5)),
@@ -164,12 +170,9 @@ def test_kernel_matches_the_tensor_path(batch, extends, outputs, width):
     assert torch.equal(gpu_state[3].cpu(), cpu_state[3])
 
 
+@requires_cuda
 def test_kernel_compiles_once_across_batch_shapes():
     """Batch, extend and output counts change every round; none may key a new binary."""
-    from tokenspeed_kernel.ops.metadata.stop_conditions import (
-        _apply_stop_conditions_kernel,
-    )
-    from utils import assert_no_triton_compile
 
     def run(batch, extends, outputs):
         args = _random_batch(batch, extends, outputs, 4, 512, seed=batch)

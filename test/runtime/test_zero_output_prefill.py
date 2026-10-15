@@ -146,7 +146,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
     )
     sample = load_symbol(
         RUNTIME + "execution/model_executor.py",
-        "_run_sampling",
+        "_sample_and_verify",
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
         _sampling_info_for_requests=load_symbol(
@@ -515,7 +515,7 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
     )
     sample = load_symbol(
         RUNTIME + "execution/model_executor.py",
-        "_run_sampling",
+        "_sample_and_verify",
         owner="ModelExecutor",
         LogitsProcessorOutput=Output,
         _with_prefill_sample_offsets=_load_prefill_sample_offsets(),
