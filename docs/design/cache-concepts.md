@@ -74,20 +74,6 @@ A fourth quantity lives outside the logical world entirely:
   `config.kernel_page_size` overrides any default; deriving kernel_page_size
   from `prefix_granularity` is a category error and a bug.
 
-  DeepSeek V4's geometry is fully
-  registry-sourced: the compressed full-history chains declare
-  `DEEPSEEK_V4_PAGE_SIZE // ratio` rows × ratio-token stride, the SWA
-  window declares `V4_KERNEL_BLOCK_ROWS`, and the layout's field byte
-  shapes are built from the kernel page constant — nothing derives from
-  `prefix_granularity`. The V4 backend's scalar is therefore a true
-  registry-sourced `kernel_page_size` (config-overridable), and the
-  scheduler grain is free: any positive multiple of the kernel page is
-  accepted (asserted at backend construction and in the recipe's
-  `check_layout`). The V4 architecture spec defaults P to exactly one kernel
-  page by naming `DEEPSEEK_V4_PAGE_SIZE` as its
-  `default_prefix_granularity` — the registry constant itself, not a second
-  copy of the number.
-
 ### Physical world (storage units)
 
 * **`CacheBlock`** (and its aggregation, the **LCM block**) is the unit of
@@ -1784,13 +1770,8 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   (`backends/paged/write_locations.py`, failing to slot 0 — the reserved dummy
   page) and the token-shaped resolve
   (`attention/page_table.py::group_slot_mapping_from_raw` +
-  `safe_page_ids` / `mask_invalid_graph_tokens`, failing closed to the
-  `-1` skip sentinel for group buffers with no dummy page). DeepSeek-V4 is
-  a *composer*, not an owner: its SWA / compressor-state / indexer-state
-  writes call the shared token-shaped resolve over its delivered tables;
-  only the compression-boundary orchestration (per-ratio strides, boundary
-  masks, the fused dsv4 kernel) is V4-specific
-  (`kv_cache/hybrid_deepseek_v4.py`).
+  `safe_page_ids`, failing closed to the `-1` skip sentinel for group
+  buffers with no dummy page).
 
 ### Principle 6 — provenance discipline: fixed
 
@@ -1865,10 +1846,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   V4.1's same-checkpoint DSpark. ✓
 * Capacity has three shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
-* Kernel geometry does not live under the recipes package. DeepSeek V4's byte
+* Kernel geometry does not live under the recipes package. DeepSeek V4.1's byte
   formulas, cache layout and group-id vocabulary sit in
-  `attention/deepseek_v4_geometry.py`, which the backends, ops, model and pool
-  read directly; the recipe depends on it, not the reverse. ✓
+  `attention/deepseek_v41_geometry.py`, which the backend, model and pool read
+  directly; the recipe depends on it, not the reverse. ✓
 * One kernel layout has one definition. The interleaved mxfp8 KV-scale planes
   come from `plan.mxfp8_kv_scale_fields`, which also owns the page-span and
   head-dim constraints that layout imposes, so no recipe restates the shape or

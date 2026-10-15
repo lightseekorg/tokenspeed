@@ -1,33 +1,34 @@
-import unittest
+import sys
 from unittest import mock
 
+import pytest
 from tokenspeed_kernel.ops.attention import attn_merge_state
 
 from tokenspeed.runtime.models import deepseek_v3
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3ForCausalLM
 
 
-class TestDeepseekV3Loader(unittest.TestCase):
+class TestDeepseekV3Loader:
     def test_cached_prefix_merge_uses_attention_dispatcher(self):
-        self.assertIs(deepseek_v3.attn_merge_state, attn_merge_state)
-        self.assertFalse(hasattr(deepseek_v3, "merge_state"))
+        assert (deepseek_v3.attn_merge_state) is (attn_merge_state)
+        assert not (hasattr(deepseek_v3, "merge_state"))
 
     def test_missing_checkpoint_scale_params_are_silent(self):
         model = object.__new__(DeepseekV3ForCausalLM)
 
         with mock.patch("tokenspeed.runtime.models.deepseek_v3.logger") as logger:
-            self.assertIsNone(
+            assert (
                 model.get_param(
                     {},
                     "model.layers.2.self_attn.k_proj.k_scale",
                 )
-            )
-            self.assertIsNone(
+            ) is None
+            assert (
                 model.get_param(
                     {},
                     "model.layers.2.self_attn.v_proj.v_scale",
                 )
-            )
+            ) is None
 
         logger.warning.assert_not_called()
 
@@ -35,12 +36,12 @@ class TestDeepseekV3Loader(unittest.TestCase):
         model = object.__new__(DeepseekV3ForCausalLM)
 
         with mock.patch("tokenspeed.runtime.models.deepseek_v3.logger") as logger:
-            self.assertIsNone(
+            assert (
                 model.get_param({}, "model.layers.2.self_attn.q_proj.weight")
-            )
+            ) is None
 
         logger.warning.assert_called_once()
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

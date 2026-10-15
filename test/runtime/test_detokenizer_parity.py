@@ -24,7 +24,7 @@ detokenization regressions are caught.
 Tokenizer-independent edge cases (``decode_grouped_batch``, eviction
 errors, ``is_dummy`` flag, ``decoded_texts`` seed re-emission, stop-trim
 corner cases, ``output_multi_ids`` pass-through) each live in their own
-``unittest.TestCase`` subclass and use ``gpt2`` as the reference
+native pytest class and use ``gpt2`` as the reference
 tokenizer.
 
 Gates 3, 7, 8, and 9 live above the detokenizer layer (raw-token mode
@@ -41,8 +41,9 @@ case classes.
 import os
 import sys
 import unicodedata
-import unittest
 from typing import Any, Dict, List, Optional
+
+import pytest
 
 # CI registration (parsed via AST, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -303,18 +304,18 @@ def _run_per_request_path(tokenizer: Any, frames: List[Dict[str, Any]]) -> List[
 class _DetokenizerParityBase:
     """Shared tests that must pass for every tokenizer in the matrix.
 
-    Concrete subclasses set ``tokenizer_name`` and inherit
-    ``unittest.TestCase``; ``setUpClass`` loads the tokenizer exactly
-    once per class so subsequent tests reuse the cached HF download.
+    Concrete subclasses set ``tokenizer_name``; ``setup_class`` loads
+    the tokenizer exactly once per class so subsequent tests reuse the
+    cached HF download.
     """
 
     tokenizer_name: str = ""
 
     @classmethod
-    def setUpClass(cls) -> None:  # type: ignore[override]
+    def setup_class(cls) -> None:
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.tokenizer_name)
 
-    def setUp(self) -> None:
+    def setup_method(self) -> None:
         self.manager = _StubDetokenizerManager(self.tokenizer)
 
     # ---- gate 1: streamed text ------------------------------------------
@@ -325,12 +326,12 @@ class _DetokenizerParityBase:
         out = self.manager.handle_batch_token_id_out(
             _batch(["req-1"], decode_ids=[ids])
         )
-        self.assertEqual(out.output_strs, [source])
+        assert (out.output_strs) == ([source])
 
     def test_two_frame_split_reconstructs_source_text(self):
         source = "Hello world, how are you today?"
         ids = self.tokenizer.encode(source, add_special_tokens=False)
-        self.assertGreaterEqual(len(ids), 4, "test requires at least 4 tokens")
+        assert (len(ids)) >= (4), "test requires at least 4 tokens"
         mid = len(ids) // 2
 
         out1 = self.manager.handle_batch_token_id_out(
@@ -340,10 +341,10 @@ class _DetokenizerParityBase:
             _batch(["req-1"], decode_ids=[ids[mid:]])
         )
 
-        self.assertEqual(out1.output_strs[0] + out2.output_strs[0], source)
+        assert (out1.output_strs[0] + out2.output_strs[0]) == (source)
         status = self.manager.decode_status["req-1"]
-        self.assertEqual(status.decode_ids, ids)
-        self.assertEqual(status.decoded_text, source)
+        assert (status.decode_ids) == (ids)
+        assert (status.decoded_text) == (source)
 
     def test_per_token_streaming_reconstructs_source_text(self):
         source = "The quick brown fox jumps over the lazy dog."
@@ -351,7 +352,7 @@ class _DetokenizerParityBase:
 
         pieces = _stream_per_token(self.manager, "req-1", ids)
 
-        self.assertEqual("".join(pieces), source)
+        assert ("".join(pieces)) == (source)
 
     # ---- gate 5: partial-UTF-8 deferral (CJK, emoji, combining) ---------
 
@@ -370,11 +371,12 @@ class _DetokenizerParityBase:
 
         pieces = _stream_per_token(self.manager, "req-1", ids)
 
-        self.assertEqual("".join(pieces), source)
+        assert ("".join(pieces)) == (source)
         for i, piece in enumerate(pieces):
-            self.assertNotIn(
-                "\ufffd", piece, f"frame {i} leaked replacement char: {piece!r}"
-            )
+            _pytest_member_1 = "\ufffd"
+            _pytest_container_2 = piece
+            _pytest_msg_3 = f"frame {i} leaked replacement char: {piece!r}"
+            assert _pytest_member_1 not in _pytest_container_2, _pytest_msg_3
 
     def test_cjk_two_frame_split_reconstructs_source(self):
         source = "你好世界"
@@ -388,7 +390,7 @@ class _DetokenizerParityBase:
             _batch(["req-1"], decode_ids=[ids[mid:]])
         )
 
-        self.assertEqual(out1.output_strs[0] + out2.output_strs[0], source)
+        assert (out1.output_strs[0] + out2.output_strs[0]) == (source)
 
     def test_emoji_per_token_streaming_never_leaks_partial_bytes(self):
         # "🌟" is U+1F31F (4 bytes in UTF-8). Byte-level BPE tokenizers
@@ -400,13 +402,12 @@ class _DetokenizerParityBase:
 
         pieces = _stream_per_token(self.manager, "req-1", ids)
 
-        self.assertEqual("".join(pieces), source)
+        assert ("".join(pieces)) == (source)
         for i, piece in enumerate(pieces):
-            self.assertNotIn(
-                "\ufffd",
-                piece,
-                f"frame {i} leaked replacement char: {piece!r}",
-            )
+            _pytest_member_4 = "\ufffd"
+            _pytest_container_5 = piece
+            _pytest_msg_6 = f"frame {i} leaked replacement char: {piece!r}"
+            assert _pytest_member_4 not in _pytest_container_5, _pytest_msg_6
 
     def test_zwj_emoji_sequence_round_trips_through_streaming(self):
         # A ZWJ emoji sequence ("family": man + ZWJ + woman + ZWJ + girl)
@@ -418,7 +419,7 @@ class _DetokenizerParityBase:
 
         pieces = _stream_per_token(self.manager, "req-1", ids)
 
-        self.assertEqual("".join(pieces), source)
+        assert ("".join(pieces)) == (source)
 
     def test_nfd_combining_character_round_trip(self):
         # "á" in NFD form is two codepoints: U+0061 (a) + U+0301
@@ -436,9 +437,8 @@ class _DetokenizerParityBase:
 
         pieces = _stream_per_token(self.manager, "req-1", ids)
 
-        self.assertEqual(
-            unicodedata.normalize("NFC", "".join(pieces)),
-            unicodedata.normalize("NFC", source),
+        assert (unicodedata.normalize("NFC", "".join(pieces))) == (
+            unicodedata.normalize("NFC", source)
         )
 
     def test_mixed_ascii_cjk_emoji_stream_reconstructs_source(self):
@@ -447,13 +447,12 @@ class _DetokenizerParityBase:
 
         pieces = _stream_per_token(self.manager, "req-1", ids)
 
-        self.assertEqual("".join(pieces), source)
+        assert ("".join(pieces)) == (source)
         for i, piece in enumerate(pieces):
-            self.assertNotIn(
-                "\ufffd",
-                piece,
-                f"frame {i} leaked replacement char: {piece!r}",
-            )
+            _pytest_member_7 = "\ufffd"
+            _pytest_container_8 = piece
+            _pytest_msg_9 = f"frame {i} leaked replacement char: {piece!r}"
+            assert _pytest_member_7 not in _pytest_container_8, _pytest_msg_9
 
     # ---- gate 2: output_ids pass-through --------------------------------
 
@@ -462,8 +461,8 @@ class _DetokenizerParityBase:
         batch = _batch(["req-1"], decode_ids=[ids])
         out = self.manager.handle_batch_token_id_out(batch)
 
-        self.assertIs(out.output_ids, batch.decode_ids)
-        self.assertEqual(out.output_ids, [ids])
+        assert (out.output_ids) is (batch.decode_ids)
+        assert (out.output_ids) == ([ids])
 
     # ---- gate 4: stop trimming (matched string, matched token) ----------
 
@@ -478,11 +477,11 @@ class _DetokenizerParityBase:
             )
         )
 
-        self.assertEqual(out.output_strs, ["answer "])
+        assert (out.output_strs) == (["answer "])
 
     def test_finished_with_matched_stop_token_drops_last_id_text(self):
         ids = self.tokenizer.encode("Hello world", add_special_tokens=False)
-        self.assertGreaterEqual(len(ids), 2)
+        assert (len(ids)) >= (2)
 
         out = self.manager.handle_batch_token_id_out(
             _batch(
@@ -493,7 +492,7 @@ class _DetokenizerParityBase:
         )
 
         expected = self.tokenizer.decode(ids[:-1])
-        self.assertEqual(out.output_strs[0], expected)
+        assert (out.output_strs[0]) == (expected)
 
     def test_no_stop_trim_true_preserves_matched_string_content(self):
         source = "answer STOP trailing"
@@ -507,7 +506,7 @@ class _DetokenizerParityBase:
             )
         )
 
-        self.assertEqual(out.output_strs, [source])
+        assert (out.output_strs) == ([source])
 
     def test_unfinished_state_does_not_apply_stop_trim(self):
         source = "answer STOP"
@@ -520,7 +519,7 @@ class _DetokenizerParityBase:
             )
         )
 
-        self.assertEqual(out.output_strs, [source])
+        assert (out.output_strs) == ([source])
 
     # ---- gate 6: logprob / meta pass-through ----------------------------
 
@@ -545,18 +544,18 @@ class _DetokenizerParityBase:
 
         out = self.manager.handle_batch_token_id_out(batch)
 
-        self.assertEqual(out.input_token_logprobs_val, [-1.5])
-        self.assertEqual(out.input_token_logprobs_idx, [42])
-        self.assertEqual(out.output_token_logprobs_val, [-0.25])
-        self.assertEqual(out.output_token_logprobs_idx, [1])
-        self.assertEqual(out.input_top_logprobs_val, [[[-1.0, -2.0]]])
-        self.assertEqual(out.input_top_logprobs_idx, [[[10, 20]]])
-        self.assertEqual(out.output_top_logprobs_val, [[[-0.1, -0.2]]])
-        self.assertEqual(out.output_top_logprobs_idx, [[[1, 2]]])
-        self.assertEqual(out.input_token_ids_logprobs_val, [[[-3.0]]])
-        self.assertEqual(out.input_token_ids_logprobs_idx, [[[7]]])
-        self.assertEqual(out.output_token_ids_logprobs_val, [[[-0.3]]])
-        self.assertEqual(out.output_token_ids_logprobs_idx, [[[1]]])
+        assert (out.input_token_logprobs_val) == ([-1.5])
+        assert (out.input_token_logprobs_idx) == ([42])
+        assert (out.output_token_logprobs_val) == ([-0.25])
+        assert (out.output_token_logprobs_idx) == ([1])
+        assert (out.input_top_logprobs_val) == ([[[-1.0, -2.0]]])
+        assert (out.input_top_logprobs_idx) == ([[[10, 20]]])
+        assert (out.output_top_logprobs_val) == ([[[-0.1, -0.2]]])
+        assert (out.output_top_logprobs_idx) == ([[[1, 2]]])
+        assert (out.input_token_ids_logprobs_val) == ([[[-3.0]]])
+        assert (out.input_token_ids_logprobs_idx) == ([[[7]]])
+        assert (out.output_token_ids_logprobs_val) == ([[[-0.3]]])
+        assert (out.output_token_ids_logprobs_idx) == ([[[1]]])
 
     def test_meta_scalar_fields_and_extras_flow_through_unchanged(self):
         ids = self.tokenizer.encode("x", add_special_tokens=False)
@@ -576,16 +575,16 @@ class _DetokenizerParityBase:
 
         out = self.manager.handle_batch_token_id_out(batch)
 
-        self.assertEqual(out.rids, ["req-1"])
-        self.assertEqual(out.prompt_tokens, [11])
-        self.assertEqual(out.completion_tokens, [7])
-        self.assertEqual(out.cached_tokens, [3])
-        self.assertEqual(out.spec_verify_ct, [2])
-        self.assertEqual(out.output_hidden_states, [[0.5, 0.25]])
-        self.assertEqual(out.batch_accept_draft_tokens, [0.75])
-        self.assertEqual(out.output_extra_infos, [{"frame": 1}])
-        self.assertEqual(out.generated_time, 123456)
-        self.assertEqual(out.finished_reasons, [{"type": "stop", "matched": None}])
+        assert (out.rids) == (["req-1"])
+        assert (out.prompt_tokens) == ([11])
+        assert (out.completion_tokens) == ([7])
+        assert (out.cached_tokens) == ([3])
+        assert (out.spec_verify_ct) == ([2])
+        assert (out.output_hidden_states) == ([[0.5, 0.25]])
+        assert (out.batch_accept_draft_tokens) == ([0.75])
+        assert (out.output_extra_infos) == ([{"frame": 1}])
+        assert (out.generated_time) == (123456)
+        assert (out.finished_reasons) == ([{"type": "stop", "matched": None}])
 
     # ---- multi-request and lifecycle ------------------------------------
 
@@ -597,10 +596,10 @@ class _DetokenizerParityBase:
             _batch(["req-1", "req-2"], decode_ids=[ids_1, ids_2])
         )
 
-        self.assertEqual(out.output_strs[0], "Hello")
-        self.assertEqual(out.output_strs[1], "world")
-        self.assertEqual(self.manager.decode_status["req-1"].decoded_text, "Hello")
-        self.assertEqual(self.manager.decode_status["req-2"].decoded_text, "world")
+        assert (out.output_strs[0]) == ("Hello")
+        assert (out.output_strs[1]) == ("world")
+        assert (self.manager.decode_status["req-1"].decoded_text) == ("Hello")
+        assert (self.manager.decode_status["req-2"].decoded_text) == ("world")
 
     def test_second_frame_on_one_request_does_not_disturb_the_other(self):
         ids_a = self.tokenizer.encode("Hello", add_special_tokens=False)
@@ -614,14 +613,11 @@ class _DetokenizerParityBase:
             _batch(["req-1"], decode_ids=[ids_a_more])
         )
 
-        self.assertEqual(
-            self.manager.decode_status["req-1"].decoded_text, "Hello there"
+        assert (self.manager.decode_status["req-1"].decoded_text) == ("Hello there")
+        assert (out.output_strs[0]) == (
+            self.manager.decode_status["req-1"].decoded_text[len("Hello") :]
         )
-        self.assertEqual(
-            out.output_strs[0],
-            self.manager.decode_status["req-1"].decoded_text[len("Hello") :],
-        )
-        self.assertEqual(self.manager.decode_status["req-2"].decoded_text, "world")
+        assert (self.manager.decode_status["req-2"].decoded_text) == ("world")
 
     def test_embedding_batch_passes_through_unchanged(self):
         recv = BatchEmbeddingOut(
@@ -633,7 +629,7 @@ class _DetokenizerParityBase:
 
         out = self.manager.handle_batch_embedding_out(recv)
 
-        self.assertIs(out, recv)
+        assert (out) is (recv)
 
     # ---- multi-frame state machine branches (gap closure #1/#2/#3) -----
 
@@ -646,7 +642,7 @@ class _DetokenizerParityBase:
         # accumulated offsets. Lock that branch in here.
         source = "Hello world the long sentence STOP tail text"
         ids = self.tokenizer.encode(source, add_special_tokens=False)
-        self.assertGreaterEqual(len(ids), 6)
+        assert (len(ids)) >= (6)
 
         # Find the largest split index whose decoded prefix is still
         # free of "STOP". This guarantees frame 1 commits a clean
@@ -658,7 +654,7 @@ class _DetokenizerParityBase:
             if "STOP" not in prefix_text:
                 split = candidate
                 break
-        self.assertIsNotNone(split, "need a clean STOP-free prefix split")
+        assert (split) is not None, "need a clean STOP-free prefix split"
 
         out1 = self.manager.handle_batch_token_id_out(
             _batch(["req-1"], decode_ids=[ids[:split]])
@@ -674,12 +670,12 @@ class _DetokenizerParityBase:
         total_emitted = out1.output_strs[0] + out2.output_strs[0]
         full_decoded = self.tokenizer.decode(ids)
         expected = full_decoded[: full_decoded.find("STOP")]
-        self.assertEqual(total_emitted, expected)
+        assert (total_emitted) == (expected)
 
         # The finished frame does NOT commit to s.decoded_text. Lock
         # that semantic: the status reflects only the unfinished commit.
         status = self.manager.decode_status["req-1"]
-        self.assertEqual(status.decoded_text, out1.output_strs[0])
+        assert (status.decoded_text) == (out1.output_strs[0])
 
     def test_nonzero_read_offset_seed_changes_surr_slice_on_first_frame(self):
         # Gap 2. When the scheduler sends a non-zero read_offset on a
@@ -692,7 +688,7 @@ class _DetokenizerParityBase:
         # already-read portion.
         source = "Hello world goodbye universe"
         ids = self.tokenizer.encode(source, add_special_tokens=False)
-        self.assertGreaterEqual(len(ids), 3)
+        assert (len(ids)) >= (3)
 
         initial_read_offset = 2
         out = self.manager.handle_batch_token_id_out(
@@ -706,16 +702,16 @@ class _DetokenizerParityBase:
         surr_text = self.tokenizer.decode(ids[:initial_read_offset])
         full_text = self.tokenizer.decode(ids)
         expected_emit = full_text[len(surr_text) :]
-        self.assertEqual(out.output_strs, [expected_emit])
+        assert (out.output_strs) == ([expected_emit])
 
         status = self.manager.decode_status["req-1"]
-        self.assertEqual(status.decode_ids, ids)
-        self.assertEqual(status.decoded_text, expected_emit)
+        assert (status.decode_ids) == (ids)
+        assert (status.decoded_text) == (expected_emit)
         # After commit, surr_offset bumps to the OLD read_offset and
         # read_offset bumps to len(decode_ids).
-        self.assertEqual(status.surr_offset, initial_read_offset)
-        self.assertEqual(status.read_offset, len(ids))
-        self.assertEqual(status.sent_offset, len(expected_emit))
+        assert (status.surr_offset) == (initial_read_offset)
+        assert (status.read_offset) == (len(ids))
+        assert (status.sent_offset) == (len(expected_emit))
 
     def test_offset_bookkeeping_monotonic_across_partial_utf8_stream(self):
         # Gap 3. Across per-token CJK streaming, (read_offset,
@@ -735,20 +731,20 @@ class _DetokenizerParityBase:
             )
             s = self.manager.decode_status["req-1"]
 
-            self.assertGreaterEqual(s.read_offset, prev_read_offset)
-            self.assertGreaterEqual(s.sent_offset, prev_sent_offset)
-            self.assertTrue(
-                source.startswith(s.decoded_text),
-                f"decoded_text={s.decoded_text!r} not a prefix of "
-                f"source={source!r}",
+            assert (s.read_offset) >= (prev_read_offset)
+            assert (s.sent_offset) >= (prev_sent_offset)
+            _pytest_expr_10 = source.startswith(s.decoded_text)
+            _pytest_msg_11 = (
+                f"decoded_text={s.decoded_text!r} not a prefix of " f"source={source!r}"
             )
+            assert _pytest_expr_10, _pytest_msg_11
 
             prev_read_offset = s.read_offset
             prev_sent_offset = s.sent_offset
 
         final = self.manager.decode_status["req-1"]
-        self.assertEqual(final.decoded_text, source)
-        self.assertEqual(final.read_offset, len(ids))
+        assert (final.decoded_text) == (source)
+        assert (final.read_offset) == (len(ids))
 
     def test_empty_decode_ids_frame_is_noop(self):
         # Gap 4. A frame with decode_ids=[[]] (empty delta) should be
@@ -769,7 +765,7 @@ class _DetokenizerParityBase:
 
         out = self.manager.handle_batch_token_id_out(_batch(["req-1"], decode_ids=[[]]))
 
-        self.assertEqual(out.output_strs, [""])
+        assert (out.output_strs) == ([""])
         s_after = self.manager.decode_status["req-1"]
         after = (
             s_after.decoded_text,
@@ -778,7 +774,7 @@ class _DetokenizerParityBase:
             s_after.sent_offset,
             list(s_after.decode_ids),
         )
-        self.assertEqual(before, after)
+        assert (before) == (after)
 
     # ---- per-request class vs batch function ---------------------------
     #
@@ -795,21 +791,20 @@ class _DetokenizerParityBase:
         batch_emits = _run_batch_path(self.tokenizer, "req-1", frames)
         per_req_emits = _run_per_request_path(self.tokenizer, frames)
 
-        self.assertEqual(batch_emits, per_req_emits)
+        assert (batch_emits) == (per_req_emits)
 
     def test_per_request_matches_batch_two_frame_split(self):
         source = "Hello world, how are you today?"
         ids = self.tokenizer.encode(source, add_special_tokens=False)
-        self.assertGreaterEqual(len(ids), 4)
+        assert (len(ids)) >= (4)
         mid = len(ids) // 2
         frames = [
             {"decode_ids": ids[:mid]},
             {"decode_ids": ids[mid:]},
         ]
 
-        self.assertEqual(
-            _run_batch_path(self.tokenizer, "req-1", frames),
-            _run_per_request_path(self.tokenizer, frames),
+        assert (_run_batch_path(self.tokenizer, "req-1", frames)) == (
+            _run_per_request_path(self.tokenizer, frames)
         )
 
     def test_per_request_matches_batch_per_token_ascii(self):
@@ -817,9 +812,8 @@ class _DetokenizerParityBase:
         ids = self.tokenizer.encode(source, add_special_tokens=False)
         frames = [{"decode_ids": [tid]} for tid in ids]
 
-        self.assertEqual(
-            _run_batch_path(self.tokenizer, "req-1", frames),
-            _run_per_request_path(self.tokenizer, frames),
+        assert (_run_batch_path(self.tokenizer, "req-1", frames)) == (
+            _run_per_request_path(self.tokenizer, frames)
         )
 
     def test_per_request_matches_batch_cjk_per_token(self):
@@ -827,9 +821,8 @@ class _DetokenizerParityBase:
         ids = self.tokenizer.encode(source, add_special_tokens=False)
         frames = [{"decode_ids": [tid]} for tid in ids]
 
-        self.assertEqual(
-            _run_batch_path(self.tokenizer, "req-1", frames),
-            _run_per_request_path(self.tokenizer, frames),
+        assert (_run_batch_path(self.tokenizer, "req-1", frames)) == (
+            _run_per_request_path(self.tokenizer, frames)
         )
 
     def test_per_request_matches_batch_emoji_per_token(self):
@@ -837,9 +830,8 @@ class _DetokenizerParityBase:
         ids = self.tokenizer.encode(source, add_special_tokens=False)
         frames = [{"decode_ids": [tid]} for tid in ids]
 
-        self.assertEqual(
-            _run_batch_path(self.tokenizer, "req-1", frames),
-            _run_per_request_path(self.tokenizer, frames),
+        assert (_run_batch_path(self.tokenizer, "req-1", frames)) == (
+            _run_per_request_path(self.tokenizer, frames)
         )
 
     def test_per_request_matches_batch_finish_with_matched_stop_string(self):
@@ -852,15 +844,14 @@ class _DetokenizerParityBase:
             }
         ]
 
-        self.assertEqual(
-            _run_batch_path(self.tokenizer, "req-1", frames),
-            _run_per_request_path(self.tokenizer, frames),
+        assert (_run_batch_path(self.tokenizer, "req-1", frames)) == (
+            _run_per_request_path(self.tokenizer, frames)
         )
 
     def test_per_request_matches_batch_finish_on_later_frame(self):
         source = "Hello world the long sentence STOP tail text"
         ids = self.tokenizer.encode(source, add_special_tokens=False)
-        self.assertGreaterEqual(len(ids), 6)
+        assert (len(ids)) >= (6)
 
         # Pick the largest split where the decoded prefix still lacks
         # "STOP" so frame 1 commits a clean prefix.
@@ -869,7 +860,7 @@ class _DetokenizerParityBase:
             if "STOP" not in self.tokenizer.decode(ids[:candidate]):
                 split = candidate
                 break
-        self.assertIsNotNone(split)
+        assert (split) is not None
 
         frames = [
             {"decode_ids": ids[:split]},
@@ -879,9 +870,8 @@ class _DetokenizerParityBase:
             },
         ]
 
-        self.assertEqual(
-            _run_batch_path(self.tokenizer, "req-1", frames),
-            _run_per_request_path(self.tokenizer, frames),
+        assert (_run_batch_path(self.tokenizer, "req-1", frames)) == (
+            _run_per_request_path(self.tokenizer, frames)
         )
 
     def test_per_request_matches_batch_no_stop_trim(self):
@@ -895,9 +885,8 @@ class _DetokenizerParityBase:
             }
         ]
 
-        self.assertEqual(
-            _run_batch_path(self.tokenizer, "req-1", frames),
-            _run_per_request_path(self.tokenizer, frames),
+        assert (_run_batch_path(self.tokenizer, "req-1", frames)) == (
+            _run_per_request_path(self.tokenizer, frames)
         )
 
     def test_per_request_matches_batch_decoded_text_seed(self):
@@ -909,16 +898,15 @@ class _DetokenizerParityBase:
             }
         ]
 
-        self.assertEqual(
-            _run_batch_path(self.tokenizer, "req-1", frames),
-            _run_per_request_path(self.tokenizer, frames),
+        assert (_run_batch_path(self.tokenizer, "req-1", frames)) == (
+            _run_per_request_path(self.tokenizer, frames)
         )
 
     def test_per_request_matches_batch_nonzero_read_offset_seed(self):
         ids = self.tokenizer.encode(
             "Hello world goodbye universe", add_special_tokens=False
         )
-        self.assertGreaterEqual(len(ids), 3)
+        assert (len(ids)) >= (3)
         frames = [
             {
                 "decode_ids": ids,
@@ -926,20 +914,19 @@ class _DetokenizerParityBase:
             }
         ]
 
-        self.assertEqual(
-            _run_batch_path(self.tokenizer, "req-1", frames),
-            _run_per_request_path(self.tokenizer, frames),
+        assert (_run_batch_path(self.tokenizer, "req-1", frames)) == (
+            _run_per_request_path(self.tokenizer, frames)
         )
 
 
 # Concrete tokenizer matrix.
 
 
-class TestGpt2DetokenizerParity(_DetokenizerParityBase, unittest.TestCase):
+class TestGpt2DetokenizerParity(_DetokenizerParityBase):
     tokenizer_name = _GPT2_TOKENIZER
 
 
-class TestQwen2DetokenizerParity(_DetokenizerParityBase, unittest.TestCase):
+class TestQwen2DetokenizerParity(_DetokenizerParityBase):
     tokenizer_name = _QWEN_TOKENIZER
 
 
@@ -948,7 +935,7 @@ class TestQwen2DetokenizerParity(_DetokenizerParityBase, unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDetokenizerGroupedBatch(unittest.TestCase):
+class TestDetokenizerGroupedBatch:
     """Force the ``all_same=False`` branch that routes through
     ``decode_grouped_batch`` instead of ``tokenizer.batch_decode`` on
     the full batch. This branch activates whenever requests in one
@@ -957,10 +944,10 @@ class TestDetokenizerGroupedBatch(unittest.TestCase):
     """
 
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tokenizer = AutoTokenizer.from_pretrained(_GPT2_TOKENIZER)
 
-    def setUp(self) -> None:
+    def setup_method(self) -> None:
         self.manager = _StubDetokenizerManager(self.tokenizer)
 
     def test_mixed_skip_special_tokens_activates_grouped_path(self):
@@ -974,9 +961,9 @@ class TestDetokenizerGroupedBatch(unittest.TestCase):
             )
         )
 
-        self.assertEqual(out.output_strs, ["Hello", "world"])
-        self.assertEqual(self.manager.decode_status["req-1"].decoded_text, "Hello")
-        self.assertEqual(self.manager.decode_status["req-2"].decoded_text, "world")
+        assert (out.output_strs) == (["Hello", "world"])
+        assert (self.manager.decode_status["req-1"].decoded_text) == ("Hello")
+        assert (self.manager.decode_status["req-2"].decoded_text) == ("world")
 
     def test_mixed_spaces_between_special_tokens_activates_grouped_path(self):
         ids_a = self.tokenizer.encode("Hello", add_special_tokens=False)
@@ -989,7 +976,7 @@ class TestDetokenizerGroupedBatch(unittest.TestCase):
             )
         )
 
-        self.assertEqual(out.output_strs, ["Hello", "world"])
+        assert (out.output_strs) == (["Hello", "world"])
 
     def test_grouped_path_preserves_per_request_ordering(self):
         # Three requests with alternating skip_special_tokens settings.
@@ -1007,7 +994,7 @@ class TestDetokenizerGroupedBatch(unittest.TestCase):
             )
         )
 
-        self.assertEqual(out.output_strs, ["alpha", "beta", "gamma"])
+        assert (out.output_strs) == (["alpha", "beta", "gamma"])
 
 
 # ---------------------------------------------------------------------------
@@ -1015,12 +1002,12 @@ class TestDetokenizerGroupedBatch(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDetokenizerStopEdgeCases(unittest.TestCase):
+class TestDetokenizerStopEdgeCases:
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tokenizer = AutoTokenizer.from_pretrained(_GPT2_TOKENIZER)
 
-    def setUp(self) -> None:
+    def setup_method(self) -> None:
         self.manager = _StubDetokenizerManager(self.tokenizer)
 
     def test_no_stop_trim_true_with_matched_int_preserves_last_token(self):
@@ -1029,7 +1016,7 @@ class TestDetokenizerStopEdgeCases(unittest.TestCase):
         # no_stop_trim=True must short-circuit BOTH branches and keep
         # the full sequence untouched.
         ids = self.tokenizer.encode("Hello world", add_special_tokens=False)
-        self.assertGreaterEqual(len(ids), 2)
+        assert (len(ids)) >= (2)
 
         out = self.manager.handle_batch_token_id_out(
             _batch(
@@ -1041,7 +1028,7 @@ class TestDetokenizerStopEdgeCases(unittest.TestCase):
         )
 
         expected = self.tokenizer.decode(ids)
-        self.assertEqual(out.output_strs, [expected])
+        assert (out.output_strs) == ([expected])
 
     def test_multiple_stop_strings_in_text_only_trims_the_matched_one(self):
         # Gap 8. trim_matched_stop has a literal
@@ -1061,7 +1048,7 @@ class TestDetokenizerStopEdgeCases(unittest.TestCase):
 
         # Output cuts at the first occurrence of "STOP2" only; the
         # earlier "STOP1" survives untouched.
-        self.assertEqual(out.output_strs, ["answer STOP1 middle "])
+        assert (out.output_strs) == (["answer STOP1 middle "])
 
     def test_matched_string_not_present_in_decoded_text_is_noop(self):
         source = "pure answer"
@@ -1076,7 +1063,7 @@ class TestDetokenizerStopEdgeCases(unittest.TestCase):
 
         # trim_matched_stop returns output unchanged when
         # output.find(matched) == -1.
-        self.assertEqual(out.output_strs, [source])
+        assert (out.output_strs) == ([source])
 
     def test_finished_reason_without_matched_key_is_noop(self):
         source = "pure answer"
@@ -1089,7 +1076,7 @@ class TestDetokenizerStopEdgeCases(unittest.TestCase):
             )
         )
 
-        self.assertEqual(out.output_strs, [source])
+        assert (out.output_strs) == ([source])
 
 
 # ---------------------------------------------------------------------------
@@ -1097,7 +1084,7 @@ class TestDetokenizerStopEdgeCases(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDetokenizerRawTokenPath(unittest.TestCase):
+class TestDetokenizerRawTokenPath:
     """BatchTokenIDOut.output_multi_ids is populated in the raw-token
     path (scheduler → tokenizer_manager direct, bypassing detokenizer).
     The detokenizer must still accept a BatchTokenIDOut that has this
@@ -1108,10 +1095,10 @@ class TestDetokenizerRawTokenPath(unittest.TestCase):
     """
 
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tokenizer = AutoTokenizer.from_pretrained(_GPT2_TOKENIZER)
 
-    def setUp(self) -> None:
+    def setup_method(self) -> None:
         self.manager = _StubDetokenizerManager(self.tokenizer)
 
     def test_output_multi_ids_on_input_does_not_affect_detokenized_text(self):
@@ -1125,9 +1112,9 @@ class TestDetokenizerRawTokenPath(unittest.TestCase):
         )
 
         # Detokenized text is unaffected by the raw-token payload.
-        self.assertEqual(out.output_strs, ["Hello world"])
+        assert (out.output_strs) == (["Hello world"])
         # BatchStrOut does not expose output_multi_ids by design.
-        self.assertFalse(hasattr(out, "output_multi_ids"))
+        assert not (hasattr(out, "output_multi_ids"))
 
 
 # ---------------------------------------------------------------------------
@@ -1135,9 +1122,9 @@ class TestDetokenizerRawTokenPath(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDetokenizerLifecycle(unittest.TestCase):
+class TestDetokenizerLifecycle:
     @classmethod
-    def setUpClass(cls) -> None:
+    def setup_class(cls) -> None:
         cls.tokenizer = AutoTokenizer.from_pretrained(_GPT2_TOKENIZER)
 
     def test_missing_decode_status_raises_descriptive_runtime_error_on_eviction(
@@ -1154,7 +1141,7 @@ class TestDetokenizerLifecycle(unittest.TestCase):
         ids_2 = self.tokenizer.encode("beta", add_special_tokens=False)
         ids_3 = self.tokenizer.encode("gamma", add_special_tokens=False)
 
-        with self.assertRaises(RuntimeError) as cm:
+        with pytest.raises((RuntimeError)) as cm:
             manager.handle_batch_token_id_out(
                 _batch(
                     ["req-1", "req-2", "req-3"],
@@ -1162,9 +1149,9 @@ class TestDetokenizerLifecycle(unittest.TestCase):
                 )
             )
 
-        message = str(cm.exception)
-        self.assertIn("TOKENSPEED_DETOKENIZER_MAX_STATES", message)
-        self.assertIn("req-1", message)
+        message = str(cm.value)
+        assert ("TOKENSPEED_DETOKENIZER_MAX_STATES") in (message)
+        assert ("req-1") in (message)
 
     def test_is_dummy_flag_does_not_alter_decoding_output(self):
         # Gap 7. The production code sets self.is_dummy from
@@ -1182,8 +1169,8 @@ class TestDetokenizerLifecycle(unittest.TestCase):
             _batch(["req-1"], decode_ids=[ids])
         )
 
-        self.assertEqual(dummy_out.output_strs, live_out.output_strs)
-        self.assertEqual(dummy_out.output_strs, ["Hello world"])
+        assert (dummy_out.output_strs) == (live_out.output_strs)
+        assert (dummy_out.output_strs) == (["Hello world"])
 
     def test_decoded_texts_seed_is_reemited_on_first_frame(self):
         # Gap 9. When recv_obj.decoded_texts[i] is non-empty on the
@@ -1206,10 +1193,10 @@ class TestDetokenizerLifecycle(unittest.TestCase):
         )
 
         status = manager.decode_status["req-1"]
-        self.assertEqual(status.decoded_text, seed + " world")
+        assert (status.decoded_text) == (seed + " world")
         # Current behavior: the full committed text (seed + new) is
         # emitted on the first frame because sent_offset starts at 0.
-        self.assertEqual(out.output_strs, [seed + " world"])
+        assert (out.output_strs) == ([seed + " world"])
 
     def test_empty_logprob_arrays_pass_through_unchanged(self):
         # Gap 5. Empty logprob arrays (which the scheduler can emit
@@ -1239,18 +1226,18 @@ class TestDetokenizerLifecycle(unittest.TestCase):
             )
         )
 
-        self.assertEqual(out.input_token_logprobs_val, [])
-        self.assertEqual(out.input_token_logprobs_idx, [])
-        self.assertEqual(out.output_token_logprobs_val, [])
-        self.assertEqual(out.output_token_logprobs_idx, [])
-        self.assertEqual(out.input_top_logprobs_val, [])
-        self.assertEqual(out.input_top_logprobs_idx, [])
-        self.assertEqual(out.output_top_logprobs_val, [])
-        self.assertEqual(out.output_top_logprobs_idx, [])
-        self.assertEqual(out.input_token_ids_logprobs_val, [])
-        self.assertEqual(out.input_token_ids_logprobs_idx, [])
-        self.assertEqual(out.output_token_ids_logprobs_val, [])
-        self.assertEqual(out.output_token_ids_logprobs_idx, [])
+        assert (out.input_token_logprobs_val) == ([])
+        assert (out.input_token_logprobs_idx) == ([])
+        assert (out.output_token_logprobs_val) == ([])
+        assert (out.output_token_logprobs_idx) == ([])
+        assert (out.input_top_logprobs_val) == ([])
+        assert (out.input_top_logprobs_idx) == ([])
+        assert (out.output_top_logprobs_val) == ([])
+        assert (out.output_top_logprobs_idx) == ([])
+        assert (out.input_token_ids_logprobs_val) == ([])
+        assert (out.input_token_ids_logprobs_idx) == ([])
+        assert (out.output_token_ids_logprobs_val) == ([])
+        assert (out.output_token_ids_logprobs_idx) == ([])
 
     def test_limited_capacity_dict_update_does_not_evict(self):
         # Regression for the update-at-capacity eviction bug caught by
@@ -1265,35 +1252,35 @@ class TestDetokenizerLifecycle(unittest.TestCase):
         d = LimitedCapacityDict(capacity=2)
         d["a"] = 1
         d["b"] = 2
-        self.assertEqual(len(d), 2)
-        self.assertEqual(list(d.keys()), ["a", "b"])
+        assert (len(d)) == (2)
+        assert (list(d.keys())) == (["a", "b"])
 
         # Update existing key at capacity: no eviction.
         d["b"] = 20
-        self.assertEqual(len(d), 2)
-        self.assertEqual(list(d.keys()), ["a", "b"])
-        self.assertEqual(d["a"], 1)
-        self.assertEqual(d["b"], 20)
+        assert (len(d)) == (2)
+        assert (list(d.keys())) == (["a", "b"])
+        assert (d["a"]) == (1)
+        assert (d["b"]) == (20)
 
         # Update the oldest key: still no eviction.
         d["a"] = 10
-        self.assertEqual(len(d), 2)
-        self.assertEqual(d["a"], 10)
-        self.assertEqual(d["b"], 20)
+        assert (len(d)) == (2)
+        assert (d["a"]) == (10)
+        assert (d["b"]) == (20)
 
         # Inserting a genuinely new key at capacity evicts the oldest —
         # this is the add-new-key path that the production flow uses,
         # and it is unchanged by the fix.
         d["c"] = 3
-        self.assertEqual(len(d), 2)
-        self.assertIn("c", d)
-        self.assertEqual(d["c"], 3)
+        assert (len(d)) == (2)
+        assert ("c") in (d)
+        assert (d["c"]) == (3)
         # "a" was the oldest (after the update above moved "b" to end?
         # No — update of an existing key in OrderedDict does NOT move
         # it to the end. Insertion order is ["a", "b"] throughout, so
         # "a" is still the oldest and gets evicted when "c" is added).
-        self.assertNotIn("a", d)
-        self.assertIn("b", d)
+        assert ("a") not in (d)
+        assert ("b") in (d)
 
     def test_tokenizer_decode_error_propagates_unchanged(self):
         # Gap 7. If the underlying tokenizer's batch_decode raises,
@@ -1306,9 +1293,9 @@ class TestDetokenizerLifecycle(unittest.TestCase):
 
         manager = _StubDetokenizerManager(_RaisingTokenizer())
 
-        with self.assertRaises(RuntimeError) as cm:
+        with pytest.raises((RuntimeError)) as cm:
             manager.handle_batch_token_id_out(_batch(["req-1"], decode_ids=[[1, 2, 3]]))
-        self.assertIn("tokenizer exploded", str(cm.exception))
+        assert ("tokenizer exploded") in (str(cm.value))
 
 
 # ---------------------------------------------------------------------------
@@ -1316,7 +1303,7 @@ class TestDetokenizerLifecycle(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestIncrementalDetokenizerConstruction(unittest.TestCase):
+class TestIncrementalDetokenizerConstruction:
     """Tokenizer-independent tests for the per-request class's init
     and state accessor. The matrix-based cross-check tests on
     ``_DetokenizerParityBase`` already validate end-to-end semantics;
@@ -1327,31 +1314,31 @@ class TestIncrementalDetokenizerConstruction(unittest.TestCase):
         det = IncrementalDetokenizer()
         s = det.status
 
-        self.assertEqual(s.decoded_text, "")
-        self.assertEqual(s.decode_ids, [])
-        self.assertEqual(s.surr_offset, 0)
-        self.assertEqual(s.read_offset, 0)
-        self.assertEqual(s.sent_offset, 0)
+        assert (s.decoded_text) == ("")
+        assert (s.decode_ids) == ([])
+        assert (s.surr_offset) == (0)
+        assert (s.read_offset) == (0)
+        assert (s.sent_offset) == (0)
 
     def test_init_accepts_decoded_text_seed(self):
         det = IncrementalDetokenizer(decoded_text="Hello,")
         s = det.status
 
-        self.assertEqual(s.decoded_text, "Hello,")
-        self.assertEqual(s.decode_ids, [])
-        self.assertEqual(s.surr_offset, 0)
-        self.assertEqual(s.read_offset, 0)
-        self.assertEqual(s.sent_offset, 0)
+        assert (s.decoded_text) == ("Hello,")
+        assert (s.decode_ids) == ([])
+        assert (s.surr_offset) == (0)
+        assert (s.read_offset) == (0)
+        assert (s.sent_offset) == (0)
 
     def test_init_accepts_nonzero_read_offset_seed(self):
         det = IncrementalDetokenizer(read_offset=7)
         s = det.status
 
-        self.assertEqual(s.decoded_text, "")
-        self.assertEqual(s.decode_ids, [])
-        self.assertEqual(s.surr_offset, 0)
-        self.assertEqual(s.read_offset, 7)
-        self.assertEqual(s.sent_offset, 0)
+        assert (s.decoded_text) == ("")
+        assert (s.decode_ids) == ([])
+        assert (s.surr_offset) == (0)
+        assert (s.read_offset) == (7)
+        assert (s.sent_offset) == (0)
 
     def test_status_property_exposes_live_state_not_copy(self):
         # The status property must return the underlying DecodeStatus
@@ -1361,17 +1348,17 @@ class TestIncrementalDetokenizerConstruction(unittest.TestCase):
         det = IncrementalDetokenizer()
         first_ref = det.status
         second_ref = det.status
-        self.assertIs(first_ref, second_ref)
+        assert (first_ref) is (second_ref)
 
     def test_each_instance_owns_independent_state(self):
         det_a = IncrementalDetokenizer(decoded_text="A")
         det_b = IncrementalDetokenizer(decoded_text="B")
 
-        self.assertEqual(det_a.status.decoded_text, "A")
-        self.assertEqual(det_b.status.decoded_text, "B")
-        self.assertIsNot(det_a.status, det_b.status)
-        self.assertIsNot(det_a.status.decode_ids, det_b.status.decode_ids)
+        assert (det_a.status.decoded_text) == ("A")
+        assert (det_b.status.decoded_text) == ("B")
+        assert (det_a.status) is not (det_b.status)
+        assert (det_a.status.decode_ids) is not (det_b.status.decode_ids)
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))

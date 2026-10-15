@@ -51,9 +51,6 @@ def test_draft_idle_global_num_tokens_match_multi_step_decode_shape():
 def test_block_drafters_idle_with_one_forward_of_the_targets_rows():
     # Block drafters propose the whole block in one draft forward, so an idle
     # rank mirrors them with a single IDLE forward sized by the target's rows.
-    from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
-        DeepseekV4DSpark,
-    )
     from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
         DeepseekV41DSpark,
     )
@@ -62,7 +59,7 @@ def test_block_drafters_idle_with_one_forward_of_the_targets_rows():
 
     global_num_tokens = [6, 0, 3]
     global_bs = [2, 0, 1]
-    for cls in (DFlash, DSpark, DeepseekV4DSpark, DeepseekV41DSpark):
+    for cls in (DFlash, DSpark, DeepseekV41DSpark):
         drafter = cls.__new__(cls)
         drafter.spec_num_steps = 3
         assert drafter.idle_forward_global_num_tokens(global_num_tokens, global_bs) == [

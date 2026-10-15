@@ -23,7 +23,17 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import ScaleFormat, format_signatures
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
+
+# ===-----------------------------------------------------------------------===#
+# Scaled FP8: PyTorch row-wise scaled GEMM (NVIDIA SM100)
+# ===-----------------------------------------------------------------------===#
+
 
 _FP8_CHANNEL_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
 # Below this many rows the Triton kernel is as fast and skips the scale expansion.
@@ -43,9 +53,12 @@ TORCH_FP8_SCALED_MIN_M = 65
     signatures=format_signatures(
         ("a", "b"), "scaled-fp8", {torch.float8_e4m3fn}, scale=_FP8_CHANNEL_SCALE
     ),
-    # torch._scaled_mm reads row-major A and column-major B, both 16-aligned.
+    # torch._scaled_mm reads row-major A and column-major B, both 16-aligned,
+    # and its row-wise scaling writes BF16 only (an FP16 output is garbage on
+    # SM100, not refused).
     traits={
         "m_min": frozenset({TORCH_FP8_SCALED_MIN_M}),
+        "out_dtype": frozenset({torch.bfloat16}),
         "n_align": frozenset({16}),
         "k_align": frozenset({16}),
         "a_inner_stride_one": frozenset({True}),
@@ -75,7 +88,7 @@ def torch_mm_fp8_scaled(
         B: ``[K, N]`` column-major FP8 weights (a transposed ``[N, K]``).
         A_scales: FP32 ``[M, 1]`` per-token or one-element per-tensor scales.
         B_scales: FP32 ``[N, 1]`` per-channel or one-element per-tensor scales.
-        out_dtype: Output dtype.
+        out_dtype: BF16; the row-wise scaling writes nothing else.
         alpha: Must be None; the scales carry the dequant.
         block_size: Must be None; the scales are per token or channel.
         out: Optional ``[M, N]`` output buffer.
@@ -85,6 +98,10 @@ def torch_mm_fp8_scaled(
     """
     if alpha is not None or block_size is not None:
         raise ValueError("row-wise scaled FP8 GEMM takes no alpha or block_size")
+    # The out_dtype trait keeps FP16 away in normal selection, but an override
+    # skips trait matching; torch._scaled_mm writes garbage rather than refusing.
+    if out_dtype != torch.bfloat16:
+        raise ValueError(f"row-wise scaled FP8 GEMM writes BF16, not {out_dtype}")
     m, n = A.shape[0], B.shape[1]
     # The kernel takes only dense [M, 1] and [1, N] scales; per-tensor ones are expanded.
     scale_a = A_scales.reshape(-1, 1).expand(m, 1).contiguous()
@@ -92,3 +109,39 @@ def torch_mm_fp8_scaled(
     return torch._scaled_mm(
         A, B, scale_a=scale_a, scale_b=scale_b, out_dtype=out_dtype, out=out
     )
+
+
+# ===-----------------------------------------------------------------------===#
+# Decode GEMV: PyTorch
+# ===-----------------------------------------------------------------------===#
+
+
+@register_kernel(
+    "gemm",
+    "mv",
+    name="torch_decode_gemv",
+    solution="torch",
+    signatures=frozenset(
+        format_signature(
+            x=dense_tensor_format(x_dtype),
+            weight=dense_tensor_format(weight_dtype),
+        )
+        for x_dtype, weight_dtype in (
+            (torch.bfloat16, torch.bfloat16),
+            (torch.float32, torch.float32),
+            (torch.bfloat16, torch.float32),
+        )
+    ),
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def torch_decode_gemv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if x.dtype == torch.bfloat16 and weight.dtype == torch.float32:
+        x = x.float()
+    if out is not None:
+        return torch.mm(x, weight.t(), out=out)
+    return x @ weight.t()

@@ -201,7 +201,7 @@ def test_l2norm_row_count():
 
 
 def test_mxfp4_mm_row_count():
-    from tokenspeed_kernel.ops.gemm import triton as gemm
+    from tokenspeed_kernel.ops.gemm._triton import mxfp4 as gemm
 
     n, k = 64, 256
     a = torch.randint(0, 256, (1500, k // 2), dtype=torch.uint8, device=DEVICE)
